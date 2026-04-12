@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+Working branch for the next feature set after `v0.1.0`.
+
+### Planned focus
+
+- Multi-system and multi-enclosure selection
+- Mapping export/import workflow
+- Compact topology and sibling-awareness improvements
+- Optional SMART summary enrichment
+- Optional multipath/member awareness
+- Adapter groundwork for future TrueNAS SCALE support
+
 ## v0.1.0 - 2026-04-12
 
 Initial public release of the TrueNAS JBOD Enclosure UI.
