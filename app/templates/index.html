@@ -1,0 +1,215 @@
+{% extends "base.html" %}
+{% block title %}TrueNAS JBOD Enclosure UI{% endblock %}
+{% block body %}
+<div class="app-shell">
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">TrueNAS CORE / Supermicro CSE-946 Top View</p>
+      <h1>JBOD Enclosure UI</h1>
+      <p class="subtle" id="header-summary">
+        Top-loading bay map with API-or-SSH LED control and optional SSH enrichment.
+      </p>
+    </div>
+    <div class="topbar-meta">
+      <div class="meta-card">
+        <span class="meta-label">Enclosure</span>
+        <span class="meta-value" id="enclosure-name">{{ snapshot.selected_enclosure_label or snapshot.selected_enclosure_name or "Auto-selected" }}</span>
+      </div>
+      <div class="meta-card">
+        <span class="meta-label">Last Updated</span>
+        <span class="meta-value" id="last-updated">{{ snapshot.last_updated }}</span>
+      </div>
+    </div>
+  </header>
+
+  <section class="toolbar">
+    <label class="field grow">
+      <span>Search</span>
+      <input id="search-box" type="search" placeholder="serial, daX, gptid, pool, vdev">
+    </label>
+    <button id="refresh-button" class="button">Refresh Now</button>
+    <label class="toggle">
+      <input id="auto-refresh-toggle" type="checkbox" checked>
+      <span>Auto-refresh</span>
+    </label>
+    <label class="field refresh-interval-field">
+      <span>Refresh Every</span>
+      <select id="refresh-interval-select">
+        <option value="15">15 sec</option>
+        <option value="30" selected>30 sec</option>
+        <option value="60">1 min</option>
+        <option value="300">5 min</option>
+      </select>
+    </label>
+  </section>
+
+  <section class="status-strip" id="status-strip">
+    <div class="status-chip" id="api-status-chip">API</div>
+    <div class="status-chip" id="ssh-status-chip">SSH</div>
+    <div class="status-text" id="status-text">Ready.</div>
+  </section>
+
+  <section class="summary-strip" id="summary-strip">
+    <div class="summary-card">
+      <span class="summary-label">Disks</span>
+      <span class="summary-value" id="summary-disk-count">{{ snapshot.summary.disk_count }}</span>
+      <span class="summary-note">discovered from inventory</span>
+    </div>
+    <div class="summary-card">
+      <span class="summary-label">Pools</span>
+      <span class="summary-value" id="summary-pool-count">{{ snapshot.summary.pool_count }}</span>
+      <span class="summary-note">visible in `pool.query`</span>
+    </div>
+    <div class="summary-card">
+      <span class="summary-label">Enclosure Rows</span>
+      <span class="summary-value" id="summary-enclosure-count">{{ snapshot.summary.enclosure_count }}</span>
+      <span class="summary-note">returned by API</span>
+    </div>
+    <div class="summary-card">
+      <span class="summary-label">Slot Matches</span>
+      <span class="summary-value" id="summary-mapped-slot-count">{{ snapshot.summary.mapped_slot_count }}</span>
+      <span class="summary-note">slots tied to disks</span>
+    </div>
+    <div class="summary-card">
+      <span class="summary-label">Saved Mappings</span>
+      <span class="summary-value" id="summary-manual-mapping-count">{{ snapshot.summary.manual_mapping_count }}</span>
+      <span class="summary-note">manual calibration entries</span>
+    </div>
+    <div class="summary-card">
+      <span class="summary-label">SSH Slot Hints</span>
+      <span class="summary-value" id="summary-ssh-slot-hint-count">{{ snapshot.summary.ssh_slot_hint_count }}</span>
+      <span class="summary-note">from `sesutil` parsing</span>
+    </div>
+  </section>
+
+  <main class="content-grid">
+    <section class="panel enclosure-panel">
+      <div class="panel-header">
+        <div>
+          <h2>Enclosure Top</h2>
+        </div>
+        <div class="legend">
+          <span class="legend-item"><i class="swatch healthy"></i> Healthy</span>
+          <span class="legend-item"><i class="swatch empty"></i> Empty</span>
+          <span class="legend-item"><i class="swatch identify"></i> Identify</span>
+          <span class="legend-item"><i class="swatch fault"></i> Fault</span>
+          <span class="legend-item"><i class="swatch unknown"></i> Unknown</span>
+          <span class="legend-item"><i class="swatch unmapped"></i> Unmapped</span>
+        </div>
+      </div>
+      <div class="enclosure-face">
+        <div class="chassis-shell">
+          <div class="service-zone" aria-hidden="true">
+            <div class="service-panel service-panel-wide"></div>
+            <div class="service-cavity"></div>
+            <div class="service-panel service-panel-short"></div>
+          </div>
+          <div class="slot-grid" id="slot-grid"></div>
+          <div class="front-edge" aria-hidden="true">
+            <span class="front-handle"></span>
+            <span class="front-label">System front / latch edge</span>
+            <span class="front-handle"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="panel detail-panel">
+      <div class="panel-header">
+        <div>
+          <h2>Slot Details</h2>
+          <p class="subtle">Select a bay to inspect metadata or calibrate mapping.</p>
+        </div>
+      </div>
+
+      <div id="detail-empty" class="detail-empty">
+        Select a slot tile to view disk, pool, and mapping details.
+      </div>
+
+      <div id="detail-content" class="detail-content hidden">
+        <div class="detail-slot-head">
+          <div>
+            <p class="eyebrow">Selected Bay</p>
+            <h3 id="detail-slot-title">Slot 00</h3>
+          </div>
+          <span class="state-pill" id="detail-state-pill">Unknown</span>
+        </div>
+
+        <div class="kv-grid" id="detail-kv-grid"></div>
+
+        <div class="action-group">
+          <h4>LED Control</h4>
+          <p class="subtle" id="led-note">
+            LED control uses the TrueNAS enclosure API when available, and SSH `sesutil locate` on shelves that only expose SES fallback data.
+          </p>
+          <div class="button-row">
+            <button class="button" data-led-action="IDENTIFY">Identify On</button>
+            <button class="button secondary" data-led-action="CLEAR">Identify Off / Clear</button>
+          </div>
+        </div>
+
+        <div class="action-group">
+          <div class="action-header">
+            <h4>Calibration Mapping</h4>
+            <button class="button secondary small" id="prefill-mapping-button" type="button">Prefill From Slot</button>
+          </div>
+          <p class="subtle">
+            First-pass workflow: light the slot, verify the physical bay, then save
+            the observed serial, device, or gptid so the app can persist the mapping.
+          </p>
+          <form id="mapping-form">
+            <label class="field">
+              <span>Serial</span>
+              <input type="text" name="serial" maxlength="256">
+            </label>
+            <label class="field">
+              <span>Device</span>
+              <input type="text" name="device_name" maxlength="256">
+            </label>
+            <label class="field">
+              <span>GPTID</span>
+              <input type="text" name="gptid" maxlength="256">
+            </label>
+            <label class="field">
+              <span>Notes</span>
+              <textarea name="notes" rows="3" maxlength="256" placeholder="Optional calibration note"></textarea>
+            </label>
+            <label class="toggle compact">
+              <input type="checkbox" name="clear_identify_after_save" checked>
+              <span>Clear identify LED after saving</span>
+            </label>
+            <div class="button-row">
+              <button class="button" type="submit">Save Mapping</button>
+              <button class="button danger" id="clear-mapping-button" type="button">Clear Mapping</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <section class="panel">
+    <div class="panel-header">
+      <h2>Warnings</h2>
+    </div>
+    <div id="warning-list" class="warning-list">
+      {% if snapshot.warnings %}
+        {% for warning in snapshot.warnings %}
+          <div class="warning-item">{{ warning }}</div>
+        {% endfor %}
+      {% else %}
+        <div class="warning-item muted">No warnings.</div>
+      {% endif %}
+    </div>
+  </section>
+</div>
+
+<script>
+  window.APP_BOOTSTRAP = {
+    snapshot: {{ initial_snapshot_json | safe }},
+    layoutRows: {{ layout_rows | tojson }},
+    refreshIntervalSeconds: {{ snapshot.refresh_interval_seconds }},
+    slotCount: {{ settings.layout.slot_count }},
+  };
+</script>
+{% endblock %}

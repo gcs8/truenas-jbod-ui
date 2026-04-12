@@ -1,0 +1,55 @@
+app:
+  host: 0.0.0.0
+  port: 8080
+  refresh_interval_seconds: 30
+  cache_ttl_seconds: 10
+  log_level: INFO
+  debug: false
+  verify_ssl: true
+
+truenas:
+  # Use env vars for secrets in production.
+  # Base appliance URL only, without /api/v2.0.
+  host: https://truenas.example.local
+  api_key: ""
+  verify_ssl: false
+  timeout_seconds: 15
+  # Optional substring match against enclosure id/name/label.
+  enclosure_filter: ""
+
+ssh:
+  enabled: false
+  host: truenas.example.local
+  port: 22
+  user: jbodmap
+  # Mount your SSH key into ./config/ssh on the Docker host.
+  key_path: /run/ssh/id_truenas
+  # Optional: set via SSH_SUDO_PASSWORD env var if your CORE build only supports
+  # passworded command-limited sudo.
+  sudo_password: ""
+  known_hosts_path: /run/ssh/known_hosts
+  strict_host_key_checking: true
+  timeout_seconds: 15
+  commands:
+    - /sbin/glabel status
+    - /usr/local/sbin/zpool status -gP
+    - sudo -n /usr/sbin/sesutil map
+    - sudo -n /usr/sbin/sesutil show
+  # Optional if you also allow SSH identify LED control through command-limited sudo:
+  #  - sudo -n /usr/sbin/sesutil locate -u /dev/ses4 16 on
+  #  - sudo -n /usr/sbin/sesutil locate -u /dev/ses4 16 off
+  # Optional extra hint source if you also allow command-limited sudo for camcontrol:
+  #  - sudo -n /sbin/camcontrol devlist -v
+
+layout:
+  slot_count: 60
+  rows: 4
+  columns: 15
+  # UI labels remain 00-59 by default.
+  slot_number_base: 0
+  # TrueNAS enclosure APIs often use 1-based slot numbering.
+  api_slot_number_base: 1
+
+paths:
+  mapping_file: /app/data/slot_mappings.json
+  log_file: /app/logs/app.log

@@ -1,0 +1,23 @@
+services:
+  enclosure-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: truenas-jbod-ui
+    env_file:
+      - .env
+    ports:
+      - "${APP_PORT:-8080}:8000"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config/ssh:/run/ssh:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+

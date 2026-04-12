@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local runtime state
+config/config.yaml
+config/ssh/*
+!config/ssh/.gitkeep
+data/slot_mappings.json
+logs/*.log
+
+# Editor and platform noise
+.DS_Store
+Thumbs.db
