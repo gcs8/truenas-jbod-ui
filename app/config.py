@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -62,10 +63,19 @@ class PathConfig(BaseModel):
     log_file: str = "/app/logs/app.log"
 
 
+class SystemConfig(BaseModel):
+    id: str = "default"
+    label: str | None = None
+    truenas: TrueNASConfig = Field(default_factory=TrueNASConfig)
+    ssh: SSHConfig = Field(default_factory=SSHConfig)
+
+
 class Settings(BaseModel):
     app: AppConfig = Field(default_factory=AppConfig)
     truenas: TrueNASConfig = Field(default_factory=TrueNASConfig)
     ssh: SSHConfig = Field(default_factory=SSHConfig)
+    systems: list[SystemConfig] = Field(default_factory=list)
+    default_system_id: str | None = None
     layout: LayoutConfig = Field(default_factory=LayoutConfig)
     paths: PathConfig = Field(default_factory=PathConfig)
     config_file: str = "/app/config/config.yaml"
@@ -95,6 +105,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_STRICT_HOST_KEY_CHECKING": ("ssh", "strict_host_key_checking"),
     "SSH_TIMEOUT": ("ssh", "timeout_seconds"),
     "SSH_COMMANDS_JSON": ("ssh", "commands"),
+    "SYSTEM_DEFAULT_ID": ("default_system_id",),
     "LAYOUT_SLOT_COUNT": ("layout", "slot_count"),
     "LAYOUT_ROWS": ("layout", "rows"),
     "LAYOUT_COLUMNS": ("layout", "columns"),
@@ -151,6 +162,72 @@ def _load_yaml_config(config_path: Path) -> dict[str, Any]:
         return loaded
 
 
+def _normalize_system_id(value: str | None, fallback_index: int) -> str:
+    text = normalize_text(value)
+    if not text:
+        return f"system-{fallback_index}"
+    normalized = re.sub(r"[^a-zA-Z0-9_-]+", "-", text.strip()).strip("-_").lower()
+    return normalized or f"system-{fallback_index}"
+
+
+def normalize_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _normalize_systems(settings: Settings) -> Settings:
+    systems = list(settings.systems)
+    if not systems:
+        systems = [
+            SystemConfig(
+                id="default",
+                label="Primary",
+                truenas=settings.truenas,
+                ssh=settings.ssh,
+            )
+        ]
+
+    normalized_systems: list[SystemConfig] = []
+    seen_ids: set[str] = set()
+    for index, system in enumerate(systems, start=1):
+        system_id = _normalize_system_id(system.id, index)
+        if system_id in seen_ids:
+            suffix = 2
+            while f"{system_id}-{suffix}" in seen_ids:
+                suffix += 1
+            system_id = f"{system_id}-{suffix}"
+        seen_ids.add(system_id)
+        normalized_systems.append(
+            system.model_copy(
+                update={
+                    "id": system_id,
+                    "label": normalize_text(system.label) or system_id.replace("-", " ").title(),
+                }
+            )
+        )
+
+    default_system_id = normalize_text(settings.default_system_id)
+    if not default_system_id or default_system_id not in seen_ids:
+        default_system_id = normalized_systems[0].id
+
+    default_system = next(
+        (system for system in normalized_systems if system.id == default_system_id),
+        normalized_systems[0],
+    )
+    return settings.model_copy(
+        update={
+            "systems": normalized_systems,
+            "default_system_id": default_system.id,
+            # Keep top-level configs aligned with the active default system so older
+            # code paths and templates continue to behave sensibly.
+            "truenas": default_system.truenas,
+            "ssh": default_system.ssh,
+        }
+    )
+
+
 @lru_cache
 def get_settings() -> Settings:
     defaults = Settings().model_dump()
@@ -164,7 +241,7 @@ def get_settings() -> Settings:
             continue
         _set_path_value(merged, target_path, _parse_scalar(raw_value))
 
-    settings = Settings.model_validate(merged)
+    settings = _normalize_systems(Settings.model_validate(merged))
     Path(settings.paths.mapping_file).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.paths.log_file).parent.mkdir(parents=True, exist_ok=True)
     return settings

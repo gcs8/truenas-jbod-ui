@@ -27,6 +27,7 @@ class LedAction(str, Enum):
 
 
 class ManualMapping(BaseModel):
+    system_id: str | None = None
     slot: int
     enclosure_id: str | None = None
     serial: str | None = None
@@ -86,6 +87,17 @@ class SourceStatus(BaseModel):
     message: str | None = None
 
 
+class SystemOption(BaseModel):
+    id: str
+    label: str
+
+
+class EnclosureOption(BaseModel):
+    id: str
+    label: str
+    name: str | None = None
+
+
 class InventorySummary(BaseModel):
     disk_count: int = 0
     pool_count: int = 0
@@ -100,9 +112,13 @@ class InventorySnapshot(BaseModel):
     last_updated: datetime = Field(default_factory=utcnow)
     generated_at: datetime = Field(default_factory=utcnow)
     refresh_interval_seconds: int
+    selected_system_id: str | None = None
+    selected_system_label: str | None = None
     selected_enclosure_id: str | None = None
     selected_enclosure_label: str | None = None
     selected_enclosure_name: str | None = None
+    systems: list[SystemOption] = Field(default_factory=list)
+    enclosures: list[EnclosureOption] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     sources: dict[str, SourceStatus] = Field(default_factory=dict)
     summary: InventorySummary = Field(default_factory=InventorySummary)

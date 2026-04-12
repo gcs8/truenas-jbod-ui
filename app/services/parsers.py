@@ -516,6 +516,7 @@ def build_slot_candidates_from_ses_enclosures(
     enclosures: list[SESMapEnclosure],
     slot_count: int,
     enclosure_filter: str | None,
+    selected_enclosure_id: str | None = None,
 ) -> tuple[dict[int, dict[str, Any]], dict[str, str | None]]:
     """
     Convert parsed SES maps into the app's 0-based slot view.
@@ -524,16 +525,30 @@ def build_slot_candidates_from_ses_enclosures(
     is detected, we stack the groups into one 60-slot view in name order, preferring
     "Front" before "Rear". Duplicate paths to the same enclosure ID are merged.
     """
-
+    merged_enclosures = _merge_ses_enclosures(enclosures)
+    selected_ids = {
+        item
+        for item in (
+            normalize_text(value)
+            for value in (selected_enclosure_id.split("+") if selected_enclosure_id else [])
+        )
+        if item
+    }
     filter_text = enclosure_filter.lower() if enclosure_filter else None
+
     filtered = []
-    for enclosure in enclosures:
+    for enclosure in merged_enclosures:
+        if selected_ids:
+            if enclosure.enclosure_id in selected_ids:
+                filtered.append(enclosure)
+            continue
+
         haystack = " ".join(filter(None, [enclosure.enclosure_id or "", enclosure.enclosure_name or ""])).lower()
         if filter_text and filter_text not in haystack:
             continue
         filtered.append(enclosure)
 
-    ordered = _pick_preferred_enclosures(_merge_ses_enclosures(filtered), slot_count)
+    ordered = _pick_preferred_enclosures(filtered, slot_count)
 
     candidates: dict[int, dict[str, Any]] = {}
     labels: list[str] = []
@@ -627,6 +642,7 @@ def extract_enclosure_slot_candidates(
     enclosure_filter: str | None,
     slot_count: int,
     api_slot_number_base: int,
+    selected_enclosure_id: str | None = None,
 ) -> tuple[dict[int, dict[str, Any]], dict[str, str | None]]:
     """
     Extract slot metadata from `enclosure.query` defensively.
@@ -639,13 +655,24 @@ def extract_enclosure_slot_candidates(
     selected_meta: dict[str, str | None] = {"id": None, "label": None, "name": None}
     scored: dict[int, tuple[int, dict[str, Any]]] = {}
     filter_text = enclosure_filter.lower() if enclosure_filter else None
+    selected_ids = {
+        item
+        for item in (
+            normalize_text(value)
+            for value in (selected_enclosure_id.split("+") if selected_enclosure_id else [])
+        )
+        if item
+    }
 
     for enclosure in enclosures:
         enclosure_id = str(enclosure.get("id") or "")
         enclosure_name = str(enclosure.get("name") or "")
         enclosure_label = str(enclosure.get("label") or "")
         haystack = " ".join([enclosure_id, enclosure_name, enclosure_label]).lower()
-        if filter_text and filter_text not in haystack:
+        if selected_ids:
+            if enclosure_id not in selected_ids:
+                continue
+        elif filter_text and filter_text not in haystack:
             continue
 
         if selected_meta["id"] is None:
@@ -976,6 +1003,7 @@ def parse_ssh_outputs(
     outputs: dict[str, str],
     slot_count: int,
     enclosure_filter: str | None,
+    selected_enclosure_id: str | None = None,
 ) -> ParsedSSHData:
     parsed = ParsedSSHData()
     normalized_outputs: dict[str, str] = {}
@@ -998,6 +1026,7 @@ def parse_ssh_outputs(
             ses_map_enclosures,
             slot_count,
             enclosure_filter,
+            selected_enclosure_id,
         )
 
     if normalized_outputs.get("sesutil show"):
@@ -1006,6 +1035,7 @@ def parse_ssh_outputs(
             ses_show_enclosures,
             slot_count,
             enclosure_filter,
+            selected_enclosure_id,
         )
         parsed.ses_slot_candidates = merge_slot_candidate_maps(parsed.ses_slot_candidates, show_candidates)
         parsed.ses_selected_meta = merge_enclosure_meta(parsed.ses_selected_meta, show_meta)

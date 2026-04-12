@@ -3,9 +3,11 @@
   const supportedRefreshIntervals = [15, 30, 60, 300];
   const bootstrapRefreshInterval = Number(bootstrap.refreshIntervalSeconds) || 30;
   const state = {
-    snapshot: bootstrap.snapshot || { slots: [] },
+    snapshot: bootstrap.snapshot || { slots: [], systems: [], enclosures: [] },
     layoutRows: bootstrap.layoutRows || [],
     selectedSlot: null,
+    selectedSystemId: bootstrap.snapshot?.selected_system_id || null,
+    selectedEnclosureId: bootstrap.snapshot?.selected_enclosure_id || null,
     search: "",
     autoRefresh: true,
     refreshIntervalSeconds: supportedRefreshIntervals.includes(bootstrapRefreshInterval) ? bootstrapRefreshInterval : 30,
@@ -23,8 +25,9 @@
   const refreshButton = document.getElementById("refresh-button");
   const autoRefreshToggle = document.getElementById("auto-refresh-toggle");
   const refreshIntervalSelect = document.getElementById("refresh-interval-select");
+  const systemSelect = document.getElementById("system-select");
+  const enclosureSelect = document.getElementById("enclosure-select");
   const lastUpdated = document.getElementById("last-updated");
-  const enclosureName = document.getElementById("enclosure-name");
   const apiStatusChip = document.getElementById("api-status-chip");
   const sshStatusChip = document.getElementById("ssh-status-chip");
   const statusText = document.getElementById("status-text");
@@ -53,6 +56,23 @@
       return [row.slice(0, 6), row.slice(6, 12), row.slice(12)];
     }
     return [row];
+  }
+
+  function buildSelectionParams() {
+    const params = new URLSearchParams();
+    if (state.selectedSystemId) {
+      params.set("system_id", state.selectedSystemId);
+    }
+    if (state.selectedEnclosureId) {
+      params.set("enclosure_id", state.selectedEnclosureId);
+    }
+    return params;
+  }
+
+  function syncLocation() {
+    const params = buildSelectionParams();
+    const query = params.toString();
+    window.history.replaceState({}, "", query ? `/?${query}` : "/");
   }
 
   function setStatus(message, tone = "info") {
@@ -269,11 +289,7 @@
     sshStatusChip.textContent = !ssh.enabled ? "SSH OFF" : ssh.ok ? "SSH OK" : "SSH ERR";
 
     lastUpdated.textContent = formatTimestamp(state.snapshot.last_updated);
-    enclosureName.textContent =
-      state.snapshot.selected_enclosure_label ||
-      state.snapshot.selected_enclosure_name ||
-      state.snapshot.selected_enclosure_id ||
-      "Auto-selected";
+    syncLocation();
   }
 
   function renderSummary() {
@@ -286,6 +302,45 @@
     summarySshSlotHintCount.textContent = String(summary.ssh_slot_hint_count ?? 0);
   }
 
+  function renderRefreshControls() {
+    autoRefreshToggle.checked = state.autoRefresh;
+    refreshIntervalSelect.value = String(state.refreshIntervalSeconds);
+    refreshIntervalSelect.disabled = !state.autoRefresh;
+  }
+
+  function renderSelectors() {
+    const systems = state.snapshot.systems || [];
+    const enclosures = state.snapshot.enclosures || [];
+
+    if (systemSelect) {
+      systemSelect.innerHTML = systems
+        .map((system) => {
+          const selected = system.id === state.selectedSystemId ? " selected" : "";
+          return `<option value="${escapeHtml(system.id)}"${selected}>${escapeHtml(system.label)}</option>`;
+        })
+        .join("");
+      if (state.selectedSystemId) {
+        systemSelect.value = state.selectedSystemId;
+      }
+      systemSelect.disabled = systems.length <= 1;
+    }
+
+    if (enclosureSelect) {
+      if (!enclosures.length) {
+        enclosureSelect.innerHTML = '<option value="">Auto-selected</option>';
+      } else {
+        enclosureSelect.innerHTML = enclosures
+          .map((enclosure) => {
+            const selected = enclosure.id === state.selectedEnclosureId ? " selected" : "";
+            return `<option value="${escapeHtml(enclosure.id)}"${selected}>${escapeHtml(enclosure.label)}</option>`;
+          })
+          .join("");
+      }
+      enclosureSelect.value = state.selectedEnclosureId || "";
+      enclosureSelect.disabled = enclosures.length <= 1;
+    }
+  }
+
   function renderAll() {
     renderGrid();
     renderDetail();
@@ -293,12 +348,7 @@
     renderStatus();
     renderSummary();
     renderRefreshControls();
-  }
-
-  function renderRefreshControls() {
-    autoRefreshToggle.checked = state.autoRefresh;
-    refreshIntervalSelect.value = String(state.refreshIntervalSeconds);
-    refreshIntervalSelect.disabled = !state.autoRefresh;
+    renderSelectors();
   }
 
   function selectSlot(slotNumber) {
@@ -318,13 +368,26 @@
     return payload;
   }
 
+  async function sendScopedRequest(url, options = {}) {
+    const params = buildSelectionParams();
+    const scopedUrl = params.toString() ? `${url}?${params.toString()}` : url;
+    return fetchJson(scopedUrl, options);
+  }
+
   async function refreshSnapshot(force = false) {
     try {
       setStatus(force ? "Refreshing inventory..." : "Auto-refreshing inventory...");
-      const snapshot = await fetchJson(`/api/inventory?force=${force ? "true" : "false"}`);
+      const params = buildSelectionParams();
+      params.set("force", force ? "true" : "false");
+      const snapshot = await fetchJson(`/api/inventory?${params.toString()}`);
       state.snapshot = snapshot;
+      state.selectedSystemId = snapshot.selected_system_id || state.selectedSystemId;
+      state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
       if (state.selectedSlot === null && snapshot.slots.length) {
         state.selectedSlot = snapshot.slots[0].slot;
+      }
+      if (state.selectedSlot !== null && !getSlotById(state.selectedSlot)) {
+        state.selectedSlot = snapshot.slots.length ? snapshot.slots[0].slot : null;
       }
       renderAll();
       setStatus("Inventory updated.");
@@ -342,11 +405,13 @@
     }
     try {
       setStatus(`Sending ${action} for slot ${slot.slot_label}...`);
-      const payload = await fetchJson(`/api/slots/${slot.slot}/led`, {
+      const payload = await sendScopedRequest(`/api/slots/${slot.slot}/led`, {
         method: "POST",
         body: JSON.stringify({ action }),
       });
       state.snapshot = payload.snapshot;
+      state.selectedSystemId = payload.snapshot.selected_system_id || state.selectedSystemId;
+      state.selectedEnclosureId = payload.snapshot.selected_enclosure_id || state.selectedEnclosureId;
       renderAll();
       setStatus(`Slot ${slot.slot_label} LED action ${action} completed via ${slot.led_backend === "ssh" ? "SSH SES" : "API"}.`);
     } catch (error) {
@@ -370,11 +435,13 @@
 
     try {
       setStatus(`Saving calibration for slot ${slot.slot_label}...`);
-      const result = await fetchJson(`/api/slots/${slot.slot}/mapping`, {
+      const result = await sendScopedRequest(`/api/slots/${slot.slot}/mapping`, {
         method: "POST",
         body: JSON.stringify(payload),
       });
       state.snapshot = result.snapshot;
+      state.selectedSystemId = result.snapshot.selected_system_id || state.selectedSystemId;
+      state.selectedEnclosureId = result.snapshot.selected_enclosure_id || state.selectedEnclosureId;
       renderAll();
       setStatus(result.warning || `Saved mapping for slot ${slot.slot_label}.`);
     } catch (error) {
@@ -392,8 +459,10 @@
 
     try {
       setStatus(`Clearing mapping for slot ${slot.slot_label}...`);
-      const result = await fetchJson(`/api/slots/${slot.slot}/mapping`, { method: "DELETE" });
+      const result = await sendScopedRequest(`/api/slots/${slot.slot}/mapping`, { method: "DELETE" });
       state.snapshot = result.snapshot;
+      state.selectedSystemId = result.snapshot.selected_system_id || state.selectedSystemId;
+      state.selectedEnclosureId = result.snapshot.selected_enclosure_id || state.selectedEnclosureId;
       renderAll();
       setStatus(`Cleared mapping for slot ${slot.slot_label}.`);
     } catch (error) {
@@ -439,6 +508,21 @@
   });
 
   refreshButton.addEventListener("click", () => refreshSnapshot(true));
+  if (systemSelect) {
+    systemSelect.addEventListener("change", async (event) => {
+      state.selectedSystemId = event.target.value || null;
+      state.selectedEnclosureId = null;
+      state.selectedSlot = null;
+      await refreshSnapshot(true);
+    });
+  }
+  if (enclosureSelect) {
+    enclosureSelect.addEventListener("change", async (event) => {
+      state.selectedEnclosureId = event.target.value || null;
+      state.selectedSlot = null;
+      await refreshSnapshot(true);
+    });
+  }
   autoRefreshToggle.addEventListener("change", (event) => {
     state.autoRefresh = event.target.checked;
     resetTimer();

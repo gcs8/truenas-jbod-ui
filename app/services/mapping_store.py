@@ -16,8 +16,8 @@ class MappingStore:
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
-    def _slot_key(self, enclosure_id: str | None, slot: int) -> str:
-        return f"{enclosure_id or 'default'}:{slot}"
+    def _slot_key(self, system_id: str | None, enclosure_id: str | None, slot: int) -> str:
+        return f"{system_id or 'default_system'}:{enclosure_id or 'default'}:{slot}"
 
     def load_all(self) -> dict[str, ManualMapping]:
         if not self.file_path.exists():
@@ -31,8 +31,25 @@ class MappingStore:
             loaded[key] = ManualMapping.model_validate(value)
         return loaded
 
-    def get_mapping(self, enclosure_id: str | None, slot: int) -> ManualMapping | None:
-        return self.load_all().get(self._slot_key(enclosure_id, slot))
+    def get_mapping(self, system_id: str | None, enclosure_id: str | None, slot: int) -> ManualMapping | None:
+        current = self.load_all()
+        return (
+            current.get(self._slot_key(system_id, enclosure_id, slot))
+            or current.get(self._slot_key(system_id, None, slot))
+            or current.get(f"{enclosure_id or 'default'}:{slot}")
+            or current.get(f"default:{slot}")
+        )
+
+    def count_for_system(self, system_id: str | None) -> int:
+        mappings = self.load_all()
+        if not system_id:
+            return len(mappings)
+
+        count = 0
+        for key, mapping in mappings.items():
+            if mapping.system_id == system_id or key.startswith(f"{system_id}:"):
+                count += 1
+        return count
 
     def save_mapping(self, mapping: ManualMapping) -> ManualMapping:
         with self._lock:
@@ -40,14 +57,20 @@ class MappingStore:
             saved = mapping.model_copy(
                 update={"updated_at": datetime.now(timezone.utc)}
             )
-            current[self._slot_key(mapping.enclosure_id, mapping.slot)] = saved
+            current[self._slot_key(mapping.system_id, mapping.enclosure_id, mapping.slot)] = saved
             self._write(current)
         return saved
 
-    def clear_mapping(self, enclosure_id: str | None, slot: int) -> bool:
+    def clear_mapping(self, system_id: str | None, enclosure_id: str | None, slot: int) -> bool:
         with self._lock:
             current = self.load_all()
-            removed = current.pop(self._slot_key(enclosure_id, slot), None)
+            removed = current.pop(self._slot_key(system_id, enclosure_id, slot), None)
+            if removed is None:
+                removed = current.pop(self._slot_key(system_id, None, slot), None)
+            if removed is None:
+                removed = current.pop(f"{enclosure_id or 'default'}:{slot}", None)
+            if removed is None:
+                removed = current.pop(f"default:{slot}", None)
             if removed is None:
                 return False
             self._write(current)

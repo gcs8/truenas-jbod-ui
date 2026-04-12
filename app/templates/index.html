@@ -11,9 +11,29 @@
       </p>
     </div>
     <div class="topbar-meta">
-      <div class="meta-card">
-        <span class="meta-label">Enclosure</span>
-        <span class="meta-value" id="enclosure-name">{{ snapshot.selected_enclosure_label or snapshot.selected_enclosure_name or "Auto-selected" }}</span>
+      <div class="meta-card meta-select-card">
+        <label class="meta-label" for="system-select">System</label>
+        <select class="meta-select" id="system-select">
+          {% for system in snapshot.systems %}
+            <option value="{{ system.id }}" {% if system.id == snapshot.selected_system_id %}selected{% endif %}>
+              {{ system.label }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="meta-card meta-select-card">
+        <label class="meta-label" for="enclosure-select">Enclosure</label>
+        <select class="meta-select" id="enclosure-select">
+          {% if snapshot.enclosures %}
+            {% for enclosure in snapshot.enclosures %}
+              <option value="{{ enclosure.id }}" {% if enclosure.id == snapshot.selected_enclosure_id %}selected{% endif %}>
+                {{ enclosure.label }}
+              </option>
+            {% endfor %}
+          {% else %}
+            <option value="">Auto-selected</option>
+          {% endif %}
+        </select>
       </div>
       <div class="meta-card">
         <span class="meta-label">Last Updated</span>

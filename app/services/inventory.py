@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from app.config import Settings
+from app.config import Settings, SystemConfig
 from app.models.domain import (
+    EnclosureOption,
     InventorySnapshot,
     InventorySummary,
     LedAction,
@@ -16,6 +17,7 @@ from app.models.domain import (
     SlotState,
     SlotView,
     SourceStatus,
+    SystemOption,
 )
 from app.services.mapping_store import MappingStore
 from app.services.parsers import (
@@ -58,31 +60,45 @@ class InventoryService:
     def __init__(
         self,
         settings: Settings,
+        system: SystemConfig,
         truenas_client: TrueNASWebsocketClient,
         ssh_probe: SSHProbe,
         mapping_store: MappingStore,
     ) -> None:
         self.settings = settings
+        self.system = system
         self.truenas_client = truenas_client
         self.ssh_probe = ssh_probe
         self.mapping_store = mapping_store
-        self._cache: InventorySnapshot | None = None
-        self._cache_until = datetime.min.replace(tzinfo=timezone.utc)
+        self._cache: dict[str, InventorySnapshot] = {}
+        self._cache_until: dict[str, datetime] = {}
         self._lock = asyncio.Lock()
 
-    async def get_snapshot(self, force_refresh: bool = False) -> InventorySnapshot:
+    async def get_snapshot(
+        self,
+        force_refresh: bool = False,
+        selected_enclosure_id: str | None = None,
+    ) -> InventorySnapshot:
         async with self._lock:
             now = utcnow()
-            if not force_refresh and self._cache and now < self._cache_until:
-                return self._cache
+            cache_key = selected_enclosure_id or "__default__"
+            cached = self._cache.get(cache_key)
+            cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
+            if not force_refresh and cached and now < cache_until:
+                return cached
 
-            snapshot = await self._build_snapshot()
-            self._cache = snapshot
-            self._cache_until = now + timedelta(seconds=self.settings.app.cache_ttl_seconds)
+            snapshot = await self._build_snapshot(selected_enclosure_id=selected_enclosure_id)
+            self._cache[cache_key] = snapshot
+            self._cache_until[cache_key] = now + timedelta(seconds=self.settings.app.cache_ttl_seconds)
             return snapshot
 
-    async def set_slot_led(self, slot: int, action: LedAction) -> None:
-        snapshot = await self.get_snapshot(force_refresh=True)
+    async def set_slot_led(
+        self,
+        slot: int,
+        action: LedAction,
+        selected_enclosure_id: str | None = None,
+    ) -> None:
+        snapshot = await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         if not slot_view:
             raise TrueNASAPIError(f"Slot {slot:02d} is not present in the current snapshot.")
@@ -109,31 +125,41 @@ class InventoryService:
                 or f"LED backend {slot_view.led_backend!r} is not supported for slot {slot:02d}."
             )
 
-        await self.get_snapshot(force_refresh=True)
+        await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
 
-    async def save_mapping(self, slot: int, payload: dict[str, Any]) -> ManualMapping:
-        snapshot = await self.get_snapshot(force_refresh=True)
+    async def save_mapping(
+        self,
+        slot: int,
+        payload: dict[str, Any],
+        selected_enclosure_id: str | None = None,
+    ) -> ManualMapping:
+        snapshot = await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         enclosure_id = slot_view.enclosure_id if slot_view else None
-        mapping = ManualMapping(slot=slot, enclosure_id=enclosure_id, **payload)
+        mapping = ManualMapping(
+            system_id=self.system.id,
+            slot=slot,
+            enclosure_id=enclosure_id,
+            **payload,
+        )
         saved = self.mapping_store.save_mapping(mapping)
-        await self.get_snapshot(force_refresh=True)
+        await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
         return saved
 
-    async def clear_mapping(self, slot: int) -> bool:
-        snapshot = await self.get_snapshot(force_refresh=True)
+    async def clear_mapping(self, slot: int, selected_enclosure_id: str | None = None) -> bool:
+        snapshot = await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         enclosure_id = slot_view.enclosure_id if slot_view else None
-        cleared = self.mapping_store.clear_mapping(enclosure_id, slot)
-        await self.get_snapshot(force_refresh=True)
+        cleared = self.mapping_store.clear_mapping(self.system.id, enclosure_id, slot)
+        await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
         return cleared
 
-    async def _build_snapshot(self) -> InventorySnapshot:
+    async def _build_snapshot(self, selected_enclosure_id: str | None = None) -> InventorySnapshot:
         warnings: list[str] = []
         ssh_data = ParsedSSHData()
         sources = {
             "api": SourceStatus(enabled=True, ok=False, message=None),
-            "ssh": SourceStatus(enabled=self.settings.ssh.enabled, ok=not self.settings.ssh.enabled, message=None),
+            "ssh": SourceStatus(enabled=self.system.ssh.enabled, ok=not self.system.ssh.enabled, message=None),
         }
 
         try:
@@ -145,7 +171,7 @@ class InventoryService:
             sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
             warnings.append("TrueNAS API is unreachable. Slot details may be partial or unavailable.")
 
-        if self.settings.ssh.enabled:
+        if self.system.ssh.enabled:
             try:
                 command_results = await self.ssh_probe.run_commands()
                 outputs = {item.command: item.stdout for item in command_results if item.ok}
@@ -153,7 +179,8 @@ class InventoryService:
                 ssh_data = parse_ssh_outputs(
                     outputs,
                     self.settings.layout.slot_count,
-                    self.settings.truenas.enclosure_filter,
+                    self.system.truenas.enclosure_filter,
+                    selected_enclosure_id,
                 )
                 sources["ssh"] = SourceStatus(
                     enabled=True,
@@ -173,25 +200,49 @@ class InventoryService:
                 "but physical slot mapping on this system will require SSH enrichment or manual calibration."
             )
 
-        slots = self._correlate(raw_data, ssh_data, warnings)
-        selected_slot = next((slot for slot in slots if slot.enclosure_id), slots[0] if slots else None)
+        slots, available_enclosures, selected_meta = self._correlate(
+            raw_data,
+            ssh_data,
+            warnings,
+            selected_enclosure_id=selected_enclosure_id,
+        )
+        option_by_id = {item.id: item for item in available_enclosures}
+        resolved_enclosure_id = None
+        if selected_enclosure_id and selected_enclosure_id in option_by_id:
+            resolved_enclosure_id = selected_enclosure_id
+        elif selected_meta.get("id") and selected_meta["id"] in option_by_id:
+            resolved_enclosure_id = selected_meta["id"]
+        elif available_enclosures:
+            resolved_enclosure_id = available_enclosures[0].id
+
+        selected_option = option_by_id.get(resolved_enclosure_id) if resolved_enclosure_id else None
+        selected_slot = None
+        if resolved_enclosure_id:
+            selected_slot = next((slot for slot in slots if slot.enclosure_id == resolved_enclosure_id), None)
+        if selected_slot is None:
+            selected_slot = next((slot for slot in slots if slot.enclosure_id), slots[0] if slots else None)
+
         summary = InventorySummary(
             disk_count=len(raw_data.disks),
             pool_count=len(raw_data.pools),
             enclosure_count=len(raw_data.enclosures),
             mapped_slot_count=sum(1 for slot in slots if slot.device_name),
-            manual_mapping_count=len(self.mapping_store.load_all()),
+            manual_mapping_count=self.mapping_store.count_for_system(self.system.id),
             ssh_slot_hint_count=len(ssh_data.ses_slot_candidates),
         )
         return InventorySnapshot(
             slots=slots,
             refresh_interval_seconds=self.settings.app.refresh_interval_seconds,
+            selected_system_id=self.system.id,
+            selected_system_label=self.system.label,
             warnings=warnings,
             last_updated=utcnow(),
             generated_at=utcnow(),
-            selected_enclosure_id=selected_slot.enclosure_id if selected_slot else None,
-            selected_enclosure_label=selected_slot.enclosure_label if selected_slot else None,
-            selected_enclosure_name=selected_slot.enclosure_name if selected_slot else None,
+            systems=[SystemOption(id=system.id, label=system.label or system.id) for system in self.settings.systems],
+            enclosures=available_enclosures,
+            selected_enclosure_id=selected_option.id if selected_option else selected_slot.enclosure_id if selected_slot else None,
+            selected_enclosure_label=selected_option.label if selected_option else selected_slot.enclosure_label if selected_slot else None,
+            selected_enclosure_name=selected_option.name if selected_option else selected_slot.enclosure_name if selected_slot else None,
             sources=sources,
             summary=summary,
         )
@@ -201,14 +252,18 @@ class InventoryService:
         raw_data: TrueNASRawData,
         ssh_data: ParsedSSHData,
         warnings: list[str],
-    ) -> list[SlotView]:
+        selected_enclosure_id: str | None = None,
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None]]:
         slot_count = self.settings.layout.slot_count
-        api_candidates, selected_meta = extract_enclosure_slot_candidates(
+        api_candidates, api_selected_meta = extract_enclosure_slot_candidates(
             raw_data.enclosures,
-            self.settings.truenas.enclosure_filter,
+            self.system.truenas.enclosure_filter,
             slot_count,
             self.settings.layout.api_slot_number_base,
+            selected_enclosure_id,
         )
+        selected_meta = self._merge_enclosure_meta(ssh_data.ses_selected_meta, api_selected_meta)
+        available_enclosures = self._build_enclosure_options(raw_data, selected_meta)
         api_enclosure_ids = {
             enclosure_id
             for enclosure_id in (
@@ -216,10 +271,9 @@ class InventoryService:
             )
             if enclosure_id
         }
-        if selected_meta.get("id"):
-            api_enclosure_ids.add(selected_meta["id"])
+        if api_selected_meta.get("id"):
+            api_enclosure_ids.add(api_selected_meta["id"])
         slot_candidates = merge_slot_candidate_maps(ssh_data.ses_slot_candidates, api_candidates)
-        selected_meta = self._merge_enclosure_meta(ssh_data.ses_selected_meta, selected_meta)
         api_topology_members = parse_pool_query_topology(raw_data.pools)
         disk_records = self._build_disk_records(raw_data.disks, ssh_data)
 
@@ -232,15 +286,14 @@ class InventoryService:
                 disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
                 disks_by_slot[(None, disk.slot)] = disk
 
-        manual_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
 
         for slot in range(slot_count):
             row_index = slot // self.settings.layout.columns
             column_index = slot % self.settings.layout.columns
             candidate = slot_candidates.get(slot, {})
-            enclosure_id = normalize_text(candidate.get("enclosure_id")) or selected_meta.get("id")
-            mapping = manual_mappings.get(f"{enclosure_id or 'default'}:{slot}") or manual_mappings.get(f"default:{slot}")
+            enclosure_id = selected_meta.get("id") or normalize_text(candidate.get("enclosure_id"))
+            mapping = self.mapping_store.get_mapping(self.system.id, enclosure_id, slot)
             disk = self._resolve_disk_for_slot(slot, enclosure_id, mapping, disks_by_key, disks_by_slot, candidate, ssh_data)
             slot_view = self._build_slot_view(
                 slot=slot,
@@ -258,7 +311,49 @@ class InventoryService:
                 warnings.append(f"Manual mapping for slot {slot:02d} did not match any current disk.")
             slot_views.append(slot_view)
 
-        return slot_views
+        return slot_views, available_enclosures, selected_meta
+
+    def _build_enclosure_options(
+        self,
+        raw_data: TrueNASRawData,
+        selected_meta: dict[str, str | None],
+    ) -> list[EnclosureOption]:
+        options: list[EnclosureOption] = []
+        seen_ids: set[str] = set()
+        filter_text = normalize_text(self.system.truenas.enclosure_filter)
+        filter_value = filter_text.lower() if filter_text else None
+
+        for enclosure in raw_data.enclosures:
+            enclosure_id = normalize_text(str(enclosure.get("id") or ""))
+            if not enclosure_id:
+                continue
+            enclosure_name = normalize_text(str(enclosure.get("name") or ""))
+            enclosure_label = normalize_text(str(enclosure.get("label") or ""))
+            haystack = " ".join(filter(None, [enclosure_id, enclosure_name, enclosure_label])).lower()
+            if filter_value and filter_value not in haystack:
+                continue
+            if enclosure_id in seen_ids:
+                continue
+            seen_ids.add(enclosure_id)
+            options.append(
+                EnclosureOption(
+                    id=enclosure_id,
+                    label=enclosure_label or enclosure_name or enclosure_id,
+                    name=enclosure_name,
+                )
+            )
+
+        selected_id = normalize_text(selected_meta.get("id"))
+        if selected_id and selected_id not in seen_ids:
+            options.append(
+                EnclosureOption(
+                    id=selected_id,
+                    label=normalize_text(selected_meta.get("label")) or selected_id,
+                    name=normalize_text(selected_meta.get("name")),
+                )
+            )
+
+        return options
 
     def _build_disk_records(self, disks: list[dict[str, Any]], ssh_data: ParsedSSHData) -> list[DiskRecord]:
         records: list[DiskRecord] = []
@@ -456,7 +551,7 @@ class InventoryService:
         size_bytes = disk.size_bytes if disk else None
         size_human = format_bytes(size_bytes) or normalize_text(raw_slot_status.get("reported_size"))
         notes = mapping.notes if mapping else None
-        enclosure_id = normalize_text(raw_slot_status.get("enclosure_id")) or enclosure_meta.get("id")
+        enclosure_id = enclosure_meta.get("id") or normalize_text(raw_slot_status.get("enclosure_id"))
         ses_device = normalize_text(raw_slot_status.get("ses_device"))
         raw_ses_element_id = raw_slot_status.get("ses_element_id")
         ses_element_id = raw_ses_element_id if isinstance(raw_ses_element_id, int) else None
@@ -487,7 +582,7 @@ class InventoryService:
             )
 
         api_led_supported = bool(enclosure_id and enclosure_id in api_enclosure_ids)
-        ssh_led_supported = bool(self.settings.ssh.enabled and ses_targets)
+        ssh_led_supported = bool(self.system.ssh.enabled and ses_targets)
         if api_led_supported:
             led_supported = True
             led_backend = "api"
@@ -503,7 +598,7 @@ class InventoryService:
         else:
             led_supported = False
             led_backend = None
-            if enclosure_id and self.settings.ssh.enabled:
+            if enclosure_id and self.system.ssh.enabled:
                 led_reason = (
                     "LED control unavailable because this slot did not expose the SES controller metadata "
                     "needed for SSH `sesutil locate`."
@@ -568,7 +663,7 @@ class InventoryService:
         )
 
     async def _set_slot_led_over_ssh(self, slot_view: SlotView, action: LedAction) -> None:
-        if not self.settings.ssh.enabled:
+        if not self.system.ssh.enabled:
             raise TrueNASAPIError("SSH fallback is disabled, so LED control cannot use sesutil locate.")
         ses_targets = slot_view.ssh_ses_targets or []
         if not ses_targets and slot_view.ssh_ses_device and slot_view.ssh_ses_element_id is not None:

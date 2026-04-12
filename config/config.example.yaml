@@ -41,6 +41,40 @@ ssh:
   # Optional extra hint source if you also allow command-limited sudo for camcontrol:
   #  - sudo -n /sbin/camcontrol devlist -v
 
+# Optional v0.2+ multi-system shape. When present, the app builds one inventory
+# client per system and shows a picker in the header.
+#
+# default_system_id: archive-core
+# systems:
+#   - id: archive-core
+#     label: Archive CORE
+#     truenas:
+#       host: https://10.13.37.10
+#       api_key: ""
+#       verify_ssl: false
+#       enclosure_filter: ""
+#     ssh:
+#       enabled: true
+#       host: 10.13.37.10
+#       user: jbodmap
+#       key_path: /run/ssh/id_truenas
+#       sudo_password: ""
+#       known_hosts_path: /run/ssh/known_hosts
+#       strict_host_key_checking: true
+#       commands:
+#         - /sbin/glabel status
+#         - /usr/local/sbin/zpool status -gP
+#         - sudo -n /usr/sbin/sesutil map
+#         - sudo -n /usr/sbin/sesutil show
+#   - id: offsite-scale
+#     label: Offsite SCALE
+#     truenas:
+#       host: https://scale.example.local
+#       api_key: ""
+#       verify_ssl: false
+#     ssh:
+#       enabled: false
+
 layout:
   slot_count: 60
   rows: 4

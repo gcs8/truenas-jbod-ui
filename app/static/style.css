@@ -111,6 +111,10 @@ textarea {
   border: 1px solid var(--panel-border);
 }
 
+.meta-select-card {
+  gap: 8px;
+}
+
 .meta-label {
   font-size: 0.75rem;
   text-transform: uppercase;
@@ -121,6 +125,21 @@ textarea {
 .meta-value {
   margin-top: 6px;
   font-family: var(--mono);
+}
+
+.meta-select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: #0f141a;
+  color: var(--text);
+  padding: 10px 12px;
+  font-family: var(--mono);
+}
+
+.meta-select:disabled {
+  opacity: 0.7;
 }
 
 .toolbar {

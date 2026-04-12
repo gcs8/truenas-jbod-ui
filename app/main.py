@@ -14,10 +14,8 @@ from app.config import Settings, get_settings
 from app import __version__
 from app.logging_config import configure_logging
 from app.models.domain import InventorySnapshot, LedAction, LedRequest, MappingRequest
-from app.services.inventory import InventoryService
-from app.services.mapping_store import MappingStore
-from app.services.ssh_probe import SSHProbe
-from app.services.truenas_ws import TrueNASAPIError, TrueNASWebsocketClient
+from app.services.inventory_registry import InventoryRegistry
+from app.services.truenas_ws import TrueNASAPIError
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -26,15 +24,10 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache
-def get_inventory_service() -> InventoryService:
+def get_inventory_registry() -> InventoryRegistry:
     settings = get_settings()
     configure_logging(settings)
-    return InventoryService(
-        settings=settings,
-        truenas_client=TrueNASWebsocketClient(settings.truenas),
-        ssh_probe=SSHProbe(settings.ssh),
-        mapping_store=MappingStore(settings.paths.mapping_file),
-    )
+    return InventoryRegistry(settings)
 
 
 def build_layout_rows(settings: Settings) -> list[list[int]]:
@@ -58,9 +51,14 @@ def create_app() -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
     @app.get("/", response_class=HTMLResponse)
-    async def index(request: Request) -> HTMLResponse:
-        service = get_inventory_service()
-        snapshot = await service.get_snapshot()
+    async def index(
+        request: Request,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> HTMLResponse:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
         return templates.TemplateResponse(
             request,
             "index.html",
@@ -73,41 +71,58 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/inventory", response_model=InventorySnapshot)
-    async def get_inventory(force: bool = False) -> InventorySnapshot:
-        service = get_inventory_service()
-        return await service.get_snapshot(force_refresh=force)
+    async def get_inventory(
+        force: bool = False,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> InventorySnapshot:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        return await service.get_snapshot(force_refresh=force, selected_enclosure_id=enclosure_id)
 
     @app.post("/api/slots/{slot}/led")
-    async def set_slot_led(slot: int, payload: LedRequest) -> JSONResponse:
+    async def set_slot_led(
+        slot: int,
+        payload: LedRequest,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> JSONResponse:
         ensure_slot_bounds(settings, slot)
-        service = get_inventory_service()
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
         try:
-            await service.set_slot_led(slot, payload.action)
+            await service.set_slot_led(slot, payload.action, selected_enclosure_id=enclosure_id)
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        snapshot = await service.get_snapshot(force_refresh=True)
+        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": True, "snapshot": snapshot.model_dump(mode="json")})
 
     @app.post("/api/slots/{slot}/mapping")
-    async def save_mapping(slot: int, payload: MappingRequest) -> JSONResponse:
+    async def save_mapping(
+        slot: int,
+        payload: MappingRequest,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> JSONResponse:
         ensure_slot_bounds(settings, slot)
-        service = get_inventory_service()
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
         mapping_payload = {
             "serial": payload.serial,
             "device_name": payload.device_name,
             "gptid": payload.gptid,
             "notes": payload.notes,
         }
-        mapping = await service.save_mapping(slot, mapping_payload)
+        mapping = await service.save_mapping(slot, mapping_payload, selected_enclosure_id=enclosure_id)
 
         led_warning = None
         if payload.clear_identify_after_save:
             try:
-                await service.set_slot_led(slot, LedAction.clear)
+                await service.set_slot_led(slot, LedAction.clear, selected_enclosure_id=enclosure_id)
             except Exception as exc:  # noqa: BLE001 - surface as non-fatal warning.
                 led_warning = str(exc)
 
-        snapshot = await service.get_snapshot(force_refresh=True)
+        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
         return JSONResponse(
             {
                 "ok": True,
@@ -118,16 +133,22 @@ def create_app() -> FastAPI:
         )
 
     @app.delete("/api/slots/{slot}/mapping")
-    async def clear_mapping(slot: int) -> JSONResponse:
+    async def clear_mapping(
+        slot: int,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> JSONResponse:
         ensure_slot_bounds(settings, slot)
-        service = get_inventory_service()
-        cleared = await service.clear_mapping(slot)
-        snapshot = await service.get_snapshot(force_refresh=True)
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        cleared = await service.clear_mapping(slot, selected_enclosure_id=enclosure_id)
+        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": cleared, "snapshot": snapshot.model_dump(mode="json")})
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
-        service = get_inventory_service()
+        registry = get_inventory_registry()
+        service = registry.get_service(None)
         snapshot = await service.get_snapshot()
         api_status = snapshot.sources.get("api")
         return JSONResponse(
