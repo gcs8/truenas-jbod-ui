@@ -14,6 +14,7 @@ Working branch for the next feature set after `v0.1.0`.
 - Selected-slot peer highlighting that dims non-sibling bays and accents the active vdev set on the enclosure map
 - Optional `gmultipath list` enrichment for multipath device mode, path state, and member-device awareness
 - Example multi-system YAML config showing the intended `v0.2` shape
+- Stable enclosure geometry so slot carriers keep a consistent physical-looking size when selection state changes
 
 ### Planned focus
 
@@ -22,6 +23,7 @@ Working branch for the next feature set after `v0.1.0`.
 - Compact topology and sibling-awareness improvements
 - Optional SMART summary enrichment
 - Optional deeper multipath/member awareness, including controller labeling when safe sources exist
+- Enclosure profile metadata for chassis-specific slot grouping and bay proportions
 - Adapter groundwork for future TrueNAS SCALE support
 
 ## v0.1.0 - 2026-04-12

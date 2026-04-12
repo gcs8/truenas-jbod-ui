@@ -20,6 +20,8 @@
   --tray: #12161a;
   --tray-edge: #313941;
   --tray-latch: #6e2c32;
+  --slot-bay-aspect: 1 / 2.82;
+  --slot-bay-min-height: 156px;
   --shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
   --mono: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
   --sans: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
@@ -314,7 +316,7 @@ textarea {
   display: grid;
   grid-template-columns: 2fr minmax(340px, 420px);
   gap: 18px;
-  align-items: stretch;
+  align-items: start;
   margin-bottom: 18px;
 }
 
@@ -325,6 +327,7 @@ textarea {
 .enclosure-panel {
   display: flex;
   flex-direction: column;
+  align-self: start;
 }
 
 .panel-header {
@@ -362,9 +365,8 @@ textarea {
 .swatch.unmapped { background: var(--unmapped); }
 
 .enclosure-face {
-  flex: 1;
+  flex: 0 0 auto;
   display: flex;
-  min-height: 0;
   border-radius: 28px;
   padding: 24px;
   background: linear-gradient(180deg, #69717a, #2a333c 12%, #171d24 100%);
@@ -376,11 +378,10 @@ textarea {
 }
 
 .chassis-shell {
-  flex: 1;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   min-width: 1120px;
-  min-height: 100%;
   border-radius: 22px;
   padding: 20px 18px 18px;
   background:
@@ -459,23 +460,20 @@ textarea {
 }
 
 .slot-grid {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   gap: 14px;
-  min-height: 720px;
 }
 
 .slot-row {
-  flex: 1 1 0;
-  min-height: 0;
+  flex: 0 0 auto;
 }
 
 .row-slots {
   display: grid;
   gap: 18px;
   align-items: stretch;
-  min-height: 100%;
 }
 
 .row-group {
@@ -508,8 +506,8 @@ textarea {
   flex-direction: column;
   align-items: flex-start;
   gap: 6px;
-  min-height: 100%;
-  height: 100%;
+  aspect-ratio: var(--slot-bay-aspect);
+  min-height: var(--slot-bay-min-height);
   padding: 10px 8px 30px;
   border-radius: 8px 8px 12px 12px;
   border: 1px solid rgba(255, 255, 255, 0.08);

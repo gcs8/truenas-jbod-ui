@@ -61,6 +61,7 @@ Suggested first pass:
 - selected-slot sibling list
 - small vdev summary panel or modal
 - cross-highlighting between a selected bay and its vdev members
+- keep the enclosure geometry physically stable when details expand or collapse
 
 Avoid for `v0.2`:
 
@@ -101,6 +102,20 @@ Suggested first pass:
 - member devices
 - controller or HBA labels such as `mpr0` and `mpr1`
 - path state if it can be derived reliably
+
+### 6. Enclosure profile driven presentation
+
+Primary value:
+
+- keep bay geometry visually consistent regardless of selection state
+- let different chassis families define different carrier proportions and row grouping
+- avoid hardcoding one shelf's look into every future enclosure view
+
+Suggested first pass:
+
+- define enclosure profile metadata for slot grouping and bay aspect ratio
+- keep the current CSE-946 profile as the default top-loading 60-bay layout
+- let the UI read profile hints instead of inferring all geometry from panel height
 
 ## Foundation Work For Later SCALE Support
 
