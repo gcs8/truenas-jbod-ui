@@ -21,6 +21,10 @@ The current target layout is a Supermicro CSE-946 style 60-bay top view:
 The visual row layout groups each 15-bay row as `6 + 6 + 3` to better match the
 physical divider layout of the chassis.
 
+## Screenshot
+
+![TrueNAS JBOD Enclosure UI screenshot](docs/images/ui-overview.png)
+
 ## Features
 
 - FastAPI app with server-rendered Jinja templates and light plain JavaScript
