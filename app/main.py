@@ -13,7 +13,7 @@ from fastapi.templating import Jinja2Templates
 from app.config import Settings, get_settings
 from app import __version__
 from app.logging_config import configure_logging
-from app.models.domain import InventorySnapshot, LedAction, LedRequest, MappingRequest
+from app.models.domain import InventorySnapshot, LedAction, LedRequest, MappingBundle, MappingRequest
 from app.services.inventory_registry import InventoryRegistry
 from app.services.truenas_ws import TrueNASAPIError
 
@@ -144,6 +144,33 @@ def create_app() -> FastAPI:
         cleared = await service.clear_mapping(slot, selected_enclosure_id=enclosure_id)
         snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": cleared, "snapshot": snapshot.model_dump(mode="json")})
+
+    @app.get("/api/mappings/export", response_model=MappingBundle)
+    async def export_mappings(
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> MappingBundle:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        return await service.export_mapping_bundle(selected_enclosure_id=enclosure_id)
+
+    @app.post("/api/mappings/import")
+    async def import_mappings(
+        payload: MappingBundle,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> JSONResponse:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        imported = await service.import_mapping_bundle(payload, selected_enclosure_id=enclosure_id)
+        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
+        return JSONResponse(
+            {
+                "ok": True,
+                "imported": imported,
+                "snapshot": snapshot.model_dump(mode="json"),
+            }
+        )
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:

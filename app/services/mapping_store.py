@@ -51,6 +51,22 @@ class MappingStore:
                 count += 1
         return count
 
+    def list_mappings(
+        self,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> list[ManualMapping]:
+        mappings = self.load_all()
+        selected: list[ManualMapping] = []
+        for key, mapping in mappings.items():
+            mapping_system_id = mapping.system_id or key.split(":", 1)[0]
+            if system_id and mapping_system_id != system_id:
+                continue
+            if enclosure_id and mapping.enclosure_id not in {None, enclosure_id}:
+                continue
+            selected.append(mapping)
+        return sorted(selected, key=lambda item: item.slot)
+
     def save_mapping(self, mapping: ManualMapping) -> ManualMapping:
         with self._lock:
             current = self.load_all()
@@ -75,6 +91,37 @@ class MappingStore:
                 return False
             self._write(current)
         return True
+
+    def replace_mappings(
+        self,
+        system_id: str | None,
+        enclosure_id: str | None,
+        mappings: list[ManualMapping],
+    ) -> int:
+        with self._lock:
+            current = self.load_all()
+            keys_to_remove: list[str] = []
+            for key, mapping in current.items():
+                mapping_system_id = mapping.system_id or key.split(":", 1)[0]
+                if system_id and mapping_system_id != system_id:
+                    continue
+                if enclosure_id and mapping.enclosure_id not in {None, enclosure_id}:
+                    continue
+                keys_to_remove.append(key)
+
+            for key in keys_to_remove:
+                current.pop(key, None)
+
+            saved_count = 0
+            for mapping in mappings:
+                saved = mapping.model_copy(
+                    update={"updated_at": datetime.now(timezone.utc)}
+                )
+                current[self._slot_key(saved.system_id, saved.enclosure_id, saved.slot)] = saved
+                saved_count += 1
+
+            self._write(current)
+        return saved_count
 
     def _write(self, mappings: dict[str, ManualMapping]) -> None:
         payload = {

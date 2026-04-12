@@ -7,12 +7,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app import __version__
 from app.config import Settings, SystemConfig
 from app.models.domain import (
     EnclosureOption,
     InventorySnapshot,
     InventorySummary,
     LedAction,
+    MappingBundle,
     ManualMapping,
     SlotState,
     SlotView,
@@ -153,6 +155,36 @@ class InventoryService:
         cleared = self.mapping_store.clear_mapping(self.system.id, enclosure_id, slot)
         await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
         return cleared
+
+    async def export_mapping_bundle(self, selected_enclosure_id: str | None = None) -> MappingBundle:
+        return MappingBundle(
+            app_version=__version__,
+            system_id=self.system.id,
+            enclosure_id=selected_enclosure_id,
+            mappings=self.mapping_store.list_mappings(self.system.id, selected_enclosure_id),
+        )
+
+    async def import_mapping_bundle(
+        self,
+        bundle: MappingBundle,
+        selected_enclosure_id: str | None = None,
+    ) -> int:
+        rewritten: list[ManualMapping] = []
+        for mapping in bundle.mappings:
+            target_enclosure_id = selected_enclosure_id or mapping.enclosure_id
+            rewritten.append(
+                mapping.model_copy(
+                    update={
+                        "system_id": self.system.id,
+                        "enclosure_id": target_enclosure_id,
+                        "source": "import",
+                    }
+                )
+            )
+
+        saved_count = self.mapping_store.replace_mappings(self.system.id, selected_enclosure_id, rewritten)
+        await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
+        return saved_count
 
     async def _build_snapshot(self, selected_enclosure_id: str | None = None) -> InventorySnapshot:
         warnings: list[str] = []

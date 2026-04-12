@@ -40,6 +40,9 @@
   const mappingForm = document.getElementById("mapping-form");
   const clearMappingButton = document.getElementById("clear-mapping-button");
   const prefillMappingButton = document.getElementById("prefill-mapping-button");
+  const exportMappingsButton = document.getElementById("export-mappings-button");
+  const importMappingsButton = document.getElementById("import-mappings-button");
+  const mappingImportFile = document.getElementById("mapping-import-file");
   const ledNote = document.getElementById("led-note");
   const ledButtons = Array.from(document.querySelectorAll("[data-led-action]"));
 
@@ -49,6 +52,12 @@
 
   function formatSlotLabel(slotNumber) {
     return String(slotNumber).padStart(2, "0");
+  }
+
+  function formatScopeLabel() {
+    const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
+    const enclosurePart = state.snapshot.selected_enclosure_id || state.selectedEnclosureId || "all-enclosures";
+    return `${systemPart}-${enclosurePart}`.replace(/[^a-zA-Z0-9._-]+/g, "-");
   }
 
   function splitRowIntoGroups(row) {
@@ -470,6 +479,52 @@
     }
   }
 
+  async function exportMappings() {
+    try {
+      setStatus("Preparing mapping export...");
+      const bundle = await sendScopedRequest("/api/mappings/export");
+      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
+      const objectUrl = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = `slot-mappings-${formatScopeLabel()}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(objectUrl);
+      setStatus(`Exported ${bundle.mappings?.length || 0} mappings.`);
+    } catch (error) {
+      setStatus(`Export failed: ${error.message || error}`, "error");
+    }
+  }
+
+  async function importMappingsFromFile(file) {
+    if (!file) return;
+    try {
+      setStatus(`Importing mappings from ${file.name}...`);
+      const rawText = await file.text();
+      const bundle = JSON.parse(rawText);
+      const result = await sendScopedRequest("/api/mappings/import", {
+        method: "POST",
+        body: JSON.stringify(bundle),
+      });
+      state.snapshot = result.snapshot;
+      state.selectedSystemId = result.snapshot.selected_system_id || state.selectedSystemId;
+      state.selectedEnclosureId = result.snapshot.selected_enclosure_id || state.selectedEnclosureId;
+      if (state.selectedSlot !== null && !getSlotById(state.selectedSlot)) {
+        state.selectedSlot = result.snapshot.slots.length ? result.snapshot.slots[0].slot : null;
+      }
+      renderAll();
+      setStatus(`Imported ${result.imported} mappings into the active scope.`);
+    } catch (error) {
+      setStatus(`Import failed: ${error.message || error}`, "error");
+    } finally {
+      if (mappingImportFile) {
+        mappingImportFile.value = "";
+      }
+    }
+  }
+
   function prefillMapping() {
     const slot = getSlotById(state.selectedSlot);
     if (!slot) return;
@@ -538,6 +593,17 @@
   mappingForm.addEventListener("submit", saveMapping);
   clearMappingButton.addEventListener("click", clearMapping);
   prefillMappingButton.addEventListener("click", prefillMapping);
+  if (exportMappingsButton) {
+    exportMappingsButton.addEventListener("click", exportMappings);
+  }
+  if (importMappingsButton && mappingImportFile) {
+    importMappingsButton.addEventListener("click", () => mappingImportFile.click());
+    mappingImportFile.addEventListener("change", (event) => {
+      const [file] = event.target.files || [];
+      if (!file) return;
+      importMappingsFromFile(file);
+    });
+  }
 
   document.querySelectorAll("[data-led-action]").forEach((button) => {
     button.addEventListener("click", () => sendLedAction(button.dataset.ledAction));

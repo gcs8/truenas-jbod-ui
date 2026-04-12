@@ -142,3 +142,12 @@ class MappingRequest(BaseModel):
             return None
         cleaned = value.strip()
         return cleaned[:256] if cleaned else None
+
+
+class MappingBundle(BaseModel):
+    schema_version: int = 1
+    app_version: str | None = None
+    exported_at: datetime = Field(default_factory=utcnow)
+    system_id: str | None = None
+    enclosure_id: str | None = None
+    mappings: list[ManualMapping] = Field(default_factory=list)

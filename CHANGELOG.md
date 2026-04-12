@@ -9,6 +9,7 @@ Working branch for the next feature set after `v0.1.0`.
 - Multi-system inventory registry groundwork with per-system connection settings
 - Header `System` and `Enclosure` pickers wired through inventory, LED, and mapping routes
 - System-aware persistent mapping keys so calibration can be scoped per appliance
+- Mapping export/import workflow for the active system or enclosure scope
 - Example multi-system YAML config showing the intended `v0.2` shape
 
 ### Planned focus
