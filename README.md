@@ -472,3 +472,7 @@ Notes:
   underlying `disk.query` payload is reliable enough
 - Optional multipath/member detail for operators who want quick awareness of how
   each disk is presented through CORE
+
+## License
+
+This project is licensed under the MIT License. See `LICENSE`.
