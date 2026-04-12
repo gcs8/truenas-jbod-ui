@@ -256,24 +256,25 @@ That means the current working-shaped payload for this system is:
 midclt call user.update 54 '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show"]}'
 ```
 
-If you also want SSH identify LED control in the web UI, widen the command list
-to include `sesutil locate`.
-
-Practical next allow-list to try:
+If you want the full current web UI feature set on this CORE box, use this
+combined allow-list:
 
 ```bash
-midclt call user.update 54 '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off"]}'
+midclt call user.update 54 '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off"]}'
 ```
 
-This wildcard guidance is an inference from standard `sudoers` command
-matching, which supports shell-style wildcards in command arguments. Validate
-it on your specific CORE build before relying on it broadly.
+That enables:
 
-Optional extra command if you later want `camcontrol` enrichment too:
+- SSH slot mapping through `sesutil map`
+- SSH slot metadata overlay through `sesutil show`
+- SSH identify LED control through `sesutil locate`
+- multipath controller labels such as `mpr0` and `mpr1` through
+  `camcontrol devlist -v`
 
-```bash
-midclt call user.update 54 '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v"]}'
-```
+This wildcard guidance for `sesutil locate` is an inference from standard
+`sudoers` command matching, which supports shell-style wildcards in command
+arguments. Validate it on your specific CORE build before relying on it
+broadly.
 
 ## Important Behavior On This CORE Build
 
