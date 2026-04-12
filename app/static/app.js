@@ -15,6 +15,7 @@
   };
 
   const grid = document.getElementById("slot-grid");
+  const enclosureFace = document.querySelector(".enclosure-face");
   const detailEmpty = document.getElementById("detail-empty");
   const detailContent = document.getElementById("detail-content");
   const detailSlotTitle = document.getElementById("detail-slot-title");
@@ -220,7 +221,14 @@
             <span class="slot-pool">${escapeHtml(slot.pool_name || stateLabel(slot))}</span>
             <span class="slot-latch" aria-hidden="true"></span>
           `;
-          tile.addEventListener("click", () => selectSlot(slot.slot));
+          tile.addEventListener("click", (event) => {
+            event.stopPropagation();
+            if (state.selectedSlot === slot.slot) {
+              clearSelectedSlot();
+              return;
+            }
+            selectSlot(slot.slot);
+          });
           rowGroup.appendChild(tile);
         });
 
@@ -518,6 +526,11 @@
     renderAll();
   }
 
+  function clearSelectedSlot() {
+    state.selectedSlot = null;
+    renderAll();
+  }
+
   async function fetchJson(url, options = {}) {
     const response = await fetch(url, {
       headers: { "Content-Type": "application/json" },
@@ -545,11 +558,8 @@
       state.snapshot = snapshot;
       state.selectedSystemId = snapshot.selected_system_id || state.selectedSystemId;
       state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
-      if (state.selectedSlot === null && snapshot.slots.length) {
-        state.selectedSlot = snapshot.slots[0].slot;
-      }
       if (state.selectedSlot !== null && !getSlotById(state.selectedSlot)) {
-        state.selectedSlot = snapshot.slots.length ? snapshot.slots[0].slot : null;
+        state.selectedSlot = null;
       }
       renderAll();
       setStatus("Inventory updated.");
@@ -720,15 +730,23 @@
     systemSelect.addEventListener("change", async (event) => {
       state.selectedSystemId = event.target.value || null;
       state.selectedEnclosureId = null;
-      state.selectedSlot = null;
+      clearSelectedSlot();
       await refreshSnapshot(true);
     });
   }
   if (enclosureSelect) {
     enclosureSelect.addEventListener("change", async (event) => {
       state.selectedEnclosureId = event.target.value || null;
-      state.selectedSlot = null;
+      clearSelectedSlot();
       await refreshSnapshot(true);
+    });
+  }
+  if (enclosureFace) {
+    enclosureFace.addEventListener("click", (event) => {
+      if (event.target.closest(".slot-tile")) {
+        return;
+      }
+      clearSelectedSlot();
     });
   }
   autoRefreshToggle.addEventListener("change", (event) => {
@@ -762,9 +780,6 @@
     button.addEventListener("click", () => sendLedAction(button.dataset.ledAction));
   });
 
-  if (state.snapshot.slots.length) {
-    state.selectedSlot = state.snapshot.slots[0].slot;
-  }
   renderAll();
   resetTimer();
 })();

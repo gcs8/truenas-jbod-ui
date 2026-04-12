@@ -588,8 +588,28 @@ textarea {
 }
 
 .slot-tile.peer-dimmed {
-  opacity: 0.26;
-  filter: saturate(0.55) brightness(0.82);
+  border-color: rgba(255, 255, 255, 0.05);
+  filter: saturate(0.38) brightness(0.72);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    inset 0 -10px 16px rgba(0, 0, 0, 0.38);
+}
+
+.slot-tile.peer-dimmed::before {
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0) 18%),
+    linear-gradient(90deg, rgba(255,255,255,0.02), transparent 18%, transparent 82%, rgba(255,255,255,0.02));
+}
+
+.slot-tile.peer-dimmed .slot-status-led {
+  opacity: 0.45;
+}
+
+.slot-tile.peer-dimmed .slot-number,
+.slot-tile.peer-dimmed .slot-device,
+.slot-tile.peer-dimmed .slot-pool,
+.slot-tile.peer-dimmed .slot-latch {
+  opacity: 0.42;
 }
 
 .slot-tile.filtered-out {
