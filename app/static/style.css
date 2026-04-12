@@ -846,6 +846,15 @@ textarea {
   gap: 10px;
 }
 
+.compact-subsection {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 6px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
 .state-pill {
   background: #10161c;
   border: 1px solid var(--panel-border);

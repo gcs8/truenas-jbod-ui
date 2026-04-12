@@ -160,20 +160,6 @@
         </div>
 
         <div class="kv-grid" id="detail-kv-grid"></div>
-
-        <div class="action-group">
-          <div class="action-header">
-            <h4>Mapping Backup</h4>
-            <input id="mapping-import-file" type="file" accept="application/json" class="hidden">
-          </div>
-          <p class="subtle">
-            Export the current system or enclosure mapping scope as JSON, or import a previously exported backup into the active selection.
-          </p>
-          <div class="button-row">
-            <button class="button secondary" id="export-mappings-button" type="button">Export Mappings</button>
-            <button class="button secondary" id="import-mappings-button" type="button">Import Mappings</button>
-          </div>
-        </div>
       </div>
     </aside>
   </main>
@@ -233,6 +219,19 @@
               <button class="button danger" id="clear-mapping-button" type="button">Clear Mapping</button>
             </div>
           </form>
+          <div class="compact-subsection">
+            <div class="action-header">
+              <h4>Mapping Backup</h4>
+              <input id="mapping-import-file" type="file" accept="application/json" class="hidden">
+            </div>
+            <p class="subtle">
+              Export the current system or enclosure mapping scope as JSON, or import a previously exported backup into the active selection.
+            </p>
+            <div class="button-row">
+              <button class="button secondary" id="export-mappings-button" type="button">Export Mappings</button>
+              <button class="button secondary" id="import-mappings-button" type="button">Import Mappings</button>
+            </div>
+          </div>
         </div>
       </section>
     </div>
