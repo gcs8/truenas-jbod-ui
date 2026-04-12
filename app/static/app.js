@@ -20,6 +20,7 @@
   const detailSlotTitle = document.getElementById("detail-slot-title");
   const detailStatePill = document.getElementById("detail-state-pill");
   const detailKvGrid = document.getElementById("detail-kv-grid");
+  const topologyContext = document.getElementById("topology-context");
   const warningList = document.getElementById("warning-list");
   const searchBox = document.getElementById("search-box");
   const refreshButton = document.getElementById("refresh-button");
@@ -264,6 +265,8 @@
       });
     });
 
+    renderTopologyContext(slot);
+
     mappingForm.serial.value = slot.serial || "";
     mappingForm.device_name.value = slot.device_name || "";
     mappingForm.gptid.value = slot.gptid || "";
@@ -272,6 +275,59 @@
       button.disabled = !slot.led_supported;
     });
     ledNote.textContent = ledNoteText(slot);
+  }
+
+  function renderTopologyContext(slot) {
+    if (!topologyContext) {
+      return;
+    }
+
+    if (!slot.pool_name || !slot.vdev_name) {
+      topologyContext.innerHTML = '<div class="warning-item muted">This slot is not currently tied to a pool vdev.</div>';
+      return;
+    }
+
+    const vdevMembers = state.snapshot.slots
+      .filter((candidate) =>
+        candidate.pool_name === slot.pool_name &&
+        candidate.vdev_name === slot.vdev_name &&
+        candidate.vdev_class === slot.vdev_class &&
+        candidate.device_name
+      )
+      .sort((left, right) => left.slot - right.slot);
+
+    const ancestry = escapeHtml(slot.topology_label || `${slot.pool_name} > ${slot.vdev_name}`);
+    const pills = vdevMembers
+      .map((member) => {
+        const selected = member.slot === slot.slot ? " selected" : "";
+        return `
+          <button type="button" class="topology-pill state-${member.state}${selected}" data-topology-slot="${member.slot}">
+            <span>${member.slot_label}</span>
+            <small>${escapeHtml(member.device_name || member.serial || member.state)}</small>
+          </button>
+        `;
+      })
+      .join("");
+
+    topologyContext.innerHTML = `
+      <div class="topology-summary">
+        <div class="topology-label">Selected Path</div>
+        <div class="topology-path">${ancestry}</div>
+      </div>
+      <div class="topology-summary">
+        <div class="topology-label">Peer Slots In This Vdev</div>
+        <div class="topology-pill-row">${pills}</div>
+      </div>
+    `;
+
+    topologyContext.querySelectorAll("[data-topology-slot]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const slotNumber = Number(button.dataset.topologySlot);
+        if (!Number.isNaN(slotNumber)) {
+          selectSlot(slotNumber);
+        }
+      });
+    });
   }
 
   function renderWarnings() {
