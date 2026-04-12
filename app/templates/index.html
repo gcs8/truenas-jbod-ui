@@ -158,31 +158,6 @@
         <div class="kv-grid" id="detail-kv-grid"></div>
 
         <div class="action-group">
-          <h4>Topology Context</h4>
-          <div id="topology-context" class="topology-context">
-            <div class="warning-item muted">Select a mapped slot to inspect its vdev peers.</div>
-          </div>
-        </div>
-
-        <div class="action-group">
-          <h4>Multipath Presentation</h4>
-          <div id="multipath-context" class="topology-context">
-            <div class="warning-item muted">Select a multipath-backed slot to inspect active and standby member paths.</div>
-          </div>
-        </div>
-
-        <div class="action-group">
-          <h4>LED Control</h4>
-          <p class="subtle" id="led-note">
-            LED control uses the TrueNAS enclosure API when available, and SSH `sesutil locate` on shelves that only expose SES fallback data.
-          </p>
-          <div class="button-row">
-            <button class="button" data-led-action="IDENTIFY">Identify On</button>
-            <button class="button secondary" data-led-action="CLEAR">Identify Off / Clear</button>
-          </div>
-        </div>
-
-        <div class="action-group">
           <div class="action-header">
             <h4>Calibration Mapping</h4>
             <button class="button secondary small" id="prefill-mapping-button" type="button">Prefill From Slot</button>
@@ -235,6 +210,43 @@
       </div>
     </aside>
   </main>
+
+  <section id="detail-secondary" class="detail-secondary hidden">
+    <div class="detail-secondary-grid">
+      <section class="panel detail-secondary-card">
+        <div class="panel-header compact">
+          <h2>Topology Context</h2>
+        </div>
+        <div id="topology-context" class="topology-context">
+          <div class="warning-item muted">Select a mapped slot to inspect its vdev peers.</div>
+        </div>
+      </section>
+
+      <section class="panel detail-secondary-card">
+        <div class="panel-header compact">
+          <h2>Multipath Presentation</h2>
+        </div>
+        <div id="multipath-context" class="topology-context">
+          <div class="warning-item muted">Select a multipath-backed slot to inspect active and standby member paths.</div>
+        </div>
+      </section>
+
+      <section class="panel detail-secondary-card">
+        <div class="panel-header compact">
+          <h2>LED Control</h2>
+        </div>
+        <div class="action-group compact">
+          <p class="subtle" id="led-note">
+            LED control uses the TrueNAS enclosure API when available, and SSH `sesutil locate` on shelves that only expose SES fallback data.
+          </p>
+          <div class="button-row">
+            <button class="button" data-led-action="IDENTIFY">Identify On</button>
+            <button class="button secondary" data-led-action="CLEAR">Identify Off / Clear</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </section>
 
   <section class="panel">
     <div class="panel-header">

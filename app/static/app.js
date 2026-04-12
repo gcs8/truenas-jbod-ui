@@ -18,6 +18,7 @@
   const enclosureFace = document.querySelector(".enclosure-face");
   const detailEmpty = document.getElementById("detail-empty");
   const detailContent = document.getElementById("detail-content");
+  const detailSecondary = document.getElementById("detail-secondary");
   const detailSlotTitle = document.getElementById("detail-slot-title");
   const detailStatePill = document.getElementById("detail-state-pill");
   const detailKvGrid = document.getElementById("detail-kv-grid");
@@ -265,11 +266,13 @@
     if (!slot) {
       detailEmpty.classList.remove("hidden");
       detailContent.classList.add("hidden");
+      detailSecondary.classList.add("hidden");
       return;
     }
 
     detailEmpty.classList.add("hidden");
     detailContent.classList.remove("hidden");
+    detailSecondary.classList.remove("hidden");
     detailSlotTitle.textContent = `Slot ${slot.slot_label}`;
     detailStatePill.textContent = stateLabel(slot);
     detailStatePill.className = `state-pill state-${slot.state}`;

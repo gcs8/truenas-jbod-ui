@@ -20,7 +20,7 @@
   --tray: #12161a;
   --tray-edge: #313941;
   --tray-latch: #6e2c32;
-  --slot-bay-height: 128px;
+  --slot-bay-height: 136px;
   --shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
   --mono: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
   --sans: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
@@ -52,7 +52,7 @@ textarea {
 }
 
 .app-shell {
-  max-width: 1680px;
+  max-width: 1840px;
   margin: 0 auto;
   padding: 24px;
 }
@@ -313,7 +313,7 @@ textarea {
 
 .content-grid {
   display: grid;
-  grid-template-columns: 2fr minmax(340px, 420px);
+  grid-template-columns: minmax(0, 2.05fr) minmax(380px, 470px);
   gap: 18px;
   align-items: start;
   margin-bottom: 18px;
@@ -334,6 +334,10 @@ textarea {
   justify-content: space-between;
   gap: 14px;
   margin-bottom: 16px;
+}
+
+.panel-header.compact {
+  margin-bottom: 12px;
 }
 
 .legend {
@@ -370,7 +374,7 @@ textarea {
   padding: 24px;
   background: linear-gradient(180deg, #69717a, #2a333c 12%, #171d24 100%);
   border: 1px solid #4d5660;
-  overflow-x: auto;
+  overflow-x: hidden;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.12),
     inset 0 -24px 40px rgba(0, 0, 0, 0.18);
@@ -380,7 +384,8 @@ textarea {
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  min-width: 1120px;
+  width: 100%;
+  min-width: 0;
   border-radius: 22px;
   padding: 20px 18px 18px;
   background:
@@ -471,20 +476,20 @@ textarea {
 
 .row-slots {
   display: grid;
-  gap: 18px;
+  gap: 14px;
   align-items: stretch;
 }
 
 .row-group {
   position: relative;
   display: grid;
-  grid-template-columns: repeat(var(--group-columns, 1), minmax(52px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(var(--group-columns, 1), minmax(0, 1fr));
+  gap: 6px;
   min-width: 0;
 }
 
 .row-group + .row-group {
-  padding-left: 14px;
+  padding-left: 10px;
 }
 
 .row-group + .row-group::before {
@@ -780,6 +785,20 @@ textarea {
   align-self: start;
 }
 
+.detail-secondary {
+  margin-bottom: 18px;
+}
+
+.detail-secondary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.detail-secondary-card {
+  min-width: 0;
+}
+
 .detail-empty {
   padding: 18px;
   border-radius: 14px;
@@ -863,6 +882,10 @@ textarea {
   flex-direction: column;
   gap: 10px;
   padding-top: 4px;
+}
+
+.action-group.compact {
+  padding-top: 0;
 }
 
 .topology-context {
@@ -998,6 +1021,10 @@ textarea {
 
 @media (max-width: 1240px) {
   .content-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .detail-secondary-grid {
     grid-template-columns: 1fr;
   }
 
