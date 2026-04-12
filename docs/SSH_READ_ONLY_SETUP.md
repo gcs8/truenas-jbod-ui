@@ -237,6 +237,17 @@ First, confirm the middleware user id:
 midclt call user.query '[["username","=","jbodmap"]]'
 ```
 
+Look for the returned `"id"` field and use that value in the later
+`user.update` commands.
+
+Example:
+
+```json
+[{"id": 54, "username": "jbodmap", ...}]
+```
+
+In that case, replace `USER_ID` below with `54`.
+
 On this system as of April 12, 2026, the app saw:
 
 - middleware user id `54`
@@ -253,14 +264,14 @@ Important detail for this CORE build:
 That means the current working-shaped payload for this system is:
 
 ```bash
-midclt call user.update 54 '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show"]}'
 ```
 
 If you want the full current web UI feature set on this CORE box, use this
 combined allow-list:
 
 ```bash
-midclt call user.update 54 '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off"]}'
 ```
 
 That enables:
