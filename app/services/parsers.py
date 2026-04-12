@@ -36,6 +36,7 @@ class ZpoolMember:
 class ParsedSSHData:
     glabel: GlabelInfo = field(default_factory=GlabelInfo)
     zpool_members: dict[str, ZpoolMember] = field(default_factory=dict)
+    multipath_info: dict[str, "MultipathInfo"] = field(default_factory=dict)
     ses_slot_to_device: dict[int, str] = field(default_factory=dict)
     camcontrol_models: dict[str, str] = field(default_factory=dict)
     ses_slot_candidates: dict[int, dict[str, Any]] = field(default_factory=dict)
@@ -64,6 +65,25 @@ class SESMapEnclosure:
     enclosure_id: str | None = None
     enclosure_name: str | None = None
     slots: dict[int, SESMapSlot] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class MultipathConsumer:
+    device_name: str
+    state: str | None = None
+    mode: str | None = None
+    controller_label: str | None = None
+
+
+@dataclass(slots=True)
+class MultipathInfo:
+    name: str
+    device_name: str
+    uuid: str | None = None
+    mode: str | None = None
+    state: str | None = None
+    provider_state: str | None = None
+    consumers: list[MultipathConsumer] = field(default_factory=list)
 
 
 def normalize_text(value: str | None) -> str | None:
@@ -165,6 +185,86 @@ def parse_camcontrol_devlist(output: str) -> dict[str, str]:
             if normalized:
                 models[normalized.lower()] = model
     return models
+
+
+def parse_gmultipath_list(output: str) -> dict[str, MultipathInfo]:
+    multipaths: dict[str, MultipathInfo] = {}
+    current: MultipathInfo | None = None
+    current_consumer: MultipathConsumer | None = None
+    section: str | None = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith("Geom name:"):
+            name = normalize_text(stripped.split(":", 1)[1]) or "unknown"
+            current = MultipathInfo(name=name, device_name=f"multipath/{name}")
+            multipaths[current.device_name.lower()] = current
+            multipaths[name.lower()] = current
+            current_consumer = None
+            section = None
+            continue
+
+        if current is None:
+            continue
+
+        if stripped == "Providers:":
+            section = "providers"
+            current_consumer = None
+            continue
+
+        if stripped == "Consumers:":
+            section = "consumers"
+            current_consumer = None
+            continue
+
+        if section == "providers":
+            provider_match = re.match(r"^\d+\.\s+Name:\s+(?P<device>\S+)", stripped)
+            if provider_match:
+                device_name = normalize_device_name(provider_match.group("device"))
+                if device_name:
+                    current.device_name = device_name
+                    multipaths[current.device_name.lower()] = current
+                continue
+
+            if stripped.startswith("State:"):
+                current.provider_state = normalize_text(stripped.split(":", 1)[1])
+                continue
+
+        if section == "consumers":
+            consumer_match = re.match(r"^\d+\.\s+Name:\s+(?P<device>\S+)", stripped)
+            if consumer_match:
+                device_name = normalize_device_name(consumer_match.group("device")) or consumer_match.group("device")
+                current_consumer = MultipathConsumer(device_name=device_name)
+                current.consumers.append(current_consumer)
+                continue
+
+            if current_consumer and stripped.startswith("State:"):
+                current_consumer.state = normalize_text(stripped.split(":", 1)[1])
+                continue
+
+            if current_consumer and stripped.startswith("Mode:"):
+                current_consumer.mode = normalize_text(stripped.split(":", 1)[1])
+                continue
+
+        if section is not None:
+            continue
+
+        if stripped.startswith("UUID:"):
+            current.uuid = normalize_text(stripped.split(":", 1)[1])
+            continue
+
+        if stripped.startswith("Mode:"):
+            current.mode = normalize_text(stripped.split(":", 1)[1])
+            continue
+
+        if stripped.startswith("State:"):
+            current.state = normalize_text(stripped.split(":", 1)[1])
+
+    return {key: value for key, value in multipaths.items() if key.startswith("multipath/")}
 
 
 def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
@@ -991,6 +1091,8 @@ def canonicalize_ssh_command(command: str) -> str:
         return "zpool status -gP" if "-gP" in args[1:] else "zpool status"
     if executable == "camcontrol" and args[:1] == ["devlist"]:
         return "camcontrol devlist -v" if "-v" in args[1:] else "camcontrol devlist"
+    if executable == "gmultipath" and args[:1] == ["list"]:
+        return "gmultipath list"
     if executable == "sesutil" and args[:1] == ["map"]:
         return "sesutil map"
     if executable == "sesutil" and args[:1] == ["show"]:
@@ -1015,6 +1117,8 @@ def parse_ssh_outputs(
         parsed.glabel = parse_glabel_status(normalized_outputs["glabel status"])
     if normalized_outputs.get("zpool status -gP"):
         parsed.zpool_members = parse_zpool_status(normalized_outputs["zpool status -gP"])
+    if normalized_outputs.get("gmultipath list"):
+        parsed.multipath_info = parse_gmultipath_list(normalized_outputs["gmultipath list"])
     if normalized_outputs.get("camcontrol devlist"):
         parsed.camcontrol_models = parse_camcontrol_devlist(normalized_outputs["camcontrol devlist"])
     if normalized_outputs.get("camcontrol devlist -v"):

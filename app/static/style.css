@@ -556,6 +556,42 @@ textarea {
   pointer-events: none;
 }
 
+.slot-tile.peer-highlight {
+  border-color: rgba(76, 216, 164, 0.72);
+  box-shadow:
+    0 0 0 1px rgba(76, 216, 164, 0.34),
+    0 0 20px rgba(76, 216, 164, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    inset 0 -10px 16px rgba(0, 0, 0, 0.34);
+}
+
+.slot-tile.peer-highlight::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 6px 6px 10px 10px;
+  border: 1px solid rgba(76, 216, 164, 0.4);
+  pointer-events: none;
+}
+
+.slot-tile.peer-highlight .slot-number {
+  background: rgba(76, 216, 164, 0.16);
+  color: #effcf7;
+}
+
+.slot-tile.peer-highlight .slot-latch {
+  border-color: rgba(76, 216, 164, 0.3);
+  box-shadow:
+    0 0 0 1px rgba(76, 216, 164, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.16);
+}
+
+.slot-tile.peer-dimmed {
+  opacity: 0.26;
+  filter: saturate(0.55) brightness(0.82);
+}
+
 .slot-tile.filtered-out {
   opacity: 0.18;
   filter: saturate(0.75);
@@ -846,6 +882,12 @@ textarea {
   gap: 8px;
 }
 
+.topology-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .topology-pill {
   display: inline-flex;
   flex-direction: column;
@@ -885,6 +927,34 @@ textarea {
   border-color: rgba(210, 74, 74, 0.45);
 }
 
+.topology-pill.path-state-active {
+  border-color: rgba(76, 216, 164, 0.55);
+  box-shadow: 0 0 0 1px rgba(76, 216, 164, 0.16);
+}
+
+.topology-pill.path-state-passive {
+  border-color: rgba(91, 183, 255, 0.45);
+}
+
+.topology-pill.path-state-fail,
+.topology-pill.path-state-degraded {
+  border-color: rgba(210, 74, 74, 0.48);
+}
+
+.topology-pill.path-state-unknown {
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.topology-mini-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--surface);
+  border: 1px solid var(--panel-border);
+}
+
 .warning-list {
   display: flex;
   flex-direction: column;
@@ -904,6 +974,11 @@ textarea {
   color: var(--muted);
 }
 
+.warning-item.compact {
+  padding: 8px 10px;
+  width: 100%;
+}
+
 @media (max-width: 1240px) {
   .content-grid {
     grid-template-columns: 1fr;
@@ -915,6 +990,10 @@ textarea {
 
   .summary-strip {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .topology-grid {
+    grid-template-columns: 1fr;
   }
 }
 

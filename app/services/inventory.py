@@ -16,6 +16,8 @@ from app.models.domain import (
     LedAction,
     MappingBundle,
     ManualMapping,
+    MultipathMember,
+    MultipathView,
     SlotState,
     SlotView,
     SourceStatus,
@@ -47,12 +49,17 @@ def utcnow() -> datetime:
 class DiskRecord:
     raw: dict[str, Any]
     device_name: str | None
+    path_device_name: str | None
+    multipath_name: str | None
+    multipath_member: str | None
     serial: str | None
     model: str | None
     size_bytes: int | None
     identifier: str | None
     health: str | None
     pool_name: str | None
+    lunid: str | None
+    bus: str | None
     enclosure_id: str | None
     slot: int | None
     lookup_keys: set[str]
@@ -393,6 +400,9 @@ class InventoryService:
             device_name = normalize_device_name(
                 disk.get("devname") or disk.get("name") or disk.get("device") or disk.get("disk")
             )
+            path_device_name = normalize_device_name(disk.get("name"))
+            multipath_name = normalize_text(disk.get("multipath_name"))
+            multipath_member = normalize_device_name(disk.get("multipath_member"))
             serial = normalize_text(disk.get("serial") or disk.get("serial_lunid") or disk.get("lunid"))
             model = normalize_text(disk.get("model"))
             size_bytes = disk.get("size") if isinstance(disk.get("size"), int) else None
@@ -408,6 +418,8 @@ class InventoryService:
             lookup_keys = set()
             for value in (
                 device_name,
+                path_device_name,
+                multipath_member,
                 serial,
                 model,
                 identifier,
@@ -419,7 +431,6 @@ class InventoryService:
             ):
                 lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
 
-            multipath_name = normalize_text(disk.get("multipath_name"))
             if multipath_name:
                 lookup_keys.update(normalize_lookup_keys(f"multipath/{multipath_name}"))
 
@@ -432,12 +443,17 @@ class InventoryService:
                 DiskRecord(
                     raw=disk,
                     device_name=device_name,
+                    path_device_name=path_device_name,
+                    multipath_name=multipath_name,
+                    multipath_member=multipath_member,
                     serial=serial,
                     model=model,
                     size_bytes=size_bytes,
                     identifier=identifier,
                     health=health,
                     pool_name=pool_name,
+                    lunid=normalize_text(disk.get("lunid")),
+                    bus=normalize_text(disk.get("bus")),
                     enclosure_id=enclosure_id,
                     slot=slot,
                     lookup_keys=lookup_keys,
@@ -548,6 +564,7 @@ class InventoryService:
         model = disk.model if disk else normalize_text(raw_slot_status.get("model_hint"))
         if not model and device_name:
             model = ssh_data.camcontrol_models.get(device_name.lower())
+        multipath = self._build_multipath_view(disk, ssh_data)
 
         identify_active = bool(raw_slot_status.get("identify_active")) or self._status_contains(raw_slot_status, "identify", "led=locate")
         faulty = self._status_contains(raw_slot_status, "fault") or self._health_is_bad(
@@ -665,6 +682,7 @@ class InventoryService:
             vdev_class=zpool.vdev_class if zpool else None,
             topology_label=zpool.topology_label if zpool else None,
             health=disk.health if disk and disk.health else zpool.health if zpool else raw_slot_status.get("status"),
+            multipath=multipath,
             enclosure_identifier=normalize_text(raw_slot_status.get("descriptor")),
             led_supported=led_supported,
             led_backend=led_backend,
@@ -680,6 +698,9 @@ class InventoryService:
                     [
                         f"{slot + self.settings.layout.slot_number_base:02d}",
                         device_name or "",
+                        multipath.device_name if multipath else "",
+                        " ".join(member.device_name for member in multipath.members) if multipath else "",
+                        " ".join(filter(None, [member.state for member in multipath.members])) if multipath else "",
                         serial or "",
                         model or "",
                         (gptid or normalize_text(raw_slot_status.get("gptid_hint")) or "") or "",
@@ -782,6 +803,55 @@ class InventoryService:
                 if api_member:
                     return api_member
         return None
+
+    def _build_multipath_view(
+        self,
+        disk: DiskRecord | None,
+        ssh_data: ParsedSSHData,
+    ) -> MultipathView | None:
+        if not disk:
+            return None
+
+        multipath_name = disk.multipath_name
+        if not multipath_name:
+            return None
+
+        multipath_device = f"multipath/{multipath_name}"
+        parsed = ssh_data.multipath_info.get(multipath_device.lower())
+        members: list[MultipathMember] = []
+
+        if parsed:
+            members = [
+                MultipathMember(
+                    device_name=member.device_name,
+                    state=member.state,
+                    mode=member.mode,
+                    controller_label=member.controller_label,
+                )
+                for member in parsed.consumers
+            ]
+        else:
+            fallback_devices = [
+                device
+                for device in dict.fromkeys(
+                    filter(None, [disk.path_device_name, disk.multipath_member])
+                )
+            ]
+            members = [MultipathMember(device_name=device) for device in fallback_devices]
+
+        return MultipathView(
+            name=multipath_name,
+            device_name=parsed.device_name if parsed else multipath_device,
+            uuid=parsed.uuid if parsed else None,
+            mode=parsed.mode if parsed else None,
+            state=parsed.state if parsed else None,
+            provider_state=parsed.provider_state if parsed else None,
+            path_device_name=disk.path_device_name,
+            alternate_path_device=disk.multipath_member,
+            lunid=disk.lunid,
+            bus=disk.bus,
+            members=members,
+        )
 
     @staticmethod
     def _status_contains(raw_status: dict[str, Any], *needles: str) -> bool:

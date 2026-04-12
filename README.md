@@ -36,6 +36,7 @@ physical divider layout of the chassis.
   - `pool.query`
 - Optional SSH enrichment for:
   - `glabel status`
+  - `gmultipath list`
   - `zpool status -gP`
   - `camcontrol devlist -v`
   - `sesutil map`
@@ -43,6 +44,7 @@ physical divider layout of the chassis.
   - `sesutil locate`
 - 60-bay enclosure top view with color-coded slot state
 - Clear selected-slot highlight for quick visual focus
+- Selected-slot vdev-peer highlighting so sibling bays stand out together on the map
 - Small top summary for discovered disks, pools, enclosure rows, slot matches,
   saved mappings, and SSH slot hints
 - Search/filter by slot, serial, device, gptid, pool, vdev
@@ -59,6 +61,7 @@ physical divider layout of the chassis.
   - vdev class
   - topology
   - health
+  - multipath mode and member-path state
   - enclosure metadata
   - LED state
 - Copy-to-clipboard buttons for serial and gptid
@@ -250,6 +253,7 @@ output.
 The SSH layer helps with:
 
 - recovering `gptid -> device` relationships from `glabel status`
+- recovering multipath member-path state from `gmultipath list`
 - recovering pool/vdev/class membership from `zpool status -gP`
 - recovering device model hints from `camcontrol devlist -v`
 - recovering physical slot layout from `sesutil map`
@@ -264,6 +268,7 @@ command strings, for example:
 commands:
   - /sbin/glabel status
   - /usr/local/sbin/zpool status -gP
+  - gmultipath list
   - sudo -n /usr/sbin/sesutil map
   - sudo -n /usr/sbin/sesutil show
   # Optional if you also enable SSH LED control:
@@ -380,6 +385,19 @@ Notes:
 - the UI uses POST requests for LED-changing actions and surfaces errors instead
   of pretending the action succeeded
 
+## Multipath Awareness
+
+When SSH mode includes `gmultipath list`, the detail pane can also show a small
+operator-focused presentation summary for multipath-backed disks:
+
+- multipath device name such as `multipath/disk12`
+- overall multipath mode such as `Active/Passive`
+- overall geom state such as `OPTIMAL` or `DEGRADED`
+- member path devices and their state such as `ACTIVE`, `PASSIVE`, or `FAIL`
+
+This first pass intentionally stops short of controller/HBA labeling unless a
+safe and reliable source is available on the target system.
+
 ## Security Notes
 
 - Do not commit `.env` with real API keys.
@@ -475,7 +493,8 @@ Notes:
 - Optional SMART summary data such as temperature and last test status when the
   underlying `disk.query` payload is reliable enough
 - Optional multipath/member detail for operators who want quick awareness of how
-  each disk is presented through CORE
+  each disk is presented through CORE, including controller labeling when safe
+  sources are available
 
 ## License
 

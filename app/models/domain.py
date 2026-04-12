@@ -46,6 +46,27 @@ class ManualMapping(BaseModel):
         return cleaned[:256] if cleaned else None
 
 
+class MultipathMember(BaseModel):
+    device_name: str
+    state: str | None = None
+    mode: str | None = None
+    controller_label: str | None = None
+
+
+class MultipathView(BaseModel):
+    name: str
+    device_name: str
+    uuid: str | None = None
+    mode: str | None = None
+    state: str | None = None
+    provider_state: str | None = None
+    path_device_name: str | None = None
+    alternate_path_device: str | None = None
+    lunid: str | None = None
+    bus: str | None = None
+    members: list[MultipathMember] = Field(default_factory=list)
+
+
 class SlotView(BaseModel):
     slot: int
     slot_label: str
@@ -68,6 +89,7 @@ class SlotView(BaseModel):
     vdev_class: str | None = None
     topology_label: str | None = None
     health: str | None = None
+    multipath: MultipathView | None = None
     enclosure_identifier: str | None = None
     led_supported: bool = False
     led_backend: str | None = None

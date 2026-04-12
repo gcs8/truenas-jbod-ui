@@ -43,6 +43,7 @@ class SSHConfig(BaseModel):
         default_factory=lambda: [
             "glabel status",
             "zpool status -gP",
+            "gmultipath list",
             "camcontrol devlist -v",
             "sesutil map",
             "sesutil show",

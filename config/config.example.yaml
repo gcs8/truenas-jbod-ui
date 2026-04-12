@@ -33,6 +33,7 @@ ssh:
   commands:
     - /sbin/glabel status
     - /usr/local/sbin/zpool status -gP
+    - gmultipath list
     - sudo -n /usr/sbin/sesutil map
     - sudo -n /usr/sbin/sesutil show
   # Optional if you also allow SSH identify LED control through command-limited sudo:
@@ -64,6 +65,7 @@ ssh:
 #       commands:
 #         - /sbin/glabel status
 #         - /usr/local/sbin/zpool status -gP
+#         - gmultipath list
 #         - sudo -n /usr/sbin/sesutil map
 #         - sudo -n /usr/sbin/sesutil show
 #   - id: offsite-scale

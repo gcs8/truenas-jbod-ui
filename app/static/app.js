@@ -21,6 +21,7 @@
   const detailStatePill = document.getElementById("detail-state-pill");
   const detailKvGrid = document.getElementById("detail-kv-grid");
   const topologyContext = document.getElementById("topology-context");
+  const multipathContext = document.getElementById("multipath-context");
   const warningList = document.getElementById("warning-list");
   const searchBox = document.getElementById("search-box");
   const refreshButton = document.getElementById("refresh-button");
@@ -149,9 +150,33 @@
     return (slot.search_text || "").includes(state.search);
   }
 
+  function getSelectedPeerContext() {
+    const slot = getSlotById(state.selectedSlot);
+    if (!slot || !slot.pool_name || !slot.vdev_name) {
+      return { active: false, peerSlots: new Set() };
+    }
+
+    const peerSlots = new Set(
+      state.snapshot.slots
+        .filter((candidate) =>
+          candidate.pool_name === slot.pool_name &&
+          candidate.vdev_name === slot.vdev_name &&
+          candidate.vdev_class === slot.vdev_class &&
+          candidate.device_name
+        )
+        .map((candidate) => candidate.slot)
+    );
+
+    return {
+      active: peerSlots.size > 1,
+      peerSlots,
+    };
+  }
+
   function renderGrid() {
     grid.innerHTML = "";
     const slotsByNumber = new Map(state.snapshot.slots.map((slot) => [slot.slot, slot]));
+    const peerContext = getSelectedPeerContext();
 
     state.layoutRows.forEach((row) => {
       const rowWrapper = document.createElement("div");
@@ -181,6 +206,10 @@
           }
           if (state.selectedSlot === slot.slot) {
             tile.classList.add("selected");
+          } else if (peerContext.active && peerContext.peerSlots.has(slot.slot)) {
+            tile.classList.add("peer-highlight");
+          } else if (peerContext.active) {
+            tile.classList.add("peer-dimmed");
           }
           tile.dataset.slot = String(slot.slot);
           tile.title = slotTooltip(slot);
@@ -266,6 +295,7 @@
     });
 
     renderTopologyContext(slot);
+    renderMultipathContext(slot);
 
     mappingForm.serial.value = slot.serial || "";
     mappingForm.device_name.value = slot.device_name || "";
@@ -328,6 +358,73 @@
         }
       });
     });
+  }
+
+  function renderMultipathContext(slot) {
+    if (!multipathContext) {
+      return;
+    }
+
+    const multipath = slot.multipath;
+    if (!multipath) {
+      multipathContext.innerHTML = '<div class="warning-item muted">This slot is not currently presented through gmultipath.</div>';
+      return;
+    }
+
+    const activeMembers = multipath.members.filter((member) => (member.state || "").toUpperCase() === "ACTIVE");
+    const standbyMembers = multipath.members.filter((member) => {
+      const stateName = (member.state || "").toUpperCase();
+      return stateName && stateName !== "ACTIVE";
+    });
+
+    multipathContext.innerHTML = `
+      <div class="topology-summary">
+        <div class="topology-label">Multipath Device</div>
+        <div class="topology-path">${escapeHtml(multipath.device_name)}</div>
+      </div>
+      <div class="topology-grid">
+        ${topologyInfoCard("Mode", multipath.mode)}
+        ${topologyInfoCard("State", multipath.state || multipath.provider_state)}
+        ${topologyInfoCard("Bus", multipath.bus)}
+        ${topologyInfoCard("LUN ID", multipath.lunid)}
+      </div>
+      <div class="topology-summary">
+        <div class="topology-label">Active Path</div>
+        <div class="topology-pill-row">${renderMultipathPills(activeMembers)}</div>
+      </div>
+      <div class="topology-summary">
+        <div class="topology-label">Other Member Paths</div>
+        <div class="topology-pill-row">${renderMultipathPills(standbyMembers.length ? standbyMembers : multipath.members.filter((member) => !activeMembers.includes(member)))}</div>
+      </div>
+    `;
+  }
+
+  function topologyInfoCard(label, value) {
+    const safeValue = escapeHtml(value || "n/a");
+    return `
+      <div class="topology-mini-card">
+        <div class="topology-label">${escapeHtml(label)}</div>
+        <div class="topology-path">${safeValue}</div>
+      </div>
+    `;
+  }
+
+  function renderMultipathPills(members) {
+    if (!members.length) {
+      return '<div class="warning-item muted compact">No member-path detail returned.</div>';
+    }
+
+    return members
+      .map((member) => {
+        const stateName = (member.state || "Unknown").toUpperCase();
+        return `
+          <div class="topology-pill path-state-${stateName.toLowerCase()}">
+            <span>${escapeHtml(member.device_name)}</span>
+            <small>${escapeHtml(stateName)}</small>
+          </div>
+        `;
+      })
+      .join("");
   }
 
   function renderWarnings() {

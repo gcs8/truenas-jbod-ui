@@ -11,6 +11,8 @@ Working branch for the next feature set after `v0.1.0`.
 - System-aware persistent mapping keys so calibration can be scoped per appliance
 - Mapping export/import workflow for the active system or enclosure scope
 - Selected-slot topology context with clickable sibling awareness for the current vdev
+- Selected-slot peer highlighting that dims non-sibling bays and accents the active vdev set on the enclosure map
+- Optional `gmultipath list` enrichment for multipath device mode, path state, and member-device awareness
 - Example multi-system YAML config showing the intended `v0.2` shape
 
 ### Planned focus
@@ -19,7 +21,7 @@ Working branch for the next feature set after `v0.1.0`.
 - Mapping export/import workflow
 - Compact topology and sibling-awareness improvements
 - Optional SMART summary enrichment
-- Optional multipath/member awareness
+- Optional deeper multipath/member awareness, including controller labeling when safe sources exist
 - Adapter groundwork for future TrueNAS SCALE support
 
 ## v0.1.0 - 2026-04-12
