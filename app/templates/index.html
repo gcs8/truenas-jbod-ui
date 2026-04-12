@@ -135,10 +135,14 @@
     </section>
 
     <aside class="panel detail-panel">
-      <div class="panel-header">
+      <div class="panel-header detail-panel-top">
         <div>
           <h2>Slot Details</h2>
           <p class="subtle">Select a bay to inspect metadata or calibrate mapping.</p>
+        </div>
+        <div id="detail-led-controls" class="detail-led-controls hidden">
+          <button class="button small" data-led-action="IDENTIFY">Identify On</button>
+          <button class="button secondary small" data-led-action="CLEAR">Identify Off / Clear</button>
         </div>
       </div>
 
@@ -156,43 +160,6 @@
         </div>
 
         <div class="kv-grid" id="detail-kv-grid"></div>
-
-        <div class="action-group">
-          <div class="action-header">
-            <h4>Calibration Mapping</h4>
-            <button class="button secondary small" id="prefill-mapping-button" type="button">Prefill From Slot</button>
-          </div>
-          <p class="subtle">
-            First-pass workflow: light the slot, verify the physical bay, then save
-            the observed serial, device, or gptid so the app can persist the mapping.
-          </p>
-          <form id="mapping-form">
-            <label class="field">
-              <span>Serial</span>
-              <input type="text" name="serial" maxlength="256">
-            </label>
-            <label class="field">
-              <span>Device</span>
-              <input type="text" name="device_name" maxlength="256">
-            </label>
-            <label class="field">
-              <span>GPTID</span>
-              <input type="text" name="gptid" maxlength="256">
-            </label>
-            <label class="field">
-              <span>Notes</span>
-              <textarea name="notes" rows="3" maxlength="256" placeholder="Optional calibration note"></textarea>
-            </label>
-            <label class="toggle compact">
-              <input type="checkbox" name="clear_identify_after_save" checked>
-              <span>Clear identify LED after saving</span>
-            </label>
-            <div class="button-row">
-              <button class="button" type="submit">Save Mapping</button>
-              <button class="button danger" id="clear-mapping-button" type="button">Clear Mapping</button>
-            </div>
-          </form>
-        </div>
 
         <div class="action-group">
           <div class="action-header">
@@ -233,16 +200,39 @@
 
       <section class="panel detail-secondary-card">
         <div class="panel-header compact">
-          <h2>LED Control</h2>
+          <h2>Calibration Mapping</h2>
+          <button class="button secondary small" id="prefill-mapping-button" type="button">Prefill From Slot</button>
         </div>
         <div class="action-group compact">
-          <p class="subtle" id="led-note">
-            LED control uses the TrueNAS enclosure API when available, and SSH `sesutil locate` on shelves that only expose SES fallback data.
+          <p class="subtle">
+            Save the observed serial, device, or gptid so this slot can be recovered quickly later.
           </p>
-          <div class="button-row">
-            <button class="button" data-led-action="IDENTIFY">Identify On</button>
-            <button class="button secondary" data-led-action="CLEAR">Identify Off / Clear</button>
-          </div>
+          <form id="mapping-form" class="mapping-form-compact">
+            <label class="field">
+              <span>Serial</span>
+              <input type="text" name="serial" maxlength="256">
+            </label>
+            <label class="field">
+              <span>Device</span>
+              <input type="text" name="device_name" maxlength="256">
+            </label>
+            <label class="field">
+              <span>GPTID</span>
+              <input type="text" name="gptid" maxlength="256">
+            </label>
+            <label class="field">
+              <span>Notes</span>
+              <textarea name="notes" rows="3" maxlength="256" placeholder="Optional calibration note"></textarea>
+            </label>
+            <label class="toggle compact">
+              <input type="checkbox" name="clear_identify_after_save" checked>
+              <span>Clear identify LED after saving</span>
+            </label>
+            <div class="button-row">
+              <button class="button" type="submit">Save Mapping</button>
+              <button class="button danger" id="clear-mapping-button" type="button">Clear Mapping</button>
+            </div>
+          </form>
         </div>
       </section>
     </div>

@@ -19,6 +19,7 @@
   const detailEmpty = document.getElementById("detail-empty");
   const detailContent = document.getElementById("detail-content");
   const detailSecondary = document.getElementById("detail-secondary");
+  const detailLedControls = document.getElementById("detail-led-controls");
   const detailSlotTitle = document.getElementById("detail-slot-title");
   const detailStatePill = document.getElementById("detail-state-pill");
   const detailKvGrid = document.getElementById("detail-kv-grid");
@@ -47,7 +48,6 @@
   const exportMappingsButton = document.getElementById("export-mappings-button");
   const importMappingsButton = document.getElementById("import-mappings-button");
   const mappingImportFile = document.getElementById("mapping-import-file");
-  const ledNote = document.getElementById("led-note");
   const ledButtons = Array.from(document.querySelectorAll("[data-led-action]"));
 
   function getSlotById(slotNumber) {
@@ -129,22 +129,6 @@
   function ledStatusLabel(slot) {
     if (!slot.led_supported && !slot.identify_active) return "Unavailable";
     return slot.identify_active ? "On" : "Off";
-  }
-
-  function ledNoteText(slot) {
-    if (!slot) {
-      return "LED control uses the TrueNAS enclosure API when available, and SSH sesutil locate on shelves that only expose SES fallback data.";
-    }
-    if (!slot.led_supported) {
-      return slot.led_reason || "LED control is unavailable for this slot.";
-    }
-    if (slot.led_backend === "api") {
-      return "LED control is available for this slot through the TrueNAS enclosure API.";
-    }
-    if (slot.led_backend === "ssh") {
-      return "LED control is available for this slot through SSH sesutil locate on the mapped SES controller.";
-    }
-    return "LED control is available for this slot.";
   }
 
   function passesFilter(slot) {
@@ -267,12 +251,17 @@
       detailEmpty.classList.remove("hidden");
       detailContent.classList.add("hidden");
       detailSecondary.classList.add("hidden");
+      detailLedControls.classList.add("hidden");
+      ledButtons.forEach((button) => {
+        button.disabled = true;
+      });
       return;
     }
 
     detailEmpty.classList.add("hidden");
     detailContent.classList.remove("hidden");
     detailSecondary.classList.remove("hidden");
+    detailLedControls.classList.remove("hidden");
     detailSlotTitle.textContent = `Slot ${slot.slot_label}`;
     detailStatePill.textContent = stateLabel(slot);
     detailStatePill.className = `state-pill state-${slot.state}`;
@@ -315,7 +304,6 @@
     ledButtons.forEach((button) => {
       button.disabled = !slot.led_supported;
     });
-    ledNote.textContent = ledNoteText(slot);
   }
 
   function renderTopologyContext(slot) {
