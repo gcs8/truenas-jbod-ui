@@ -701,6 +701,7 @@ class InventoryService:
                         multipath.device_name if multipath else "",
                         " ".join(member.device_name for member in multipath.members) if multipath else "",
                         " ".join(filter(None, [member.state for member in multipath.members])) if multipath else "",
+                        " ".join(filter(None, [member.controller_label for member in multipath.members])) if multipath else "",
                         serial or "",
                         model or "",
                         (gptid or normalize_text(raw_slot_status.get("gptid_hint")) or "") or "",
@@ -826,7 +827,7 @@ class InventoryService:
                     device_name=member.device_name,
                     state=member.state,
                     mode=member.mode,
-                    controller_label=member.controller_label,
+                    controller_label=member.controller_label or ssh_data.camcontrol_controllers.get(member.device_name.lower()),
                 )
                 for member in parsed.consumers
             ]
@@ -837,7 +838,13 @@ class InventoryService:
                     filter(None, [disk.path_device_name, disk.multipath_member])
                 )
             ]
-            members = [MultipathMember(device_name=device) for device in fallback_devices]
+            members = [
+                MultipathMember(
+                    device_name=device,
+                    controller_label=ssh_data.camcontrol_controllers.get(device.lower()),
+                )
+                for device in fallback_devices
+            ]
 
         return MultipathView(
             name=multipath_name,

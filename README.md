@@ -394,9 +394,11 @@ operator-focused presentation summary for multipath-backed disks:
 - overall multipath mode such as `Active/Passive`
 - overall geom state such as `OPTIMAL` or `DEGRADED`
 - member path devices and their state such as `ACTIVE`, `PASSIVE`, or `FAIL`
+- per-member controller labels such as `mpr0` and `mpr1` when SSH also includes
+  `camcontrol devlist -v`
 
-This first pass intentionally stops short of controller/HBA labeling unless a
-safe and reliable source is available on the target system.
+If `camcontrol` is unavailable or not permitted, the app still renders the
+multipath summary and simply omits controller/HBA labels.
 
 ## Security Notes
 

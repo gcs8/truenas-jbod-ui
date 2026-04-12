@@ -39,6 +39,7 @@ class ParsedSSHData:
     multipath_info: dict[str, "MultipathInfo"] = field(default_factory=dict)
     ses_slot_to_device: dict[int, str] = field(default_factory=dict)
     camcontrol_models: dict[str, str] = field(default_factory=dict)
+    camcontrol_controllers: dict[str, str] = field(default_factory=dict)
     ses_slot_candidates: dict[int, dict[str, Any]] = field(default_factory=dict)
     ses_selected_meta: dict[str, str | None] = field(default_factory=dict)
 
@@ -84,6 +85,12 @@ class MultipathInfo:
     state: str | None = None
     provider_state: str | None = None
     consumers: list[MultipathConsumer] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class CamcontrolInfo:
+    models: dict[str, str] = field(default_factory=dict)
+    controllers: dict[str, str] = field(default_factory=dict)
 
 
 def normalize_text(value: str | None) -> str | None:
@@ -172,19 +179,30 @@ def parse_glabel_status(output: str) -> GlabelInfo:
     return info
 
 
-def parse_camcontrol_devlist(output: str) -> dict[str, str]:
-    models: dict[str, str] = {}
+def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
+    info = CamcontrolInfo()
+    current_controller: str | None = None
+
     for line in output.splitlines():
+        bus_match = re.match(r"^(?:scbus|umass-sim)\d+\s+on\s+(?P<controller>\S+)\s+bus\s+\d+:", line.strip(), re.IGNORECASE)
+        if bus_match:
+            current_controller = normalize_text(bus_match.group("controller"))
+            continue
+
         match = re.search(r"<(?P<model>[^>]+)>.*\((?P<devices>[^)]+)\)", line)
         if not match:
             continue
 
         model = match.group("model").strip()
         for device in match.group("devices").split(","):
+            if not DEVICE_REGEX.search(device.strip()):
+                continue
             normalized = normalize_device_name(device)
             if normalized:
-                models[normalized.lower()] = model
-    return models
+                info.models[normalized.lower()] = model
+                if current_controller:
+                    info.controllers[normalized.lower()] = current_controller
+    return info
 
 
 def parse_gmultipath_list(output: str) -> dict[str, MultipathInfo]:
@@ -1120,9 +1138,13 @@ def parse_ssh_outputs(
     if normalized_outputs.get("gmultipath list"):
         parsed.multipath_info = parse_gmultipath_list(normalized_outputs["gmultipath list"])
     if normalized_outputs.get("camcontrol devlist"):
-        parsed.camcontrol_models = parse_camcontrol_devlist(normalized_outputs["camcontrol devlist"])
+        camcontrol_info = parse_camcontrol_devlist(normalized_outputs["camcontrol devlist"])
+        parsed.camcontrol_models = camcontrol_info.models
+        parsed.camcontrol_controllers = camcontrol_info.controllers
     if normalized_outputs.get("camcontrol devlist -v"):
-        parsed.camcontrol_models = parse_camcontrol_devlist(normalized_outputs["camcontrol devlist -v"])
+        camcontrol_info = parse_camcontrol_devlist(normalized_outputs["camcontrol devlist -v"])
+        parsed.camcontrol_models = camcontrol_info.models
+        parsed.camcontrol_controllers = camcontrol_info.controllers
 
     if normalized_outputs.get("sesutil map"):
         ses_map_enclosures = parse_sesutil_map(normalized_outputs["sesutil map"])

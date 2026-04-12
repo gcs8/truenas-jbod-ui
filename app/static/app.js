@@ -416,10 +416,14 @@
     return members
       .map((member) => {
         const stateName = (member.state || "Unknown").toUpperCase();
+        const detailParts = [stateName];
+        if (member.controller_label) {
+          detailParts.push(member.controller_label);
+        }
         return `
           <div class="topology-pill path-state-${stateName.toLowerCase()}">
             <span>${escapeHtml(member.device_name)}</span>
-            <small>${escapeHtml(stateName)}</small>
+            <small>${escapeHtml(detailParts.join(" · "))}</small>
           </div>
         `;
       })

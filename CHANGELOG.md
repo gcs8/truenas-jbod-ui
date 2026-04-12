@@ -13,6 +13,7 @@ Working branch for the next feature set after `v0.1.0`.
 - Selected-slot topology context with clickable sibling awareness for the current vdev
 - Selected-slot peer highlighting that dims non-sibling bays and accents the active vdev set on the enclosure map
 - Optional `gmultipath list` enrichment for multipath device mode, path state, and member-device awareness
+- Optional `camcontrol devlist -v` enrichment for per-member controller labels such as `mpr0` and `mpr1`
 - Example multi-system YAML config showing the intended `v0.2` shape
 - Stable enclosure geometry so slot carriers keep a consistent physical-looking size when selection state changes
 

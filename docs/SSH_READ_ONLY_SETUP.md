@@ -363,6 +363,9 @@ Optional:
   - sudo -n /usr/sbin/sesutil locate -u /dev/ses4 16 off
 ```
 
+`camcontrol devlist -v` is the safest optional add-on if you want the app to
+label multipath member paths with controller names such as `mpr0` and `mpr1`.
+
 If your TrueNAS CORE build requires passworded command-limited sudo instead of
 `nopasswd`, keep the same command list and also set:
 
