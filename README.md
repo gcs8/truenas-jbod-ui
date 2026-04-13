@@ -65,7 +65,7 @@ physical divider layout of the chassis.
   - vdev class
   - topology
   - health
-  - multipath mode and member-path state
+  - multipath mode, member-path state, and HBA/controller path context when available
   - enclosure metadata
   - LED state
 - Copy-to-clipboard buttons for serial and gptid

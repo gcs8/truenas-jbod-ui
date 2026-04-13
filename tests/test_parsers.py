@@ -61,6 +61,40 @@ State: OPTIMAL
         self.assertEqual(multipath.consumers[1].device_name, "da18")
         self.assertEqual(multipath.consumers[1].state, "PASSIVE")
 
+    def test_parse_gmultipath_list_handles_degraded_failed_member(self) -> None:
+        output = """
+Geom name: disk19
+Providers:
+1. Name: multipath/disk19
+   Mediasize: 18000207937536 (16T)
+   Sectorsize: 512
+   State: DEGRADED
+Consumers:
+1. Name: da85
+   Mediasize: 18000207937536 (16T)
+   State: ACTIVE
+   Mode: r2w2e4
+2. Name: da38
+   Mediasize: 18000207937536 (16T)
+   State: FAIL
+   Mode: r2w2e4
+Mode: Active/Active
+UUID: 31260ced-2335-11e8-a29d-0cc47a8ff400
+State: DEGRADED
+""".strip()
+
+        parsed = parse_gmultipath_list(output)
+        multipath = parsed["multipath/disk19"]
+
+        self.assertEqual(multipath.mode, "Active/Active")
+        self.assertEqual(multipath.state, "DEGRADED")
+        self.assertEqual(multipath.provider_state, "DEGRADED")
+        self.assertEqual(len(multipath.consumers), 2)
+        self.assertEqual(multipath.consumers[0].device_name, "da85")
+        self.assertEqual(multipath.consumers[0].state, "ACTIVE")
+        self.assertEqual(multipath.consumers[1].device_name, "da38")
+        self.assertEqual(multipath.consumers[1].state, "FAIL")
+
     def test_parse_smart_test_results_uses_latest_test(self) -> None:
         results = [
             {

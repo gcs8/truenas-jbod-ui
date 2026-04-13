@@ -493,16 +493,25 @@
       },
     ].filter((section) => section.members.length);
 
+    const activeControllers = summarizeControllerLabels(activeMembers);
+    const passiveControllers = summarizeControllerLabels(passiveMembers);
+    const failedControllers = summarizeControllerLabels(failedMembers);
+    const multipathAlert = buildMultipathAlert(multipath, activeControllers, passiveControllers, failedControllers);
+
     multipathContext.innerHTML = `
       <div class="topology-summary">
         <div class="topology-label">Multipath Device</div>
         <div class="topology-path">${escapeHtml(multipath.device_name)}</div>
       </div>
+      ${multipathAlert ? `<div class="warning-item compact">${escapeHtml(multipathAlert)}</div>` : ""}
       <div class="topology-grid">
         ${topologyInfoCard("Mode", multipath.mode)}
         ${topologyInfoCard("State", multipath.state || multipath.provider_state)}
         ${topologyInfoCard("Transport", multipath.bus)}
         ${topologyInfoCard("LUN ID", multipath.lunid)}
+        ${topologyInfoCardIfPresent(activeMembers.length > 1 ? "Active HBAs" : "Active HBA", activeControllers)}
+        ${topologyInfoCardIfPresent(passiveMembers.length > 1 ? "Passive HBAs" : "Passive HBA", passiveControllers)}
+        ${topologyInfoCardIfPresent(failedMembers.length > 1 ? "Failed HBAs" : "Failed HBA", failedControllers)}
       </div>
       ${sections.length
         ? sections
@@ -532,6 +541,53 @@
         <div class="topology-path">${safeValue}</div>
       </div>
     `;
+  }
+
+  function topologyInfoCardIfPresent(label, value) {
+    if (!value) {
+      return "";
+    }
+    return topologyInfoCard(label, value);
+  }
+
+  function summarizeControllerLabels(members) {
+    const labels = Array.from(
+      new Set(
+        members
+          .map((member) => member.controller_label)
+          .filter((value) => value && value.trim())
+      )
+    );
+
+    if (!labels.length) {
+      return null;
+    }
+
+    return labels.join(", ");
+  }
+
+  function buildMultipathAlert(multipath, activeControllers, passiveControllers, failedControllers) {
+    const stateName = (multipath.state || multipath.provider_state || "").toUpperCase();
+    if (stateName !== "DEGRADED" && !failedControllers) {
+      return "";
+    }
+
+    const fragments = [];
+    if (activeControllers) {
+      fragments.push(`active on ${activeControllers}`);
+    }
+    if (passiveControllers) {
+      fragments.push(`standby on ${passiveControllers}`);
+    }
+    if (failedControllers) {
+      fragments.push(`failed on ${failedControllers}`);
+    }
+
+    if (!fragments.length) {
+      return "Multipath is degraded.";
+    }
+
+    return `Multipath is degraded: ${fragments.join(", ")}.`;
   }
 
   function renderMultipathPills(members) {

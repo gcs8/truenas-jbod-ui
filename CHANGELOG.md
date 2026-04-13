@@ -15,6 +15,7 @@ Working branch for the next feature set after `v0.1.0`.
 - SMART phase 1 basics with per-slot temperature, last SMART test result, power-on age, and logical/physical sector size
 - Optional `gmultipath list` enrichment for multipath device mode, path state, and member-device awareness
 - Optional `camcontrol devlist -v` enrichment for per-member controller labels such as `mpr0` and `mpr1`
+- Multipath presentation cards that summarize active, passive, and failed HBA/controller paths when available
 - Example multi-system YAML config showing the intended `v0.2` shape
 - Stable enclosure geometry so slot carriers keep a consistent physical-looking size when selection state changes
 
