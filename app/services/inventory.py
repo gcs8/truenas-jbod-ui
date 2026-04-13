@@ -983,6 +983,8 @@ class InventoryService:
         seen: set[str] = set()
 
         if slot_view.multipath:
+            # Prefer ACTIVE member paths first so ad-hoc smartctl calls land on
+            # the same physical leg the system is currently favoring.
             active_first = sorted(
                 slot_view.multipath.members,
                 key=lambda member: ((member.state or "").upper() != "ACTIVE", member.device_name),

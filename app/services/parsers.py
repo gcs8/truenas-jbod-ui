@@ -249,6 +249,9 @@ def parse_gmultipath_list(output: str) -> dict[str, MultipathInfo]:
                     multipaths[current.device_name.lower()] = current
                 continue
 
+            # Only indented provider state lines belong to the Providers block.
+            # Unindented "State:" / "Mode:" lines that follow Consumers are the
+            # top-level multipath summary and need to fall through below.
             if line != stripped and stripped.startswith("State:"):
                 current.provider_state = normalize_text(stripped.split(":", 1)[1])
                 continue

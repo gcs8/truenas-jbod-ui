@@ -474,6 +474,9 @@
       return stateName && stateName !== "ACTIVE" && stateName !== "PASSIVE" && stateName !== "FAIL" && stateName !== "FAILED";
     });
 
+    // Keep the operator view grouped by path role so degraded shelves read as
+    // "active / passive / failed" first, with oddball states falling into a
+    // final catch-all bucket instead of being silently mixed together.
     const sections = [
       {
         label: activeMembers.length > 1 ? "Active Paths" : "Active Path",

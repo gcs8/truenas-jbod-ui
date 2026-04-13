@@ -491,16 +491,18 @@ multipath summary and simply omits controller/HBA labels.
 
 ## Future Improvements
 
+- Enclosure profile metadata so different chassis can define bay proportions,
+  row grouping, and service-area layout without hardcoding one visual shape
+- Richer topology visualization for pool and vdev ancestry beyond the current
+  compact sibling-awareness panel
+- Expanded SMART detail when the underlying data is stable enough, such as SAS
+  address, logical unit identifier, cache flags, and negotiated link rate
+- More operator-focused multipath detail, especially for edge cases and future
+  controller types beyond the current `mpr0` / `mpr1` presentation
 - WebSocket or Server-Sent Events live updates
-- Multi-enclosure support with enclosure picker
-- Richer topology graph for pools and vdev ancestry
 - Per-slot historical events and LED action audit trail
-- Mapping export/import backup workflow
-- Optional SMART summary data such as temperature and last test status when the
-  underlying `disk.query` payload is reliable enough
-- Optional multipath/member detail for operators who want quick awareness of how
-  each disk is presented through CORE, including controller labeling when safe
-  sources are available
+- TrueNAS SCALE adapter support once the CORE-oriented collection path is fully
+  settled
 
 ## License
 

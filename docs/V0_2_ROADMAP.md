@@ -131,16 +131,23 @@ Suggested target shape:
 - `TrueNASCoreAdapter`
 - `TrueNASScaleAdapter`
 
-## Suggested Implementation Order
+## Status Snapshot
 
-1. Add branch-safe versioning and roadmap notes
-2. Add multi-system config model
-3. Add system/enclosure pickers in the UI
-4. Add export/import mapping workflow
-5. Add sibling-aware topology summaries
-6. Add optional SMART summary fields
-7. Add optional multipath/member details
-8. Refactor backend collection toward adapter-based design
+Completed on the local `v0.2.x` branch:
+
+- multi-system and multi-enclosure selection
+- mapping export/import
+- sibling-aware topology context
+- SMART phase 1 basics
+- multipath/member presentation with controller labels when available
+
+Still good follow-on work before or after a `v0.2.0` push:
+
+1. Refactor backend collection toward clearer adapter boundaries
+2. Add enclosure profile metadata for chassis-specific geometry
+3. Expand SMART fields only where the source data is consistent
+4. Add deeper multipath edge-case presentation and validation
+5. Decide how much richer topology visualization belongs in this app
 
 ## Things To Keep Out Of Scope
 
