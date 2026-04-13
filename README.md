@@ -23,7 +23,7 @@ physical divider layout of the chassis.
 
 ## Screenshot
 
-![TrueNAS JBOD Enclosure UI screenshot](docs/images/ui-overview.png)
+![TrueNAS JBOD Enclosure UI screenshot](docs/images/ui-overview-v0.2.0.png)
 
 ## Features
 
