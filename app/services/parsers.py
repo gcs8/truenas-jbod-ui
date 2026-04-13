@@ -249,9 +249,12 @@ def parse_gmultipath_list(output: str) -> dict[str, MultipathInfo]:
                     multipaths[current.device_name.lower()] = current
                 continue
 
-            if stripped.startswith("State:"):
+            if line != stripped and stripped.startswith("State:"):
                 current.provider_state = normalize_text(stripped.split(":", 1)[1])
                 continue
+
+            if line == stripped:
+                section = None
 
         if section == "consumers":
             consumer_match = re.match(r"^\d+\.\s+Name:\s+(?P<device>\S+)", stripped)
@@ -261,13 +264,17 @@ def parse_gmultipath_list(output: str) -> dict[str, MultipathInfo]:
                 current.consumers.append(current_consumer)
                 continue
 
-            if current_consumer and stripped.startswith("State:"):
+            if current_consumer and line != stripped and stripped.startswith("State:"):
                 current_consumer.state = normalize_text(stripped.split(":", 1)[1])
                 continue
 
-            if current_consumer and stripped.startswith("Mode:"):
+            if current_consumer and line != stripped and stripped.startswith("Mode:"):
                 current_consumer.mode = normalize_text(stripped.split(":", 1)[1])
                 continue
+
+            if line == stripped:
+                section = None
+                current_consumer = None
 
         if section is not None:
             continue

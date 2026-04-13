@@ -194,7 +194,7 @@
     const logical = smartEntry?.data?.logical_block_size;
     const physical = smartEntry?.data?.physical_block_size;
     if (Number.isInteger(logical) && Number.isInteger(physical)) {
-      return `${logical} B / ${physical} B`;
+      return `Logical ${logical} B / Physical ${physical} B`;
     }
     if (smartEntry?.loading) {
       return "Loading...";
