@@ -55,6 +55,10 @@ physical divider layout of the chassis.
   - serial
   - model
   - size
+  - SMART temperature
+  - last SMART test result
+  - power-on age
+  - logical and physical sector size
   - gptid
   - pool
   - vdev

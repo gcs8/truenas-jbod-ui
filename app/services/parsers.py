@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -1027,6 +1028,66 @@ def parse_pool_query_topology(pools: list[dict[str, Any]]) -> dict[str, ZpoolMem
                         composite_vdev_index += 1
 
     return members
+
+
+def parse_smart_test_results(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    parsed: dict[str, dict[str, Any]] = {}
+
+    for item in results:
+        disk_name = normalize_device_name(item.get("disk"))
+        tests = item.get("tests")
+        if not disk_name or not isinstance(tests, list) or not tests:
+            continue
+
+        latest = tests[0] if isinstance(tests[0], dict) else None
+        if not latest:
+            continue
+
+        parsed[disk_name.lower()] = {
+            "description": normalize_text(latest.get("description")),
+            "status": normalize_text(latest.get("status")),
+            "status_verbose": normalize_text(latest.get("status_verbose")),
+            "lifetime": latest.get("lifetime") if isinstance(latest.get("lifetime"), int) else None,
+            "current_test": item.get("current_test"),
+        }
+
+    return parsed
+
+
+def parse_smartctl_summary(output: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return {"available": False, "message": "SMART JSON parsing failed."}
+
+    temperature = payload.get("temperature") if isinstance(payload.get("temperature"), dict) else {}
+    power_on_time = payload.get("power_on_time") if isinstance(payload.get("power_on_time"), dict) else {}
+    logical_block_size = payload.get("logical_block_size")
+    physical_block_size = payload.get("physical_block_size")
+    power_on_hours = power_on_time.get("hours") if isinstance(power_on_time.get("hours"), int) else None
+
+    summary = {
+        "available": any(
+            value is not None
+            for value in (
+                temperature.get("current"),
+                power_on_hours,
+                logical_block_size if isinstance(logical_block_size, int) else None,
+                physical_block_size if isinstance(physical_block_size, int) else None,
+            )
+        ),
+        "temperature_c": temperature.get("current") if isinstance(temperature.get("current"), int) else None,
+        "power_on_hours": power_on_hours,
+        "power_on_days": power_on_hours // 24 if isinstance(power_on_hours, int) else None,
+        "logical_block_size": logical_block_size if isinstance(logical_block_size, int) else None,
+        "physical_block_size": physical_block_size if isinstance(physical_block_size, int) else None,
+        "message": None,
+    }
+
+    if not summary["available"]:
+        summary["message"] = "No SMART summary fields were returned for this disk."
+
+    return summary
 
 
 def _compose_topology_label(pool_name: str, vdev_path: list[str], vdev_class: str | None) -> str | None:

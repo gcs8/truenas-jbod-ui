@@ -12,6 +12,7 @@ Working branch for the next feature set after `v0.1.0`.
 - Mapping export/import workflow for the active system or enclosure scope
 - Selected-slot topology context with clickable sibling awareness for the current vdev
 - Selected-slot peer highlighting that dims non-sibling bays and accents the active vdev set on the enclosure map
+- SMART phase 1 basics with per-slot temperature, last SMART test result, power-on age, and logical/physical sector size
 - Optional `gmultipath list` enrichment for multipath device mode, path state, and member-device awareness
 - Optional `camcontrol devlist -v` enrichment for per-member controller labels such as `mpr0` and `mpr1`
 - Example multi-system YAML config showing the intended `v0.2` shape
@@ -22,8 +23,8 @@ Working branch for the next feature set after `v0.1.0`.
 - Multi-system and multi-enclosure selection
 - Mapping export/import workflow
 - Compact topology and sibling-awareness improvements
-- Optional SMART summary enrichment
-- Optional deeper multipath/member awareness, including controller labeling when safe sources exist
+- Expanded SMART summary details and validation across more drive types
+- Deeper multipath/member awareness and presentation polish
 - Enclosure profile metadata for chassis-specific slot grouping and bay proportions
 - Adapter groundwork for future TrueNAS SCALE support
 

@@ -13,7 +13,7 @@ from fastapi.templating import Jinja2Templates
 from app.config import Settings, get_settings
 from app import __version__
 from app.logging_config import configure_logging
-from app.models.domain import InventorySnapshot, LedAction, LedRequest, MappingBundle, MappingRequest
+from app.models.domain import InventorySnapshot, LedAction, LedRequest, MappingBundle, MappingRequest, SmartSummaryView
 from app.services.inventory_registry import InventoryRegistry
 from app.services.truenas_ws import TrueNASAPIError
 
@@ -171,6 +171,20 @@ def create_app() -> FastAPI:
                 "snapshot": snapshot.model_dump(mode="json"),
             }
         )
+
+    @app.get("/api/slots/{slot}/smart", response_model=SmartSummaryView)
+    async def get_slot_smart_summary(
+        slot: int,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> SmartSummaryView:
+        ensure_slot_bounds(settings, slot)
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        try:
+            return await service.get_slot_smart_summary(slot, selected_enclosure_id=enclosure_id)
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:

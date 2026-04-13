@@ -18,6 +18,7 @@ from app.models.domain import (
     ManualMapping,
     MultipathMember,
     MultipathView,
+    SmartSummaryView,
     SlotState,
     SlotView,
     SourceStatus,
@@ -33,6 +34,8 @@ from app.services.parsers import (
     normalize_lookup_keys,
     normalize_text,
     parse_pool_query_topology,
+    parse_smart_test_results,
+    parse_smartctl_summary,
     parse_ssh_outputs,
 )
 from app.services.ssh_probe import SSHProbe
@@ -60,6 +63,10 @@ class DiskRecord:
     pool_name: str | None
     lunid: str | None
     bus: str | None
+    temperature_c: int | None
+    last_smart_test_type: str | None
+    last_smart_test_status: str | None
+    last_smart_test_lifetime_hours: int | None
     enclosure_id: str | None
     slot: int | None
     lookup_keys: set[str]
@@ -81,6 +88,8 @@ class InventoryService:
         self.mapping_store = mapping_store
         self._cache: dict[str, InventorySnapshot] = {}
         self._cache_until: dict[str, datetime] = {}
+        self._smart_cache: dict[str, SmartSummaryView] = {}
+        self._smart_cache_until: dict[str, datetime] = {}
         self._lock = asyncio.Lock()
 
     async def get_snapshot(
@@ -163,6 +172,59 @@ class InventoryService:
         await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
         return cleared
 
+    async def get_slot_smart_summary(
+        self,
+        slot: int,
+        selected_enclosure_id: str | None = None,
+    ) -> SmartSummaryView:
+        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
+        slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
+        if not slot_view:
+            raise TrueNASAPIError(f"Slot {slot:02d} is not present in the current snapshot.")
+
+        candidates = self._smart_candidate_devices(slot_view)
+        if not candidates:
+            return SmartSummaryView(available=False, message="No SMART-capable device path is available for this slot.")
+
+        cache_key = f"{self.system.id}|{'|'.join(candidates)}"
+        cache_until = self._smart_cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
+        cached = self._smart_cache.get(cache_key)
+        if cached and utcnow() < cache_until:
+            return cached
+
+        last_error: str | None = None
+        for candidate in candidates:
+            try:
+                payload = await self.truenas_client.fetch_disk_smartctl(candidate, ["-a", "-j"])
+            except TrueNASAPIError as exc:
+                last_error = str(exc)
+                continue
+
+            summary = SmartSummaryView.model_validate(parse_smartctl_summary(payload))
+            summary.temperature_c = summary.temperature_c or slot_view.temperature_c
+            summary.last_test_type = slot_view.last_smart_test_type
+            summary.last_test_status = slot_view.last_smart_test_status
+            summary.last_test_lifetime_hours = slot_view.last_smart_test_lifetime_hours
+            if (
+                summary.power_on_hours is not None
+                and summary.last_test_lifetime_hours is not None
+                and summary.power_on_hours >= summary.last_test_lifetime_hours
+            ):
+                summary.last_test_age_hours = summary.power_on_hours - summary.last_test_lifetime_hours
+
+            self._smart_cache[cache_key] = summary
+            self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
+            return summary
+
+        return SmartSummaryView(
+            available=False,
+            temperature_c=slot_view.temperature_c,
+            last_test_type=slot_view.last_smart_test_type,
+            last_test_status=slot_view.last_smart_test_status,
+            last_test_lifetime_hours=slot_view.last_smart_test_lifetime_hours,
+            message=last_error or "SMART summary is unavailable for this slot.",
+        )
+
     async def export_mapping_bundle(self, selected_enclosure_id: str | None = None) -> MappingBundle:
         return MappingBundle(
             app_version=__version__,
@@ -206,7 +268,13 @@ class InventoryService:
             sources["api"] = SourceStatus(enabled=True, ok=True, message="TrueNAS API reachable.")
         except Exception as exc:
             logger.exception("Failed to fetch TrueNAS API data")
-            raw_data = TrueNASRawData(enclosures=[], disks=[], pools=[])
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                disks=[],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
             sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
             warnings.append("TrueNAS API is unreachable. Slot details may be partial or unavailable.")
 
@@ -314,7 +382,12 @@ class InventoryService:
             api_enclosure_ids.add(api_selected_meta["id"])
         slot_candidates = merge_slot_candidate_maps(ssh_data.ses_slot_candidates, api_candidates)
         api_topology_members = parse_pool_query_topology(raw_data.pools)
-        disk_records = self._build_disk_records(raw_data.disks, ssh_data)
+        disk_records = self._build_disk_records(
+            raw_data.disks,
+            ssh_data,
+            raw_data.disk_temperatures,
+            parse_smart_test_results(raw_data.smart_test_results),
+        )
 
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
@@ -394,7 +467,13 @@ class InventoryService:
 
         return options
 
-    def _build_disk_records(self, disks: list[dict[str, Any]], ssh_data: ParsedSSHData) -> list[DiskRecord]:
+    def _build_disk_records(
+        self,
+        disks: list[dict[str, Any]],
+        ssh_data: ParsedSSHData,
+        disk_temperatures: dict[str, int],
+        smart_tests: dict[str, dict[str, Any]],
+    ) -> list[DiskRecord]:
         records: list[DiskRecord] = []
         for disk in disks:
             device_name = normalize_device_name(
@@ -407,6 +486,8 @@ class InventoryService:
             model = normalize_text(disk.get("model"))
             size_bytes = disk.get("size") if isinstance(disk.get("size"), int) else None
             identifier = normalize_text(disk.get("identifier"))
+            temperature_c = self._lookup_disk_temperature(disk_temperatures, path_device_name, device_name, multipath_member)
+            latest_test = self._lookup_smart_test(smart_tests, path_device_name, device_name, multipath_member)
             health = normalize_text(
                 disk.get("status")
                 or disk.get("health")
@@ -454,6 +535,10 @@ class InventoryService:
                     pool_name=pool_name,
                     lunid=normalize_text(disk.get("lunid")),
                     bus=normalize_text(disk.get("bus")),
+                    temperature_c=temperature_c,
+                    last_smart_test_type=normalize_text(latest_test.get("description")) if latest_test else None,
+                    last_smart_test_status=normalize_text(latest_test.get("status_verbose") or latest_test.get("status")) if latest_test else None,
+                    last_smart_test_lifetime_hours=latest_test.get("lifetime") if latest_test else None,
                     enclosure_id=enclosure_id,
                     slot=slot,
                     lookup_keys=lookup_keys,
@@ -683,6 +768,10 @@ class InventoryService:
             topology_label=zpool.topology_label if zpool else None,
             health=disk.health if disk and disk.health else zpool.health if zpool else raw_slot_status.get("status"),
             multipath=multipath,
+            temperature_c=disk.temperature_c if disk else None,
+            last_smart_test_type=disk.last_smart_test_type if disk else None,
+            last_smart_test_status=disk.last_smart_test_status if disk else None,
+            last_smart_test_lifetime_hours=disk.last_smart_test_lifetime_hours if disk else None,
             enclosure_identifier=normalize_text(raw_slot_status.get("descriptor")),
             led_supported=led_supported,
             led_backend=led_backend,
@@ -859,6 +948,66 @@ class InventoryService:
             bus=disk.bus,
             members=members,
         )
+
+    @staticmethod
+    def _lookup_disk_temperature(
+        temperatures: dict[str, int],
+        *device_names: str | None,
+    ) -> int | None:
+        for device_name in device_names:
+            normalized = normalize_device_name(device_name)
+            if not normalized:
+                continue
+            value = temperatures.get(normalized) or temperatures.get(normalized.lower())
+            if isinstance(value, int):
+                return value
+        return None
+
+    @staticmethod
+    def _lookup_smart_test(
+        tests: dict[str, dict[str, Any]],
+        *device_names: str | None,
+    ) -> dict[str, Any] | None:
+        for device_name in device_names:
+            normalized = normalize_device_name(device_name)
+            if not normalized:
+                continue
+            payload = tests.get(normalized.lower())
+            if payload:
+                return payload
+        return None
+
+    @staticmethod
+    def _smart_candidate_devices(slot_view: SlotView) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        if slot_view.multipath:
+            active_first = sorted(
+                slot_view.multipath.members,
+                key=lambda member: ((member.state or "").upper() != "ACTIVE", member.device_name),
+            )
+            for member in active_first:
+                normalized = normalize_device_name(member.device_name)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    candidates.append(normalized)
+
+            for fallback in (
+                slot_view.multipath.path_device_name,
+                slot_view.multipath.alternate_path_device,
+            ):
+                normalized = normalize_device_name(fallback)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    candidates.append(normalized)
+
+        normalized_device = normalize_device_name(slot_view.device_name)
+        if normalized_device and normalized_device not in seen:
+            seen.add(normalized_device)
+            candidates.append(normalized_device)
+
+        return candidates
 
     @staticmethod
     def _status_contains(raw_status: dict[str, Any], *needles: str) -> bool:

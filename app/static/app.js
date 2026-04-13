@@ -12,6 +12,7 @@
     autoRefresh: true,
     refreshIntervalSeconds: supportedRefreshIntervals.includes(bootstrapRefreshInterval) ? bootstrapRefreshInterval : 30,
     timerId: null,
+    smartSummaries: {},
   };
 
   const grid = document.getElementById("slot-grid");
@@ -131,6 +132,76 @@
     return slot.identify_active ? "On" : "Off";
   }
 
+  function getSmartCacheKey(slot) {
+    const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
+    const enclosurePart = state.snapshot.selected_enclosure_id || state.selectedEnclosureId || "all-enclosures";
+    return `${systemPart}|${enclosurePart}|${slot.slot}|${slot.device_name || "unknown"}`;
+  }
+
+  function getSmartSummaryEntry(slot) {
+    if (!slot) return null;
+    return state.smartSummaries[getSmartCacheKey(slot)] || null;
+  }
+
+  function formatTemperatureValue(slot, smartEntry) {
+    const temperature = smartEntry?.data?.temperature_c ?? slot.temperature_c;
+    if (Number.isInteger(temperature)) {
+      return `${temperature} C`;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return "n/a";
+  }
+
+  function formatLastSmartTestValue(slot, smartEntry) {
+    const data = smartEntry?.data;
+    const testType = data?.last_test_type || slot.last_smart_test_type;
+    const testStatus = data?.last_test_status || slot.last_smart_test_status;
+    const ageHours = data?.last_test_age_hours;
+    const lifetimeHours = data?.last_test_lifetime_hours ?? slot.last_smart_test_lifetime_hours;
+
+    if (testType && testStatus) {
+      let suffix = "";
+      if (Number.isInteger(ageHours)) {
+        suffix = ` (${ageHours}h ago)`;
+      } else if (Number.isInteger(lifetimeHours)) {
+        suffix = ` (@ ${lifetimeHours}h)`;
+      }
+      return `${testType}: ${testStatus}${suffix}`;
+    }
+
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+
+    return "n/a";
+  }
+
+  function formatPowerOnValue(smartEntry) {
+    const hours = smartEntry?.data?.power_on_hours;
+    const days = smartEntry?.data?.power_on_days;
+    if (Number.isInteger(hours)) {
+      return Number.isInteger(days) ? `${hours} hr (${days} d)` : `${hours} hr`;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return smartEntry?.data?.message ? "Unavailable" : "n/a";
+  }
+
+  function formatSectorSizeValue(smartEntry) {
+    const logical = smartEntry?.data?.logical_block_size;
+    const physical = smartEntry?.data?.physical_block_size;
+    if (Number.isInteger(logical) && Number.isInteger(physical)) {
+      return `${logical} B / ${physical} B`;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return smartEntry?.data?.message ? "Unavailable" : "n/a";
+  }
+
   function passesFilter(slot) {
     if (!state.search) return true;
     return (slot.search_text || "").includes(state.search);
@@ -226,13 +297,14 @@
   }
 
   function kvRow(label, value, copyable = false) {
-    const safeValue = escapeHtml(value || "n/a");
-    const encodedValue = value ? encodeURIComponent(value) : "";
+    const hasValue = value !== null && value !== undefined && value !== "";
+    const safeValue = escapeHtml(hasValue ? String(value) : "n/a");
+    const encodedValue = hasValue ? encodeURIComponent(String(value)) : "";
     return `
       <div class="kv-row">
         <div class="kv-label">${escapeHtml(label)}</div>
         <div class="kv-value">${safeValue}</div>
-        <div>${copyable && value ? `<button class="copy-button" data-copy="${encodedValue}">Copy</button>` : ""}</div>
+        <div>${copyable && hasValue ? `<button class="copy-button" data-copy="${encodedValue}">Copy</button>` : ""}</div>
       </div>
     `;
   }
@@ -250,8 +322,12 @@
     if (!slot) {
       detailEmpty.classList.remove("hidden");
       detailContent.classList.add("hidden");
-      detailSecondary.classList.add("hidden");
+      detailSecondary.classList.remove("hidden");
       detailLedControls.classList.add("hidden");
+      renderTopologyContext(null);
+      renderMultipathContext(null);
+      resetMappingForm();
+      setMappingFormEnabled(false);
       ledButtons.forEach((button) => {
         button.disabled = true;
       });
@@ -265,6 +341,7 @@
     detailSlotTitle.textContent = `Slot ${slot.slot_label}`;
     detailStatePill.textContent = stateLabel(slot);
     detailStatePill.className = `state-pill state-${slot.state}`;
+    const smartEntry = getSmartSummaryEntry(slot);
 
     detailKvGrid.innerHTML = [
       kvRow("Device", slot.device_name),
@@ -277,6 +354,10 @@
       kvRow("Class", slot.vdev_class),
       kvRow("Topology", slot.topology_label),
       kvRow("Health", slot.health),
+      kvRow("Temp", formatTemperatureValue(slot, smartEntry)),
+      kvRow("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
+      kvRow("Power On", formatPowerOnValue(smartEntry)),
+      kvRow("Sector Size", formatSectorSizeValue(smartEntry)),
       kvRow("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
       kvRow("LED", ledStatusLabel(slot)),
       kvRow("Mapping", slot.mapping_source),
@@ -301,13 +382,20 @@
     mappingForm.device_name.value = slot.device_name || "";
     mappingForm.gptid.value = slot.gptid || "";
     mappingForm.notes.value = slot.notes || "";
+    setMappingFormEnabled(true);
     ledButtons.forEach((button) => {
       button.disabled = !slot.led_supported;
     });
+    void ensureSmartSummary(slot);
   }
 
   function renderTopologyContext(slot) {
     if (!topologyContext) {
+      return;
+    }
+
+    if (!slot) {
+      topologyContext.innerHTML = '<div class="warning-item muted">Select a mapped slot to inspect its vdev peers.</div>';
       return;
     }
 
@@ -364,6 +452,11 @@
       return;
     }
 
+    if (!slot) {
+      multipathContext.innerHTML = '<div class="warning-item muted">Select a multipath-backed slot to inspect active and standby member paths.</div>';
+      return;
+    }
+
     const multipath = slot.multipath;
     if (!multipath) {
       multipathContext.innerHTML = '<div class="warning-item muted">This slot is not currently presented through gmultipath.</div>';
@@ -371,10 +464,34 @@
     }
 
     const activeMembers = multipath.members.filter((member) => (member.state || "").toUpperCase() === "ACTIVE");
-    const standbyMembers = multipath.members.filter((member) => {
+    const passiveMembers = multipath.members.filter((member) => (member.state || "").toUpperCase() === "PASSIVE");
+    const failedMembers = multipath.members.filter((member) => {
       const stateName = (member.state || "").toUpperCase();
-      return stateName && stateName !== "ACTIVE";
+      return stateName === "FAIL" || stateName === "FAILED";
     });
+    const otherMembers = multipath.members.filter((member) => {
+      const stateName = (member.state || "").toUpperCase();
+      return stateName && stateName !== "ACTIVE" && stateName !== "PASSIVE" && stateName !== "FAIL" && stateName !== "FAILED";
+    });
+
+    const sections = [
+      {
+        label: activeMembers.length > 1 ? "Active Paths" : "Active Path",
+        members: activeMembers,
+      },
+      {
+        label: passiveMembers.length > 1 ? "Passive Paths" : "Passive Path",
+        members: passiveMembers,
+      },
+      {
+        label: failedMembers.length > 1 ? "Failed Paths" : "Failed Path",
+        members: failedMembers,
+      },
+      {
+        label: otherMembers.length > 1 ? "Other Member Paths" : "Other Member Path",
+        members: otherMembers,
+      },
+    ].filter((section) => section.members.length);
 
     multipathContext.innerHTML = `
       <div class="topology-summary">
@@ -384,17 +501,26 @@
       <div class="topology-grid">
         ${topologyInfoCard("Mode", multipath.mode)}
         ${topologyInfoCard("State", multipath.state || multipath.provider_state)}
-        ${topologyInfoCard("Bus", multipath.bus)}
+        ${topologyInfoCard("Transport", multipath.bus)}
         ${topologyInfoCard("LUN ID", multipath.lunid)}
       </div>
-      <div class="topology-summary">
-        <div class="topology-label">Active Path</div>
-        <div class="topology-pill-row">${renderMultipathPills(activeMembers)}</div>
-      </div>
-      <div class="topology-summary">
-        <div class="topology-label">Other Member Paths</div>
-        <div class="topology-pill-row">${renderMultipathPills(standbyMembers.length ? standbyMembers : multipath.members.filter((member) => !activeMembers.includes(member)))}</div>
-      </div>
+      ${sections.length
+        ? sections
+            .map(
+              (section) => `
+                <div class="topology-summary">
+                  <div class="topology-label">${escapeHtml(section.label)}</div>
+                  <div class="topology-pill-row">${renderMultipathPills(section.members)}</div>
+                </div>
+              `
+            )
+            .join("")
+        : `
+            <div class="topology-summary">
+              <div class="topology-label">Member Paths</div>
+              <div class="topology-pill-row">${renderMultipathPills(multipath.members)}</div>
+            </div>
+          `}
     `;
   }
 
@@ -423,7 +549,7 @@
         return `
           <div class="topology-pill path-state-${stateName.toLowerCase()}">
             <span>${escapeHtml(member.device_name)}</span>
-            <small>${escapeHtml(detailParts.join(" · "))}</small>
+            <small>${escapeHtml(detailParts.join(" / "))}</small>
           </div>
         `;
       })
@@ -689,6 +815,43 @@
     mappingForm.serial.value = slot.serial || "";
     mappingForm.device_name.value = slot.device_name || "";
     mappingForm.gptid.value = slot.gptid || "";
+  }
+
+  function resetMappingForm() {
+    mappingForm.serial.value = "";
+    mappingForm.device_name.value = "";
+    mappingForm.gptid.value = "";
+    mappingForm.notes.value = "";
+  }
+
+  function setMappingFormEnabled(enabled) {
+    mappingForm.querySelectorAll("input, textarea, button").forEach((element) => {
+      element.disabled = !enabled;
+    });
+    prefillMappingButton.disabled = !enabled;
+  }
+
+  async function ensureSmartSummary(slot) {
+    const cacheKey = getSmartCacheKey(slot);
+    const entry = state.smartSummaries[cacheKey];
+    if (entry?.loading || entry?.data) {
+      return;
+    }
+
+    state.smartSummaries[cacheKey] = { loading: true };
+    try {
+      const payload = await sendScopedRequest(`/api/slots/${slot.slot}/smart`);
+      state.smartSummaries[cacheKey] = { loading: false, data: payload };
+    } catch (error) {
+      state.smartSummaries[cacheKey] = {
+        loading: false,
+        data: { available: false, message: error.message || String(error) },
+      };
+    }
+
+    if (state.selectedSlot === slot.slot) {
+      renderDetail();
+    }
   }
 
   function formatRefreshInterval(seconds) {

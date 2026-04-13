@@ -67,6 +67,20 @@ class MultipathView(BaseModel):
     members: list[MultipathMember] = Field(default_factory=list)
 
 
+class SmartSummaryView(BaseModel):
+    available: bool = False
+    temperature_c: int | None = None
+    last_test_type: str | None = None
+    last_test_status: str | None = None
+    last_test_lifetime_hours: int | None = None
+    last_test_age_hours: int | None = None
+    power_on_hours: int | None = None
+    power_on_days: int | None = None
+    logical_block_size: int | None = None
+    physical_block_size: int | None = None
+    message: str | None = None
+
+
 class SlotView(BaseModel):
     slot: int
     slot_label: str
@@ -90,6 +104,10 @@ class SlotView(BaseModel):
     topology_label: str | None = None
     health: str | None = None
     multipath: MultipathView | None = None
+    temperature_c: int | None = None
+    last_smart_test_type: str | None = None
+    last_smart_test_status: str | None = None
+    last_smart_test_lifetime_hours: int | None = None
     enclosure_identifier: str | None = None
     led_supported: bool = False
     led_backend: str | None = None

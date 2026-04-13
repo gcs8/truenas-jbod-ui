@@ -36,6 +36,8 @@ class TrueNASRawData:
     enclosures: list[dict[str, Any]]
     disks: list[dict[str, Any]]
     pools: list[dict[str, Any]]
+    disk_temperatures: dict[str, int]
+    smart_test_results: list[dict[str, Any]]
 
 
 class TrueNASWebsocketClient:
@@ -59,11 +61,39 @@ class TrueNASWebsocketClient:
                 logger.warning("disk.query with extra.pools failed; retrying without extra options.")
                 disks = await self._call(ws, "disk.query", [[]])
             pools = await self._call(ws, "pool.query", [])
+            disk_temperatures: dict[str, int] = {}
+            smart_test_results: list[dict[str, Any]] = []
+            try:
+                temperatures = await self._call(ws, "disk.temperatures", [[]])
+                if isinstance(temperatures, dict):
+                    disk_temperatures = {
+                        str(key): value
+                        for key, value in temperatures.items()
+                        if isinstance(value, int)
+                    }
+            except TrueNASAPIError:
+                logger.warning("disk.temperatures failed; continuing without temperature overview.")
+            try:
+                results = await self._call(ws, "smart.test.results", [])
+                if isinstance(results, list):
+                    smart_test_results = [item for item in results if isinstance(item, dict)]
+            except TrueNASAPIError:
+                logger.warning("smart.test.results failed; continuing without SMART test overview.")
             return TrueNASRawData(
                 enclosures=self._ensure_list(enclosures),
                 disks=self._ensure_list(disks),
                 pools=self._ensure_list(pools),
+                disk_temperatures=disk_temperatures,
+                smart_test_results=smart_test_results,
             )
+
+    async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None) -> str:
+        command_args = args or ["-a", "-j"]
+        async with self._session() as ws:
+            result = await self._call(ws, "disk.smartctl", [disk_name, command_args])
+            if not isinstance(result, str):
+                raise TrueNASAPIError(f"disk.smartctl returned unexpected payload type for {disk_name!r}.")
+            return result
 
     async def set_slot_status(self, enclosure_id: str, slot_number: int, status: str) -> None:
         async with self._session() as ws:
