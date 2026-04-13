@@ -14,6 +14,7 @@ DEVICE_REGEX = re.compile(
 GPTID_REGEX = re.compile(r"(?P<gptid>(?:/dev/)?gptid/[A-Za-z0-9\-_.]+)", re.IGNORECASE)
 GUID_REGEX = re.compile(r"^[0-9]{16,}$")
 SLOT_REGEX = re.compile(r"(?:slot|bay|element)\D{0,4}(?P<slot>\d{1,3})", re.IGNORECASE)
+HEX_VALUE_REGEX = re.compile(r"^(?:0x)?(?P<value>[0-9a-fA-F]+)$")
 
 
 @dataclass(slots=True)
@@ -43,6 +44,7 @@ class ParsedSSHData:
     camcontrol_controllers: dict[str, str] = field(default_factory=dict)
     ses_slot_candidates: dict[int, dict[str, Any]] = field(default_factory=dict)
     ses_selected_meta: dict[str, str | None] = field(default_factory=dict)
+    ses_enclosures: list["SESMapEnclosure"] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -59,6 +61,8 @@ class SESMapSlot:
     model: str | None = None
     size_text: str | None = None
     present: bool | None = None
+    sas_address: str | None = None
+    sas_device_type: str | None = None
 
 
 @dataclass(slots=True)
@@ -66,6 +70,9 @@ class SESMapEnclosure:
     ses_device: str | None = None
     enclosure_id: str | None = None
     enclosure_name: str | None = None
+    enclosure_label: str | None = None
+    layout_rows: int | None = None
+    layout_columns: int | None = None
     slots: dict[int, SESMapSlot] = field(default_factory=dict)
 
 
@@ -136,6 +143,26 @@ def normalize_lookup_keys(value: str | None) -> set[str]:
         keys.add(gptid.lower())
 
     return keys
+
+
+def normalize_hex_identifier(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = HEX_VALUE_REGEX.match(value.strip())
+    if not match:
+        return None
+    normalized = match.group("value").lower().lstrip("0")
+    return normalized or "0"
+
+
+def shift_hex_identifier(value: str | None, delta: int) -> str | None:
+    normalized = normalize_hex_identifier(value)
+    if normalized is None:
+        return None
+    shifted = int(normalized, 16) + delta
+    if shifted < 0:
+        return None
+    return f"{shifted:x}"
 
 
 def format_bytes(size_bytes: int | None) -> str | None:
@@ -462,6 +489,127 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
     return [item for item in enclosures if item.slots]
 
 
+def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure | None:
+    """
+    Parse `sg_ses -p aes /dev/sgN` output into an enclosure/slot record.
+
+    On Linux/TrueNAS SCALE, the AES page is the first practical slot source we
+    have found for these Supermicro shelves. It exposes per-slot SAS addresses
+    and element indices, which is enough to build a slot map even before we have
+    prettier enclosure APIs available.
+    """
+
+    ses_device = _extract_sg_ses_device(command)
+    enclosure = SESMapEnclosure(ses_device=ses_device)
+    current_slot: SESMapSlot | None = None
+    in_array_slots = False
+
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if enclosure.enclosure_name is None:
+            name = normalize_text(" ".join(stripped.split()))
+            if name:
+                enclosure.enclosure_name = name
+            continue
+
+        if stripped.startswith("Primary enclosure logical identifier"):
+            enclosure.enclosure_id = normalize_text(stripped.split(":", 1)[1])
+            continue
+
+        if stripped.startswith("Element type:"):
+            in_array_slots = "Array device slot" in stripped
+            current_slot = None
+            continue
+
+        if not in_array_slots:
+            continue
+
+        element_match = re.match(r"Element index:\s*(?P<element>\d+)", stripped)
+        if element_match:
+            current_slot = SESMapSlot(
+                slot_number=-1,
+                element_id=int(element_match.group("element")),
+                ses_device=ses_device,
+            )
+            continue
+
+        if current_slot is None:
+            continue
+
+        slot_match = re.search(r"device slot number:\s*(?P<slot>\d+)", stripped, re.IGNORECASE)
+        if slot_match:
+            current_slot.slot_number = int(slot_match.group("slot"))
+            current_slot.description = f"Slot {current_slot.slot_number:02d}"
+            current_slot.control_targets = _merge_control_targets(
+                current_slot.control_targets,
+                [
+                    {
+                        "ses_device": ses_device,
+                        "ses_element_id": current_slot.element_id,
+                    }
+                ],
+            )
+            enclosure.slots[current_slot.slot_number] = current_slot
+            continue
+
+        if stripped.startswith("SAS device type:"):
+            current_slot.sas_device_type = normalize_text(stripped.split(":", 1)[1])
+            if current_slot.sas_device_type:
+                lowered = current_slot.sas_device_type.lower()
+                current_slot.present = "no sas device attached" not in lowered
+            continue
+
+        if stripped.startswith("SAS address:"):
+            current_slot.sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
+            if current_slot.sas_address == "0":
+                current_slot.present = False
+            elif current_slot.sas_address:
+                current_slot.present = True
+            continue
+
+    if not enclosure.slots:
+        return None
+
+    slot_count = max(enclosure.slots) + 1
+    enclosure.enclosure_label, enclosure.layout_rows, enclosure.layout_columns = _infer_scale_enclosure_profile(
+        enclosure,
+        slot_count,
+    )
+    return enclosure
+
+
+def _extract_sg_ses_device(command: str | None) -> str | None:
+    if not command:
+        return None
+    match = re.search(r"(/dev/sg\d+)", command)
+    return normalize_text(match.group(1)) if match else None
+
+
+def _infer_scale_enclosure_profile(
+    enclosure: SESMapEnclosure,
+    slot_count: int,
+) -> tuple[str | None, int | None, int | None]:
+    name = (enclosure.enclosure_name or "").lower()
+    ses_device = (enclosure.ses_device or "").lower()
+
+    if "sas3x40" in name or slot_count == 24 or ses_device.endswith("sg27"):
+        return "Front 24 Bay", 4, 6
+    if "sas3x28" in name or slot_count == 12 or ses_device.endswith("sg38"):
+        return "Rear 12 Bay", 3, 4
+    if slot_count == 60:
+        return "60 Bay Shelf", 4, 15
+    if slot_count == 30:
+        return "30 Bay Shelf", 3, 10
+
+    rows = max(1, min(4, slot_count))
+    columns = max(1, (slot_count + rows - 1) // rows)
+    return f"{slot_count} Bay SES", rows, columns
+
+
 def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclosure]:
     merged: dict[str, SESMapEnclosure] = {}
 
@@ -473,10 +621,16 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
                 ses_device=enclosure.ses_device,
                 enclosure_id=enclosure.enclosure_id,
                 enclosure_name=enclosure.enclosure_name,
+                enclosure_label=enclosure.enclosure_label,
+                layout_rows=enclosure.layout_rows,
+                layout_columns=enclosure.layout_columns,
                 slots={},
             ),
         )
         target.ses_device = target.ses_device or enclosure.ses_device
+        target.enclosure_label = target.enclosure_label or enclosure.enclosure_label
+        target.layout_rows = target.layout_rows or enclosure.layout_rows
+        target.layout_columns = target.layout_columns or enclosure.layout_columns
 
         for slot_number, slot in enclosure.slots.items():
             existing = target.slots.get(slot_number)
@@ -495,6 +649,8 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
             existing.serial = existing.serial or slot.serial
             existing.model = existing.model or slot.model
             existing.size_text = existing.size_text or slot.size_text
+            existing.sas_address = existing.sas_address or slot.sas_address
+            existing.sas_device_type = existing.sas_device_type or slot.sas_device_type
             if existing.present is None:
                 existing.present = slot.present
             elif slot.present is not None:
@@ -709,10 +865,13 @@ def build_slot_candidates_from_ses_enclosures(
                 if slot.present is not None
                 else bool(slot.device_names) and "not installed" not in (slot.status or "").lower(),
                 "enclosure_id": enclosure.enclosure_id,
+                "enclosure_label": enclosure.enclosure_label,
                 "enclosure_name": enclosure.enclosure_name,
                 "ses_device": enclosure.ses_device,
                 "ses_element_id": slot.element_id,
                 "ses_slot_number": slot.slot_number,
+                "sas_address_hint": slot.sas_address,
+                "sas_device_type": slot.sas_device_type,
                 "ses_targets": _merge_control_targets(
                     slot.control_targets,
                     [
@@ -727,7 +886,11 @@ def build_slot_candidates_from_ses_enclosures(
 
     return candidates, {
         "id": "+".join(filter(None, [item.enclosure_id for item in ordered])) or None,
-        "label": " + ".join(labels) if labels else None,
+        "label": " + ".join(
+            filter(None, [item.enclosure_label or item.enclosure_name or item.enclosure_id for item in ordered])
+        )
+        if ordered
+        else None,
         "name": ordered[0].enclosure_name if len(ordered) == 1 else "SES Combined View" if ordered else None,
     }
 
@@ -1186,6 +1349,18 @@ def canonicalize_ssh_command(command: str) -> str:
         return "sesutil map"
     if executable == "sesutil" and args[:1] == ["show"]:
         return "sesutil show"
+    if executable == "sg_ses":
+        target_device = next((arg for arg in reversed(args) if arg.startswith("/dev/sg")), None)
+        has_aes_page = False
+        for index, arg in enumerate(args):
+            if arg == "-p" and index + 1 < len(args) and args[index + 1].lower() == "aes":
+                has_aes_page = True
+                break
+            if arg.lower() == "aes":
+                has_aes_page = True
+                break
+        if has_aes_page and target_device:
+            return f"sg_ses aes {target_device}"
 
     return " ".join([executable] + args).strip()
 
@@ -1219,6 +1394,7 @@ def parse_ssh_outputs(
 
     if normalized_outputs.get("sesutil map"):
         ses_map_enclosures = parse_sesutil_map(normalized_outputs["sesutil map"])
+        parsed.ses_enclosures.extend(ses_map_enclosures)
         parsed.ses_slot_candidates, parsed.ses_selected_meta = build_slot_candidates_from_ses_enclosures(
             ses_map_enclosures,
             slot_count,
@@ -1228,6 +1404,7 @@ def parse_ssh_outputs(
 
     if normalized_outputs.get("sesutil show"):
         ses_show_enclosures = parse_sesutil_show_enclosures(normalized_outputs["sesutil show"])
+        parsed.ses_enclosures.extend(ses_show_enclosures)
         show_candidates, show_meta = build_slot_candidates_from_ses_enclosures(
             ses_show_enclosures,
             slot_count,
@@ -1236,6 +1413,16 @@ def parse_ssh_outputs(
         )
         parsed.ses_slot_candidates = merge_slot_candidate_maps(parsed.ses_slot_candidates, show_candidates)
         parsed.ses_selected_meta = merge_enclosure_meta(parsed.ses_selected_meta, show_meta)
+
+    for command_key, output in normalized_outputs.items():
+        if not command_key.startswith("sg_ses aes /dev/sg"):
+            continue
+        enclosure = parse_sg_ses_aes(output, command_key)
+        if enclosure:
+            parsed.ses_enclosures.append(enclosure)
+
+    if parsed.ses_enclosures:
+        parsed.ses_enclosures = _merge_ses_enclosures(parsed.ses_enclosures)
 
     for slot, payload in parsed.ses_slot_candidates.items():
         device_hint = normalize_device_name(payload.get("device_hint"))

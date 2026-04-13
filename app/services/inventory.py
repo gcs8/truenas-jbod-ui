@@ -27,16 +27,19 @@ from app.models.domain import (
 from app.services.mapping_store import MappingStore
 from app.services.parsers import (
     ParsedSSHData,
+    build_slot_candidates_from_ses_enclosures,
     extract_enclosure_slot_candidates,
     format_bytes,
     merge_slot_candidate_maps,
     normalize_device_name,
+    normalize_hex_identifier,
     normalize_lookup_keys,
     normalize_text,
     parse_pool_query_topology,
     parse_smart_test_results,
     parse_smartctl_summary,
     parse_ssh_outputs,
+    shift_hex_identifier,
 )
 from app.services.ssh_probe import SSHProbe
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebsocketClient
@@ -46,6 +49,16 @@ logger = logging.getLogger(__name__)
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def build_layout_rows(rows: int, columns: int, slot_count: int) -> list[list[int]]:
+    layout_rows: list[list[int]] = []
+    for row_index in reversed(range(rows)):
+        start = row_index * columns
+        row_slots = [slot for slot in range(start, start + columns) if slot < slot_count]
+        if row_slots:
+            layout_rows.append(row_slots)
+    return layout_rows
 
 
 @dataclass(slots=True)
@@ -182,9 +195,18 @@ class InventoryService:
         if not slot_view:
             raise TrueNASAPIError(f"Slot {slot:02d} is not present in the current snapshot.")
 
+        if self.system.truenas.platform == "scale":
+            return self._fallback_smart_summary(
+                slot_view,
+                "Detailed SMART JSON is not currently available through the SCALE API on this system.",
+            )
+
         candidates = self._smart_candidate_devices(slot_view)
         if not candidates:
-            return SmartSummaryView(available=False, message="No SMART-capable device path is available for this slot.")
+            return self._fallback_smart_summary(
+                slot_view,
+                "No SMART-capable device path is available for this slot.",
+            )
 
         cache_key = f"{self.system.id}|{'|'.join(candidates)}"
         cache_until = self._smart_cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
@@ -216,13 +238,9 @@ class InventoryService:
             self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
             return summary
 
-        return SmartSummaryView(
-            available=False,
-            temperature_c=slot_view.temperature_c,
-            last_test_type=slot_view.last_smart_test_type,
-            last_test_status=slot_view.last_smart_test_status,
-            last_test_lifetime_hours=slot_view.last_smart_test_lifetime_hours,
-            message=last_error or "SMART summary is unavailable for this slot.",
+        return self._fallback_smart_summary(
+            slot_view,
+            last_error or "SMART summary is unavailable for this slot.",
         )
 
     async def export_mapping_bundle(self, selected_enclosure_id: str | None = None) -> MappingBundle:
@@ -301,13 +319,26 @@ class InventoryService:
                 sources["ssh"] = SourceStatus(enabled=True, ok=False, message=str(exc))
                 warnings.append("SSH mode is enabled but could not collect fallback command output.")
 
+        has_scale_linux_ses = self._has_scale_linux_ses(ssh_data)
         if not raw_data.enclosures:
-            warnings.append(
-                "TrueNAS API returned no enclosure rows. API-only mode can still show disk and pool metadata, "
-                "but physical slot mapping on this system will require SSH enrichment or manual calibration."
-            )
+            if self.system.truenas.platform == "scale" and has_scale_linux_ses:
+                warnings.append(
+                    "TrueNAS SCALE did not return enclosure rows, so this view is using Linux SES AES page parsing "
+                    "for slot mapping on the selected enclosure."
+                )
+            elif self.system.truenas.platform == "scale":
+                warnings.append(
+                    "TrueNAS SCALE did not return mappable enclosure rows. This first-pass SCALE mode can still "
+                    "show disk and pool metadata, but physical slot mapping and LED control will require future "
+                    "Linux enclosure support or manual calibration."
+                )
+            else:
+                warnings.append(
+                    "TrueNAS API returned no enclosure rows. API-only mode can still show disk and pool metadata, "
+                    "but physical slot mapping on this system will require SSH enrichment or manual calibration."
+                )
 
-        slots, available_enclosures, selected_meta = self._correlate(
+        slots, available_enclosures, selected_meta, layout_rows, layout_slot_count, layout_columns = self._correlate(
             raw_data,
             ssh_data,
             warnings,
@@ -335,10 +366,16 @@ class InventoryService:
             enclosure_count=len(raw_data.enclosures),
             mapped_slot_count=sum(1 for slot in slots if slot.device_name),
             manual_mapping_count=self.mapping_store.count_for_system(self.system.id),
-            ssh_slot_hint_count=len(ssh_data.ses_slot_candidates),
+            ssh_slot_hint_count=max(
+                len(ssh_data.ses_slot_candidates),
+                sum(len(enclosure.slots) for enclosure in ssh_data.ses_enclosures),
+            ),
         )
         return InventorySnapshot(
             slots=slots,
+            layout_rows=layout_rows,
+            layout_slot_count=layout_slot_count,
+            layout_columns=layout_columns,
             refresh_interval_seconds=self.settings.app.refresh_interval_seconds,
             selected_system_id=self.system.id,
             selected_system_label=self.system.label,
@@ -360,7 +397,10 @@ class InventoryService:
         ssh_data: ParsedSSHData,
         warnings: list[str],
         selected_enclosure_id: str | None = None,
-    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None]]:
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int]], int, int]:
+        if self.system.truenas.platform == "scale" and self._has_scale_linux_ses(ssh_data):
+            return self._correlate_scale_linux(raw_data, ssh_data, warnings, selected_enclosure_id)
+
         slot_count = self.settings.layout.slot_count
         api_candidates, api_selected_meta = extract_enclosure_slot_candidates(
             raw_data.enclosures,
@@ -370,7 +410,7 @@ class InventoryService:
             selected_enclosure_id,
         )
         selected_meta = self._merge_enclosure_meta(ssh_data.ses_selected_meta, api_selected_meta)
-        available_enclosures = self._build_enclosure_options(raw_data, selected_meta)
+        available_enclosures = self._build_enclosure_options(raw_data, ssh_data, selected_meta)
         api_enclosure_ids = {
             enclosure_id
             for enclosure_id in (
@@ -382,6 +422,10 @@ class InventoryService:
             api_enclosure_ids.add(api_selected_meta["id"])
         slot_candidates = merge_slot_candidate_maps(ssh_data.ses_slot_candidates, api_candidates)
         api_topology_members = parse_pool_query_topology(raw_data.pools)
+        selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, selected_meta)
+        layout_rows_count = selected_option.rows if selected_option and selected_option.rows else self.settings.layout.rows
+        layout_columns = selected_option.columns if selected_option and selected_option.columns else self.settings.layout.columns
+        layout_slot_count = selected_option.slot_count if selected_option and selected_option.slot_count else slot_count
         disk_records = self._build_disk_records(
             raw_data.disks,
             ssh_data,
@@ -391,22 +435,39 @@ class InventoryService:
 
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
+        disks_by_sas: dict[str, DiskRecord] = {}
         for disk in disk_records:
             for key in disk.lookup_keys:
                 disks_by_key[key] = disk
             if disk.slot is not None:
                 disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
                 disks_by_slot[(None, disk.slot)] = disk
+            if disk.lunid:
+                normalized_lunid = normalize_hex_identifier(disk.lunid)
+                if normalized_lunid:
+                    disks_by_sas[normalized_lunid] = disk
+                incremented_lunid = shift_hex_identifier(disk.lunid, 1)
+                if incremented_lunid:
+                    disks_by_sas[incremented_lunid] = disk
 
         slot_views: list[SlotView] = []
 
-        for slot in range(slot_count):
-            row_index = slot // self.settings.layout.columns
-            column_index = slot % self.settings.layout.columns
+        for slot in range(layout_slot_count):
+            row_index = slot // layout_columns
+            column_index = slot % layout_columns
             candidate = slot_candidates.get(slot, {})
             enclosure_id = selected_meta.get("id") or normalize_text(candidate.get("enclosure_id"))
             mapping = self.mapping_store.get_mapping(self.system.id, enclosure_id, slot)
-            disk = self._resolve_disk_for_slot(slot, enclosure_id, mapping, disks_by_key, disks_by_slot, candidate, ssh_data)
+            disk = self._resolve_disk_for_slot(
+                slot,
+                enclosure_id,
+                mapping,
+                disks_by_key,
+                disks_by_slot,
+                disks_by_sas,
+                candidate,
+                ssh_data,
+            )
             slot_view = self._build_slot_view(
                 slot=slot,
                 row_index=row_index,
@@ -423,11 +484,116 @@ class InventoryService:
                 warnings.append(f"Manual mapping for slot {slot:02d} did not match any current disk.")
             slot_views.append(slot_view)
 
-        return slot_views, available_enclosures, selected_meta
+        return (
+            slot_views,
+            available_enclosures,
+            selected_meta,
+            build_layout_rows(layout_rows_count, layout_columns, layout_slot_count),
+            layout_slot_count,
+            layout_columns,
+        )
+
+    def _correlate_scale_linux(
+        self,
+        raw_data: TrueNASRawData,
+        ssh_data: ParsedSSHData,
+        warnings: list[str],
+        selected_enclosure_id: str | None,
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int]], int, int]:
+        available_enclosures = self._build_scale_linux_enclosure_options(ssh_data)
+        selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
+        if selected_option is None:
+            return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
+
+        slot_count = selected_option.slot_count or self.settings.layout.slot_count
+        ssh_candidates, ssh_meta = build_slot_candidates_from_ses_enclosures(
+            ssh_data.ses_enclosures,
+            slot_count,
+            self.system.truenas.enclosure_filter,
+            selected_option.id,
+        )
+        api_candidates, api_selected_meta = extract_enclosure_slot_candidates(
+            raw_data.enclosures,
+            self.system.truenas.enclosure_filter,
+            slot_count,
+            self.settings.layout.api_slot_number_base,
+            None,
+        )
+        selected_meta = self._merge_enclosure_meta(self._enclosure_option_meta(selected_option), api_selected_meta)
+        selected_meta = self._merge_enclosure_meta(selected_meta, ssh_meta)
+        slot_candidates = merge_slot_candidate_maps(ssh_candidates, api_candidates)
+        api_topology_members = parse_pool_query_topology(raw_data.pools)
+        api_enclosure_ids: set[str] = set()
+        disk_records = self._build_disk_records(
+            raw_data.disks,
+            ssh_data,
+            raw_data.disk_temperatures,
+            parse_smart_test_results(raw_data.smart_test_results),
+        )
+
+        disks_by_key: dict[str, DiskRecord] = {}
+        disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
+        disks_by_sas: dict[str, DiskRecord] = {}
+        for disk in disk_records:
+            for key in disk.lookup_keys:
+                disks_by_key[key] = disk
+            if disk.slot is not None:
+                disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
+                disks_by_slot[(None, disk.slot)] = disk
+            if disk.lunid:
+                normalized_lunid = normalize_hex_identifier(disk.lunid)
+                if normalized_lunid:
+                    disks_by_sas[normalized_lunid] = disk
+                incremented_lunid = shift_hex_identifier(disk.lunid, 1)
+                if incremented_lunid:
+                    disks_by_sas[incremented_lunid] = disk
+
+        rows = selected_option.rows or self.settings.layout.rows
+        columns = selected_option.columns or self.settings.layout.columns
+        slot_views: list[SlotView] = []
+
+        for slot in range(slot_count):
+            candidate = slot_candidates.get(slot, {})
+            mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            disk = self._resolve_disk_for_slot(
+                slot,
+                selected_option.id,
+                mapping,
+                disks_by_key,
+                disks_by_slot,
+                disks_by_sas,
+                candidate,
+                ssh_data,
+            )
+            slot_view = self._build_slot_view(
+                slot=slot,
+                row_index=slot // columns,
+                column_index=slot % columns,
+                enclosure_meta=selected_meta,
+                raw_slot_status=candidate,
+                disk=disk,
+                mapping=mapping,
+                ssh_data=ssh_data,
+                api_topology_members=api_topology_members,
+                api_enclosure_ids=api_enclosure_ids,
+            )
+            if mapping and not disk:
+                warnings.append(f"Manual mapping for slot {slot:02d} did not match any current disk.")
+            slot_views.append(slot_view)
+
+        return (
+            slot_views,
+            available_enclosures,
+            selected_meta,
+            build_layout_rows(rows, columns, slot_count),
+            slot_count,
+            columns,
+        )
 
     def _build_enclosure_options(
         self,
         raw_data: TrueNASRawData,
+        ssh_data: ParsedSSHData,
         selected_meta: dict[str, str | None],
     ) -> list[EnclosureOption]:
         options: list[EnclosureOption] = []
@@ -455,6 +621,13 @@ class InventoryService:
                 )
             )
 
+        if self.system.truenas.platform == "scale":
+            for enclosure in self._build_scale_linux_enclosure_options(ssh_data):
+                if enclosure.id in seen_ids:
+                    continue
+                seen_ids.add(enclosure.id)
+                options.append(enclosure)
+
         selected_id = normalize_text(selected_meta.get("id"))
         if selected_id and selected_id not in seen_ids:
             options.append(
@@ -466,6 +639,61 @@ class InventoryService:
             )
 
         return options
+
+    def _build_scale_linux_enclosure_options(self, ssh_data: ParsedSSHData) -> list[EnclosureOption]:
+        options: list[EnclosureOption] = []
+        for enclosure in ssh_data.ses_enclosures:
+            if not enclosure.enclosure_id:
+                continue
+            slot_count = max(enclosure.slots) + 1 if enclosure.slots else 0
+            options.append(
+                EnclosureOption(
+                    id=enclosure.enclosure_id,
+                    label=enclosure.enclosure_label or enclosure.enclosure_name or enclosure.enclosure_id,
+                    name=enclosure.enclosure_name,
+                    rows=enclosure.layout_rows,
+                    columns=enclosure.layout_columns,
+                    slot_count=slot_count,
+                )
+            )
+
+        return sorted(
+            options,
+            key=lambda item: (
+                0 if "front" in item.label.lower() else 1 if "rear" in item.label.lower() else 2,
+                item.slot_count or 0,
+                item.label,
+            ),
+        )
+
+    @staticmethod
+    def _enclosure_option_meta(option: EnclosureOption) -> dict[str, str | None]:
+        return {
+            "id": option.id,
+            "label": option.label,
+            "name": option.name,
+        }
+
+    @staticmethod
+    def _resolve_selected_enclosure_option(
+        options: list[EnclosureOption],
+        selected_enclosure_id: str | None,
+        selected_meta: dict[str, str | None],
+    ) -> EnclosureOption | None:
+        option_by_id = {item.id: item for item in options}
+        if selected_enclosure_id and selected_enclosure_id in option_by_id:
+            return option_by_id[selected_enclosure_id]
+        selected_meta_id = normalize_text(selected_meta.get("id"))
+        if selected_meta_id and selected_meta_id in option_by_id:
+            return option_by_id[selected_meta_id]
+        return options[0] if options else None
+
+    @staticmethod
+    def _has_scale_linux_ses(ssh_data: ParsedSSHData) -> bool:
+        return any(
+            enclosure.ses_device and enclosure.ses_device.startswith("/dev/sg")
+            for enclosure in ssh_data.ses_enclosures
+        )
 
     def _build_disk_records(
         self,
@@ -519,6 +747,13 @@ class InventoryService:
                 gptid = ssh_data.glabel.device_to_gptid.get(device_name.lower())
                 if gptid:
                     lookup_keys.update(normalize_lookup_keys(gptid))
+
+            normalized_lunid = normalize_hex_identifier(disk.get("lunid"))
+            if normalized_lunid:
+                lookup_keys.add(normalized_lunid)
+            incremented_lunid = shift_hex_identifier(disk.get("lunid"), 1)
+            if incremented_lunid:
+                lookup_keys.add(incremented_lunid)
 
             records.append(
                 DiskRecord(
@@ -582,6 +817,7 @@ class InventoryService:
         mapping: ManualMapping | None,
         disks_by_key: dict[str, DiskRecord],
         disks_by_slot: dict[tuple[str | None, int], DiskRecord],
+        disks_by_sas: dict[str, DiskRecord],
         raw_slot_status: dict[str, Any],
         ssh_data: ParsedSSHData,
     ) -> DiskRecord | None:
@@ -614,6 +850,12 @@ class InventoryService:
                 hinted = disks_by_key.get(key)
                 if hinted:
                     return hinted
+
+        sas_address_hint = normalize_hex_identifier(raw_slot_status.get("sas_address_hint"))
+        if sas_address_hint:
+            hinted = disks_by_sas.get(sas_address_hint)
+            if hinted:
+                return hinted
 
         ssh_device_hint = ssh_data.ses_slot_to_device.get(slot)
         if ssh_device_hint:
@@ -716,7 +958,15 @@ class InventoryService:
             )
 
         api_led_supported = bool(enclosure_id and enclosure_id in api_enclosure_ids)
-        ssh_led_supported = bool(self.system.ssh.enabled and ses_targets)
+        scale_linux_ses_targets = bool(
+            self.system.truenas.platform == "scale"
+            and any(
+                normalize_text(target.get("ses_device", "")).startswith("/dev/sg")
+                for target in ses_targets
+                if isinstance(target, dict) and normalize_text(target.get("ses_device", ""))
+            )
+        )
+        ssh_led_supported = bool(self.system.ssh.enabled and ses_targets and not scale_linux_ses_targets)
         if api_led_supported:
             led_supported = True
             led_backend = "api"
@@ -725,6 +975,14 @@ class InventoryService:
             led_supported = True
             led_backend = "ssh"
             led_reason = None
+        elif scale_linux_ses_targets:
+            led_supported = False
+            led_backend = None
+            led_reason = (
+                "LED control is not available yet for this SCALE slot. "
+                "The slot map is coming from Linux `sg_ses` AES page reads, but no "
+                "safe LED control path has been wired for that backend yet."
+            )
         elif not enclosure_id and not ses_device:
             led_supported = False
             led_backend = None
@@ -751,7 +1009,7 @@ class InventoryService:
             row_index=row_index,
             column_index=column_index,
             enclosure_id=enclosure_id,
-            enclosure_label=enclosure_meta.get("label"),
+            enclosure_label=normalize_text(raw_slot_status.get("enclosure_label")) or enclosure_meta.get("label"),
             enclosure_name=normalize_text(raw_slot_status.get("enclosure_name")) or enclosure_meta.get("name"),
             present=present,
             state=state,
@@ -797,7 +1055,10 @@ class InventoryService:
                         (disk.pool_name if disk else "") or "",
                         (zpool.vdev_name if zpool else "") or "",
                         (zpool.vdev_class if zpool else "") or "",
+                        normalize_text(raw_slot_status.get("sas_device_type")) or "",
+                        normalize_text(raw_slot_status.get("sas_address_hint")) or "",
                         normalize_text(raw_slot_status.get("enclosure_name")) or "",
+                        normalize_text(raw_slot_status.get("enclosure_label")) or "",
                         notes or "",
                     ],
                 )
@@ -1010,6 +1271,25 @@ class InventoryService:
             candidates.append(normalized_device)
 
         return candidates
+
+    @staticmethod
+    def _fallback_smart_summary(slot_view: SlotView, message: str) -> SmartSummaryView:
+        return SmartSummaryView(
+            available=any(
+                value is not None
+                for value in (
+                    slot_view.temperature_c,
+                    slot_view.last_smart_test_type,
+                    slot_view.last_smart_test_status,
+                    slot_view.last_smart_test_lifetime_hours,
+                )
+            ),
+            temperature_c=slot_view.temperature_c,
+            last_test_type=slot_view.last_smart_test_type,
+            last_test_status=slot_view.last_smart_test_status,
+            last_test_lifetime_hours=slot_view.last_smart_test_lifetime_hours,
+            message=message,
+        )
 
     @staticmethod
     def _status_contains(raw_status: dict[str, Any], *needles: str) -> bool:

@@ -1,8 +1,10 @@
 import unittest
 
 from app.services.parsers import (
+    canonicalize_ssh_command,
     parse_camcontrol_devlist,
     parse_gmultipath_list,
+    parse_sg_ses_aes,
     parse_smart_test_results,
     parse_smartctl_summary,
 )
@@ -25,6 +27,11 @@ scbus13 on mpr1 bus 0:
         self.assertEqual(parsed.models["da77"], "HGST HUH728080AL5200 A907")
         self.assertEqual(parsed.controllers["da24"], "mpr0")
         self.assertEqual(parsed.controllers["da71"], "mpr1")
+
+    def test_canonicalize_sg_ses_command_preserves_target_device(self) -> None:
+        command = "sudo -n /usr/bin/sg_ses -p aes /dev/sg27"
+
+        self.assertEqual(canonicalize_ssh_command(command), "sg_ses aes /dev/sg27")
 
     def test_parse_gmultipath_list_preserves_consumers(self) -> None:
         output = """
@@ -94,6 +101,74 @@ State: DEGRADED
         self.assertEqual(multipath.consumers[0].state, "ACTIVE")
         self.assertEqual(multipath.consumers[1].device_name, "da38")
         self.assertEqual(multipath.consumers[1].state, "FAIL")
+
+    def test_parse_sg_ses_aes_extracts_scale_front_slots(self) -> None:
+        output = """
+  LSI       SAS3x40           0601
+  Primary enclosure logical identifier (hex): 5003048001c1043f
+Additional element status diagnostic page:
+  generation code: 0x0
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 0
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5003048001c1043f
+          SAS address: 0x5000cca264d473d5
+      Element index: 1  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 1
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5003048001c1043f
+          SAS address: 0x5000cca264ccb7ed
+    Element type: SAS expander, subenclosure id: 0 [ti=1]
+      Element index: 24  eiioe=0
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg27")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.ses_device, "/dev/sg27")
+        self.assertEqual(parsed.enclosure_id, "5003048001c1043f")
+        self.assertEqual(parsed.enclosure_label, "Front 24 Bay")
+        self.assertEqual(parsed.layout_rows, 4)
+        self.assertEqual(parsed.layout_columns, 6)
+        self.assertEqual(parsed.slots[0].sas_address, "5000cca264d473d5")
+        self.assertEqual(parsed.slots[1].sas_address, "5000cca264ccb7ed")
+        self.assertTrue(parsed.slots[0].present)
+
+    def test_parse_sg_ses_aes_marks_empty_rear_slots(self) -> None:
+        output = """
+  LSI       SAS3x28           0601
+  Primary enclosure logical identifier (hex): 500304801e977aff
+Additional element status diagnostic page:
+  generation code: 0x0
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 2  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 2
+        phy index: 0
+          SAS device type: no SAS device attached
+          attached SAS address: 0x0
+          SAS address: 0x0
+    Element type: SAS expander, subenclosure id: 0 [ti=1]
+      Element index: 12  eiioe=0
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg38")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.enclosure_label, "Rear 12 Bay")
+        self.assertEqual(parsed.layout_rows, 3)
+        self.assertEqual(parsed.layout_columns, 4)
+        self.assertEqual(parsed.slots[2].sas_address, "0")
+        self.assertFalse(parsed.slots[2].present)
 
     def test_parse_smart_test_results_uses_latest_test(self) -> None:
         results = [

@@ -2,16 +2,16 @@
 
 ## Overview
 
-This project is a first-pass, production-usable web app for visualizing a
-60-bay top-loading JBOD attached to a TrueNAS CORE system, without installing
-anything on the TrueNAS box itself.
+This project is a first-pass, production-usable web app for visualizing JBOD
+and chassis-attached disks on TrueNAS systems without installing anything on
+the storage host itself.
 
 It runs entirely off-box in Docker, talks to TrueNAS over the middleware
 websocket API, optionally enriches data over SSH, and renders a dark,
-enclosure-style slot map with per-slot detail, identify LED actions, and
-persistent manual calibration.
+enclosure-style slot map with per-slot detail, identify LED actions where
+supported, and persistent manual calibration.
 
-The current target layout is a Supermicro CSE-946 style 60-bay top view:
+The primary CORE target layout is a Supermicro CSE-946 style 60-bay top view:
 
 - Top row: `45-59`
 - Row 3: `30-44`
@@ -34,6 +34,9 @@ physical divider layout of the chassis.
   - `enclosure.set_slot_status`
   - `disk.query`
   - `pool.query`
+- `disk.details` on SCALE when available
+- First-pass TrueNAS SCALE support with split front/rear enclosure pickers when
+  Linux SES AES data is available over SSH
 - Optional SSH enrichment for:
   - `glabel status`
   - `gmultipath list`
@@ -42,6 +45,7 @@ physical divider layout of the chassis.
   - `sesutil map`
   - `sesutil show`
   - `sesutil locate`
+  - `sg_ses -p aes`
 - 60-bay enclosure top view with color-coded slot state
 - Clear selected-slot highlight for quick visual focus
 - Selected-slot vdev-peer highlighting so sibling bays stand out together on the map
@@ -102,6 +106,7 @@ truenas-jbod-ui/
 |  |- .gitkeep
 |- docs/
 |  |- SSH_READ_ONLY_SETUP.md
+|  |- V0_3_SCALE_NOTES.md
 |- logs/
 |  |- .gitkeep
 |- .dockerignore
@@ -501,8 +506,12 @@ multipath summary and simply omits controller/HBA labels.
   controller types beyond the current `mpr0` / `mpr1` presentation
 - WebSocket or Server-Sent Events live updates
 - Per-slot historical events and LED action audit trail
-- TrueNAS SCALE adapter support once the CORE-oriented collection path is fully
-  settled
+- Continued TrueNAS SCALE adapter work once Linux enclosure mapping and SES
+  mapping are in place, especially LED control and richer SMART history
+
+Current first-pass SCALE findings and hardware notes live here:
+
+- [docs/V0_3_SCALE_NOTES.md](docs/V0_3_SCALE_NOTES.md)
 
 ## License
 

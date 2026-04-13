@@ -49,6 +49,7 @@
   const exportMappingsButton = document.getElementById("export-mappings-button");
   const importMappingsButton = document.getElementById("import-mappings-button");
   const mappingImportFile = document.getElementById("mapping-import-file");
+  const mappingEmpty = document.getElementById("mapping-empty");
   const ledButtons = Array.from(document.querySelectorAll("[data-led-action]"));
 
   function getSlotById(slotNumber) {
@@ -81,6 +82,16 @@
       params.set("enclosure_id", state.selectedEnclosureId);
     }
     return params;
+  }
+
+  function applySnapshot(snapshot) {
+    state.snapshot = snapshot;
+    state.layoutRows = snapshot.layout_rows || state.layoutRows || [];
+    state.selectedSystemId = snapshot.selected_system_id || state.selectedSystemId;
+    state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
+    if (state.selectedSlot !== null && !getSlotById(state.selectedSlot)) {
+      state.selectedSlot = null;
+    }
   }
 
   function syncLocation() {
@@ -327,6 +338,10 @@
       renderTopologyContext(null);
       renderMultipathContext(null);
       resetMappingForm();
+      if (mappingEmpty) {
+        mappingEmpty.classList.remove("hidden");
+      }
+      mappingForm.classList.add("hidden");
       setMappingFormEnabled(false);
       ledButtons.forEach((button) => {
         button.disabled = true;
@@ -338,6 +353,10 @@
     detailContent.classList.remove("hidden");
     detailSecondary.classList.remove("hidden");
     detailLedControls.classList.remove("hidden");
+    if (mappingEmpty) {
+      mappingEmpty.classList.add("hidden");
+    }
+    mappingForm.classList.remove("hidden");
     detailSlotTitle.textContent = `Slot ${slot.slot_label}`;
     detailStatePill.textContent = stateLabel(slot);
     detailStatePill.className = `state-pill state-${slot.state}`;
@@ -735,12 +754,7 @@
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
       const snapshot = await fetchJson(`/api/inventory?${params.toString()}`);
-      state.snapshot = snapshot;
-      state.selectedSystemId = snapshot.selected_system_id || state.selectedSystemId;
-      state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
-      if (state.selectedSlot !== null && !getSlotById(state.selectedSlot)) {
-        state.selectedSlot = null;
-      }
+      applySnapshot(snapshot);
       renderAll();
       setStatus("Inventory updated.");
     } catch (error) {
@@ -761,9 +775,7 @@
         method: "POST",
         body: JSON.stringify({ action }),
       });
-      state.snapshot = payload.snapshot;
-      state.selectedSystemId = payload.snapshot.selected_system_id || state.selectedSystemId;
-      state.selectedEnclosureId = payload.snapshot.selected_enclosure_id || state.selectedEnclosureId;
+      applySnapshot(payload.snapshot);
       renderAll();
       setStatus(`Slot ${slot.slot_label} LED action ${action} completed via ${slot.led_backend === "ssh" ? "SSH SES" : "API"}.`);
     } catch (error) {
@@ -791,9 +803,7 @@
         method: "POST",
         body: JSON.stringify(payload),
       });
-      state.snapshot = result.snapshot;
-      state.selectedSystemId = result.snapshot.selected_system_id || state.selectedSystemId;
-      state.selectedEnclosureId = result.snapshot.selected_enclosure_id || state.selectedEnclosureId;
+      applySnapshot(result.snapshot);
       renderAll();
       setStatus(result.warning || `Saved mapping for slot ${slot.slot_label}.`);
     } catch (error) {
@@ -812,9 +822,7 @@
     try {
       setStatus(`Clearing mapping for slot ${slot.slot_label}...`);
       const result = await sendScopedRequest(`/api/slots/${slot.slot}/mapping`, { method: "DELETE" });
-      state.snapshot = result.snapshot;
-      state.selectedSystemId = result.snapshot.selected_system_id || state.selectedSystemId;
-      state.selectedEnclosureId = result.snapshot.selected_enclosure_id || state.selectedEnclosureId;
+      applySnapshot(result.snapshot);
       renderAll();
       setStatus(`Cleared mapping for slot ${slot.slot_label}.`);
     } catch (error) {
@@ -851,12 +859,7 @@
         method: "POST",
         body: JSON.stringify(bundle),
       });
-      state.snapshot = result.snapshot;
-      state.selectedSystemId = result.snapshot.selected_system_id || state.selectedSystemId;
-      state.selectedEnclosureId = result.snapshot.selected_enclosure_id || state.selectedEnclosureId;
-      if (state.selectedSlot !== null && !getSlotById(state.selectedSlot)) {
-        state.selectedSlot = result.snapshot.slots.length ? result.snapshot.slots[0].slot : null;
-      }
+      applySnapshot(result.snapshot);
       renderAll();
       setStatus(`Imported ${result.imported} mappings into the active scope.`);
     } catch (error) {

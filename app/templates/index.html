@@ -190,10 +190,13 @@
           <button class="button secondary small" id="prefill-mapping-button" type="button">Prefill From Slot</button>
         </div>
         <div class="action-group compact">
+          <div id="mapping-empty" class="detail-empty compact">
+            Select a slot to save or restore calibration details for that bay.
+          </div>
           <p class="subtle">
             Save the observed serial, device, or gptid so this slot can be recovered quickly later.
           </p>
-          <form id="mapping-form" class="mapping-form-compact">
+          <form id="mapping-form" class="mapping-form-compact hidden">
             <label class="field">
               <span>Serial</span>
               <input type="text" name="serial" maxlength="256">
@@ -256,9 +259,9 @@
 <script>
   window.APP_BOOTSTRAP = {
     snapshot: {{ initial_snapshot_json | safe }},
-    layoutRows: {{ layout_rows | tojson }},
+    layoutRows: {{ snapshot.layout_rows | tojson }},
     refreshIntervalSeconds: {{ snapshot.refresh_interval_seconds }},
-    slotCount: {{ settings.layout.slot_count }},
+    slotCount: {{ snapshot.layout_slot_count or settings.layout.slot_count }},
   };
 </script>
 {% endblock %}

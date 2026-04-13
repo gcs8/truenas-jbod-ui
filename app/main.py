@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.config import Settings, get_settings
+from app.config import get_settings
 from app import __version__
 from app.logging_config import configure_logging
 from app.models.domain import InventorySnapshot, LedAction, LedRequest, MappingBundle, MappingRequest, SmartSummaryView
@@ -28,16 +28,6 @@ def get_inventory_registry() -> InventoryRegistry:
     settings = get_settings()
     configure_logging(settings)
     return InventoryRegistry(settings)
-
-
-def build_layout_rows(settings: Settings) -> list[list[int]]:
-    rows: list[list[int]] = []
-    for row_index in reversed(range(settings.layout.rows)):
-        start = row_index * settings.layout.columns
-        rows.append(list(range(start, start + settings.layout.columns)))
-    return rows
-
-
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings)
@@ -65,7 +55,6 @@ def create_app() -> FastAPI:
             {
                 "snapshot": snapshot,
                 "settings": settings,
-                "layout_rows": build_layout_rows(settings),
                 "initial_snapshot_json": json.dumps(snapshot.model_dump(mode="json")),
             },
         )

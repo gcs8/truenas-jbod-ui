@@ -4,6 +4,18 @@
 
 Working branch for the next feature set after `v0.2.0`.
 
+### Added
+
+- First-pass TrueNAS SCALE rough-in with a selectable `offsite-scale` system profile
+- Linux SES AES parsing for SCALE through `sg_ses -p aes`
+- Split SCALE enclosure views for a front `24`-bay map and rear `12`-bay map
+- SCALE disk-to-slot correlation using Linux `lunid` plus parsed SAS addresses from AES pages
+
+### Changed
+
+- SCALE slot warnings now explicitly call out Linux SES AES parsing when TrueNAS does not expose enclosure rows
+- SCALE AES-backed slots no longer claim LED control support until a real Linux LED control backend is implemented
+
 ## v0.2.0 - 2026-04-12
 
 Second public release focused on operator awareness, multi-system selection,

@@ -136,6 +136,9 @@ class EnclosureOption(BaseModel):
     id: str
     label: str
     name: str | None = None
+    rows: int | None = None
+    columns: int | None = None
+    slot_count: int | None = None
 
 
 class InventorySummary(BaseModel):
@@ -149,6 +152,9 @@ class InventorySummary(BaseModel):
 
 class InventorySnapshot(BaseModel):
     slots: list[SlotView]
+    layout_rows: list[list[int]] = Field(default_factory=list)
+    layout_slot_count: int = 0
+    layout_columns: int = 0
     last_updated: datetime = Field(default_factory=utcnow)
     generated_at: datetime = Field(default_factory=utcnow)
     refresh_interval_seconds: int
