@@ -5,7 +5,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -24,6 +24,7 @@ class AppConfig(BaseModel):
 class TrueNASConfig(BaseModel):
     host: str = "https://truenas.local"
     api_key: str = ""
+    platform: Literal["core", "scale"] = "core"
     verify_ssl: bool = True
     timeout_seconds: int = 15
     enclosure_filter: str | None = None
@@ -93,6 +94,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "APP_CONFIG_PATH": ("config_file",),
     "TRUENAS_HOST": ("truenas", "host"),
     "TRUENAS_API_KEY": ("truenas", "api_key"),
+    "TRUENAS_PLATFORM": ("truenas", "platform"),
     "TRUENAS_VERIFY_SSL": ("truenas", "verify_ssl"),
     "TRUENAS_TIMEOUT": ("truenas", "timeout_seconds"),
     "TRUENAS_ENCLOSURE_FILTER": ("truenas", "enclosure_filter"),

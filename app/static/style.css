@@ -817,6 +817,21 @@ textarea {
   color: var(--muted);
 }
 
+.detail-empty.compact {
+  padding: 12px 14px;
+}
+
+.detail-smart-note {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(232, 179, 66, 0.28);
+  background: rgba(232, 179, 66, 0.08);
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
 .detail-slot-head,
 .action-header,
 .button-row {

@@ -12,6 +12,7 @@ truenas:
   # Base appliance URL only, without /api/v2.0.
   host: https://truenas.example.local
   api_key: ""
+  platform: core
   verify_ssl: false
   timeout_seconds: 15
   # Optional substring match against enclosure id/name/label.
@@ -52,6 +53,7 @@ ssh:
 #     truenas:
 #       host: https://10.13.37.10
 #       api_key: ""
+#       platform: core
 #       verify_ssl: false
 #       enclosure_filter: ""
 #     ssh:
@@ -73,9 +75,25 @@ ssh:
 #     truenas:
 #       host: https://scale.example.local
 #       api_key: ""
+#       platform: scale
 #       verify_ssl: false
 #     ssh:
-#       enabled: false
+#       enabled: true
+#       host: scale.example.local
+#       user: jbodmap
+#       key_path: /run/ssh/id_truenas
+#       known_hosts_path: /run/ssh/known_hosts
+#       strict_host_key_checking: true
+#       commands:
+#         - /usr/sbin/zpool status -gP
+#         - /usr/bin/lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,HCTL
+#         - /usr/bin/lsscsi -g
+#         # Optional if you allow limited Linux SES reads for enclosure discovery:
+#         - sudo -n /usr/bin/sg_ses -p aes /dev/sg27
+#         - sudo -n /usr/bin/sg_ses -p aes /dev/sg38
+#         # Optional if you also want the UI to refresh live identify LED state:
+#         - sudo -n /usr/bin/sg_ses -p ec /dev/sg27
+#         - sudo -n /usr/bin/sg_ses -p ec /dev/sg38
 
 layout:
   slot_count: 60

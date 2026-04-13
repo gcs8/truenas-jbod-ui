@@ -73,6 +73,7 @@ class SESMapEnclosure:
     enclosure_label: str | None = None
     layout_rows: int | None = None
     layout_columns: int | None = None
+    slot_layout: list[list[int]] | None = None
     slots: dict[int, SESMapSlot] = field(default_factory=dict)
 
 
@@ -163,6 +164,13 @@ def shift_hex_identifier(value: str | None, delta: int) -> str | None:
     if shifted < 0:
         return None
     return f"{shifted:x}"
+
+
+def format_hex_identifier(value: str | None) -> str | None:
+    normalized = normalize_hex_identifier(value)
+    if normalized is not None:
+        return f"0x{normalized}"
+    return normalize_text(value)
 
 
 def format_bytes(size_bytes: int | None) -> str | None:
@@ -550,6 +558,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
                     {
                         "ses_device": ses_device,
                         "ses_element_id": current_slot.element_id,
+                        "ses_slot_number": current_slot.slot_number,
                     }
                 ],
             )
@@ -575,7 +584,103 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
         return None
 
     slot_count = max(enclosure.slots) + 1
-    enclosure.enclosure_label, enclosure.layout_rows, enclosure.layout_columns = _infer_scale_enclosure_profile(
+    (
+        enclosure.enclosure_label,
+        enclosure.layout_rows,
+        enclosure.layout_columns,
+        enclosure.slot_layout,
+    ) = _infer_scale_enclosure_profile(
+        enclosure,
+        slot_count,
+    )
+    return enclosure
+
+
+def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SESMapEnclosure | None:
+    """
+    Parse `sg_ses -p ec /dev/sgN` output into slot status/identify metadata.
+
+    The AES page tells us which SAS address belongs to which slot. The
+    Enclosure Status page is what lets us track whether an identify LED is
+    currently asserted on a given slot after a refresh.
+    """
+
+    ses_device = _extract_sg_ses_device(command)
+    enclosure = SESMapEnclosure(ses_device=ses_device)
+    current_slot: SESMapSlot | None = None
+    in_array_slots = False
+
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if enclosure.enclosure_name is None:
+            name = normalize_text(" ".join(stripped.split()))
+            if name:
+                enclosure.enclosure_name = name
+            continue
+
+        if stripped.startswith("Primary enclosure logical identifier"):
+            enclosure.enclosure_id = normalize_text(stripped.split(":", 1)[1])
+            continue
+
+        if stripped.startswith("Element type:"):
+            in_array_slots = "Array device slot" in stripped
+            current_slot = None
+            continue
+
+        if not in_array_slots:
+            continue
+
+        if stripped.startswith("Overall descriptor:"):
+            current_slot = None
+            continue
+
+        element_match = re.match(r"Element\s+(?P<slot>\d+)\s+descriptor:", stripped)
+        if element_match:
+            slot_number = int(element_match.group("slot"))
+            current_slot = SESMapSlot(
+                slot_number=slot_number,
+                element_id=slot_number,
+                ses_device=ses_device,
+                description=f"Slot {slot_number:02d}",
+                control_targets=[
+                    {
+                        "ses_device": ses_device,
+                        "ses_element_id": slot_number,
+                        "ses_slot_number": slot_number,
+                    }
+                ],
+            )
+            enclosure.slots[slot_number] = current_slot
+            continue
+
+        if current_slot is None:
+            continue
+
+        if stripped.startswith("Predicted failure=") and "status:" in stripped:
+            current_slot.status = normalize_text(stripped.split("status:", 1)[1])
+            if current_slot.status:
+                current_slot.present = "not installed" not in current_slot.status.lower()
+            continue
+
+        ident_match = re.search(r"\bIdent=(?P<ident>[01])\b", stripped)
+        if ident_match:
+            current_slot.identify_active = ident_match.group("ident") == "1"
+            continue
+
+    if not enclosure.slots:
+        return None
+
+    slot_count = max(enclosure.slots) + 1
+    (
+        enclosure.enclosure_label,
+        enclosure.layout_rows,
+        enclosure.layout_columns,
+        enclosure.slot_layout,
+    ) = _infer_scale_enclosure_profile(
         enclosure,
         slot_count,
     )
@@ -592,45 +697,91 @@ def _extract_sg_ses_device(command: str | None) -> str | None:
 def _infer_scale_enclosure_profile(
     enclosure: SESMapEnclosure,
     slot_count: int,
-) -> tuple[str | None, int | None, int | None]:
+) -> tuple[str | None, int | None, int | None, list[list[int]] | None]:
     name = (enclosure.enclosure_name or "").lower()
     ses_device = (enclosure.ses_device or "").lower()
 
     if "sas3x40" in name or slot_count == 24 or ses_device.endswith("sg27"):
-        return "Front 24 Bay", 4, 6
+        # Front 24-bay CryoStorage chassis view: 4 columns across, 6 rows tall.
+        # The operator-facing front view counts each column bottom-to-top, so
+        # slot 0 sits at the bottom of column 1 and slot 5 sits at the top.
+        # Each vertical 6-slot column corresponds to one front vdev.
+        return (
+            "Front 24 Bay",
+            6,
+            4,
+            [
+                [5, 11, 17, 23],
+                [4, 10, 16, 22],
+                [3, 9, 15, 21],
+                [2, 8, 14, 20],
+                [1, 7, 13, 19],
+                [0, 6, 12, 18],
+            ],
+        )
     if "sas3x28" in name or slot_count == 12 or ses_device.endswith("sg38"):
-        return "Rear 12 Bay", 3, 4
+        # Rear 12-bay view: 4 columns across, 3 rows tall, matching the rear
+        # backplane numbering diagrams and the operator's front-view notes.
+        return (
+            "Rear 12 Bay",
+            3,
+            4,
+            [
+                [2, 5, 8, 11],
+                [1, 4, 7, 10],
+                [0, 3, 6, 9],
+            ],
+        )
     if slot_count == 60:
-        return "60 Bay Shelf", 4, 15
+        return "60 Bay Shelf", 4, 15, None
     if slot_count == 30:
-        return "30 Bay Shelf", 3, 10
+        return "30 Bay Shelf", 3, 10, None
 
     rows = max(1, min(4, slot_count))
     columns = max(1, (slot_count + rows - 1) // rows)
-    return f"{slot_count} Bay SES", rows, columns
+    return f"{slot_count} Bay SES", rows, columns, None
 
 
 def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclosure]:
     merged: dict[str, SESMapEnclosure] = {}
 
     for enclosure in enclosures:
-        key = enclosure.enclosure_id or enclosure.enclosure_name or f"unknown-{len(merged)}"
-        target = merged.setdefault(
-            key,
-            SESMapEnclosure(
+        key: str | None = None
+        if enclosure.enclosure_id:
+            for candidate_key, candidate in merged.items():
+                if candidate.enclosure_id == enclosure.enclosure_id:
+                    key = candidate_key
+                    break
+        if key is None and enclosure.ses_device:
+            for candidate_key, candidate in merged.items():
+                if candidate.ses_device == enclosure.ses_device:
+                    key = candidate_key
+                    break
+        if key is None and enclosure.enclosure_name:
+            for candidate_key, candidate in merged.items():
+                if candidate.enclosure_name == enclosure.enclosure_name:
+                    key = candidate_key
+                    break
+        if key is None:
+            key = enclosure.enclosure_id or enclosure.ses_device or enclosure.enclosure_name or f"unknown-{len(merged)}"
+            merged[key] = SESMapEnclosure(
                 ses_device=enclosure.ses_device,
                 enclosure_id=enclosure.enclosure_id,
                 enclosure_name=enclosure.enclosure_name,
                 enclosure_label=enclosure.enclosure_label,
                 layout_rows=enclosure.layout_rows,
                 layout_columns=enclosure.layout_columns,
+                slot_layout=enclosure.slot_layout,
                 slots={},
-            ),
-        )
+            )
+        target = merged[key]
+        target.enclosure_id = target.enclosure_id or enclosure.enclosure_id
+        target.enclosure_name = target.enclosure_name or enclosure.enclosure_name
         target.ses_device = target.ses_device or enclosure.ses_device
         target.enclosure_label = target.enclosure_label or enclosure.enclosure_label
         target.layout_rows = target.layout_rows or enclosure.layout_rows
         target.layout_columns = target.layout_columns or enclosure.layout_columns
+        target.slot_layout = target.slot_layout or enclosure.slot_layout
 
         for slot_number, slot in enclosure.slots.items():
             existing = target.slots.get(slot_number)
@@ -728,6 +879,9 @@ def _merge_control_targets(
             {
                 "ses_device": pair[0],
                 "ses_element_id": pair[1],
+                "ses_slot_number": item.get("ses_slot_number")
+                if isinstance(item.get("ses_slot_number"), int)
+                else None,
             }
         )
     return merged
@@ -763,6 +917,9 @@ def merge_slot_candidate_maps(
                             {
                                 "ses_device": pair[0],
                                 "ses_element_id": pair[1],
+                                "ses_slot_number": item.get("ses_slot_number")
+                                if isinstance(item.get("ses_slot_number"), int)
+                                else None,
                             }
                         )
                     target[key] = combined
@@ -878,6 +1035,7 @@ def build_slot_candidates_from_ses_enclosures(
                         {
                             "ses_device": slot.ses_device or enclosure.ses_device,
                             "ses_element_id": slot.element_id,
+                            "ses_slot_number": slot.slot_number,
                         }
                     ],
                 ),
@@ -1234,26 +1392,138 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         return {"available": False, "message": "SMART JSON parsing failed."}
 
     temperature = payload.get("temperature") if isinstance(payload.get("temperature"), dict) else {}
+    environmental_reports = (
+        payload.get("scsi_environmental_reports")
+        if isinstance(payload.get("scsi_environmental_reports"), dict)
+        else {}
+    )
+    environmental_temperature = (
+        environmental_reports.get("temperature_1")
+        if isinstance(environmental_reports.get("temperature_1"), dict)
+        else {}
+    )
     power_on_time = payload.get("power_on_time") if isinstance(payload.get("power_on_time"), dict) else {}
     logical_block_size = payload.get("logical_block_size")
     physical_block_size = payload.get("physical_block_size")
+    rotation_rate = payload.get("rotation_rate") if isinstance(payload.get("rotation_rate"), int) else None
+    form_factor = (
+        normalize_text(payload.get("form_factor", {}).get("name"))
+        if isinstance(payload.get("form_factor"), dict)
+        else None
+    )
+    transport_protocol = (
+        normalize_text(payload.get("scsi_transport_protocol", {}).get("name"))
+        if isinstance(payload.get("scsi_transport_protocol"), dict)
+        else None
+    )
+    logical_unit_id = format_hex_identifier(payload.get("logical_unit_id"))
     power_on_hours = power_on_time.get("hours") if isinstance(power_on_time.get("hours"), int) else None
+    latest_test_type: str | None = None
+    latest_test_status: str | None = None
+    latest_test_lifetime_hours: int | None = None
+    sas_address: str | None = None
+    attached_sas_address: str | None = None
+    negotiated_link_rate: str | None = None
+
+    sas_port_phys: list[dict[str, Any]] = []
+    for key, value in payload.items():
+        if not (key.startswith("scsi_sas_port_") and isinstance(value, dict)):
+            continue
+        for subkey, phy in value.items():
+            if subkey.startswith("phy_") and isinstance(phy, dict):
+                sas_port_phys.append(phy)
+
+    selected_phy = next(
+        (
+            phy
+            for phy in sas_port_phys
+            if format_hex_identifier(phy.get("attached_sas_address")) not in {None, "0x0"}
+            or normalize_text(phy.get("attached_device_type")) not in {None, "no device attached"}
+        ),
+        sas_port_phys[0] if sas_port_phys else None,
+    )
+    if selected_phy:
+        sas_address = format_hex_identifier(selected_phy.get("sas_address"))
+        attached_sas_address = format_hex_identifier(selected_phy.get("attached_sas_address"))
+        negotiated_link_rate = normalize_text(selected_phy.get("negotiated_logical_link_rate"))
+
+    scsi_tests: list[tuple[int, dict[str, Any]]] = []
+    for key, value in payload.items():
+        if not (key.startswith("scsi_self_test_") and isinstance(value, dict)):
+            continue
+        suffix = key.removeprefix("scsi_self_test_")
+        if suffix.isdigit():
+            scsi_tests.append((int(suffix), value))
+
+    if scsi_tests:
+        _, latest_test = min(scsi_tests, key=lambda item: item[0])
+        code = latest_test.get("code") if isinstance(latest_test.get("code"), dict) else {}
+        result = latest_test.get("result") if isinstance(latest_test.get("result"), dict) else {}
+        lifetime = latest_test.get("power_on_time") if isinstance(latest_test.get("power_on_time"), dict) else {}
+        latest_test_type = normalize_text(code.get("string")) or normalize_text(code.get("name"))
+        latest_test_status = normalize_text(result.get("string")) or normalize_text(result.get("name"))
+        latest_test_lifetime_hours = lifetime.get("hours") if isinstance(lifetime.get("hours"), int) else None
+    else:
+        ata_log = payload.get("ata_smart_self_test_log") if isinstance(payload.get("ata_smart_self_test_log"), dict) else {}
+        standard = ata_log.get("standard") if isinstance(ata_log.get("standard"), dict) else {}
+        table = standard.get("table") if isinstance(standard.get("table"), list) else []
+        if table and isinstance(table[0], dict):
+            latest_test = table[0]
+            latest_test_type = normalize_text(latest_test.get("type", {}).get("string")) if isinstance(latest_test.get("type"), dict) else normalize_text(latest_test.get("type"))
+            latest_test_status = normalize_text(latest_test.get("status", {}).get("string")) if isinstance(latest_test.get("status"), dict) else normalize_text(latest_test.get("status"))
+            lifetime = latest_test.get("lifetime_hours") if isinstance(latest_test.get("lifetime_hours"), dict) else {}
+            latest_test_lifetime_hours = lifetime.get("hours") if isinstance(lifetime.get("hours"), int) else None
+
+    current_temperature = (
+        temperature.get("current")
+        if isinstance(temperature.get("current"), int)
+        else environmental_temperature.get("current")
+        if isinstance(environmental_temperature.get("current"), int)
+        else None
+    )
 
     summary = {
         "available": any(
             value is not None
             for value in (
-                temperature.get("current"),
+                current_temperature,
                 power_on_hours,
+                latest_test_type,
+                latest_test_status,
+                latest_test_lifetime_hours,
                 logical_block_size if isinstance(logical_block_size, int) else None,
                 physical_block_size if isinstance(physical_block_size, int) else None,
+                rotation_rate,
+                form_factor,
+                transport_protocol,
+                logical_unit_id,
+                sas_address,
+                attached_sas_address,
+                negotiated_link_rate,
             )
         ),
-        "temperature_c": temperature.get("current") if isinstance(temperature.get("current"), int) else None,
+        "temperature_c": current_temperature,
         "power_on_hours": power_on_hours,
         "power_on_days": power_on_hours // 24 if isinstance(power_on_hours, int) else None,
+        "last_test_type": latest_test_type,
+        "last_test_status": latest_test_status,
+        "last_test_lifetime_hours": latest_test_lifetime_hours,
+        "last_test_age_hours": (
+            power_on_hours - latest_test_lifetime_hours
+            if isinstance(power_on_hours, int)
+            and isinstance(latest_test_lifetime_hours, int)
+            and power_on_hours >= latest_test_lifetime_hours
+            else None
+        ),
         "logical_block_size": logical_block_size if isinstance(logical_block_size, int) else None,
         "physical_block_size": physical_block_size if isinstance(physical_block_size, int) else None,
+        "rotation_rate_rpm": rotation_rate,
+        "form_factor": form_factor,
+        "transport_protocol": transport_protocol,
+        "logical_unit_id": logical_unit_id,
+        "sas_address": sas_address,
+        "attached_sas_address": attached_sas_address,
+        "negotiated_link_rate": negotiated_link_rate,
         "message": None,
     }
 
@@ -1261,6 +1531,36 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         summary["message"] = "No SMART summary fields were returned for this disk."
 
     return summary
+
+
+def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
+    read_cache_enabled: bool | None = None
+    writeback_cache_enabled: bool | None = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("Read Cache is:"):
+            value = normalize_text(line.split(":", 1)[1])
+            if value:
+                lowered = value.lower()
+                if lowered.startswith("enabled"):
+                    read_cache_enabled = True
+                elif lowered.startswith("disabled"):
+                    read_cache_enabled = False
+        elif line.startswith("Writeback Cache is:"):
+            value = normalize_text(line.split(":", 1)[1])
+            if value:
+                lowered = value.lower()
+                if lowered.startswith("enabled"):
+                    writeback_cache_enabled = True
+                elif lowered.startswith("disabled"):
+                    writeback_cache_enabled = False
+
+    return {
+        "available": any(value is not None for value in (read_cache_enabled, writeback_cache_enabled)),
+        "read_cache_enabled": read_cache_enabled,
+        "writeback_cache_enabled": writeback_cache_enabled,
+    }
 
 
 def _compose_topology_label(pool_name: str, vdev_path: list[str], vdev_class: str | None) -> str | None:
@@ -1352,15 +1652,24 @@ def canonicalize_ssh_command(command: str) -> str:
     if executable == "sg_ses":
         target_device = next((arg for arg in reversed(args) if arg.startswith("/dev/sg")), None)
         has_aes_page = False
+        has_ec_page = False
         for index, arg in enumerate(args):
             if arg == "-p" and index + 1 < len(args) and args[index + 1].lower() == "aes":
                 has_aes_page = True
-                break
+                continue
+            if arg == "-p" and index + 1 < len(args) and args[index + 1].lower() == "ec":
+                has_ec_page = True
+                continue
             if arg.lower() == "aes":
                 has_aes_page = True
-                break
+                continue
+            if arg.lower() == "ec":
+                has_ec_page = True
+                continue
         if has_aes_page and target_device:
             return f"sg_ses aes {target_device}"
+        if has_ec_page and target_device:
+            return f"sg_ses ec {target_device}"
 
     return " ".join([executable] + args).strip()
 
@@ -1418,6 +1727,13 @@ def parse_ssh_outputs(
         if not command_key.startswith("sg_ses aes /dev/sg"):
             continue
         enclosure = parse_sg_ses_aes(output, command_key)
+        if enclosure:
+            parsed.ses_enclosures.append(enclosure)
+
+    for command_key, output in normalized_outputs.items():
+        if not command_key.startswith("sg_ses ec /dev/sg"):
+            continue
+        enclosure = parse_sg_ses_enclosure_status(output, command_key)
         if enclosure:
             parsed.ses_enclosures.append(enclosure)
 

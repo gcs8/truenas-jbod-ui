@@ -37,6 +37,7 @@ from app.services.parsers import (
     normalize_text,
     parse_pool_query_topology,
     parse_smart_test_results,
+    parse_smartctl_text_enrichment,
     parse_smartctl_summary,
     parse_ssh_outputs,
     shift_hex_identifier,
@@ -61,6 +62,24 @@ def build_layout_rows(rows: int, columns: int, slot_count: int) -> list[list[int
     return layout_rows
 
 
+def build_lunid_aliases(value: str | None, platform: str) -> set[str]:
+    aliases: set[str] = set()
+    normalized = normalize_hex_identifier(value)
+    if normalized:
+        aliases.add(normalized)
+
+    # CORE shelves have mostly matched on exact lunid or +1 shifted SAS hints.
+    # On the user's SCALE host, the rear SSD enclosure exposes AES SAS addresses
+    # that can differ from disk.query lunids by up to two hex counts, so we keep
+    # the match window intentionally small but a little wider there.
+    deltas = (1,) if platform != "scale" else (-2, -1, 1, 2)
+    for delta in deltas:
+        shifted = shift_hex_identifier(value, delta)
+        if shifted:
+            aliases.add(shifted)
+    return aliases
+
+
 @dataclass(slots=True)
 class DiskRecord:
     raw: dict[str, Any]
@@ -80,6 +99,8 @@ class DiskRecord:
     last_smart_test_type: str | None
     last_smart_test_status: str | None
     last_smart_test_lifetime_hours: int | None
+    logical_block_size: int | None
+    physical_block_size: int | None
     enclosure_id: str | None
     slot: int | None
     lookup_keys: set[str]
@@ -148,7 +169,7 @@ class InventoryService:
                     await self._set_slot_led_over_ssh(slot_view, action)
                 else:
                     raise
-        elif slot_view.led_backend == "ssh":
+        elif slot_view.led_backend in {"ssh", "scale_sg_ses"}:
             await self._set_slot_led_over_ssh(slot_view, action)
         else:
             raise TrueNASAPIError(
@@ -195,12 +216,6 @@ class InventoryService:
         if not slot_view:
             raise TrueNASAPIError(f"Slot {slot:02d} is not present in the current snapshot.")
 
-        if self.system.truenas.platform == "scale":
-            return self._fallback_smart_summary(
-                slot_view,
-                "Detailed SMART JSON is not currently available through the SCALE API on this system.",
-            )
-
         candidates = self._smart_candidate_devices(slot_view)
         if not candidates:
             return self._fallback_smart_summary(
@@ -214,6 +229,20 @@ class InventoryService:
         if cached and utcnow() < cache_until:
             return cached
 
+        if self.system.truenas.platform == "scale":
+            summary, error_message = await self._fetch_smart_summary_over_ssh(candidates)
+            if summary is not None:
+                summary = self._merge_smart_summary(slot_view, summary)
+                self._smart_cache[cache_key] = summary
+                self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
+                return summary
+
+            return self._fallback_smart_summary(
+                slot_view,
+                error_message
+                or "Detailed SMART JSON is not currently available through the SCALE API on this system.",
+            )
+
         last_error: str | None = None
         for candidate in candidates:
             try:
@@ -222,17 +251,10 @@ class InventoryService:
                 last_error = str(exc)
                 continue
 
-            summary = SmartSummaryView.model_validate(parse_smartctl_summary(payload))
-            summary.temperature_c = summary.temperature_c or slot_view.temperature_c
-            summary.last_test_type = slot_view.last_smart_test_type
-            summary.last_test_status = slot_view.last_smart_test_status
-            summary.last_test_lifetime_hours = slot_view.last_smart_test_lifetime_hours
-            if (
-                summary.power_on_hours is not None
-                and summary.last_test_lifetime_hours is not None
-                and summary.power_on_hours >= summary.last_test_lifetime_hours
-            ):
-                summary.last_test_age_hours = summary.power_on_hours - summary.last_test_lifetime_hours
+            summary = self._merge_smart_summary(
+                slot_view,
+                SmartSummaryView.model_validate(parse_smartctl_summary(payload)),
+            )
 
             self._smart_cache[cache_key] = summary
             self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
@@ -242,6 +264,63 @@ class InventoryService:
             slot_view,
             last_error or "SMART summary is unavailable for this slot.",
         )
+
+    async def _fetch_smart_summary_over_ssh(
+        self,
+        candidates: list[str],
+    ) -> tuple[SmartSummaryView | None, str | None]:
+        if not self.system.ssh.enabled:
+            return None, (
+                "Detailed SMART JSON is not currently available through the SCALE API on this system, "
+                "and SSH fallback is disabled."
+            )
+
+        last_error: str | None = None
+        for candidate in candidates:
+            device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
+            command = shlex.join(
+                [
+                    "sudo",
+                    "-n",
+                    "/usr/sbin/smartctl",
+                    "-x",
+                    "-j",
+                    device_path,
+                ]
+            )
+            result = await self.ssh_probe.run_command(command)
+            summary = None
+            if result.stdout.strip():
+                parsed = parse_smartctl_summary(result.stdout)
+                candidate_summary = SmartSummaryView.model_validate(parsed)
+                # smartctl commonly returns advisory non-zero exit codes even when the
+                # JSON payload is intact and contains useful SMART data.
+                if candidate_summary.available or candidate_summary.message != "SMART JSON parsing failed.":
+                    summary = candidate_summary
+            if summary is None:
+                detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH smartctl error."
+                last_error = f"{device_path}: {detail}"
+                continue
+
+            text_command = shlex.join(
+                [
+                    "sudo",
+                    "-n",
+                    "/usr/sbin/smartctl",
+                    "-x",
+                    device_path,
+                ]
+            )
+            text_result = await self.ssh_probe.run_command(text_command)
+            if text_result.stdout.strip():
+                enrichment = parse_smartctl_text_enrichment(text_result.stdout)
+                summary.read_cache_enabled = enrichment.get("read_cache_enabled")
+                summary.writeback_cache_enabled = enrichment.get("writeback_cache_enabled")
+            if summary.available or summary.message != "SMART JSON parsing failed.":
+                return summary, None
+            last_error = f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+
+        return None, last_error
 
     async def export_mapping_bundle(self, selected_enclosure_id: str | None = None) -> MappingBundle:
         return MappingBundle(
@@ -379,10 +458,18 @@ class InventoryService:
             refresh_interval_seconds=self.settings.app.refresh_interval_seconds,
             selected_system_id=self.system.id,
             selected_system_label=self.system.label,
+            selected_system_platform=self.system.truenas.platform,
             warnings=warnings,
             last_updated=utcnow(),
             generated_at=utcnow(),
-            systems=[SystemOption(id=system.id, label=system.label or system.id) for system in self.settings.systems],
+            systems=[
+                SystemOption(
+                    id=system.id,
+                    label=system.label or system.id,
+                    platform=system.truenas.platform,
+                )
+                for system in self.settings.systems
+            ],
             enclosures=available_enclosures,
             selected_enclosure_id=selected_option.id if selected_option else selected_slot.enclosure_id if selected_slot else None,
             selected_enclosure_label=selected_option.label if selected_option else selected_slot.enclosure_label if selected_slot else None,
@@ -442,13 +529,8 @@ class InventoryService:
             if disk.slot is not None:
                 disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
                 disks_by_slot[(None, disk.slot)] = disk
-            if disk.lunid:
-                normalized_lunid = normalize_hex_identifier(disk.lunid)
-                if normalized_lunid:
-                    disks_by_sas[normalized_lunid] = disk
-                incremented_lunid = shift_hex_identifier(disk.lunid, 1)
-                if incremented_lunid:
-                    disks_by_sas[incremented_lunid] = disk
+            for alias in build_lunid_aliases(disk.lunid, self.system.truenas.platform):
+                disks_by_sas[alias] = disk
 
         slot_views: list[SlotView] = []
 
@@ -541,15 +623,17 @@ class InventoryService:
                 disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
                 disks_by_slot[(None, disk.slot)] = disk
             if disk.lunid:
-                normalized_lunid = normalize_hex_identifier(disk.lunid)
-                if normalized_lunid:
-                    disks_by_sas[normalized_lunid] = disk
-                incremented_lunid = shift_hex_identifier(disk.lunid, 1)
-                if incremented_lunid:
-                    disks_by_sas[incremented_lunid] = disk
+                for alias in build_lunid_aliases(disk.lunid, self.system.truenas.platform):
+                    disks_by_sas[alias] = disk
 
         rows = selected_option.rows or self.settings.layout.rows
         columns = selected_option.columns or self.settings.layout.columns
+        layout_rows = selected_option.slot_layout or build_layout_rows(rows, columns, slot_count)
+        slot_positions = {
+            slot_number: (row_index, column_index)
+            for row_index, row in enumerate(layout_rows)
+            for column_index, slot_number in enumerate(row)
+        }
         slot_views: list[SlotView] = []
 
         for slot in range(slot_count):
@@ -567,8 +651,8 @@ class InventoryService:
             )
             slot_view = self._build_slot_view(
                 slot=slot,
-                row_index=slot // columns,
-                column_index=slot % columns,
+                row_index=slot_positions.get(slot, (slot // columns, slot % columns))[0],
+                column_index=slot_positions.get(slot, (slot // columns, slot % columns))[1],
                 enclosure_meta=selected_meta,
                 raw_slot_status=candidate,
                 disk=disk,
@@ -585,7 +669,7 @@ class InventoryService:
             slot_views,
             available_enclosures,
             selected_meta,
-            build_layout_rows(rows, columns, slot_count),
+            layout_rows,
             slot_count,
             columns,
         )
@@ -654,6 +738,7 @@ class InventoryService:
                     rows=enclosure.layout_rows,
                     columns=enclosure.layout_columns,
                     slot_count=slot_count,
+                    slot_layout=enclosure.slot_layout,
                 )
             )
 
@@ -713,6 +798,8 @@ class InventoryService:
             serial = normalize_text(disk.get("serial") or disk.get("serial_lunid") or disk.get("lunid"))
             model = normalize_text(disk.get("model"))
             size_bytes = disk.get("size") if isinstance(disk.get("size"), int) else None
+            logical_block_size = self._extract_logical_block_size(disk, size_bytes)
+            physical_block_size = self._extract_physical_block_size(disk)
             identifier = normalize_text(disk.get("identifier"))
             temperature_c = self._lookup_disk_temperature(disk_temperatures, path_device_name, device_name, multipath_member)
             latest_test = self._lookup_smart_test(smart_tests, path_device_name, device_name, multipath_member)
@@ -748,12 +835,7 @@ class InventoryService:
                 if gptid:
                     lookup_keys.update(normalize_lookup_keys(gptid))
 
-            normalized_lunid = normalize_hex_identifier(disk.get("lunid"))
-            if normalized_lunid:
-                lookup_keys.add(normalized_lunid)
-            incremented_lunid = shift_hex_identifier(disk.get("lunid"), 1)
-            if incremented_lunid:
-                lookup_keys.add(incremented_lunid)
+            lookup_keys.update(build_lunid_aliases(disk.get("lunid"), self.system.truenas.platform))
 
             records.append(
                 DiskRecord(
@@ -774,6 +856,8 @@ class InventoryService:
                     last_smart_test_type=normalize_text(latest_test.get("description")) if latest_test else None,
                     last_smart_test_status=normalize_text(latest_test.get("status_verbose") or latest_test.get("status")) if latest_test else None,
                     last_smart_test_lifetime_hours=latest_test.get("lifetime") if latest_test else None,
+                    logical_block_size=logical_block_size,
+                    physical_block_size=physical_block_size,
                     enclosure_id=enclosure_id,
                     slot=slot,
                     lookup_keys=lookup_keys,
@@ -939,6 +1023,7 @@ class InventoryService:
                 continue
             target_device = normalize_text(item.get("ses_device"))
             target_element = item.get("ses_element_id")
+            target_slot_number = item.get("ses_slot_number") if isinstance(item.get("ses_slot_number"), int) else None
             target_pair = (target_device, target_element if isinstance(target_element, int) else None)
             if target_pair in seen_ses_targets or not target_pair[0] or target_pair[1] is None:
                 continue
@@ -947,6 +1032,7 @@ class InventoryService:
                 {
                     "ses_device": target_pair[0],
                     "ses_element_id": target_pair[1],
+                    "ses_slot_number": target_slot_number,
                 }
             )
         if not ses_targets and ses_device and ses_element_id is not None:
@@ -954,6 +1040,7 @@ class InventoryService:
                 {
                     "ses_device": ses_device,
                     "ses_element_id": ses_element_id,
+                    "ses_slot_number": slot,
                 }
             )
 
@@ -971,18 +1058,14 @@ class InventoryService:
             led_supported = True
             led_backend = "api"
             led_reason = None
+        elif scale_linux_ses_targets and self.system.ssh.enabled:
+            led_supported = True
+            led_backend = "scale_sg_ses"
+            led_reason = None
         elif ssh_led_supported:
             led_supported = True
             led_backend = "ssh"
             led_reason = None
-        elif scale_linux_ses_targets:
-            led_supported = False
-            led_backend = None
-            led_reason = (
-                "LED control is not available yet for this SCALE slot. "
-                "The slot map is coming from Linux `sg_ses` AES page reads, but no "
-                "safe LED control path has been wired for that backend yet."
-            )
         elif not enclosure_id and not ses_device:
             led_supported = False
             led_backend = None
@@ -1030,6 +1113,10 @@ class InventoryService:
             last_smart_test_type=disk.last_smart_test_type if disk else None,
             last_smart_test_status=disk.last_smart_test_status if disk else None,
             last_smart_test_lifetime_hours=disk.last_smart_test_lifetime_hours if disk else None,
+            logical_block_size=disk.logical_block_size if disk else None,
+            physical_block_size=disk.physical_block_size if disk else None,
+            logical_unit_id=disk.lunid if disk else None,
+            sas_address=normalize_text(raw_slot_status.get("sas_address_hint")),
             enclosure_identifier=normalize_text(raw_slot_status.get("descriptor")),
             led_supported=led_supported,
             led_backend=led_backend,
@@ -1068,13 +1155,14 @@ class InventoryService:
 
     async def _set_slot_led_over_ssh(self, slot_view: SlotView, action: LedAction) -> None:
         if not self.system.ssh.enabled:
-            raise TrueNASAPIError("SSH fallback is disabled, so LED control cannot use sesutil locate.")
+            raise TrueNASAPIError("SSH fallback is disabled, so LED control cannot use enclosure control commands.")
         ses_targets = slot_view.ssh_ses_targets or []
         if not ses_targets and slot_view.ssh_ses_device and slot_view.ssh_ses_element_id is not None:
             ses_targets = [
                 {
                     "ses_device": slot_view.ssh_ses_device,
                     "ses_element_id": slot_view.ssh_ses_element_id,
+                    "ses_slot_number": slot_view.slot,
                 }
             ]
 
@@ -1095,20 +1183,41 @@ class InventoryService:
         for target in ses_targets:
             target_device = normalize_text(target.get("ses_device"))
             target_element = target.get("ses_element_id")
+            target_slot_number = target.get("ses_slot_number")
             if not target_device or not isinstance(target_element, int):
                 continue
-            command = shlex.join(
-                [
-                    "sudo",
-                    "-n",
-                    "/usr/sbin/sesutil",
-                    "locate",
-                    "-u",
-                    target_device,
-                    str(target_element),
-                    locate_state,
-                ]
-            )
+            if target_device.startswith("/dev/sg"):
+                if action == LedAction.identify:
+                    sg_action = "--set=ident"
+                elif action == LedAction.clear:
+                    sg_action = "--clear=ident"
+                else:
+                    raise TrueNASAPIError("SCALE sg_ses LED control currently supports identify on and clear/off only.")
+
+                target_slot = target_slot_number if isinstance(target_slot_number, int) else slot_view.slot
+                command = shlex.join(
+                    [
+                        "sudo",
+                        "-n",
+                        "/usr/bin/sg_ses",
+                        f"--dev-slot-num={target_slot}",
+                        sg_action,
+                        target_device,
+                    ]
+                )
+            else:
+                command = shlex.join(
+                    [
+                        "sudo",
+                        "-n",
+                        "/usr/sbin/sesutil",
+                        "locate",
+                        "-u",
+                        target_device,
+                        str(target_element),
+                        locate_state,
+                    ]
+                )
             result = await self.ssh_probe.run_command(command)
             if not result.ok:
                 detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH LED error."
@@ -1239,6 +1348,25 @@ class InventoryService:
         return None
 
     @staticmethod
+    def _extract_physical_block_size(disk: dict[str, Any]) -> int | None:
+        sectorsize = disk.get("sectorsize")
+        if isinstance(sectorsize, int) and sectorsize > 0:
+            return sectorsize
+        return None
+
+    @staticmethod
+    def _extract_logical_block_size(disk: dict[str, Any], size_bytes: int | None) -> int | None:
+        blocks = disk.get("blocks")
+        if isinstance(blocks, int) and blocks > 0 and isinstance(size_bytes, int) and size_bytes > 0:
+            logical = size_bytes // blocks
+            if logical > 0 and logical * blocks == size_bytes:
+                return logical
+        sectorsize = disk.get("sectorsize")
+        if isinstance(sectorsize, int) and sectorsize > 0:
+            return sectorsize
+        return None
+
+    @staticmethod
     def _smart_candidate_devices(slot_view: SlotView) -> list[str]:
         candidates: list[str] = []
         seen: set[str] = set()
@@ -1282,14 +1410,64 @@ class InventoryService:
                     slot_view.last_smart_test_type,
                     slot_view.last_smart_test_status,
                     slot_view.last_smart_test_lifetime_hours,
+                    slot_view.logical_block_size,
+                    slot_view.physical_block_size,
                 )
             ),
             temperature_c=slot_view.temperature_c,
             last_test_type=slot_view.last_smart_test_type,
             last_test_status=slot_view.last_smart_test_status,
             last_test_lifetime_hours=slot_view.last_smart_test_lifetime_hours,
+            logical_block_size=slot_view.logical_block_size,
+            physical_block_size=slot_view.physical_block_size,
+            logical_unit_id=slot_view.logical_unit_id,
+            sas_address=slot_view.sas_address,
             message=message,
         )
+
+    @staticmethod
+    def _merge_smart_summary(slot_view: SlotView, summary: SmartSummaryView) -> SmartSummaryView:
+        summary.temperature_c = summary.temperature_c or slot_view.temperature_c
+        summary.last_test_type = summary.last_test_type or slot_view.last_smart_test_type
+        summary.last_test_status = summary.last_test_status or slot_view.last_smart_test_status
+        summary.last_test_lifetime_hours = (
+            summary.last_test_lifetime_hours or slot_view.last_smart_test_lifetime_hours
+        )
+        summary.logical_block_size = summary.logical_block_size or slot_view.logical_block_size
+        summary.physical_block_size = summary.physical_block_size or slot_view.physical_block_size
+        summary.logical_unit_id = summary.logical_unit_id or slot_view.logical_unit_id
+        summary.sas_address = summary.sas_address or slot_view.sas_address
+        if summary.power_on_hours is not None and summary.power_on_days is None:
+            summary.power_on_days = summary.power_on_hours // 24
+        if (
+            summary.power_on_hours is not None
+            and summary.last_test_lifetime_hours is not None
+            and summary.last_test_age_hours is None
+            and summary.power_on_hours >= summary.last_test_lifetime_hours
+        ):
+            summary.last_test_age_hours = summary.power_on_hours - summary.last_test_lifetime_hours
+        summary.available = summary.available or any(
+            value is not None
+            for value in (
+                summary.temperature_c,
+                summary.last_test_type,
+                summary.last_test_status,
+                summary.last_test_lifetime_hours,
+                summary.power_on_hours,
+                summary.logical_block_size,
+                summary.physical_block_size,
+                summary.rotation_rate_rpm,
+                summary.form_factor,
+                summary.read_cache_enabled,
+                summary.writeback_cache_enabled,
+                summary.transport_protocol,
+                summary.logical_unit_id,
+                summary.sas_address,
+                summary.attached_sas_address,
+                summary.negotiated_link_rate,
+            )
+        )
+        return summary
 
     @staticmethod
     def _status_contains(raw_status: dict[str, Any], *needles: str) -> bool:

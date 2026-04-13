@@ -1,13 +1,25 @@
 {% extends "base.html" %}
 {% block title %}TrueNAS JBOD Enclosure UI{% endblock %}
 {% block body %}
+{% set is_scale = snapshot.selected_system_platform == "scale" %}
+{% set is_scale_rear = is_scale and snapshot.selected_enclosure_label and "rear" in snapshot.selected_enclosure_label|lower %}
 <div class="app-shell">
   <header class="topbar">
     <div>
-      <p class="eyebrow">TrueNAS CORE / Supermicro CSE-946 Top View</p>
+      <p class="eyebrow" id="header-eyebrow">
+        {% if is_scale %}
+          TrueNAS SCALE / Supermicro SSG-6048R {{ "Rear" if is_scale_rear else "Front" }} View
+        {% else %}
+          TrueNAS CORE / Supermicro CSE-946 Top View
+        {% endif %}
+      </p>
       <h1>JBOD Enclosure UI</h1>
       <p class="subtle" id="header-summary">
-        Top-loading bay map with API-or-SSH LED control and optional SSH enrichment.
+        {% if is_scale %}
+          {{ "Rear-drive map with Linux SES AES slot mapping and SSH smartctl enrichment." if is_scale_rear else "Front-drive map with Linux SES AES slot mapping and SSH smartctl enrichment." }}
+        {% else %}
+          Top-loading bay map with API-or-SSH LED control and optional SSH enrichment.
+        {% endif %}
       </p>
     </div>
     <div class="topbar-meta">
@@ -106,7 +118,13 @@
     <section class="panel enclosure-panel">
       <div class="panel-header">
         <div>
-          <h2>Enclosure Top</h2>
+          <h2 id="enclosure-panel-title">
+            {% if is_scale and snapshot.selected_enclosure_label %}
+              {{ snapshot.selected_enclosure_label }}
+            {% else %}
+              Enclosure Top
+            {% endif %}
+          </h2>
         </div>
         <div class="legend">
           <span class="legend-item"><i class="swatch healthy"></i> Healthy</span>
@@ -127,7 +145,13 @@
           <div class="slot-grid" id="slot-grid"></div>
           <div class="front-edge" aria-hidden="true">
             <span class="front-handle"></span>
-            <span class="front-label">System front / latch edge</span>
+            <span class="front-label" id="enclosure-edge-label">
+              {% if is_scale %}
+                {{ "Rear of chassis" if is_scale_rear else "Front of chassis" }}
+              {% else %}
+                System front / latch edge
+              {% endif %}
+            </span>
             <span class="front-handle"></span>
           </div>
         </div>
@@ -160,6 +184,7 @@
         </div>
 
         <div class="kv-grid" id="detail-kv-grid"></div>
+        <p id="detail-smart-note" class="detail-smart-note hidden"></p>
       </div>
     </aside>
   </main>

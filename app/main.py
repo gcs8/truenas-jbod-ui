@@ -28,6 +28,8 @@ def get_inventory_registry() -> InventoryRegistry:
     settings = get_settings()
     configure_logging(settings)
     return InventoryRegistry(settings)
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings)

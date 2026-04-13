@@ -2,24 +2,25 @@
 
 ## Overview
 
-This project is a first-pass, production-usable web app for visualizing JBOD
-and chassis-attached disks on TrueNAS systems without installing anything on
-the storage host itself.
+This project is a production-usable web app for visualizing JBOD and
+chassis-attached disks on TrueNAS systems without installing anything on the
+storage host itself.
 
 It runs entirely off-box in Docker, talks to TrueNAS over the middleware
 websocket API, optionally enriches data over SSH, and renders a dark,
 enclosure-style slot map with per-slot detail, identify LED actions where
-supported, and persistent manual calibration.
+supported, persistent manual calibration, and per-system / per-enclosure
+selection.
 
-The primary CORE target layout is a Supermicro CSE-946 style 60-bay top view:
+The current tested hardware profiles are:
 
-- Top row: `45-59`
-- Row 3: `30-44`
-- Row 2: `15-29`
-- Bottom row: `00-14`
+- TrueNAS CORE on a Supermicro CSE-946 style `60`-bay top-loading shelf
+- TrueNAS SCALE on a Supermicro `SSG-6048R-E1CR36L` with separate front `24`-bay
+  and rear `12`-bay enclosure views
 
-The visual row layout groups each 15-bay row as `6 + 6 + 3` to better match the
-physical divider layout of the chassis.
+The CORE layout groups each 15-bay row as `6 + 6 + 3` to better match the
+physical divider layout of the chassis. The SCALE layout uses chassis-specific
+front and rear grids derived from Linux SES data and operator notes.
 
 ## Screenshot
 
@@ -34,9 +35,12 @@ physical divider layout of the chassis.
   - `enclosure.set_slot_status`
   - `disk.query`
   - `pool.query`
-- `disk.details` on SCALE when available
+- `disk.details`, `disk.temperatures`, and on-demand SMART summaries on SCALE
+  when available through API or SSH
+- Multi-system and multi-enclosure pickers so CORE shelves and SCALE front/rear
+  views can live in the same app
 - First-pass TrueNAS SCALE support with split front/rear enclosure pickers when
-  Linux SES AES data is available over SSH
+  Linux SES AES and enclosure-status data is available over SSH
 - Optional SSH enrichment for:
   - `glabel status`
   - `gmultipath list`
@@ -46,7 +50,9 @@ physical divider layout of the chassis.
   - `sesutil show`
   - `sesutil locate`
   - `sg_ses -p aes`
-- 60-bay enclosure top view with color-coded slot state
+  - `sg_ses -p ec`
+  - `smartctl -x -j`
+- Chassis-specific enclosure views with color-coded slot state
 - Clear selected-slot highlight for quick visual focus
 - Selected-slot vdev-peer highlighting so sibling bays stand out together on the map
 - Small top summary for discovered disks, pools, enclosure rows, slot matches,
@@ -63,6 +69,8 @@ physical divider layout of the chassis.
   - last SMART test result
   - power-on age
   - logical and physical sector size
+  - rotation rate, form factor, and read/write cache state when SMART data provides them
+  - SCALE smartctl transport context such as protocol, logical unit ID, SAS address, and negotiated link rate when available
   - gptid
   - pool
   - vdev
@@ -73,8 +81,9 @@ physical divider layout of the chassis.
   - enclosure metadata
   - LED state
 - Copy-to-clipboard buttons for serial and gptid
-- SSH identify LED control via `sesutil locate` when the TrueNAS enclosure API
-  does not expose writable enclosure rows
+- SSH identify LED control via `sesutil locate` on CORE or `sg_ses` identify
+  control on SCALE when the TrueNAS enclosure API does not expose writable
+  enclosure rows
 - Persistent JSON slot calibration storage on a bind mount
 - Manual calibration workflow for imperfect slot mapping
 - Graceful partial-data behavior when API or SSH is incomplete
@@ -90,10 +99,14 @@ physical divider layout of the chassis.
   heuristic and meant as a practical first pass, not a perfect topology engine
   for every hardware layout.
 - LED control depends on either the TrueNAS enclosure API exposing a writable
-  enclosure row, or SSH fallback being allowed to run `sesutil locate`.
-- The default layout is the Supermicro 60-bay top view. Different chassis
-  layouts will likely need config changes and possibly small template/CSS
-  adjustments.
+  enclosure row, CORE SSH fallback being allowed to run `sesutil locate`, or
+  SCALE SSH fallback being allowed to run `sg_ses` identify control.
+- The current enclosure profiles are intentionally targeted to the hardware that
+  has been validated so far: the CORE CSE-946 top-loader and the SCALE
+  SSG-6048R-E1CR36L front / rear chassis views.
+- SCALE slot mapping and LED control currently depend on Linux SES access over
+  SSH because the tested SCALE host does not expose usable enclosure rows
+  through the middleware API.
 
 ## Directory Layout
 
@@ -378,6 +391,8 @@ When that API is unavailable on a given chassis, the app can fall back to SSH:
 
 - `sesutil locate -u /dev/sesN <element> on`
 - `sesutil locate -u /dev/sesN <element> off`
+- `sg_ses --dev-slot-num=<slot> --set=ident /dev/sgN`
+- `sg_ses --dev-slot-num=<slot> --clear=ident /dev/sgN`
 
 Supported actions in this first pass are:
 
@@ -387,10 +402,13 @@ Supported actions in this first pass are:
 Notes:
 
 - the app only enables SSH LED control for slots that carry SES controller and
-  element metadata from `sesutil map`
+  element metadata from `sesutil map` or Linux SES data from `sg_ses`
 - on systems like this one, `sesutil locate` is the practical path for identify
   LEDs because `enclosure.query` returns no writable rows even though the shelf
   is visible over SES
+- on the tested SCALE host, identify LEDs are driven through `sg_ses`
+  `--set=ident` / `--clear=ident` after the host exposes `/usr/bin/sg_ses`
+  through command-limited sudo
 - the UI uses POST requests for LED-changing actions and surfaces errors instead
   of pretending the action succeeded
 
@@ -453,7 +471,8 @@ multipath summary and simply omits controller/HBA labels.
   `pool.query` work correctly.
 - Enable SSH mode so the app can parse `sesutil map` and `sesutil show`.
 - The first-pass parser prefers large populated SES groups and can combine a
-  `Front` and `Rear` 30-slot pair into the 60-bay UI automatically.
+  `Front` and `Rear` 30-slot pair into the 60-bay UI automatically on the
+  tested CORE chassis.
 
 ### Identify LED requests fail
 
@@ -497,17 +516,21 @@ multipath summary and simply omits controller/HBA labels.
 ## Future Improvements
 
 - Enclosure profile metadata so different chassis can define bay proportions,
-  row grouping, and service-area layout without hardcoding one visual shape
+  row grouping, service-area layout, and orientation rules without hardcoding
+  one visual shape
 - Richer topology visualization for pool and vdev ancestry beyond the current
   compact sibling-awareness panel
 - Expanded SMART detail when the underlying data is stable enough, such as SAS
-  address, logical unit identifier, cache flags, and negotiated link rate
+  cache flags and other controller-specific transport hints beyond the current
+  SCALE `smartctl` fields
 - More operator-focused multipath detail, especially for edge cases and future
   controller types beyond the current `mpr0` / `mpr1` presentation
+- Broader SCALE enclosure validation beyond the currently tested front `24` and
+  rear `12` views
 - WebSocket or Server-Sent Events live updates
 - Per-slot historical events and LED action audit trail
-- Continued TrueNAS SCALE adapter work once Linux enclosure mapping and SES
-  mapping are in place, especially LED control and richer SMART history
+- Continued TrueNAS SCALE adapter work for richer Linux disk correlation,
+  profile-driven chassis layouts, and safer long-term Linux SES control rules
 
 Current first-pass SCALE findings and hardware notes live here:
 

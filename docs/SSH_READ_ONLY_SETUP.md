@@ -405,3 +405,127 @@ If it partly works, we adjust only where needed.
 
 If it does not work at all, then and only then do we discuss a tightly
 controlled root fallback.
+
+## SCALE Linux SES Unlock
+
+The SCALE path is different from CORE:
+
+- there is no `sesutil`
+- Linux SES access typically goes through `sg_ses`
+- richer per-slot SMART data can come from `smartctl`
+- enclosure device nodes may be `/dev/sgN`
+- on the tested SCALE host, the enclosure SG nodes were owned by `root:root`
+  with mode `0600`
+
+That last point matters because it means adding `jbodmap` to a broader group
+such as `disk` does not solve the problem. The least-privilege path is
+command-limited sudo for the exact `sg_ses` probes the app needs.
+
+### What We Observed On The SCALE Box
+
+On the tested SCALE system:
+
+- SSH as `jbodmap` worked
+- `/usr/bin/lsscsi -g` identified two enclosure SG devices:
+  - `/dev/sg27`
+  - `/dev/sg38`
+- direct reads like `sg_ses -p aes /dev/sg27` failed with `Permission denied`
+- direct `smartctl` reads against disk devices also needed elevated access
+- the API key and the `jbodmap` shell account were able to read inventory but
+  not modify user permissions directly
+
+This means the unlock step must be performed by a true SCALE admin in the UI or
+from a root shell on the appliance.
+
+### Recommended SCALE Sudo Allow-List
+
+If you want first-pass Linux SES mapping support, grant `jbodmap` the AES and
+enclosure-status page reads for the known enclosure SG devices:
+
+```bash
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/bin/sg_ses -p aes /dev/sg27","/usr/bin/sg_ses -p aes /dev/sg38","/usr/bin/sg_ses -p ec /dev/sg27","/usr/bin/sg_ses -p ec /dev/sg38"]}'
+```
+
+That is the smallest current allow-list for read-only enclosure discovery plus
+live identify-state reads on this SCALE host.
+
+On the tested SCALE box, the web UI allow-list also worked when
+`/usr/bin/sg_ses` was added to both:
+
+- `Allowed sudo commands`
+- `Allowed Sudo Commands (No Password)`
+
+That broader entry is enough for first-pass AES page reads, enclosure-status
+reads, and identify LED control on this tested host, but the exact command list
+above is still the safer documentation target because it keeps the granted
+surface area narrower.
+
+If you also want richer per-slot SMART data on SCALE, add `/usr/sbin/smartctl`
+to the allowed sudo commands too. That lets the app run one-off commands such
+as:
+
+```bash
+sudo -n /usr/sbin/smartctl -x -j /dev/sdc
+```
+
+The app uses that JSON path to surface:
+
+- current temperature
+- last SMART self-test type and status
+- last SMART self-test lifetime hours
+- power-on hours and days
+- logical and physical block size
+
+If you want SSH identify LED control from the app on SCALE, add exact write
+commands after validating the safe `sg_ses` syntax for the target backplanes.
+On this host the app was validated with:
+
+```bash
+sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg27
+sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg27
+sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg38
+sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg38
+```
+
+If your SCALE build accepts wildcard command arguments in sudo rules, a
+narrower exact-command shape would look like:
+
+```bash
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/bin/sg_ses -p aes /dev/sg27","/usr/bin/sg_ses -p aes /dev/sg38","/usr/bin/sg_ses -p ec /dev/sg27","/usr/bin/sg_ses -p ec /dev/sg38","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg27","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg27","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg38","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg38"]}'
+```
+
+The tested web UI path on this box was broader: add `/usr/bin/sg_ses` to both
+`Allowed sudo commands` and `Allowed Sudo Commands (No Password)`. That works,
+but it grants a wider surface area than the exact-command list above.
+
+### Example SCALE SSH Commands
+
+For a first-pass SCALE config that combines inventory with Linux SES reads, the
+SSH command list should look like:
+
+```yaml
+commands:
+  - /usr/sbin/zpool status -gP
+  - /usr/bin/lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,HCTL
+  - /usr/bin/lsscsi -g
+  - sudo -n /usr/bin/sg_ses -p aes /dev/sg27
+  - sudo -n /usr/bin/sg_ses -p aes /dev/sg38
+  - sudo -n /usr/bin/sg_ses -p ec /dev/sg27
+  - sudo -n /usr/bin/sg_ses -p ec /dev/sg38
+```
+
+`smartctl` does not need to be added to the standing SSH command list above.
+The app runs it on demand for the selected slot, but the user still needs sudo
+permission for `/usr/sbin/smartctl` on the SCALE host.
+
+`sg_ses` identify-control commands also do not need to be in the standing SSH
+command list above. The app runs them on demand when a user clicks `Identify
+On` or `Identify Off / Clear`, but the user still needs the corresponding sudo
+permission for `/usr/bin/sg_ses` on the SCALE host.
+
+If this SCALE build requires passworded command-limited sudo instead of
+`nopasswd`, keep the exact same command list and set:
+
+```env
+SSH_SUDO_PASSWORD=your-long-random-password
+```

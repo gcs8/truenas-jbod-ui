@@ -23,13 +23,18 @@ Working today:
 - SSH connectivity as `jbodmap`
 - Linux command probes such as `zpool`, `lsblk`, and `lsscsi -g`
 - Linux SES AES page reads through `sudo -n /usr/bin/sg_ses`
+- Linux SES enclosure-status reads through `sudo -n /usr/bin/sg_ses -p ec`
 - Front `24`-bay enclosure picker and slot map from `/dev/sg27`
 - Rear `12`-bay enclosure picker and slot map from `/dev/sg38`
 - Disk-to-slot correlation from SCALE `lunid` values plus AES `SAS address`
+- Per-slot SMART summary through `sudo -n /usr/sbin/smartctl -x -j /dev/<disk>`
+- SSH identify LED control through `sg_ses --set=ident` / `--clear=ident`
+- Physical front/rear slot geometry aligned to CryoStorage operator notes:
+  - front = `4` columns by `6` rows, with each `6`-disk vertical column acting as one vdev and slot numbers running bottom-to-top within each column
+  - rear = `4` columns by `3` rows
 
 Not working yet:
 
-- LED control
 - Detailed SMART JSON via the websocket API
 - SMART test history via the websocket API
 
@@ -75,13 +80,46 @@ as `jbodmap`:
 
 - `sudo -n /usr/bin/sg_ses -p aes /dev/sg27`
 - `sudo -n /usr/bin/sg_ses -p aes /dev/sg38`
+- `sudo -n /usr/bin/sg_ses -p ec /dev/sg27`
+- `sudo -n /usr/bin/sg_ses -p ec /dev/sg38`
 
 That means first-pass Linux SES page parsing is now practical on this host, and
 the current app branch is using it to drive:
 
-- a front `24`-slot `4 x 6` enclosure view
-- a rear `12`-slot `3 x 4` enclosure view
+- a front `24`-slot enclosure view that is `4` columns wide by `6` rows tall, with the front-view rows flipped so slot `0` sits at the bottom and slot `5` at the top of column `1`
+- a rear `12`-slot enclosure view that is `4` columns wide by `3` rows tall
 - per-slot disk correlation where SCALE `disk.details` and AES page data agree
+- current identify LED state through parsed enclosure-status pages
+
+Identify LED control was then validated through:
+
+- `sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg27`
+- `sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg27`
+- `sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg38`
+- `sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg38`
+
+That means the current app branch can now drive first-pass SCALE identify LEDs
+on both the front and rear enclosures.
+
+After `/usr/sbin/smartctl` was added to the allowed sudo commands, these
+one-off SMART probes also worked as `jbodmap`:
+
+- `sudo -n /usr/sbin/smartctl -x -j /dev/sdc`
+- `sudo -n /usr/sbin/smartctl -x -j /dev/sdab`
+
+That gives the app a practical SCALE SMART path even though the websocket API
+still does not expose the same detailed SMART JSON coverage we have on CORE.
+The app now uses SSH `smartctl` JSON on demand for the selected slot to show:
+
+- current temperature
+- last SMART self-test type and status
+- last SMART self-test lifetime hours and relative age
+- power-on hours and days
+- logical and physical block size
+- transport protocol
+- logical unit ID
+- SAS address and attached SAS address
+- negotiated link rate
 
 ## Why The Hardware Info Matters
 
@@ -103,8 +141,8 @@ useful than the current live API output:
 
 - EID `26` appears to be the front `24`-bay enclosure on `/dev/sg27`
 - EID `14` appears to be the rear `12`-bay enclosure on `/dev/sg38`
-- The front visual order is already mapped in operator notes as a `6 x 4` grid
-- The rear visual order is already mapped in operator notes as a `3 x 4` grid
+- The front visual order is already mapped in operator notes as `4` columns by `6` rows, with slot numbering running bottom-to-top per column
+- The rear visual order is already mapped in operator notes as `4` columns by `3` rows
 - The current notes also carry serial, WWN, SAS address, Linux device, and SG
   device correlations for most of the installed drives
 
@@ -123,8 +161,9 @@ mapping/import path for any slots that still need operator help.
 For the next SCALE pass, the most valuable improvement is probably one of:
 
 1. Parse `lsblk` and `lsscsi -g` into a better Linux disk presentation layer
-2. Add a real Linux LED control backend once the safe `sg_ses` control form is verified
-3. Build a SCALE-specific enclosure profile that uses the front/rear hardware notes directly
+2. Build a SCALE-specific enclosure profile that uses the front/rear hardware notes directly
+3. Add richer Linux transport detail such as SAS address, LUN id, and link-rate context where it is stable enough to trust
 
-`sg_ses` AES parsing is now usable for mapping, so the next real question is
-how much of the Linux SES control surface we want to expose safely.
+`sg_ses` AES plus enclosure-status parsing is now usable for mapping and first-pass
+identify LEDs, so the next real question is how much more Linux device detail we
+want to expose without turning this into a host-debugging UI.

@@ -78,6 +78,15 @@ class SmartSummaryView(BaseModel):
     power_on_days: int | None = None
     logical_block_size: int | None = None
     physical_block_size: int | None = None
+    rotation_rate_rpm: int | None = None
+    form_factor: str | None = None
+    read_cache_enabled: bool | None = None
+    writeback_cache_enabled: bool | None = None
+    transport_protocol: str | None = None
+    logical_unit_id: str | None = None
+    sas_address: str | None = None
+    attached_sas_address: str | None = None
+    negotiated_link_rate: str | None = None
     message: str | None = None
 
 
@@ -108,6 +117,10 @@ class SlotView(BaseModel):
     last_smart_test_type: str | None = None
     last_smart_test_status: str | None = None
     last_smart_test_lifetime_hours: int | None = None
+    logical_block_size: int | None = None
+    physical_block_size: int | None = None
+    logical_unit_id: str | None = None
+    sas_address: str | None = None
     enclosure_identifier: str | None = None
     led_supported: bool = False
     led_backend: str | None = None
@@ -130,6 +143,7 @@ class SourceStatus(BaseModel):
 class SystemOption(BaseModel):
     id: str
     label: str
+    platform: str | None = None
 
 
 class EnclosureOption(BaseModel):
@@ -139,6 +153,7 @@ class EnclosureOption(BaseModel):
     rows: int | None = None
     columns: int | None = None
     slot_count: int | None = None
+    slot_layout: list[list[int]] | None = None
 
 
 class InventorySummary(BaseModel):
@@ -160,6 +175,7 @@ class InventorySnapshot(BaseModel):
     refresh_interval_seconds: int
     selected_system_id: str | None = None
     selected_system_label: str | None = None
+    selected_system_platform: str | None = None
     selected_enclosure_id: str | None = None
     selected_enclosure_label: str | None = None
     selected_enclosure_name: str | None = None

@@ -54,31 +54,11 @@ class TrueNASWebsocketClient:
 
     async def fetch_all(self) -> TrueNASRawData:
         async with self._session() as ws:
-            enclosures = await self._call(ws, "enclosure.query", [])
-            try:
-                disks = await self._call(ws, "disk.query", [[], {"extra": {"pools": True}}])
-            except TrueNASAPIError:
-                logger.warning("disk.query with extra.pools failed; retrying without extra options.")
-                disks = await self._call(ws, "disk.query", [[]])
+            enclosures = await self._fetch_enclosures(ws)
+            disks = await self._fetch_disks(ws)
             pools = await self._call(ws, "pool.query", [])
-            disk_temperatures: dict[str, int] = {}
-            smart_test_results: list[dict[str, Any]] = []
-            try:
-                temperatures = await self._call(ws, "disk.temperatures", [[]])
-                if isinstance(temperatures, dict):
-                    disk_temperatures = {
-                        str(key): value
-                        for key, value in temperatures.items()
-                        if isinstance(value, int)
-                    }
-            except TrueNASAPIError:
-                logger.warning("disk.temperatures failed; continuing without temperature overview.")
-            try:
-                results = await self._call(ws, "smart.test.results", [])
-                if isinstance(results, list):
-                    smart_test_results = [item for item in results if isinstance(item, dict)]
-            except TrueNASAPIError:
-                logger.warning("smart.test.results failed; continuing without SMART test overview.")
+            disk_temperatures = await self._fetch_disk_temperatures(ws)
+            smart_test_results = await self._fetch_smart_test_results(ws)
             return TrueNASRawData(
                 enclosures=self._ensure_list(enclosures),
                 disks=self._ensure_list(disks),
@@ -90,7 +70,14 @@ class TrueNASWebsocketClient:
     async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None) -> str:
         command_args = args or ["-a", "-j"]
         async with self._session() as ws:
-            result = await self._call(ws, "disk.smartctl", [disk_name, command_args])
+            try:
+                result = await self._call(ws, "disk.smartctl", [disk_name, command_args])
+            except TrueNASAPIError as exc:
+                if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
+                    raise TrueNASAPIError(
+                        "Detailed SMART JSON is not available through the SCALE websocket API on this system."
+                    ) from exc
+                raise
             if not isinstance(result, str):
                 raise TrueNASAPIError(f"disk.smartctl returned unexpected payload type for {disk_name!r}.")
             return result
@@ -121,6 +108,113 @@ class TrueNASWebsocketClient:
         authenticated = await self._call(ws, "auth.login_with_api_key", [self.config.api_key])
         if authenticated is not True:
             raise TrueNASAPIError("TrueNAS API authentication failed.")
+
+    async def _fetch_enclosures(self, ws: ClientConnection) -> list[dict[str, Any]]:
+        methods = ["enclosure.query", "enclosure2.query"]
+        if self.config.platform == "scale":
+            methods = ["enclosure2.query", "enclosure.query"]
+
+        for method in methods:
+            try:
+                result = await self._call(ws, method, [])
+            except TrueNASAPIError:
+                continue
+            return self._ensure_list(result)
+
+        logger.warning("No supported enclosure query method succeeded; continuing without enclosure rows.")
+        return []
+
+    async def _fetch_disks(self, ws: ClientConnection) -> list[dict[str, Any]]:
+        try:
+            query_disks = self._ensure_list(await self._call(ws, "disk.query", [[], {"extra": {"pools": True}}]))
+        except TrueNASAPIError:
+            logger.warning("disk.query with extra.pools failed; retrying without extra options.")
+            query_disks = self._ensure_list(await self._call(ws, "disk.query", [[]]))
+
+        if self.config.platform != "scale":
+            return query_disks
+
+        try:
+            details_payload = await self._call(ws, "disk.details", [])
+        except TrueNASAPIError:
+            logger.warning("disk.details failed on SCALE; continuing with disk.query only.")
+            return query_disks
+
+        detail_disks = self._flatten_disk_details(details_payload)
+        if not detail_disks:
+            return query_disks
+
+        detail_index: dict[str, dict[str, Any]] = {}
+        for item in detail_disks:
+            for key in self._disk_lookup_keys(item):
+                detail_index[key] = item
+
+        merged: list[dict[str, Any]] = []
+        for disk in query_disks:
+            detail = next((detail_index[key] for key in self._disk_lookup_keys(disk) if key in detail_index), None)
+            if detail:
+                merged.append({**detail, **disk})
+            else:
+                merged.append(disk)
+        return merged
+
+    async def _fetch_disk_temperatures(self, ws: ClientConnection) -> dict[str, int]:
+        try:
+            temperatures = await self._call(ws, "disk.temperatures", [[]])
+        except TrueNASAPIError:
+            logger.warning("disk.temperatures failed; continuing without temperature overview.")
+            return {}
+
+        if isinstance(temperatures, dict):
+            return {
+                str(key): value
+                for key, value in temperatures.items()
+                if isinstance(value, int)
+            }
+        return {}
+
+    async def _fetch_smart_test_results(self, ws: ClientConnection) -> list[dict[str, Any]]:
+        try:
+            results = await self._call(ws, "smart.test.results", [])
+        except TrueNASAPIError as exc:
+            if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
+                logger.info("smart.test.results is unavailable on this SCALE system; continuing without SMART history.")
+            else:
+                logger.warning("smart.test.results failed; continuing without SMART test overview.")
+            return []
+
+        if isinstance(results, list):
+            return [item for item in results if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _flatten_disk_details(payload: Any) -> list[dict[str, Any]]:
+        if isinstance(payload, dict):
+            combined: list[dict[str, Any]] = []
+            for bucket in ("used", "unused"):
+                rows = payload.get(bucket)
+                if isinstance(rows, list):
+                    combined.extend(item for item in rows if isinstance(item, dict))
+            return combined
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _disk_lookup_keys(disk: dict[str, Any]) -> set[str]:
+        values = (
+            disk.get("name"),
+            disk.get("devname"),
+            disk.get("identifier"),
+            disk.get("serial"),
+            disk.get("serial_lunid"),
+            disk.get("lunid"),
+        )
+        return {
+            str(value).strip().lower()
+            for value in values
+            if value is not None and str(value).strip()
+        }
 
     @asynccontextmanager
     async def _session(self):

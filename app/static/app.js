@@ -17,6 +17,10 @@
 
   const grid = document.getElementById("slot-grid");
   const enclosureFace = document.querySelector(".enclosure-face");
+  const headerEyebrow = document.getElementById("header-eyebrow");
+  const headerSummary = document.getElementById("header-summary");
+  const enclosurePanelTitle = document.getElementById("enclosure-panel-title");
+  const enclosureEdgeLabel = document.getElementById("enclosure-edge-label");
   const detailEmpty = document.getElementById("detail-empty");
   const detailContent = document.getElementById("detail-content");
   const detailSecondary = document.getElementById("detail-secondary");
@@ -24,6 +28,7 @@
   const detailSlotTitle = document.getElementById("detail-slot-title");
   const detailStatePill = document.getElementById("detail-state-pill");
   const detailKvGrid = document.getElementById("detail-kv-grid");
+  const detailSmartNote = document.getElementById("detail-smart-note");
   const topologyContext = document.getElementById("topology-context");
   const multipathContext = document.getElementById("multipath-context");
   const warningList = document.getElementById("warning-list");
@@ -64,6 +69,40 @@
     const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
     const enclosurePart = state.snapshot.selected_enclosure_id || state.selectedEnclosureId || "all-enclosures";
     return `${systemPart}-${enclosurePart}`.replace(/[^a-zA-Z0-9._-]+/g, "-");
+  }
+
+  function getSelectedSystemOption() {
+    return (state.snapshot.systems || []).find((system) => system.id === state.selectedSystemId) || null;
+  }
+
+  function getSelectedEnclosureOption() {
+    return (state.snapshot.enclosures || []).find((enclosure) => enclosure.id === state.selectedEnclosureId) || null;
+  }
+
+  function buildViewProfile() {
+    const system = getSelectedSystemOption();
+    const enclosure = getSelectedEnclosureOption();
+    const enclosureLabel = enclosure?.label || state.snapshot.selected_enclosure_label || "Enclosure";
+    const platform = (state.snapshot.selected_system_platform || system?.platform || "core").toLowerCase();
+
+    if (platform === "scale") {
+      const isRearView = enclosureLabel.toLowerCase().includes("rear");
+      return {
+        eyebrow: `TrueNAS SCALE / Supermicro SSG-6048R ${isRearView ? "Rear" : "Front"} View`,
+        summary: isRearView
+          ? "Rear-drive map with Linux SES AES slot mapping and SSH smartctl enrichment."
+          : "Front-drive map with Linux SES AES slot mapping and SSH smartctl enrichment.",
+        enclosureTitle: enclosureLabel || (isRearView ? "Rear 12 Bay" : "Front 24 Bay"),
+        edgeLabel: isRearView ? "Rear of chassis" : "Front of chassis",
+      };
+    }
+
+    return {
+      eyebrow: "TrueNAS CORE / Supermicro CSE-946 Top View",
+      summary: "Top-loading bay map with API-or-SSH LED control and optional SSH enrichment.",
+      enclosureTitle: "Enclosure Top",
+      edgeLabel: "System front / latch edge",
+    };
   }
 
   function splitRowIntoGroups(row) {
@@ -201,9 +240,9 @@
     return smartEntry?.data?.message ? "Unavailable" : "n/a";
   }
 
-  function formatSectorSizeValue(smartEntry) {
-    const logical = smartEntry?.data?.logical_block_size;
-    const physical = smartEntry?.data?.physical_block_size;
+  function formatSectorSizeValue(slot, smartEntry) {
+    const logical = smartEntry?.data?.logical_block_size ?? slot?.logical_block_size;
+    const physical = smartEntry?.data?.physical_block_size ?? slot?.physical_block_size;
     if (Number.isInteger(logical) && Number.isInteger(physical)) {
       return `Logical ${logical} B / Physical ${physical} B`;
     }
@@ -211,6 +250,126 @@
       return "Loading...";
     }
     return smartEntry?.data?.message ? "Unavailable" : "n/a";
+  }
+
+  function formatRotationValue(smartEntry) {
+    const rpm = smartEntry?.data?.rotation_rate_rpm;
+    if (rpm === 0) {
+      return "SSD";
+    }
+    if (Number.isInteger(rpm)) {
+      return `${rpm} rpm`;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return "n/a";
+  }
+
+  function formatFormFactorValue(smartEntry) {
+    const formFactor = smartEntry?.data?.form_factor;
+    if (formFactor) {
+      return formFactor;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return "n/a";
+  }
+
+  function formatCacheFlagValue(value, smartEntry) {
+    if (value === true) {
+      return "Enabled";
+    }
+    if (value === false) {
+      return "Disabled";
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return "n/a";
+  }
+
+  function formatReadCacheValue(smartEntry) {
+    return formatCacheFlagValue(smartEntry?.data?.read_cache_enabled, smartEntry);
+  }
+
+  function formatWritebackCacheValue(smartEntry) {
+    return formatCacheFlagValue(smartEntry?.data?.writeback_cache_enabled, smartEntry);
+  }
+
+  function formatHexIdentifier(value) {
+    if (value === null || value === undefined || value === "") {
+      return null;
+    }
+    const text = String(value).trim();
+    if (!text) {
+      return null;
+    }
+    if (/^0x[0-9a-f]+$/i.test(text)) {
+      return text.toLowerCase();
+    }
+    if (/^[0-9a-f]+$/i.test(text)) {
+      return `0x${text.toLowerCase()}`;
+    }
+    return text;
+  }
+
+  function formatTransportValue(smartEntry) {
+    const transport = smartEntry?.data?.transport_protocol;
+    if (transport) {
+      return transport;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return "n/a";
+  }
+
+  function formatLogicalUnitIdValue(slot, smartEntry) {
+    const logicalUnitId = smartEntry?.data?.logical_unit_id || slot?.logical_unit_id || slot?.multipath?.lunid;
+    const formatted = formatHexIdentifier(logicalUnitId);
+    if (formatted) {
+      return formatted;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return "n/a";
+  }
+
+  function formatSasAddressValue(slot, smartEntry) {
+    const sasAddress = smartEntry?.data?.sas_address || slot?.sas_address;
+    const formatted = formatHexIdentifier(sasAddress);
+    if (formatted) {
+      return formatted;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return "n/a";
+  }
+
+  function formatAttachedSasAddressValue(smartEntry) {
+    const formatted = formatHexIdentifier(smartEntry?.data?.attached_sas_address);
+    if (formatted && formatted !== "0x0") {
+      return formatted;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return "n/a";
+  }
+
+  function formatLinkRateValue(smartEntry) {
+    const linkRate = smartEntry?.data?.negotiated_link_rate;
+    if (linkRate) {
+      return linkRate;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return "n/a";
   }
 
   function passesFilter(slot) {
@@ -333,6 +492,8 @@
     if (!slot) {
       detailEmpty.classList.remove("hidden");
       detailContent.classList.add("hidden");
+      detailSmartNote.classList.add("hidden");
+      detailSmartNote.textContent = "";
       detailSecondary.classList.remove("hidden");
       detailLedControls.classList.add("hidden");
       renderTopologyContext(null);
@@ -376,12 +537,30 @@
       kvRow("Temp", formatTemperatureValue(slot, smartEntry)),
       kvRow("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
       kvRow("Power On", formatPowerOnValue(smartEntry)),
-      kvRow("Sector Size", formatSectorSizeValue(smartEntry)),
+      kvRow("Sector Size", formatSectorSizeValue(slot, smartEntry)),
+      kvRow("Rotation", formatRotationValue(smartEntry)),
+      kvRow("Form Factor", formatFormFactorValue(smartEntry)),
+      kvRow("Read Cache", formatReadCacheValue(smartEntry)),
+      kvRow("Writeback Cache", formatWritebackCacheValue(smartEntry)),
+      kvRow("Transport", formatTransportValue(smartEntry)),
+      kvRow("Logical Unit ID", formatLogicalUnitIdValue(slot, smartEntry)),
+      kvRow("SAS Address", formatSasAddressValue(slot, smartEntry)),
+      kvRow("Attached SAS", formatAttachedSasAddressValue(smartEntry)),
+      kvRow("Link Rate", formatLinkRateValue(smartEntry)),
       kvRow("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
       kvRow("LED", ledStatusLabel(slot)),
       kvRow("Mapping", slot.mapping_source),
       kvRow("Notes", slot.notes),
     ].join("");
+
+    const smartMessage = smartEntry?.data?.message;
+    if (smartMessage) {
+      detailSmartNote.textContent = smartMessage;
+      detailSmartNote.classList.remove("hidden");
+    } else {
+      detailSmartNote.classList.add("hidden");
+      detailSmartNote.textContent = "";
+    }
 
     detailKvGrid.querySelectorAll("[data-copy]").forEach((button) => {
       button.addEventListener("click", async () => {
@@ -671,6 +850,22 @@
     summarySshSlotHintCount.textContent = String(summary.ssh_slot_hint_count ?? 0);
   }
 
+  function renderViewChrome() {
+    const profile = buildViewProfile();
+    if (headerEyebrow) {
+      headerEyebrow.textContent = profile.eyebrow;
+    }
+    if (headerSummary) {
+      headerSummary.textContent = profile.summary;
+    }
+    if (enclosurePanelTitle) {
+      enclosurePanelTitle.textContent = profile.enclosureTitle;
+    }
+    if (enclosureEdgeLabel) {
+      enclosureEdgeLabel.textContent = profile.edgeLabel;
+    }
+  }
+
   function renderRefreshControls() {
     autoRefreshToggle.checked = state.autoRefresh;
     refreshIntervalSelect.value = String(state.refreshIntervalSeconds);
@@ -711,6 +906,7 @@
   }
 
   function renderAll() {
+    renderViewChrome();
     renderGrid();
     renderDetail();
     renderWarnings();
