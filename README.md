@@ -93,8 +93,9 @@ front and rear grids derived from Linux SES data and operator notes.
 
 - The enclosure parser is intentionally defensive because `enclosure.query`
   payloads can differ between TrueNAS versions, HBAs, and SES implementations.
-- The app assumes one primary enclosure at a time. There is a config filter for
-  selecting the intended enclosure, but the UI is not yet multi-enclosure.
+- The UI can switch between configured systems and enclosure views, but the
+  validated enclosure profiles are still intentionally narrow rather than
+  claiming universal chassis support.
 - SSH parsing for `sesutil map`, `sesutil show`, and `zpool status -gP` is
   heuristic and meant as a practical first pass, not a perfect topology engine
   for every hardware layout.
@@ -122,6 +123,7 @@ truenas-jbod-ui/
 |  |- V0_3_SCALE_NOTES.md
 |- logs/
 |  |- .gitkeep
+|- tests/
 |- .dockerignore
 |- .env.example
 |- Dockerfile
@@ -520,9 +522,9 @@ multipath summary and simply omits controller/HBA labels.
   one visual shape
 - Richer topology visualization for pool and vdev ancestry beyond the current
   compact sibling-awareness panel
-- Expanded SMART detail when the underlying data is stable enough, such as SAS
-  cache flags and other controller-specific transport hints beyond the current
-  SCALE `smartctl` fields
+- Expanded SMART detail when the underlying data is stable enough, such as
+  error counters, background scan summaries, and other controller-specific
+  transport hints beyond the current baseline
 - More operator-focused multipath detail, especially for edge cases and future
   controller types beyond the current `mpr0` / `mpr1` presentation
 - Broader SCALE enclosure validation beyond the currently tested front `24` and
