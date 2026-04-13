@@ -2,7 +2,12 @@
 
 ## Unreleased
 
-Working branch for the next feature set after `v0.1.0`.
+Working branch for the next feature set after `v0.2.0`.
+
+## v0.2.0 - 2026-04-12
+
+Second public release focused on operator awareness, multi-system selection,
+and richer CORE shelf context.
 
 ### Added
 
@@ -18,16 +23,6 @@ Working branch for the next feature set after `v0.1.0`.
 - Multipath presentation cards that summarize active, passive, and failed HBA/controller paths when available
 - Example multi-system YAML config showing the intended `v0.2` shape
 - Stable enclosure geometry so slot carriers keep a consistent physical-looking size when selection state changes
-
-### Planned focus
-
-- Multi-system and multi-enclosure selection
-- Mapping export/import workflow
-- Compact topology and sibling-awareness improvements
-- Expanded SMART summary details and validation across more drive types
-- Deeper multipath/member awareness and presentation polish
-- Enclosure profile metadata for chassis-specific slot grouping and bay proportions
-- Adapter groundwork for future TrueNAS SCALE support
 
 ## v0.1.0 - 2026-04-12
 
