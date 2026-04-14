@@ -529,3 +529,26 @@ If this SCALE build requires passworded command-limited sudo instead of
 ```env
 SSH_SUDO_PASSWORD=your-long-random-password
 ```
+
+## Generic Linux NVMe Notes
+
+For generic Linux hosts that are inventory-only and do not expose SES devices,
+the app can still build profile-driven slot views and richer NVMe slot detail
+through SSH.
+
+The `gpu-server` Ubuntu `mdadm` / NVMe test host currently uses:
+
+```bash
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/nvme*n*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/lsblk -OJ
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail --scan
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail /dev/md*
+```
+
+`nvme list-subsys -o json` may work without sudo and is useful for controller
+and PCIe-path discovery. The privileged `nvme` commands above are only needed
+for on-demand controller-native enrichment such as firmware revision, protocol
+version, namespace GUIDs, and warning/critical temperature thresholds.

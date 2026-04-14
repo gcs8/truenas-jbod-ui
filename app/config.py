@@ -24,7 +24,7 @@ class AppConfig(BaseModel):
 class TrueNASConfig(BaseModel):
     host: str = "https://truenas.local"
     api_key: str = ""
-    platform: Literal["core", "scale"] = "core"
+    platform: Literal["core", "scale", "linux"] = "core"
     verify_ssl: bool = True
     timeout_seconds: int = 15
     enclosure_filter: str | None = None
@@ -52,6 +52,22 @@ class SSHConfig(BaseModel):
     )
 
 
+class EnclosureProfileConfig(BaseModel):
+    id: str
+    label: str
+    eyebrow: str | None = None
+    summary: str | None = None
+    panel_title: str | None = None
+    edge_label: str | None = None
+    face_style: str = "generic"
+    latch_edge: str = "bottom"
+    rows: int
+    columns: int
+    slot_layout: list[list[int]] | None = None
+    row_groups: list[int] = Field(default_factory=list)
+    slot_hints: dict[int, list[str]] = Field(default_factory=dict)
+
+
 class LayoutConfig(BaseModel):
     slot_count: int = 60
     rows: int = 4
@@ -63,6 +79,7 @@ class LayoutConfig(BaseModel):
 class PathConfig(BaseModel):
     mapping_file: str = "/app/data/slot_mappings.json"
     log_file: str = "/app/logs/app.log"
+    profile_file: str = "/app/config/profiles.yaml"
 
 
 class SystemConfig(BaseModel):
@@ -70,6 +87,8 @@ class SystemConfig(BaseModel):
     label: str | None = None
     truenas: TrueNASConfig = Field(default_factory=TrueNASConfig)
     ssh: SSHConfig = Field(default_factory=SSHConfig)
+    default_profile_id: str | None = None
+    enclosure_profiles: dict[str, str] = Field(default_factory=dict)
 
 
 class Settings(BaseModel):
@@ -80,6 +99,7 @@ class Settings(BaseModel):
     default_system_id: str | None = None
     layout: LayoutConfig = Field(default_factory=LayoutConfig)
     paths: PathConfig = Field(default_factory=PathConfig)
+    profiles: list[EnclosureProfileConfig] = Field(default_factory=list)
     config_file: str = "/app/config/config.yaml"
 
 
@@ -116,6 +136,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "LAYOUT_API_SLOT_NUMBER_BASE": ("layout", "api_slot_number_base"),
     "PATH_MAPPING_FILE": ("paths", "mapping_file"),
     "PATH_LOG_FILE": ("paths", "log_file"),
+    "PATH_PROFILE_FILE": ("paths", "profile_file"),
 }
 
 
@@ -165,6 +186,25 @@ def _load_yaml_config(config_path: Path) -> dict[str, Any]:
         return loaded
 
 
+def _load_profile_yaml(profile_path: Path) -> dict[str, Any]:
+    if not profile_path.exists():
+        return {}
+
+    with profile_path.open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle) or {}
+
+    if isinstance(loaded, list):
+        return {"profiles": loaded}
+    if isinstance(loaded, dict):
+        profiles = loaded.get("profiles", loaded)
+        if isinstance(profiles, list):
+            return {"profiles": profiles}
+
+    raise ValueError(
+        f"Profile file {profile_path} must contain a YAML list of profiles or a mapping with a 'profiles' list."
+    )
+
+
 def _normalize_system_id(value: str | None, fallback_index: int) -> str:
     text = normalize_text(value)
     if not text:
@@ -207,6 +247,12 @@ def _normalize_systems(settings: Settings) -> Settings:
                 update={
                     "id": system_id,
                     "label": normalize_text(system.label) or system_id.replace("-", " ").title(),
+                    "default_profile_id": normalize_text(system.default_profile_id),
+                    "enclosure_profiles": {
+                        str(key): str(value)
+                        for key, value in (system.enclosure_profiles or {}).items()
+                        if normalize_text(str(key)) and normalize_text(str(value))
+                    },
                 }
             )
         )
@@ -244,7 +290,13 @@ def get_settings() -> Settings:
             continue
         _set_path_value(merged, target_path, _parse_scalar(raw_value))
 
+    profile_path = Path(merged.get("paths", {}).get("profile_file", defaults["paths"]["profile_file"]))
+    if profile_path.exists():
+        profile_config = _load_profile_yaml(profile_path)
+        merged["profiles"] = [*(merged.get("profiles") or []), *(profile_config.get("profiles") or [])]
+
     settings = _normalize_systems(Settings.model_validate(merged))
     Path(settings.paths.mapping_file).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.paths.log_file).parent.mkdir(parents=True, exist_ok=True)
+    Path(settings.paths.profile_file).parent.mkdir(parents=True, exist_ok=True)
     return settings

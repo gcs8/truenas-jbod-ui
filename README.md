@@ -4,7 +4,8 @@
 
 This project is a production-usable web app for visualizing JBOD and
 chassis-attached disks on TrueNAS systems without installing anything on the
-storage host itself.
+storage host itself. It now also has a first-pass SSH-only Linux inventory path
+for profile-driven, non-TrueNAS hosts where physical disk layout still matters.
 
 It runs entirely off-box in Docker, talks to TrueNAS over the middleware
 websocket API, optionally enriches data over SSH, and renders a dark,
@@ -17,6 +18,8 @@ The current tested hardware profiles are:
 - TrueNAS CORE on a Supermicro CSE-946 style `60`-bay top-loading shelf
 - TrueNAS SCALE on a Supermicro `SSG-6048R-E1CR36L` with separate front `24`-bay
   and rear `12`-bay enclosure views
+- Generic Linux on a Supermicro `SYS-2029GP-TR` using a profile-driven `2`-bay
+  right-side NVMe view backed by SSH `lsblk`, `mdadm`, and `nvme` discovery
 
 The CORE layout groups each 15-bay row as `6 + 6 + 3` to better match the
 physical divider layout of the chassis. The SCALE layout uses chassis-specific
@@ -26,11 +29,11 @@ front and rear grids derived from Linux SES data and operator notes.
 
 ### Archive CORE
 
-![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/core-overview-v0.3.1.png)
+![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/core-overview-v0.4.0.png)
 
 ### Offsite SCALE
 
-![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/scale-overview-v0.3.1.png)
+![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/scale-overview-v0.4.0.png)
 
 ## Features
 
@@ -45,12 +48,21 @@ front and rear grids derived from Linux SES data and operator notes.
   when available through API or SSH
 - Multi-system and multi-enclosure pickers so CORE shelves and SCALE front/rear
   views can live in the same app
+- Profile-driven enclosure rendering so validated hardware and custom layouts
+  can share the same slot-map UI
 - First-pass TrueNAS SCALE support with split front/rear enclosure pickers when
   Linux SES AES and enclosure-status data is available over SSH
+- First-pass generic Linux support for SSH-only `mdadm` / NVMe hosts where no
+  TrueNAS API is available
 - Optional SSH enrichment for:
   - `glabel status`
   - `gmultipath list`
   - `zpool status -gP`
+  - `mdadm --detail --scan`
+  - `nvme list-subsys -o json`
+  - `nvme smart-log -o json`
+  - `nvme id-ctrl -o json`
+  - `nvme id-ns -o json`
   - `camcontrol devlist -v`
   - `sesutil map`
   - `sesutil show`
@@ -77,6 +89,14 @@ front and rear grids derived from Linux SES data and operator notes.
   - logical and physical sector size
   - rotation rate, form factor, and read/write cache state when SMART data provides them
   - SCALE smartctl transport context such as protocol, logical unit ID, SAS address, and negotiated link rate when available
+  - NVMe endurance and write-volume context such as percentage used, available spare,
+    bytes read, bytes written, annualized write rate, and estimated remaining
+    write endurance when SMART data provides them
+  - SAS/SCSI lifetime read and write totals, plus annualized write rate, when
+    `smartctl` exposes processed-byte counters through the error log
+  - optional NVMe controller and namespace detail such as firmware revision,
+    protocol version, warning/critical temperature thresholds, and namespace
+    GUIDs when `nvme-cli` access is available over SSH
   - persistent identifier such as GPTID, PARTUUID, or WWN
   - pool
   - vdev
@@ -90,6 +110,8 @@ front and rear grids derived from Linux SES data and operator notes.
 - SSH identify LED control via `sesutil locate` on CORE or `sg_ses` identify
   control on SCALE when the TrueNAS enclosure API does not expose writable
   enclosure rows
+- Custom YAML-defined enclosure profiles loaded from `paths.profile_file`
+  without code changes
 - Persistent JSON slot calibration storage on a bind mount
 - Manual calibration workflow for imperfect slot mapping
 - Graceful partial-data behavior when API or SSH is incomplete
@@ -110,10 +132,19 @@ front and rear grids derived from Linux SES data and operator notes.
   SCALE SSH fallback being allowed to run `sg_ses` identify control.
 - The current enclosure profiles are intentionally targeted to the hardware that
   has been validated so far: the CORE CSE-946 top-loader and the SCALE
-  SSG-6048R-E1CR36L front / rear chassis views.
+  SSG-6048R-E1CR36L front / rear chassis views, plus a first-pass Linux NVMe
+  profile for a SYS-2029GP-TR right-side dual-bay layout.
 - SCALE slot mapping and LED control currently depend on Linux SES access over
   SSH because the tested SCALE host does not expose usable enclosure rows
   through the middleware API.
+- Generic Linux slot mapping currently depends on explicit profile `slot_hints`
+  and host inventory data such as `lsblk`, `mdadm`, and `nvme list-subsys`.
+  It does not currently infer arbitrary Linux chassis geometry on its own.
+- Write-endurance and TBW-style estimates are only shown when the underlying
+  SMART data actually exposes lifetime write counters. The current NVMe path is
+  good here; generic HDD/SAS write-rate coverage is still best-effort.
+- Generic Linux LED control is not assumed. If the host does not expose SES
+  devices such as `/dev/sg*`, the app will stay inventory-only for that system.
 
 ## Directory Layout
 
@@ -122,10 +153,13 @@ truenas-jbod-ui/
 |- app/
 |- config/
 |  |- config.example.yaml
+|  |- profiles.example.yaml
 |- data/
 |  |- .gitkeep
 |- docs/
+|  |- PROFILE_AUTHORING.md
 |  |- SSH_READ_ONLY_SETUP.md
+|  |- GPU_SERVER_NOTES.md
 |  |- V0_3_SCALE_NOTES.md
 |- logs/
 |  |- .gitkeep
@@ -152,13 +186,19 @@ truenas-jbod-ui/
    cp config/config.example.yaml config/config.yaml
    ```
 
-3. Edit `.env`:
+3. Optional if you want custom chassis layouts:
+
+   ```bash
+   cp config/profiles.example.yaml config/profiles.yaml
+   ```
+
+4. Edit `.env`:
    - set `TRUENAS_HOST`
    - set `TRUENAS_API_KEY`
    - decide whether `TRUENAS_VERIFY_SSL` should be `true` or `false`
    - enable SSH only if you want richer correlation
 
-4. If you want SSH enrichment:
+5. If you want SSH enrichment:
    - place your private key in `./config/ssh/id_truenas`
    - prefer a dedicated non-root account if it can run the required inventory
      commands
@@ -166,13 +206,13 @@ truenas-jbod-ui/
    - consider mounting a `known_hosts` file and enabling strict host key
      checking
 
-5. Start the app:
+6. Start the app:
 
    ```bash
    docker compose up -d --build
    ```
 
-6. Open the UI:
+7. Open the UI:
 
    - `http://your-docker-host:8080`
 
@@ -204,6 +244,25 @@ docker compose down
 A conservative SSH setup guide for live slot mapping is included here:
 
 - [docs/SSH_READ_ONLY_SETUP.md](docs/SSH_READ_ONLY_SETUP.md)
+- [docs/GPU_SERVER_NOTES.md](docs/GPU_SERVER_NOTES.md) for the current Ubuntu /
+  `mdadm` / NVMe generic Linux test host
+
+## GitHub Wiki Source
+
+The repo now includes a GitHub-wiki-ready page set under:
+
+- [`wiki/Home.md`](wiki/Home.md)
+- [`wiki/Quick-Start.md`](wiki/Quick-Start.md)
+- [`wiki/TrueNAS-CORE-Setup.md`](wiki/TrueNAS-CORE-Setup.md)
+- [`wiki/TrueNAS-SCALE-Setup.md`](wiki/TrueNAS-SCALE-Setup.md)
+- [`wiki/Generic-Linux-Setup.md`](wiki/Generic-Linux-Setup.md)
+- [`wiki/SSH-Setup-and-Sudo.md`](wiki/SSH-Setup-and-Sudo.md)
+- [`wiki/Profiles-and-Custom-Layouts.md`](wiki/Profiles-and-Custom-Layouts.md)
+- [`wiki/Advanced-Configuration.md`](wiki/Advanced-Configuration.md)
+- [`wiki/Troubleshooting.md`](wiki/Troubleshooting.md)
+
+The idea is to keep the wiki content reviewable in the main repo, then copy or
+publish those pages to the GitHub wiki repo when you want them live.
 
 The short version is:
 
@@ -251,9 +310,46 @@ practice:
 - `LAYOUT_ROWS`
 - `LAYOUT_COLUMNS`
 - `LAYOUT_API_SLOT_NUMBER_BASE`
+- `PATH_PROFILE_FILE`
 
 `LAYOUT_API_SLOT_NUMBER_BASE` matters because many TrueNAS enclosure APIs use
 1-based slot numbers while the UI intentionally labels slots `00-59`.
+
+## Enclosure Profiles
+
+The `0.4.0` profile system moves enclosure presentation out of scattered
+hardware-specific UI logic and into profile metadata.
+
+Built-in validated profiles currently cover:
+
+- `supermicro-cse-946-top-60`
+- `supermicro-ssg-6048r-front-24`
+- `supermicro-ssg-6048r-rear-12`
+
+Custom profiles can be loaded from `paths.profile_file` / `PATH_PROFILE_FILE`
+without code changes.
+
+Profile docs and examples:
+
+- [config/profiles.example.yaml](config/profiles.example.yaml)
+- [docs/PROFILE_AUTHORING.md](docs/PROFILE_AUTHORING.md)
+
+## Profile Migration Notes
+
+The validated CORE and SCALE layouts now render through built-in enclosure
+profiles instead of scattered hardcoded renderer rules.
+
+For existing deployments:
+
+- validated hardware keeps working through the built-in profiles
+- `default_profile_id` can pin a system to a specific built-in or custom
+  profile
+- `enclosure_profiles` can override the profile for a specific enclosure id
+- `paths.profile_file` or `PATH_PROFILE_FILE` can load custom layouts from YAML
+
+If no explicit profile is configured, the app falls back to the validated
+built-in profile when it knows the chassis, or to a conservative runtime profile
+when it does not.
 
 ## API-Only Mode
 
@@ -523,26 +619,22 @@ multipath summary and simply omits controller/HBA labels.
 
 ## Future Improvements
 
-- Enclosure profile metadata so different chassis can define bay proportions,
-  row grouping, service-area layout, and orientation rules without hardcoding
-  one visual shape
+- `v0.4.x`: keep polishing the new enclosure-profile system and reduce the
+  remaining hardcoded chassis assumptions
+- `v0.5.0`: add OSNexus Quantastor support now that the profile system is in
+  place
 - Richer topology visualization for pool and vdev ancestry beyond the current
   compact sibling-awareness panel
-- Expanded SMART detail when the underlying data is stable enough, such as
-  error counters, background scan summaries, and other controller-specific
-  transport hints beyond the current baseline
-- More operator-focused multipath detail, especially for edge cases and future
-  controller types beyond the current `mpr0` / `mpr1` presentation
-- Broader SCALE enclosure validation beyond the currently tested front `24` and
-  rear `12` views
 - WebSocket or Server-Sent Events live updates
 - Per-slot historical events and LED action audit trail
-- Continued TrueNAS SCALE adapter work for richer Linux disk correlation,
-  profile-driven chassis layouts, and safer long-term Linux SES control rules
 
-Current first-pass SCALE findings and hardware notes live here:
+Current planning and SCALE-specific notes live here:
 
+- [docs/ROADMAP.md](docs/ROADMAP.md)
+- [docs/V0_3_X_PLAN.md](docs/V0_3_X_PLAN.md)
+- [docs/V0_4_PROFILE_PLAN.md](docs/V0_4_PROFILE_PLAN.md)
 - [docs/V0_3_SCALE_NOTES.md](docs/V0_3_SCALE_NOTES.md)
+- [docs/PROFILE_AUTHORING.md](docs/PROFILE_AUTHORING.md)
 
 ## License
 

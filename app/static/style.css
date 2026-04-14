@@ -397,6 +397,28 @@ textarea {
     inset 0 -28px 40px rgba(0, 0, 0, 0.24);
 }
 
+.chassis-shell[data-face-style="front-drive"],
+.chassis-shell[data-face-style="rear-drive"] {
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0) 16%),
+    linear-gradient(180deg, #7e878f 0%, #505962 8%, #1d242b 8.2%, #12171c 100%);
+}
+
+.chassis-shell[data-face-style="front-drive"] .service-zone,
+.chassis-shell[data-face-style="rear-drive"] .service-zone {
+  grid-template-columns: 1.2fr 0.9fr 1.2fr;
+  min-height: 88px;
+}
+
+.chassis-shell[data-face-style="front-drive"] .service-panel-short,
+.chassis-shell[data-face-style="rear-drive"] .service-panel-short {
+  margin-left: 0;
+}
+
+.chassis-shell[data-face-style="rear-drive"] .service-zone {
+  min-height: 80px;
+}
+
 .service-zone {
   flex: 0 0 auto;
   display: grid;
@@ -480,6 +502,11 @@ textarea {
   align-items: stretch;
 }
 
+.chassis-shell[data-latch-edge="bottom"] .row-slots,
+.chassis-shell[data-latch-edge="top"] .row-slots {
+  justify-items: center;
+}
+
 .row-group {
   position: relative;
   display: grid;
@@ -527,6 +554,28 @@ textarea {
   transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
 }
 
+.chassis-shell[data-latch-edge="bottom"] .slot-tile,
+.chassis-shell[data-latch-edge="top"] .slot-tile {
+  width: min(100%, 148px);
+  height: auto;
+  aspect-ratio: 0.8 / 1;
+}
+
+.chassis-shell[data-latch-edge="right"] .slot-tile {
+  padding: 10px 30px 10px 8px;
+  border-radius: 8px 12px 12px 8px;
+}
+
+.chassis-shell[data-latch-edge="top"] .slot-tile {
+  padding: 30px 8px 10px;
+  border-radius: 12px 12px 8px 8px;
+}
+
+.chassis-shell[data-latch-edge="left"] .slot-tile {
+  padding: 10px 8px 10px 30px;
+  border-radius: 12px 8px 8px 12px;
+}
+
 .slot-tile:hover,
 .slot-tile.selected {
   transform: translateY(-2px);
@@ -556,6 +605,21 @@ textarea {
   border-radius: 6px 6px 10px 10px;
   border: 2px solid rgba(91, 183, 255, 0.42);
   pointer-events: none;
+}
+
+.chassis-shell[data-latch-edge="right"] .slot-tile.selected::after,
+.chassis-shell[data-latch-edge="right"] .slot-tile.peer-highlight::after {
+  border-radius: 6px 10px 10px 6px;
+}
+
+.chassis-shell[data-latch-edge="top"] .slot-tile.selected::after,
+.chassis-shell[data-latch-edge="top"] .slot-tile.peer-highlight::after {
+  border-radius: 10px 10px 6px 6px;
+}
+
+.chassis-shell[data-latch-edge="left"] .slot-tile.selected::after,
+.chassis-shell[data-latch-edge="left"] .slot-tile.peer-highlight::after {
+  border-radius: 10px 6px 6px 10px;
 }
 
 .slot-tile.peer-highlight {
@@ -630,6 +694,18 @@ textarea {
   pointer-events: none;
 }
 
+.chassis-shell[data-latch-edge="right"] .slot-tile::before {
+  inset: 5px 22px 5px 5px;
+}
+
+.chassis-shell[data-latch-edge="top"] .slot-tile::before {
+  inset: 22px 5px 5px 5px;
+}
+
+.chassis-shell[data-latch-edge="left"] .slot-tile::before {
+  inset: 5px 5px 5px 22px;
+}
+
 .slot-status-led {
   position: absolute;
   top: 8px;
@@ -693,6 +769,37 @@ textarea {
     inset 0 -1px 0 rgba(0, 0, 0, 0.16);
 }
 
+.chassis-shell[data-latch-edge="right"] .slot-latch {
+  left: auto;
+  right: 8px;
+  top: 8px;
+  bottom: 8px;
+  width: 18px;
+  height: auto;
+  border-radius: 8px 4px 4px 8px;
+  background: linear-gradient(90deg, #86444a, var(--tray-latch));
+}
+
+.chassis-shell[data-latch-edge="top"] .slot-latch {
+  top: 8px;
+  bottom: auto;
+  left: 8px;
+  right: 8px;
+  border-radius: 8px 8px 4px 4px;
+  background: linear-gradient(180deg, var(--tray-latch), #86444a);
+}
+
+.chassis-shell[data-latch-edge="left"] .slot-latch {
+  left: 8px;
+  right: auto;
+  top: 8px;
+  bottom: 8px;
+  width: 18px;
+  height: auto;
+  border-radius: 4px 8px 8px 4px;
+  background: linear-gradient(90deg, var(--tray-latch), #86444a);
+}
+
 .slot-tile.selected .slot-latch {
   border-color: rgba(91, 183, 255, 0.38);
   box-shadow:
@@ -750,6 +857,34 @@ textarea {
 .slot-tile.state-fault .slot-status-led { background: var(--fault); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.34), 0 0 12px rgba(210, 74, 74, 0.42); }
 .slot-tile.state-unknown .slot-status-led { background: var(--unknown); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.34), 0 0 12px rgba(47, 110, 187, 0.34); }
 .slot-tile.state-unmapped .slot-status-led { background: var(--unmapped); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.34), 0 0 12px rgba(197, 125, 58, 0.34); }
+
+.slot-tooltip {
+  position: fixed;
+  z-index: 1200;
+  max-width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(122, 169, 255, 0.25);
+  background: rgba(9, 13, 18, 0.96);
+  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.42);
+  pointer-events: none;
+  backdrop-filter: blur(10px);
+}
+
+.slot-tooltip-title {
+  font-family: var(--mono);
+  color: #f4f7fb;
+  font-size: 0.88rem;
+}
+
+.slot-tooltip-line {
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
 
 .front-edge {
   flex: 0 0 auto;

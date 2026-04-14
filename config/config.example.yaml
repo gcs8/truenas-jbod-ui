@@ -50,6 +50,7 @@ ssh:
 # systems:
 #   - id: archive-core
 #     label: Archive CORE
+#     default_profile_id: supermicro-cse-946-top-60
 #     truenas:
 #       host: https://10.13.37.10
 #       api_key: ""
@@ -70,8 +71,12 @@ ssh:
 #         - gmultipath list
 #         - sudo -n /usr/sbin/sesutil map
 #         - sudo -n /usr/sbin/sesutil show
+#     # Optional enclosure-specific override if you want to force a profile id:
+#     # enclosure_profiles:
+#     #   "500304801f715f3f": supermicro-cse-946-top-60
 #   - id: offsite-scale
 #     label: Offsite SCALE
+#     default_profile_id: supermicro-ssg-6048r-front-24
 #     truenas:
 #       host: https://scale.example.local
 #       api_key: ""
@@ -97,6 +102,28 @@ ssh:
 #         # smartctl does not need to live in the standing command list; the app
 #         # runs it on demand for the selected slot, but the user still needs
 #         # sudo permission for /usr/sbin/smartctl on the SCALE host.
+#     enclosure_profiles:
+#       "5003048001c1043f": supermicro-ssg-6048r-front-24
+#       "500304801e977aff": supermicro-ssg-6048r-rear-12
+#   - id: gpu-server
+#     label: GPU Server Linux
+#     default_profile_id: supermicro-sys-2029gp-tr-right-nvme-2
+#     truenas:
+#       host: http://gpu-server.example.local
+#       api_key: ""
+#       platform: linux
+#       verify_ssl: false
+#     ssh:
+#       enabled: true
+#       host: gpu-server.example.local
+#       user: jbodmap
+#       key_path: /run/ssh/id_truenas
+#       known_hosts_path: /run/ssh/known_hosts
+#       strict_host_key_checking: false
+#       commands:
+#         - /usr/bin/lsblk -OJ
+#         - sudo -n /usr/sbin/mdadm --detail --scan
+#         - /usr/sbin/nvme list-subsys -o json
 
 layout:
   slot_count: 60
@@ -110,3 +137,5 @@ layout:
 paths:
   mapping_file: /app/data/slot_mappings.json
   log_file: /app/logs/app.log
+  # Optional custom profile file for the v0.4.0 profile system.
+  profile_file: /app/config/profiles.yaml

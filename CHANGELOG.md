@@ -2,7 +2,66 @@
 
 ## Unreleased
 
-Working branch for the next feature set after `v0.3.1`.
+Working branch for the next feature set after `v0.4.0`.
+
+## v0.4.0 - 2026-04-14
+
+Chassis/profile release that generalizes enclosure rendering, extends Linux
+support beyond TrueNAS, and hardens CORE/SCALE parity for richer SMART and
+topology detail.
+
+### Added
+
+- First-pass `0.4.0` chassis/profile system work, including built-in validated
+  enclosure profiles for the supported CORE and SCALE hardware
+- Profile-driven tray latch/release-tab orientation so different chassis
+  families can keep horizontal and vertical tray visuals aligned with the real
+  hardware
+- First-pass generic Linux SSH-only inventory support for profile-driven NVMe /
+  `mdadm` hosts, validated against the `gpu-server` SYS-2029GP-TR right-side
+  dual-bay NVMe layout
+- NVMe SMART endurance/write-volume surfacing for Linux hosts, including wear
+  remaining, available spare, bytes written, annualized write rate, estimated
+  remaining write endurance, and richer slot hover tooltips
+- Optional `nvme-cli` enrichment for Linux NVMe slots, including firmware
+  revision, NVMe protocol version, namespace GUIDs, and warning/critical
+  temperature thresholds
+- SAS/SCSI lifetime read/write surfacing for CORE and SCALE slots when
+  `smartctl` exposes processed-byte counters in the error log
+- CORE alias matching for dual-path SAS devices so slot inventory can resolve
+  pool topology through peer HBA legs, including `special` vdev members that
+  only appear under alternate `da*` names in `pool.query`
+- Profile-aware snapshot and rendering plumbing so enclosure eyebrow/summary,
+  panel labels, edge labels, face styles, row grouping, and slot ordering now
+  come from profile metadata instead of scattered hardware-specific UI logic
+- Custom profile loading through `paths.profile_file` / `PATH_PROFILE_FILE`
+
+### Planning
+
+- Added detailed `0.3.x` and `0.4.0` execution-plan documents so ongoing work
+  can resume from repo files instead of chat context alone.
+
+### Docs
+
+- Added an active roadmap note that captures the intended release order of
+  `v0.3.x` parity work, `v0.4.0` chassis profiles, and `v0.5.0` Quantastor
+  support
+- Added a SCALE note about the appliance REST deprecation alert and recorded
+  that this app currently uses the websocket / JSON-RPC middleware path rather
+  than `/api/v2.0`
+- Added a profile authoring guide and example custom profile file so the
+  `0.4.0` chassis/profile system can be adopted without code edits
+- Refreshed the README to point at `v0.4.0` CORE/SCALE screenshots and
+  added profile migration notes for deployments moving from hardcoded layouts to
+  built-in or custom profiles
+- Added Ubuntu / `mdadm` / NVMe notes for the `gpu-server` generic Linux test
+  host and refreshed config examples to show the SSH-only Linux command set
+- Added a Quantastor planning note for the dual-node Supermicro
+  `SSG-2028R-DE2CR24L` chassis so the shared-slot representation problem is
+  captured ahead of `v0.5.0`
+- Added a GitHub-wiki-ready page set under `wiki/` so beginner quick-start
+  docs, platform setup guides, profile docs, and troubleshooting can be
+  reviewed in-repo before being published to the GitHub wiki
 
 ## v0.3.1 - 2026-04-14
 

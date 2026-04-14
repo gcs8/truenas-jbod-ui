@@ -64,14 +64,14 @@ def capture_core(page: Page) -> None:
     open_and_select_slot(page, CORE_PARAMS, 21)
     for label in ("Read Cache", "Transport", "Link Rate"):
         wait_for_kv_value(page, label)
-    capture_app_shell(page, "core-overview-v0.3.1.png")
+    capture_app_shell(page, "core-overview-v0.4.0.png")
 
 
 def capture_scale(page: Page) -> None:
     open_and_select_slot(page, SCALE_PARAMS, 0)
     for label in ("Temp", "Read Cache", "Transport", "Link Rate"):
         wait_for_kv_value(page, label)
-    capture_app_shell(page, "scale-overview-v0.3.1.png")
+    capture_app_shell(page, "scale-overview-v0.4.0.png")
 
 
 def main() -> None:

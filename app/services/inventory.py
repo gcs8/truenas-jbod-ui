@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shlex
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -25,9 +26,12 @@ from app.models.domain import (
     SystemOption,
 )
 from app.services.mapping_store import MappingStore
+from app.services.profile_registry import ProfileRegistry
 from app.services.parsers import (
     ParsedSSHData,
+    ZpoolMember,
     build_slot_candidates_from_ses_enclosures,
+    extract_nvme_controller_name,
     extract_enclosure_slot_candidates,
     format_bytes,
     merge_slot_candidate_maps,
@@ -36,6 +40,9 @@ from app.services.parsers import (
     normalize_lookup_keys,
     normalize_text,
     parse_pool_query_topology,
+    parse_nvme_id_ctrl_summary,
+    parse_nvme_id_ns_summary,
+    parse_nvme_smart_log_summary,
     parse_smart_test_results,
     parse_smartctl_text_enrichment,
     parse_smartctl_summary,
@@ -60,6 +67,27 @@ def build_layout_rows(rows: int, columns: int, slot_count: int) -> list[list[int
         if row_slots:
             layout_rows.append(row_slots)
     return layout_rows
+
+
+def infer_slot_count_from_layout(layout_rows: list[list[int]], fallback: int | None = None) -> int:
+    if layout_rows:
+        return max(slot for row in layout_rows for slot in row) + 1
+    return fallback or 0
+
+
+def parse_size_to_bytes(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    text = normalize_text(str(value) if value is not None else None)
+    if not text:
+        return None
+    match = re.match(r"^(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTPE]?)(?:i?B?)$", text, re.IGNORECASE)
+    if not match:
+        return None
+    number = float(match.group("number"))
+    unit = match.group("unit").upper()
+    power = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4, "P": 5, "E": 6}[unit]
+    return int(number * (1000 ** power))
 
 
 def build_lunid_aliases(value: str | None, platform: str) -> set[str]:
@@ -100,6 +128,8 @@ def resolve_persistent_id(*candidates: str | None) -> tuple[str | None, str | No
             return value, "GPTID"
         if leaf_lowered.startswith("wwn-"):
             return leaf, "WWN"
+        if leaf_lowered.startswith("eui."):
+            return leaf, "EUI64"
 
         return value, None
 
@@ -129,6 +159,7 @@ class DiskRecord:
     physical_block_size: int | None
     enclosure_id: str | None
     slot: int | None
+    smart_devices: list[str]
     lookup_keys: set[str]
 
 
@@ -140,12 +171,14 @@ class InventoryService:
         truenas_client: TrueNASWebsocketClient,
         ssh_probe: SSHProbe,
         mapping_store: MappingStore,
+        profile_registry: ProfileRegistry,
     ) -> None:
         self.settings = settings
         self.system = system
         self.truenas_client = truenas_client
         self.ssh_probe = ssh_probe
         self.mapping_store = mapping_store
+        self.profile_registry = profile_registry
         self._cache: dict[str, InventorySnapshot] = {}
         self._cache_until: dict[str, datetime] = {}
         self._smart_cache: dict[str, SmartSummaryView] = {}
@@ -255,7 +288,7 @@ class InventoryService:
         if cached and utcnow() < cache_until:
             return cached
 
-        if self.system.truenas.platform == "scale":
+        if self.system.truenas.platform in {"scale", "linux"}:
             summary, error_message = await self._fetch_smart_summary_over_ssh(candidates)
             if summary is not None:
                 summary = self._merge_smart_summary(slot_view, summary)
@@ -266,7 +299,11 @@ class InventoryService:
             return self._fallback_smart_summary(
                 slot_view,
                 error_message
-                or "Detailed SMART JSON is not currently available through the SCALE API on this system.",
+                or (
+                    "Detailed SMART JSON is not currently available through the SCALE API on this system."
+                    if self.system.truenas.platform == "scale"
+                    else "Detailed SMART data is not available for this Linux slot."
+                ),
             )
 
         last_error: str | None = None
@@ -299,15 +336,6 @@ class InventoryService:
                             parse_smartctl_text_enrichment(enrichment_payload)
                         ),
                     )
-            if self.system.ssh.enabled and self._summary_needs_ssh_enrichment(api_summary):
-                ssh_summary, ssh_error = await self._fetch_smart_summary_over_ssh(candidates)
-                if ssh_summary is not None:
-                    api_summary = self._merge_missing_smart_fields(
-                        api_summary,
-                        self._merge_smart_summary(slot_view, ssh_summary),
-                    )
-                elif ssh_error and not api_summary.message:
-                    api_summary.message = ssh_error
 
             self._smart_cache[cache_key] = api_summary
             self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
@@ -385,6 +413,10 @@ class InventoryService:
                             parse_smartctl_text_enrichment(text_result.stdout)
                         ),
                     )
+                if self.system.truenas.platform == "linux":
+                    nvme_summary = await self._fetch_linux_nvme_enrichment_over_ssh(device_path)
+                    if nvme_summary is not None:
+                        summary = self._merge_missing_smart_fields(summary, nvme_summary)
                 if summary.available or summary.message != "SMART JSON parsing failed.":
                     return summary, None
                 last_error = f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
@@ -396,6 +428,44 @@ class InventoryService:
         if self.system.truenas.platform == "core":
             return ("/usr/local/sbin/smartctl", "/usr/sbin/smartctl")
         return ("/usr/sbin/smartctl", "/usr/local/sbin/smartctl")
+
+    async def _fetch_linux_nvme_enrichment_over_ssh(self, device_path: str) -> SmartSummaryView | None:
+        if self.system.truenas.platform != "linux":
+            return None
+
+        device_name = normalize_device_name(device_path)
+        controller_name = extract_nvme_controller_name(device_name)
+        if not controller_name:
+            return None
+
+        controller_path = f"/dev/{controller_name}"
+        namespace_path = device_path if device_path.startswith("/dev/") else f"/dev/{device_name}"
+        summary: SmartSummaryView | None = None
+
+        for command, parser in (
+            (
+                shlex.join(["sudo", "-n", "/usr/sbin/nvme", "smart-log", "-o", "json", controller_path]),
+                parse_nvme_smart_log_summary,
+            ),
+            (
+                shlex.join(["sudo", "-n", "/usr/sbin/nvme", "id-ctrl", "-o", "json", controller_path]),
+                parse_nvme_id_ctrl_summary,
+            ),
+            (
+                shlex.join(["sudo", "-n", "/usr/sbin/nvme", "id-ns", "-o", "json", namespace_path]),
+                parse_nvme_id_ns_summary,
+            ),
+        ):
+            result = await self.ssh_probe.run_command(command)
+            if not result.stdout.strip():
+                continue
+            parsed = SmartSummaryView.model_validate(parser(result.stdout))
+            if summary is None:
+                summary = parsed
+            else:
+                summary = self._merge_missing_smart_fields(summary, parsed)
+
+        return summary
 
     async def export_mapping_bundle(self, selected_enclosure_id: str | None = None) -> MappingBundle:
         return MappingBundle(
@@ -430,25 +500,31 @@ class InventoryService:
     async def _build_snapshot(self, selected_enclosure_id: str | None = None) -> InventorySnapshot:
         warnings: list[str] = []
         ssh_data = ParsedSSHData()
+        api_enabled = self.system.truenas.platform != "linux"
         sources = {
-            "api": SourceStatus(enabled=True, ok=False, message=None),
+            "api": SourceStatus(
+                enabled=api_enabled,
+                ok=not api_enabled,
+                message="TrueNAS API disabled for this SSH-only Linux system." if not api_enabled else None,
+            ),
             "ssh": SourceStatus(enabled=self.system.ssh.enabled, ok=not self.system.ssh.enabled, message=None),
         }
 
-        try:
-            raw_data = await self.truenas_client.fetch_all()
-            sources["api"] = SourceStatus(enabled=True, ok=True, message="TrueNAS API reachable.")
-        except Exception as exc:
-            logger.exception("Failed to fetch TrueNAS API data")
-            raw_data = TrueNASRawData(
-                enclosures=[],
-                disks=[],
-                pools=[],
-                disk_temperatures={},
-                smart_test_results=[],
-            )
-            sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
-            warnings.append("TrueNAS API is unreachable. Slot details may be partial or unavailable.")
+        raw_data = TrueNASRawData(
+            enclosures=[],
+            disks=[],
+            pools=[],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+        if api_enabled:
+            try:
+                raw_data = await self.truenas_client.fetch_all()
+                sources["api"] = SourceStatus(enabled=True, ok=True, message="TrueNAS API reachable.")
+            except Exception as exc:
+                logger.exception("Failed to fetch TrueNAS API data")
+                sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
+                warnings.append("TrueNAS API is unreachable. Slot details may be partial or unavailable.")
 
         if self.system.ssh.enabled:
             try:
@@ -474,7 +550,7 @@ class InventoryService:
                 warnings.append("SSH mode is enabled but could not collect fallback command output.")
 
         has_scale_linux_ses = self._has_scale_linux_ses(ssh_data)
-        if not raw_data.enclosures:
+        if api_enabled and not raw_data.enclosures:
             if self.system.truenas.platform == "scale" and has_scale_linux_ses:
                 warnings.append(
                     "TrueNAS SCALE did not return enclosure rows, so this view is using Linux SES AES page parsing "
@@ -508,22 +584,45 @@ class InventoryService:
             resolved_enclosure_id = available_enclosures[0].id
 
         selected_option = option_by_id.get(resolved_enclosure_id) if resolved_enclosure_id else None
+        selected_profile = self.profile_registry.resolve_for_enclosure(
+            self.system,
+            selected_option,
+            fallback_label=selected_option.label if selected_option else selected_meta.get("label"),
+            fallback_rows=len(layout_rows) if layout_rows else None,
+            fallback_columns=layout_columns or None,
+            fallback_slot_count=layout_slot_count or None,
+            fallback_slot_layout=layout_rows or None,
+        )
         selected_slot = None
         if resolved_enclosure_id:
             selected_slot = next((slot for slot in slots if slot.enclosure_id == resolved_enclosure_id), None)
         if selected_slot is None:
             selected_slot = next((slot for slot in slots if slot.enclosure_id), slots[0] if slots else None)
 
-        summary = InventorySummary(
-            disk_count=len(raw_data.disks),
-            pool_count=len(raw_data.pools),
-            enclosure_count=len(raw_data.enclosures),
-            mapped_slot_count=sum(1 for slot in slots if slot.device_name),
-            manual_mapping_count=self.mapping_store.count_for_system(self.system.id),
-            ssh_slot_hint_count=max(
+        if self.system.truenas.platform == "linux":
+            disk_count = sum(1 for slot in slots if slot.device_name)
+            pool_count = len({slot.pool_name for slot in slots if slot.pool_name})
+            enclosure_count = len(available_enclosures)
+            ssh_slot_hint_count = max(
+                len((selected_profile.slot_hints if selected_profile else {}) or {}),
+                sum(1 for slot in slots if slot.smart_device_names),
+            )
+        else:
+            disk_count = len(raw_data.disks)
+            pool_count = len(raw_data.pools)
+            enclosure_count = len(raw_data.enclosures)
+            ssh_slot_hint_count = max(
                 len(ssh_data.ses_slot_candidates),
                 sum(len(enclosure.slots) for enclosure in ssh_data.ses_enclosures),
-            ),
+            )
+
+        summary = InventorySummary(
+            disk_count=disk_count,
+            pool_count=pool_count,
+            enclosure_count=enclosure_count,
+            mapped_slot_count=sum(1 for slot in slots if slot.device_name),
+            manual_mapping_count=self.mapping_store.count_for_system(self.system.id),
+            ssh_slot_hint_count=ssh_slot_hint_count,
         )
         return InventorySnapshot(
             slots=slots,
@@ -549,6 +648,7 @@ class InventoryService:
             selected_enclosure_id=selected_option.id if selected_option else selected_slot.enclosure_id if selected_slot else None,
             selected_enclosure_label=selected_option.label if selected_option else selected_slot.enclosure_label if selected_slot else None,
             selected_enclosure_name=selected_option.name if selected_option else selected_slot.enclosure_name if selected_slot else None,
+            selected_profile=selected_profile,
             sources=sources,
             summary=summary,
         )
@@ -560,6 +660,8 @@ class InventoryService:
         warnings: list[str],
         selected_enclosure_id: str | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int]], int, int]:
+        if self.system.truenas.platform == "linux":
+            return self._correlate_linux_host(ssh_data, warnings, selected_enclosure_id)
         if self.system.truenas.platform == "scale" and self._has_scale_linux_ses(ssh_data):
             return self._correlate_scale_linux(raw_data, ssh_data, warnings, selected_enclosure_id)
 
@@ -585,9 +687,40 @@ class InventoryService:
         slot_candidates = merge_slot_candidate_maps(ssh_data.ses_slot_candidates, api_candidates)
         api_topology_members = parse_pool_query_topology(raw_data.pools)
         selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, selected_meta)
-        layout_rows_count = selected_option.rows if selected_option and selected_option.rows else self.settings.layout.rows
-        layout_columns = selected_option.columns if selected_option and selected_option.columns else self.settings.layout.columns
-        layout_slot_count = selected_option.slot_count if selected_option and selected_option.slot_count else slot_count
+        selected_profile = self.profile_registry.resolve_for_enclosure(
+            self.system,
+            selected_option,
+            fallback_label=selected_option.label if selected_option else selected_meta.get("label"),
+            fallback_rows=selected_option.rows if selected_option and selected_option.rows else self.settings.layout.rows,
+            fallback_columns=selected_option.columns if selected_option and selected_option.columns else self.settings.layout.columns,
+            fallback_slot_count=selected_option.slot_count if selected_option and selected_option.slot_count else slot_count,
+            fallback_slot_layout=selected_option.slot_layout if selected_option else None,
+        )
+        layout_columns = (
+            selected_profile.columns
+            if selected_profile
+            else selected_option.columns if selected_option and selected_option.columns
+            else self.settings.layout.columns
+        )
+        layout_rows = (
+            [list(row) for row in selected_profile.slot_layout]
+            if selected_profile and selected_profile.slot_layout
+            else selected_option.slot_layout if selected_option and selected_option.slot_layout
+            else build_layout_rows(
+                selected_option.rows if selected_option and selected_option.rows else self.settings.layout.rows,
+                layout_columns,
+                selected_option.slot_count if selected_option and selected_option.slot_count else slot_count,
+            )
+        )
+        layout_slot_count = infer_slot_count_from_layout(
+            layout_rows,
+            selected_option.slot_count if selected_option and selected_option.slot_count else slot_count,
+        )
+        slot_positions = {
+            slot_number: (row_index, column_index)
+            for row_index, row in enumerate(layout_rows)
+            for column_index, slot_number in enumerate(row)
+        }
         disk_records = self._build_disk_records(
             raw_data.disks,
             ssh_data,
@@ -610,8 +743,7 @@ class InventoryService:
         slot_views: list[SlotView] = []
 
         for slot in range(layout_slot_count):
-            row_index = slot // layout_columns
-            column_index = slot % layout_columns
+            row_index, column_index = slot_positions.get(slot, (slot // layout_columns, slot % layout_columns))
             candidate = slot_candidates.get(slot, {})
             enclosure_id = selected_meta.get("id") or normalize_text(candidate.get("enclosure_id"))
             mapping = self.mapping_store.get_mapping(self.system.id, enclosure_id, slot)
@@ -645,7 +777,102 @@ class InventoryService:
             slot_views,
             available_enclosures,
             selected_meta,
-            build_layout_rows(layout_rows_count, layout_columns, layout_slot_count),
+            layout_rows,
+            layout_slot_count,
+            layout_columns,
+        )
+
+    def _correlate_linux_host(
+        self,
+        ssh_data: ParsedSSHData,
+        warnings: list[str],
+        selected_enclosure_id: str | None,
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int]], int, int]:
+        available_enclosures = self._build_linux_enclosure_options()
+        selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
+        if selected_option is None:
+            warnings.append("No profile-backed Linux enclosure is configured for this host yet.")
+            return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
+
+        selected_profile = self.profile_registry.resolve_for_enclosure(
+            self.system,
+            selected_option,
+            fallback_label=selected_option.label,
+            fallback_rows=selected_option.rows or self.settings.layout.rows,
+            fallback_columns=selected_option.columns or self.settings.layout.columns,
+            fallback_slot_count=selected_option.slot_count or self.settings.layout.slot_count,
+            fallback_slot_layout=selected_option.slot_layout,
+        )
+        if selected_profile is None:
+            warnings.append("This Linux host is missing an enclosure profile for rendering.")
+            return [], available_enclosures, self._enclosure_option_meta(selected_option), [], 0, 0
+
+        layout_rows = [list(row) for row in selected_profile.slot_layout]
+        layout_slot_count = infer_slot_count_from_layout(layout_rows, selected_option.slot_count)
+        layout_columns = selected_profile.columns
+        slot_positions = {
+            slot_number: (row_index, column_index)
+            for row_index, row in enumerate(layout_rows)
+            for column_index, slot_number in enumerate(row)
+        }
+
+        disk_records = self._build_linux_disk_records(ssh_data)
+        disks_by_key: dict[str, DiskRecord] = {}
+        for disk in disk_records:
+            for key in disk.lookup_keys:
+                disks_by_key[key] = disk
+
+        linux_topology_members = self._build_linux_topology_members(disk_records)
+        slot_views: list[SlotView] = []
+        selected_meta = self._enclosure_option_meta(selected_option)
+        slot_hints = selected_profile.slot_hints or {}
+        if not slot_hints:
+            warnings.append(
+                "This Linux profile does not define slot hints yet, so physical slot correlation will require manual mapping."
+            )
+
+        for slot in range(layout_slot_count):
+            row_index, column_index = slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))
+            hint_values = [normalize_text(value) for value in slot_hints.get(slot, []) if normalize_text(value)]
+            raw_slot_status = {
+                "device_names": hint_values,
+                "device_hint": hint_values[0] if hint_values else None,
+                "enclosure_id": selected_option.id,
+                "enclosure_label": selected_option.label,
+                "enclosure_name": selected_option.name,
+            }
+            mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            disk = self._resolve_disk_for_slot(
+                slot,
+                selected_option.id,
+                mapping,
+                disks_by_key,
+                {},
+                {},
+                raw_slot_status,
+                ssh_data,
+            )
+            slot_view = self._build_slot_view(
+                slot=slot,
+                row_index=row_index,
+                column_index=column_index,
+                enclosure_meta=selected_meta,
+                raw_slot_status=raw_slot_status,
+                disk=disk,
+                mapping=mapping,
+                ssh_data=ssh_data,
+                api_topology_members=linux_topology_members,
+                api_enclosure_ids=set(),
+            )
+            if mapping and not disk:
+                warnings.append(f"Manual mapping for slot {slot:02d} did not match any current Linux device.")
+            slot_views.append(slot_view)
+
+        return (
+            slot_views,
+            available_enclosures,
+            selected_meta,
+            layout_rows,
             layout_slot_count,
             layout_columns,
         )
@@ -662,7 +889,20 @@ class InventoryService:
         if selected_option is None:
             return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
 
-        slot_count = selected_option.slot_count or self.settings.layout.slot_count
+        selected_profile = self.profile_registry.resolve_for_enclosure(
+            self.system,
+            selected_option,
+            fallback_label=selected_option.label,
+            fallback_rows=selected_option.rows or self.settings.layout.rows,
+            fallback_columns=selected_option.columns or self.settings.layout.columns,
+            fallback_slot_count=selected_option.slot_count or self.settings.layout.slot_count,
+            fallback_slot_layout=selected_option.slot_layout,
+        )
+        slot_count = (
+            infer_slot_count_from_layout(selected_profile.slot_layout, selected_option.slot_count)
+            if selected_profile
+            else selected_option.slot_count or self.settings.layout.slot_count
+        )
         ssh_candidates, ssh_meta = build_slot_candidates_from_ses_enclosures(
             ssh_data.ses_enclosures,
             slot_count,
@@ -701,9 +941,17 @@ class InventoryService:
                 for alias in build_lunid_aliases(disk.lunid, self.system.truenas.platform):
                     disks_by_sas[alias] = disk
 
-        rows = selected_option.rows or self.settings.layout.rows
-        columns = selected_option.columns or self.settings.layout.columns
-        layout_rows = selected_option.slot_layout or build_layout_rows(rows, columns, slot_count)
+        columns = (
+            selected_profile.columns
+            if selected_profile
+            else selected_option.columns or self.settings.layout.columns
+        )
+        layout_rows = (
+            [list(row) for row in selected_profile.slot_layout]
+            if selected_profile and selected_profile.slot_layout
+            else selected_option.slot_layout or build_layout_rows(selected_option.rows or self.settings.layout.rows, columns, slot_count)
+        )
+        slot_count = infer_slot_count_from_layout(layout_rows, slot_count)
         slot_positions = {
             slot_number: (row_index, column_index)
             for row_index, row in enumerate(layout_rows)
@@ -748,6 +996,33 @@ class InventoryService:
             slot_count,
             columns,
         )
+
+    def _build_linux_enclosure_options(self) -> list[EnclosureOption]:
+        profile = self.profile_registry.resolve_for_enclosure(
+            self.system,
+            None,
+            fallback_label=self.system.label or "Linux Enclosure",
+            fallback_rows=self.settings.layout.rows,
+            fallback_columns=self.settings.layout.columns,
+            fallback_slot_count=self.settings.layout.slot_count,
+        )
+        if profile is None:
+            return []
+
+        slot_count = infer_slot_count_from_layout(profile.slot_layout, profile.rows * profile.columns)
+        enclosure_id = profile.id
+        return [
+            EnclosureOption(
+                id=enclosure_id,
+                label=profile.panel_title or profile.label,
+                name=profile.label,
+                profile_id=profile.id,
+                rows=profile.rows,
+                columns=profile.columns,
+                slot_count=slot_count,
+                slot_layout=profile.slot_layout,
+            )
+        ]
 
     def _build_enclosure_options(
         self,
@@ -810,6 +1085,7 @@ class InventoryService:
                     id=enclosure.enclosure_id,
                     label=enclosure.enclosure_label or enclosure.enclosure_name or enclosure.enclosure_id,
                     name=enclosure.enclosure_name,
+                    profile_id=enclosure.profile_id,
                     rows=enclosure.layout_rows,
                     columns=enclosure.layout_columns,
                     slot_count=slot_count,
@@ -854,6 +1130,223 @@ class InventoryService:
             enclosure.ses_device and enclosure.ses_device.startswith("/dev/sg")
             for enclosure in ssh_data.ses_enclosures
         )
+
+    def _build_linux_disk_records(self, ssh_data: ParsedSSHData) -> list[DiskRecord]:
+        controllers: dict[str, dict[str, Any]] = {}
+        for blockdevice in ssh_data.linux_blockdevices:
+            device_name = normalize_text(blockdevice.get("name"))
+            controller_name = extract_nvme_controller_name(device_name)
+            if not controller_name:
+                continue
+
+            controller = controllers.setdefault(
+                controller_name,
+                {
+                    "controller_name": controller_name,
+                    "serial": None,
+                    "model": None,
+                    "size_bytes": 0,
+                    "logical_block_size": None,
+                    "physical_block_size": None,
+                    "namespace_devices": [],
+                    "lookup_keys": set(),
+                    "primary_namespace": None,
+                    "primary_rank": -1,
+                    "top_array_path": None,
+                    "top_array_name": None,
+                    "top_mountpoint": None,
+                    "top_role": None,
+                    "identifier": None,
+                    "transport_address": None,
+                    "transport": None,
+                },
+            )
+
+            controller["serial"] = controller["serial"] or normalize_text(blockdevice.get("serial"))
+            controller["model"] = controller["model"] or normalize_text(blockdevice.get("model"))
+            controller["logical_block_size"] = controller["logical_block_size"] or (
+                blockdevice.get("log-sec") if isinstance(blockdevice.get("log-sec"), int) else None
+            )
+            controller["physical_block_size"] = controller["physical_block_size"] or (
+                blockdevice.get("phy-sec") if isinstance(blockdevice.get("phy-sec"), int) else None
+            )
+            controller["size_bytes"] += parse_size_to_bytes(blockdevice.get("size")) or 0
+
+            namespace_name = normalize_device_name(device_name)
+            if namespace_name:
+                controller["namespace_devices"].append(namespace_name)
+                controller["lookup_keys"].update(normalize_lookup_keys(namespace_name))
+            controller["lookup_keys"].update(normalize_lookup_keys(controller_name))
+            for value in (
+                blockdevice.get("serial"),
+                blockdevice.get("model"),
+                blockdevice.get("wwn"),
+                blockdevice.get("ptuuid"),
+            ):
+                controller["lookup_keys"].update(normalize_lookup_keys(str(value) if value is not None else None))
+            namespace_identifier = next(
+                (
+                    normalized
+                    for normalized in (
+                        normalize_text(str(blockdevice.get("wwn")) if blockdevice.get("wwn") is not None else None),
+                        normalize_text(str(blockdevice.get("ptuuid")) if blockdevice.get("ptuuid") is not None else None),
+                    )
+                    if normalized
+                ),
+                None,
+            )
+            for identifier_candidate in (
+                blockdevice.get("wwn"),
+                blockdevice.get("ptuuid"),
+            ):
+                normalized_identifier = normalize_text(str(identifier_candidate) if identifier_candidate is not None else None)
+                if normalized_identifier:
+                    controller["identifier"] = controller["identifier"] or normalized_identifier
+
+            controller["transport"] = controller["transport"] or normalize_text(blockdevice.get("tran"))
+            subsystem_meta = ssh_data.linux_nvme_subsystems.get(controller_name.lower())
+            if subsystem_meta:
+                controller["transport_address"] = controller["transport_address"] or subsystem_meta.get("address")
+                controller["transport"] = controller["transport"] or subsystem_meta.get("transport")
+                controller["lookup_keys"].update(normalize_lookup_keys(subsystem_meta.get("address")))
+                controller["lookup_keys"].update(normalize_lookup_keys(subsystem_meta.get("nqn")))
+
+            descendants = self._collect_linux_descendants(blockdevice)
+            raid_nodes = [node for node in descendants if str(node.get("type") or "").lower().startswith("raid")]
+            mountpoints = [
+                normalize_text(node.get("mountpoint"))
+                for node in descendants
+                if normalize_text(node.get("mountpoint"))
+            ]
+            top_array = raid_nodes[-1] if raid_nodes else None
+            top_array_name = normalize_device_name(top_array.get("name")) if top_array else None
+            top_array_path = normalize_text(top_array.get("path")) if top_array else None
+            top_mountpoint = next(
+                (mount for mount in mountpoints if mount not in {"/boot", "/boot/efi", "/"}),
+                mountpoints[0] if mountpoints else None,
+            )
+            top_role = "system" if top_mountpoint in {"/", "/boot", "/boot/efi"} else "data"
+            namespace_rank = self._linux_namespace_rank(top_mountpoint, top_array_name, namespace_name)
+            if namespace_rank > controller["primary_rank"]:
+                controller["primary_rank"] = namespace_rank
+                controller["primary_namespace"] = namespace_name
+                controller["top_array_name"] = top_array_name
+                controller["top_array_path"] = top_array_path
+                controller["top_mountpoint"] = top_mountpoint
+                controller["top_role"] = top_role
+                if namespace_identifier:
+                    controller["identifier"] = namespace_identifier
+
+        records: list[DiskRecord] = []
+        for controller_name, payload in controllers.items():
+            namespace_devices = list(dict.fromkeys(payload["namespace_devices"]))
+            primary_namespace = payload["primary_namespace"] or (namespace_devices[0] if namespace_devices else controller_name)
+            smart_devices = [
+                device
+                for device in dict.fromkeys(
+                    [primary_namespace, *namespace_devices]
+                )
+                if device
+            ]
+            top_array_name = payload["top_array_name"]
+            top_mountpoint = payload["top_mountpoint"]
+            role = payload["top_role"] or "data"
+            pool_name = top_mountpoint or top_array_name or "mdadm"
+            lookup_keys = set(payload["lookup_keys"])
+            lookup_keys.update(normalize_lookup_keys(controller_name))
+            lookup_keys.update(normalize_lookup_keys(primary_namespace))
+
+            records.append(
+                DiskRecord(
+                    raw={
+                        "controller_name": controller_name,
+                        "namespace_devices": smart_devices,
+                        "transport_address": payload["transport_address"],
+                        "top_array_name": top_array_name,
+                        "top_mountpoint": top_mountpoint,
+                        "top_role": role,
+                    },
+                    device_name=controller_name,
+                    path_device_name=primary_namespace,
+                    multipath_name=None,
+                    multipath_member=None,
+                    serial=payload["serial"],
+                    model=payload["model"],
+                    size_bytes=payload["size_bytes"] or None,
+                    identifier=payload["identifier"],
+                    health="ONLINE",
+                    pool_name=pool_name,
+                    lunid=None,
+                    bus=(payload["transport"] or "nvme").upper(),
+                    temperature_c=None,
+                    last_smart_test_type=None,
+                    last_smart_test_status=None,
+                    last_smart_test_lifetime_hours=None,
+                    logical_block_size=payload["logical_block_size"],
+                    physical_block_size=payload["physical_block_size"],
+                    enclosure_id=None,
+                    slot=None,
+                    smart_devices=smart_devices or [primary_namespace],
+                    lookup_keys=lookup_keys,
+                )
+            )
+
+        return records
+
+    @staticmethod
+    def _collect_linux_descendants(node: dict[str, Any]) -> list[dict[str, Any]]:
+        descendants: list[dict[str, Any]] = []
+        children = node.get("children") if isinstance(node.get("children"), list) else []
+        for child in children:
+            if not isinstance(child, dict):
+                continue
+            descendants.append(child)
+            descendants.extend(InventoryService._collect_linux_descendants(child))
+        return descendants
+
+    @staticmethod
+    def _linux_namespace_rank(mountpoint: str | None, top_array_name: str | None, namespace_name: str | None) -> int:
+        if mountpoint and mountpoint not in {"/", "/boot", "/boot/efi"}:
+            return 4
+        if top_array_name and top_array_name.startswith("md"):
+            return 3
+        if namespace_name and namespace_name.endswith("n1"):
+            return 1
+        return 2
+
+    @staticmethod
+    def _build_linux_topology_members(disk_records: list[DiskRecord]) -> dict[str, ZpoolMember]:
+        members: dict[str, ZpoolMember] = {}
+        for disk in disk_records:
+            top_array_name = normalize_text(disk.raw.get("top_array_name"))
+            top_mountpoint = normalize_text(disk.raw.get("top_mountpoint"))
+            role = normalize_text(disk.raw.get("top_role")) or "data"
+            if not top_array_name and not top_mountpoint:
+                continue
+            pool_name = top_mountpoint or "mdadm"
+            topology_label = " > ".join(
+                filter(
+                    None,
+                    [
+                        pool_name,
+                        top_array_name,
+                        role,
+                    ],
+                )
+            )
+            member = ZpoolMember(
+                pool_name=pool_name,
+                vdev_class=role,
+                vdev_name=top_array_name or disk.device_name,
+                topology_label=topology_label,
+                health=disk.health,
+                raw_name=disk.device_name or "",
+                raw_path=f"/dev/{disk.path_device_name or disk.device_name}" if (disk.path_device_name or disk.device_name) else None,
+            )
+            for value in (disk.device_name, disk.path_device_name, disk.identifier, *disk.smart_devices):
+                for key in normalize_lookup_keys(value):
+                    members[key] = member
+        return members
 
     def _build_disk_records(
         self,
@@ -910,6 +1403,10 @@ class InventoryService:
                 if gptid:
                     lookup_keys.update(normalize_lookup_keys(gptid))
 
+            for candidate in dict.fromkeys(filter(None, [path_device_name, multipath_member, device_name])):
+                for peer in ssh_data.camcontrol_peer_devices.get(candidate.lower(), []):
+                    lookup_keys.update(normalize_lookup_keys(peer))
+
             lookup_keys.update(build_lunid_aliases(disk.get("lunid"), self.system.truenas.platform))
 
             records.append(
@@ -935,6 +1432,12 @@ class InventoryService:
                     physical_block_size=physical_block_size,
                     enclosure_id=enclosure_id,
                     slot=slot,
+                    smart_devices=[
+                        candidate
+                        for candidate in dict.fromkeys(
+                            filter(None, [path_device_name, multipath_member, device_name])
+                        )
+                    ],
                     lookup_keys=lookup_keys,
                 )
             )
@@ -1089,6 +1592,7 @@ class InventoryService:
         persistent_id, persistent_id_label = resolve_persistent_id(
             gptid,
             raw_slot_status.get("gptid_hint"),
+            disk.identifier if disk else None,
             zpool.raw_path if zpool else None,
             zpool.raw_name if zpool else None,
             mapping.gptid if mapping else None,
@@ -1180,13 +1684,14 @@ class InventoryService:
             state=state,
             identify_active=identify_active,
             device_name=device_name,
+            smart_device_names=list(disk.smart_devices) if disk else [],
             serial=serial,
             model=model,
             size_bytes=size_bytes,
             size_human=size_human,
             gptid=persistent_id,
             persistent_id_label=persistent_id_label,
-            pool_name=disk.pool_name if disk else zpool.pool_name if zpool else None,
+            pool_name=disk.pool_name if (disk and disk.pool_name) else zpool.pool_name if zpool else None,
             vdev_name=zpool.vdev_name if zpool else None,
             vdev_class=zpool.vdev_class if zpool else None,
             topology_label=zpool.topology_label if zpool else None,
@@ -1207,7 +1712,15 @@ class InventoryService:
             ssh_ses_device=ses_device,
             ssh_ses_element_id=ses_element_id,
             ssh_ses_targets=ses_targets,
-            mapping_source=mapping.source if mapping else "ssh" if ses_device else "api" if disk else "unknown",
+            mapping_source=(
+                mapping.source
+                if mapping
+                else "ssh"
+                if ses_device or self.system.truenas.platform == "linux"
+                else "api"
+                if disk
+                else "unknown"
+            ),
             notes=notes,
             search_text=" ".join(
                 filter(
@@ -1331,20 +1844,36 @@ class InventoryService:
         ssh_data: ParsedSSHData,
         api_topology_members: dict[str, Any],
     ):
+        seen: set[str] = set()
+        candidate_keys: list[str] = []
+
         for value in (
             gptid,
             device_name,
+            *(disk.smart_devices if disk else []),
             disk.identifier if disk else None,
             str(disk.raw.get("zfs_guid")) if disk and disk.raw.get("zfs_guid") is not None else None,
             disk.serial if disk else None,
         ):
             for key in normalize_lookup_keys(value):
-                member = ssh_data.zpool_members.get(key)
-                if member:
-                    return member
-                api_member = api_topology_members.get(key)
-                if api_member:
-                    return api_member
+                if key not in seen:
+                    seen.add(key)
+                    candidate_keys.append(key)
+
+        if disk:
+            for key in sorted(disk.lookup_keys):
+                lowered = key.lower()
+                if lowered not in seen:
+                    seen.add(lowered)
+                    candidate_keys.append(lowered)
+
+        for key in candidate_keys:
+            member = ssh_data.zpool_members.get(key)
+            if member:
+                return member
+            api_member = api_topology_members.get(key)
+            if api_member:
+                return api_member
         return None
 
     def _build_multipath_view(
@@ -1454,6 +1983,12 @@ class InventoryService:
         candidates: list[str] = []
         seen: set[str] = set()
 
+        for device in slot_view.smart_device_names or []:
+            normalized = normalize_device_name(device)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                candidates.append(normalized)
+
         if slot_view.multipath:
             # Prefer ACTIVE member paths first so ad-hoc smartctl calls land on
             # the same physical leg the system is currently favoring.
@@ -1533,14 +2068,31 @@ class InventoryService:
             value is not None
             for value in (
                 summary.temperature_c,
+                summary.warning_temperature_c,
+                summary.critical_temperature_c,
                 summary.last_test_type,
                 summary.last_test_status,
                 summary.last_test_lifetime_hours,
                 summary.power_on_hours,
                 summary.logical_block_size,
                 summary.physical_block_size,
+                summary.available_spare_percent,
+                summary.available_spare_threshold_percent,
+                summary.endurance_used_percent,
+                summary.endurance_remaining_percent,
+                summary.bytes_read,
+                summary.bytes_written,
+                summary.annualized_bytes_written,
+                summary.estimated_lifetime_bytes_written,
+                summary.estimated_remaining_bytes_written,
+                summary.media_errors,
+                summary.unsafe_shutdowns,
                 summary.rotation_rate_rpm,
                 summary.form_factor,
+                summary.firmware_version,
+                summary.protocol_version,
+                summary.namespace_eui64,
+                summary.namespace_nguid,
                 summary.read_cache_enabled,
                 summary.writeback_cache_enabled,
                 summary.transport_protocol,
@@ -1573,6 +2125,8 @@ class InventoryService:
     ) -> SmartSummaryView:
         for field_name in (
             "temperature_c",
+            "warning_temperature_c",
+            "critical_temperature_c",
             "last_test_type",
             "last_test_status",
             "last_test_lifetime_hours",
@@ -1581,8 +2135,23 @@ class InventoryService:
             "power_on_days",
             "logical_block_size",
             "physical_block_size",
+            "available_spare_percent",
+            "available_spare_threshold_percent",
+            "endurance_used_percent",
+            "endurance_remaining_percent",
+            "bytes_read",
+            "bytes_written",
+            "annualized_bytes_written",
+            "estimated_lifetime_bytes_written",
+            "estimated_remaining_bytes_written",
+            "media_errors",
+            "unsafe_shutdowns",
             "rotation_rate_rpm",
             "form_factor",
+            "firmware_version",
+            "protocol_version",
+            "namespace_eui64",
+            "namespace_nguid",
             "read_cache_enabled",
             "writeback_cache_enabled",
             "transport_protocol",

@@ -40,6 +40,32 @@ Not working yet:
 
 ## Live Findings
 
+### API Deprecation Watch
+
+On `2026-04-14`, the SCALE host reported this alert:
+
+- the deprecated REST API authenticated `3` times in the last `24` hours
+- source IP reported by the alert: `10.13.37.67`
+- removal target called out by the appliance alert: `26.04`
+
+Important context for this app:
+
+- this app talks to TrueNAS through the middleware websocket endpoint
+  (`/websocket`) using `auth.login_with_api_key`
+- the current codebase does not intentionally call `/api/v2.0` for TrueNAS
+  inventory, SMART, enclosure, or LED actions
+
+That means this alert is very likely coming from some other integration,
+browser session, script, or tool running from the same Docker host / IP rather
+than from this app itself.
+
+Follow-up to keep in mind:
+
+- investigate other integrations on `10.13.37.67`
+- keep this app on the websocket / JSON-RPC path only
+- treat REST-removal compatibility as an explicit `v0.3.x` parity and hardening
+  item rather than a future cleanup
+
 ### API
 
 The SCALE API on this system returns useful disk and pool inventory, but not a

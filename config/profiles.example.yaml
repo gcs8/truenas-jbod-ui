@@ -1,0 +1,47 @@
+profiles:
+  - id: custom-lab-front-8
+    label: Custom Lab Front 8
+    eyebrow: Custom LAB / Front View
+    summary: Operator-defined front-drive layout loaded from profiles.yaml.
+    panel_title: Lab Front 8 Bay
+    edge_label: Front of chassis
+    face_style: front-drive
+    latch_edge: right
+    rows: 2
+    columns: 4
+    slot_layout:
+      - [4, 5, 6, 7]
+      - [0, 1, 2, 3]
+    row_groups: [2, 2]
+
+  - id: custom-jbod-top-12
+    label: Custom JBOD Top 12
+    eyebrow: Custom JBOD / Top View
+    summary: Example top-loading profile with grouped rows.
+    panel_title: Custom Top 12
+    edge_label: System front / latch edge
+    face_style: top-loader
+    latch_edge: bottom
+    rows: 3
+    columns: 4
+    slot_layout:
+      - [8, 9, 10, 11]
+      - [4, 5, 6, 7]
+      - [0, 1, 2, 3]
+    row_groups: [2, 2]
+
+  - id: custom-right-nvme-2
+    label: Custom Right NVMe 2
+    eyebrow: Generic Linux / Rear View
+    summary: Example SSH-only Linux profile for two rear NVMe bays.
+    panel_title: Right NVMe 2
+    edge_label: Rear of chassis
+    face_style: rear-drive
+    latch_edge: bottom
+    rows: 1
+    columns: 2
+    slot_layout:
+      - [0, 1]
+    slot_hints:
+      0: ["nvme0", "0000:01:00.0"]
+      1: ["nvme1", "0000:02:00.0"]

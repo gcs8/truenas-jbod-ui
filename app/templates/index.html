@@ -1,25 +1,16 @@
 {% extends "base.html" %}
 {% block title %}TrueNAS JBOD Enclosure UI{% endblock %}
 {% block body %}
-{% set is_scale = snapshot.selected_system_platform == "scale" %}
-{% set is_scale_rear = is_scale and snapshot.selected_enclosure_label and "rear" in snapshot.selected_enclosure_label|lower %}
+{% set profile = snapshot.selected_profile %}
 <div class="app-shell">
   <header class="topbar">
     <div>
       <p class="eyebrow" id="header-eyebrow">
-        {% if is_scale %}
-          TrueNAS SCALE / Supermicro SSG-6048R {{ "Rear" if is_scale_rear else "Front" }} View
-        {% else %}
-          TrueNAS CORE / Supermicro CSE-946 Top View
-        {% endif %}
+        {{ profile.eyebrow if profile and profile.eyebrow else (snapshot.selected_system_label or "TrueNAS JBOD Enclosure UI") }}
       </p>
       <h1>JBOD Enclosure UI</h1>
       <p class="subtle" id="header-summary">
-        {% if is_scale %}
-          {{ "Rear-drive map with Linux SES AES slot mapping and SSH smartctl enrichment." if is_scale_rear else "Front-drive map with Linux SES AES slot mapping and SSH smartctl enrichment." }}
-        {% else %}
-          Top-loading bay map with API-or-SSH LED control and optional SSH enrichment.
-        {% endif %}
+        {{ profile.summary if profile and profile.summary else "Drive-bay map with API-or-SSH enrichment for the selected enclosure." }}
       </p>
     </div>
     <div class="topbar-meta">
@@ -110,7 +101,7 @@
     <div class="summary-card">
       <span class="summary-label">SSH Slot Hints</span>
       <span class="summary-value" id="summary-ssh-slot-hint-count">{{ snapshot.summary.ssh_slot_hint_count }}</span>
-      <span class="summary-note">from `sesutil` parsing</span>
+      <span class="summary-note">from SSH enclosure parsing</span>
     </div>
   </section>
 
@@ -119,11 +110,7 @@
       <div class="panel-header">
         <div>
           <h2 id="enclosure-panel-title">
-            {% if is_scale and snapshot.selected_enclosure_label %}
-              {{ snapshot.selected_enclosure_label }}
-            {% else %}
-              Enclosure Top
-            {% endif %}
+            {{ profile.panel_title if profile and profile.panel_title else (snapshot.selected_enclosure_label or "Enclosure") }}
           </h2>
         </div>
         <div class="legend">
@@ -136,7 +123,7 @@
         </div>
       </div>
       <div class="enclosure-face">
-        <div class="chassis-shell">
+        <div class="chassis-shell" id="chassis-shell" data-face-style="{{ profile.face_style if profile else 'generic' }}" data-latch-edge="{{ profile.latch_edge if profile else 'bottom' }}">
           <div class="service-zone" aria-hidden="true">
             <div class="service-panel service-panel-wide"></div>
             <div class="service-cavity"></div>
@@ -146,11 +133,7 @@
           <div class="front-edge" aria-hidden="true">
             <span class="front-handle"></span>
             <span class="front-label" id="enclosure-edge-label">
-              {% if is_scale %}
-                {{ "Rear of chassis" if is_scale_rear else "Front of chassis" }}
-              {% else %}
-                System front / latch edge
-              {% endif %}
+              {{ profile.edge_label if profile and profile.edge_label else "System front" }}
             </span>
             <span class="front-handle"></span>
           </div>
@@ -280,6 +263,7 @@
     </div>
   </section>
 </div>
+<div id="slot-tooltip" class="slot-tooltip hidden" role="tooltip" aria-hidden="true"></div>
 
 <script>
   window.APP_BOOTSTRAP = {

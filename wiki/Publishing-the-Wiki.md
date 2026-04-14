@@ -1,0 +1,40 @@
+# Publishing the Wiki
+
+This repo keeps a GitHub-wiki-ready copy of the pages in the `wiki/` folder so
+they can be maintained like normal project docs first.
+
+## Basic Publish Flow
+
+Clone the GitHub wiki repo:
+
+```bash
+git clone <your-github-repo>.wiki.git repo-wiki
+```
+
+Copy the page set in:
+
+```bash
+cp wiki/*.md repo-wiki/
+```
+
+Commit and push:
+
+```bash
+cd repo-wiki
+git add .
+git commit -m "Refresh wiki pages"
+git push
+```
+
+## Recommended Maintainer Workflow
+
+- treat the repo `wiki/` folder as the source of truth
+- review changes in normal PRs
+- publish to GitHub Wiki after the docs look right
+
+## Good Times To Refresh The Wiki
+
+- after a release
+- after a new platform guide lands
+- after a profile system change
+- after a setup flow becomes simpler or safer

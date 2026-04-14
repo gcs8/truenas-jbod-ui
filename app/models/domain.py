@@ -70,6 +70,8 @@ class MultipathView(BaseModel):
 class SmartSummaryView(BaseModel):
     available: bool = False
     temperature_c: int | None = None
+    warning_temperature_c: int | None = None
+    critical_temperature_c: int | None = None
     last_test_type: str | None = None
     last_test_status: str | None = None
     last_test_lifetime_hours: int | None = None
@@ -78,8 +80,23 @@ class SmartSummaryView(BaseModel):
     power_on_days: int | None = None
     logical_block_size: int | None = None
     physical_block_size: int | None = None
+    available_spare_percent: int | None = None
+    available_spare_threshold_percent: int | None = None
+    endurance_used_percent: int | None = None
+    endurance_remaining_percent: int | None = None
+    bytes_read: int | None = None
+    bytes_written: int | None = None
+    annualized_bytes_written: int | None = None
+    estimated_lifetime_bytes_written: int | None = None
+    estimated_remaining_bytes_written: int | None = None
+    media_errors: int | None = None
+    unsafe_shutdowns: int | None = None
     rotation_rate_rpm: int | None = None
     form_factor: str | None = None
+    firmware_version: str | None = None
+    protocol_version: str | None = None
+    namespace_eui64: str | None = None
+    namespace_nguid: str | None = None
     read_cache_enabled: bool | None = None
     writeback_cache_enabled: bool | None = None
     transport_protocol: str | None = None
@@ -102,6 +119,7 @@ class SlotView(BaseModel):
     state: SlotState = SlotState.unknown
     identify_active: bool = False
     device_name: str | None = None
+    smart_device_names: list[str] = Field(default_factory=list)
     serial: str | None = None
     model: str | None = None
     size_bytes: int | None = None
@@ -151,10 +169,27 @@ class EnclosureOption(BaseModel):
     id: str
     label: str
     name: str | None = None
+    profile_id: str | None = None
     rows: int | None = None
     columns: int | None = None
     slot_count: int | None = None
     slot_layout: list[list[int]] | None = None
+
+
+class EnclosureProfileView(BaseModel):
+    id: str
+    label: str
+    eyebrow: str | None = None
+    summary: str | None = None
+    panel_title: str | None = None
+    edge_label: str | None = None
+    face_style: str = "generic"
+    latch_edge: str = "bottom"
+    rows: int
+    columns: int
+    slot_layout: list[list[int]] = Field(default_factory=list)
+    row_groups: list[int] = Field(default_factory=list)
+    slot_hints: dict[int, list[str]] = Field(default_factory=dict)
 
 
 class InventorySummary(BaseModel):
@@ -180,6 +215,7 @@ class InventorySnapshot(BaseModel):
     selected_enclosure_id: str | None = None
     selected_enclosure_label: str | None = None
     selected_enclosure_name: str | None = None
+    selected_profile: EnclosureProfileView | None = None
     systems: list[SystemOption] = Field(default_factory=list)
     enclosures: list[EnclosureOption] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
