@@ -2,7 +2,22 @@
 
 ## Unreleased
 
-Working branch for the next feature set after `v0.3.0`.
+Working branch for the next feature set after `v0.3.1`.
+
+## v0.3.1 - 2026-04-14
+
+Patch release focused on CORE SMART detail restoration and refreshed release
+screenshots.
+
+### Fixed
+
+- CORE slot SMART summaries now merge sparse API JSON with `disk.smartctl -x`
+  text output before falling back to SSH, restoring fields such as read/write
+  cache state, transport, SAS addresses, and negotiated link rate
+- SSH SMART text enrichment now carries the same transport and cache fields when
+  the app does need to fall back to host-side commands
+- README screenshots now wait for populated slot details and use fresh `v0.3.1`
+  captures for both the validated CORE and SCALE views
 
 ## v0.3.0 - 2026-04-13
 

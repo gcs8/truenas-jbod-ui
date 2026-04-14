@@ -270,6 +270,8 @@ class InventoryService:
             )
 
         last_error: str | None = None
+        api_summary: SmartSummaryView | None = None
+        api_candidate: str | None = None
         for candidate in candidates:
             try:
                 payload = await self.truenas_client.fetch_disk_smartctl(candidate, ["-a", "-j"])
@@ -277,14 +279,49 @@ class InventoryService:
                 last_error = str(exc)
                 continue
 
-            summary = self._merge_smart_summary(
+            api_summary = self._merge_smart_summary(
                 slot_view,
                 SmartSummaryView.model_validate(parse_smartctl_summary(payload)),
             )
+            api_candidate = candidate
+            break
 
-            self._smart_cache[cache_key] = summary
+        if api_summary is not None:
+            if api_candidate and self._summary_needs_ssh_enrichment(api_summary):
+                try:
+                    enrichment_payload = await self.truenas_client.fetch_disk_smartctl(api_candidate, ["-x"])
+                except TrueNASAPIError as exc:
+                    last_error = str(exc)
+                else:
+                    api_summary = self._merge_missing_smart_fields(
+                        api_summary,
+                        SmartSummaryView.model_validate(
+                            parse_smartctl_text_enrichment(enrichment_payload)
+                        ),
+                    )
+            if self.system.ssh.enabled and self._summary_needs_ssh_enrichment(api_summary):
+                ssh_summary, ssh_error = await self._fetch_smart_summary_over_ssh(candidates)
+                if ssh_summary is not None:
+                    api_summary = self._merge_missing_smart_fields(
+                        api_summary,
+                        self._merge_smart_summary(slot_view, ssh_summary),
+                    )
+                elif ssh_error and not api_summary.message:
+                    api_summary.message = ssh_error
+
+            self._smart_cache[cache_key] = api_summary
             self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
-            return summary
+            return api_summary
+
+        if self.system.ssh.enabled:
+            ssh_summary, ssh_error = await self._fetch_smart_summary_over_ssh(candidates)
+            if ssh_summary is not None:
+                ssh_summary = self._merge_smart_summary(slot_view, ssh_summary)
+                self._smart_cache[cache_key] = ssh_summary
+                self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
+                return ssh_summary
+            if ssh_error:
+                last_error = ssh_error
 
         return self._fallback_smart_summary(
             slot_view,
@@ -304,49 +341,61 @@ class InventoryService:
         last_error: str | None = None
         for candidate in candidates:
             device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
-            command = shlex.join(
-                [
-                    "sudo",
-                    "-n",
-                    "/usr/sbin/smartctl",
-                    "-x",
-                    "-j",
-                    device_path,
-                ]
-            )
-            result = await self.ssh_probe.run_command(command)
-            summary = None
-            if result.stdout.strip():
-                parsed = parse_smartctl_summary(result.stdout)
-                candidate_summary = SmartSummaryView.model_validate(parsed)
-                # smartctl commonly returns advisory non-zero exit codes even when the
-                # JSON payload is intact and contains useful SMART data.
-                if candidate_summary.available or candidate_summary.message != "SMART JSON parsing failed.":
-                    summary = candidate_summary
-            if summary is None:
-                detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH smartctl error."
-                last_error = f"{device_path}: {detail}"
-                continue
+            for smartctl_binary in self._smartctl_binary_candidates():
+                command = shlex.join(
+                    [
+                        "sudo",
+                        "-n",
+                        smartctl_binary,
+                        "-x",
+                        "-j",
+                        device_path,
+                    ]
+                )
+                result = await self.ssh_probe.run_command(command)
+                summary = None
+                if result.stdout.strip():
+                    parsed = parse_smartctl_summary(result.stdout)
+                    candidate_summary = SmartSummaryView.model_validate(parsed)
+                    # smartctl commonly returns advisory non-zero exit codes even when the
+                    # JSON payload is intact and contains useful SMART data.
+                    if candidate_summary.available or candidate_summary.message != "SMART JSON parsing failed.":
+                        summary = candidate_summary
+                if summary is None:
+                    detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH smartctl error."
+                    last_error = f"{device_path}: {detail}"
+                    if "command not found" in detail.lower():
+                        continue
+                    break
 
-            text_command = shlex.join(
-                [
-                    "sudo",
-                    "-n",
-                    "/usr/sbin/smartctl",
-                    "-x",
-                    device_path,
-                ]
-            )
-            text_result = await self.ssh_probe.run_command(text_command)
-            if text_result.stdout.strip():
-                enrichment = parse_smartctl_text_enrichment(text_result.stdout)
-                summary.read_cache_enabled = enrichment.get("read_cache_enabled")
-                summary.writeback_cache_enabled = enrichment.get("writeback_cache_enabled")
-            if summary.available or summary.message != "SMART JSON parsing failed.":
-                return summary, None
-            last_error = f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                text_command = shlex.join(
+                    [
+                        "sudo",
+                        "-n",
+                        smartctl_binary,
+                        "-x",
+                        device_path,
+                    ]
+                )
+                text_result = await self.ssh_probe.run_command(text_command)
+                if text_result.stdout.strip():
+                    summary = self._merge_missing_smart_fields(
+                        summary,
+                        SmartSummaryView.model_validate(
+                            parse_smartctl_text_enrichment(text_result.stdout)
+                        ),
+                    )
+                if summary.available or summary.message != "SMART JSON parsing failed.":
+                    return summary, None
+                last_error = f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                break
 
         return None, last_error
+
+    def _smartctl_binary_candidates(self) -> tuple[str, ...]:
+        if self.system.truenas.platform == "core":
+            return ("/usr/local/sbin/smartctl", "/usr/sbin/smartctl")
+        return ("/usr/sbin/smartctl", "/usr/local/sbin/smartctl")
 
     async def export_mapping_bundle(self, selected_enclosure_id: str | None = None) -> MappingBundle:
         return MappingBundle(
@@ -1502,6 +1551,53 @@ class InventoryService:
             )
         )
         return summary
+
+    @staticmethod
+    def _summary_needs_ssh_enrichment(summary: SmartSummaryView) -> bool:
+        return any(
+            value is None
+            for value in (
+                summary.read_cache_enabled,
+                summary.writeback_cache_enabled,
+                summary.transport_protocol,
+                summary.sas_address,
+                summary.attached_sas_address,
+                summary.negotiated_link_rate,
+            )
+        )
+
+    @staticmethod
+    def _merge_missing_smart_fields(
+        primary: SmartSummaryView,
+        supplement: SmartSummaryView,
+    ) -> SmartSummaryView:
+        for field_name in (
+            "temperature_c",
+            "last_test_type",
+            "last_test_status",
+            "last_test_lifetime_hours",
+            "last_test_age_hours",
+            "power_on_hours",
+            "power_on_days",
+            "logical_block_size",
+            "physical_block_size",
+            "rotation_rate_rpm",
+            "form_factor",
+            "read_cache_enabled",
+            "writeback_cache_enabled",
+            "transport_protocol",
+            "logical_unit_id",
+            "sas_address",
+            "attached_sas_address",
+            "negotiated_link_rate",
+        ):
+            if getattr(primary, field_name) is None and getattr(supplement, field_name) is not None:
+                setattr(primary, field_name, getattr(supplement, field_name))
+
+        primary.available = primary.available or supplement.available
+        if not primary.message and supplement.message:
+            primary.message = supplement.message
+        return primary
 
     @staticmethod
     def _status_contains(raw_status: dict[str, Any], *needles: str) -> bool:

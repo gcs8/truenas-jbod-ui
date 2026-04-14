@@ -26,11 +26,11 @@ front and rear grids derived from Linux SES data and operator notes.
 
 ### Archive CORE
 
-![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/core-overview-v0.3.0.png)
+![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/core-overview-v0.3.1.png)
 
 ### Offsite SCALE
 
-![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/scale-overview-v0.3.0.png)
+![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/scale-overview-v0.3.1.png)
 
 ## Features
 

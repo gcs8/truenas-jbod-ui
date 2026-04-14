@@ -5,10 +5,11 @@ import unittest
 from unittest.mock import AsyncMock
 
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
-from app.models.domain import InventorySnapshot, LedAction, SlotView
+from app.models.domain import InventorySnapshot, LedAction, MultipathView, SlotView
 from app.services.inventory import InventoryService, build_lunid_aliases, resolve_persistent_id
 from app.services.mapping_store import MappingStore
 from app.services.ssh_probe import SSHCommandResult
+from app.services.truenas_ws import TrueNASAPIError
 
 
 class InventoryHelpersTests(unittest.TestCase):
@@ -72,6 +73,204 @@ class InventoryHelpersTests(unittest.TestCase):
 
 
 class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_core_smart_summary_enriches_sparse_api_result_with_smartctl_text(self) -> None:
+        class DummyTrueNASClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+            async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None):
+                self.calls.append((disk_name, tuple(args or [])))
+                if args == ["-x"]:
+                    return (
+                        "Transport protocol:   SAS (SPL-4)\n"
+                        "Logical Unit id:      0x5000cca23b713c80\n"
+                        "Read Cache is:        Enabled\n"
+                        "Writeback Cache is:   Disabled\n"
+                        "    negotiated logical link rate: phy enabled; 12 Gbps\n"
+                        "    SAS address = 0x5000cca23b713c81\n"
+                        "    attached SAS address = 0x500304801f715f3f\n"
+                    )
+                return (
+                    '{'
+                    '"temperature":{"current":29},'
+                    '"power_on_time":{"hours":24572},'
+                    '"logical_block_size":512,'
+                    '"physical_block_size":4096,'
+                    '"rotation_rate":7200,'
+                    '"form_factor":{"name":"3.5 inches"},'
+                    '"scsi_self_test_0":{'
+                    '"code":{"string":"Background short"},'
+                    '"result":{"string":"Completed"},'
+                    '"power_on_time":{"hours":24549}'
+                    "}"
+                    "}"
+                )
+
+        class DummySSHProbe:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            async def run_command(self, command: str) -> SSHCommandResult:
+                self.commands.append(command)
+                return SSHCommandResult(
+                    command=command,
+                    ok=False,
+                    stderr="ssh fallback should not run for core API text enrichment",
+                    exit_code=1,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = InventoryService(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                DummySSHProbe(),
+                MappingStore(f"{temp_dir}\\slot_mappings.json"),
+            )
+            slot = SlotView(
+                slot=21,
+                slot_label="21",
+                row_index=0,
+                column_index=0,
+                device_name="multipath/disk12",
+                logical_block_size=512,
+                physical_block_size=4096,
+                logical_unit_id="5000cca23b713c80",
+                multipath=MultipathView(
+                    name="disk12",
+                    device_name="multipath/disk12",
+                    members=[
+                        {"device_name": "da65", "state": "ACTIVE", "controller_label": "mpr1"},
+                        {"device_name": "da18", "state": "PASSIVE", "controller_label": "mpr0"},
+                    ],
+                ),
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[slot],
+                    refresh_interval_seconds=30,
+                )
+            )
+
+            summary = await service.get_slot_smart_summary(21)
+
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.temperature_c, 29)
+            self.assertEqual(summary.power_on_hours, 24572)
+            self.assertEqual(summary.logical_block_size, 512)
+            self.assertEqual(summary.physical_block_size, 4096)
+            self.assertEqual(summary.rotation_rate_rpm, 7200)
+            self.assertEqual(summary.form_factor, "3.5 inches")
+            self.assertEqual(summary.read_cache_enabled, True)
+            self.assertEqual(summary.writeback_cache_enabled, False)
+            self.assertEqual(summary.transport_protocol, "SAS (SPL-4)")
+            self.assertEqual(summary.logical_unit_id, "5000cca23b713c80")
+            self.assertEqual(summary.sas_address, "0x5000cca23b713c81")
+            self.assertEqual(summary.attached_sas_address, "0x500304801f715f3f")
+            self.assertEqual(summary.negotiated_link_rate, "phy enabled; 12 Gbps")
+            self.assertEqual(service.ssh_probe.commands, [])
+            self.assertEqual(
+                service.truenas_client.calls,
+                [
+                    ("da65", ("-a", "-j")),
+                    ("da65", ("-x",)),
+                ],
+            )
+
+    async def test_core_smart_summary_falls_back_to_ssh_when_api_smartctl_fails(self) -> None:
+        class DummyTrueNASClient:
+            async def fetch_disk_smartctl(self, *_args, **_kwargs):
+                raise TrueNASAPIError("api smartctl unavailable")
+
+        class DummySSHProbe:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            async def run_command(self, command: str) -> SSHCommandResult:
+                self.commands.append(command)
+                if command.endswith("-x /dev/da65"):
+                    return SSHCommandResult(
+                        command=command,
+                        ok=True,
+                        stdout=(
+                            "Read Cache is:        Enabled\n"
+                            "Writeback Cache is:   Disabled\n"
+                        ),
+                        exit_code=0,
+                    )
+                return SSHCommandResult(
+                    command=command,
+                    ok=True,
+                    stdout=(
+                        '{'
+                        '"temperature":{"current":28},'
+                        '"power_on_time":{"hours":33037},'
+                        '"logical_block_size":512,'
+                        '"physical_block_size":4096,'
+                        '"rotation_rate":7200,'
+                        '"form_factor":{"name":"3.5 inches"},'
+                        '"logical_unit_id":"0x5000cca2c272c1b8",'
+                        '"scsi_transport_protocol":{"name":"SAS (SPL-4)"},'
+                        '"scsi_sas_port_0":{'
+                        '"phy_0":{'
+                        '"attached_device_type":"expander device",'
+                        '"negotiated_logical_link_rate":"phy enabled; 12 Gbps",'
+                        '"sas_address":"0x5000cca2c272c1b9",'
+                        '"attached_sas_address":"0x500304801f715f3f"'
+                        '}'
+                        '}'
+                        "}"
+                    ),
+                    exit_code=0,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = InventoryService(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                DummySSHProbe(),
+                MappingStore(f"{temp_dir}\\slot_mappings.json"),
+            )
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                device_name="da65",
+                logical_block_size=512,
+                physical_block_size=4096,
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[slot],
+                    refresh_interval_seconds=30,
+                )
+            )
+
+            summary = await service.get_slot_smart_summary(0)
+
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.temperature_c, 28)
+            self.assertEqual(summary.read_cache_enabled, True)
+            self.assertEqual(summary.writeback_cache_enabled, False)
+            self.assertEqual(summary.transport_protocol, "SAS (SPL-4)")
+            self.assertEqual(summary.sas_address, "0x5000cca2c272c1b9")
+            self.assertEqual(summary.attached_sas_address, "0x500304801f715f3f")
+            self.assertEqual(summary.negotiated_link_rate, "phy enabled; 12 Gbps")
+
     async def test_scale_smart_summary_falls_back_to_ssh_smartctl(self) -> None:
         class DummyTrueNASClient:
             async def fetch_disk_smartctl(self, *_args, **_kwargs):

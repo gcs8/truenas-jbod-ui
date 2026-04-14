@@ -325,17 +325,27 @@ Enclosure status diagnostic page:
         self.assertEqual(parsed["attached_sas_address"], "0x5003048001c1043f")
         self.assertEqual(parsed["negotiated_link_rate"], "phy enabled; 12 Gbps")
 
-    def test_parse_smartctl_text_enrichment_extracts_cache_flags(self) -> None:
+    def test_parse_smartctl_text_enrichment_extracts_transport_fields(self) -> None:
         output = """
+Transport protocol:   SAS (SPL-4)
+Logical Unit id:      0x5000cca23b713c80
 Read Cache is:        Enabled
 Writeback Cache is:   Disabled
+    negotiated logical link rate: phy enabled; 12 Gbps
+    SAS address = 0x5000cca23b713c81
+    attached SAS address = 0x500304801f715f3f
 """.strip()
 
         parsed = parse_smartctl_text_enrichment(output)
 
         self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["transport_protocol"], "SAS (SPL-4)")
+        self.assertEqual(parsed["logical_unit_id"], "0x5000cca23b713c80")
         self.assertEqual(parsed["read_cache_enabled"], True)
         self.assertEqual(parsed["writeback_cache_enabled"], False)
+        self.assertEqual(parsed["sas_address"], "0x5000cca23b713c81")
+        self.assertEqual(parsed["attached_sas_address"], "0x500304801f715f3f")
+        self.assertEqual(parsed["negotiated_link_rate"], "phy enabled; 12 Gbps")
 
     def test_parse_smartctl_summary_handles_invalid_json(self) -> None:
         parsed = parse_smartctl_summary("not-json")

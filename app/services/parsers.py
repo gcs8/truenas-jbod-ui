@@ -1536,6 +1536,11 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
 def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
     read_cache_enabled: bool | None = None
     writeback_cache_enabled: bool | None = None
+    transport_protocol: str | None = None
+    logical_unit_id: str | None = None
+    sas_address: str | None = None
+    attached_sas_address: str | None = None
+    negotiated_link_rate: str | None = None
 
     for raw_line in output.splitlines():
         line = raw_line.strip()
@@ -1555,11 +1560,37 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
                     writeback_cache_enabled = True
                 elif lowered.startswith("disabled"):
                     writeback_cache_enabled = False
+        elif line.startswith("Transport protocol:"):
+            transport_protocol = normalize_text(line.split(":", 1)[1])
+        elif line.startswith("Logical Unit id:"):
+            logical_unit_id = format_hex_identifier(line.split(":", 1)[1])
+        elif line.startswith("SAS address ="):
+            sas_address = format_hex_identifier(line.split("=", 1)[1])
+        elif line.startswith("attached SAS address ="):
+            attached_sas_address = format_hex_identifier(line.split("=", 1)[1])
+        elif line.startswith("negotiated logical link rate:"):
+            negotiated_link_rate = normalize_text(line.split(":", 1)[1])
 
     return {
-        "available": any(value is not None for value in (read_cache_enabled, writeback_cache_enabled)),
+        "available": any(
+            value is not None
+            for value in (
+                read_cache_enabled,
+                writeback_cache_enabled,
+                transport_protocol,
+                logical_unit_id,
+                sas_address,
+                attached_sas_address,
+                negotiated_link_rate,
+            )
+        ),
         "read_cache_enabled": read_cache_enabled,
         "writeback_cache_enabled": writeback_cache_enabled,
+        "transport_protocol": transport_protocol,
+        "logical_unit_id": logical_unit_id,
+        "sas_address": sas_address,
+        "attached_sas_address": attached_sas_address,
+        "negotiated_link_rate": negotiated_link_rate,
     }
 
 
