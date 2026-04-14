@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import InventorySnapshot, LedAction, SlotView
-from app.services.inventory import InventoryService, build_lunid_aliases
+from app.services.inventory import InventoryService, build_lunid_aliases, resolve_persistent_id
 from app.services.mapping_store import MappingStore
 from app.services.ssh_probe import SSHCommandResult
 
@@ -57,6 +57,18 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(summary.physical_block_size, 4096)
         self.assertEqual(summary.logical_unit_id, "5000cca264d473d4")
         self.assertEqual(summary.sas_address, "5000cca264d473d5")
+
+    def test_resolve_persistent_id_prefers_partuuid_leaf(self) -> None:
+        value, label = resolve_persistent_id("/dev/disk/by-partuuid/83672e59-1b7c-40a0-970a-15ad0776ddda")
+
+        self.assertEqual(value, "83672e59-1b7c-40a0-970a-15ad0776ddda")
+        self.assertEqual(label, "PARTUUID")
+
+    def test_resolve_persistent_id_preserves_wwn_leaf(self) -> None:
+        value, label = resolve_persistent_id("/dev/disk/by-id/wwn-0x5000c5003e8253a7")
+
+        self.assertEqual(value, "wwn-0x5000c5003e8253a7")
+        self.assertEqual(label, "WWN")
 
 
 class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):

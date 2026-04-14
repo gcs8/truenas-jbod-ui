@@ -2,10 +2,12 @@
 
 ## Unreleased
 
-Working branch for the next feature set after `v0.2.0`.
+Working branch for the next feature set after `v0.3.0`.
 
-Current version target while this branch is still local and in-flight:
-`0.3.0-dev`.
+## v0.3.0 - 2026-04-13
+
+Third public release focused on first-pass TrueNAS SCALE support, richer slot
+identity, and Linux-side enclosure awareness.
 
 ### Added
 
@@ -17,6 +19,9 @@ Current version target while this branch is still local and in-flight:
 - SCALE per-slot SMART summary through SSH `smartctl -x -j` when the websocket API does not expose detailed SMART JSON
 - SCALE transport detail in slot summaries through SSH `smartctl -x -j`, including logical unit ID, SAS address, attached SAS address, and negotiated link rate
 - SCALE identify LED control through `sg_ses --dev-slot-num=<slot> --set=ident` and `--clear=ident`
+- Persistent identifier labeling in slot details so SCALE slots can show `PARTUUID`
+  or `WWN` instead of falling back to an empty CORE-style GPTID field
+- Fresh release screenshots for both the validated CORE and SCALE views
 
 ### Changed
 
@@ -25,6 +30,9 @@ Current version target while this branch is still local and in-flight:
 - SCALE SMART fallback now prefers SSH `smartctl` JSON and only falls back to metadata-only placeholders when SSH SMART reads fail
 - SCALE SMART fallback now accepts advisory non-zero `smartctl` exit codes when valid JSON/text output is still available
 - SCALE front and rear enclosure views now use front/rear chassis wording instead of inheriting the older top-loader UI labels
+- README, sample config, and sample env docs now describe the current SCALE
+  `sg_ses` and on-demand `smartctl` workflow instead of the older placeholder
+  story
 
 ## v0.2.0 - 2026-04-12
 

@@ -22,9 +22,15 @@ The CORE layout groups each 15-bay row as `6 + 6 + 3` to better match the
 physical divider layout of the chassis. The SCALE layout uses chassis-specific
 front and rear grids derived from Linux SES data and operator notes.
 
-## Screenshot
+## Screenshots
 
-![TrueNAS JBOD Enclosure UI screenshot](docs/images/ui-overview-v0.2.0.png)
+### Archive CORE
+
+![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/core-overview-v0.3.0.png)
+
+### Offsite SCALE
+
+![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/scale-overview-v0.3.0.png)
 
 ## Features
 
@@ -57,7 +63,7 @@ front and rear grids derived from Linux SES data and operator notes.
 - Selected-slot vdev-peer highlighting so sibling bays stand out together on the map
 - Small top summary for discovered disks, pools, enclosure rows, slot matches,
   saved mappings, and SSH slot hints
-- Search/filter by slot, serial, device, gptid, pool, vdev
+- Search/filter by slot, serial, device, persistent ID, pool, vdev
 - Manual refresh plus configurable auto-refresh intervals
 - Last updated timestamp and source health strip
 - Per-slot detail pane with:
@@ -71,7 +77,7 @@ front and rear grids derived from Linux SES data and operator notes.
   - logical and physical sector size
   - rotation rate, form factor, and read/write cache state when SMART data provides them
   - SCALE smartctl transport context such as protocol, logical unit ID, SAS address, and negotiated link rate when available
-  - gptid
+  - persistent identifier such as GPTID, PARTUUID, or WWN
   - pool
   - vdev
   - vdev class
@@ -80,7 +86,7 @@ front and rear grids derived from Linux SES data and operator notes.
   - multipath mode, member-path state, and HBA/controller path context when available
   - enclosure metadata
   - LED state
-- Copy-to-clipboard buttons for serial and gptid
+- Copy-to-clipboard buttons for serial and persistent identifier
 - SSH identify LED control via `sesutil locate` on CORE or `sg_ses` identify
   control on SCALE when the TrueNAS enclosure API does not expose writable
   enclosure rows
@@ -276,7 +282,7 @@ output.
 
 The SSH layer helps with:
 
-- recovering `gptid -> device` relationships from `glabel status`
+- recovering CORE `gptid -> device` relationships from `glabel status`
 - recovering multipath member-path state from `gmultipath list`
 - recovering pool/vdev/class membership from `zpool status -gP`
 - recovering device model hints from `camcontrol devlist -v`
@@ -323,7 +329,7 @@ imperfect even when TrueNAS itself is healthy.
 1. Select a slot in the UI.
 2. Click `Identify On`.
 3. Verify which physical bay lights up on the chassis.
-4. Enter or confirm the observed serial, device, or gptid in the calibration
+4. Enter or confirm the observed serial, device, or persistent identifier in the calibration
    form.
 5. Save the mapping.
 6. Optionally let the app clear the identify LED after saving.
@@ -369,7 +375,7 @@ This is derived from:
 
 - API pool/disk data where available
 - `zpool status -gP` when SSH mode is enabled
-- `glabel status` for gptid/device normalization
+- `glabel status` for CORE gptid/device normalization and persistent identifier lookups
 
 ### Edge cases called out in code
 

@@ -80,6 +80,32 @@ def build_lunid_aliases(value: str | None, platform: str) -> set[str]:
     return aliases
 
 
+def resolve_persistent_id(*candidates: str | None) -> tuple[str | None, str | None]:
+    for candidate in candidates:
+        value = normalize_text(candidate)
+        if not value:
+            continue
+
+        lowered = value.lower()
+        leaf = value.rsplit("/", 1)[-1]
+        leaf_lowered = leaf.lower()
+
+        if "/dev/disk/by-partuuid/" in lowered:
+            return leaf, "PARTUUID"
+        if "/dev/disk/by-id/" in lowered:
+            if leaf_lowered.startswith("wwn-"):
+                return leaf, "WWN"
+            return leaf, "Disk ID"
+        if lowered.startswith("gptid/") or "/gptid/" in lowered:
+            return value, "GPTID"
+        if leaf_lowered.startswith("wwn-"):
+            return leaf, "WWN"
+
+        return value, None
+
+    return None, None
+
+
 @dataclass(slots=True)
 class DiskRecord:
     raw: dict[str, Any]
@@ -1011,6 +1037,13 @@ class InventoryService:
         size_bytes = disk.size_bytes if disk else None
         size_human = format_bytes(size_bytes) or normalize_text(raw_slot_status.get("reported_size"))
         notes = mapping.notes if mapping else None
+        persistent_id, persistent_id_label = resolve_persistent_id(
+            gptid,
+            raw_slot_status.get("gptid_hint"),
+            zpool.raw_path if zpool else None,
+            zpool.raw_name if zpool else None,
+            mapping.gptid if mapping else None,
+        )
         enclosure_id = enclosure_meta.get("id") or normalize_text(raw_slot_status.get("enclosure_id"))
         ses_device = normalize_text(raw_slot_status.get("ses_device"))
         raw_ses_element_id = raw_slot_status.get("ses_element_id")
@@ -1102,7 +1135,8 @@ class InventoryService:
             model=model,
             size_bytes=size_bytes,
             size_human=size_human,
-            gptid=gptid or normalize_text(raw_slot_status.get("gptid_hint")) or (mapping.gptid if mapping else None),
+            gptid=persistent_id,
+            persistent_id_label=persistent_id_label,
             pool_name=disk.pool_name if disk else zpool.pool_name if zpool else None,
             vdev_name=zpool.vdev_name if zpool else None,
             vdev_class=zpool.vdev_class if zpool else None,
@@ -1138,7 +1172,7 @@ class InventoryService:
                         " ".join(filter(None, [member.controller_label for member in multipath.members])) if multipath else "",
                         serial or "",
                         model or "",
-                        (gptid or normalize_text(raw_slot_status.get("gptid_hint")) or "") or "",
+                        persistent_id or "",
                         (disk.pool_name if disk else "") or "",
                         (zpool.vdev_name if zpool else "") or "",
                         (zpool.vdev_class if zpool else "") or "",

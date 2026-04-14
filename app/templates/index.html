@@ -57,7 +57,7 @@
   <section class="toolbar">
     <label class="field grow">
       <span>Search</span>
-      <input id="search-box" type="search" placeholder="serial, daX, gptid, pool, vdev">
+      <input id="search-box" type="search" placeholder="serial, disk, persistent id, pool, vdev">
     </label>
     <button id="refresh-button" class="button">Refresh Now</button>
     <label class="toggle">
@@ -219,7 +219,7 @@
             Select a slot to save or restore calibration details for that bay.
           </div>
           <p class="subtle">
-            Save the observed serial, device, or gptid so this slot can be recovered quickly later.
+            Save the observed serial, device, or persistent ID so this slot can be recovered quickly later.
           </p>
           <form id="mapping-form" class="mapping-form-compact hidden">
             <label class="field">
@@ -231,7 +231,7 @@
               <input type="text" name="device_name" maxlength="256">
             </label>
             <label class="field">
-              <span>GPTID</span>
+              <span>Persistent ID</span>
               <input type="text" name="gptid" maxlength="256">
             </label>
             <label class="field">

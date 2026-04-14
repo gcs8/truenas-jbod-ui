@@ -107,6 +107,7 @@ class SlotView(BaseModel):
     size_bytes: int | None = None
     size_human: str | None = None
     gptid: str | None = None
+    persistent_id_label: str | None = None
     pool_name: str | None = None
     vdev_name: str | None = None
     vdev_class: str | None = None

@@ -94,6 +94,9 @@ ssh:
 #         # Optional if you also want the UI to refresh live identify LED state:
 #         - sudo -n /usr/bin/sg_ses -p ec /dev/sg27
 #         - sudo -n /usr/bin/sg_ses -p ec /dev/sg38
+#         # smartctl does not need to live in the standing command list; the app
+#         # runs it on demand for the selected slot, but the user still needs
+#         # sudo permission for /usr/sbin/smartctl on the SCALE host.
 
 layout:
   slot_count: 60

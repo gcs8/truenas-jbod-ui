@@ -166,15 +166,23 @@
   }
 
   function slotTooltip(slot) {
+    const persistentIdLabel = slot.persistent_id_label || ((state.snapshot.selected_system_platform || "core").toLowerCase() === "scale" ? "Persistent ID" : "GPTID");
     return [
       `Slot ${slot.slot_label}`,
       slot.device_name ? `Device: ${slot.device_name}` : "Device: n/a",
       slot.serial ? `Serial: ${slot.serial}` : "Serial: n/a",
-      slot.gptid ? `GPTID: ${slot.gptid}` : "GPTID: n/a",
+      slot.gptid ? `${persistentIdLabel}: ${slot.gptid}` : `${persistentIdLabel}: n/a`,
       slot.pool_name ? `Pool: ${slot.pool_name}` : "Pool: n/a",
       slot.vdev_name ? `Vdev: ${slot.vdev_name}` : "Vdev: n/a",
       slot.health ? `Health: ${slot.health}` : "Health: n/a",
     ].join("\n");
+  }
+
+  function persistentIdLabel(slot) {
+    return (
+      slot?.persistent_id_label ||
+      ((state.snapshot.selected_system_platform || "core").toLowerCase() === "scale" ? "Persistent ID" : "GPTID")
+    );
   }
 
   function ledStatusLabel(slot) {
@@ -528,7 +536,7 @@
       kvRow("Serial", slot.serial, true),
       kvRow("Model", slot.model),
       kvRow("Size", slot.size_human),
-      kvRow("GPTID", slot.gptid, true),
+      kvRow(persistentIdLabel(slot), slot.gptid, true),
       kvRow("Pool", slot.pool_name),
       kvRow("Vdev", slot.vdev_name),
       kvRow("Class", slot.vdev_class),
