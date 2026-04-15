@@ -12,6 +12,7 @@ from app.services.inventory import InventoryService, build_lunid_aliases, resolv
 from app.services.mapping_store import MappingStore
 from app.services.parsers import ParsedSSHData, ZpoolMember, parse_ssh_outputs
 from app.services.profile_registry import ProfileRegistry
+from app.services.profile_registry import UNIFI_UNVR_FRONT_4_PROFILE_ID, UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID
 from app.services.ssh_probe import SSHCommandResult
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
 
@@ -58,6 +59,17 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertIn("5002538b103e5ee0", aliases)
         self.assertIn("5002538b103e5ee1", aliases)
         self.assertIn("5002538b103e5ee2", aliases)
+
+    def test_smart_candidate_devices_ignores_placeholder_hctl_labels(self) -> None:
+        slot = SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            device_name="7:0:0:0",
+        )
+
+        self.assertEqual(InventoryService._smart_candidate_devices(slot), [])
 
     def test_extract_block_sizes_from_scale_disk_metadata(self) -> None:
         disk = {
@@ -194,6 +206,312 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertEqual(record.identifier, "eui.000000000000001000a075012b91c7cf")
             self.assertEqual(record.pool_name, "/mnt/nvme_raid")
             self.assertEqual(record.smart_devices[0], "nvme0n2")
+
+    def test_build_linux_disk_records_supports_sata_disks_with_hctl_lookup_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="unvr",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {
+                        "name": "sda",
+                        "type": "disk",
+                        "path": "/dev/sda",
+                        "hctl": "0:0:0:0",
+                        "serial": "ZC14D9W1",
+                        "model": "ST4000NM0115-1YZ107",
+                        "size": "3.7T",
+                        "log-sec": 512,
+                        "phy-sec": 4096,
+                        "tran": "sata",
+                        "wwn": "0x5000c500abcd0001",
+                        "children": [
+                            {
+                                "name": "md3",
+                                "type": "raid5",
+                                "mountpoint": "/volume1",
+                            }
+                        ],
+                    },
+                    {
+                        "name": "sdb",
+                        "type": "disk",
+                        "path": "/dev/sdb",
+                        "hctl": "2:0:0:0",
+                        "serial": "ZC14DAGA",
+                        "model": "ST4000NM0115-1YZ107",
+                        "size": "3.7T",
+                        "log-sec": 512,
+                        "phy-sec": 4096,
+                        "tran": "sata",
+                        "wwn": "0x5000c500abcd0002",
+                        "children": [
+                            {
+                                "name": "md3",
+                                "type": "raid5",
+                                "mountpoint": "/volume1",
+                            }
+                        ],
+                    },
+                ],
+            )
+
+            records = service._build_linux_disk_records(ssh_data)
+
+            self.assertEqual(len(records), 2)
+            first = records[0]
+            self.assertEqual(first.device_name, "sda")
+            self.assertEqual(first.path_device_name, "sda")
+            self.assertEqual(first.pool_name, "/volume1")
+            self.assertEqual(first.bus, "SATA")
+            self.assertEqual(first.smart_devices, ["sda"])
+            self.assertIn("0:0:0:0", first.lookup_keys)
+            self.assertIn("ZC14D9W1".lower(), first.lookup_keys)
+
+    def test_build_linux_disk_records_preserves_ubntstorage_vendor_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="unvr-pro",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {
+                        "name": "sda",
+                        "type": "disk",
+                        "path": "/dev/sda",
+                        "hctl": "5:0:0:0",
+                        "serial": "Y5F2A056FJKH",
+                        "model": "TOSHIBA_MG09ACA16TE",
+                        "size": "14.6T",
+                        "log-sec": 512,
+                        "phy-sec": 4096,
+                        "tran": "sata",
+                        "children": [],
+                    }
+                ],
+                ubntstorage_disks=[
+                    {
+                        "node": "sda",
+                        "slot": 2,
+                        "healthy": "optimal",
+                        "model": "TOSHIBA MG09ACA16TE",
+                        "serial": "Y5F2A056FJKH",
+                    }
+                ],
+            )
+
+            records = service._build_linux_disk_records(ssh_data)
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].raw["vendor_slot"], 1)
+            self.assertEqual(records[0].health, "optimal")
+
+    def test_correlate_linux_host_uses_ubntstorage_slots_and_marks_nodisk_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="unvr-pro",
+                label="UniFi UNVR Pro",
+                default_profile_id=UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {
+                        "name": "sda",
+                        "type": "disk",
+                        "path": "/dev/sda",
+                        "hctl": "5:0:0:0",
+                        "serial": "Y5F2A056FJKH",
+                        "model": "TOSHIBA_MG09ACA16TE",
+                        "size": "14.6T",
+                        "log-sec": 512,
+                        "phy-sec": 4096,
+                        "tran": "sata",
+                        "children": [],
+                    },
+                    {
+                        "name": "sdb",
+                        "type": "disk",
+                        "path": "/dev/sdb",
+                        "hctl": "7:0:0:0",
+                        "serial": "Y5F2A056FJKK",
+                        "model": "TOSHIBA_MG09ACA16TE",
+                        "size": "14.6T",
+                        "log-sec": 512,
+                        "phy-sec": 4096,
+                        "tran": "sata",
+                        "children": [],
+                    },
+                ],
+                ubntstorage_disks=[
+                    {"node": "sdb", "slot": 1, "healthy": "optimal", "state": "ready", "size": 16000000000000},
+                    {"node": "sda", "slot": 2, "healthy": "optimal", "state": "ready", "size": 16000000000000},
+                    {"slot": 3, "healthy": "none", "state": "nodisk"},
+                    {"slot": 4, "healthy": "none", "state": "nodisk"},
+                    {"slot": 5, "healthy": "none", "state": "nodisk"},
+                    {"slot": 6, "healthy": "none", "state": "nodisk"},
+                    {"slot": 7, "healthy": "none", "state": "nodisk"},
+                ],
+            )
+            warnings: list[str] = []
+
+            slot_views, _available, _meta, _rows, slot_count, _columns = service._correlate_linux_host(
+                ssh_data,
+                warnings,
+                None,
+            )
+
+            self.assertEqual(slot_count, 7)
+            self.assertEqual(slot_views[0].device_name, "sdb")
+            self.assertEqual(slot_views[1].device_name, "sda")
+            self.assertFalse(slot_views[2].present)
+            self.assertEqual(slot_views[2].state.value, "empty")
+            self.assertEqual(slot_views[2].mapping_source, "ssh")
+            self.assertTrue(any("UniFi UNVR Pro LED control is experimental." in warning for warning in warnings))
+
+    def test_correlate_linux_host_enables_unvr_led_backend_and_gpio_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="unvr",
+                label="UniFi UNVR",
+                default_profile_id=UNIFI_UNVR_FRONT_4_PROFILE_ID,
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True, user="root"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {
+                        "name": "sdd",
+                        "type": "disk",
+                        "path": "/dev/sdd",
+                        "hctl": "6:0:0:0",
+                        "serial": "ZC14DAYS",
+                        "model": "ST4000NM0115-1YZ107",
+                        "size": "3.6T",
+                        "log-sec": 512,
+                        "phy-sec": 4096,
+                        "tran": "sata",
+                        "children": [],
+                    }
+                ],
+                ubntstorage_disks=[
+                    {"node": "sdd", "slot": 1, "healthy": "good", "state": "normal", "size": 4000787030016},
+                    {"slot": 2, "healthy": "none", "state": "nodisk"},
+                    {"slot": 3, "healthy": "none", "state": "nodisk"},
+                    {"slot": 4, "healthy": "none", "state": "nodisk"},
+                ],
+                unifi_led_states={0: True},
+            )
+
+            slot_views, _available, _meta, _rows, slot_count, _columns = service._correlate_linux_host(
+                ssh_data,
+                [],
+                None,
+            )
+
+            self.assertEqual(slot_count, 4)
+            self.assertEqual(slot_views[0].device_name, "sdd")
+            self.assertEqual(slot_views[0].led_backend, "unifi_fault")
+            self.assertTrue(slot_views[0].led_supported)
+            self.assertTrue(slot_views[0].identify_active)
+
+    def test_correlate_linux_host_enables_unvr_pro_led_backend_as_experimental(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="unvr-pro",
+                label="UniFi UNVR Pro",
+                default_profile_id=UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True, user="root"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {
+                        "name": "sdb",
+                        "type": "disk",
+                        "path": "/dev/sdb",
+                        "hctl": "7:0:0:0",
+                        "serial": "Y5E2A0BSFJKH",
+                        "model": "TOSHIBA_MG09ACA16TE",
+                        "size": "14.0T",
+                        "log-sec": 512,
+                        "phy-sec": 4096,
+                        "tran": "sata",
+                        "children": [],
+                    }
+                ],
+                ubntstorage_disks=[
+                    {"node": "sdb", "slot": 1, "healthy": "good", "state": "normal", "size": 16000900661248},
+                    {"slot": 2, "healthy": "none", "state": "nodisk"},
+                    {"slot": 3, "healthy": "none", "state": "nodisk"},
+                    {"slot": 4, "healthy": "none", "state": "nodisk"},
+                    {"slot": 5, "healthy": "none", "state": "nodisk"},
+                    {"slot": 6, "healthy": "none", "state": "nodisk"},
+                    {"slot": 7, "healthy": "none", "state": "nodisk"},
+                ],
+                unifi_led_states={0: True},
+            )
+            warnings: list[str] = []
+
+            slot_views, _available, _meta, _rows, slot_count, _columns = service._correlate_linux_host(
+                ssh_data,
+                warnings,
+                None,
+            )
+
+            self.assertEqual(slot_count, 7)
+            self.assertEqual(slot_views[0].device_name, "sdb")
+            self.assertEqual(slot_views[0].led_backend, "unifi_fault")
+            self.assertTrue(slot_views[0].led_supported)
+            self.assertTrue(slot_views[0].identify_active)
+            self.assertTrue(slot_views[0].raw_status.get("experimental_led"))
+            self.assertTrue(any("UniFi UNVR Pro LED control is experimental." in warning for warning in warnings))
 
     def test_build_disk_records_adds_camcontrol_peer_aliases_to_lookup_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2435,6 +2753,55 @@ Enclosure Status diagnostic page:
 
 
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unifi_led_control_uses_sata_led_sm_set_fault(self) -> None:
+        class DummyTrueNASClient:
+            pass
+
+        class DummySSHProbe:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            async def run_command(self, command: str) -> SSHCommandResult:
+                self.commands.append(command)
+                return SSHCommandResult(command=command, ok=True, stdout="", exit_code=0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="unvr",
+                default_profile_id=UNIFI_UNVR_FRONT_4_PROFILE_ID,
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True, user="root"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                DummySSHProbe(),
+                temp_dir,
+            )
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                led_supported=True,
+                led_backend="unifi_fault",
+                raw_status={"vendor_slot_number": 1},
+            )
+
+            await service._set_unifi_slot_led_over_ssh(slot, LedAction.identify)
+            await service._set_unifi_slot_led_over_ssh(slot, LedAction.clear)
+
+            self.assertIn(
+                "python3 -c 'from ustd.hwmon import sata_led_sm; sata_led_sm.set_fault(1, True)'",
+                service.ssh_probe.commands,
+            )
+            self.assertIn(
+                "python3 -c 'from ustd.hwmon import sata_led_sm; sata_led_sm.set_fault(1, False)'",
+                service.ssh_probe.commands,
+            )
+
     async def test_scale_sg_ses_led_control_uses_slot_number(self) -> None:
         class DummyTrueNASClient:
             pass

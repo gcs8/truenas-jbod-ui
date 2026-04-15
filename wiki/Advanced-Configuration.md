@@ -25,13 +25,13 @@ systems:
       host: https://archive-core.example.local
       api_key: ""
       platform: core
-      verify_ssl: false
+      verify_ssl: true
     ssh:
       enabled: true
       host: archive-core.example.local
       user: jbodmap
       key_path: /run/ssh/id_truenas
-      known_hosts_path: /run/ssh/known_hosts
+      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /sbin/glabel status
@@ -49,13 +49,13 @@ systems:
       host: https://offsite-scale.example.local
       api_key: ""
       platform: scale
-      verify_ssl: false
+      verify_ssl: true
     ssh:
       enabled: true
       host: offsite-scale.example.local
       user: jbodmap
       key_path: /run/ssh/id_truenas
-      known_hosts_path: /run/ssh/known_hosts
+      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /usr/sbin/zpool status -gP

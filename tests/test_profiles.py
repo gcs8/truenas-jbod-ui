@@ -14,6 +14,8 @@ from app.services.profile_registry import (
     SCALE_SSG_FRONT_24_PROFILE_ID,
     SCALE_SSG_REAR_12_PROFILE_ID,
     ProfileRegistry,
+    UNIFI_UNVR_FRONT_4_PROFILE_ID,
+    UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 )
 
 
@@ -123,6 +125,58 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.rows, 1)
         self.assertEqual(profile.columns, 24)
         self.assertEqual(profile.slot_layout, [list(range(24))])
+
+    def test_builtin_unvr_profile_can_be_selected_explicitly_for_linux_hosts(self) -> None:
+        system = SystemConfig(
+            id="unvr",
+            label="UniFi UNVR",
+            default_profile_id=UNIFI_UNVR_FRONT_4_PROFILE_ID,
+            truenas=TrueNASConfig(platform="linux"),
+        )
+        registry = ProfileRegistry(get_settings())
+
+        profile = registry.resolve_for_enclosure(
+            system,
+            None,
+            fallback_label="Front 4 Bay",
+            fallback_rows=1,
+            fallback_columns=4,
+            fallback_slot_count=4,
+        )
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.id, UNIFI_UNVR_FRONT_4_PROFILE_ID)
+        self.assertEqual(profile.face_style, "unifi-drive")
+        self.assertEqual(profile.latch_edge, "bottom")
+        self.assertEqual(profile.slot_layout, [[0, 1, 2, 3]])
+        self.assertEqual(profile.slot_hints[0], ["0:0:0:0"])
+        self.assertEqual(profile.slot_hints[3], ["6:0:0:0"])
+
+    def test_builtin_unvr_pro_profile_can_be_selected_explicitly_for_linux_hosts(self) -> None:
+        system = SystemConfig(
+            id="unvr-pro",
+            label="UniFi UNVR Pro",
+            default_profile_id=UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+            truenas=TrueNASConfig(platform="linux"),
+        )
+        registry = ProfileRegistry(get_settings())
+
+        profile = registry.resolve_for_enclosure(
+            system,
+            None,
+            fallback_label="Front 7 Bay",
+            fallback_rows=2,
+            fallback_columns=4,
+            fallback_slot_count=7,
+        )
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.id, UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID)
+        self.assertEqual(profile.face_style, "unifi-drive")
+        self.assertEqual(profile.latch_edge, "bottom")
+        self.assertEqual(profile.slot_layout, [[0, 1, 2], [3, 4, 5, 6]])
+        self.assertEqual(profile.slot_hints[0], ["7:0:0:0"])
+        self.assertEqual(profile.slot_hints[1], ["5:0:0:0"])
 
     def test_get_settings_loads_custom_profile_file_and_system_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

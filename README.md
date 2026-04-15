@@ -6,8 +6,8 @@ This project is a production-usable web app for visualizing JBOD and
 chassis-attached disks on TrueNAS systems without installing anything on the
 storage host itself. It also supports a first-pass SSH-only Linux inventory
 path for profile-driven, non-TrueNAS hosts where physical disk layout still
-matters, plus a shipped `v0.5.0` OSNexus Quantastor adapter for storage-system,
-pool, SMART, and LED-aware slot visibility on shared-slot hardware.
+matters, plus shipped adapters and profiles for OSNexus Quantastor shared-slot
+hardware and first-pass UniFi UNVR-family appliances.
 
 It runs entirely off-box in Docker, talks to TrueNAS over the middleware
 websocket API, optionally enriches data over SSH, and renders a dark,
@@ -25,6 +25,12 @@ The current tested hardware profiles are:
 - OSNexus Quantastor on a Supermicro `SSG-2028R-DE2CR24L`, modeled as a
   first-pass shared-front `24`-slot `1x24` profile with REST-first inventory,
   SSH/`qs` enrichment, SES-aware LED control, and shared-face HA context
+- UniFi UNVR as a generic Linux / vendor-CLI appliance with a built-in `4`-bay
+  front profile, direct ATA/SATA SMART detail, and validated vendor-local SSH
+  LED control
+- UniFi UNVR Pro as a generic Linux / vendor-CLI appliance with a built-in
+  `7`-bay `3-over-4` front profile, direct ATA/SATA SMART detail, and
+  experimental vendor-local SSH LED control
 
 The CORE layout groups each 15-bay row as `6 + 6 + 3` to better match the
 physical divider layout of the chassis. The SCALE layout uses chassis-specific
@@ -59,10 +65,17 @@ front and rear grids derived from Linux SES data and operator notes.
   Linux SES AES and enclosure-status data is available over SSH
 - First-pass generic Linux support for SSH-only `mdadm` / NVMe hosts where no
   TrueNAS API is available
+- Generic Linux support can also cover password-only appliance-style hosts
+  when SSH works but the vendor API does not expose per-disk slot inventory,
+  such as the shipped UniFi UNVR and first-pass UNVR Pro paths
 - First-pass Quantastor support for storage-system, disk, and pool inventory on
   shared-slot hardware, with REST-first metadata plus optional SSH/`qs` CLI
   enrichment for disk and enclosure detail, and master-node / IO-fencing
   warnings
+- UniFi appliance inventory through `ubntstorage disk inspect`, with built-in
+  UniFi-specific tray styling and ATA/SATA SMART enrichment over SSH
+- Vendor-local UniFi SSH LED control for the regular UNVR and experimental
+  vendor-local UniFi SSH LED control for the UNVR Pro
 - Optional SSH enrichment for:
   - `glabel status`
   - `gmultipath list`
@@ -152,11 +165,16 @@ front and rear grids derived from Linux SES data and operator notes.
 - Generic Linux slot mapping currently depends on explicit profile `slot_hints`
   and host inventory data such as `lsblk`, `mdadm`, and `nvme list-subsys`.
   It does not currently infer arbitrary Linux chassis geometry on its own.
-- Quantastor support is still first-pass in the `v0.5.0` release. The current
+- Quantastor support is still intentionally first-pass in the current release. The current
   implementation treats each storage system as a selectable system-scoped view,
   supplements the REST path with SSH/`qs` CLI disk/enclosure rows when enabled,
   and warns when HA groups are present instead of attempting full shared-face,
   active-node, or IO-fencing visualization yet.
+- UniFi UNVR support is currently centered on SSH plus on-box vendor tooling,
+  not on a rich documented Protect storage API.
+- UniFi UNVR Pro support is still first-pass and should be treated as
+  inventory/SMART-solid but LED-experimental until more bays are validated on
+  real hardware.
 - On the validated Quantastor cluster, the documented REST and `qs` identify
   operations are still being rejected by the LSI controller path, so the app
   now prefers SSH `sg_ses` when one of the HA nodes exposes a usable enclosure
@@ -167,7 +185,9 @@ front and rear grids derived from Linux SES data and operator notes.
   SMART data actually exposes lifetime write counters. The current NVMe path is
   good here; generic HDD/SAS write-rate coverage is still best-effort.
 - Generic Linux LED control is not assumed. If the host does not expose SES
-  devices such as `/dev/sg*`, the app will stay inventory-only for that system.
+  devices such as `/dev/sg*`, the app will stay inventory-only unless there is
+  a validated vendor-local control path such as the current UniFi UNVR-family
+  `sata_led_sm.set_fault(...)` flow.
 
 ## Directory Layout
 
@@ -219,7 +239,8 @@ truenas-jbod-ui/
    - set `TRUENAS_HOST`
    - for TrueNAS CORE/SCALE, set `TRUENAS_API_KEY`
    - for Quantastor, set `TRUENAS_API_USER` and `TRUENAS_API_PASSWORD`
-   - decide whether `TRUENAS_VERIFY_SSL` should be `true` or `false`
+   - leave `TRUENAS_VERIFY_SSL=true` unless you intentionally need to trust a
+     self-signed or rapidly rotating lab certificate
    - enable SSH if you want the app to supplement Quantastor REST data with
      `qs` CLI disk / enclosure rows
 
@@ -228,8 +249,9 @@ truenas-jbod-ui/
    - prefer a dedicated non-root account if it can run the required inventory
      commands
    - make sure the key is readable by Docker
-   - consider mounting a `known_hosts` file and enabling strict host key
-     checking
+   - by default, the first successful SSH connection pins the observed host key
+     into `/app/data/known_hosts`; future connections must match it unless you
+     intentionally clear or edit that file
 
 6. Start the app:
 
@@ -271,6 +293,8 @@ A conservative SSH setup guide for live slot mapping is included here:
 - [docs/SSH_READ_ONLY_SETUP.md](docs/SSH_READ_ONLY_SETUP.md)
 - [docs/GPU_SERVER_NOTES.md](docs/GPU_SERVER_NOTES.md) for the current Ubuntu /
   `mdadm` / NVMe generic Linux test host
+- [docs/UNVR_NOTES.md](docs/UNVR_NOTES.md) for the current UniFi UNVR /
+  UNVR Pro generic Linux discovery notes
 
 ## GitHub Wiki Source
 
@@ -333,6 +357,7 @@ fallback too.
 - `SSH_USER`
 - `SSH_PORT`
 - `SSH_KEY_PATH`
+- `SSH_PASSWORD`
 - `SSH_SUDO_PASSWORD`
 - `SSH_KNOWN_HOSTS_PATH`
 - `SSH_STRICT_HOST_KEY_CHECKING`
@@ -577,8 +602,12 @@ multipath summary and simply omits controller/HBA labels.
 - Prefer a dedicated TrueNAS API key with only the permissions you need.
 - If you enable SSH, prefer a dedicated non-root operational account that can
   run the required inventory commands.
-- Consider enabling `SSH_STRICT_HOST_KEY_CHECKING=true` and mounting a
-  `known_hosts` file once you have the workflow validated.
+- `SSH_STRICT_HOST_KEY_CHECKING` is enabled by default, and the app now uses a
+  trust-on-first-use flow that pins the first observed host key into
+  `/app/data/known_hosts`.
+- The app is still intentionally unauthenticated. Keep it on a trusted
+  management LAN/VLAN, or restrict access with host firewalling or a reverse
+  proxy if the network boundary is broader than that.
 - The app avoids logging secrets and only logs operational errors and warnings.
 
 ## Troubleshooting
@@ -628,8 +657,8 @@ multipath summary and simply omits controller/HBA labels.
 
 - Verify the key path inside the container matches `SSH_KEY_PATH`
 - Confirm the key is mounted into `./config/ssh`
-- If strict host key checking is enabled, make sure the mounted `known_hosts`
-  file is correct
+- If strict host key checking is enabled, make sure the saved
+  `/app/data/known_hosts` entry is correct for the target host
 - Confirm the TrueNAS account can run the configured commands
 
 ## Known Caveats for Slot Mapping
@@ -658,8 +687,9 @@ multipath summary and simply omits controller/HBA labels.
 
 - `v0.4.x`: keep polishing the new enclosure-profile system and reduce the
   remaining hardcoded chassis assumptions
-- `v0.5.0`: add OSNexus Quantastor support now that the profile system is in
-  place
+- `v0.6.0`: ship UniFi UNVR-family support and tighten SSH/API defaults
+- next: keep polishing validated platforms, then decide whether the next step
+  is broader Linux appliance support, richer topology context, or optional auth
 - Richer topology visualization for pool and vdev ancestry beyond the current
   compact sibling-awareness panel
 - WebSocket or Server-Sent Events live updates

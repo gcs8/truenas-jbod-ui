@@ -116,6 +116,36 @@ Why this is not `v0.4.0`:
 - we want to avoid mixing "new platform adapter" work with "new chassis/profile
   abstraction" work in the same release
 
+## v0.6.0 - UniFi UNVR Family And Secure Defaults
+
+Goal:
+
+- prove that the generic Linux path can stretch to appliance-style storage
+  boxes that expose useful SSH and vendor-local tooling even when they do not
+  expose SES or a rich public disk API
+
+Primary outcomes:
+
+- shipped `ubiquiti-unvr-front-4` and `ubiquiti-unvr-pro-front-7` built-in
+  profiles
+- password-SSH support plus keyboard-interactive fallback for appliance Linux
+  hosts
+- vendor-native UniFi slot mapping through `ubntstorage disk inspect`
+- ATA/SATA SMART enrichment for the UniFi family, including cache state,
+  link-rate metadata, and lifetime read/write counters when available
+- validated vendor-local SSH LED control for the regular UNVR and experimental
+  parity for the UNVR Pro
+- safer release defaults for SSH/API trust, including TOFU-pinned SSH host keys
+  and sample configs that prefer TLS verification by default
+
+Current status:
+
+- shipped in `v0.6.0`
+- regular UNVR support is operationally validated for inventory, SMART, layout,
+  and LED control
+- UNVR Pro support is solid for inventory/layout/SMART and still intentionally
+  experimental for LED control until more bays are confirmed on real hardware
+
 ## Longer-Term Ideas
 
 - broader chassis-profile sharing and import/export

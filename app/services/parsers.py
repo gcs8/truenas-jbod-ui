@@ -55,6 +55,9 @@ class ParsedSSHData:
     linux_blockdevices: list[dict[str, Any]] = field(default_factory=list)
     linux_mdadm_arrays: dict[str, "LinuxMdArray"] = field(default_factory=dict)
     linux_nvme_subsystems: dict[str, dict[str, str | None]] = field(default_factory=dict)
+    ubntstorage_disks: list[dict[str, Any]] = field(default_factory=list)
+    ubntstorage_spaces: list[dict[str, Any]] = field(default_factory=list)
+    unifi_led_states: dict[int, bool] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -238,6 +241,25 @@ def _coerce_non_negative_int(value: Any) -> int | None:
     return None
 
 
+def _coerce_int_like(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    match = re.search(r"-?\d+", text.replace(",", ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
+
+
 def _nvme_data_units_to_bytes(value: Any) -> int | None:
     units = _coerce_non_negative_int(value)
     if units is None:
@@ -261,6 +283,17 @@ def _scsi_gigabytes_processed_to_bytes(value: Any) -> int | None:
         return int(Decimal(text) * Decimal(1_000_000_000))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _annualize_bytes_written(
+    bytes_written: int | None,
+    power_on_hours: int | None,
+    *,
+    minimum_hours: int = 24 * 30,
+) -> int | None:
+    if bytes_written is None or not isinstance(power_on_hours, int) or power_on_hours < minimum_hours:
+        return None
+    return int(bytes_written * 24 * 365 / power_on_hours)
 
 
 def _kelvin_to_celsius(value: Any) -> int | None:
@@ -292,6 +325,31 @@ def _format_nvme_eui64(value: Any) -> str | None:
 def _format_nvme_nguid(value: Any) -> str | None:
     text = normalize_text(str(value) if value is not None else None)
     return text.lower() if text else None
+
+
+def _extract_ata_attribute_raw_value(payload: dict[str, Any], *attribute_ids: int) -> int | None:
+    table = (
+        payload.get("ata_smart_attributes", {}).get("table")
+        if isinstance(payload.get("ata_smart_attributes"), dict)
+        else None
+    )
+    if not isinstance(table, list):
+        return None
+
+    attribute_id_set = set(attribute_ids)
+    for entry in table:
+        if not isinstance(entry, dict) or entry.get("id") not in attribute_id_set:
+            continue
+        raw_value = entry.get("raw")
+        if isinstance(raw_value, dict):
+            for candidate in (raw_value.get("value"), raw_value.get("string")):
+                parsed = _coerce_int_like(candidate)
+                if parsed is not None and parsed >= 0:
+                    return parsed
+        parsed = _coerce_int_like(raw_value)
+        if parsed is not None and parsed >= 0:
+            return parsed
+    return None
 
 
 def parse_glabel_status(output: str) -> GlabelInfo:
@@ -1565,11 +1623,18 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         if isinstance(payload.get("nvme_version"), dict)
         else None
     )
+    if not protocol_version:
+        protocol_version = (
+            normalize_text(payload.get("sata_version", {}).get("string"))
+            if isinstance(payload.get("sata_version"), dict)
+            else None
+        )
     nvme_health = (
         payload.get("nvme_smart_health_information_log")
         if isinstance(payload.get("nvme_smart_health_information_log"), dict)
         else {}
     )
+    smart_status = payload.get("smart_status") if isinstance(payload.get("smart_status"), dict) else {}
     rotation_rate = payload.get("rotation_rate") if isinstance(payload.get("rotation_rate"), int) else None
     form_factor = (
         normalize_text(payload.get("form_factor", {}).get("name"))
@@ -1586,8 +1651,15 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
             normalize_text(payload.get("device", {}).get("protocol"))
             if isinstance(payload.get("device"), dict)
             else None
-        )
+    )
     logical_unit_id = format_hex_identifier(payload.get("logical_unit_id"))
+    smart_health_status = None
+    if smart_status:
+        passed = smart_status.get("passed")
+        if passed is True:
+            smart_health_status = "PASSED"
+        elif passed is False:
+            smart_health_status = "FAILED"
     power_on_hours = power_on_time.get("hours") if isinstance(power_on_time.get("hours"), int) else None
     warning_temperature_c = None
     critical_temperature_c = None
@@ -1620,11 +1692,16 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         bytes_read = _scsi_gigabytes_processed_to_bytes(scsi_read_error_log.get("gigabytes_processed"))
     if bytes_written is None:
         bytes_written = _scsi_gigabytes_processed_to_bytes(scsi_write_error_log.get("gigabytes_processed"))
-    annualized_bytes_written = (
-        int(bytes_written * 24 * 365 / power_on_hours)
-        if bytes_written is not None and isinstance(power_on_hours, int) and power_on_hours > 0
-        else None
-    )
+    sector_size_for_ata = logical_block_size if isinstance(logical_block_size, int) and logical_block_size > 0 else 512
+    if bytes_read is None:
+        ata_lbas_read = _extract_ata_attribute_raw_value(payload, 242)
+        if ata_lbas_read is not None:
+            bytes_read = ata_lbas_read * sector_size_for_ata
+    if bytes_written is None:
+        ata_lbas_written = _extract_ata_attribute_raw_value(payload, 241)
+        if ata_lbas_written is not None:
+            bytes_written = ata_lbas_written * sector_size_for_ata
+    annualized_bytes_written = _annualize_bytes_written(bytes_written, power_on_hours)
     estimated_lifetime_bytes_written = (
         int(bytes_written * 100 / endurance_used_percent)
         if bytes_written is not None
@@ -1643,6 +1720,22 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
     sas_address: str | None = None
     attached_sas_address: str | None = None
     negotiated_link_rate: str | None = None
+    read_cache_enabled = (
+        payload.get("read_lookahead", {}).get("enabled")
+        if isinstance(payload.get("read_lookahead"), dict)
+        and isinstance(payload.get("read_lookahead", {}).get("enabled"), bool)
+        else None
+    )
+    writeback_cache_enabled = (
+        payload.get("write_cache", {}).get("enabled")
+        if isinstance(payload.get("write_cache"), dict)
+        and isinstance(payload.get("write_cache", {}).get("enabled"), bool)
+        else None
+    )
+    interface_speed = payload.get("interface_speed") if isinstance(payload.get("interface_speed"), dict) else {}
+    interface_speed_current = interface_speed.get("current") if isinstance(interface_speed.get("current"), dict) else {}
+    if not negotiated_link_rate:
+        negotiated_link_rate = normalize_text(interface_speed_current.get("string"))
 
     if rotation_rate is None and transport_protocol and transport_protocol.upper() == "NVME":
         rotation_rate = 0
@@ -1720,6 +1813,7 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
             for value in (
                 current_temperature,
                 power_on_hours,
+                smart_health_status,
                 latest_test_type,
                 latest_test_status,
                 latest_test_lifetime_hours,
@@ -1742,6 +1836,8 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
                 namespace_eui64,
                 warning_temperature_c,
                 critical_temperature_c,
+                read_cache_enabled,
+                writeback_cache_enabled,
                 transport_protocol,
                 logical_unit_id,
                 sas_address,
@@ -1752,6 +1848,7 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         "temperature_c": current_temperature,
         "warning_temperature_c": warning_temperature_c,
         "critical_temperature_c": critical_temperature_c,
+        "smart_health_status": smart_health_status,
         "power_on_hours": power_on_hours,
         "power_on_days": power_on_hours // 24 if isinstance(power_on_hours, int) else None,
         "last_test_type": latest_test_type,
@@ -1783,6 +1880,8 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         "protocol_version": protocol_version,
         "namespace_eui64": namespace_eui64,
         "namespace_nguid": None,
+        "read_cache_enabled": read_cache_enabled,
+        "writeback_cache_enabled": writeback_cache_enabled,
         "transport_protocol": transport_protocol,
         "logical_unit_id": logical_unit_id,
         "sas_address": sas_address,
@@ -1815,11 +1914,7 @@ def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
     bytes_written = _nvme_data_units_to_bytes(payload.get("data_units_written"))
     media_errors = _coerce_non_negative_int(payload.get("media_errors"))
     unsafe_shutdowns = _coerce_non_negative_int(payload.get("unsafe_shutdowns"))
-    annualized_bytes_written = (
-        int(bytes_written * 24 * 365 / power_on_hours)
-        if bytes_written is not None and isinstance(power_on_hours, int) and power_on_hours > 0
-        else None
-    )
+    annualized_bytes_written = _annualize_bytes_written(bytes_written, power_on_hours)
     estimated_lifetime_bytes_written = (
         int(bytes_written * 100 / endurance_used_percent)
         if bytes_written is not None
@@ -1932,6 +2027,8 @@ def parse_nvme_id_ns_summary(output: str) -> dict[str, Any]:
 def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
     read_cache_enabled: bool | None = None
     writeback_cache_enabled: bool | None = None
+    smart_health_status: str | None = None
+    protocol_version: str | None = None
     transport_protocol: str | None = None
     logical_unit_id: str | None = None
     sas_address: str | None = None
@@ -1948,6 +2045,14 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
                     read_cache_enabled = True
                 elif lowered.startswith("disabled"):
                     read_cache_enabled = False
+        elif line.startswith("Rd look-ahead is:"):
+            value = normalize_text(line.split(":", 1)[1])
+            if value:
+                lowered = value.lower()
+                if lowered.startswith("enabled"):
+                    read_cache_enabled = True
+                elif lowered.startswith("disabled"):
+                    read_cache_enabled = False
         elif line.startswith("Writeback Cache is:"):
             value = normalize_text(line.split(":", 1)[1])
             if value:
@@ -1956,6 +2061,26 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
                     writeback_cache_enabled = True
                 elif lowered.startswith("disabled"):
                     writeback_cache_enabled = False
+        elif line.startswith("Write cache is:"):
+            value = normalize_text(line.split(":", 1)[1])
+            if value:
+                lowered = value.lower()
+                if lowered.startswith("enabled"):
+                    writeback_cache_enabled = True
+                elif lowered.startswith("disabled"):
+                    writeback_cache_enabled = False
+        elif line.startswith("SMART Health Status:"):
+            smart_health_status = normalize_text(line.split(":", 1)[1])
+        elif line.startswith("SMART overall-health self-assessment test result:"):
+            smart_health_status = normalize_text(line.split(":", 1)[1])
+        elif line.startswith("SATA Version is:"):
+            value = normalize_text(line.split(":", 1)[1])
+            if value:
+                current_match = re.search(r"\(current:\s*([^)]+)\)", value, re.IGNORECASE)
+                if current_match:
+                    negotiated_link_rate = normalize_text(current_match.group(1))
+                    value = normalize_text(value[: current_match.start()].rstrip(" ,")) or value
+                protocol_version = value
         elif line.startswith("Transport protocol:"):
             transport_protocol = normalize_text(line.split(":", 1)[1])
         elif line.startswith("Logical Unit id:"):
@@ -1973,6 +2098,8 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
             for value in (
                 read_cache_enabled,
                 writeback_cache_enabled,
+                smart_health_status,
+                protocol_version,
                 transport_protocol,
                 logical_unit_id,
                 sas_address,
@@ -1982,6 +2109,8 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
         ),
         "read_cache_enabled": read_cache_enabled,
         "writeback_cache_enabled": writeback_cache_enabled,
+        "smart_health_status": smart_health_status,
+        "protocol_version": protocol_version,
         "transport_protocol": transport_protocol,
         "logical_unit_id": logical_unit_id,
         "sas_address": sas_address,
@@ -2107,6 +2236,12 @@ def canonicalize_ssh_command(command: str) -> str:
         return "nvme list-subsys -o json"
     if executable == "nvme" and args[:2] == ["list", "-o"] and len(args) >= 3 and args[2].lower() == "json":
         return "nvme list -o json"
+    if executable == "ubntstorage" and args[:2] == ["disk", "inspect"]:
+        return "ubntstorage disk inspect"
+    if executable == "ubntstorage" and args[:2] == ["space", "inspect"]:
+        return "ubntstorage space inspect"
+    if "/sys/kernel/debug/gpio" in command:
+        return "gpio debug"
 
     return " ".join([executable] + args).strip()
 
@@ -2120,6 +2255,46 @@ def parse_lsblk_json(output: str) -> list[dict[str, Any]]:
     if not isinstance(blockdevices, list):
         return []
     return [item for item in blockdevices if isinstance(item, dict)]
+
+
+def parse_ubntstorage_json(output: str) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+
+    if isinstance(payload, dict):
+        for key in ("items", "data", "disks", "spaces", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+
+    return []
+
+
+def parse_unifi_gpio_debug(output: str) -> dict[int, bool]:
+    slot_states: dict[int, bool] = {}
+    line_pattern = re.compile(
+        r"gpio-\d+\s+\(.*\|hdd@(?P<slot>\d+)\s+\)\s+(?P<direction>out|in)\s+(?P<state>hi|lo|\?)",
+        re.IGNORECASE,
+    )
+    for raw_line in output.splitlines():
+        match = line_pattern.search(raw_line)
+        if not match:
+            continue
+        if match.group("direction").lower() != "out":
+            continue
+        slot = int(match.group("slot"))
+        state = match.group("state").lower()
+        if state not in {"hi", "lo"}:
+            continue
+        # The UniFi UNVR GPIO dump exposes multiple hdd@N lines per slot.
+        # The last writable output line is the one that toggles during fault/locate.
+        slot_states[slot] = state == "hi"
+    return slot_states
 
 
 def parse_mdadm_detail_scan(output: str) -> dict[str, LinuxMdArray]:
@@ -2202,6 +2377,12 @@ def parse_ssh_outputs(
         parsed.linux_mdadm_arrays = parse_mdadm_detail_scan(normalized_outputs["mdadm --detail --scan"])
     if normalized_outputs.get("nvme list-subsys -o json"):
         parsed.linux_nvme_subsystems = parse_nvme_list_subsys_json(normalized_outputs["nvme list-subsys -o json"])
+    if normalized_outputs.get("ubntstorage disk inspect"):
+        parsed.ubntstorage_disks = parse_ubntstorage_json(normalized_outputs["ubntstorage disk inspect"])
+    if normalized_outputs.get("ubntstorage space inspect"):
+        parsed.ubntstorage_spaces = parse_ubntstorage_json(normalized_outputs["ubntstorage space inspect"])
+    if normalized_outputs.get("gpio debug"):
+        parsed.unifi_led_states = parse_unifi_gpio_debug(normalized_outputs["gpio debug"])
     if normalized_outputs.get("gmultipath list"):
         parsed.multipath_info = parse_gmultipath_list(normalized_outputs["gmultipath list"])
     if normalized_outputs.get("camcontrol devlist"):

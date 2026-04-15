@@ -57,7 +57,7 @@ ssh:
   port: 22
   user: jbodmap
   key_path: /run/ssh/id_truenas
-  known_hosts_path: /run/ssh/known_hosts
+  known_hosts_path: /app/data/known_hosts
   strict_host_key_checking: true
   commands:
     - /sbin/glabel status
@@ -84,7 +84,7 @@ systems:
       host: https://truenas.example.local
       api_key: ""
       platform: core
-      verify_ssl: false
+      verify_ssl: true
       enclosure_filter: ""
     ssh:
       enabled: true
@@ -92,7 +92,7 @@ systems:
       user: jbodmap
       key_path: /run/ssh/id_truenas
       sudo_password: ""
-      known_hosts_path: /run/ssh/known_hosts
+      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /sbin/glabel status

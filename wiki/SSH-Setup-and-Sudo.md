@@ -21,7 +21,7 @@ The short version:
 On the Docker host:
 
 - private key in `./config/ssh/id_truenas`
-- known hosts file in `./config/ssh/known_hosts`
+- pinned host keys in `./data/known_hosts` by default
 
 In app config:
 
@@ -32,9 +32,17 @@ ssh:
   port: 22
   user: jbodmap
   key_path: /run/ssh/id_truenas
-  known_hosts_path: /run/ssh/known_hosts
+  password: ""
+  known_hosts_path: /app/data/known_hosts
   strict_host_key_checking: true
 ```
+
+If the appliance only supports password SSH, set `ssh.password` and leave
+`key_path` empty or unset.
+
+With that default, the first successful SSH connection pins the observed host
+key into `/app/data/known_hosts`, and later connections must match it unless
+you intentionally clear the saved entry.
 
 ## CORE Command Ideas
 

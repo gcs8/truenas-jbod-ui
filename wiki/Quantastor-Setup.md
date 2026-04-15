@@ -33,7 +33,7 @@ Use a block shaped like this:
     api_user: jbodmap
     api_password: replace_me
     platform: quantastor
-    verify_ssl: false
+    verify_ssl: true
     timeout_seconds: 15
   ssh:
     enabled: true
@@ -43,8 +43,8 @@ Use a block shaped like this:
     port: 22
     user: jbodmap
     key_path: /run/ssh/id_truenas
-    known_hosts_path: /run/ssh/known_hosts
-    strict_host_key_checking: false
+    known_hosts_path: /app/data/known_hosts
+    strict_host_key_checking: true
     timeout_seconds: 15
     commands: []
 ```

@@ -346,15 +346,27 @@ SSH_HOST=10.13.37.10
 SSH_PORT=22
 SSH_USER=jbodmap
 SSH_KEY_PATH=/run/ssh/id_truenas
+SSH_PASSWORD=
 SSH_STRICT_HOST_KEY_CHECKING=true
 ```
 
-If you enable strict host key checking, also mount a `known_hosts` file and
-set:
+If the appliance only exposes password SSH, set `SSH_PASSWORD` and leave
+`SSH_KEY_PATH` empty.
+
+If you want to override the default trust-on-first-use location, set:
 
 ```env
-SSH_KNOWN_HOSTS_PATH=/run/ssh/known_hosts
+SSH_KNOWN_HOSTS_PATH=/app/data/known_hosts
 ```
+
+The current default already uses:
+
+- `SSH_STRICT_HOST_KEY_CHECKING=true`
+- `SSH_KNOWN_HOSTS_PATH=/app/data/known_hosts`
+
+That means the first successful SSH connection pins the observed host key into
+the app's writable data directory, and later connections must match it unless
+you intentionally remove or replace the saved entry.
 
 For this system, the preferred SSH command list is:
 

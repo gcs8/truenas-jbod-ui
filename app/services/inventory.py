@@ -29,12 +29,17 @@ from app.models.domain import (
     SystemOption,
 )
 from app.services.mapping_store import MappingStore
-from app.services.profile_registry import ProfileRegistry
+from app.services.profile_registry import (
+    ProfileRegistry,
+    UNIFI_UNVR_FRONT_4_PROFILE_ID,
+    UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+)
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.parsers import (
     ParsedSSHData,
     ZpoolMember,
     build_slot_candidates_from_ses_enclosures,
+    canonicalize_ssh_command,
     extract_nvme_controller_name,
     extract_enclosure_slot_candidates,
     format_bytes,
@@ -57,6 +62,11 @@ from app.services.ssh_probe import SSHProbe
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebsocketClient
 
 logger = logging.getLogger(__name__)
+HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
+UNIFI_GPIO_LED_PROFILE_IDS = {
+    UNIFI_UNVR_FRONT_4_PROFILE_ID,
+    UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+}
 
 
 def utcnow() -> datetime:
@@ -235,6 +245,8 @@ class InventoryService:
                     raise
         elif slot_view.led_backend in {"ssh", "scale_sg_ses", "quantastor_sg_ses"}:
             await self._set_slot_led_over_ssh(slot_view, action)
+        elif slot_view.led_backend == "unifi_fault":
+            await self._set_unifi_slot_led_over_ssh(slot_view, action)
         else:
             raise TrueNASAPIError(
                 slot_view.led_reason
@@ -610,6 +622,8 @@ class InventoryService:
         if self.system.ssh.enabled:
             try:
                 command_results = await self.ssh_probe.run_commands()
+                if self._should_probe_unifi_gpio_debug(command_results):
+                    command_results.append(await self.ssh_probe.run_command("cat /sys/kernel/debug/gpio"))
                 outputs = {item.command: item.stdout for item in command_results if item.ok}
                 failures = [item for item in command_results if not item.ok]
                 ssh_available = True
@@ -978,17 +992,28 @@ class InventoryService:
 
         disk_records = self._build_linux_disk_records(ssh_data)
         disks_by_key: dict[str, DiskRecord] = {}
+        disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
         for disk in disk_records:
             for key in disk.lookup_keys:
                 disks_by_key[key] = disk
+            vendor_slot = disk.raw.get("vendor_slot")
+            if isinstance(vendor_slot, int):
+                disks_by_slot[(selected_option.id, vendor_slot)] = disk
+                disks_by_slot[(None, vendor_slot)] = disk
 
         linux_topology_members = self._build_linux_topology_members(disk_records)
         slot_views: list[SlotView] = []
         selected_meta = self._enclosure_option_meta(selected_option)
+        vendor_slot_candidates = self._build_linux_vendor_slot_candidates(ssh_data, selected_option)
         slot_hints = selected_profile.slot_hints or {}
-        if not slot_hints:
+        if not slot_hints and not vendor_slot_candidates:
             warnings.append(
                 "This Linux profile does not define slot hints yet, so physical slot correlation will require manual mapping."
+            )
+        if selected_profile.id == UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID:
+            warnings.append(
+                "UniFi UNVR Pro LED control is experimental. The vendor-local SSH command path is responding and "
+                "GPIO state changes are visible, but operator-visible bay validation is still pending."
             )
 
         for slot in range(layout_slot_count):
@@ -1000,14 +1025,34 @@ class InventoryService:
                 "enclosure_id": selected_option.id,
                 "enclosure_label": selected_option.label,
                 "enclosure_name": selected_option.name,
+                "experimental_led": selected_profile.id == UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
             }
+            vendor_candidate = vendor_slot_candidates.get(slot)
+            if vendor_candidate:
+                vendor_device_names = vendor_candidate.get("device_names", [])
+                if isinstance(vendor_device_names, list) and vendor_device_names:
+                    raw_slot_status["device_names"] = list(
+                        dict.fromkeys(
+                            [*vendor_device_names, *raw_slot_status.get("device_names", [])]
+                        )
+                    )
+                    raw_slot_status["device_hint"] = vendor_candidate.get("device_hint") or raw_slot_status["device_names"][0]
+                elif vendor_candidate.get("device_hint"):
+                    raw_slot_status["device_hint"] = vendor_candidate.get("device_hint")
+                raw_slot_status.update(
+                    {
+                        key: value
+                        for key, value in vendor_candidate.items()
+                        if key not in {"device_names", "device_hint"} and value is not None
+                    }
+                )
             mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
             disk = self._resolve_disk_for_slot(
                 slot,
                 selected_option.id,
                 mapping,
                 disks_by_key,
-                {},
+                disks_by_slot,
                 {},
                 raw_slot_status,
                 ssh_data,
@@ -2779,8 +2824,77 @@ class InventoryService:
             for enclosure in ssh_data.ses_enclosures
         )
 
+    @staticmethod
+    def _extract_linux_vendor_slot(value: Any) -> int | None:
+        if isinstance(value, int):
+            return value - 1 if value > 0 else 0
+        if isinstance(value, float) and value.is_integer():
+            parsed = int(value)
+            return parsed - 1 if parsed > 0 else 0
+        if not isinstance(value, str):
+            return None
+        match = re.search(r"\d+", value.strip())
+        if not match:
+            return None
+        parsed = int(match.group(0))
+        return parsed - 1 if parsed > 0 else 0
+
+    @staticmethod
+    def _linux_vendor_slot_present(entry: dict[str, Any]) -> bool | None:
+        healthy = normalize_text(entry.get("healthy") or entry.get("health"))
+        state = normalize_text(entry.get("state"))
+        if healthy and healthy.lower() == "none":
+            return False
+        if state and state.lower() in {"nodisk", "absent", "empty"}:
+            return False
+        if healthy or state:
+            return True
+        return None
+
+    def _build_linux_vendor_slot_candidates(
+        self,
+        ssh_data: ParsedSSHData,
+        selected_option: EnclosureOption,
+    ) -> dict[int, dict[str, Any]]:
+        candidates: dict[int, dict[str, Any]] = {}
+        for entry in ssh_data.ubntstorage_disks:
+            slot = self._extract_linux_vendor_slot(entry.get("slot"))
+            if slot is None:
+                continue
+            node = normalize_device_name(entry.get("node"))
+            present = self._linux_vendor_slot_present(entry)
+            status = normalize_text(entry.get("healthy") or entry.get("state"))
+            size_value = entry.get("size")
+            device_names = [node] if node and present is not False else []
+            candidates[slot] = {
+                "vendor_slot": slot,
+                "vendor_slot_number": slot + 1,
+                "status": status,
+                "value": status,
+                "present": present,
+                "device_names": device_names,
+                "device_hint": device_names[0] if device_names else None,
+                "serial_hint": normalize_text(entry.get("serial")),
+                "model_hint": normalize_text(entry.get("model")),
+                "reported_size": (
+                    format_bytes(size_value)
+                    if isinstance(size_value, int)
+                    else normalize_text(str(size_value) if size_value is not None else None)
+                ),
+                "enclosure_id": selected_option.id,
+                "enclosure_label": selected_option.label,
+                "enclosure_name": selected_option.name,
+                "vendor_raw": entry,
+            }
+        return candidates
+
     def _build_linux_disk_records(self, ssh_data: ParsedSSHData) -> list[DiskRecord]:
         controllers: dict[str, dict[str, Any]] = {}
+        ubntstorage_by_node: dict[str, dict[str, Any]] = {}
+        for entry in ssh_data.ubntstorage_disks:
+            node = normalize_device_name(entry.get("node"))
+            if node:
+                ubntstorage_by_node[node.lower()] = entry
         for blockdevice in ssh_data.linux_blockdevices:
             device_name = normalize_text(blockdevice.get("name"))
             controller_name = extract_nvme_controller_name(device_name)
@@ -2885,6 +2999,91 @@ class InventoryService:
                 if namespace_identifier:
                     controller["identifier"] = namespace_identifier
 
+        generic_records: list[DiskRecord] = []
+        for blockdevice in ssh_data.linux_blockdevices:
+            device_name = normalize_device_name(blockdevice.get("name"))
+            if not device_name or extract_nvme_controller_name(device_name):
+                continue
+            if not re.match(r"^(sd|hd|vd|xvd)[a-z]+$", device_name):
+                continue
+            device_type = normalize_text(blockdevice.get("type"))
+            if device_type and device_type.lower() != "disk":
+                continue
+            vendor_entry = ubntstorage_by_node.get(device_name.lower())
+
+            descendants = self._collect_linux_descendants(blockdevice)
+            raid_nodes = [node for node in descendants if str(node.get("type") or "").lower().startswith("raid")]
+            mountpoints = [
+                normalize_text(node.get("mountpoint"))
+                for node in descendants
+                if normalize_text(node.get("mountpoint"))
+            ]
+            top_array = raid_nodes[-1] if raid_nodes else None
+            top_array_name = normalize_device_name(top_array.get("name")) if top_array else None
+            top_array_path = normalize_text(top_array.get("path")) if top_array else None
+            top_mountpoint = next(
+                (mount for mount in mountpoints if mount not in {"/boot", "/boot/efi", "/"}),
+                mountpoints[0] if mountpoints else None,
+            )
+            role = "system" if top_mountpoint in {"/", "/boot", "/boot/efi"} else "data"
+            pool_name = top_mountpoint or top_array_name or "mdadm"
+            identifier, _identifier_label = resolve_persistent_id(
+                str(blockdevice.get("wwn")) if blockdevice.get("wwn") is not None else None,
+                str(blockdevice.get("ptuuid")) if blockdevice.get("ptuuid") is not None else None,
+            )
+            vendor_slot = self._extract_linux_vendor_slot(vendor_entry.get("slot")) if vendor_entry else None
+            lookup_keys: set[str] = set()
+            for value in (
+                device_name,
+                blockdevice.get("path"),
+                blockdevice.get("hctl"),
+                blockdevice.get("serial"),
+                blockdevice.get("model"),
+                blockdevice.get("wwn"),
+                blockdevice.get("ptuuid"),
+                vendor_entry.get("node") if vendor_entry else None,
+                vendor_entry.get("serial") if vendor_entry else None,
+                vendor_entry.get("model") if vendor_entry else None,
+            ):
+                lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+
+            generic_records.append(
+                DiskRecord(
+                    raw={
+                        "top_array_name": top_array_name,
+                        "top_array_path": top_array_path,
+                        "top_mountpoint": top_mountpoint,
+                        "top_role": role,
+                        "hctl": normalize_text(blockdevice.get("hctl")),
+                        "transport": normalize_text(blockdevice.get("tran")),
+                        "vendor_slot": vendor_slot,
+                        "vendor_raw": vendor_entry,
+                    },
+                    device_name=device_name,
+                    path_device_name=device_name,
+                    multipath_name=None,
+                    multipath_member=None,
+                    serial=normalize_text(blockdevice.get("serial")) or normalize_text(vendor_entry.get("serial") if vendor_entry else None),
+                    model=normalize_text(blockdevice.get("model")) or normalize_text(vendor_entry.get("model") if vendor_entry else None),
+                    size_bytes=parse_size_to_bytes(blockdevice.get("size")),
+                    identifier=identifier,
+                    health=normalize_text(vendor_entry.get("healthy") if vendor_entry else None) or "ONLINE",
+                    pool_name=pool_name,
+                    lunid=None,
+                    bus=(normalize_text(blockdevice.get("tran")) or "disk").upper(),
+                    temperature_c=None,
+                    last_smart_test_type=None,
+                    last_smart_test_status=None,
+                    last_smart_test_lifetime_hours=None,
+                    logical_block_size=blockdevice.get("log-sec") if isinstance(blockdevice.get("log-sec"), int) else None,
+                    physical_block_size=blockdevice.get("phy-sec") if isinstance(blockdevice.get("phy-sec"), int) else None,
+                    enclosure_id=None,
+                    slot=None,
+                    smart_devices=[device_name],
+                    lookup_keys=lookup_keys,
+                )
+            )
+
         records: list[DiskRecord] = []
         for controller_name, payload in controllers.items():
             namespace_devices = list(dict.fromkeys(payload["namespace_devices"]))
@@ -2939,6 +3138,7 @@ class InventoryService:
                 )
             )
 
+        records.extend(generic_records)
         return records
 
     @staticmethod
@@ -3217,6 +3417,8 @@ class InventoryService:
             if disk
             else normalize_device_name(raw_slot_status.get("device_hint")) or fallback_device
         )
+        if not disk and self._is_placeholder_hint_device(device_name):
+            device_name = None
         gptid = ssh_data.glabel.device_to_gptid.get(device_name.lower()) if device_name else None
         zpool = self._lookup_zpool_member(disk, device_name, gptid, ssh_data, api_topology_members)
         model = disk.model if disk else normalize_text(raw_slot_status.get("model_hint"))
@@ -3225,6 +3427,8 @@ class InventoryService:
         multipath = self._build_multipath_view(disk, ssh_data)
 
         identify_active = bool(raw_slot_status.get("identify_active")) or self._status_contains(raw_slot_status, "identify", "led=locate")
+        if not identify_active and slot in ssh_data.unifi_led_states:
+            identify_active = ssh_data.unifi_led_states[slot]
         faulty = self._status_contains(raw_slot_status, "fault") or self._health_is_bad(
             disk.health if disk else None,
             zpool.health if zpool else None,
@@ -3323,6 +3527,13 @@ class InventoryService:
             )
         )
         ssh_led_supported = bool(self.system.ssh.enabled and ses_targets and not scale_linux_ses_targets)
+        unifi_vendor_slot_number = raw_slot_status.get("vendor_slot_number")
+        unifi_fault_led_supported = bool(
+            self.system.truenas.platform == "linux"
+            and normalize_text(raw_slot_status.get("enclosure_id")) in UNIFI_GPIO_LED_PROFILE_IDS
+            and self.system.ssh.enabled
+            and isinstance(unifi_vendor_slot_number, int)
+        )
         if self.system.truenas.platform == "quantastor" and self.system.ssh.enabled and ses_targets:
             led_supported = True
             led_backend = "quantastor_sg_ses"
@@ -3342,6 +3553,10 @@ class InventoryService:
         elif scale_linux_ses_targets and self.system.ssh.enabled:
             led_supported = True
             led_backend = "scale_sg_ses"
+            led_reason = None
+        elif unifi_fault_led_supported:
+            led_supported = True
+            led_backend = "unifi_fault"
             led_reason = None
         elif ssh_led_supported:
             led_supported = True
@@ -3444,6 +3659,14 @@ class InventoryService:
             raw_status=raw_slot_status,
         )
 
+    def _should_probe_unifi_gpio_debug(self, command_results: list[Any]) -> bool:
+        if self.system.truenas.platform != "linux":
+            return False
+        if self.system.default_profile_id not in UNIFI_GPIO_LED_PROFILE_IDS:
+            return False
+        seen_commands = {canonicalize_ssh_command(item.command) for item in command_results}
+        return "gpio debug" not in seen_commands
+
     async def _set_slot_led_over_ssh(self, slot_view: SlotView, action: LedAction) -> None:
         if not self.system.ssh.enabled:
             raise TrueNASAPIError("SSH fallback is disabled, so LED control cannot use enclosure control commands.")
@@ -3518,6 +3741,36 @@ class InventoryService:
 
         if failures:
             raise TrueNASAPIError("SSH LED action failed: " + " | ".join(failures))
+
+    async def _set_unifi_slot_led_over_ssh(self, slot_view: SlotView, action: LedAction) -> None:
+        if not self.system.ssh.enabled:
+            raise TrueNASAPIError("SSH fallback is disabled, so UniFi LED control cannot run.")
+
+        vendor_slot_number = slot_view.raw_status.get("vendor_slot_number")
+        if not isinstance(vendor_slot_number, int):
+            raise TrueNASAPIError(
+                slot_view.led_reason
+                or f"Slot {slot_view.slot_label} is missing the UniFi vendor bay number required for LED control."
+            )
+
+        if action == LedAction.identify:
+            toggle = "True"
+        elif action == LedAction.clear:
+            toggle = "False"
+        else:
+            raise TrueNASAPIError("UniFi SSH LED control currently supports identify on and clear/off only.")
+
+        command = shlex.join(
+            [
+                "python3",
+                "-c",
+                f"from ustd.hwmon import sata_led_sm; sata_led_sm.set_fault({vendor_slot_number}, {toggle})",
+            ]
+        )
+        result = await self._run_ssh_command(command)
+        if not result.ok:
+            detail = result.stderr.strip() or result.stdout.strip() or "Unknown UniFi SSH LED error."
+            raise TrueNASAPIError("SSH LED action failed: " + detail)
 
     async def _run_ssh_command(self, command: str, host: str | None = None) -> Any:
         target_host = normalize_text(host)
@@ -3657,6 +3910,10 @@ class InventoryService:
         )
 
     @staticmethod
+    def _is_placeholder_hint_device(value: str | None) -> bool:
+        return bool(value and HCTL_NAME_REGEX.fullmatch(value.strip()))
+
+    @staticmethod
     def _lookup_disk_temperature(
         temperatures: dict[str, int],
         *device_names: str | None,
@@ -3710,7 +3967,7 @@ class InventoryService:
 
         for device in slot_view.smart_device_names or []:
             normalized = normalize_device_name(device)
-            if normalized and normalized not in seen:
+            if normalized and not InventoryService._is_placeholder_hint_device(normalized) and normalized not in seen:
                 seen.add(normalized)
                 candidates.append(normalized)
 
@@ -3723,7 +3980,7 @@ class InventoryService:
             )
             for member in active_first:
                 normalized = normalize_device_name(member.device_name)
-                if normalized and normalized not in seen:
+                if normalized and not InventoryService._is_placeholder_hint_device(normalized) and normalized not in seen:
                     seen.add(normalized)
                     candidates.append(normalized)
 
@@ -3732,12 +3989,16 @@ class InventoryService:
                 slot_view.multipath.alternate_path_device,
             ):
                 normalized = normalize_device_name(fallback)
-                if normalized and normalized not in seen:
+                if normalized and not InventoryService._is_placeholder_hint_device(normalized) and normalized not in seen:
                     seen.add(normalized)
                     candidates.append(normalized)
 
         normalized_device = normalize_device_name(slot_view.device_name)
-        if normalized_device and normalized_device not in seen:
+        if (
+            normalized_device
+            and not InventoryService._is_placeholder_hint_device(normalized_device)
+            and normalized_device not in seen
+        ):
             seen.add(normalized_device)
             candidates.append(normalized_device)
 

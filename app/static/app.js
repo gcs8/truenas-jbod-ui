@@ -197,8 +197,12 @@
     return (slot.state || "unknown").replace("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
   }
 
+  function isPlaceholderHintLabel(value) {
+    return typeof value === "string" && /^\d+:\d+:\d+:\d+$/.test(value.trim());
+  }
+
   function slotPrimaryLabel(slot) {
-    if (slot.device_name) return slot.device_name;
+    if (slot.device_name && !isPlaceholderHintLabel(slot.device_name)) return slot.device_name;
     if (slot.state === "empty") return "EMPTY";
     if (slot.state === "unknown") return "UNKNOWN";
     if (slot.state === "unmapped") return "UNMAPPED";
@@ -218,6 +222,15 @@
   function ledStatusLabel(slot) {
     if (!slot.led_supported && !slot.identify_active) return "Unavailable";
     return slot.identify_active ? "On" : "Off";
+  }
+
+  function ledBackendLabel(slot) {
+    if (!slot || !slot.led_backend) return "unknown backend";
+    if (slot.led_backend === "api") return "API";
+    if (slot.led_backend === "unifi_fault") {
+      return slot?.raw_status?.experimental_led ? "UniFi SSH LED (Experimental)" : "UniFi SSH LED";
+    }
+    return "SSH SES";
   }
 
   function getSmartCacheKey(slot) {
@@ -875,6 +888,11 @@
       lines.push(`Wear: ${endurance}`);
     }
 
+    const bytesRead = formatBytesReadValue(smartEntry);
+    if (bytesRead !== "n/a") {
+      lines.push(`Reads: ${bytesRead}`);
+    }
+
     const bytesWritten = formatBytesWrittenValue(smartEntry);
     if (bytesWritten !== "n/a") {
       lines.push(`Writes: ${bytesWritten}`);
@@ -903,6 +921,11 @@
     const transport = formatTransportValue(smartEntry);
     if (transport !== "n/a") {
       lines.push(`Transport: ${transport}`);
+    }
+
+    const linkRate = formatLinkRateValue(smartEntry);
+    if (linkRate !== "n/a") {
+      lines.push(`Link Rate: ${linkRate}`);
     }
 
     const attachedSas = formatAttachedSasAddressValue(slot, smartEntry);
@@ -1023,12 +1046,14 @@
 
       const rowSlots = document.createElement("div");
       rowSlots.className = "row-slots";
+      rowSlots.dataset.slotCount = String(row.length);
       const rowGroups = splitRowIntoGroups(row);
       rowSlots.style.gridTemplateColumns = rowGroups.map((group) => `minmax(0, ${group.length}fr)`).join(" ");
 
       rowGroups.forEach((group) => {
         const rowGroup = document.createElement("div");
         rowGroup.className = "row-group";
+        rowGroup.dataset.slotCount = String(group.length);
         rowGroup.style.setProperty("--group-columns", String(group.length));
 
         group.forEach((slotNumber) => {
@@ -1188,6 +1213,7 @@
     detailStatePill.className = `state-pill state-${slot.state}`;
     const smartEntry = getSmartSummaryEntry(slot);
     const showSasTransportFields = shouldShowSasTransportFields(slot, smartEntry);
+    const showLinkRate = showSasTransportFields || formatLinkRateValue(smartEntry) !== "n/a";
     const showQuantastorContext = currentPlatform() === "quantastor";
 
     detailKvGrid.innerHTML = [
@@ -1238,7 +1264,7 @@
       showSasTransportFields ? kvRow("Logical Unit ID", formatLogicalUnitIdValue(slot, smartEntry)) : "",
       showSasTransportFields ? kvRow("SAS Address", formatSasAddressValue(slot, smartEntry)) : "",
       showSasTransportFields ? kvRow("Attached SAS", formatAttachedSasAddressValue(slot, smartEntry)) : "",
-      showSasTransportFields ? kvRow("Link Rate", formatLinkRateValue(smartEntry)) : "",
+      showLinkRate ? kvRow("Link Rate", formatLinkRateValue(smartEntry)) : "",
       showQuantastorContext ? kvRowIfMeaningful("SES Flags", formatSesStateValue(slot)) : "",
       kvRow("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
       kvRow("LED", ledStatusLabel(slot)),
@@ -1247,10 +1273,23 @@
     ].filter(Boolean).join("");
 
     const smartMessage = smartEntry?.data?.message;
+    const ataVolumeCounterNote = (
+      smartEntry?.data?.transport_protocol === "ATA"
+      && (Number.isInteger(smartEntry?.data?.bytes_read) || Number.isInteger(smartEntry?.data?.bytes_written))
+    )
+      ? "ATA read/write totals are lifetime SMART host counters and can exceed current pool usage, especially after array initialization, parity build, or rebuild."
+      : null;
+    const lowHourAnnualizedNote = (
+      Number.isInteger(smartEntry?.data?.power_on_hours)
+      && smartEntry.data.power_on_hours < (24 * 30)
+      && Number.isInteger(smartEntry?.data?.bytes_written)
+    )
+      ? "Annualized write is hidden until the disk has at least about 30 days of power-on time."
+      : null;
     const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
       ? "Estimated write-endurance values extrapolate current writes against the NVMe percentage-used SMART field."
       : null;
-    const smartNoteText = [smartMessage, enduranceEstimateNote].filter(Boolean).join(" ");
+    const smartNoteText = [smartMessage, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
     if (smartNoteText) {
       detailSmartNote.textContent = smartNoteText;
       detailSmartNote.classList.remove("hidden");
@@ -1756,7 +1795,7 @@
       applySnapshot(payload.snapshot);
       renderAll();
       scheduleSmartPrefetch();
-      setStatus(`Slot ${slot.slot_label} LED action ${action} completed via ${slot.led_backend === "ssh" ? "SSH SES" : "API"}.`);
+      setStatus(`Slot ${slot.slot_label} LED action ${action} completed via ${ledBackendLabel(slot)}.`);
     } catch (error) {
       setStatus(`LED action failed: ${error.message || error}`, "error");
     }

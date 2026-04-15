@@ -2,7 +2,77 @@
 
 ## Unreleased
 
-Post-`v0.5.0` follow-up work will land here.
+Post-`v0.6.0` follow-up work will land here.
+
+## v0.6.0 - 2026-04-15
+
+UniFi appliance release that extends the generic Linux path onto password-SSH
+storage appliances, adds validated vendor-local LED control for the regular
+UNVR, and tightens the default SSH/API security posture ahead of the release.
+
+### Added
+
+- Optional SSH password authentication alongside key-based SSH so password-only
+  appliances can still use the generic Linux enrichment path
+- First-pass built-in `ubiquiti-unvr-front-4` enclosure profile for UniFi UNVR
+  style `4`-bay front-drive appliances
+- First-pass built-in `ubiquiti-unvr-pro-front-7` enclosure profile for UniFi
+  UNVR Pro appliances using the operator-confirmed `3`-over-`4` front layout
+- Working notes for the UniFi UNVR discovery spike, including the verified
+  Protect integration endpoints and the Debian/Linux storage stack observed
+  over SSH
+- Sample config and wiki guidance for password-only appliance-style Linux hosts,
+  including the first-pass UniFi UNVR generic Linux example
+- Keyboard-interactive SSH fallback for password-only Linux appliances that
+  reject direct password auth, which is needed for the tested UniFi UNVR Pro
+- First-pass observed slot hints for the validated UniFi UNVR Pro test unit so
+  the first two reported bays can map automatically
+- UniFi-specific `unifi-drive` tray styling for the built-in UNVR and UNVR Pro
+  profiles so their rendered bays look closer to the vendor front-face design,
+  including wide silver trays, no Supermicro-style red latch, and a right-side
+  LED position
+
+### Changed
+
+- SSH host-key verification now defaults to strict trust-on-first-use pinning,
+  storing the first observed key in `/app/data/known_hosts` and rejecting later
+  mismatches unless the operator intentionally clears or replaces the saved
+  entry
+- Sample env/config/wiki guidance now defaults API TLS verification to `true`
+  and points SSH known-host persistence at the writable app data path instead
+  of the read-only SSH key mount
+- Generic SSH command execution now degrades cleanly when appliance SSH
+  connections or remote command execution fail, returning structured failure
+  results instead of bubbling hard exceptions into inventory or SMART calls
+- UniFi appliance inventory now uses `ubntstorage disk inspect` as the primary
+  vendor slot source, so the regular UNVR and tested UNVR Pro can render
+  vendor-numbered bays and explicit empty `nodisk` rows instead of relying only
+  on HCTL hints
+- Regular UniFi UNVR LED control is now validated through the on-box
+  `ustd.hwmon.sata_led_sm.set_fault(slot, toggle)` path instead of SES, and the
+  app can drive the left-to-right `4`-bay face over SSH using the vendor slot
+  numbers exposed by `ubntstorage disk inspect`
+- Generic Linux SMART parsing now extracts more ATA/SATA detail where the host
+  exposes it, including SMART health state, read/write cache status, negotiated
+  SATA link information, and ATA lifetime read/write volume counters
+- Annualized write rate is now suppressed for very low-hour disks so fresh
+  appliance installs do not project a few days of ATA SMART writes out to a
+  misleading full-year rate
+- UniFi placeholder HCTL slot hints are no longer treated as real device labels
+  or SMART targets when no validated disk correlation exists, avoiding sticky
+  bogus device placeholders in the UI
+- The regular UniFi UNVR now polls `/sys/kernel/debug/gpio` as an extra
+  host-local SSH probe so live identify/fault LED state can be reflected in the
+  slot map after an LED action without depending on SES metadata
+- The UniFi UNVR Pro now uses the same vendor-local `sata_led_sm.set_fault`
+  SSH LED path as the regular UNVR, but it is surfaced as experimental until
+  someone confirms operator-visible per-bay behavior on real hardware
+- UniFi hint-only slots no longer get stuck in bogus `"SMART loading"` states
+  when only placeholder HCTL observations are available
+- UniFi notes now document the tested vendor inventory path and the current
+  LED-control findings: the regular UNVR and UNVR Pro both expose a working
+  vendor-local Python LED path, and the Pro still appears to be backed by the
+  kernel-owned `sata_sw_leds` / SGPO stack rather than SES
 
 ## v0.5.0 - 2026-04-14
 

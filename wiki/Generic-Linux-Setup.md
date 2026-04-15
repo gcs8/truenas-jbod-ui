@@ -10,6 +10,8 @@ Today it is best for:
 - `mdadm` hosts
 - NVMe-heavy systems
 - hosts where physical disk placement matters but no appliance API exists
+- appliance-style Linux boxes such as UniFi UNVR where SSH works but the vendor
+  API does not expose per-disk slot inventory
 
 ## What Generic Linux Can Do Today
 
@@ -77,21 +79,72 @@ systems:
       host: http://gpu-server.example.local
       api_key: ""
       platform: linux
-      verify_ssl: false
+      verify_ssl: true
     ssh:
       enabled: true
       host: gpu-server.example.local
       user: jbodmap
       key_path: /run/ssh/id_truenas
-      known_hosts_path: /run/ssh/known_hosts
-      strict_host_key_checking: false
+      known_hosts_path: /app/data/known_hosts
+      strict_host_key_checking: true
       commands:
         - /usr/bin/lsblk -OJ
         - sudo -n /usr/sbin/mdadm --detail --scan
         - /usr/sbin/nvme list-subsys -o json
 ```
 
-## 5. SES On Generic Linux
+Password-only appliance example:
+
+```yaml
+systems:
+  - id: unvr
+    label: UniFi UNVR
+    default_profile_id: ubiquiti-unvr-front-4
+    truenas:
+      host: https://unvr.example.local
+      api_key: ""
+      platform: linux
+      verify_ssl: true
+    ssh:
+      enabled: true
+      host: unvr.example.local
+      port: 22
+      user: root
+      key_path: ""
+      password: "REPLACE_ME"
+      known_hosts_path: /app/data/known_hosts
+      strict_host_key_checking: true
+      commands:
+        - /bin/lsblk -OJ
+        - /sbin/mdadm --detail --scan
+        - /usr/sbin/ubntstorage disk inspect
+        - /usr/sbin/ubntstorage space inspect
+```
+
+## 5. UniFi UNVR Family Notes
+
+The current first-pass UniFi UNVR path is generic Linux, not a dedicated
+vendor adapter.
+
+What was validated on the tested UNVR and UNVR Pro units:
+
+- Debian 11 userspace on the `alpine-unvr` kernel family
+- direct `smartctl` access to SATA disks over SSH
+- `mdadm` arrays for the appliance storage layout
+- `ubntstorage disk inspect` as the most useful on-box vendor slot source
+- no usable `/sys/class/enclosure` path on either tested unit
+
+What is still missing:
+
+- a documented per-disk Protect API endpoint for slot inventory
+- a validated SES/LED path across the family
+
+The current built-in profile is:
+
+- `ubiquiti-unvr-front-4` for the regular `4`-bay UNVR front view
+- `ubiquiti-unvr-pro-front-7` for the first-pass UNVR Pro `3-over-4` front view
+
+## 6. SES On Generic Linux
 
 If the host exposes SES devices like `/dev/sg*`, the app may be able to do
 enclosure mapping or LED work.
@@ -99,7 +152,7 @@ enclosure mapping or LED work.
 If it does not, the app can still be very useful as an inventory-only physical
 layout tool.
 
-## 6. Common Generic Linux Notes
+## 7. Common Generic Linux Notes
 
 - `nvme list-subsys` is excellent for controller-to-slot hints.
 - `smartctl` is still the base path for SMART detail.

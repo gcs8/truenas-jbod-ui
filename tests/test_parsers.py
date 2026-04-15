@@ -11,11 +11,13 @@ from app.services.parsers import (
     parse_nvme_list_subsys_json,
     parse_nvme_smart_log_summary,
     parse_ssh_outputs,
+    parse_ubntstorage_json,
     parse_sg_ses_aes,
     parse_sg_ses_enclosure_status,
     parse_smart_test_results,
     parse_smartctl_text_enrichment,
     parse_smartctl_summary,
+    parse_unifi_gpio_debug,
 )
 
 
@@ -53,6 +55,49 @@ scbus13 on mpr1 bus 0:
         self.assertEqual(canonicalize_ssh_command("/usr/bin/lsblk -OJ"), "lsblk -OJ")
         self.assertEqual(canonicalize_ssh_command("sudo -n /usr/sbin/mdadm --detail --scan"), "mdadm --detail --scan")
         self.assertEqual(canonicalize_ssh_command("/usr/bin/nvme list-subsys -o json"), "nvme list-subsys -o json")
+        self.assertEqual(canonicalize_ssh_command("/usr/sbin/ubntstorage disk inspect"), "ubntstorage disk inspect")
+        self.assertEqual(canonicalize_ssh_command("/usr/sbin/ubntstorage space inspect"), "ubntstorage space inspect")
+        self.assertEqual(canonicalize_ssh_command("cat /sys/kernel/debug/gpio"), "gpio debug")
+
+    def test_parse_unifi_gpio_debug_uses_last_output_line_per_slot(self) -> None:
+        output = """
+gpiochip1: GPIOs 480-495, parent: i2c/0-0021, pca9575, can sleep:
+ gpio-480 (                    |hdd@0               ) out hi
+ gpio-481 (                    |hdd@1               ) out hi
+ gpio-492 (                    |hdd@0               ) out lo
+ gpio-493 (                    |hdd@1               ) out hi
+""".strip()
+
+        parsed = parse_unifi_gpio_debug(output)
+
+        self.assertEqual(parsed, {0: False, 1: True})
+
+    def test_parse_ubntstorage_json_accepts_plain_list_payloads(self) -> None:
+        parsed = parse_ubntstorage_json('[{"node":"sda","slot":1},{"node":"sdb","slot":2}]')
+
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0]["node"], "sda")
+        self.assertEqual(parsed[1]["slot"], 2)
+
+    def test_parse_ssh_outputs_preserves_ubntstorage_rows(self) -> None:
+        parsed = parse_ssh_outputs(
+            {
+                "/usr/sbin/ubntstorage disk inspect": '[{"node":"sda","slot":1,"healthy":"optimal"}]',
+                "/usr/sbin/ubntstorage space inspect": '[{"node":"md3","state":"ready"}]',
+                "cat /sys/kernel/debug/gpio": """
+gpiochip1: GPIOs 480-495, parent: i2c/0-0021, pca9575, can sleep:
+ gpio-480 (                    |hdd@0               ) out hi
+ gpio-492 (                    |hdd@0               ) out hi
+ gpio-493 (                    |hdd@1               ) out lo
+""".strip(),
+            },
+            7,
+            None,
+        )
+
+        self.assertEqual(parsed.ubntstorage_disks[0]["node"], "sda")
+        self.assertEqual(parsed.ubntstorage_spaces[0]["node"], "md3")
+        self.assertEqual(parsed.unifi_led_states, {0: True, 1: False})
 
     def test_parse_gmultipath_list_preserves_consumers(self) -> None:
         output = """
@@ -330,6 +375,67 @@ Enclosure status diagnostic page:
         self.assertEqual(parsed["physical_block_size"], 4096)
         self.assertIsNone(parsed["message"])
 
+    def test_parse_smartctl_summary_extracts_ata_volume_cache_and_link_metrics(self) -> None:
+        output = """
+{
+  "device": {"protocol": "ATA"},
+  "temperature": {"current": 48},
+  "power_on_time": {"hours": 39905},
+  "logical_block_size": 512,
+  "physical_block_size": 4096,
+  "rotation_rate": 7200,
+  "form_factor": {"name": "3.5 inches"},
+  "firmware_version": "SN04",
+  "smart_status": {"passed": true},
+  "sata_version": {"string": "SATA 3.1"},
+  "interface_speed": {"current": {"string": "6.0 Gb/s"}},
+  "read_lookahead": {"enabled": true},
+  "write_cache": {"enabled": true},
+  "ata_smart_attributes": {
+    "table": [
+      {"id": 241, "raw": {"value": 1000}},
+      {"id": 242, "raw": {"value": 2000}}
+    ]
+  }
+}
+""".strip()
+
+        parsed = parse_smartctl_summary(output)
+
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["smart_health_status"], "PASSED")
+        self.assertEqual(parsed["rotation_rate_rpm"], 7200)
+        self.assertEqual(parsed["form_factor"], "3.5 inches")
+        self.assertEqual(parsed["firmware_version"], "SN04")
+        self.assertEqual(parsed["transport_protocol"], "ATA")
+        self.assertEqual(parsed["protocol_version"], "SATA 3.1")
+        self.assertEqual(parsed["negotiated_link_rate"], "6.0 Gb/s")
+        self.assertTrue(parsed["read_cache_enabled"])
+        self.assertTrue(parsed["writeback_cache_enabled"])
+        self.assertEqual(parsed["bytes_read"], 1024000)
+        self.assertEqual(parsed["bytes_written"], 512000)
+
+    def test_parse_smartctl_summary_hides_annualized_write_for_low_hour_disk(self) -> None:
+        output = """
+{
+  "device": {"protocol": "ATA"},
+  "power_on_time": {"hours": 183},
+  "logical_block_size": 512,
+  "ata_smart_attributes": {
+    "table": [
+      {"id": 241, "raw": {"value": 35446452000}},
+      {"id": 242, "raw": {"value": 590679}}
+    ]
+  }
+}
+""".strip()
+
+        parsed = parse_smartctl_summary(output)
+
+        self.assertEqual(parsed["bytes_written"], 18148583424000)
+        self.assertEqual(parsed["bytes_read"], 302427648)
+        self.assertIsNone(parsed["annualized_bytes_written"])
+
     def test_parse_smartctl_summary_extracts_scsi_self_test_history(self) -> None:
         output = """
 {
@@ -398,6 +504,24 @@ Enclosure status diagnostic page:
         self.assertEqual(parsed["bytes_read"], 330638625000000)
         self.assertEqual(parsed["bytes_written"], 111254503000000)
         self.assertEqual(parsed["annualized_bytes_written"], 19831300795214)
+
+    def test_parse_smartctl_text_enrichment_extracts_ata_cache_health_and_link_metadata(self) -> None:
+        output = """
+=== START OF INFORMATION SECTION ===
+SMART overall-health self-assessment test result: PASSED
+SATA Version is: SATA 3.1, 6.0 Gb/s (current: 6.0 Gb/s)
+Rd look-ahead is: Enabled
+Write cache is: Enabled
+""".strip()
+
+        parsed = parse_smartctl_text_enrichment(output)
+
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["smart_health_status"], "PASSED")
+        self.assertEqual(parsed["protocol_version"], "SATA 3.1, 6.0 Gb/s")
+        self.assertEqual(parsed["negotiated_link_rate"], "6.0 Gb/s")
+        self.assertTrue(parsed["read_cache_enabled"])
+        self.assertTrue(parsed["writeback_cache_enabled"])
 
     def test_parse_smartctl_summary_extracts_nvme_wear_and_write_metrics(self) -> None:
         output = """

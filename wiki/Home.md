@@ -43,6 +43,8 @@ The app runs off-box in Docker and talks to storage hosts over:
 - the TrueNAS middleware websocket API for CORE and SCALE
 - optional SSH for richer disk, enclosure, and LED detail
 - SSH-only inventory for supported generic Linux hosts
+- generic Linux coverage is broad enough to handle appliance-style boxes such
+  as UniFi UNVR when SSH works but the vendor API does not expose disk slots
 - Quantastor REST plus optional SSH/`qs`/`sg_ses` enrichment for supported HA
   appliances
 
@@ -62,10 +64,15 @@ It gives you:
 - TrueNAS SCALE on a Supermicro `SSG-6048R-E1CR36L` with front `24` and rear `12`
 - OSNexus Quantastor on a Supermicro `SSG-2028R-DE2CR24L` shared front `24`
 - Generic Linux on a Supermicro `SYS-2029GP-TR` with a right-side `2`-bay NVMe profile
+- UniFi UNVR as generic Linux over SSH with a built-in `4`-bay profile and
+  validated vendor-local LED control
+- UniFi UNVR Pro as generic Linux over SSH with a built-in `7`-bay `3-over-4`
+  profile and experimental vendor-local LED control
 
 ## Current Direction
 
 - `0.4.0` is the chassis/profile release
 - `0.5.0` ships first-pass OSNexus Quantastor support
+- `0.6.0` ships UniFi UNVR-family support plus safer SSH/API defaults
 - next work is focused on hardening, polish, and whatever validated hardware
   comes after the current platform set

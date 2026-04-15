@@ -44,7 +44,7 @@ ssh:
   host: scale.example.local
   user: jbodmap
   key_path: /run/ssh/id_truenas
-  known_hosts_path: /run/ssh/known_hosts
+  known_hosts_path: /app/data/known_hosts
   strict_host_key_checking: true
   commands:
     - /usr/sbin/zpool status -gP
@@ -89,14 +89,14 @@ systems:
       host: https://scale.example.local
       api_key: ""
       platform: scale
-      verify_ssl: false
+      verify_ssl: true
       enclosure_filter: ""
     ssh:
       enabled: true
       host: scale.example.local
       user: jbodmap
       key_path: /run/ssh/id_truenas
-      known_hosts_path: /run/ssh/known_hosts
+      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /usr/sbin/zpool status -gP

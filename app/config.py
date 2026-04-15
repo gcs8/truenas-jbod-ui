@@ -39,9 +39,10 @@ class SSHConfig(BaseModel):
     port: int = 22
     user: str = ""
     key_path: str = "/run/ssh/id_truenas"
+    password: str = ""
     sudo_password: str = ""
-    known_hosts_path: str | None = None
-    strict_host_key_checking: bool = False
+    known_hosts_path: str | None = "/app/data/known_hosts"
+    strict_host_key_checking: bool = True
     timeout_seconds: int = 15
     commands: list[str] = Field(
         default_factory=lambda: [
@@ -129,6 +130,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_PORT": ("ssh", "port"),
     "SSH_USER": ("ssh", "user"),
     "SSH_KEY_PATH": ("ssh", "key_path"),
+    "SSH_PASSWORD": ("ssh", "password"),
     "SSH_SUDO_PASSWORD": ("ssh", "sudo_password"),
     "SSH_KNOWN_HOSTS_PATH": ("ssh", "known_hosts_path"),
     "SSH_STRICT_HOST_KEY_CHECKING": ("ssh", "strict_host_key_checking"),

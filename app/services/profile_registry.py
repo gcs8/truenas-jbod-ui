@@ -10,6 +10,8 @@ SCALE_SSG_FRONT_24_PROFILE_ID = "supermicro-ssg-6048r-front-24"
 SCALE_SSG_REAR_12_PROFILE_ID = "supermicro-ssg-6048r-rear-12"
 LINUX_GPU_SERVER_NVME_PROFILE_ID = "supermicro-sys-2029gp-tr-right-nvme-2"
 QUANTASTOR_SSG_SHARED_24_PROFILE_ID = "supermicro-ssg-2028r-shared-front-24"
+UNIFI_UNVR_FRONT_4_PROFILE_ID = "ubiquiti-unvr-front-4"
+UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID = "ubiquiti-unvr-pro-front-7"
 
 
 def default_slot_layout(rows: int, columns: int, slot_count: int) -> list[list[int]]:
@@ -97,6 +99,50 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             slot_hints={
                 0: ["nvme0", "10000:01:00.0"],
                 1: ["nvme1", "10000:02:00.0"],
+            },
+        ),
+        EnclosureProfileConfig(
+            id=UNIFI_UNVR_FRONT_4_PROFILE_ID,
+            label="Ubiquiti UniFi UNVR Front 4",
+            eyebrow="Generic Linux / Ubiquiti UniFi UNVR Front View",
+            summary="First-pass 4-bay front-drive profile for UniFi UNVR and similar password-SSH Linux appliances.",
+            panel_title="Front 4 Bay",
+            edge_label="Front of chassis",
+            face_style="unifi-drive",
+            latch_edge="bottom",
+            rows=1,
+            columns=4,
+            slot_layout=[
+                [0, 1, 2, 3],
+            ],
+            slot_hints={
+                0: ["0:0:0:0"],
+                1: ["2:0:0:0"],
+                2: ["4:0:0:0"],
+                3: ["6:0:0:0"],
+            },
+        ),
+        EnclosureProfileConfig(
+            id=UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+            label="Ubiquiti UniFi UNVR Pro Front 7",
+            eyebrow="Generic Linux / Ubiquiti UniFi UNVR Pro Front View",
+            summary="First-pass 7-bay front-drive profile for UniFi UNVR Pro appliances, using the validated 3-over-4 physical face layout.",
+            panel_title="Front 7 Bay",
+            edge_label="Front of chassis",
+            face_style="unifi-drive",
+            latch_edge="bottom",
+            rows=2,
+            columns=4,
+            slot_layout=[
+                [0, 1, 2],
+                [3, 4, 5, 6],
+            ],
+            slot_hints={
+                # On the validated UNVR Pro test unit, the two installed disks were
+                # reported by the UniFi UI as HDD 1 / HDD 2 in bays 1 and 2, while
+                # Linux exposed them as HCTL 7:0:0:0 and 5:0:0:0 respectively.
+                0: ["7:0:0:0"],
+                1: ["5:0:0:0"],
             },
         ),
         EnclosureProfileConfig(

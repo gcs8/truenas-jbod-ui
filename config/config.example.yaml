@@ -15,7 +15,9 @@ truenas:
   api_user: ""
   api_password: ""
   platform: core
-  verify_ssl: false
+  # Leave this true by default. Only disable it intentionally for
+  # self-signed or rapidly-rotating lab appliances.
+  verify_ssl: true
   timeout_seconds: 15
   # Optional substring match against enclosure id/name/label.
   enclosure_filter: ""
@@ -30,10 +32,14 @@ ssh:
   user: jbodmap
   # Mount your SSH key into ./config/ssh on the Docker host.
   key_path: /run/ssh/id_truenas
+  # Optional: use this for password-only appliances when key auth is not available.
+  password: ""
   # Optional: set via SSH_SUDO_PASSWORD env var if your CORE build only supports
   # passworded command-limited sudo.
   sudo_password: ""
-  known_hosts_path: /run/ssh/known_hosts
+  # First connection pins the observed host key here, then future SSH
+  # sessions must match it unless you remove the entry.
+  known_hosts_path: /app/data/known_hosts
   strict_host_key_checking: true
   timeout_seconds: 15
   commands:
@@ -60,7 +66,7 @@ ssh:
 #       host: https://10.13.37.10
 #       api_key: ""
 #       platform: core
-#       verify_ssl: false
+#       verify_ssl: true
 #       enclosure_filter: ""
 #     ssh:
 #       enabled: true
@@ -68,7 +74,7 @@ ssh:
 #       user: jbodmap
 #       key_path: /run/ssh/id_truenas
 #       sudo_password: ""
-#       known_hosts_path: /run/ssh/known_hosts
+#       known_hosts_path: /app/data/known_hosts
 #       strict_host_key_checking: true
 #       commands:
 #         - /sbin/glabel status
@@ -86,13 +92,13 @@ ssh:
 #       host: https://scale.example.local
 #       api_key: ""
 #       platform: scale
-#       verify_ssl: false
+#       verify_ssl: true
 #     ssh:
 #       enabled: true
 #       host: scale.example.local
 #       user: jbodmap
 #       key_path: /run/ssh/id_truenas
-#       known_hosts_path: /run/ssh/known_hosts
+#       known_hosts_path: /app/data/known_hosts
 #       strict_host_key_checking: true
 #       commands:
 #         - /usr/sbin/zpool status -gP
@@ -117,18 +123,62 @@ ssh:
 #       host: http://gpu-server.example.local
 #       api_key: ""
 #       platform: linux
-#       verify_ssl: false
+#       verify_ssl: true
 #     ssh:
 #       enabled: true
 #       host: gpu-server.example.local
 #       user: jbodmap
 #       key_path: /run/ssh/id_truenas
-#       known_hosts_path: /run/ssh/known_hosts
-#       strict_host_key_checking: false
+#       known_hosts_path: /app/data/known_hosts
+#       strict_host_key_checking: true
 #       commands:
 #         - /usr/bin/lsblk -OJ
 #         - sudo -n /usr/sbin/mdadm --detail --scan
 #         - /usr/sbin/nvme list-subsys -o json
+#   - id: unvr
+#     label: UniFi UNVR
+#     default_profile_id: ubiquiti-unvr-front-4
+#     truenas:
+#       host: https://unvr.example.local
+#       api_key: ""
+#       platform: linux
+#       verify_ssl: true
+#     ssh:
+#       enabled: true
+#       host: unvr.example.local
+#       port: 22
+#       user: root
+#       key_path: ""
+#       password: ""
+#       known_hosts_path: /app/data/known_hosts
+#       strict_host_key_checking: true
+#       commands:
+#         - /bin/lsblk -OJ
+#         - /sbin/mdadm --detail --scan
+#         - /usr/sbin/ubntstorage disk inspect
+#         - /usr/sbin/ubntstorage space inspect
+#   - id: unvr-pro
+#     label: UniFi UNVR Pro
+#     default_profile_id: ubiquiti-unvr-pro-front-7
+#     truenas:
+#       host: https://unvr-pro.example.local
+#       api_key: ""
+#       platform: linux
+#       verify_ssl: true
+#     ssh:
+#       enabled: true
+#       host: unvr-pro.example.local
+#       port: 22
+#       user: root
+#       key_path: ""
+#       password: ""
+#       known_hosts_path: /app/data/known_hosts
+#       strict_host_key_checking: true
+#       commands:
+#         - /bin/lsblk -OJ
+#         - /sbin/mdadm --detail --scan
+#         - /usr/sbin/ubntstorage disk inspect
+#         - /usr/sbin/ubntstorage space inspect
 #   - id: quantastor-lab
 #     label: Quantastor Lab
 #     default_profile_id: supermicro-ssg-2028r-shared-front-24
@@ -137,7 +187,7 @@ ssh:
 #       api_user: admin
 #       api_password: ""
 #       platform: quantastor
-#       verify_ssl: false
+#       verify_ssl: true
 #     ssh:
 #       enabled: true
 #       host: 10.0.0.30
@@ -146,7 +196,8 @@ ssh:
 #       port: 22
 #       user: jbodmap
 #       key_path: /run/ssh/id_truenas
-#       strict_host_key_checking: false
+#       known_hosts_path: /app/data/known_hosts
+#       strict_host_key_checking: true
 #       commands: []
 #     # Quantastor can supplement the REST view with `qs disk-list`,
 #     # `qs hw-disk-list`, and `qs hw-enclosure-list` over SSH when the

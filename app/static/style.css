@@ -419,6 +419,43 @@ textarea {
   min-height: 80px;
 }
 
+.chassis-shell[data-face-style="unifi-drive"] {
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.22), rgba(255,255,255,0) 12%),
+    linear-gradient(180deg, #d3d6dc 0%, #c1c6cd 8%, #4d545c 8.3%, #1a2026 8.6%, #12171c 100%);
+  border-color: rgba(255, 255, 255, 0.26);
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .service-zone {
+  grid-template-columns: 0.9fr 1.65fr 0.9fr;
+  min-height: 62px;
+  margin-bottom: 22px;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .service-panel,
+.chassis-shell[data-face-style="unifi-drive"] .service-cavity {
+  border-radius: 10px;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .service-panel {
+  background: linear-gradient(180deg, #d7dbe0, #c3c8cf 44%, #adb4bc);
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .service-panel::before {
+  inset: 10px;
+  border-color: rgba(56, 64, 73, 0.22);
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .service-cavity {
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0) 18%),
+    linear-gradient(180deg, #171d24, #0b0f13);
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-grid {
+  gap: 16px;
+}
+
 .service-zone {
   flex: 0 0 auto;
   display: grid;
@@ -576,6 +613,72 @@ textarea {
   border-radius: 12px 8px 8px 12px;
 }
 
+.chassis-shell[data-face-style="unifi-drive"] .row-slots {
+  justify-items: stretch;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .row-group {
+  justify-self: stretch;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .row-group[data-slot-count="3"] {
+  width: calc((100% - 18px) * 0.75 + 12px);
+  justify-self: center;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-tile {
+  width: 100%;
+  height: 102px;
+  min-height: 102px;
+  aspect-ratio: auto;
+  padding: 14px 34px 14px 14px;
+  border-radius: 5px;
+  border-color: rgba(29, 37, 44, 0.26);
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.58), rgba(255,255,255,0.26) 14%, rgba(255,255,255,0.16) 15%, rgba(181, 187, 195, 0.9) 100%),
+    linear-gradient(180deg, #d9dde2, #b8bfc7 48%, #a5adb6);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.64),
+    inset 0 -10px 12px rgba(56, 63, 71, 0.12),
+    0 8px 18px rgba(0, 0, 0, 0.14);
+  color: #15202b;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-tile::before {
+  inset: 8px 18px 8px 10px;
+  border-radius: 3px;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.22), rgba(255,255,255,0) 18%),
+    linear-gradient(90deg, rgba(0,0,0,0.08), transparent 8%, transparent 92%, rgba(0,0,0,0.08));
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-status-led {
+  top: 50%;
+  right: 12px;
+  transform: translateY(-50%);
+  width: 9px;
+  height: 9px;
+  box-shadow: 0 0 0 2px rgba(215, 221, 228, 0.9), 0 0 0 3px rgba(0, 0, 0, 0.16);
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-number {
+  background: rgba(21, 32, 43, 0.08);
+  color: #1a2530;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-device,
+.chassis-shell[data-face-style="unifi-drive"] .slot-pool {
+  color: #24303c;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-pool {
+  opacity: 0.82;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-latch {
+  display: none;
+}
+
 .slot-tile:hover,
 .slot-tile.selected {
   transform: translateY(-2px);
@@ -679,6 +782,10 @@ textarea {
 
 .slot-tile.peer-dimmed .slot-latch {
   opacity: 0.2;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-tile.peer-dimmed {
+  filter: saturate(0.42) brightness(0.86);
 }
 
 .slot-tile.filtered-out {
@@ -824,10 +931,23 @@ textarea {
   color: #f0f4f8;
 }
 
+.chassis-shell[data-face-style="unifi-drive"] .slot-tile.state-empty {
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.42), rgba(255,255,255,0.12) 14%, rgba(255,255,255,0.08) 15%, rgba(203, 208, 215, 0.92) 100%),
+    linear-gradient(180deg, #d8dce1, #bcc3cb 52%, #aeb6bf);
+  color: #6c7783;
+}
+
 .slot-tile.state-empty::before {
   background:
     linear-gradient(180deg, rgba(255,255,255,0.1), rgba(255,255,255,0.02) 18%),
     repeating-linear-gradient(90deg, rgba(255,255,255,0.08) 0 2px, transparent 2px 16px);
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-tile.state-empty::before {
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0) 18%),
+    linear-gradient(90deg, rgba(0,0,0,0.05), transparent 10%, transparent 90%, rgba(0,0,0,0.05));
 }
 
 .slot-tile.state-empty .slot-latch {
