@@ -2,6 +2,10 @@
   const bootstrap = window.APP_BOOTSTRAP || {};
   const supportedRefreshIntervals = [15, 30, 60, 300];
   const bootstrapRefreshInterval = Number(bootstrap.refreshIntervalSeconds) || 30;
+  const SMART_PREFETCH_DELAY_MS = 180;
+  const SMART_PREFETCH_CHUNK_SIZE = 8;
+  const SMART_PREFETCH_BATCH_CONCURRENCY = 2;
+  const SMART_PREFETCH_STALE_MS = 15000;
   const state = {
     snapshot: bootstrap.snapshot || { slots: [], systems: [], enclosures: [] },
     layoutRows: bootstrap.layoutRows || [],
@@ -14,6 +18,11 @@
     refreshIntervalSeconds: supportedRefreshIntervals.includes(bootstrapRefreshInterval) ? bootstrapRefreshInterval : 30,
     timerId: null,
     smartSummaries: {},
+    smartSummaryGeneration: 0,
+    smartPrefetchToken: 0,
+    smartPrefetchTimerId: null,
+    smartPrefetchRunning: false,
+    smartPrefetchScopeKey: null,
   };
 
   const grid = document.getElementById("slot-grid");
@@ -34,6 +43,7 @@
   const detailSmartNote = document.getElementById("detail-smart-note");
   const topologyContext = document.getElementById("topology-context");
   const multipathContext = document.getElementById("multipath-context");
+  const secondaryContextTitle = document.getElementById("secondary-context-title");
   const warningList = document.getElementById("warning-list");
   const searchBox = document.getElementById("search-box");
   const refreshButton = document.getElementById("refresh-button");
@@ -90,6 +100,10 @@
     return (state.snapshot.selected_system_platform || "core").toLowerCase();
   }
 
+  function currentPlatformContext() {
+    return state.snapshot.platform_context || {};
+  }
+
   function usesGenericPersistentIdLabel() {
     return ["scale", "linux"].includes(currentPlatform());
   }
@@ -144,9 +158,22 @@
     state.layoutRows = snapshot.layout_rows || state.layoutRows || [];
     state.selectedSystemId = snapshot.selected_system_id || state.selectedSystemId;
     state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
+    state.smartSummaryGeneration += 1;
+    pruneSmartSummaryCache();
     if (state.selectedSlot !== null && !getSlotById(state.selectedSlot)) {
       state.selectedSlot = null;
     }
+  }
+
+  function pruneSmartSummaryCache() {
+    const validKeys = new Set(
+      (state.snapshot.slots || []).map((slot) => getSmartCacheKey(slot))
+    );
+    Object.keys(state.smartSummaries).forEach((key) => {
+      if (!validKeys.has(key)) {
+        delete state.smartSummaries[key];
+      }
+    });
   }
 
   function syncLocation() {
@@ -202,6 +229,176 @@
   function getSmartSummaryEntry(slot) {
     if (!slot) return null;
     return state.smartSummaries[getSmartCacheKey(slot)] || null;
+  }
+
+  function currentSmartPrefetchScopeKey() {
+    const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
+    const enclosurePart = state.snapshot.selected_enclosure_id || state.selectedEnclosureId || "all-enclosures";
+    return `${systemPart}|${enclosurePart}`;
+  }
+
+  function isSmartEntryCurrent(entry) {
+    return entry?.generation === state.smartSummaryGeneration;
+  }
+
+  function isSmartEntryInFlight(entry) {
+    if (!entry || (!entry.loading && !entry.refreshing)) {
+      return false;
+    }
+    const requestedAt = Number(entry.requestedAt) || 0;
+    return requestedAt > 0 && Date.now() - requestedAt < SMART_PREFETCH_STALE_MS;
+  }
+
+  function candidateSlotsForSmartPrefetch() {
+    return (state.snapshot.slots || []).filter((slot) => {
+      if (!slot.present) {
+        return false;
+      }
+      if (!slot.device_name && !(Array.isArray(slot.smart_device_names) && slot.smart_device_names.length)) {
+        return false;
+      }
+      const entry = getSmartSummaryEntry(slot);
+      if (!entry) {
+        return true;
+      }
+      if (isSmartEntryCurrent(entry) && (entry.data || isSmartEntryInFlight(entry))) {
+        return false;
+      }
+      return !isSmartEntryInFlight(entry);
+    });
+  }
+
+  function updateSmartPrefetchViews() {
+    if (state.selectedSlot !== null) {
+      renderDetail();
+    }
+    if (state.hoveredSlot !== null) {
+      refreshHoveredTooltip();
+    }
+  }
+
+  async function runSmartPrefetch(runToken, scopeKey) {
+    if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
+      return;
+    }
+    state.smartPrefetchRunning = true;
+    const slots = candidateSlotsForSmartPrefetch();
+    if (!slots.length) {
+      state.smartPrefetchRunning = false;
+      return;
+    }
+
+    try {
+      slots.forEach((slot) => {
+        const cacheKey = getSmartCacheKey(slot);
+        const existingEntry = state.smartSummaries[cacheKey];
+        state.smartSummaries[cacheKey] = {
+          loading: !existingEntry?.data,
+          refreshing: Boolean(existingEntry?.data),
+          data: existingEntry?.data || null,
+          requestedAt: Date.now(),
+          generation: state.smartSummaryGeneration,
+        };
+      });
+      updateSmartPrefetchViews();
+
+      const chunks = [];
+      for (let index = 0; index < slots.length; index += SMART_PREFETCH_CHUNK_SIZE) {
+        chunks.push(slots.slice(index, index + SMART_PREFETCH_CHUNK_SIZE));
+      }
+
+      let nextChunkIndex = 0;
+      const processNextChunk = async () => {
+        while (nextChunkIndex < chunks.length) {
+          if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
+            return;
+          }
+          const chunk = chunks[nextChunkIndex];
+          nextChunkIndex += 1;
+        try {
+          const payload = await sendScopedRequest("/api/slots/smart-batch", {
+            method: "POST",
+            body: JSON.stringify({ slots: chunk.map((slot) => slot.slot) }),
+          });
+          if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
+            return;
+          }
+          const seenSlots = new Set();
+          (payload.summaries || []).forEach((item) => {
+            const slot = getSlotById(item.slot);
+            if (!slot) {
+              return;
+            }
+            seenSlots.add(item.slot);
+            state.smartSummaries[getSmartCacheKey(slot)] = {
+              loading: false,
+              refreshing: false,
+              data: item.summary,
+              requestedAt: Date.now(),
+              generation: state.smartSummaryGeneration,
+            };
+          });
+          chunk.forEach((slot) => {
+            if (seenSlots.has(slot.slot)) {
+              return;
+            }
+            const existingEntry = state.smartSummaries[getSmartCacheKey(slot)];
+            state.smartSummaries[getSmartCacheKey(slot)] = {
+              loading: false,
+              refreshing: false,
+              data: existingEntry?.data || { available: false, message: "SMART prefetch returned no data for this slot." },
+              requestedAt: Date.now(),
+              generation: state.smartSummaryGeneration,
+            };
+          });
+        } catch (error) {
+          console.error("SMART prefetch failed", error);
+          chunk.forEach((slot) => {
+            const existingEntry = state.smartSummaries[getSmartCacheKey(slot)];
+            state.smartSummaries[getSmartCacheKey(slot)] = {
+              loading: false,
+              refreshing: false,
+              data: existingEntry?.data || {
+                available: false,
+                message: error.message || String(error),
+              },
+              requestedAt: Date.now(),
+              generation: state.smartSummaryGeneration,
+            };
+          });
+        }
+        updateSmartPrefetchViews();
+        }
+      };
+
+      const workerCount = Math.min(SMART_PREFETCH_BATCH_CONCURRENCY, chunks.length);
+      await Promise.all(Array.from({ length: workerCount }, () => processNextChunk()));
+    } finally {
+      if (runToken === state.smartPrefetchToken && scopeKey === state.smartPrefetchScopeKey) {
+        state.smartPrefetchRunning = false;
+        if (candidateSlotsForSmartPrefetch().length) {
+          scheduleSmartPrefetch();
+        }
+      }
+    }
+  }
+
+  function scheduleSmartPrefetch() {
+    if (state.smartPrefetchTimerId) {
+      window.clearTimeout(state.smartPrefetchTimerId);
+      state.smartPrefetchTimerId = null;
+    }
+    const scopeKey = currentSmartPrefetchScopeKey();
+    if (state.smartPrefetchRunning && state.smartPrefetchScopeKey === scopeKey) {
+      return;
+    }
+    const runToken = state.smartPrefetchToken + 1;
+    state.smartPrefetchToken = runToken;
+    state.smartPrefetchScopeKey = scopeKey;
+    state.smartPrefetchTimerId = window.setTimeout(() => {
+      state.smartPrefetchTimerId = null;
+      void runSmartPrefetch(runToken, scopeKey);
+    }, SMART_PREFETCH_DELAY_MS);
   }
 
   function formatTemperatureValue(slot, smartEntry) {
@@ -288,17 +485,21 @@
     return "n/a";
   }
 
-  function formatCacheFlagValue(value, smartEntry) {
+  function formatBooleanFlagValue(value, smartEntry, trueLabel = "Enabled", falseLabel = "Disabled") {
     if (value === true) {
-      return "Enabled";
+      return trueLabel;
     }
     if (value === false) {
-      return "Disabled";
+      return falseLabel;
     }
     if (smartEntry?.loading) {
       return "Loading...";
     }
     return "n/a";
+  }
+
+  function formatCacheFlagValue(value, smartEntry) {
+    return formatBooleanFlagValue(value, smartEntry);
   }
 
   function formatReadCacheValue(smartEntry) {
@@ -307,6 +508,10 @@
 
   function formatWritebackCacheValue(smartEntry) {
     return formatCacheFlagValue(smartEntry?.data?.writeback_cache_enabled, smartEntry);
+  }
+
+  function formatTrimSupportedValue(smartEntry) {
+    return formatBooleanFlagValue(smartEntry?.data?.trim_supported, smartEntry, "Supported", "Not Supported");
   }
 
   function formatHexIdentifier(value) {
@@ -361,8 +566,17 @@
     return "n/a";
   }
 
-  function formatAttachedSasAddressValue(smartEntry) {
-    const formatted = formatHexIdentifier(smartEntry?.data?.attached_sas_address);
+  function firstSesTarget(slot) {
+    if (!Array.isArray(slot?.ssh_ses_targets)) {
+      return null;
+    }
+    return slot.ssh_ses_targets.find((target) => target && (target.ssh_host || target.ses_device)) || null;
+  }
+
+  function formatAttachedSasAddressValue(slot, smartEntry) {
+    const formatted = formatHexIdentifier(
+      smartEntry?.data?.attached_sas_address || slot?.raw_status?.attached_sas_address
+    );
     if (formatted && formatted !== "0x0") {
       return formatted;
     }
@@ -383,6 +597,34 @@
     return "n/a";
   }
 
+  function formatSesHostValue(slot) {
+    const host = firstSesTarget(slot)?.ssh_host;
+    return host || "n/a";
+  }
+
+  function formatSesStateValue(slot) {
+    const flags = [];
+    if (slot?.raw_status?.ses_hot_spare) {
+      flags.push("Hot Spare");
+    }
+    if (slot?.raw_status?.ses_do_not_remove) {
+      flags.push("Do Not Remove");
+    }
+    if (slot?.raw_status?.ses_predicted_failure) {
+      flags.push("Predicted Failure");
+    }
+    if (slot?.raw_status?.ses_fault_sensed) {
+      flags.push("Fault Sensed");
+    }
+    if (slot?.raw_status?.ses_fault_requested) {
+      flags.push("Fault Requested");
+    }
+    if (slot?.raw_status?.ses_disabled) {
+      flags.push("Disabled");
+    }
+    return flags.length ? flags.join(", ") : "n/a";
+  }
+
   function shouldShowSasTransportFields(slot, smartEntry) {
     const transport = String(smartEntry?.data?.transport_protocol || "").toLowerCase();
     if (transport.includes("sas")) {
@@ -399,6 +641,7 @@
       smartEntry?.data?.negotiated_link_rate ||
       slot?.logical_unit_id ||
       slot?.sas_address ||
+      slot?.raw_status?.attached_sas_address ||
       slot?.multipath?.lunid
     );
   }
@@ -568,8 +811,35 @@
     return formatOptionalCount(smartEntry?.data?.media_errors, smartEntry);
   }
 
+  function formatPredictiveErrorsValue(smartEntry) {
+    return formatOptionalCount(smartEntry?.data?.predictive_errors, smartEntry);
+  }
+
+  function formatNonMediumErrorsValue(smartEntry) {
+    return formatOptionalCount(smartEntry?.data?.non_medium_errors, smartEntry);
+  }
+
+  function formatUncorrectedReadErrorsValue(smartEntry) {
+    return formatOptionalCount(smartEntry?.data?.uncorrected_read_errors, smartEntry);
+  }
+
+  function formatUncorrectedWriteErrorsValue(smartEntry) {
+    return formatOptionalCount(smartEntry?.data?.uncorrected_write_errors, smartEntry);
+  }
+
   function formatUnsafeShutdownsValue(smartEntry) {
     return formatOptionalCount(smartEntry?.data?.unsafe_shutdowns, smartEntry);
+  }
+
+  function formatSmartHealthStatusValue(smartEntry) {
+    const status = smartEntry?.data?.smart_health_status;
+    if (status) {
+      return status;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return "n/a";
   }
 
   function buildTooltipLines(slot, smartEntry) {
@@ -595,6 +865,11 @@
       lines.push(`Temp: ${temperature}`);
     }
 
+    const smartHealth = formatSmartHealthStatusValue(smartEntry);
+    if (smartHealth !== "n/a") {
+      lines.push(`SMART: ${smartHealth}`);
+    }
+
     const endurance = formatEnduranceValue(smartEntry);
     if (endurance !== "n/a") {
       lines.push(`Wear: ${endurance}`);
@@ -618,6 +893,32 @@
     const mediaErrors = formatMediaErrorsValue(smartEntry);
     if (mediaErrors !== "n/a") {
       lines.push(`Media Errors: ${mediaErrors}`);
+    }
+
+    const predictiveErrors = formatPredictiveErrorsValue(smartEntry);
+    if (predictiveErrors !== "n/a") {
+      lines.push(`Predictive Errors: ${predictiveErrors}`);
+    }
+
+    const transport = formatTransportValue(smartEntry);
+    if (transport !== "n/a") {
+      lines.push(`Transport: ${transport}`);
+    }
+
+    const attachedSas = formatAttachedSasAddressValue(slot, smartEntry);
+    if (attachedSas !== "n/a") {
+      lines.push(`Attached SAS: ${attachedSas}`);
+    }
+
+    if (currentPlatform() === "quantastor") {
+      const sesHost = formatSesHostValue(slot);
+      if (sesHost !== "n/a") {
+        lines.push(`SES Host: ${sesHost}`);
+      }
+      const sesState = formatSesStateValue(slot);
+      if (sesState !== "n/a") {
+        lines.push(`SES Flags: ${sesState}`);
+      }
     }
 
     return lines;
@@ -834,6 +1135,23 @@
       .replaceAll('"', "&quot;");
   }
 
+  function operatorContext(slot) {
+    return slot?.operator_context || {};
+  }
+
+  function formatVisibleOnValue(slot) {
+    const labels = operatorContext(slot).visible_on_labels;
+    return Array.isArray(labels) && labels.length ? labels.join(", ") : "n/a";
+  }
+
+  function formatQuantastorContextValue(slot, key) {
+    const value = operatorContext(slot)[key];
+    if (Array.isArray(value)) {
+      return value.length ? value.join(", ") : "n/a";
+    }
+    return value ?? "n/a";
+  }
+
   function renderDetail() {
     const slot = getSlotById(state.selectedSlot);
     if (!slot) {
@@ -870,6 +1188,7 @@
     detailStatePill.className = `state-pill state-${slot.state}`;
     const smartEntry = getSmartSummaryEntry(slot);
     const showSasTransportFields = shouldShowSasTransportFields(slot, smartEntry);
+    const showQuantastorContext = currentPlatform() === "quantastor";
 
     detailKvGrid.innerHTML = [
       kvRow("Device", slot.device_name),
@@ -883,10 +1202,16 @@
       kvRow(currentPlatform() === "linux" ? "Array" : "Vdev", slot.vdev_name),
       kvRow(currentPlatform() === "linux" ? "Role" : "Class", slot.vdev_class),
       kvRow("Topology", slot.topology_label),
+      showQuantastorContext ? kvRowIfMeaningful("Presented By", formatQuantastorContextValue(slot, "presented_by_label")) : "",
+      showQuantastorContext ? kvRowIfMeaningful("Pool Active On", formatQuantastorContextValue(slot, "pool_owner_label")) : "",
+      showQuantastorContext ? kvRowIfMeaningful("I/O Fence On", formatQuantastorContextValue(slot, "fence_owner_label")) : "",
+      showQuantastorContext ? kvRowIfMeaningful("Visible On", formatVisibleOnValue(slot)) : "",
+      showQuantastorContext ? kvRowIfMeaningful("SES Host", formatSesHostValue(slot)) : "",
       kvRow("Health", slot.health),
       kvRow("Temp", formatTemperatureValue(slot, smartEntry)),
       kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
       kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
+      kvRowIfMeaningful("SMART Status", formatSmartHealthStatusValue(smartEntry)),
       kvRow("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
       kvRow("Power On", formatPowerOnValue(smartEntry)),
       kvRow("Sector Size", formatSectorSizeValue(slot, smartEntry)),
@@ -896,19 +1221,25 @@
       kvRowIfMeaningful("Protocol Version", formatProtocolVersionValue(smartEntry)),
       kvRowIfMeaningful("Endurance", formatEnduranceValue(smartEntry)),
       kvRowIfMeaningful("Available Spare", formatAvailableSpareValue(smartEntry)),
+      kvRowIfMeaningful("TRIM", formatTrimSupportedValue(smartEntry)),
       kvRowIfMeaningful("Bytes Read", formatBytesReadValue(smartEntry)),
       kvRowIfMeaningful("Bytes Written", formatBytesWrittenValue(smartEntry)),
       kvRowIfMeaningful("Annualized Write", formatAnnualizedWriteValue(smartEntry)),
       kvRowIfMeaningful("Est. TBW Left", formatEstimatedRemainingWriteValue(smartEntry)),
       kvRowIfMeaningful("Media Errors", formatMediaErrorsValue(smartEntry)),
+      kvRowIfMeaningful("Predictive Errors", formatPredictiveErrorsValue(smartEntry)),
+      kvRowIfMeaningful("Non-Medium Errors", formatNonMediumErrorsValue(smartEntry)),
+      kvRowIfMeaningful("Uncorrected Read", formatUncorrectedReadErrorsValue(smartEntry)),
+      kvRowIfMeaningful("Uncorrected Write", formatUncorrectedWriteErrorsValue(smartEntry)),
       kvRowIfMeaningful("Unsafe Shutdowns", formatUnsafeShutdownsValue(smartEntry)),
       kvRow("Read Cache", formatReadCacheValue(smartEntry)),
       kvRow("Writeback Cache", formatWritebackCacheValue(smartEntry)),
       kvRow("Transport", formatTransportValue(smartEntry)),
       showSasTransportFields ? kvRow("Logical Unit ID", formatLogicalUnitIdValue(slot, smartEntry)) : "",
       showSasTransportFields ? kvRow("SAS Address", formatSasAddressValue(slot, smartEntry)) : "",
-      showSasTransportFields ? kvRow("Attached SAS", formatAttachedSasAddressValue(smartEntry)) : "",
+      showSasTransportFields ? kvRow("Attached SAS", formatAttachedSasAddressValue(slot, smartEntry)) : "",
       showSasTransportFields ? kvRow("Link Rate", formatLinkRateValue(smartEntry)) : "",
+      showQuantastorContext ? kvRowIfMeaningful("SES Flags", formatSesStateValue(slot)) : "",
       kvRow("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
       kvRow("LED", ledStatusLabel(slot)),
       kvRow("Mapping", slot.mapping_source),
@@ -1021,6 +1352,11 @@
       return;
     }
 
+    if (currentPlatform() === "quantastor") {
+      renderQuantastorContext(slot);
+      return;
+    }
+
     if (!slot) {
       multipathContext.innerHTML = currentPlatform() === "linux"
         ? '<div class="warning-item muted">Select a slot to inspect transport and member-path details when available.</div>'
@@ -1106,6 +1442,69 @@
               <div class="topology-pill-row">${renderMultipathPills(multipath.members)}</div>
             </div>
           `}
+    `;
+  }
+
+  function renderQuantastorContext(slot) {
+    if (!multipathContext) {
+      return;
+    }
+
+    const clusterContext = currentPlatformContext();
+    if (!slot) {
+      multipathContext.innerHTML = '<div class="warning-item muted">Select a slot to inspect Quantastor ownership and fencing context.</div>';
+      return;
+    }
+
+    const context = operatorContext(slot);
+    const visibleOnLabels = Array.isArray(context.visible_on_labels) ? context.visible_on_labels : [];
+    const visibleOnMarkup = visibleOnLabels.length
+      ? visibleOnLabels.map((label) => `<div class="context-chip">${escapeHtml(label)}</div>`).join("")
+      : '<div class="warning-item muted compact">Only the current node has reported this disk so far.</div>';
+    const clusterRows = [
+      contextRow("Selected View", clusterContext.selected_view_label),
+      contextRow("Cluster Master", clusterContext.master_label),
+      contextRow("Peer Nodes", Array.isArray(clusterContext.peer_labels) && clusterContext.peer_labels.length ? clusterContext.peer_labels.join(", ") : null),
+      contextRow(
+        "I/O Fencing",
+        clusterContext.io_fencing_enabled === true ? "Enabled" : clusterContext.io_fencing_enabled === false ? "Disabled" : null
+      ),
+    ].filter(Boolean).join("");
+    const slotRows = [
+      contextRow("Presented By", context.presented_by_label),
+      contextRow("Pool Active On", context.pool_owner_label),
+      contextRow("I/O Fence On", context.fence_owner_label),
+      contextRow("Pool Device Node", context.pool_device_node_label),
+      contextRow("Ownership Rev", context.ownership_revision),
+    ].filter(Boolean).join("");
+    const notes = Array.isArray(context.notes) ? context.notes.filter(Boolean) : [];
+
+    multipathContext.innerHTML = `
+      <div class="topology-summary">
+        <div class="topology-label">Cluster State</div>
+        <div class="context-grid">${clusterRows || '<div class="warning-item muted compact">No extra cluster metadata is available.</div>'}</div>
+      </div>
+      <div class="topology-summary">
+        <div class="topology-label">Slot Ownership</div>
+        <div class="context-grid">${slotRows || '<div class="warning-item muted compact">This slot has no extra ownership overlay yet.</div>'}</div>
+      </div>
+      <div class="topology-summary">
+        <div class="topology-label">Visible On</div>
+        <div class="topology-pill-row">${visibleOnMarkup}</div>
+      </div>
+      ${notes.map((note) => `<div class="warning-item compact">${escapeHtml(note)}</div>`).join("")}
+    `;
+  }
+
+  function contextRow(label, value) {
+    if (value === null || value === undefined || value === "" || value === "n/a") {
+      return "";
+    }
+    return `
+      <div class="context-row">
+        <span class="context-label">${escapeHtml(label)}</span>
+        <span class="context-value">${escapeHtml(value)}</span>
+      </div>
     `;
   }
 
@@ -1243,6 +1642,9 @@
       chassisShell.dataset.faceStyle = profile.faceStyle;
       chassisShell.dataset.latchEdge = profile.latchEdge;
     }
+    if (secondaryContextTitle) {
+      secondaryContextTitle.textContent = currentPlatform() === "quantastor" ? "HA Context" : "Multipath Presentation";
+    }
   }
 
   function renderRefreshControls() {
@@ -1331,6 +1733,7 @@
       const snapshot = await fetchJson(`/api/inventory?${params.toString()}`);
       applySnapshot(snapshot);
       renderAll();
+      scheduleSmartPrefetch();
       setStatus("Inventory updated.");
     } catch (error) {
       setStatus(`Refresh failed: ${error.message || error}`, "error");
@@ -1352,6 +1755,7 @@
       });
       applySnapshot(payload.snapshot);
       renderAll();
+      scheduleSmartPrefetch();
       setStatus(`Slot ${slot.slot_label} LED action ${action} completed via ${slot.led_backend === "ssh" ? "SSH SES" : "API"}.`);
     } catch (error) {
       setStatus(`LED action failed: ${error.message || error}`, "error");
@@ -1380,6 +1784,7 @@
       });
       applySnapshot(result.snapshot);
       renderAll();
+      scheduleSmartPrefetch();
       setStatus(result.warning || `Saved mapping for slot ${slot.slot_label}.`);
     } catch (error) {
       setStatus(`Save mapping failed: ${error.message || error}`, "error");
@@ -1399,6 +1804,7 @@
       const result = await sendScopedRequest(`/api/slots/${slot.slot}/mapping`, { method: "DELETE" });
       applySnapshot(result.snapshot);
       renderAll();
+      scheduleSmartPrefetch();
       setStatus(`Cleared mapping for slot ${slot.slot_label}.`);
     } catch (error) {
       setStatus(`Clear mapping failed: ${error.message || error}`, "error");
@@ -1436,6 +1842,7 @@
       });
       applySnapshot(result.snapshot);
       renderAll();
+      scheduleSmartPrefetch();
       setStatus(`Imported ${result.imported} mappings into the active scope.`);
     } catch (error) {
       setStatus(`Import failed: ${error.message || error}`, "error");
@@ -1471,24 +1878,39 @@
   async function ensureSmartSummary(slot) {
     const cacheKey = getSmartCacheKey(slot);
     const entry = state.smartSummaries[cacheKey];
-    if (entry?.loading || entry?.data) {
+    if (isSmartEntryCurrent(entry) && (entry?.data || isSmartEntryInFlight(entry))) {
       if (state.hoveredSlot === slot.slot) {
         refreshHoveredTooltip();
       }
       return;
     }
 
-    state.smartSummaries[cacheKey] = { loading: true };
+    state.smartSummaries[cacheKey] = {
+      loading: !entry?.data,
+      refreshing: Boolean(entry?.data),
+      data: entry?.data || null,
+      requestedAt: Date.now(),
+      generation: state.smartSummaryGeneration,
+    };
     if (state.hoveredSlot === slot.slot) {
       refreshHoveredTooltip();
     }
     try {
       const payload = await sendScopedRequest(`/api/slots/${slot.slot}/smart`);
-      state.smartSummaries[cacheKey] = { loading: false, data: payload };
+      state.smartSummaries[cacheKey] = {
+        loading: false,
+        refreshing: false,
+        data: payload,
+        requestedAt: Date.now(),
+        generation: state.smartSummaryGeneration,
+      };
     } catch (error) {
       state.smartSummaries[cacheKey] = {
         loading: false,
-        data: { available: false, message: error.message || String(error) },
+        refreshing: false,
+        data: entry?.data || { available: false, message: error.message || String(error) },
+        requestedAt: Date.now(),
+        generation: state.smartSummaryGeneration,
       };
     }
 
@@ -1585,5 +2007,6 @@
   });
 
   renderAll();
+  scheduleSmartPrefetch();
   resetTimer();
 })();

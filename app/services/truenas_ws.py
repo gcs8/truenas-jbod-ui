@@ -6,6 +6,7 @@ import ssl
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -38,6 +39,14 @@ class TrueNASRawData:
     pools: list[dict[str, Any]]
     disk_temperatures: dict[str, int]
     smart_test_results: list[dict[str, Any]]
+    systems: list[dict[str, Any]] = field(default_factory=list)
+    pool_devices: list[dict[str, Any]] = field(default_factory=list)
+    ha_groups: list[dict[str, Any]] = field(default_factory=list)
+    hw_disks: list[dict[str, Any]] = field(default_factory=list)
+    hw_enclosures: list[dict[str, Any]] = field(default_factory=list)
+    cli_disks: list[dict[str, Any]] = field(default_factory=list)
+    cli_hw_disks: list[dict[str, Any]] = field(default_factory=list)
+    cli_hw_enclosures: list[dict[str, Any]] = field(default_factory=list)
 
 
 class TrueNASWebsocketClient:

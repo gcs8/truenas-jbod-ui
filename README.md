@@ -4,8 +4,10 @@
 
 This project is a production-usable web app for visualizing JBOD and
 chassis-attached disks on TrueNAS systems without installing anything on the
-storage host itself. It now also has a first-pass SSH-only Linux inventory path
-for profile-driven, non-TrueNAS hosts where physical disk layout still matters.
+storage host itself. It also supports a first-pass SSH-only Linux inventory
+path for profile-driven, non-TrueNAS hosts where physical disk layout still
+matters, plus a shipped `v0.5.0` OSNexus Quantastor adapter for storage-system,
+pool, SMART, and LED-aware slot visibility on shared-slot hardware.
 
 It runs entirely off-box in Docker, talks to TrueNAS over the middleware
 websocket API, optionally enriches data over SSH, and renders a dark,
@@ -20,6 +22,9 @@ The current tested hardware profiles are:
   and rear `12`-bay enclosure views
 - Generic Linux on a Supermicro `SYS-2029GP-TR` using a profile-driven `2`-bay
   right-side NVMe view backed by SSH `lsblk`, `mdadm`, and `nvme` discovery
+- OSNexus Quantastor on a Supermicro `SSG-2028R-DE2CR24L`, modeled as a
+  first-pass shared-front `24`-slot `1x24` profile with REST-first inventory,
+  SSH/`qs` enrichment, SES-aware LED control, and shared-face HA context
 
 The CORE layout groups each 15-bay row as `6 + 6 + 3` to better match the
 physical divider layout of the chassis. The SCALE layout uses chassis-specific
@@ -54,6 +59,10 @@ front and rear grids derived from Linux SES data and operator notes.
   Linux SES AES and enclosure-status data is available over SSH
 - First-pass generic Linux support for SSH-only `mdadm` / NVMe hosts where no
   TrueNAS API is available
+- First-pass Quantastor support for storage-system, disk, and pool inventory on
+  shared-slot hardware, with REST-first metadata plus optional SSH/`qs` CLI
+  enrichment for disk and enclosure detail, and master-node / IO-fencing
+  warnings
 - Optional SSH enrichment for:
   - `glabel status`
   - `gmultipath list`
@@ -70,6 +79,9 @@ front and rear grids derived from Linux SES data and operator notes.
   - `sg_ses -p aes`
   - `sg_ses -p ec`
   - `smartctl -x -j`
+- Optional Quantastor SSH/`qs` CLI enrichment for `disk-list`,
+  `hw-disk-list`, and `hw-enclosure-list` when the appliance API is missing
+  slot/controller detail
 - Chassis-specific enclosure views with color-coded slot state
 - Clear selected-slot highlight for quick visual focus
 - Selected-slot vdev-peer highlighting so sibling bays stand out together on the map
@@ -140,6 +152,17 @@ front and rear grids derived from Linux SES data and operator notes.
 - Generic Linux slot mapping currently depends on explicit profile `slot_hints`
   and host inventory data such as `lsblk`, `mdadm`, and `nvme list-subsys`.
   It does not currently infer arbitrary Linux chassis geometry on its own.
+- Quantastor support is still first-pass in the `v0.5.0` release. The current
+  implementation treats each storage system as a selectable system-scoped view,
+  supplements the REST path with SSH/`qs` CLI disk/enclosure rows when enabled,
+  and warns when HA groups are present instead of attempting full shared-face,
+  active-node, or IO-fencing visualization yet.
+- On the validated Quantastor cluster, the documented REST and `qs` identify
+  operations are still being rejected by the LSI controller path, so the app
+  now prefers SSH `sg_ses` when one of the HA nodes exposes a usable enclosure
+  device. If the selected node does not expose the working SES path, add the
+  peer node to `ssh.extra_hosts` so the app can fall through to it for LED
+  control and live identify-state refresh.
 - Write-endurance and TBW-style estimates are only shown when the underlying
   SMART data actually exposes lifetime write counters. The current NVMe path is
   good here; generic HDD/SAS write-rate coverage is still best-effort.
@@ -194,9 +217,11 @@ truenas-jbod-ui/
 
 4. Edit `.env`:
    - set `TRUENAS_HOST`
-   - set `TRUENAS_API_KEY`
+   - for TrueNAS CORE/SCALE, set `TRUENAS_API_KEY`
+   - for Quantastor, set `TRUENAS_API_USER` and `TRUENAS_API_PASSWORD`
    - decide whether `TRUENAS_VERIFY_SSL` should be `true` or `false`
-   - enable SSH only if you want richer correlation
+   - enable SSH if you want the app to supplement Quantastor REST data with
+     `qs` CLI disk / enclosure rows
 
 5. If you want SSH enrichment:
    - place your private key in `./config/ssh/id_truenas`
@@ -255,6 +280,7 @@ The repo now includes a GitHub-wiki-ready page set under:
 - [`wiki/Quick-Start.md`](wiki/Quick-Start.md)
 - [`wiki/TrueNAS-CORE-Setup.md`](wiki/TrueNAS-CORE-Setup.md)
 - [`wiki/TrueNAS-SCALE-Setup.md`](wiki/TrueNAS-SCALE-Setup.md)
+- [`wiki/Quantastor-Setup.md`](wiki/Quantastor-Setup.md)
 - [`wiki/Generic-Linux-Setup.md`](wiki/Generic-Linux-Setup.md)
 - [`wiki/SSH-Setup-and-Sudo.md`](wiki/SSH-Setup-and-Sudo.md)
 - [`wiki/Profiles-and-Custom-Layouts.md`](wiki/Profiles-and-Custom-Layouts.md)
@@ -289,9 +315,16 @@ practice:
 
 - `TRUENAS_HOST`
 - `TRUENAS_API_KEY`
+- `TRUENAS_API_USER`
+- `TRUENAS_API_PASSWORD`
 - `TRUENAS_VERIFY_SSL`
 - `TRUENAS_TIMEOUT`
 - `TRUENAS_ENCLOSURE_FILTER`
+
+TrueNAS CORE/SCALE use `TRUENAS_API_KEY`. Quantastor currently uses
+`TRUENAS_API_USER` and `TRUENAS_API_PASSWORD` for basic-auth REST access and,
+when SSH enrichment is enabled, for the local `qs --server=localhost,...` CLI
+fallback too.
 
 #### SSH
 
@@ -513,6 +546,10 @@ Notes:
 - on the tested SCALE host, identify LEDs are driven through `sg_ses`
   `--set=ident` / `--clear=ident` after the host exposes `/usr/bin/sg_ses`
   through command-limited sudo
+- on the validated Quantastor HA cluster, the documented REST and `qs`
+  identify methods are still failing, but the right-hand node exposes a usable
+  `sg_ses` controller path; the app can now use that through `ssh.extra_hosts`
+  even while the selected app view remains on the opposite node
 - the UI uses POST requests for LED-changing actions and surfaces errors instead
   of pretending the action succeeded
 
@@ -633,7 +670,9 @@ Current planning and SCALE-specific notes live here:
 - [docs/ROADMAP.md](docs/ROADMAP.md)
 - [docs/V0_3_X_PLAN.md](docs/V0_3_X_PLAN.md)
 - [docs/V0_4_PROFILE_PLAN.md](docs/V0_4_PROFILE_PLAN.md)
+- [docs/V0_5_QUANTASTOR_PLAN.md](docs/V0_5_QUANTASTOR_PLAN.md)
 - [docs/V0_3_SCALE_NOTES.md](docs/V0_3_SCALE_NOTES.md)
+- [docs/QUANTASTOR_NOTES.md](docs/QUANTASTOR_NOTES.md)
 - [docs/PROFILE_AUTHORING.md](docs/PROFILE_AUTHORING.md)
 
 ## License

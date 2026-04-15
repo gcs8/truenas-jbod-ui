@@ -72,6 +72,7 @@ class SmartSummaryView(BaseModel):
     temperature_c: int | None = None
     warning_temperature_c: int | None = None
     critical_temperature_c: int | None = None
+    smart_health_status: str | None = None
     last_test_type: str | None = None
     last_test_status: str | None = None
     last_test_lifetime_hours: int | None = None
@@ -90,6 +91,10 @@ class SmartSummaryView(BaseModel):
     estimated_lifetime_bytes_written: int | None = None
     estimated_remaining_bytes_written: int | None = None
     media_errors: int | None = None
+    predictive_errors: int | None = None
+    non_medium_errors: int | None = None
+    uncorrected_read_errors: int | None = None
+    uncorrected_write_errors: int | None = None
     unsafe_shutdowns: int | None = None
     rotation_rate_rpm: int | None = None
     form_factor: str | None = None
@@ -99,12 +104,26 @@ class SmartSummaryView(BaseModel):
     namespace_nguid: str | None = None
     read_cache_enabled: bool | None = None
     writeback_cache_enabled: bool | None = None
+    trim_supported: bool | None = None
     transport_protocol: str | None = None
     logical_unit_id: str | None = None
     sas_address: str | None = None
     attached_sas_address: str | None = None
     negotiated_link_rate: str | None = None
     message: str | None = None
+
+
+class SmartBatchRequest(BaseModel):
+    slots: list[int] = Field(default_factory=list)
+
+
+class SmartBatchItem(BaseModel):
+    slot: int
+    summary: SmartSummaryView
+
+
+class SmartBatchResponse(BaseModel):
+    summaries: list[SmartBatchItem] = Field(default_factory=list)
 
 
 class SlotView(BaseModel):
@@ -150,6 +169,7 @@ class SlotView(BaseModel):
     mapping_source: str = "unknown"
     notes: str | None = None
     search_text: str = ""
+    operator_context: dict[str, Any] = Field(default_factory=dict)
     raw_status: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -218,6 +238,7 @@ class InventorySnapshot(BaseModel):
     selected_profile: EnclosureProfileView | None = None
     systems: list[SystemOption] = Field(default_factory=list)
     enclosures: list[EnclosureOption] = Field(default_factory=list)
+    platform_context: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     sources: dict[str, SourceStatus] = Field(default_factory=dict)
     summary: InventorySummary = Field(default_factory=InventorySummary)

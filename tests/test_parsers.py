@@ -277,6 +277,9 @@ Enclosure status diagnostic page:
 
         self.assertEqual(len(parsed.ses_enclosures), 1)
         self.assertEqual(parsed.ses_enclosures[0].profile_id, "supermicro-ssg-6048r-front-24")
+        self.assertIn(0, parsed.ses_slot_candidates)
+        self.assertEqual(parsed.ses_slot_candidates[0]["ses_device"], "/dev/sg27")
+        self.assertEqual(parsed.ses_slot_candidates[0]["attached_sas_address"], "5003048001c1043f")
 
     def test_parse_smart_test_results_uses_latest_test(self) -> None:
         results = [

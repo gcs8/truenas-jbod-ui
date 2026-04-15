@@ -552,3 +552,34 @@ jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail /dev/md*
 and PCIe-path discovery. The privileged `nvme` commands above are only needed
 for on-demand controller-native enrichment such as firmware revision, protocol
 version, namespace GUIDs, and warning/critical temperature thresholds.
+
+## Quantastor HA SES Notes
+
+On the validated Quantastor `SSG-2028R-DE2CR24L` cluster, the documented REST
+and `qs` identify operations are still being rejected by the active LSI
+controller path. The working LED path is currently:
+
+- SSH `qs disk-list`, `qs hw-disk-list`, and `qs hw-enclosure-list` for
+  appliance inventory enrichment
+- SSH `smartctl` for verified per-disk SMART detail
+- SSH `sg_ses` for live SES slot state and identify LED control
+
+The tested wildcard sudoers entries for `jbodmap` were:
+
+```bash
+Defaults:jbodmap !requiretty
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p aes /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p ec /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/sd*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x /dev/sd*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/disk/by-id/scsi-*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x /dev/disk/by-id/scsi-*
+```
+
+One node on that cluster currently exposes the real SES device, while the peer
+node only exposes the broken short-status view. If your Quantastor HA chassis
+behaves the same way, keep the selected app view on whichever storage system
+you want, but include the working node in `ssh.extra_hosts` so the app can fall
+through to the usable `sg_ses` controller host for LED control.

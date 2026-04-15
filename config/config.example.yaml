@@ -9,9 +9,11 @@ app:
 
 truenas:
   # Use env vars for secrets in production.
-  # Base appliance URL only, without /api/v2.0.
+  # Base appliance URL only, without /api/v2.0 or /qstorapi.
   host: https://truenas.example.local
   api_key: ""
+  api_user: ""
+  api_password: ""
   platform: core
   verify_ssl: false
   timeout_seconds: 15
@@ -21,6 +23,9 @@ truenas:
 ssh:
   enabled: false
   host: truenas.example.local
+  # Optional extra node/controller hosts to try when the primary SSH host does
+  # not expose the best enclosure-control path.
+  extra_hosts: []
   port: 22
   user: jbodmap
   # Mount your SSH key into ./config/ssh on the Docker host.
@@ -124,6 +129,30 @@ ssh:
 #         - /usr/bin/lsblk -OJ
 #         - sudo -n /usr/sbin/mdadm --detail --scan
 #         - /usr/sbin/nvme list-subsys -o json
+#   - id: quantastor-lab
+#     label: Quantastor Lab
+#     default_profile_id: supermicro-ssg-2028r-shared-front-24
+#     truenas:
+#       host: https://quantastor.example.local
+#       api_user: admin
+#       api_password: ""
+#       platform: quantastor
+#       verify_ssl: false
+#     ssh:
+#       enabled: true
+#       host: 10.0.0.30
+#       extra_hosts:
+#         - 10.0.0.31
+#       port: 22
+#       user: jbodmap
+#       key_path: /run/ssh/id_truenas
+#       strict_host_key_checking: false
+#       commands: []
+#     # Quantastor can supplement the REST view with `qs disk-list`,
+#     # `qs hw-disk-list`, and `qs hw-enclosure-list` over SSH when the
+#     # appliance API is missing slot/controller detail. If only one HA node
+#     # exposes a working SES path, `extra_hosts` lets the app fall through to
+#     # the usable controller host for `sg_ses` identify and slot-state reads.
 
 layout:
   slot_count: 60

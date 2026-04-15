@@ -2,7 +2,113 @@
 
 ## Unreleased
 
-Working branch for the next feature set after `v0.4.0`.
+Post-`v0.5.0` follow-up work will land here.
+
+## v0.5.0 - 2026-04-14
+
+Quantastor release that adds the first new storage-platform adapter after the
+profile system, keeps CORE/SCALE/Linux behavior intact, and makes the shared
+`24`-bay Quantastor HA chassis genuinely operator-usable.
+
+### Added
+
+- First-pass Quantastor REST adapter with support for
+  `storageSystemEnum`, `physicalDiskEnum`, `storagePoolEnum`,
+  `storagePoolDeviceEnum`, and `haGroupEnum`
+- Shared-slot Quantastor profile groundwork for the Supermicro
+  `SSG-2028R-DE2CR24L`, rendered as a first-pass shared front `24`-bay view
+- Quantastor storage-system inventory correlation that can render pool, member,
+  and active-owner context through the existing slot-map UI
+- Dedicated Quantastor REST client coverage alongside the inventory/profile
+  tests that already exercise the first-pass adapter end to end
+
+### Changed
+
+- Bumped the app to `v0.5.0`
+- Refreshed config and env examples so Quantastor user/password auth and
+  API-first setup are documented alongside CORE, SCALE, and generic Linux
+- Quantastor snapshots now surface live HA context from cluster metadata,
+  including current master-node warnings and IO-fencing-disabled warnings when
+  the appliance reports them
+- Quantastor shared-slot mapping now normalizes the validated appliance's mixed
+  slot string formats so the real occupied bays render as physical slots
+  `0-7` and `12` instead of collapsing the last occupied disk into slot `8`
+- Quantastor pool-device slot metadata now outranks the broken per-node
+  hardware slot rows when the appliance disagrees with itself, so the validated
+  spare disk stays in physical slot `12` in the live UI instead of slipping
+  back to slot `8`
+- Quantastor HA warnings now prefer the real node records over the synthetic
+  cluster aggregate object when evaluating IO fencing state, avoiding false
+  "disabled" alerts on validated clusters where both nodes report fencing
+  enabled
+- Quantastor snapshots can now supplement the REST payload with SSH `qs`
+  `disk-list`, `hw-disk-list`, and `hw-enclosure-list` rows, improving shared
+  slot truth and slot-detail enrichment on validated clusters
+- Quantastor slot details now surface richer operator context for shared-face
+  HA systems, including the selected node view, the current cluster master,
+  pool-active owner, fence owner, and which nodes currently report visibility
+  into the selected slot
+- Quantastor slot SMART views now surface the appliance fields that are useful
+  without inventing history, including SMART health status, block size, TRIM
+  support, SSD life remaining, firmware, transport, SAS address, temperature,
+  and predictive / non-medium / uncorrected error counters when the REST or
+  SSH `qs` payload provides them
+- Quantastor SMART drill-down can now merge host `smartctl` output over SSH
+  when sudo is available, surfacing verified power-on time, SSD rotation,
+  form factor, and read/write cache state instead of leaving those rows blank
+- Quantastor slot detail can now overlay live `sg_ses` AES / enclosure-status
+  metadata, including real identify state and enclosure-side SAS slot mapping,
+  when one of the HA nodes exposes a working SES path over SSH
+- Slot-status matching now ignores nested raw key names like `isFaulty=false`,
+  preventing healthy Quantastor spares from rendering as red faulted bays just
+  because the raw payload includes a boolean flag name that contains "fault"
+- Quantastor can now probe multiple SSH node hosts for a working SES path,
+  overlay live `sg_ses` slot metadata onto the shared `24`-bay face, and drive
+  identify LEDs through the validated node-local enclosure even when the
+  selected storage-system view is the opposite HA node
+- Quantastor LED control now prefers the validated SSH `sg_ses` path over the
+  appliance REST and `qs` identify methods, because the documented controller
+  actions are still being rejected by the active LSI driver path on this
+  cluster
+- Quantastor slot correlation now lets verified SES presence and SAS-address
+  truth override stale appliance slot hints, keeping the validated spare on
+  physical slot `12` instead of letting it slip back to slot `8`
+- Quantastor SMART and SES probing now prefer the cached working enclosure host
+  first, so shared-HA clusters stop fan-out probing both nodes once the app
+  already knows which node can talk to the live SES path
+- Quantastor CLI enrichment now follows the same cached-host preference and
+  host-fallback order as SES and `smartctl`, and Quantastor snapshots now load
+  SES discovery first so the later CLI pass can reuse the known working node
+  instead of always starting on the default SSH host
+- Quantastor slot detail and tooltips now surface the active SES host plus
+  SES-side attached-SAS / state-bit fallback data when `smartctl` or the
+  appliance payload leaves those values blank
+- Top-latch tray rendering now leaves the status LED visible and tones the
+  latch down properly on dimmed peer slots, improving the shared-front `24`-bay
+  Quantastor view
+- Quantastor SMART candidate selection now prefers stable `disk/by-id/scsi-*`
+  and direct `/dev/sd*` aliases over unsupported `disk/by-path/*` names, so
+  validated spare slots keep their verified power-on, form-factor, rotation,
+  and cache data after SES-driven slot remapping
+- Enclosure views now warm SMART summaries in the background through a bounded
+  batch API path, so tooltip/detail fields are ready faster without repeated
+  per-hover round-trips once a view has loaded
+- Background SMART warming is now generation-aware and self-healing across
+  auto/manual refreshes, so the app keeps previously-known tooltip data visible
+  while refreshing it in place and can recover late slots if a browser-side
+  prefetch request gets interrupted instead of leaving them stuck loading
+- Quantastor now auto-selects the live pool owner when you land on the shared
+  HA view without an explicit node selection, and enclosure SMART warming can
+  overlap a couple of chunk requests at once so late CORE slots stop trailing
+  as far behind the early ones
+
+### Docs
+
+- Added a dedicated `v0.5.0` Quantastor execution plan and updated the
+  Quantastor working note to record the current API-first design and current
+  limitations
+- Refreshed the README and in-repo wiki source so `v0.5.0` setup guidance now
+  includes shipped Quantastor support instead of describing it as future work
 
 ## v0.4.0 - 2026-04-14
 

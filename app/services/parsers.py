@@ -80,7 +80,14 @@ class SESMapSlot:
     size_text: str | None = None
     present: bool | None = None
     sas_address: str | None = None
+    attached_sas_address: str | None = None
     sas_device_type: str | None = None
+    predicted_failure: bool | None = None
+    disabled: bool | None = None
+    hot_spare: bool | None = None
+    do_not_remove: bool | None = None
+    fault_sensed: bool | None = None
+    fault_requested: bool | None = None
 
 
 @dataclass(slots=True)
@@ -693,6 +700,10 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
                 current_slot.present = True
             continue
 
+        if stripped.startswith("attached SAS address:"):
+            current_slot.attached_sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
+            continue
+
     if not enclosure.slots:
         return None
 
@@ -778,12 +789,29 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
             current_slot.status = normalize_text(stripped.split("status:", 1)[1])
             if current_slot.status:
                 current_slot.present = "not installed" not in current_slot.status.lower()
+            for field_name, attribute in (
+                ("Predicted failure", "predicted_failure"),
+                ("Disabled", "disabled"),
+                ("Hot spare", "hot_spare"),
+            ):
+                match = re.search(rf"{re.escape(field_name)}=(?P<value>[01])", stripped)
+                if match:
+                    setattr(current_slot, attribute, match.group("value") == "1")
             continue
 
         ident_match = re.search(r"\bIdent=(?P<ident>[01])\b", stripped)
         if ident_match:
             current_slot.identify_active = ident_match.group("ident") == "1"
             continue
+
+        for field_name, attribute in (
+            ("Do not remove", "do_not_remove"),
+            ("Fault sensed", "fault_sensed"),
+            ("Fault reqstd", "fault_requested"),
+        ):
+            match = re.search(rf"{re.escape(field_name)}=(?P<value>[01])", stripped)
+            if match:
+                setattr(current_slot, attribute, match.group("value") == "1")
 
     if not enclosure.slots:
         return None
@@ -1147,7 +1175,14 @@ def build_slot_candidates_from_ses_enclosures(
                 "ses_element_id": slot.element_id,
                 "ses_slot_number": slot.slot_number,
                 "sas_address_hint": slot.sas_address,
+                "attached_sas_address": slot.attached_sas_address,
                 "sas_device_type": slot.sas_device_type,
+                "ses_predicted_failure": slot.predicted_failure,
+                "ses_disabled": slot.disabled,
+                "ses_hot_spare": slot.hot_spare,
+                "ses_do_not_remove": slot.do_not_remove,
+                "ses_fault_sensed": slot.fault_sensed,
+                "ses_fault_requested": slot.fault_requested,
                 "ses_targets": _merge_control_targets(
                     slot.control_targets,
                     [
@@ -2218,6 +2253,14 @@ def parse_ssh_outputs(
 
     if parsed.ses_enclosures:
         parsed.ses_enclosures = _merge_ses_enclosures(parsed.ses_enclosures)
+        sg_candidates, sg_meta = build_slot_candidates_from_ses_enclosures(
+            parsed.ses_enclosures,
+            slot_count,
+            enclosure_filter,
+            selected_enclosure_id,
+        )
+        parsed.ses_slot_candidates = merge_slot_candidate_maps(parsed.ses_slot_candidates, sg_candidates)
+        parsed.ses_selected_meta = merge_enclosure_meta(parsed.ses_selected_meta, sg_meta)
 
     for slot, payload in parsed.ses_slot_candidates.items():
         device_hint = normalize_device_name(payload.get("device_hint"))

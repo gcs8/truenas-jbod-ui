@@ -10,6 +10,7 @@ from app.models.domain import EnclosureOption
 from app.services.profile_registry import (
     CORE_CSE_946_PROFILE_ID,
     LINUX_GPU_SERVER_NVME_PROFILE_ID,
+    QUANTASTOR_SSG_SHARED_24_PROFILE_ID,
     SCALE_SSG_FRONT_24_PROFILE_ID,
     SCALE_SSG_REAR_12_PROFILE_ID,
     ProfileRegistry,
@@ -102,6 +103,26 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.slot_layout, [[0, 1]])
         self.assertEqual(profile.slot_hints[0], ["nvme0", "10000:01:00.0"])
         self.assertEqual(profile.slot_hints[1], ["nvme1", "10000:02:00.0"])
+
+    def test_builtin_quantastor_profile_exposes_shared_24_slot_layout(self) -> None:
+        system = SystemConfig(id="quantastor-lab", label="Quantastor Lab", truenas=TrueNASConfig(platform="quantastor"))
+        registry = ProfileRegistry(get_settings())
+
+        profile = registry.resolve_for_enclosure(
+            system,
+            None,
+            fallback_label="Shared Front 24",
+            fallback_rows=1,
+            fallback_columns=24,
+            fallback_slot_count=24,
+        )
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.id, QUANTASTOR_SSG_SHARED_24_PROFILE_ID)
+        self.assertEqual(profile.latch_edge, "top")
+        self.assertEqual(profile.rows, 1)
+        self.assertEqual(profile.columns, 24)
+        self.assertEqual(profile.slot_layout, [list(range(24))])
 
     def test_get_settings_loads_custom_profile_file_and_system_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

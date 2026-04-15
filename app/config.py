@@ -24,7 +24,9 @@ class AppConfig(BaseModel):
 class TrueNASConfig(BaseModel):
     host: str = "https://truenas.local"
     api_key: str = ""
-    platform: Literal["core", "scale", "linux"] = "core"
+    api_user: str = ""
+    api_password: str = ""
+    platform: Literal["core", "scale", "linux", "quantastor"] = "core"
     verify_ssl: bool = True
     timeout_seconds: int = 15
     enclosure_filter: str | None = None
@@ -33,6 +35,7 @@ class TrueNASConfig(BaseModel):
 class SSHConfig(BaseModel):
     enabled: bool = False
     host: str = ""
+    extra_hosts: list[str] = Field(default_factory=list)
     port: int = 22
     user: str = ""
     key_path: str = "/run/ssh/id_truenas"
@@ -114,12 +117,15 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "APP_CONFIG_PATH": ("config_file",),
     "TRUENAS_HOST": ("truenas", "host"),
     "TRUENAS_API_KEY": ("truenas", "api_key"),
+    "TRUENAS_API_USER": ("truenas", "api_user"),
+    "TRUENAS_API_PASSWORD": ("truenas", "api_password"),
     "TRUENAS_PLATFORM": ("truenas", "platform"),
     "TRUENAS_VERIFY_SSL": ("truenas", "verify_ssl"),
     "TRUENAS_TIMEOUT": ("truenas", "timeout_seconds"),
     "TRUENAS_ENCLOSURE_FILTER": ("truenas", "enclosure_filter"),
     "SSH_ENABLED": ("ssh", "enabled"),
     "SSH_HOST": ("ssh", "host"),
+    "SSH_EXTRA_HOSTS_JSON": ("ssh", "extra_hosts"),
     "SSH_PORT": ("ssh", "port"),
     "SSH_USER": ("ssh", "user"),
     "SSH_KEY_PATH": ("ssh", "key_path"),
@@ -247,6 +253,18 @@ def _normalize_systems(settings: Settings) -> Settings:
                 update={
                     "id": system_id,
                     "label": normalize_text(system.label) or system_id.replace("-", " ").title(),
+                    "ssh": system.ssh.model_copy(
+                        update={
+                            "extra_hosts": [
+                                host
+                                for host in (
+                                    normalize_text(value)
+                                    for value in (system.ssh.extra_hosts or [])
+                                )
+                                if host
+                            ],
+                        }
+                    ),
                     "default_profile_id": normalize_text(system.default_profile_id),
                     "enclosure_profiles": {
                         str(key): str(value)

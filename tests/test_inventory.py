@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
-from app.models.domain import InventorySnapshot, LedAction, MultipathView, SlotView
+from app.models.domain import InventorySnapshot, LedAction, MultipathView, SlotView, SmartSummaryView
 from app.services.inventory import InventoryService, build_lunid_aliases, resolve_persistent_id
 from app.services.mapping_store import MappingStore
-from app.services.parsers import ParsedSSHData, ZpoolMember
+from app.services.parsers import ParsedSSHData, ZpoolMember, parse_ssh_outputs
 from app.services.profile_registry import ProfileRegistry
 from app.services.ssh_probe import SSHCommandResult
-from app.services.truenas_ws import TrueNASAPIError
+from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
 
 
 def build_inventory_service(
@@ -47,6 +49,15 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertIn("5000c5003e8253a7", aliases)
         self.assertIn("5000c5003e8253a8", aliases)
         self.assertIn("5000c5003e8253a9", aliases)
+
+    def test_build_lunid_aliases_quantastor_allows_two_count_offset(self) -> None:
+        aliases = build_lunid_aliases("5002538b103e5ee0", "quantastor")
+
+        self.assertIn("5002538b103e5ede", aliases)
+        self.assertIn("5002538b103e5edf", aliases)
+        self.assertIn("5002538b103e5ee0", aliases)
+        self.assertIn("5002538b103e5ee1", aliases)
+        self.assertIn("5002538b103e5ee2", aliases)
 
     def test_extract_block_sizes_from_scale_disk_metadata(self) -> None:
         disk = {
@@ -95,6 +106,24 @@ class InventoryHelpersTests(unittest.TestCase):
 
         self.assertEqual(value, "eui.000000000000001000a075012b91c7cf")
         self.assertEqual(label, "EUI64")
+
+    def test_extract_quantastor_slot_normalizes_mixed_zero_padded_values(self) -> None:
+        self.assertEqual(InventoryService._extract_quantastor_slot({"slot": "01"}), 0)
+        self.assertEqual(InventoryService._extract_quantastor_slot({"slot": "08"}), 7)
+        self.assertEqual(InventoryService._extract_quantastor_slot({"slot": "0"}), 0)
+        self.assertEqual(InventoryService._extract_quantastor_slot({"slot": "2"}), 2)
+        self.assertEqual(InventoryService._extract_quantastor_slot({"slot": "12"}), 12)
+
+    def test_status_contains_ignores_nested_key_names_when_value_is_false(self) -> None:
+        raw_status = {
+            "status": "Ready (RDY)",
+            "disk_raw": {
+                "isFaulty": False,
+                "smartHealthTest": "OK",
+            },
+        }
+
+        self.assertFalse(InventoryService._status_contains(raw_status, "fault"))
 
     def test_build_linux_disk_records_prefers_primary_namespace_persistent_id(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -314,6 +343,1451 @@ class InventoryHelpersTests(unittest.TestCase):
 
 
 class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_quantastor_snapshot_renders_storage_system_view_and_pool_members(self) -> None:
+        class DummyQuantastorClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                systems = [
+                    {
+                        "id": "cluster",
+                        "name": "Cluster View",
+                        "storageSystemClusterId": "cluster-1",
+                        "type": 9,
+                        "disableIoFencing": True,
+                    },
+                    {
+                        "id": "node-a",
+                        "name": "Node A",
+                        "storageSystemClusterId": "cluster-1",
+                        "isMaster": False,
+                        "disableIoFencing": False,
+                    },
+                    {
+                        "id": "node-b",
+                        "name": "Node B",
+                        "storageSystemClusterId": "cluster-1",
+                        "isMaster": True,
+                        "disableIoFencing": False,
+                    },
+                ]
+                return TrueNASRawData(
+                    enclosures=systems,
+                    systems=systems,
+                    disks=[
+                        {
+                            "id": "pdisk-1",
+                            "storageSystemId": "node-a",
+                            "storagePoolId": "pool-1",
+                            "storagePoolDeviceId": "pooldev-1",
+                            "devicePath": "/dev/sdb",
+                            "serialNumber": "QS123",
+                            "vendorId": "WDC",
+                            "productId": "Ultrastar",
+                            "size": 14000000000000,
+                            "healthStatus": "ONLINE",
+                            "temperature": 33,
+                            "powerOnHours": 1200,
+                            "bytesWritten": 12000000000000,
+                            "protocol": "SAS",
+                        },
+                        {
+                            "id": "pdisk-12",
+                            "storageSystemId": "node-a",
+                            "storagePoolId": "pool-1",
+                            "storagePoolDeviceId": "pooldev-12",
+                            "devicePath": "/dev/sdm",
+                            "serialNumber": "QS999",
+                            "vendorId": "WDC",
+                            "productId": "Ultrastar",
+                            "size": 14000000000000,
+                            "healthStatus": "ONLINE",
+                            "temperature": 29,
+                            "powerOnHours": 2200,
+                            "bytesWritten": 22000000000000,
+                            "protocol": "SAS",
+                        }
+                    ],
+                    pools=[
+                        {
+                            "id": "pool-1",
+                            "name": "archive",
+                            "primaryStorageSystemId": "node-b",
+                            "status": "ONLINE",
+                        }
+                    ],
+                    pool_devices=[
+                        {
+                            "physicalDiskId": "pdisk-1",
+                            "storagePoolId": "pool-1",
+                            "number": 0,
+                            "status": "ONLINE",
+                            "devicePath": "/dev/sdb",
+                        },
+                        {
+                            "physicalDiskId": "pdisk-12",
+                            "storagePoolId": "pool-1",
+                            "number": 12,
+                            "slot": "12",
+                            "status": "ONLINE",
+                            "devicePath": "/dev/sdm",
+                        }
+                    ],
+                    ha_groups=[],
+                    hw_disks=[
+                        {
+                            "id": "hw-a-1",
+                            "physicalDiskId": "pdisk-1",
+                            "storageSystemId": "node-a",
+                            "slot": "01",
+                            "serialNum": "QS123",
+                            "sasAddress": "5000cca000000001",
+                            "enclosureId": "enc-a",
+                        },
+                        {
+                            "id": "hw-b-1",
+                            "physicalDiskId": "peer-pdisk-1",
+                            "storageSystemId": "node-b",
+                            "slot": "01",
+                            "serialNum": "QS123",
+                            "sasAddress": "5000cca000000001",
+                            "enclosureId": "enc-b",
+                        },
+                        {
+                            "id": "hw-a-12",
+                            "physicalDiskId": "pdisk-12",
+                            "storageSystemId": "node-a",
+                            "slot": "09",
+                            "serialNum": "QS999",
+                            "sasAddress": "5000cca000000012",
+                            "enclosureId": "enc-a",
+                        },
+                        {
+                            "id": "hw-b-12",
+                            "physicalDiskId": "peer-pdisk-12",
+                            "storageSystemId": "node-b",
+                            "slot": "12",
+                            "serialNum": "QS999",
+                            "sasAddress": "5000cca000000012",
+                            "enclosureId": "enc-b",
+                        },
+                    ],
+                    hw_enclosures=[
+                        {"id": "enc-a", "storageSystemId": "node-a"},
+                        {"id": "enc-b", "storageSystemId": "node-b"},
+                    ],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="admin",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=False),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyQuantastorClient(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
+
+            self.assertEqual(snapshot.selected_enclosure_id, "node-a")
+            self.assertEqual(snapshot.selected_enclosure_label, "Node A")
+            self.assertEqual(snapshot.selected_profile.id, "supermicro-ssg-2028r-shared-front-24")
+            self.assertEqual(len(snapshot.enclosures), 2)
+            self.assertEqual({option.id for option in snapshot.enclosures}, {"node-a", "node-b"})
+            self.assertTrue(any("Cluster master is Node B; selected view is Node A." in warning for warning in snapshot.warnings))
+            self.assertFalse(any("IO fencing is currently disabled" in warning for warning in snapshot.warnings))
+            slot0 = next(slot for slot in snapshot.slots if slot.slot == 0)
+            self.assertEqual(slot0.device_name, "sdb")
+            self.assertEqual(slot0.pool_name, "archive")
+            self.assertEqual(slot0.vdev_name, "member-0")
+            self.assertEqual(slot0.vdev_class, "data")
+            self.assertIn("active on Node B", slot0.topology_label or "")
+            self.assertEqual(slot0.mapping_source, "api")
+            self.assertFalse(slot0.led_supported)
+            self.assertIn("REST and CLI identify operations are being rejected", slot0.led_reason or "")
+            slot12 = next(slot for slot in snapshot.slots if slot.slot == 12)
+            self.assertEqual(slot12.device_name, "sdm")
+            self.assertEqual(slot12.pool_name, "archive")
+            slot23 = next(slot for slot in snapshot.slots if slot.slot == 23)
+            self.assertEqual(slot23.state.value, "empty")
+
+    async def test_quantastor_snapshot_warns_when_real_node_reports_io_fencing_disabled(self) -> None:
+        class DummyQuantastorClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                systems = [
+                    {
+                        "id": "cluster",
+                        "name": "Cluster",
+                        "storageSystemClusterId": "cluster-a",
+                        "disableIoFencing": False,
+                    },
+                    {
+                        "id": "node-a",
+                        "name": "Node A",
+                        "storageSystemClusterId": "cluster-a",
+                        "isMaster": False,
+                        "disableIoFencing": True,
+                    },
+                    {
+                        "id": "node-b",
+                        "name": "Node B",
+                        "storageSystemClusterId": "cluster-a",
+                        "isMaster": True,
+                        "disableIoFencing": False,
+                    },
+                ]
+                return TrueNASRawData(
+                    enclosures=systems,
+                    systems=systems,
+                    disks=[],
+                    pools=[],
+                    pool_devices=[],
+                    ha_groups=[],
+                    hw_disks=[],
+                    hw_enclosures=[
+                        {"id": "enc-a", "storageSystemId": "node-a"},
+                        {"id": "enc-b", "storageSystemId": "node-b"},
+                    ],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="admin",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=False),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyQuantastorClient(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
+
+            self.assertTrue(any("IO fencing is currently disabled" in warning for warning in snapshot.warnings))
+
+    async def test_quantastor_smart_summary_uses_first_pass_disk_payload(self) -> None:
+        class DummyQuantastorClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                systems = [{"id": "node-a", "name": "Node A"}]
+                return TrueNASRawData(
+                    enclosures=systems,
+                    systems=systems,
+                    disks=[
+                        {
+                            "id": "pdisk-1",
+                            "storageSystemId": "node-a",
+                            "storagePoolId": "pool-1",
+                            "storagePoolDeviceId": "pooldev-1",
+                            "devicePath": "/dev/sdb",
+                            "serialNumber": "QS123",
+                            "vendorId": "WDC",
+                            "productId": "Ultrastar",
+                            "size": 14000000000000,
+                            "healthStatus": "ONLINE",
+                            "slotNumber": 1,
+                            "temperature": 33,
+                            "powerOnHours": 1200,
+                            "bytesRead": 330000000000000,
+                            "bytesWritten": 12000000000000,
+                            "protocol": "SAS",
+                            "revisionLevel": "A1B2",
+                            "rotationRate": 7200,
+                            "smartHealthTest": "OK",
+                            "trimSupported": True,
+                            "blockSize": 4096,
+                            "errCountNonMedium": 1,
+                            "errCountUncorrectedRead": 2,
+                            "errCountUncorrectedWrite": 3,
+                        }
+                    ],
+                    pools=[{"id": "pool-1", "name": "archive"}],
+                    pool_devices=[],
+                    ha_groups=[],
+                    hw_disks=[
+                        {
+                            "id": "hw-a-1",
+                            "physicalDiskId": "pdisk-1",
+                            "storageSystemId": "node-a",
+                            "slot": "01",
+                            "serialNum": "QS123",
+                            "sasAddress": "5000cca000000001",
+                            "firmwareVersion": "A1B2",
+                            "mediumErrors": 0,
+                            "ssdLifeLeft": 95,
+                            "predictiveErrors": 4,
+                        }
+                    ],
+                    hw_enclosures=[{"id": "enc-a", "storageSystemId": "node-a"}],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="admin",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=False),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyQuantastorClient(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="node-a")
+
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.temperature_c, 33)
+            self.assertEqual(summary.power_on_hours, 1200)
+            self.assertEqual(summary.bytes_read, 330000000000000)
+            self.assertEqual(summary.bytes_written, 12000000000000)
+            self.assertEqual(summary.rotation_rate_rpm, 7200)
+            self.assertEqual(summary.smart_health_status, "OK")
+            self.assertEqual(summary.firmware_version, "A1B2")
+            self.assertEqual(summary.endurance_remaining_percent, 95)
+            self.assertEqual(summary.trim_supported, True)
+            self.assertEqual(summary.logical_block_size, 4096)
+            self.assertEqual(summary.physical_block_size, 4096)
+            self.assertEqual(summary.non_medium_errors, 1)
+            self.assertEqual(summary.uncorrected_read_errors, 2)
+            self.assertEqual(summary.uncorrected_write_errors, 3)
+            self.assertEqual(summary.predictive_errors, 4)
+            self.assertEqual(summary.transport_protocol, "SAS")
+            self.assertEqual(summary.sas_address, "5000cca000000001")
+            self.assertIn("Quantastor REST SMART detail is first-pass", summary.message or "")
+
+    async def test_quantastor_snapshot_uses_cli_hw_rows_for_shared_slot_truth(self) -> None:
+        class DummyQuantastorClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                systems = [
+                    {"id": "node-a", "name": "Node A", "storageSystemClusterId": "cluster-a"},
+                    {"id": "node-b", "name": "Node B", "storageSystemClusterId": "cluster-a", "isMaster": True},
+                ]
+                return TrueNASRawData(
+                    enclosures=systems,
+                    systems=systems,
+                    disks=[
+                        {
+                            "id": "pdisk-1",
+                            "storageSystemId": "node-a",
+                            "storagePoolId": "pool-1",
+                            "devicePath": "/dev/sdb",
+                            "serialNumber": "QS123",
+                            "vendorId": "WDC",
+                            "productId": "Ultrastar",
+                            "size": 14000000000000,
+                            "healthStatus": "ONLINE",
+                            "slotNumber": 1,
+                        },
+                        {
+                            "id": "pdisk-12",
+                            "storageSystemId": "node-a",
+                            "storagePoolId": "pool-1",
+                            "storagePoolDeviceId": "pooldev-12",
+                            "iofenceSystemId": "node-b",
+                            "devicePath": "/dev/sdm",
+                            "serialNumber": "QS999",
+                            "vendorId": "WDC",
+                            "productId": "Ultrastar",
+                            "size": 14000000000000,
+                            "healthStatus": "ONLINE",
+                            "slotNumber": 9,
+                        },
+                    ],
+                    pools=[{"id": "pool-1", "name": "archive", "primaryStorageSystemId": "node-b"}],
+                    pool_devices=[
+                        {
+                            "id": "pooldev-1",
+                            "physicalDiskId": "pdisk-1",
+                            "storageSystemId": "node-a",
+                            "storagePoolId": "pool-1",
+                            "number": 0,
+                            "slot": "01",
+                            "status": "ONLINE",
+                        },
+                        {
+                            "id": "pooldev-12",
+                            "physicalDiskId": "pdisk-12",
+                            "storageSystemId": "node-b",
+                            "storagePoolId": "pool-1",
+                            "number": 12,
+                            "slot": "12",
+                            "status": "ONLINE",
+                        },
+                    ],
+                    ha_groups=[],
+                    hw_disks=[
+                        {
+                            "id": "hw-a-1",
+                            "physicalDiskId": "pdisk-1",
+                            "storageSystemId": "node-a",
+                            "slot": "01",
+                            "serialNum": "QS123",
+                            "sasAddress": "5000cca000000001",
+                            "enclosureId": "enc-a",
+                        },
+                        {
+                            "id": "hw-a-12",
+                            "physicalDiskId": "pdisk-12",
+                            "storageSystemId": "node-a",
+                            "slot": "09",
+                            "serialNum": "QS999",
+                            "sasAddress": "5000cca000000012",
+                            "enclosureId": "enc-a",
+                        },
+                    ],
+                    hw_enclosures=[{"id": "enc-a", "storageSystemId": "node-a"}],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        async def run_command(command: str) -> SSHCommandResult:
+            if "hw-disk-list" in command:
+                payload = [
+                    {
+                        "id": "hw-a-1",
+                        "physicalDiskId": "pdisk-1",
+                        "storageSystemId": "node-a",
+                        "slot": "01",
+                        "serialNum": "QS123",
+                        "sasAddress": "5000cca000000001",
+                        "enclosureId": "enc-a",
+                    },
+                    {
+                        "id": "hw-a-12",
+                        "physicalDiskId": "pdisk-12",
+                        "storageSystemId": "node-a",
+                        "slot": "09",
+                        "serialNum": "QS999",
+                        "sasAddress": "5000cca000000012",
+                        "enclosureId": "enc-a",
+                    },
+                    {
+                        "id": "hw-b-12",
+                        "physicalDiskId": "peer-pdisk-12",
+                        "storageSystemId": "node-b",
+                        "slot": "09",
+                        "serialNum": "QS999",
+                        "sasAddress": "5000cca000000012",
+                        "enclosureId": "enc-b",
+                    },
+                ]
+            elif "disk-list" in command:
+                payload = [
+                    {
+                        "id": "cli-1",
+                        "storageSystemId": "node-a",
+                        "hwDiskId": "pdisk-1",
+                        "storagePoolId": "pool-1",
+                        "devicePath": "/dev/sdb",
+                        "serialNumber": "QS123",
+                        "scsiId": "5000cca000000001",
+                    },
+                    {
+                        "id": "cli-12",
+                        "storageSystemId": "node-a",
+                        "hwDiskId": "pdisk-12",
+                        "storagePoolId": "pool-1",
+                        "devicePath": "/dev/sdm",
+                        "serialNumber": "QS999",
+                        "scsiId": "5000cca000000012",
+                    },
+                ]
+            else:
+                payload = [
+                    {"id": "enc-a", "storageSystemId": "node-a"},
+                    {"id": "enc-b", "storageSystemId": "node-b"},
+                ]
+            return SSHCommandResult(command=command, ok=True, stdout=json.dumps(payload), stderr="", exit_code=0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="jbodmap",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            ssh_probe = AsyncMock()
+            ssh_probe.run_commands.return_value = []
+            ssh_probe.run_command.side_effect = run_command
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyQuantastorClient(),
+                ssh_probe,
+                temp_dir,
+            )
+            service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ParsedSSHData(), []))
+
+            snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
+
+            self.assertEqual(snapshot.sources["ssh"].message, "SSH probe and Quantastor CLI enrichment completed.")
+            self.assertEqual(snapshot.platform_context["selected_view_label"], "Node A")
+            self.assertEqual(snapshot.platform_context["master_label"], "Node B")
+            self.assertTrue(snapshot.platform_context["io_fencing_enabled"])
+            slot12 = next(slot for slot in snapshot.slots if slot.slot == 12)
+            self.assertEqual(slot12.device_name, "sdm")
+            self.assertEqual(slot12.pool_name, "archive")
+            self.assertEqual(slot12.operator_context["pool_owner_label"], "Node B")
+            self.assertEqual(slot12.operator_context["fence_owner_label"], "Node B")
+            self.assertEqual(slot12.operator_context["visible_on_labels"], ["Node A", "Node B"])
+            slot8 = next(slot for slot in snapshot.slots if slot.slot == 8)
+            self.assertEqual(slot8.state.value, "empty")
+
+    async def test_quantastor_snapshot_prefers_ses_truth_over_stale_slot_hint(self) -> None:
+        class DummyQuantastorClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                systems = [
+                    {"id": "node-a", "name": "Node A", "storageSystemClusterId": "cluster-a"},
+                    {"id": "node-b", "name": "Node B", "storageSystemClusterId": "cluster-a", "isMaster": True},
+                ]
+                return TrueNASRawData(
+                    enclosures=systems,
+                    systems=systems,
+                    disks=[
+                        {
+                            "id": "spare-12",
+                            "storageSystemId": "node-a",
+                            "storagePoolId": "pool-1",
+                            "devicePath": "/dev/sdm",
+                            "serialNumber": "QS999",
+                            "vendorId": "SAMSUNG",
+                            "productId": "PM1643",
+                            "size": 3840000000000,
+                            "healthStatus": "ONLINE",
+                            "slotNumber": 9,
+                            "scsiId": "35002538b103e5ee0",
+                        }
+                    ],
+                    pools=[{"id": "pool-1", "name": "archive", "primaryStorageSystemId": "node-b"}],
+                    pool_devices=[
+                        {
+                            "id": "pooldev-12",
+                            "physicalDiskId": "spare-12",
+                            "storageSystemId": "node-a",
+                            "storagePoolId": "pool-1",
+                            "number": 12,
+                            "slot": "09",
+                            "status": "AVAIL",
+                            "isSpare": True,
+                        }
+                    ],
+                    ha_groups=[],
+                    hw_disks=[
+                        {
+                            "id": "hw-a-12",
+                            "physicalDiskId": "spare-12",
+                            "storageSystemId": "node-a",
+                            "slot": "09",
+                            "serialNum": "QS999",
+                            "sasAddress": "5002538b103e5ee0",
+                            "enclosureId": "enc-a",
+                        }
+                    ],
+                    hw_enclosures=[{"id": "enc-a", "storageSystemId": "node-a"}],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="jbodmap",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", extra_hosts=["10.0.0.20"], user="jbodmap", commands=[]),
+            )
+            ssh_probe = AsyncMock()
+            ssh_probe.run_commands.return_value = []
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyQuantastorClient(),
+                ssh_probe,
+                temp_dir,
+            )
+            ses_overlay = ParsedSSHData(
+                ses_slot_candidates={
+                    8: {
+                        "present": False,
+                        "sas_address_hint": "0",
+                        "sas_device_type": "no SAS device attached",
+                        "ses_device": "/dev/sg11",
+                        "ses_element_id": 8,
+                        "ses_targets": [
+                            {
+                                "ssh_host": "10.0.0.20",
+                                "ses_device": "/dev/sg11",
+                                "ses_element_id": 8,
+                                "ses_slot_number": 8,
+                            }
+                        ],
+                    },
+                    12: {
+                        "present": True,
+                        "sas_address_hint": "5002538b103e5ee2",
+                        "attached_sas_address": "5003048026b2ff7f",
+                        "sas_device_type": "end device",
+                        "ses_device": "/dev/sg11",
+                        "ses_element_id": 12,
+                        "ses_targets": [
+                            {
+                                "ssh_host": "10.0.0.20",
+                                "ses_device": "/dev/sg11",
+                                "ses_element_id": 12,
+                                "ses_slot_number": 12,
+                            }
+                        ],
+                    },
+                }
+            )
+            service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ses_overlay, []))
+            service._fetch_quantastor_cli_overlay = AsyncMock(
+                return_value=({"cli_disks": [], "cli_hw_disks": [], "cli_hw_enclosures": []}, [])
+            )
+
+            snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
+
+            slot12 = next(slot for slot in snapshot.slots if slot.slot == 12)
+            self.assertEqual(slot12.device_name, "sdm")
+            self.assertEqual(slot12.serial, "QS999")
+            self.assertEqual(slot12.ssh_ses_targets[0]["ssh_host"], "10.0.0.20")
+            self.assertEqual(slot12.raw_status.get("attached_sas_address"), "5003048026b2ff7f")
+            slot8 = next(slot for slot in snapshot.slots if slot.slot == 8)
+            self.assertFalse(slot8.present)
+            self.assertEqual(slot8.state.value, "empty")
+
+    async def test_quantastor_snapshot_defaults_to_active_pool_owner_when_selection_is_empty(self) -> None:
+        class DummyQuantastorClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                systems = [
+                    {"id": "node-a", "name": "Node A", "storageSystemClusterId": "cluster-a"},
+                    {"id": "node-b", "name": "Node B", "storageSystemClusterId": "cluster-a", "isMaster": True},
+                ]
+                return TrueNASRawData(
+                    enclosures=systems,
+                    systems=systems,
+                    disks=[],
+                    pools=[
+                        {"id": "pool-1", "name": "archive", "activeStorageSystemId": "node-b"},
+                    ],
+                    ha_groups=[],
+                    hw_disks=[
+                        {"id": "hw-a", "storageSystemId": "node-a"},
+                        {"id": "hw-b", "storageSystemId": "node-b"},
+                    ],
+                    hw_enclosures=[
+                        {"id": "enc-a", "storageSystemId": "node-a"},
+                        {"id": "enc-b", "storageSystemId": "node-b"},
+                    ],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="jbodmap",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            ssh_probe = AsyncMock()
+            ssh_probe.run_commands.return_value = []
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyQuantastorClient(),
+                ssh_probe,
+                temp_dir,
+            )
+            service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ParsedSSHData(), []))
+            service._fetch_quantastor_cli_overlay = AsyncMock(
+                return_value=({"cli_disks": [], "cli_hw_disks": [], "cli_hw_enclosures": []}, [])
+            )
+
+            snapshot = await service.get_snapshot()
+
+            self.assertEqual(snapshot.selected_enclosure_id, "node-b")
+            self.assertEqual(snapshot.selected_enclosure_label, "Node B")
+            self.assertEqual(snapshot.platform_context["selected_view_label"], "Node B")
+            self.assertEqual(snapshot.platform_context["master_label"], "Node B")
+
+    async def test_quantastor_snapshot_fetches_ses_overlay_before_cli_overlay(self) -> None:
+        class DummyQuantastorClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                systems = [{"id": "node-a", "name": "Node A"}]
+                return TrueNASRawData(
+                    enclosures=systems,
+                    systems=systems,
+                    disks=[],
+                    pools=[],
+                    ha_groups=[],
+                    hw_disks=[],
+                    hw_enclosures=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="jbodmap",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            ssh_probe = AsyncMock()
+            ssh_probe.run_commands.return_value = []
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyQuantastorClient(),
+                ssh_probe,
+                temp_dir,
+            )
+            order: list[str] = []
+
+            async def fetch_ses():
+                order.append("ses")
+                service._quantastor_preferred_ses_host = "10.0.0.20"
+                return ParsedSSHData(), []
+
+            async def fetch_cli():
+                order.append("cli")
+                return {"cli_disks": [], "cli_hw_disks": [], "cli_hw_enclosures": []}, []
+
+            service._fetch_quantastor_ses_overlay = AsyncMock(side_effect=fetch_ses)
+            service._fetch_quantastor_cli_overlay = AsyncMock(side_effect=fetch_cli)
+
+            await service.get_snapshot(selected_enclosure_id="node-a")
+
+            self.assertEqual(order, ["ses", "cli"])
+
+    async def test_fetch_quantastor_cli_overlay_prefers_cached_working_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="jbodmap",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", extra_hosts=["10.0.0.20"], user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service._quantastor_preferred_ses_host = "10.0.0.20"
+
+            async def run_command(command: str, host: str | None = None) -> SSHCommandResult:
+                payload = [{"id": f"{host}-row"}]
+                return SSHCommandResult(command=command, ok=True, stdout=json.dumps(payload), stderr="", exit_code=0)
+
+            service._run_ssh_command = AsyncMock(side_effect=run_command)
+
+            overlay, failures = await service._fetch_quantastor_cli_overlay()
+
+            self.assertEqual(failures, [])
+            self.assertEqual(service._quantastor_preferred_ses_host, "10.0.0.20")
+            self.assertEqual(overlay["cli_disks"][0]["id"], "10.0.0.20-row")
+            self.assertEqual(overlay["cli_hw_disks"][0]["id"], "10.0.0.20-row")
+            self.assertEqual(overlay["cli_hw_enclosures"][0]["id"], "10.0.0.20-row")
+            awaited_hosts = [call.args[1] for call in service._run_ssh_command.await_args_list]
+            self.assertEqual(awaited_hosts, ["10.0.0.20", "10.0.0.20", "10.0.0.20"])
+
+    async def test_fetch_quantastor_cli_overlay_falls_back_to_extra_host_and_caches_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="jbodmap",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", extra_hosts=["10.0.0.20"], user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            async def run_command(command: str, host: str | None = None) -> SSHCommandResult:
+                if host == "10.0.0.10":
+                    return SSHCommandResult(command=command, ok=False, stdout="", stderr="wrong host", exit_code=1)
+                payload = [{"id": f"{host}-row"}]
+                return SSHCommandResult(command=command, ok=True, stdout=json.dumps(payload), stderr="", exit_code=0)
+
+            service._run_ssh_command = AsyncMock(side_effect=run_command)
+
+            overlay, failures = await service._fetch_quantastor_cli_overlay()
+
+            self.assertEqual(failures, [])
+            self.assertEqual(service._quantastor_preferred_ses_host, "10.0.0.20")
+            self.assertEqual(overlay["cli_disks"][0]["id"], "10.0.0.20-row")
+            self.assertEqual(overlay["cli_hw_disks"][0]["id"], "10.0.0.20-row")
+            self.assertEqual(overlay["cli_hw_enclosures"][0]["id"], "10.0.0.20-row")
+            awaited_hosts = [call.args[1] for call in service._run_ssh_command.await_args_list]
+            self.assertEqual(
+                awaited_hosts,
+                ["10.0.0.10", "10.0.0.10", "10.0.0.10", "10.0.0.20", "10.0.0.20", "10.0.0.20"],
+            )
+
+    async def test_get_slot_smart_summaries_deduplicates_and_filters_to_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[
+                        SlotView(slot=0, slot_label="00", row_index=0, column_index=0, device_name="sda"),
+                        SlotView(slot=1, slot_label="01", row_index=0, column_index=1, device_name="sdb"),
+                    ],
+                    refresh_interval_seconds=30,
+                )
+            )
+
+            async def fetch_summary(slot: int, selected_enclosure_id: str | None = None) -> SmartSummaryView:
+                return SmartSummaryView(available=True, power_on_hours=100 + slot)
+
+            service.get_slot_smart_summary = AsyncMock(side_effect=fetch_summary)
+
+            results = await service.get_slot_smart_summaries([1, 0, 1, 99], selected_enclosure_id="node-a")
+
+            self.assertEqual([item.slot for item in results], [1, 0])
+            self.assertEqual(results[0].summary.power_on_hours, 101)
+            self.assertEqual(results[1].summary.power_on_hours, 100)
+            awaited_slots = [call.args[0] for call in service.get_slot_smart_summary.await_args_list]
+            self.assertEqual(awaited_slots, [1, 0])
+
+    async def test_quantastor_snapshot_uses_ses_overlay_for_led_control(self) -> None:
+        class DummyQuantastorClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                systems = [{"id": "node-a", "name": "Node A"}]
+                return TrueNASRawData(
+                    enclosures=systems,
+                    systems=systems,
+                    disks=[
+                        {
+                            "id": "pdisk-1",
+                            "storageSystemId": "node-a",
+                            "storagePoolId": "pool-1",
+                            "devicePath": "/dev/sdb",
+                            "serialNumber": "QS123",
+                            "vendorId": "SAMSUNG",
+                            "productId": "PM1643",
+                            "size": 3840000000000,
+                            "healthStatus": "ONLINE",
+                        }
+                    ],
+                    pools=[{"id": "pool-1", "name": "archive"}],
+                    pool_devices=[],
+                    ha_groups=[],
+                    hw_disks=[
+                        {
+                            "id": "hw-a-1",
+                            "physicalDiskId": "pdisk-1",
+                            "storageSystemId": "node-a",
+                            "slot": "01",
+                            "serialNum": "QS123",
+                            "sasAddress": "5002538b496a5512",
+                            "enclosureId": "enc-a",
+                        }
+                    ],
+                    hw_enclosures=[{"id": "enc-a", "storageSystemId": "node-a"}],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="jbodmap",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", extra_hosts=["10.0.0.20"], user="jbodmap", commands=[]),
+            )
+            ssh_probe = AsyncMock()
+            ssh_probe.run_commands.return_value = []
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyQuantastorClient(),
+                ssh_probe,
+                temp_dir,
+            )
+            service._fetch_quantastor_cli_overlay = AsyncMock(
+                return_value=({"cli_disks": [], "cli_hw_disks": [], "cli_hw_enclosures": []}, [])
+            )
+
+            aes_output = """  SMCDRS2U  SAS3x40           0701
+  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 0
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5003048026b2ff7f
+          SAS address: 0x5002538b496a5512
+          phy identifier: 0x0
+"""
+            ec_output = """  SMCDRS2U  SAS3x40           0701
+Enclosure Status diagnostic page:
+  generation code: 0x0
+  status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Overall descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+      Element 0 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+        Ready to insert=0, RMV=0, Ident=1, Report=0
+"""
+            ses_overlay = parse_ssh_outputs(
+                {
+                    "sudo -n /usr/bin/sg_ses -p aes /dev/sg11": aes_output,
+                    "sudo -n /usr/bin/sg_ses -p ec /dev/sg11": ec_output,
+                },
+                60,
+                None,
+                None,
+            )
+            service._tag_quantastor_ses_overlay(ses_overlay, "10.0.0.20")
+            service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ses_overlay, []))
+
+            snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
+
+            self.assertEqual(snapshot.sources["ssh"].message, "SSH probe and Quantastor SES overlay completed.")
+            slot0 = next(slot for slot in snapshot.slots if slot.slot == 0)
+            self.assertTrue(slot0.led_supported)
+            self.assertEqual(slot0.led_backend, "quantastor_sg_ses")
+            self.assertTrue(slot0.identify_active)
+            self.assertEqual(slot0.ssh_ses_targets[0]["ssh_host"], "10.0.0.20")
+            self.assertEqual(slot0.ssh_ses_targets[0]["ses_device"], "/dev/sg11")
+
+    async def test_quantastor_cli_enrichment_surfaces_in_smart_summary(self) -> None:
+        class DummyQuantastorClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                systems = [{"id": "node-a", "name": "Node A"}]
+                return TrueNASRawData(
+                    enclosures=systems,
+                    systems=systems,
+                    disks=[
+                        {
+                            "id": "pdisk-1",
+                            "storageSystemId": "node-a",
+                            "storagePoolId": "pool-1",
+                            "devicePath": "/dev/sdb",
+                            "serialNumber": "QS123",
+                            "vendorId": "WDC",
+                            "productId": "Ultrastar",
+                            "size": 14000000000000,
+                            "healthStatus": "ONLINE",
+                            "slotNumber": 1,
+                            "protocol": "",
+                        }
+                    ],
+                    pools=[{"id": "pool-1", "name": "archive"}],
+                    pool_devices=[],
+                    ha_groups=[],
+                    hw_disks=[
+                        {
+                            "id": "hw-a-1",
+                            "physicalDiskId": "pdisk-1",
+                            "storageSystemId": "node-a",
+                            "slot": "01",
+                            "serialNum": "QS123",
+                            "sasAddress": "5000cca000000001",
+                        }
+                    ],
+                    hw_enclosures=[{"id": "enc-a", "storageSystemId": "node-a"}],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        async def run_command(command: str) -> SSHCommandResult:
+            if "hw-disk-list" in command:
+                payload = [
+                    {
+                        "id": "hw-a-1",
+                        "physicalDiskId": "pdisk-1",
+                        "storageSystemId": "node-a",
+                        "slot": "01",
+                        "serialNum": "QS123",
+                        "sasAddress": "5000cca000000001",
+                        "firmwareVersion": "A1B2",
+                        "driveTemp": "35 C (95.00 F)",
+                        "predictiveErrors": "4",
+                    }
+                ]
+            elif "disk-list" in command:
+                payload = [
+                    {
+                        "id": "cli-1",
+                        "storageSystemId": "node-a",
+                        "hwDiskId": "pdisk-1",
+                        "storagePoolId": "pool-1",
+                        "devicePath": "/dev/sdb",
+                        "serialNumber": "QS123",
+                        "driveTemp": "35 C (95.00 F)",
+                        "protocol": "SAS",
+                        "revisionLevel": "A1B2",
+                        "smartHealthTest": "[PASSED]",
+                        "ssdLifeLeft": "92%",
+                        "trimSupported": "true",
+                        "blockSize": "4096",
+                        "errCountNonMedium": "1",
+                        "errCountUncorrectedRead": "2",
+                        "errCountUncorrectedWrite": "3",
+                    }
+                ]
+            elif "smartctl" in command and "-j" in command:
+                return SSHCommandResult(
+                    command=command,
+                    ok=True,
+                    stdout=(
+                        '{'
+                        '"power_on_time":{"hours":21854},'
+                        '"rotation_rate":0,'
+                        '"form_factor":{"name":"2.5 inches"},'
+                        '"scsi_transport_protocol":{"name":"SAS"},'
+                        '"logical_unit_id":"35002538b496a5510",'
+                        '"scsi_sas_port_0":{"phy_0":{'
+                        '"sas_address":"5002538b496a5510",'
+                        '"attached_sas_address":"5003048000000001",'
+                        '"negotiated_logical_link_rate":"phy enabled; 12 Gbps"'
+                        '}}'
+                        '}'
+                    ),
+                    stderr="",
+                    exit_code=0,
+                )
+            elif "smartctl" in command:
+                return SSHCommandResult(
+                    command=command,
+                    ok=True,
+                    stdout=(
+                        "Read Cache is:        Enabled\n"
+                        "Writeback Cache is:   Enabled\n"
+                    ),
+                    stderr="",
+                    exit_code=0,
+                )
+            else:
+                payload = [{"id": "enc-a", "storageSystemId": "node-a"}]
+            return SSHCommandResult(command=command, ok=True, stdout=json.dumps(payload), stderr="", exit_code=0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="jbodmap",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            ssh_probe = AsyncMock()
+            ssh_probe.run_commands.return_value = []
+            ssh_probe.run_command.side_effect = run_command
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyQuantastorClient(),
+                ssh_probe,
+                temp_dir,
+            )
+            service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ParsedSSHData(), []))
+
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="node-a")
+
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.temperature_c, 35)
+            self.assertEqual(summary.transport_protocol, "SAS")
+            self.assertEqual(summary.firmware_version, "A1B2")
+            self.assertEqual(summary.sas_address, "5000cca000000001")
+            self.assertEqual(summary.attached_sas_address, "0x5003048000000001")
+            self.assertEqual(summary.negotiated_link_rate, "phy enabled; 12 Gbps")
+            self.assertEqual(summary.smart_health_status, "PASSED")
+            self.assertEqual(summary.power_on_hours, 21854)
+            self.assertEqual(summary.endurance_remaining_percent, 92)
+            self.assertEqual(summary.trim_supported, True)
+            self.assertEqual(summary.logical_block_size, 4096)
+            self.assertEqual(summary.physical_block_size, 4096)
+            self.assertEqual(summary.rotation_rate_rpm, 0)
+            self.assertEqual(summary.form_factor, "2.5 inches")
+            self.assertEqual(summary.non_medium_errors, 1)
+            self.assertEqual(summary.uncorrected_read_errors, 2)
+            self.assertEqual(summary.uncorrected_write_errors, 3)
+            self.assertEqual(summary.predictive_errors, 4)
+            self.assertEqual(summary.read_cache_enabled, True)
+            self.assertEqual(summary.writeback_cache_enabled, True)
+            self.assertIn("supplemented with SSH CLI disk rows", summary.message or "")
+
+    async def test_quantastor_smart_summary_prefers_ses_target_host(self) -> None:
+        class DummyQuantastorClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                raise AssertionError("Snapshot is mocked in this test.")
+
+        async def run_command(command: str, host: str | None = None) -> SSHCommandResult:
+            target_host = host or "10.0.0.10"
+            if target_host != "10.0.0.20":
+                return SSHCommandResult(
+                    command=command,
+                    ok=False,
+                    stdout="",
+                    stderr="wrong host",
+                    exit_code=1,
+                )
+            if command.endswith("-x /dev/sdb"):
+                return SSHCommandResult(
+                    command=command,
+                    ok=True,
+                    stdout=(
+                        "Read Cache is:        Enabled\n"
+                        "Writeback Cache is:   Enabled\n"
+                    ),
+                    stderr="",
+                    exit_code=0,
+                )
+            return SSHCommandResult(
+                command=command,
+                ok=True,
+                stdout=(
+                    '{'
+                    '"power_on_time":{"hours":47003},'
+                    '"rotation_rate":0,'
+                    '"form_factor":{"name":"2.5 inches"},'
+                    '"scsi_transport_protocol":{"name":"SAS (SPL-3)"},'
+                    '"logical_unit_id":"0x5002538b496a53f0",'
+                    '"scsi_sas_port_0":{"phy_0":{'
+                    '"sas_address":"0x5002538b496a53f0",'
+                    '"attached_sas_address":"0x5003048026b2ff7f"'
+                    '}}'
+                    '}'
+                ),
+                stderr="",
+                exit_code=0,
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="jbodmap",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", extra_hosts=["10.0.0.20"], user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyQuantastorClient(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service._run_ssh_command = AsyncMock(side_effect=run_command)
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                device_name="sdb",
+                serial="QS123",
+                logical_block_size=4096,
+                raw_status={
+                    "disk_raw": {
+                        "smartHealthTest": "[PASSED]",
+                        "protocol": "SAS",
+                        "sasAddress": "5002538b496a53f0",
+                    }
+                },
+                ssh_ses_targets=[
+                    {
+                        "ssh_host": "10.0.0.20",
+                        "ses_device": "/dev/sg11",
+                        "ses_element_id": 0,
+                        "ses_slot_number": 0,
+                    }
+                ],
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[slot],
+                    refresh_interval_seconds=30,
+                )
+            )
+
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="node-a")
+
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.power_on_hours, 47003)
+            self.assertEqual(summary.attached_sas_address, "0x5003048026b2ff7f")
+            awaited = [call.args for call in service._run_ssh_command.await_args_list]
+            self.assertEqual(awaited[0][1], "10.0.0.20")
+
+    def test_build_quantastor_smart_devices_prefers_by_id_and_sd_paths_over_by_path(self) -> None:
+        settings = Settings()
+        system = SystemConfig(
+            id="quantastor-lab",
+            label="Quantastor Lab",
+            default_profile_id="supermicro-ssg-2028r-shared-front-24",
+            truenas=TrueNASConfig(
+                platform="quantastor",
+                api_user="jbodmap",
+                api_password="secret",
+            ),
+            ssh=SSHConfig(enabled=True, host="10.0.0.10", extra_hosts=["10.0.0.20"], user="jbodmap", commands=[]),
+        )
+        service = InventoryService(
+            settings=settings,
+            system=system,
+            truenas_client=AsyncMock(),
+            ssh_probe=AsyncMock(),
+            mapping_store=MappingStore(Path(tempfile.mkdtemp()) / "mappings.json"),
+            profile_registry=ProfileRegistry(settings),
+        )
+
+        smart_devices = service._build_quantastor_smart_devices(
+            disk={
+                "devicePath": "/dev/disk/by-path/pci-0000:01:00.0-sas-exp0x500605b0000272ff-phy24-lun-0",
+                "altDevicePath": "/dev/sdk",
+                "name": "sdk (pci-0000:01:00.0-sas-exp0x500605b0000272ff-phy24-lun-0)",
+            },
+            merged_raw={
+                "devicePath": "/dev/disk/by-path/pci-0000:01:00.0-sas-exp0x500605b0000272ff-phy24-lun-0",
+                "altDevicePath": "/dev/sdk",
+            },
+            cli_hint={
+                "devicePath": "/dev/disk/by-path/pci-0000:01:00.0-sas-exp0x500605b0000272ff-phy24-lun-0",
+                "altDevicePath": "/dev/sdk",
+            },
+            hw_hint=None,
+            pool_hint={
+                "pool_device_raw": {
+                    "devicePath": "/dev/disk/by-id/scsi-SSAMSUNG_MZILT3T8HALS_007_S49PNA0N308960",
+                    "physicalDiskObj": {
+                        "devicePath": "/dev/disk/by-id/scsi-SSAMSUNG_MZILT3T8HALS_007_S49PNA0N308960",
+                        "altDevicePath": "/dev/sdk",
+                    },
+                }
+            },
+        )
+
+        self.assertEqual(
+            smart_devices[:3],
+            [
+                "disk/by-id/scsi-SSAMSUNG_MZILT3T8HALS_007_S49PNA0N308960",
+                "sdk",
+                "disk/by-path/pci-0000:01:00.0-sas-exp0x500605b0000272ff-phy24-lun-0",
+            ],
+        )
+
+    async def test_quantastor_smart_summary_handles_spare_using_by_path_primary_alias(self) -> None:
+        class DummyQuantastorClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                raise AssertionError("Snapshot is mocked in this test.")
+
+        async def run_command(command: str, host: str | None = None) -> SSHCommandResult:
+            target_host = host or "10.0.0.10"
+            if target_host != "10.0.0.20":
+                return SSHCommandResult(command=command, ok=False, stdout="", stderr="wrong host", exit_code=1)
+            if "/dev/disk/by-path/" in command:
+                return SSHCommandResult(command=command, ok=False, stdout="", stderr="sudo blocked", exit_code=1)
+            if command.endswith("-x /dev/sdk") or command.endswith("-x /dev/disk/by-id/scsi-SSAMSUNG_MZILT3T8HALS_007_S49PNA0N308960"):
+                return SSHCommandResult(
+                    command=command,
+                    ok=True,
+                    stdout=(
+                        "Rotation Rate:        Solid State Device\n"
+                        "Form Factor:          2.5 inches\n"
+                        "Read Cache is:        Enabled\n"
+                        "Writeback Cache is:   Enabled\n"
+                    ),
+                    stderr="",
+                    exit_code=0,
+                )
+            return SSHCommandResult(
+                command=command,
+                ok=True,
+                stdout=(
+                    '{'
+                    '"power_on_time":{"hours":47003},'
+                    '"rotation_rate":0,'
+                    '"form_factor":{"name":"2.5 inches"},'
+                    '"scsi_transport_protocol":{"name":"SAS (SPL-3)"},'
+                    '"logical_unit_id":"0x5002538b103e5ee0",'
+                    '"scsi_sas_port_0":{"phy_0":{'
+                    '"sas_address":"0x5002538b103e5ee0",'
+                    '"attached_sas_address":"0x5003048026b2ff7f"'
+                    '}}'
+                    '}'
+                ),
+                stderr="",
+                exit_code=0,
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="jbodmap",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", extra_hosts=["10.0.0.20"], user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyQuantastorClient(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service._run_ssh_command = AsyncMock(side_effect=run_command)
+            slot = SlotView(
+                slot=12,
+                slot_label="12",
+                row_index=0,
+                column_index=12,
+                device_name="disk/by-path/pci-0000:01:00.0-sas-exp0x500605b0000272ff-phy24-lun-0",
+                smart_device_names=[
+                    "disk/by-id/scsi-SSAMSUNG_MZILT3T8HALS_007_S49PNA0N308960",
+                    "sdk",
+                    "disk/by-path/pci-0000:01:00.0-sas-exp0x500605b0000272ff-phy24-lun-0",
+                ],
+                serial="S49PNA0N308960",
+                logical_block_size=4096,
+                raw_status={
+                    "disk_raw": {
+                        "smartHealthTest": "OK",
+                        "protocol": "SAS",
+                        "sasAddress": "5002538b103e5ee0",
+                    }
+                },
+                ssh_ses_targets=[
+                    {
+                        "ssh_host": "10.0.0.20",
+                        "ses_device": "/dev/sg11",
+                        "ses_element_id": 12,
+                        "ses_slot_number": 12,
+                    }
+                ],
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[slot],
+                    refresh_interval_seconds=30,
+                )
+            )
+
+            summary = await service.get_slot_smart_summary(12, selected_enclosure_id="node-a")
+
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.power_on_hours, 47003)
+            self.assertEqual(summary.rotation_rate_rpm, 0)
+            self.assertEqual(summary.form_factor, "2.5 inches")
+            self.assertEqual(summary.read_cache_enabled, True)
+            self.assertEqual(summary.writeback_cache_enabled, True)
+            awaited = [(call.args[0], call.args[1]) for call in service._run_ssh_command.await_args_list]
+            self.assertEqual(awaited[0][1], "10.0.0.20")
+            self.assertIn("/dev/disk/by-id/scsi-SSAMSUNG_MZILT3T8HALS_007_S49PNA0N308960", awaited[0][0])
+
     async def test_core_smart_summary_enriches_sparse_api_result_with_smartctl_text(self) -> None:
         class DummyTrueNASClient:
             def __init__(self) -> None:
@@ -1013,6 +2487,61 @@ class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(
                 "sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg27",
                 service.ssh_probe.commands,
+            )
+
+    async def test_quantastor_sg_ses_led_control_uses_target_host_override(self) -> None:
+        class DummyTrueNASClient:
+            pass
+
+        class DummySSHProbe:
+            async def run_command(self, command: str) -> SSHCommandResult:
+                return SSHCommandResult(command=command, ok=True, stdout="", exit_code=0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                DummySSHProbe(),
+                temp_dir,
+            )
+            service._run_ssh_command = AsyncMock(
+                return_value=SSHCommandResult(command="", ok=True, stdout="", exit_code=0)
+            )
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                led_supported=True,
+                led_backend="quantastor_sg_ses",
+                ssh_ses_targets=[
+                    {
+                        "ssh_host": "10.0.0.20",
+                        "ses_device": "/dev/sg11",
+                        "ses_element_id": 0,
+                        "ses_slot_number": 0,
+                    }
+                ],
+            )
+
+            await service._set_slot_led_over_ssh(slot, LedAction.identify)
+            await service._set_slot_led_over_ssh(slot, LedAction.clear)
+
+            awaited = [call.args for call in service._run_ssh_command.await_args_list]
+            self.assertIn(
+                ("sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg11", "10.0.0.20"),
+                awaited,
+            )
+            self.assertIn(
+                ("sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg11", "10.0.0.20"),
+                awaited,
             )
 
 

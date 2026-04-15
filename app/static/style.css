@@ -673,9 +673,12 @@ textarea {
 
 .slot-tile.peer-dimmed .slot-number,
 .slot-tile.peer-dimmed .slot-device,
-.slot-tile.peer-dimmed .slot-pool,
-.slot-tile.peer-dimmed .slot-latch {
+.slot-tile.peer-dimmed .slot-pool {
   opacity: 0.42;
+}
+
+.slot-tile.peer-dimmed .slot-latch {
+  opacity: 0.2;
 }
 
 .slot-tile.filtered-out {
@@ -710,6 +713,7 @@ textarea {
   position: absolute;
   top: 8px;
   right: 8px;
+  z-index: 3;
   width: 10px;
   height: 10px;
   border-radius: 999px;
@@ -757,6 +761,7 @@ textarea {
 
 .slot-latch {
   position: absolute;
+  z-index: 0;
   left: 8px;
   right: 8px;
   bottom: 8px;
@@ -784,7 +789,7 @@ textarea {
   top: 8px;
   bottom: auto;
   left: 8px;
-  right: 8px;
+  right: 24px;
   border-radius: 8px 8px 4px 4px;
   background: linear-gradient(180deg, var(--tray-latch), #86444a);
 }
@@ -1096,6 +1101,42 @@ textarea {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.context-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.context-row {
+  display: grid;
+  grid-template-columns: 108px 1fr;
+  gap: 10px;
+  align-items: start;
+}
+
+.context-label {
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.context-value {
+  font-family: var(--mono);
+  word-break: break-word;
+}
+
+.context-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(95, 182, 255, 0.28);
+  background: rgba(95, 182, 255, 0.1);
+  color: var(--text);
+  font-size: 0.84rem;
 }
 
 .topology-grid {

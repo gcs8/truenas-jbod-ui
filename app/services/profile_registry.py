@@ -9,6 +9,7 @@ CORE_CSE_946_PROFILE_ID = "supermicro-cse-946-top-60"
 SCALE_SSG_FRONT_24_PROFILE_ID = "supermicro-ssg-6048r-front-24"
 SCALE_SSG_REAR_12_PROFILE_ID = "supermicro-ssg-6048r-rear-12"
 LINUX_GPU_SERVER_NVME_PROFILE_ID = "supermicro-sys-2029gp-tr-right-nvme-2"
+QUANTASTOR_SSG_SHARED_24_PROFILE_ID = "supermicro-ssg-2028r-shared-front-24"
 
 
 def default_slot_layout(rows: int, columns: int, slot_count: int) -> list[list[int]]:
@@ -97,6 +98,21 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
                 0: ["nvme0", "10000:01:00.0"],
                 1: ["nvme1", "10000:02:00.0"],
             },
+        ),
+        EnclosureProfileConfig(
+            id=QUANTASTOR_SSG_SHARED_24_PROFILE_ID,
+            label="Supermicro SSG-2028R Shared Front 24",
+            eyebrow="OSNexus Quantastor / Supermicro SSG-2028R Front View",
+            summary="First-pass shared 24-slot front-drive profile for Quantastor dual-node chassis validation.",
+            panel_title="Shared Front 24",
+            edge_label="Front of chassis",
+            face_style="front-drive",
+            latch_edge="top",
+            rows=1,
+            columns=24,
+            slot_layout=[
+                list(range(24)),
+            ],
         ),
     ]
 
@@ -190,6 +206,8 @@ class ProfileRegistry:
             return CORE_CSE_946_PROFILE_ID
         if system.truenas.platform == "linux":
             return LINUX_GPU_SERVER_NVME_PROFILE_ID
+        if system.truenas.platform == "quantastor":
+            return QUANTASTOR_SSG_SHARED_24_PROFILE_ID
 
         return None
 

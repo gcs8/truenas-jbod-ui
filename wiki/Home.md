@@ -16,6 +16,7 @@ If you already know what kind of host you are targeting, jump to:
 
 - [[TrueNAS CORE Setup|TrueNAS-CORE-Setup]]
 - [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]]
+- [[Quantastor Setup|Quantastor-Setup]]
 - [[Generic Linux Setup|Generic-Linux-Setup]]
 
 If you want to control what the enclosure looks like, use:
@@ -42,6 +43,8 @@ The app runs off-box in Docker and talks to storage hosts over:
 - the TrueNAS middleware websocket API for CORE and SCALE
 - optional SSH for richer disk, enclosure, and LED detail
 - SSH-only inventory for supported generic Linux hosts
+- Quantastor REST plus optional SSH/`qs`/`sg_ses` enrichment for supported HA
+  appliances
 
 It gives you:
 
@@ -57,11 +60,12 @@ It gives you:
 
 - TrueNAS CORE on a Supermicro CSE-946 style `60`-bay top-loading shelf
 - TrueNAS SCALE on a Supermicro `SSG-6048R-E1CR36L` with front `24` and rear `12`
+- OSNexus Quantastor on a Supermicro `SSG-2028R-DE2CR24L` shared front `24`
 - Generic Linux on a Supermicro `SYS-2029GP-TR` with a right-side `2`-bay NVMe profile
 
 ## Current Direction
 
 - `0.4.0` is the chassis/profile release
-- `0.5.0` is planned to add OSNexus Quantastor support
-
-Quantastor planning notes already exist, but that adapter is not part of `0.4.0`.
+- `0.5.0` ships first-pass OSNexus Quantastor support
+- next work is focused on hardening, polish, and whatever validated hardware
+  comes after the current platform set

@@ -9,6 +9,7 @@ Detailed execution plans live here:
 
 - [`docs/V0_3_X_PLAN.md`](./V0_3_X_PLAN.md)
 - [`docs/V0_4_PROFILE_PLAN.md`](./V0_4_PROFILE_PLAN.md)
+- [`docs/V0_5_QUANTASTOR_PLAN.md`](./V0_5_QUANTASTOR_PLAN.md)
 - [`docs/PROFILE_AUTHORING.md`](./PROFILE_AUTHORING.md)
 
 ## Guiding Principle
@@ -100,6 +101,15 @@ Primary outcomes:
 Notes:
 
 - [`docs/QUANTASTOR_NOTES.md`](./QUANTASTOR_NOTES.md)
+- [`docs/V0_5_QUANTASTOR_PLAN.md`](./V0_5_QUANTASTOR_PLAN.md)
+
+Current status:
+
+- shipped in `v0.5.0`
+- current implementation is still intentionally first-pass and
+  storage-system-scoped, but it now includes shared-face HA context, optional
+  CLI enrichment, verified SMART merge, and SES-aware LED fallback on the
+  validated cluster
 
 Why this is not `v0.4.0`:
 

@@ -9,6 +9,7 @@ Platform Guides
 
 - [[TrueNAS CORE Setup|TrueNAS-CORE-Setup]]
 - [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]]
+- [[Quantastor Setup|Quantastor-Setup]]
 - [[Generic Linux Setup|Generic-Linux-Setup]]
 
 Configuration

@@ -4,6 +4,7 @@ from app.config import Settings, SystemConfig
 from app.services.inventory import InventoryService
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import ProfileRegistry
+from app.services.quantastor_api import QuantastorRESTClient
 from app.services.ssh_probe import SSHProbe
 from app.services.truenas_ws import TrueNASWebsocketClient
 
@@ -28,10 +29,14 @@ class InventoryRegistry:
         system = self.get_system(system_id)
         service = self._services.get(system.id)
         if service is None:
+            if system.truenas.platform == "quantastor":
+                api_client = QuantastorRESTClient(system.truenas)
+            else:
+                api_client = TrueNASWebsocketClient(system.truenas)
             service = InventoryService(
                 settings=self.settings,
                 system=system,
-                truenas_client=TrueNASWebsocketClient(system.truenas),
+                truenas_client=api_client,
                 ssh_probe=SSHProbe(system.ssh),
                 mapping_store=self.mapping_store,
                 profile_registry=self.profile_registry,

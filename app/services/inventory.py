@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shlex
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -19,6 +21,7 @@ from app.models.domain import (
     ManualMapping,
     MultipathMember,
     MultipathView,
+    SmartBatchItem,
     SmartSummaryView,
     SlotState,
     SlotView,
@@ -27,6 +30,7 @@ from app.models.domain import (
 )
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import ProfileRegistry
+from app.services.quantastor_api import QuantastorRESTClient
 from app.services.parsers import (
     ParsedSSHData,
     ZpoolMember,
@@ -100,7 +104,7 @@ def build_lunid_aliases(value: str | None, platform: str) -> set[str]:
     # On the user's SCALE host, the rear SSD enclosure exposes AES SAS addresses
     # that can differ from disk.query lunids by up to two hex counts, so we keep
     # the match window intentionally small but a little wider there.
-    deltas = (1,) if platform != "scale" else (-2, -1, 1, 2)
+    deltas = (1,) if platform not in {"scale", "quantastor"} else (-2, -1, 1, 2)
     for delta in deltas:
         shifted = shift_hex_identifier(value, delta)
         if shifted:
@@ -168,7 +172,7 @@ class InventoryService:
         self,
         settings: Settings,
         system: SystemConfig,
-        truenas_client: TrueNASWebsocketClient,
+        truenas_client: TrueNASWebsocketClient | QuantastorRESTClient,
         ssh_probe: SSHProbe,
         mapping_store: MappingStore,
         profile_registry: ProfileRegistry,
@@ -183,6 +187,7 @@ class InventoryService:
         self._cache_until: dict[str, datetime] = {}
         self._smart_cache: dict[str, SmartSummaryView] = {}
         self._smart_cache_until: dict[str, datetime] = {}
+        self._quantastor_preferred_ses_host: str | None = None
         self._lock = asyncio.Lock()
 
     async def get_snapshot(
@@ -228,7 +233,7 @@ class InventoryService:
                     await self._set_slot_led_over_ssh(slot_view, action)
                 else:
                     raise
-        elif slot_view.led_backend in {"ssh", "scale_sg_ses"}:
+        elif slot_view.led_backend in {"ssh", "scale_sg_ses", "quantastor_sg_ses"}:
             await self._set_slot_led_over_ssh(slot_view, action)
         else:
             raise TrueNASAPIError(
@@ -274,6 +279,23 @@ class InventoryService:
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         if not slot_view:
             raise TrueNASAPIError(f"Slot {slot:02d} is not present in the current snapshot.")
+
+        if self.system.truenas.platform == "quantastor":
+            summary = self._merge_smart_summary(slot_view, self._build_quantastor_smart_summary(slot_view))
+            candidates = self._smart_candidate_devices(slot_view)
+            if self.system.ssh.enabled and candidates and self._summary_needs_ssh_enrichment(summary):
+                ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(
+                    candidates,
+                    hosts=self._build_quantastor_preferred_hosts(slot_view),
+                )
+                if ssh_summary is not None:
+                    summary = self._merge_missing_smart_fields(
+                        summary,
+                        self._merge_smart_summary(slot_view, ssh_summary),
+                    )
+            self._smart_cache[f"{self.system.id}|quantastor|{slot}"] = summary
+            self._smart_cache_until[f"{self.system.id}|quantastor|{slot}"] = utcnow() + timedelta(minutes=5)
+            return summary
 
         candidates = self._smart_candidate_devices(slot_view)
         if not candidates:
@@ -356,9 +378,41 @@ class InventoryService:
             last_error or "SMART summary is unavailable for this slot.",
         )
 
+    async def get_slot_smart_summaries(
+        self,
+        slots: list[int],
+        selected_enclosure_id: str | None = None,
+        max_concurrency: int = 4,
+    ) -> list[SmartBatchItem]:
+        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
+        slot_lookup = {item.slot: item for item in snapshot.slots}
+        ordered_slots: list[int] = []
+        seen_slots: set[int] = set()
+        for slot in slots:
+            if slot in seen_slots or slot not in slot_lookup:
+                continue
+            seen_slots.add(slot)
+            ordered_slots.append(slot)
+
+        if not ordered_slots:
+            return []
+
+        semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+        async def load_summary(slot: int) -> SmartBatchItem:
+            async with semaphore:
+                try:
+                    summary = await self.get_slot_smart_summary(slot, selected_enclosure_id=selected_enclosure_id)
+                except TrueNASAPIError as exc:
+                    summary = self._fallback_smart_summary(slot_lookup.get(slot), str(exc))
+                return SmartBatchItem(slot=slot, summary=summary)
+
+        return await asyncio.gather(*(load_summary(slot) for slot in ordered_slots))
+
     async def _fetch_smart_summary_over_ssh(
         self,
         candidates: list[str],
+        hosts: list[str] | None = None,
     ) -> tuple[SmartSummaryView | None, str | None]:
         if not self.system.ssh.enabled:
             return None, (
@@ -367,60 +421,75 @@ class InventoryService:
             )
 
         last_error: str | None = None
-        for candidate in candidates:
-            device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
-            for smartctl_binary in self._smartctl_binary_candidates():
-                command = shlex.join(
-                    [
-                        "sudo",
-                        "-n",
-                        smartctl_binary,
-                        "-x",
-                        "-j",
-                        device_path,
-                    ]
-                )
-                result = await self.ssh_probe.run_command(command)
-                summary = None
-                if result.stdout.strip():
-                    parsed = parse_smartctl_summary(result.stdout)
-                    candidate_summary = SmartSummaryView.model_validate(parsed)
-                    # smartctl commonly returns advisory non-zero exit codes even when the
-                    # JSON payload is intact and contains useful SMART data.
-                    if candidate_summary.available or candidate_summary.message != "SMART JSON parsing failed.":
-                        summary = candidate_summary
-                if summary is None:
-                    detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH smartctl error."
-                    last_error = f"{device_path}: {detail}"
-                    if "command not found" in detail.lower():
-                        continue
-                    break
+        host_candidates = [normalize_text(host) for host in (hosts or []) if normalize_text(host)]
+        if not host_candidates:
+            host_candidates = [None]
 
-                text_command = shlex.join(
-                    [
-                        "sudo",
-                        "-n",
-                        smartctl_binary,
-                        "-x",
-                        device_path,
-                    ]
-                )
-                text_result = await self.ssh_probe.run_command(text_command)
-                if text_result.stdout.strip():
-                    summary = self._merge_missing_smart_fields(
-                        summary,
-                        SmartSummaryView.model_validate(
-                            parse_smartctl_text_enrichment(text_result.stdout)
-                        ),
+        for target_host in host_candidates:
+            for candidate in candidates:
+                device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
+                for smartctl_binary in self._smartctl_binary_candidates():
+                    command = shlex.join(
+                        [
+                            "sudo",
+                            "-n",
+                            smartctl_binary,
+                            "-x",
+                            "-j",
+                            device_path,
+                        ]
                     )
-                if self.system.truenas.platform == "linux":
-                    nvme_summary = await self._fetch_linux_nvme_enrichment_over_ssh(device_path)
-                    if nvme_summary is not None:
-                        summary = self._merge_missing_smart_fields(summary, nvme_summary)
-                if summary.available or summary.message != "SMART JSON parsing failed.":
-                    return summary, None
-                last_error = f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
-                break
+                    result = await self._run_ssh_command(command, target_host)
+                    summary = None
+                    if result.stdout.strip():
+                        parsed = parse_smartctl_summary(result.stdout)
+                        candidate_summary = SmartSummaryView.model_validate(parsed)
+                        # smartctl commonly returns advisory non-zero exit codes even when the
+                        # JSON payload is intact and contains useful SMART data.
+                        if candidate_summary.available or candidate_summary.message != "SMART JSON parsing failed.":
+                            summary = candidate_summary
+                    if summary is None:
+                        detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH smartctl error."
+                        last_error = (
+                            f"{target_host}:{device_path}: {detail}"
+                            if target_host
+                            else f"{device_path}: {detail}"
+                        )
+                        if "command not found" in detail.lower():
+                            continue
+                        break
+
+                    text_command = shlex.join(
+                        [
+                            "sudo",
+                            "-n",
+                            smartctl_binary,
+                            "-x",
+                            device_path,
+                        ]
+                    )
+                    text_result = await self._run_ssh_command(text_command, target_host)
+                    if text_result.stdout.strip():
+                        summary = self._merge_missing_smart_fields(
+                            summary,
+                            SmartSummaryView.model_validate(
+                                parse_smartctl_text_enrichment(text_result.stdout)
+                            ),
+                        )
+                    if self.system.truenas.platform == "linux":
+                        nvme_summary = await self._fetch_linux_nvme_enrichment_over_ssh(device_path, target_host)
+                        if nvme_summary is not None:
+                            summary = self._merge_missing_smart_fields(summary, nvme_summary)
+                    if summary.available or summary.message != "SMART JSON parsing failed.":
+                        if self.system.truenas.platform == "quantastor" and target_host:
+                            self._quantastor_preferred_ses_host = target_host
+                        return summary, None
+                    last_error = (
+                        f"{target_host}:{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                        if target_host
+                        else f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                    )
+                    break
 
         return None, last_error
 
@@ -429,7 +498,11 @@ class InventoryService:
             return ("/usr/local/sbin/smartctl", "/usr/sbin/smartctl")
         return ("/usr/sbin/smartctl", "/usr/local/sbin/smartctl")
 
-    async def _fetch_linux_nvme_enrichment_over_ssh(self, device_path: str) -> SmartSummaryView | None:
+    async def _fetch_linux_nvme_enrichment_over_ssh(
+        self,
+        device_path: str,
+        host: str | None = None,
+    ) -> SmartSummaryView | None:
         if self.system.truenas.platform != "linux":
             return None
 
@@ -456,7 +529,7 @@ class InventoryService:
                 parse_nvme_id_ns_summary,
             ),
         ):
-            result = await self.ssh_probe.run_command(command)
+            result = await self._run_ssh_command(command, host)
             if not result.stdout.strip():
                 continue
             parsed = SmartSummaryView.model_validate(parser(result.stdout))
@@ -501,11 +574,12 @@ class InventoryService:
         warnings: list[str] = []
         ssh_data = ParsedSSHData()
         api_enabled = self.system.truenas.platform != "linux"
+        api_label = "Quantastor API" if self.system.truenas.platform == "quantastor" else "TrueNAS API"
         sources = {
             "api": SourceStatus(
                 enabled=api_enabled,
                 ok=not api_enabled,
-                message="TrueNAS API disabled for this SSH-only Linux system." if not api_enabled else None,
+                message=f"{api_label} disabled for this SSH-only Linux system." if not api_enabled else None,
             ),
             "ssh": SourceStatus(enabled=self.system.ssh.enabled, ok=not self.system.ssh.enabled, message=None),
         }
@@ -517,20 +591,28 @@ class InventoryService:
             disk_temperatures={},
             smart_test_results=[],
         )
+        ssh_available = False
+        ssh_failures: list[str] = []
+        quantastor_cli_loaded = False
+        quantastor_cli_failures: list[str] = []
+        quantastor_ses_loaded = False
+        quantastor_ses_data = ParsedSSHData()
+        quantastor_ses_failures: list[str] = []
         if api_enabled:
             try:
                 raw_data = await self.truenas_client.fetch_all()
-                sources["api"] = SourceStatus(enabled=True, ok=True, message="TrueNAS API reachable.")
+                sources["api"] = SourceStatus(enabled=True, ok=True, message=f"{api_label} reachable.")
             except Exception as exc:
-                logger.exception("Failed to fetch TrueNAS API data")
+                logger.exception("Failed to fetch platform API data")
                 sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
-                warnings.append("TrueNAS API is unreachable. Slot details may be partial or unavailable.")
+                warnings.append(f"{api_label} is unreachable. Slot details may be partial or unavailable.")
 
         if self.system.ssh.enabled:
             try:
                 command_results = await self.ssh_probe.run_commands()
                 outputs = {item.command: item.stdout for item in command_results if item.ok}
                 failures = [item for item in command_results if not item.ok]
+                ssh_available = True
                 ssh_data = parse_ssh_outputs(
                     outputs,
                     self.settings.layout.slot_count,
@@ -543,11 +625,68 @@ class InventoryService:
                     message="SSH probe completed." if not failures else "Some SSH commands failed.",
                 )
                 for failure in failures:
-                    warnings.append(f"SSH command failed: {failure.command} (exit {failure.exit_code})")
+                    message = f"SSH command failed: {failure.command} (exit {failure.exit_code})"
+                    warnings.append(message)
+                    ssh_failures.append(message)
             except Exception as exc:
                 logger.exception("Failed to collect SSH diagnostics")
                 sources["ssh"] = SourceStatus(enabled=True, ok=False, message=str(exc))
                 warnings.append("SSH mode is enabled but could not collect fallback command output.")
+
+        if self.system.truenas.platform == "quantastor" and ssh_available:
+            try:
+                quantastor_ses_data, quantastor_ses_failures = await self._fetch_quantastor_ses_overlay()
+            except Exception:
+                logger.exception("Failed to collect Quantastor SES diagnostics")
+                quantastor_ses_failures.append(
+                    "Quantastor SSH SES enrichment failed unexpectedly. REST and CLI slot truth is still being used."
+                )
+            else:
+                quantastor_ses_loaded = bool(quantastor_ses_data.ses_enclosures)
+                warnings.extend(quantastor_ses_failures)
+
+            try:
+                quantastor_cli_overlay, quantastor_cli_failures = await self._fetch_quantastor_cli_overlay()
+            except Exception:
+                logger.exception("Failed to collect Quantastor CLI diagnostics")
+                quantastor_cli_failures.append(
+                    "Quantastor SSH CLI enrichment failed unexpectedly. REST data is still being used."
+                )
+            else:
+                raw_data.cli_disks = quantastor_cli_overlay.get("cli_disks", [])
+                raw_data.cli_hw_disks = quantastor_cli_overlay.get("cli_hw_disks", [])
+                raw_data.cli_hw_enclosures = quantastor_cli_overlay.get("cli_hw_enclosures", [])
+                quantastor_cli_loaded = any(
+                    (
+                        raw_data.cli_disks,
+                        raw_data.cli_hw_disks,
+                        raw_data.cli_hw_enclosures,
+                    )
+                )
+                warnings.extend(quantastor_cli_failures)
+
+            if quantastor_cli_loaded:
+                sources["ssh"] = SourceStatus(
+                    enabled=True,
+                    ok=not ssh_failures and not quantastor_cli_failures and not quantastor_ses_failures,
+                    message=(
+                        "SSH probe, Quantastor CLI enrichment, and SES overlay completed."
+                        if quantastor_ses_loaded and not ssh_failures and not quantastor_cli_failures and not quantastor_ses_failures
+                        else "SSH probe and Quantastor CLI enrichment completed."
+                        if not ssh_failures and not quantastor_cli_failures and not quantastor_ses_failures
+                        else "Quantastor CLI/SES enrichment completed with some failures."
+                    ),
+                )
+            elif quantastor_ses_loaded:
+                sources["ssh"] = SourceStatus(
+                    enabled=True,
+                    ok=not ssh_failures and not quantastor_ses_failures,
+                    message=(
+                        "SSH probe and Quantastor SES overlay completed."
+                        if not ssh_failures and not quantastor_ses_failures
+                        else "Quantastor SES overlay completed with some failures."
+                    ),
+                )
 
         has_scale_linux_ses = self._has_scale_linux_ses(ssh_data)
         if api_enabled and not raw_data.enclosures:
@@ -562,6 +701,11 @@ class InventoryService:
                     "show disk and pool metadata, but physical slot mapping and LED control will require future "
                     "Linux enclosure support or manual calibration."
                 )
+            elif self.system.truenas.platform == "quantastor":
+                warnings.append(
+                    "Quantastor did not expose any storage-system rows through the REST API, so no enclosure-scoped "
+                    "view can be rendered yet."
+                )
             else:
                 warnings.append(
                     "TrueNAS API returned no enclosure rows. API-only mode can still show disk and pool metadata, "
@@ -573,6 +717,7 @@ class InventoryService:
             ssh_data,
             warnings,
             selected_enclosure_id=selected_enclosure_id,
+            quantastor_ses_data=quantastor_ses_data,
         )
         option_by_id = {item.id: item for item in available_enclosures}
         resolved_enclosure_id = None
@@ -607,6 +752,11 @@ class InventoryService:
                 len((selected_profile.slot_hints if selected_profile else {}) or {}),
                 sum(1 for slot in slots if slot.smart_device_names),
             )
+        elif self.system.truenas.platform == "quantastor":
+            disk_count = len(raw_data.disks)
+            pool_count = len(raw_data.pools)
+            enclosure_count = len(available_enclosures)
+            ssh_slot_hint_count = 0
         else:
             disk_count = len(raw_data.disks)
             pool_count = len(raw_data.pools)
@@ -615,6 +765,12 @@ class InventoryService:
                 len(ssh_data.ses_slot_candidates),
                 sum(len(enclosure.slots) for enclosure in ssh_data.ses_enclosures),
             )
+
+        platform_context: dict[str, Any] = {}
+        if self.system.truenas.platform == "quantastor":
+            selected_system_id = selected_option.id if selected_option else resolved_enclosure_id
+            platform_context = self._build_quantastor_platform_context(raw_data, selected_system_id)
+            self._annotate_quantastor_slot_context(slots, raw_data, selected_system_id, platform_context)
 
         summary = InventorySummary(
             disk_count=disk_count,
@@ -649,6 +805,7 @@ class InventoryService:
             selected_enclosure_label=selected_option.label if selected_option else selected_slot.enclosure_label if selected_slot else None,
             selected_enclosure_name=selected_option.name if selected_option else selected_slot.enclosure_name if selected_slot else None,
             selected_profile=selected_profile,
+            platform_context=platform_context,
             sources=sources,
             summary=summary,
         )
@@ -659,9 +816,12 @@ class InventoryService:
         ssh_data: ParsedSSHData,
         warnings: list[str],
         selected_enclosure_id: str | None = None,
+        quantastor_ses_data: ParsedSSHData | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int]], int, int]:
         if self.system.truenas.platform == "linux":
             return self._correlate_linux_host(ssh_data, warnings, selected_enclosure_id)
+        if self.system.truenas.platform == "quantastor":
+            return self._correlate_quantastor(raw_data, warnings, selected_enclosure_id, quantastor_ses_data or ParsedSSHData())
         if self.system.truenas.platform == "scale" and self._has_scale_linux_ses(ssh_data):
             return self._correlate_scale_linux(raw_data, ssh_data, warnings, selected_enclosure_id)
 
@@ -996,6 +1156,1494 @@ class InventoryService:
             slot_count,
             columns,
         )
+
+    def _correlate_quantastor(
+        self,
+        raw_data: TrueNASRawData,
+        warnings: list[str],
+        selected_enclosure_id: str | None,
+        quantastor_ses_data: ParsedSSHData,
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int]], int, int]:
+        available_enclosures = self._build_quantastor_enclosure_options(raw_data)
+        preferred_enclosure_id = selected_enclosure_id or self._select_quantastor_default_enclosure_id(
+            raw_data,
+            available_enclosures,
+        )
+        selected_option = self._resolve_selected_enclosure_option(available_enclosures, preferred_enclosure_id, {})
+        if selected_option is None:
+            warnings.append("Quantastor did not return any storage-system views that can be rendered yet.")
+            return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
+
+        selected_profile = self.profile_registry.resolve_for_enclosure(
+            self.system,
+            selected_option,
+            fallback_label=selected_option.label,
+            fallback_rows=selected_option.rows or self.settings.layout.rows,
+            fallback_columns=selected_option.columns or self.settings.layout.columns,
+            fallback_slot_count=selected_option.slot_count or self.settings.layout.slot_count,
+            fallback_slot_layout=selected_option.slot_layout,
+        )
+        if selected_profile is None:
+            warnings.append("This Quantastor view needs a chassis profile before it can be rendered.")
+            return [], available_enclosures, self._enclosure_option_meta(selected_option), [], 0, 0
+
+        warnings.extend(self._build_quantastor_cluster_warnings(raw_data, selected_option.id))
+
+        layout_rows = [list(row) for row in selected_profile.slot_layout]
+        layout_slot_count = infer_slot_count_from_layout(layout_rows, selected_option.slot_count)
+        layout_columns = selected_profile.columns
+        slot_positions = {
+            slot_number: (row_index, column_index)
+            for row_index, row in enumerate(layout_rows)
+            for column_index, slot_number in enumerate(row)
+        }
+
+        disk_records = self._build_quantastor_disk_records(raw_data, selected_option.id)
+        disks_by_key: dict[str, DiskRecord] = {}
+        disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
+        disks_by_sas: dict[str, DiskRecord] = {}
+        for disk in disk_records:
+            for key in disk.lookup_keys:
+                disks_by_key[key] = disk
+            if disk.slot is not None:
+                disks_by_slot[(selected_option.id, disk.slot)] = disk
+                disks_by_slot[(None, disk.slot)] = disk
+            for alias in self._disk_sas_aliases(disk):
+                disks_by_sas[alias] = disk
+
+        api_topology_members = self._build_quantastor_topology_members(raw_data, disk_records)
+        selected_meta = self._enclosure_option_meta(selected_option)
+        empty_ssh = ParsedSSHData()
+        quantastor_ses_candidates = quantastor_ses_data.ses_slot_candidates if quantastor_ses_data.ses_slot_candidates else {}
+        slot_views: list[SlotView] = []
+
+        for slot in range(layout_slot_count):
+            mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            ses_candidate = quantastor_ses_candidates.get(slot, {})
+            slot_hints = {
+                "present": False,
+                "enclosure_id": selected_option.id,
+                "enclosure_label": selected_option.label,
+                "enclosure_name": selected_option.name,
+            }
+            self._merge_quantastor_ses_candidate(slot_hints, ses_candidate)
+            disk = self._resolve_disk_for_slot(
+                slot,
+                selected_option.id,
+                mapping,
+                disks_by_key,
+                disks_by_slot,
+                disks_by_sas,
+                slot_hints,
+                empty_ssh,
+            )
+            raw_slot_status = {
+                "present": disk is not None,
+                "status": disk.health if disk else "Empty",
+                "device_hint": disk.path_device_name if disk else None,
+                "device_names": list(dict.fromkeys(disk.smart_devices if disk else [])),
+                "serial_hint": disk.serial if disk else None,
+                "model_hint": disk.model if disk else None,
+                "reported_size": format_bytes(disk.size_bytes) if disk and disk.size_bytes else None,
+                "enclosure_id": selected_option.id,
+                "enclosure_label": selected_option.label,
+                "enclosure_name": selected_option.name,
+                "identify_active": self._quantastor_bool(disk.raw.get("isBlinking")) if disk else False,
+                "sas_address_hint": normalize_hex_identifier(disk.raw.get("sasAddress")) if disk else None,
+                "disk_raw": disk.raw if disk else None,
+            }
+            self._merge_quantastor_ses_candidate(raw_slot_status, ses_candidate)
+
+            slot_view = self._build_slot_view(
+                slot=slot,
+                row_index=slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))[0],
+                column_index=slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))[1],
+                enclosure_meta=selected_meta,
+                raw_slot_status=raw_slot_status,
+                disk=disk,
+                mapping=mapping,
+                ssh_data=empty_ssh,
+                api_topology_members=api_topology_members,
+                api_enclosure_ids=set(),
+            )
+            if mapping and not disk:
+                warnings.append(f"Manual mapping for slot {slot:02d} did not match any current Quantastor disk.")
+            slot_views.append(slot_view)
+
+        return (
+            slot_views,
+            available_enclosures,
+            selected_meta,
+            layout_rows,
+            layout_slot_count,
+            layout_columns,
+        )
+
+    def _build_quantastor_enclosure_options(self, raw_data: TrueNASRawData) -> list[EnclosureOption]:
+        profile = self.profile_registry.resolve_for_enclosure(
+            self.system,
+            None,
+            fallback_label=self.system.label or "Quantastor Enclosure",
+            fallback_rows=1,
+            fallback_columns=24,
+            fallback_slot_count=24,
+        )
+        slot_layout = [list(row) for row in profile.slot_layout] if profile else None
+        rows = profile.rows if profile else None
+        columns = profile.columns if profile else None
+        slot_count = infer_slot_count_from_layout(slot_layout or [], 24 if profile else None)
+        hw_disks = self._quantastor_hw_disk_rows(raw_data)
+        hw_enclosures = self._quantastor_hw_enclosure_rows(raw_data)
+        hardware_system_ids = {
+            system_id
+            for system_id in (
+                normalize_text(str(item.get("storageSystemId")) if item.get("storageSystemId") is not None else None)
+                for item in [*hw_disks, *hw_enclosures]
+            )
+            if system_id
+        }
+
+        options: list[EnclosureOption] = []
+        for system_row in raw_data.systems:
+            system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            if not system_id:
+                continue
+            if hardware_system_ids and system_id not in hardware_system_ids:
+                continue
+            label = normalize_text(
+                system_row.get("name")
+                or system_row.get("hostname")
+                or system_row.get("description")
+                or system_id
+            )
+            options.append(
+                EnclosureOption(
+                    id=system_id,
+                    label=label or system_id,
+                    name=normalize_text(
+                        str(system_row.get("description") or system_row.get("nodeId") or label)
+                        if (system_row.get("description") or system_row.get("nodeId") or label) is not None
+                        else None
+                    ),
+                    rows=rows,
+                    columns=columns,
+                    slot_count=slot_count,
+                    slot_layout=slot_layout,
+                )
+            )
+        return options
+
+    def _build_quantastor_disk_records(self, raw_data: TrueNASRawData, selected_system_id: str | None) -> list[DiskRecord]:
+        hw_slot_hints = self._build_quantastor_hw_slot_hints(raw_data, selected_system_id)
+        cli_disk_hints = self._build_quantastor_cli_disk_hints(raw_data.cli_disks, selected_system_id)
+        pool_slot_hints = self._build_quantastor_pool_slot_hints(raw_data, selected_system_id)
+        pool_names = {
+            normalize_text(str(pool.get("id")) if pool.get("id") is not None else None): normalize_text(
+                str(pool.get("name") or pool.get("description") or pool.get("id"))
+                if (pool.get("name") or pool.get("description") or pool.get("id")) is not None
+                else None
+            )
+            for pool in raw_data.pools
+            if normalize_text(str(pool.get("id")) if pool.get("id") is not None else None)
+        }
+
+        records: list[DiskRecord] = []
+        for disk in raw_data.disks:
+            owner_id = normalize_text(
+                str(disk.get("storageSystemId") or disk.get("systemId") or disk.get("controllerId"))
+                if (disk.get("storageSystemId") or disk.get("systemId") or disk.get("controllerId")) is not None
+                else None
+            )
+            if selected_system_id and owner_id and owner_id != selected_system_id:
+                continue
+
+            device_name = normalize_device_name(
+                disk.get("devicePath") or disk.get("deviceName") or disk.get("device") or disk.get("name")
+            )
+            path_device_name = device_name
+            serial = normalize_text(disk.get("serialNumber") or disk.get("serial"))
+            model = normalize_text(
+                disk.get("model")
+                or " ".join(
+                    filter(
+                        None,
+                        [
+                            normalize_text(disk.get("vendorId") or disk.get("vendor")),
+                            normalize_text(disk.get("productId") or disk.get("product")),
+                        ],
+                    )
+                )
+            )
+            size_bytes = (
+                disk.get("size")
+                if isinstance(disk.get("size"), int)
+                else disk.get("sizeBytes")
+                if isinstance(disk.get("sizeBytes"), int)
+                else parse_size_to_bytes(disk.get("size"))
+            )
+            disk_id = normalize_text(str(disk.get("id")) if disk.get("id") is not None else None)
+            identifier, _ = resolve_persistent_id(
+                normalize_text(disk.get("wwn")),
+                normalize_text(disk.get("eui64")),
+                normalize_text(disk.get("devicePath")),
+                disk_id,
+            )
+            health = normalize_text(disk.get("healthStatus") or disk.get("status"))
+            pool_id = normalize_text(
+                str(disk.get("storagePoolId") or disk.get("poolId"))
+                if (disk.get("storagePoolId") or disk.get("poolId")) is not None
+                else None
+            )
+            lookup_keys = set()
+            for value in (
+                disk_id,
+                device_name,
+                path_device_name,
+                serial,
+                model,
+                identifier,
+                disk.get("devicePath"),
+                disk.get("name"),
+                disk.get("wwn"),
+                disk.get("eui64"),
+                disk.get("scsiId"),
+                disk.get("wwid"),
+                disk.get("hwDiskId"),
+                disk.get("storagePoolDeviceId"),
+            ):
+                lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+            hint = next((hw_slot_hints[key] for key in lookup_keys if key in hw_slot_hints), None)
+            cli_hint = next((cli_disk_hints[key] for key in lookup_keys if key in cli_disk_hints), None)
+            pool_hint = next((pool_slot_hints[key] for key in lookup_keys if key in pool_slot_hints), None)
+            merged_raw = dict(disk)
+            if hint and isinstance(hint.get("hw_raw"), dict):
+                merged_raw = self._merge_quantastor_payloads(hint["hw_raw"], merged_raw)
+                merged_raw["quantastor_hw_disk"] = hint["hw_raw"]
+                merged_raw["quantastor_hw_disk_source"] = hint.get("source")
+                for value in (
+                    hint["hw_raw"].get("physicalDiskId"),
+                    hint["hw_raw"].get("serialNum"),
+                    hint["hw_raw"].get("serialNumber"),
+                    hint["hw_raw"].get("sasAddress"),
+                    hint["hw_raw"].get("id"),
+                ):
+                    lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+            if isinstance(cli_hint, dict):
+                merged_raw = self._merge_quantastor_payloads(cli_hint, merged_raw)
+                merged_raw["quantastor_cli_disk"] = cli_hint
+                for value in (
+                    cli_hint.get("id"),
+                    cli_hint.get("hwDiskId"),
+                    cli_hint.get("serialNumber"),
+                    cli_hint.get("scsiId"),
+                    cli_hint.get("wwid"),
+                    cli_hint.get("devicePath"),
+                    cli_hint.get("altDevicePath"),
+                    cli_hint.get("multipathParentDiskId"),
+                ):
+                    lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+                if not device_name:
+                    device_name = normalize_device_name(
+                        cli_hint.get("devicePath") or cli_hint.get("altDevicePath") or cli_hint.get("name")
+                    )
+                    path_device_name = device_name
+            if not pool_hint:
+                pool_hint = next((pool_slot_hints[key] for key in lookup_keys if key in pool_slot_hints), None)
+            if pool_hint and isinstance(pool_hint.get("pool_device_raw"), dict):
+                merged_raw["quantastor_pool_device"] = pool_hint["pool_device_raw"]
+            slot = pool_hint.get("slot") if pool_hint else hint.get("slot") if hint else None
+            if not isinstance(slot, int):
+                slot = self._extract_quantastor_slot(disk)
+            smart_devices = self._build_quantastor_smart_devices(disk, merged_raw, cli_hint, hint, pool_hint)
+
+            records.append(
+                DiskRecord(
+                    raw=merged_raw,
+                    device_name=device_name,
+                    path_device_name=path_device_name,
+                    multipath_name=None,
+                    multipath_member=None,
+                    serial=serial,
+                    model=model,
+                    size_bytes=size_bytes,
+                    identifier=identifier,
+                    health=health,
+                    pool_name=pool_names.get(pool_id),
+                    lunid=normalize_text(disk.get("wwn") or disk.get("scsiId")),
+                    bus=normalize_text(disk.get("transportType") or disk.get("protocol") or disk.get("mediaInterface")),
+                    temperature_c=self._extract_quantastor_int(disk, "temperature", "currentTemperature", "currTemp"),
+                    last_smart_test_type=None,
+                    last_smart_test_status=None,
+                    last_smart_test_lifetime_hours=None,
+                    logical_block_size=self._extract_quantastor_int(disk, "logicalBlockSize", "sectorSize", "logSectorSize"),
+                    physical_block_size=self._extract_quantastor_int(disk, "physicalBlockSize", "phySectorSize"),
+                    enclosure_id=normalize_text(str(hint.get("enclosure_id")) if hint and hint.get("enclosure_id") is not None else None) or selected_system_id,
+                    slot=slot,
+                    smart_devices=smart_devices,
+                    lookup_keys=lookup_keys,
+                )
+            )
+        return records
+
+    def _select_quantastor_default_enclosure_id(
+        self,
+        raw_data: TrueNASRawData,
+        options: list[EnclosureOption],
+    ) -> str | None:
+        option_ids = [option.id for option in options if option.id]
+        if not option_ids:
+            return None
+
+        option_rank = {option_id: index for index, option_id in enumerate(option_ids)}
+        owner_counts: dict[str, int] = {}
+        for pool in raw_data.pools:
+            owner_id = next(
+                (
+                    normalize_text(str(pool.get(key)) if pool.get(key) is not None else None)
+                    for key in ("activeStorageSystemId", "primaryStorageSystemId", "storageSystemId")
+                    if normalize_text(str(pool.get(key)) if pool.get(key) is not None else None) in option_rank
+                ),
+                None,
+            )
+            if owner_id:
+                owner_counts[owner_id] = owner_counts.get(owner_id, 0) + 1
+
+        if owner_counts:
+            return min(owner_counts, key=lambda owner_id: (-owner_counts[owner_id], option_rank[owner_id]))
+
+        for system_row in raw_data.systems:
+            if not self._quantastor_bool(system_row.get("isMaster")):
+                continue
+            system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            if system_id in option_rank:
+                return system_id
+
+        return option_ids[0]
+
+    def _build_quantastor_smart_devices(
+        self,
+        disk: dict[str, Any],
+        merged_raw: dict[str, Any],
+        cli_hint: dict[str, Any] | None,
+        hw_hint: dict[str, Any] | None,
+        pool_hint: dict[str, Any] | None,
+    ) -> list[str]:
+        direct_candidates: list[str] = []
+        stable_candidates: list[str] = []
+        fallback_candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add_candidate(value: Any) -> None:
+            text = normalize_text(str(value) if value is not None else None)
+            if not text:
+                return
+            normalized = normalize_device_name(text)
+            if not normalized:
+                return
+            key = normalized.lower()
+            if key in seen:
+                return
+            seen.add(key)
+
+            if re.match(r"^(?:sd|da|ada|nvd)\d+$", key):
+                direct_candidates.append(normalized)
+            elif key.startswith("disk/by-id/scsi-"):
+                stable_candidates.append(normalized)
+            else:
+                fallback_candidates.append(normalized)
+
+        pool_device = pool_hint.get("pool_device_raw") if isinstance(pool_hint, dict) else None
+        physical_disk_obj = pool_device.get("physicalDiskObj") if isinstance(pool_device, dict) else None
+        hw_raw = hw_hint.get("hw_raw") if isinstance(hw_hint, dict) else None
+
+        for payload in (
+            disk,
+            merged_raw,
+            cli_hint,
+            hw_raw,
+            pool_device,
+            physical_disk_obj,
+        ):
+            if not isinstance(payload, dict):
+                continue
+            for value in (
+                payload.get("altDevicePath"),
+                payload.get("devicePath"),
+                payload.get("deviceName"),
+                payload.get("device"),
+                payload.get("name"),
+            ):
+                add_candidate(value)
+
+        return [*stable_candidates, *direct_candidates, *fallback_candidates]
+
+    def _build_quantastor_hw_slot_hints(
+        self,
+        raw_data: TrueNASRawData,
+        selected_system_id: str | None,
+    ) -> dict[str, dict[str, Any]]:
+        grouped_rows: dict[str, list[dict[str, Any]]] = {}
+        row_source = "cli" if raw_data.cli_hw_disks else "api"
+        for row in self._quantastor_hw_disk_rows(raw_data):
+            slot = self._extract_quantastor_slot(row)
+            if slot is None:
+                continue
+            group_key = (
+                normalize_hex_identifier(row.get("sasAddress"))
+                or normalize_text(row.get("serialNum") or row.get("serialNumber"))
+                or normalize_text(str(row.get("physicalDiskId")) if row.get("physicalDiskId") is not None else None)
+                or normalize_text(str(row.get("id")) if row.get("id") is not None else None)
+            )
+            if not group_key:
+                continue
+            grouped_rows.setdefault(group_key, []).append(row)
+
+        hints: dict[str, dict[str, Any]] = {}
+        for rows in grouped_rows.values():
+            canonical_slot = self._select_quantastor_canonical_slot(rows)
+            preferred_row = next(
+                (
+                    row
+                    for row in rows
+                    if normalize_text(str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None)
+                    == selected_system_id
+                    and self._extract_quantastor_slot(row) == canonical_slot
+                ),
+                None,
+            )
+            if preferred_row is None:
+                preferred_row = next(
+                    (
+                        row
+                        for row in rows
+                        if self._extract_quantastor_slot(row) == canonical_slot
+                        and len(str(row.get("slot") or "")) > 1
+                    ),
+                    None,
+                )
+            if preferred_row is None:
+                preferred_row = next(
+                    (
+                        row
+                        for row in rows
+                        if normalize_text(str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None)
+                        == selected_system_id
+                    ),
+                    None,
+                )
+            if preferred_row is None:
+                preferred_row = rows[0]
+
+            hint = {
+                "slot": canonical_slot,
+                "enclosure_id": normalize_text(
+                    str(preferred_row.get("enclosureId")) if preferred_row.get("enclosureId") is not None else None
+                ),
+                "controller_id": normalize_text(
+                    str(preferred_row.get("controllerId")) if preferred_row.get("controllerId") is not None else None
+                ),
+                "hw_raw": preferred_row,
+                "source": row_source,
+            }
+            for row in rows:
+                for value in (
+                    row.get("physicalDiskId"),
+                    row.get("serialNum"),
+                    row.get("serialNumber"),
+                    row.get("sasAddress"),
+                    row.get("id"),
+                ):
+                    for key in normalize_lookup_keys(str(value) if value is not None else None):
+                        hints[key] = hint
+        return hints
+
+    def _build_quantastor_cli_disk_hints(
+        self,
+        rows: list[dict[str, Any]],
+        selected_system_id: str | None,
+    ) -> dict[str, dict[str, Any]]:
+        hints: dict[str, tuple[int, dict[str, Any]]] = {}
+        for row in rows:
+            score = self._score_quantastor_cli_disk_row(row, selected_system_id)
+            for value in (
+                row.get("id"),
+                row.get("hwDiskId"),
+                row.get("serialNumber"),
+                row.get("scsiId"),
+                row.get("wwid"),
+                row.get("devicePath"),
+                row.get("altDevicePath"),
+                row.get("multipathParentDiskId"),
+                row.get("name"),
+            ):
+                for key in normalize_lookup_keys(str(value) if value is not None else None):
+                    current = hints.get(key)
+                    if current is None or score > current[0]:
+                        hints[key] = (score, row)
+        return {key: value[1] for key, value in hints.items()}
+
+    def _build_quantastor_pool_slot_hints(
+        self,
+        raw_data: TrueNASRawData,
+        selected_system_id: str | None,
+    ) -> dict[str, dict[str, Any]]:
+        hints: dict[str, tuple[int, dict[str, Any]]] = {}
+        for row in raw_data.pool_devices:
+            slot = self._extract_quantastor_slot(row)
+            if slot is None:
+                continue
+            owner_id = normalize_text(
+                str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None
+            )
+            score = 0
+            if selected_system_id and owner_id == selected_system_id:
+                score += 8
+            if self._quantastor_bool(row.get("isSpare")):
+                score += 4
+            hint = {
+                "slot": slot,
+                "storage_system_id": owner_id,
+                "pool_device_raw": row,
+            }
+            for value in (
+                row.get("physicalDiskId"),
+                row.get("physicalDiskSerialNumber"),
+                row.get("physicalDiskScsiId"),
+                row.get("devicePath"),
+                row.get("id"),
+            ):
+                for key in normalize_lookup_keys(str(value) if value is not None else None):
+                    current = hints.get(key)
+                    if current is None or score > current[0]:
+                        hints[key] = (score, hint)
+        return {key: value[1] for key, value in hints.items()}
+
+    @staticmethod
+    def _select_quantastor_canonical_slot(rows: list[dict[str, Any]]) -> int | None:
+        slot_counter: Counter[int] = Counter()
+        raw_widths: dict[int, int] = {}
+        for row in rows:
+            slot = InventoryService._extract_quantastor_slot(row)
+            if slot is None:
+                continue
+            slot_counter[slot] += 1
+            raw_widths[slot] = max(raw_widths.get(slot, 0), len(str(row.get("slot") or "")))
+        if not slot_counter:
+            return None
+        return max(slot_counter, key=lambda slot: (slot_counter[slot], raw_widths.get(slot, 0), slot))
+
+    def _build_quantastor_topology_members(
+        self,
+        raw_data: TrueNASRawData,
+        disk_records: list[DiskRecord],
+    ) -> dict[str, ZpoolMember]:
+        pool_index = {
+            normalize_text(str(pool.get("id")) if pool.get("id") is not None else None): pool
+            for pool in raw_data.pools
+            if normalize_text(str(pool.get("id")) if pool.get("id") is not None else None)
+        }
+        system_index = {
+            normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None): normalize_text(
+                str(system_row.get("name") or system_row.get("hostname") or system_row.get("id"))
+                if (system_row.get("name") or system_row.get("hostname") or system_row.get("id")) is not None
+                else None
+            )
+            for system_row in raw_data.systems
+            if normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+        }
+
+        members: dict[str, ZpoolMember] = {}
+        for device in raw_data.pool_devices:
+            pool_id = normalize_text(
+                str(device.get("storagePoolId") or device.get("poolId"))
+                if (device.get("storagePoolId") or device.get("poolId")) is not None
+                else None
+            )
+            pool = pool_index.get(pool_id)
+            if pool is None:
+                continue
+
+            pool_name = normalize_text(
+                str(pool.get("name") or pool.get("description") or pool_id)
+                if (pool.get("name") or pool.get("description") or pool_id) is not None
+                else None
+            ) or "Pool"
+            member_number = device.get("number")
+            vdev_name = normalize_text(device.get("raidGroupId") or device.get("name") or device.get("deviceName")) or (
+                f"member-{member_number}" if isinstance(member_number, int) else "member"
+            )
+            vdev_class = normalize_text(
+                device.get("class")
+                or device.get("usageType")
+                or device.get("role")
+                or ("spare" if device.get("isSpare") or normalize_text(device.get("raidGroupId")) == "spares" else None)
+            ) or "data"
+            owner_label = self._quantastor_pool_owner_label(pool, system_index)
+            topology_label = f"{pool_name} > {vdev_name} > {vdev_class}"
+            if owner_label:
+                topology_label = f"{topology_label} ({owner_label})"
+
+            member = ZpoolMember(
+                pool_name=pool_name,
+                vdev_class=vdev_class,
+                vdev_name=vdev_name,
+                topology_label=topology_label,
+                health=normalize_text(device.get("status") or pool.get("status") or pool.get("health")),
+                raw_name=normalize_text(device.get("name") or device.get("devicePath")),
+                raw_path=normalize_text(device.get("devicePath")),
+            )
+            for key in normalize_lookup_keys(device.get("physicalDiskId")):
+                members[key] = member
+            for key in normalize_lookup_keys(device.get("devicePath")):
+                members[key] = member
+            for key in normalize_lookup_keys(device.get("physicalDiskSerialNumber")):
+                members[key] = member
+            for key in normalize_lookup_keys(device.get("physicalDiskScsiId")):
+                members[key] = member
+            physical_disk_obj = device.get("physicalDiskObj")
+            if isinstance(physical_disk_obj, dict):
+                for value in (
+                    physical_disk_obj.get("id"),
+                    physical_disk_obj.get("serialNumber"),
+                    physical_disk_obj.get("scsiId"),
+                    physical_disk_obj.get("devicePath"),
+                    physical_disk_obj.get("altDevicePath"),
+                ):
+                    for key in normalize_lookup_keys(str(value) if value is not None else None):
+                        members[key] = member
+
+        if members:
+            return members
+
+        for disk in disk_records:
+            pool_id = normalize_text(
+                str(disk.raw.get("storagePoolId") or disk.raw.get("poolId"))
+                if (disk.raw.get("storagePoolId") or disk.raw.get("poolId")) is not None
+                else None
+            )
+            pool = pool_index.get(pool_id)
+            if pool is None:
+                continue
+            pool_name = normalize_text(
+                str(pool.get("name") or pool.get("description") or pool_id)
+                if (pool.get("name") or pool.get("description") or pool_id) is not None
+                else None
+            ) or "Pool"
+            owner_label = self._quantastor_pool_owner_label(pool, system_index)
+            topology_label = f"{pool_name} > disk > data"
+            if owner_label:
+                topology_label = f"{topology_label} ({owner_label})"
+            member = ZpoolMember(
+                pool_name=pool_name,
+                vdev_class="data",
+                vdev_name="disk",
+                topology_label=topology_label,
+                health=disk.health,
+                raw_name=normalize_text(disk.raw.get("name") or disk.raw.get("devicePath")),
+                raw_path=normalize_text(disk.raw.get("devicePath")),
+            )
+            for key in disk.lookup_keys:
+                members[key] = member
+        return members
+
+    @staticmethod
+    def _quantastor_pool_owner_label(pool: dict[str, Any], system_index: dict[str, str | None]) -> str | None:
+        owner_id = normalize_text(
+            str(pool.get("activeStorageSystemId") or pool.get("primaryStorageSystemId") or pool.get("storageSystemId"))
+            if (pool.get("activeStorageSystemId") or pool.get("primaryStorageSystemId") or pool.get("storageSystemId")) is not None
+            else None
+        )
+        if not owner_id:
+            return None
+        owner_name = system_index.get(owner_id) or owner_id
+        return f"active on {owner_name}"
+
+    @staticmethod
+    def _quantastor_has_cluster_peers(raw_data: TrueNASRawData) -> bool:
+        cluster_members: dict[str, set[str]] = {}
+        for system_row in raw_data.systems:
+            cluster_id = normalize_text(
+                str(system_row.get("storageSystemClusterId"))
+                if system_row.get("storageSystemClusterId") is not None
+                else None
+            )
+            system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            if cluster_id and system_id:
+                cluster_members.setdefault(cluster_id, set()).add(system_id)
+        return any(len(members) > 1 for members in cluster_members.values())
+
+    def _build_quantastor_cluster_warnings(
+        self,
+        raw_data: TrueNASRawData,
+        selected_system_id: str | None,
+    ) -> list[str]:
+        if not (raw_data.ha_groups or self._quantastor_has_cluster_peers(raw_data)):
+            return []
+
+        systems_by_id = {
+            normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None): system_row
+            for system_row in raw_data.systems
+            if normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+        }
+        hardware_system_ids = {
+            system_id
+            for system_id in (
+                normalize_text(str(item.get("storageSystemId")) if item.get("storageSystemId") is not None else None)
+                for item in [*self._quantastor_hw_disk_rows(raw_data), *self._quantastor_hw_enclosure_rows(raw_data)]
+            )
+            if system_id
+        }
+
+        selected_row = systems_by_id.get(selected_system_id)
+        cluster_id = normalize_text(
+            str(selected_row.get("storageSystemClusterId"))
+            if isinstance(selected_row, dict) and selected_row.get("storageSystemClusterId") is not None
+            else None
+        )
+
+        cluster_rows = [
+            row
+            for row in raw_data.systems
+            if (
+                cluster_id
+                and normalize_text(
+                    str(row.get("storageSystemClusterId")) if row.get("storageSystemClusterId") is not None else None
+                )
+                == cluster_id
+            )
+        ]
+        node_rows = [
+            row
+            for row in cluster_rows
+            if normalize_text(str(row.get("id")) if row.get("id") is not None else None) in hardware_system_ids
+        ] or cluster_rows
+
+        master_row = next((row for row in node_rows if self._quantastor_bool(row.get("isMaster"))), None)
+        selected_label = normalize_text(
+            str(selected_row.get("name") or selected_row.get("hostname") or selected_system_id)
+            if isinstance(selected_row, dict) and (selected_row.get("name") or selected_row.get("hostname") or selected_system_id)
+            else selected_system_id
+        ) or "selected node"
+        warnings: list[str] = []
+
+        if master_row is not None:
+            master_id = normalize_text(str(master_row.get("id")) if master_row.get("id") is not None else None)
+            master_label = normalize_text(
+                str(master_row.get("name") or master_row.get("hostname") or master_id)
+                if (master_row.get("name") or master_row.get("hostname") or master_id) is not None
+                else None
+            ) or "unknown master"
+            if selected_system_id and master_id and selected_system_id != master_id:
+                warnings.append(
+                    f"Quantastor HA detected. Cluster master is {master_label}; selected view is {selected_label}."
+                )
+            else:
+                warnings.append(f"Quantastor HA detected. Cluster master is {master_label}.")
+        else:
+            warnings.append(
+                "Quantastor HA groups were detected. This first-pass adapter renders storage-system-scoped views; "
+                "shared-slot ownership overlays and IO-fencing context are still future work."
+            )
+
+        # Quantastor can return an aggregate cluster object alongside the real
+        # node records. The aggregate may advertise broader policy defaults that
+        # do not match the current node-level state shown in the appliance UI,
+        # so prefer the hardware-backed node rows when deciding whether to warn.
+        io_fencing_rows = node_rows or cluster_rows
+        if any(self._quantastor_bool(row.get("disableIoFencing")) for row in io_fencing_rows):
+            warnings.append(
+                "Quantastor cluster metadata reports IO fencing is currently disabled."
+            )
+
+        return warnings
+
+    def _build_quantastor_platform_context(
+        self,
+        raw_data: TrueNASRawData,
+        selected_system_id: str | None,
+    ) -> dict[str, Any]:
+        systems_by_id = {
+            normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None): system_row
+            for system_row in raw_data.systems
+            if normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+        }
+        system_labels = self._quantastor_system_label_index(raw_data)
+        selected_row = systems_by_id.get(selected_system_id)
+        if selected_row is None:
+            return {}
+
+        cluster_id = normalize_text(
+            str(selected_row.get("storageSystemClusterId"))
+            if selected_row.get("storageSystemClusterId") is not None
+            else None
+        )
+        cluster_rows = [
+            row
+            for row in raw_data.systems
+            if (
+                cluster_id
+                and normalize_text(
+                    str(row.get("storageSystemClusterId")) if row.get("storageSystemClusterId") is not None else None
+                ) == cluster_id
+            )
+        ] or [selected_row]
+        hardware_system_ids = {
+            system_id
+            for system_id in (
+                normalize_text(str(item.get("storageSystemId")) if item.get("storageSystemId") is not None else None)
+                for item in [*self._quantastor_hw_disk_rows(raw_data), *self._quantastor_hw_enclosure_rows(raw_data)]
+            )
+            if system_id
+        }
+        node_rows = [
+            row
+            for row in cluster_rows
+            if normalize_text(str(row.get("id")) if row.get("id") is not None else None) in hardware_system_ids
+        ] or cluster_rows
+        master_row = next((row for row in node_rows if self._quantastor_bool(row.get("isMaster"))), None)
+        io_fencing_rows = node_rows or cluster_rows
+        selected_label = system_labels.get(selected_system_id) or selected_system_id
+        peer_labels = [
+            system_labels.get(system_id) or system_id
+            for system_id in (
+                normalize_text(str(row.get("id")) if row.get("id") is not None else None)
+                for row in node_rows
+            )
+            if system_id and system_id != selected_system_id
+        ]
+        master_id = normalize_text(str(master_row.get("id")) if master_row and master_row.get("id") is not None else None)
+
+        return {
+            "cluster_id": cluster_id,
+            "selected_view_id": selected_system_id,
+            "selected_view_label": selected_label,
+            "cluster_node_labels": [
+                system_labels.get(system_id) or system_id
+                for system_id in (
+                    normalize_text(str(row.get("id")) if row.get("id") is not None else None)
+                    for row in node_rows
+                )
+                if system_id
+            ],
+            "peer_labels": peer_labels,
+            "master_system_id": master_id,
+            "master_label": system_labels.get(master_id) or master_id,
+            "selected_is_master": bool(selected_system_id and master_id and selected_system_id == master_id),
+            "io_fencing_enabled": (
+                None
+                if not io_fencing_rows
+                else not any(self._quantastor_bool(row.get("disableIoFencing")) for row in io_fencing_rows)
+            ),
+        }
+
+    @staticmethod
+    def _quantastor_system_label_index(raw_data: TrueNASRawData) -> dict[str, str]:
+        labels: dict[str, str] = {}
+        for system_row in raw_data.systems:
+            system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            if not system_id:
+                continue
+            labels[system_id] = (
+                normalize_text(
+                    str(system_row.get("name") or system_row.get("hostname") or system_id)
+                    if (system_row.get("name") or system_row.get("hostname") or system_id) is not None
+                    else None
+                )
+                or system_id
+            )
+        return labels
+
+    def _build_quantastor_presence_hints(self, raw_data: TrueNASRawData) -> dict[str, set[str]]:
+        hints: dict[str, set[str]] = {}
+        rows = [*raw_data.disks, *raw_data.cli_disks, *self._quantastor_hw_disk_rows(raw_data)]
+        for row in rows:
+            owner_id = normalize_text(
+                str(row.get("storageSystemId") or row.get("iofenceSystemId") or row.get("controllerId"))
+                if (row.get("storageSystemId") or row.get("iofenceSystemId") or row.get("controllerId")) is not None
+                else None
+            )
+            if not owner_id:
+                continue
+            for key in self._collect_quantastor_lookup_keys(row):
+                hints.setdefault(key, set()).add(owner_id)
+        return hints
+
+    @staticmethod
+    def _collect_quantastor_lookup_keys(payload: dict[str, Any] | None) -> set[str]:
+        if not isinstance(payload, dict):
+            return set()
+
+        keys: set[str] = set()
+        for value in (
+            payload.get("id"),
+            payload.get("storagePoolDeviceId"),
+            payload.get("hwDiskId"),
+            payload.get("physicalDiskId"),
+            payload.get("serialNumber"),
+            payload.get("serialNum"),
+            payload.get("scsiId"),
+            payload.get("wwid"),
+            payload.get("devicePath"),
+            payload.get("altDevicePath"),
+            payload.get("name"),
+            payload.get("sasAddress"),
+            payload.get("vpd83Id"),
+            payload.get("multipathParentDiskId"),
+        ):
+            keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+        return keys
+
+    def _annotate_quantastor_slot_context(
+        self,
+        slot_views: list[SlotView],
+        raw_data: TrueNASRawData,
+        selected_system_id: str | None,
+        platform_context: dict[str, Any],
+    ) -> None:
+        system_labels = self._quantastor_system_label_index(raw_data)
+        presence_hints = self._build_quantastor_presence_hints(raw_data)
+        pool_index = {
+            normalize_text(str(pool.get("id")) if pool.get("id") is not None else None): pool
+            for pool in raw_data.pools
+            if normalize_text(str(pool.get("id")) if pool.get("id") is not None else None)
+        }
+
+        for slot_view in slot_views:
+            raw_disk = slot_view.raw_status.get("disk_raw") if isinstance(slot_view.raw_status, dict) else None
+            if not isinstance(raw_disk, dict):
+                continue
+
+            lookup_keys = self._collect_quantastor_lookup_keys(raw_disk)
+            cli_disk = raw_disk.get("quantastor_cli_disk") if isinstance(raw_disk.get("quantastor_cli_disk"), dict) else None
+            hw_disk = raw_disk.get("quantastor_hw_disk") if isinstance(raw_disk.get("quantastor_hw_disk"), dict) else None
+            pool_device = raw_disk.get("quantastor_pool_device") if isinstance(raw_disk.get("quantastor_pool_device"), dict) else None
+            physical_disk_obj = None
+            if pool_device and isinstance(pool_device.get("physicalDiskObj"), dict):
+                physical_disk_obj = pool_device.get("physicalDiskObj")
+
+            lookup_keys.update(self._collect_quantastor_lookup_keys(cli_disk))
+            lookup_keys.update(self._collect_quantastor_lookup_keys(hw_disk))
+            lookup_keys.update(self._collect_quantastor_lookup_keys(pool_device))
+            lookup_keys.update(self._collect_quantastor_lookup_keys(physical_disk_obj))
+
+            visible_on_ids = sorted({system_id for key in lookup_keys for system_id in presence_hints.get(key, set())})
+            visible_on_labels = [system_labels.get(system_id) or system_id for system_id in visible_on_ids if system_id]
+
+            pool_id = normalize_text(
+                str(
+                    raw_disk.get("storagePoolId")
+                    or raw_disk.get("poolId")
+                    or (pool_device.get("storagePoolId") if pool_device else None)
+                )
+                if (
+                    raw_disk.get("storagePoolId")
+                    or raw_disk.get("poolId")
+                    or (pool_device.get("storagePoolId") if pool_device else None)
+                ) is not None
+                else None
+            )
+            pool = pool_index.get(pool_id)
+            pool_owner_id = normalize_text(
+                str(
+                    (pool.get("activeStorageSystemId") if isinstance(pool, dict) else None)
+                    or (pool.get("primaryStorageSystemId") if isinstance(pool, dict) else None)
+                    or (pool.get("storageSystemId") if isinstance(pool, dict) else None)
+                    or (pool_device.get("storageSystemId") if pool_device else None)
+                )
+                if (
+                    (pool.get("activeStorageSystemId") if isinstance(pool, dict) else None)
+                    or (pool.get("primaryStorageSystemId") if isinstance(pool, dict) else None)
+                    or (pool.get("storageSystemId") if isinstance(pool, dict) else None)
+                    or (pool_device.get("storageSystemId") if pool_device else None)
+                ) is not None
+                else None
+            )
+            fence_owner_id = normalize_text(
+                str(
+                    raw_disk.get("iofenceSystemId")
+                    or (cli_disk.get("iofenceSystemId") if cli_disk else None)
+                    or (physical_disk_obj.get("iofenceSystemId") if physical_disk_obj else None)
+                )
+                if (
+                    raw_disk.get("iofenceSystemId")
+                    or (cli_disk.get("iofenceSystemId") if cli_disk else None)
+                    or (physical_disk_obj.get("iofenceSystemId") if physical_disk_obj else None)
+                ) is not None
+                else None
+            )
+            presented_by_id = normalize_text(
+                str(raw_disk.get("storageSystemId")) if raw_disk.get("storageSystemId") is not None else None
+            )
+            pool_device_node_id = normalize_text(
+                str(pool_device.get("storageSystemId")) if pool_device and pool_device.get("storageSystemId") is not None else None
+            )
+
+            selected_label = platform_context.get("selected_view_label")
+            pool_owner_label = system_labels.get(pool_owner_id) or pool_owner_id
+            fence_owner_label = system_labels.get(fence_owner_id) or fence_owner_id
+            presented_by_label = system_labels.get(presented_by_id) or presented_by_id
+            pool_device_node_label = system_labels.get(pool_device_node_id) or pool_device_node_id
+
+            notes: list[str] = []
+            if selected_label and pool_owner_label and selected_label != pool_owner_label:
+                notes.append(f"Pool is active on {pool_owner_label}, while this view is {selected_label}.")
+            if selected_label and fence_owner_label and selected_label != fence_owner_label:
+                notes.append(f"I/O fencing currently resolves to {fence_owner_label}.")
+
+            slot_view.operator_context = {
+                "selected_view_label": selected_label,
+                "cluster_master_label": platform_context.get("master_label"),
+                "presented_by_label": presented_by_label,
+                "pool_owner_label": pool_owner_label,
+                "fence_owner_label": fence_owner_label,
+                "pool_device_node_label": pool_device_node_label,
+                "visible_on_labels": visible_on_labels,
+                "io_fencing_enabled": platform_context.get("io_fencing_enabled"),
+                "is_remote_presentation": self._quantastor_bool(raw_disk.get("isRemote")),
+                "selected_view_is_pool_owner": bool(selected_system_id and pool_owner_id and selected_system_id == pool_owner_id),
+                "selected_view_is_fence_owner": bool(selected_system_id and fence_owner_id and selected_system_id == fence_owner_id),
+                "ownership_revision": raw_disk.get("ownershipRevision"),
+                "notes": notes,
+            }
+
+    @staticmethod
+    def _quantastor_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return False
+
+    def _build_quantastor_smart_summary(self, slot_view: SlotView) -> SmartSummaryView:
+        raw_disk = slot_view.raw_status.get("disk_raw") if isinstance(slot_view.raw_status, dict) else None
+        if not isinstance(raw_disk, dict):
+            return self._fallback_smart_summary(
+                slot_view,
+                "Detailed Quantastor SMART drill-down is not wired for this slot yet.",
+            )
+
+        temperature_c = (
+            self._extract_quantastor_int(raw_disk, "temperature", "currentTemperature", "currTemp")
+            or self._extract_quantastor_temperature(raw_disk.get("driveTemp"))
+            or slot_view.temperature_c
+        )
+        power_on_hours = self._extract_quantastor_int(raw_disk, "powerOnHours", "powerOnTimeHours", "powerOnTime")
+        bytes_read = self._extract_quantastor_bytes(raw_disk, "bytesRead", "dataReadBytes", "logicalBytesRead")
+        bytes_written = self._extract_quantastor_bytes(raw_disk, "bytesWritten", "dataWrittenBytes", "logicalBytesWritten")
+        rotation_rate = self._extract_quantastor_int(raw_disk, "rotationRate", "rotationRateRpm", "rpm")
+        if rotation_rate is None and raw_disk.get("isSsd") is True:
+            rotation_rate = 0
+        form_factor = normalize_text(raw_disk.get("formFactor") or raw_disk.get("diskFormFactor"))
+        smart_health_status = normalize_text(raw_disk.get("smartHealthTest"))
+        if smart_health_status and smart_health_status.startswith("[") and smart_health_status.endswith("]"):
+            smart_health_status = smart_health_status[1:-1].strip() or smart_health_status
+        transport_protocol = (
+            normalize_text(raw_disk.get("transportType") or raw_disk.get("protocol") or raw_disk.get("mediaInterface"))
+            or ("SAS" if normalize_text(raw_disk.get("sasAddress")) else None)
+        )
+
+        summary = SmartSummaryView(
+            available=True,
+            temperature_c=temperature_c,
+            smart_health_status=smart_health_status,
+            power_on_hours=power_on_hours,
+            power_on_days=(power_on_hours // 24) if isinstance(power_on_hours, int) else None,
+            logical_block_size=(
+                self._extract_quantastor_int(raw_disk, "logicalBlockSize", "sectorSize", "logSectorSize", "blockSize")
+                or slot_view.logical_block_size
+            ),
+            physical_block_size=(
+                self._extract_quantastor_int(raw_disk, "physicalBlockSize", "phySectorSize", "blockSize")
+                or slot_view.physical_block_size
+            ),
+            bytes_read=bytes_read,
+            bytes_written=bytes_written,
+            annualized_bytes_written=(
+                int(bytes_written / max(power_on_hours / 8760, 1 / 8760))
+                if isinstance(bytes_written, int) and isinstance(power_on_hours, int) and power_on_hours > 0
+                else None
+            ),
+            endurance_remaining_percent=self._extract_quantastor_int(raw_disk, "ssdLifeLeft", "lifeLeftPercent"),
+            media_errors=self._extract_quantastor_int(raw_disk, "mediumErrors", "mediaErrors", "readErrors", "writeErrors"),
+            predictive_errors=self._extract_quantastor_int(raw_disk, "predictiveErrors", "errCountPredictive"),
+            non_medium_errors=self._extract_quantastor_int(raw_disk, "errCountNonMedium", "nonMediumErrors"),
+            uncorrected_read_errors=self._extract_quantastor_int(raw_disk, "errCountUncorrectedRead"),
+            uncorrected_write_errors=self._extract_quantastor_int(raw_disk, "errCountUncorrectedWrite"),
+            rotation_rate_rpm=rotation_rate,
+            form_factor=form_factor,
+            firmware_version=normalize_text(raw_disk.get("firmwareVersion") or raw_disk.get("revisionLevel")),
+            trim_supported=(
+                self._quantastor_bool(raw_disk.get("trimSupported"))
+                if raw_disk.get("trimSupported") not in (None, "")
+                else None
+            ),
+            transport_protocol=transport_protocol,
+            logical_unit_id=normalize_text(raw_disk.get("wwn") or raw_disk.get("scsiId")) or slot_view.logical_unit_id,
+            sas_address=normalize_hex_identifier(raw_disk.get("sasAddress")) or slot_view.sas_address,
+            attached_sas_address=normalize_hex_identifier(
+                raw_disk.get("attachedSasAddress")
+                or slot_view.raw_status.get("attached_sas_address")
+            ),
+            message=(
+                "Quantastor slot detail is first-pass and reflects the current appliance payload, "
+                "supplemented with SSH CLI disk rows and smartctl when available."
+                if raw_disk.get("quantastor_cli_disk") or raw_disk.get("quantastor_hw_disk_source") == "cli"
+                else "Quantastor REST SMART detail is first-pass and reflects the current disk payload exposed by the appliance API."
+            ),
+        )
+        if not any(
+            value is not None
+            for value in (
+                summary.temperature_c,
+                summary.smart_health_status,
+                summary.power_on_hours,
+                summary.bytes_read,
+                summary.bytes_written,
+                summary.rotation_rate_rpm,
+                summary.trim_supported,
+                summary.transport_protocol,
+            )
+        ):
+            return self._fallback_smart_summary(
+                slot_view,
+                "Quantastor returned inventory for this disk, but no richer SMART counters in the current payload.",
+            )
+        return summary
+
+    @staticmethod
+    def _quantastor_hw_disk_rows(raw_data: TrueNASRawData) -> list[dict[str, Any]]:
+        return raw_data.cli_hw_disks or raw_data.hw_disks
+
+    @staticmethod
+    def _quantastor_hw_enclosure_rows(raw_data: TrueNASRawData) -> list[dict[str, Any]]:
+        return raw_data.cli_hw_enclosures or raw_data.hw_enclosures
+
+    async def _fetch_quantastor_cli_overlay(self) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+        overlay = {
+            "cli_disks": [],
+            "cli_hw_disks": [],
+            "cli_hw_enclosures": [],
+        }
+        best_overlay = dict(overlay)
+        best_score = 0
+        best_host: str | None = None
+        failures: list[str] = []
+        target_specs = (
+            ("disk-list", "disk inventory", "cli_disks"),
+            ("hw-disk-list", "hardware disk inventory", "cli_hw_disks"),
+            ("hw-enclosure-list", "hardware enclosure inventory", "cli_hw_enclosures"),
+        )
+
+        for host in self._build_quantastor_ssh_hosts():
+            host_overlay = {
+                "cli_disks": [],
+                "cli_hw_disks": [],
+                "cli_hw_enclosures": [],
+            }
+            host_failures: list[str] = []
+
+            for subcommand, label, target in target_specs:
+                result = await self._run_ssh_command(self._build_quantastor_cli_command(subcommand), host)
+                if not result.ok:
+                    detail = normalize_text(result.stderr) or normalize_text(result.stdout) or f"exit {result.exit_code}"
+                    host_failures.append(f"Quantastor SSH CLI {label} failed on {host}: {detail}")
+                    continue
+                try:
+                    payload = json.loads(result.stdout)
+                except json.JSONDecodeError:
+                    host_failures.append(f"Quantastor SSH CLI {label} returned invalid JSON on {host}.")
+                    continue
+                rows = QuantastorRESTClient._ensure_list(payload)
+                if not rows:
+                    host_failures.append(f"Quantastor SSH CLI {label} returned no usable rows on {host}.")
+                    continue
+                host_overlay[target] = rows
+
+            failures.extend(host_failures)
+            host_score = sum(len(rows) for rows in host_overlay.values())
+            if host_score > best_score:
+                best_overlay = host_overlay
+                best_score = host_score
+                best_host = host
+
+            populated_targets = sum(1 for rows in host_overlay.values() if rows)
+            if populated_targets == len(target_specs) and host_score > 0:
+                self._quantastor_preferred_ses_host = host
+                return host_overlay, []
+
+        if best_score <= 0:
+            return overlay, failures
+        self._quantastor_preferred_ses_host = best_host
+        return best_overlay, []
+
+    async def _fetch_quantastor_ses_overlay(self) -> tuple[ParsedSSHData, list[str]]:
+        best_overlay = ParsedSSHData()
+        best_score = 0
+        best_host: str | None = None
+        failures: list[str] = []
+        preferred_host = normalize_text(self._quantastor_preferred_ses_host)
+
+        for host in self._build_quantastor_ssh_hosts():
+            device_discovery = await self._run_ssh_command(self._build_quantastor_ses_discovery_command(), host)
+            if not device_discovery.ok:
+                detail = normalize_text(device_discovery.stderr) or normalize_text(device_discovery.stdout) or (
+                    f"exit {device_discovery.exit_code}"
+                )
+                failures.append(f"Quantastor SSH SES discovery failed on {host}: {detail}")
+                continue
+
+            devices = [
+                normalize_text(line)
+                for line in device_discovery.stdout.splitlines()
+                if normalize_text(line) and normalize_text(line).startswith("/dev/sg")
+            ]
+            if not devices:
+                failures.append(f"Quantastor SSH SES discovery found no usable sg_ses devices on {host}.")
+                continue
+
+            host_overlay = ParsedSSHData()
+            host_score = 0
+            host_failures: list[str] = []
+            for device in devices:
+                aes_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "aes", device])
+                aes_result = await self._run_ssh_command(aes_command, host)
+                if not aes_result.ok:
+                    detail = normalize_text(aes_result.stderr) or normalize_text(aes_result.stdout) or (
+                        f"exit {aes_result.exit_code}"
+                    )
+                    host_failures.append(f"Quantastor AES page probe failed on {host} {device}: {detail}")
+                    continue
+
+                outputs = {aes_command: aes_result.stdout}
+                ec_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "ec", device])
+                ec_result = await self._run_ssh_command(ec_command, host)
+                if ec_result.ok:
+                    outputs[ec_command] = ec_result.stdout
+
+                parsed = parse_ssh_outputs(outputs, self.settings.layout.slot_count, None, None)
+                score = sum(len(enclosure.slots) for enclosure in parsed.ses_enclosures)
+                if score <= 0:
+                    continue
+                self._tag_quantastor_ses_overlay(parsed, host)
+                if score > host_score:
+                    host_overlay = parsed
+                    host_score = score
+
+            if host_failures:
+                failures.extend(host_failures)
+            if host_score > best_score:
+                best_overlay = host_overlay
+                best_score = host_score
+                best_host = host
+            if preferred_host and host == preferred_host and host_score > 0:
+                self._quantastor_preferred_ses_host = preferred_host
+                return host_overlay, []
+
+        if best_score <= 0:
+            return ParsedSSHData(), failures
+        self._quantastor_preferred_ses_host = best_host
+        return best_overlay, []
+
+    def _build_quantastor_ssh_hosts(self) -> list[str]:
+        hosts: list[str] = []
+        for value in [self._quantastor_preferred_ses_host, self.system.ssh.host, *(self.system.ssh.extra_hosts or [])]:
+            host = normalize_text(value)
+            if host and host not in hosts:
+                hosts.append(host)
+        return hosts
+
+    def _build_quantastor_preferred_hosts(self, slot_view: SlotView | None = None) -> list[str]:
+        hosts: list[str] = []
+        if slot_view:
+            for target in slot_view.ssh_ses_targets:
+                if not isinstance(target, dict):
+                    continue
+                host = normalize_text(target.get("ssh_host"))
+                if host and host not in hosts:
+                    hosts.append(host)
+        for value in [self._quantastor_preferred_ses_host, self.system.ssh.host, *(self.system.ssh.extra_hosts or [])]:
+            host = normalize_text(value)
+            if host and host not in hosts:
+                hosts.append(host)
+        return hosts
+
+    @staticmethod
+    def _merge_quantastor_ses_candidate(target: dict[str, Any], ses_candidate: Any) -> None:
+        if not isinstance(ses_candidate, dict):
+            return
+        if ses_candidate.get("descriptor"):
+            target["descriptor"] = ses_candidate.get("descriptor")
+        if ses_candidate.get("status"):
+            target["status"] = ses_candidate.get("status")
+        if ses_candidate.get("ses_device"):
+            target["ses_device"] = ses_candidate.get("ses_device")
+        if isinstance(ses_candidate.get("ses_element_id"), int):
+            target["ses_element_id"] = ses_candidate.get("ses_element_id")
+        if isinstance(ses_candidate.get("ses_targets"), list) and ses_candidate.get("ses_targets"):
+            target["ses_targets"] = ses_candidate.get("ses_targets")
+        if ses_candidate.get("sas_address_hint"):
+            target["sas_address_hint"] = ses_candidate.get("sas_address_hint")
+        if ses_candidate.get("sas_device_type"):
+            target["sas_device_type"] = ses_candidate.get("sas_device_type")
+        if ses_candidate.get("attached_sas_address"):
+            target["attached_sas_address"] = ses_candidate.get("attached_sas_address")
+        for field in (
+            "ses_predicted_failure",
+            "ses_disabled",
+            "ses_hot_spare",
+            "ses_do_not_remove",
+            "ses_fault_sensed",
+            "ses_fault_requested",
+        ):
+            if field in ses_candidate:
+                target[field] = ses_candidate.get(field)
+        if isinstance(ses_candidate.get("identify_active"), bool):
+            target["identify_active"] = bool(target.get("identify_active")) or ses_candidate.get("identify_active")
+        if isinstance(ses_candidate.get("present"), bool):
+            target["present"] = ses_candidate.get("present")
+
+    @staticmethod
+    def _build_quantastor_ses_discovery_command() -> str:
+        script = 'for dev in /dev/sg*; do if sudo -n /usr/bin/sg_ses -p aes "$dev" >/dev/null 2>&1; then echo "$dev"; fi; done'
+        return shlex.join(["/bin/sh", "-lc", script])
+
+    @staticmethod
+    def _tag_quantastor_ses_overlay(ssh_data: ParsedSSHData, host: str) -> None:
+        tagged_host = normalize_text(host)
+        if not tagged_host:
+            return
+
+        for payload in ssh_data.ses_slot_candidates.values():
+            targets = payload.get("ses_targets")
+            if not isinstance(targets, list):
+                continue
+            tagged_targets: list[dict[str, Any]] = []
+            for item in targets:
+                if not isinstance(item, dict):
+                    continue
+                tagged = dict(item)
+                tagged["ssh_host"] = tagged_host
+                tagged_targets.append(tagged)
+            if tagged_targets:
+                payload["ses_targets"] = tagged_targets
+
+        for enclosure in ssh_data.ses_enclosures:
+            for slot in enclosure.slots.values():
+                tagged_targets: list[dict[str, Any]] = []
+                for item in slot.control_targets:
+                    if not isinstance(item, dict):
+                        continue
+                    tagged = dict(item)
+                    tagged["ssh_host"] = tagged_host
+                    tagged_targets.append(tagged)
+                if tagged_targets:
+                    slot.control_targets = tagged_targets
+
+    def _build_quantastor_cli_command(self, subcommand: str) -> str:
+        args = ["/usr/bin/qs", subcommand, "--json"]
+        server_spec = self._build_quantastor_cli_server_spec()
+        if server_spec:
+            args.append(f"--server={server_spec}")
+        return shlex.join(args)
+
+    def _build_quantastor_cli_server_spec(self) -> str | None:
+        api_user = normalize_text(self.system.truenas.api_user)
+        api_password = normalize_text(self.system.truenas.api_password)
+        if api_user and api_password:
+            return f"localhost,{api_user},{api_password}"
+        return None
+
+    def _score_quantastor_cli_disk_row(self, row: dict[str, Any], selected_system_id: str | None) -> int:
+        score = 0
+        owner_id = normalize_text(
+            str(row.get("storageSystemId") or row.get("iofenceSystemId") or row.get("controllerId"))
+            if (row.get("storageSystemId") or row.get("iofenceSystemId") or row.get("controllerId")) is not None
+            else None
+        )
+        if selected_system_id and owner_id == selected_system_id:
+            score += 8
+        if normalize_text(str(row.get("storagePoolId")) if row.get("storagePoolId") is not None else None):
+            score += 4
+        if normalize_text(str(row.get("hwDiskId")) if row.get("hwDiskId") is not None else None):
+            score += 3
+        if normalize_text(str(row.get("multipathParentDiskId")) if row.get("multipathParentDiskId") is not None else None):
+            score += 2
+        device_path = normalize_text(row.get("devicePath"))
+        if device_path and "/dev/disk/by-dmuuid/" not in device_path:
+            score += 1
+        return score
+
+    @staticmethod
+    def _merge_quantastor_payloads(preferred: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(current)
+        for key, value in preferred.items():
+            if value in (None, "", [], {}):
+                continue
+            if merged.get(key) in (None, "", [], {}):
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _extract_quantastor_slot(disk: dict[str, Any]) -> int | None:
+        for key in ("slot", "slotNumber", "slotId", "enclosureSlotNumber", "bayNumber", "positionNumber"):
+            value = disk.get(key)
+            if isinstance(value, str):
+                text = value.strip()
+                if text.isdigit():
+                    numeric = int(text)
+                    # Quantastor shared-slot payloads can mix literal zero-based slots
+                    # like "0" and "12" with zero-padded single-digit slots like "01".
+                    # Only the zero-padded single-digit form should be normalized down.
+                    if len(text) > 1 and text.startswith("0") and numeric < 10:
+                        return numeric - 1
+                    return numeric
+            if isinstance(value, int):
+                return value
+        return None
+
+    @staticmethod
+    def _extract_quantastor_int(payload: dict[str, Any], *keys: str) -> int | None:
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    normalized = text.replace(",", "")
+                    if re.fullmatch(r"-?\d+", normalized):
+                        return int(normalized)
+                    match = re.search(r"-?\d[\d,]*", text)
+                    if match:
+                        return int(match.group(0).replace(",", ""))
+        return None
+
+    @staticmethod
+    def _extract_quantastor_temperature(value: Any) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            match = re.search(r"(-?\d+)", value)
+            if match:
+                return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _extract_quantastor_bytes(payload: dict[str, Any], *keys: str) -> int | None:
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            parsed = parse_size_to_bytes(value)
+            if parsed is not None:
+                return parsed
+        return None
 
     def _build_linux_enclosure_options(self) -> list[EnclosureOption]:
         profile = self.profile_registry.resolve_for_enclosure(
@@ -1492,9 +3140,31 @@ class InventoryService:
                     if disk:
                         return disk
 
-        direct = disks_by_slot.get((enclosure_id, slot)) or disks_by_slot.get((None, slot))
-        if direct:
-            return direct
+        sas_address_hint = normalize_hex_identifier(raw_slot_status.get("sas_address_hint"))
+        raw_present = raw_slot_status.get("present") if isinstance(raw_slot_status.get("present"), bool) else None
+        sas_device_type = normalize_text(raw_slot_status.get("sas_device_type"))
+        quantastor_ses_empty = (
+            self.system.truenas.platform == "quantastor"
+            and (
+                normalize_text(raw_slot_status.get("ses_device"))
+                or (isinstance(raw_slot_status.get("ses_targets"), list) and raw_slot_status.get("ses_targets"))
+            )
+            and (
+                raw_present is False
+                or sas_address_hint == "0"
+                or (sas_device_type and "no sas device attached" in sas_device_type.lower())
+            )
+        )
+
+        if self.system.truenas.platform == "quantastor" and sas_address_hint and sas_address_hint != "0":
+            hinted = disks_by_sas.get(sas_address_hint)
+            if hinted:
+                return hinted
+
+        if not quantastor_ses_empty:
+            direct = disks_by_slot.get((enclosure_id, slot)) or disks_by_slot.get((None, slot))
+            if direct:
+                return direct
 
         for candidate in raw_slot_status.get("device_names", []) or []:
             normalized = normalize_device_name(candidate)
@@ -1513,7 +3183,6 @@ class InventoryService:
                 if hinted:
                     return hinted
 
-        sas_address_hint = normalize_hex_identifier(raw_slot_status.get("sas_address_hint"))
         if sas_address_hint:
             hinted = disks_by_sas.get(sas_address_hint)
             if hinted:
@@ -1561,10 +3230,22 @@ class InventoryService:
             zpool.health if zpool else None,
         )
         raw_present = raw_slot_status.get("present") if isinstance(raw_slot_status.get("present"), bool) else None
-        empty = raw_present is False or (not disk and self._status_contains(raw_slot_status, "empty", "not installed", "absent"))
-        present = (
-            disk is not None
-            or raw_present is True
+        quantastor_ses_empty = (
+            self.system.truenas.platform == "quantastor"
+            and raw_present is False
+            and (
+                normalize_text(raw_slot_status.get("ses_device"))
+                or (isinstance(raw_slot_status.get("ses_targets"), list) and raw_slot_status.get("ses_targets"))
+                or normalize_text(raw_slot_status.get("sas_device_type"))
+                or normalize_hex_identifier(raw_slot_status.get("sas_address_hint")) == "0"
+            )
+        )
+        empty = raw_present is False or (
+            raw_present is None and not disk and self._status_contains(raw_slot_status, "empty", "not installed", "absent")
+        )
+        present = False if quantastor_ses_empty else (
+            raw_present is True
+            or disk is not None
             or self._status_contains(raw_slot_status, "ok", "installed", "ready", "present")
             or identify_active
             or faulty
@@ -1574,10 +3255,10 @@ class InventoryService:
             state = SlotState.identify
         elif faulty:
             state = SlotState.fault
+        elif quantastor_ses_empty or empty:
+            state = SlotState.empty
         elif disk:
             state = SlotState.healthy
-        elif empty:
-            state = SlotState.empty
         elif mapping:
             state = SlotState.unmapped
         else:
@@ -1603,24 +3284,26 @@ class InventoryService:
         ses_element_id = raw_ses_element_id if isinstance(raw_ses_element_id, int) else None
         raw_ses_targets = raw_slot_status.get("ses_targets") if isinstance(raw_slot_status.get("ses_targets"), list) else []
         ses_targets = []
-        seen_ses_targets: set[tuple[str | None, int | None]] = set()
+        seen_ses_targets: set[tuple[str | None, str | None, int | None]] = set()
         for item in raw_ses_targets:
             if not isinstance(item, dict):
                 continue
+            target_host = normalize_text(item.get("ssh_host"))
             target_device = normalize_text(item.get("ses_device"))
             target_element = item.get("ses_element_id")
             target_slot_number = item.get("ses_slot_number") if isinstance(item.get("ses_slot_number"), int) else None
-            target_pair = (target_device, target_element if isinstance(target_element, int) else None)
-            if target_pair in seen_ses_targets or not target_pair[0] or target_pair[1] is None:
+            target_pair = (target_host, target_device, target_element if isinstance(target_element, int) else None)
+            if target_pair in seen_ses_targets or not target_pair[1] or target_pair[2] is None:
                 continue
             seen_ses_targets.add(target_pair)
-            ses_targets.append(
-                {
-                    "ses_device": target_pair[0],
-                    "ses_element_id": target_pair[1],
-                    "ses_slot_number": target_slot_number,
-                }
-            )
+            target_payload = {
+                "ses_device": target_pair[1],
+                "ses_element_id": target_pair[2],
+                "ses_slot_number": target_slot_number,
+            }
+            if target_host:
+                target_payload["ssh_host"] = target_host
+            ses_targets.append(target_payload)
         if not ses_targets and ses_device and ses_element_id is not None:
             ses_targets.append(
                 {
@@ -1640,7 +3323,19 @@ class InventoryService:
             )
         )
         ssh_led_supported = bool(self.system.ssh.enabled and ses_targets and not scale_linux_ses_targets)
-        if api_led_supported:
+        if self.system.truenas.platform == "quantastor" and self.system.ssh.enabled and ses_targets:
+            led_supported = True
+            led_backend = "quantastor_sg_ses"
+            led_reason = None
+        elif self.system.truenas.platform == "quantastor":
+            led_supported = False
+            led_backend = None
+            led_reason = (
+                "LED control is currently unavailable on this Quantastor cluster because the documented "
+                "REST and CLI identify operations are being rejected, and no working SES enclosure path "
+                "was discovered over SSH."
+            )
+        elif api_led_supported:
             led_supported = True
             led_backend = "api"
             led_reason = None
@@ -1777,6 +3472,7 @@ class InventoryService:
 
         failures: list[str] = []
         for target in ses_targets:
+            target_host = normalize_text(target.get("ssh_host"))
             target_device = normalize_text(target.get("ses_device"))
             target_element = target.get("ses_element_id")
             target_slot_number = target.get("ses_slot_number")
@@ -1814,13 +3510,22 @@ class InventoryService:
                         locate_state,
                     ]
                 )
-            result = await self.ssh_probe.run_command(command)
+            result = await self._run_ssh_command(command, target_host)
             if not result.ok:
                 detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH LED error."
-                failures.append(f"{target_device}:{target_element}: {detail}")
+                target_label = f"{target_host}:{target_device}" if target_host else target_device
+                failures.append(f"{target_label}:{target_element}: {detail}")
 
         if failures:
             raise TrueNASAPIError("SSH LED action failed: " + " | ".join(failures))
+
+    async def _run_ssh_command(self, command: str, host: str | None = None) -> Any:
+        target_host = normalize_text(host)
+        if not target_host or target_host == normalize_text(self.system.ssh.host):
+            return await self.ssh_probe.run_command(command)
+
+        probe = SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
+        return await probe.run_command(command)
 
     @staticmethod
     def _merge_enclosure_meta(
@@ -1875,6 +3580,26 @@ class InventoryService:
             if api_member:
                 return api_member
         return None
+
+    def _disk_sas_aliases(self, disk: DiskRecord) -> set[str]:
+        aliases = build_lunid_aliases(disk.lunid, self.system.truenas.platform)
+        raw_sources: list[dict[str, Any]] = []
+        if isinstance(disk.raw, dict):
+            raw_sources.append(disk.raw)
+            for key in ("quantastor_hw_disk", "quantastor_cli_disk"):
+                payload = disk.raw.get(key)
+                if isinstance(payload, dict):
+                    raw_sources.append(payload)
+
+        for payload in raw_sources:
+            for key in ("sasAddress", "portSasAddress", "scsiId", "wwid", "wwn"):
+                aliases.update(
+                    build_lunid_aliases(
+                        str(payload.get(key)) if payload.get(key) is not None else None,
+                        self.system.truenas.platform,
+                    )
+                )
+        return aliases
 
     def _build_multipath_view(
         self,
@@ -2070,6 +3795,7 @@ class InventoryService:
                 summary.temperature_c,
                 summary.warning_temperature_c,
                 summary.critical_temperature_c,
+                summary.smart_health_status,
                 summary.last_test_type,
                 summary.last_test_status,
                 summary.last_test_lifetime_hours,
@@ -2086,6 +3812,10 @@ class InventoryService:
                 summary.estimated_lifetime_bytes_written,
                 summary.estimated_remaining_bytes_written,
                 summary.media_errors,
+                summary.predictive_errors,
+                summary.non_medium_errors,
+                summary.uncorrected_read_errors,
+                summary.uncorrected_write_errors,
                 summary.unsafe_shutdowns,
                 summary.rotation_rate_rpm,
                 summary.form_factor,
@@ -2095,6 +3825,7 @@ class InventoryService:
                 summary.namespace_nguid,
                 summary.read_cache_enabled,
                 summary.writeback_cache_enabled,
+                summary.trim_supported,
                 summary.transport_protocol,
                 summary.logical_unit_id,
                 summary.sas_address,
@@ -2109,6 +3840,9 @@ class InventoryService:
         return any(
             value is None
             for value in (
+                summary.power_on_hours,
+                summary.rotation_rate_rpm,
+                summary.form_factor,
                 summary.read_cache_enabled,
                 summary.writeback_cache_enabled,
                 summary.transport_protocol,
@@ -2127,6 +3861,7 @@ class InventoryService:
             "temperature_c",
             "warning_temperature_c",
             "critical_temperature_c",
+            "smart_health_status",
             "last_test_type",
             "last_test_status",
             "last_test_lifetime_hours",
@@ -2145,6 +3880,10 @@ class InventoryService:
             "estimated_lifetime_bytes_written",
             "estimated_remaining_bytes_written",
             "media_errors",
+            "predictive_errors",
+            "non_medium_errors",
+            "uncorrected_read_errors",
+            "uncorrected_write_errors",
             "unsafe_shutdowns",
             "rotation_rate_rpm",
             "form_factor",
@@ -2154,6 +3893,7 @@ class InventoryService:
             "namespace_nguid",
             "read_cache_enabled",
             "writeback_cache_enabled",
+            "trim_supported",
             "transport_protocol",
             "logical_unit_id",
             "sas_address",
@@ -2170,7 +3910,18 @@ class InventoryService:
 
     @staticmethod
     def _status_contains(raw_status: dict[str, Any], *needles: str) -> bool:
-        haystack = " ".join(str(value).lower() for value in raw_status.values() if value is not None)
+        scalar_values: list[str] = []
+        for value in raw_status.values():
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                scalar_values.extend(str(item).lower() for item in value.values() if not isinstance(item, (dict, list, tuple, set)) and item is not None)
+                continue
+            if isinstance(value, (list, tuple, set)):
+                scalar_values.extend(str(item).lower() for item in value if not isinstance(item, (dict, list, tuple, set)) and item is not None)
+                continue
+            scalar_values.append(str(value).lower())
+        haystack = " ".join(scalar_values)
         return any(needle.lower() in haystack for needle in needles)
 
     @staticmethod

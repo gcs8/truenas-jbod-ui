@@ -6,7 +6,7 @@ It assumes:
 
 - you have Docker and Docker Compose
 - you can reach the storage host over the network
-- you already have a TrueNAS API key or you are ready to make one
+- you already have the right API credential for the target platform
 
 ## 1. Clone The Repo
 
@@ -36,10 +36,14 @@ If you do not need custom profiles yet, `config/profiles.yaml` can stay absent.
 Edit `.env`:
 
 - `TRUENAS_HOST`
-- `TRUENAS_API_KEY`
 - `TRUENAS_PLATFORM`
 - `SSH_ENABLED`
 - `SSH_HOST`
+
+Credential note:
+
+- TrueNAS CORE/SCALE use `TRUENAS_API_KEY`
+- Quantastor uses `TRUENAS_API_USER` and `TRUENAS_API_PASSWORD`
 
 For a simple single-system CORE setup, the minimum useful values usually look like:
 
@@ -90,4 +94,5 @@ Use these pages when you are ready:
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 - [[TrueNAS CORE Setup|TrueNAS-CORE-Setup]]
 - [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]]
+- [[Quantastor Setup|Quantastor-Setup]]
 - [[Generic Linux Setup|Generic-Linux-Setup]]
