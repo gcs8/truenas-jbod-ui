@@ -381,11 +381,19 @@ textarea {
 }
 
 .chassis-shell {
+  --slot-grid-gap: 14px;
+  --service-zone-min-height: 104px;
+  --service-zone-margin-bottom: 18px;
+  --slot-bay-width: 148px;
+  --slot-bay-aspect: 0.8 / 1;
+  --chassis-min-height: auto;
+  --slot-grid-justify: flex-start;
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   width: 100%;
   min-width: 0;
+  min-height: var(--chassis-min-height);
   border-radius: 22px;
   padding: 20px 18px 18px;
   background:
@@ -407,7 +415,7 @@ textarea {
 .chassis-shell[data-face-style="front-drive"] .service-zone,
 .chassis-shell[data-face-style="rear-drive"] .service-zone {
   grid-template-columns: 1.2fr 0.9fr 1.2fr;
-  min-height: 88px;
+  min-height: var(--service-zone-min-height, 88px);
 }
 
 .chassis-shell[data-face-style="front-drive"] .service-panel-short,
@@ -416,7 +424,7 @@ textarea {
 }
 
 .chassis-shell[data-face-style="rear-drive"] .service-zone {
-  min-height: 80px;
+  min-height: calc(var(--service-zone-min-height, 88px) - 8px);
 }
 
 .chassis-shell[data-face-style="unifi-drive"] {
@@ -456,14 +464,94 @@ textarea {
   gap: 16px;
 }
 
+.chassis-shell[data-drive-scale="3.5"]:not([data-face-style="unifi-drive"]) {
+  --slot-bay-width: 164px;
+  --slot-bay-aspect: 0.76 / 1;
+  --service-zone-min-height: 118px;
+  --service-zone-margin-bottom: 22px;
+  --slot-grid-gap: 18px;
+}
+
+.chassis-shell[data-drive-scale="2.5"]:not([data-face-style="unifi-drive"]) {
+  --slot-bay-width: 132px;
+  --slot-bay-aspect: 0.84 / 1;
+  --service-zone-min-height: 92px;
+  --service-zone-margin-bottom: 16px;
+  --slot-grid-gap: 12px;
+}
+
+.chassis-shell[data-layout-mode="top-loader-3.5"] {
+  --chassis-min-height: clamp(720px, 70vh, 920px);
+  --slot-grid-justify: flex-start;
+  --slot-grid-gap: 8px;
+  --slot-bay-width: 172px;
+  --slot-bay-height-fixed: 116px;
+  --service-zone-min-height: 72px;
+  --service-zone-margin-bottom: 10px;
+  padding: 14px 12px 12px;
+}
+
+.chassis-shell[data-layout-mode="top-loader-2.5"] {
+  --chassis-min-height: clamp(560px, 58vh, 760px);
+  --slot-grid-justify: flex-start;
+  --slot-grid-gap: 6px;
+  --slot-bay-width: 144px;
+  --slot-bay-height-fixed: 94px;
+  --service-zone-min-height: 64px;
+  --service-zone-margin-bottom: 8px;
+  padding: 14px 12px 12px;
+}
+
+.chassis-shell[data-layout-mode="dense-3.5"] {
+  --chassis-min-height: clamp(430px, 50vh, 560px);
+  --slot-grid-justify: space-between;
+}
+
+.chassis-shell[data-layout-mode="dense-2.5"] {
+  --chassis-min-height: clamp(390px, 46vh, 500px);
+  --slot-grid-justify: space-between;
+}
+
+.chassis-shell[data-layout-mode="standard-3.5"] {
+  --chassis-min-height: clamp(360px, 44vh, 460px);
+  --slot-grid-justify: center;
+}
+
+.chassis-shell[data-layout-mode="standard-2.5"] {
+  --chassis-min-height: clamp(330px, 40vh, 420px);
+  --slot-grid-justify: center;
+}
+
+.chassis-shell[data-layout-mode="compact"] {
+  --chassis-min-height: 280px;
+  --slot-grid-justify: center;
+  --slot-grid-gap: 14px;
+}
+
+.chassis-shell[data-layout-mode="compact"][data-drive-scale="2.5"] {
+  --chassis-min-height: 330px;
+  --slot-bay-width: 108px;
+  --slot-bay-aspect: 0.41 / 1;
+}
+
+.chassis-shell[data-layout-mode="unifi-1row"] {
+  --chassis-min-height: 250px;
+  --slot-grid-justify: center;
+}
+
+.chassis-shell[data-layout-mode="unifi-2row"] {
+  --chassis-min-height: 360px;
+  --slot-grid-justify: center;
+}
+
 .service-zone {
   flex: 0 0 auto;
   display: grid;
   grid-template-columns: 1.45fr 0.8fr 1fr;
   gap: 16px;
   align-items: stretch;
-  min-height: 104px;
-  margin-bottom: 18px;
+  min-height: var(--service-zone-min-height);
+  margin-bottom: var(--service-zone-margin-bottom);
 }
 
 .service-panel,
@@ -523,10 +611,12 @@ textarea {
 }
 
 .slot-grid {
-  flex: 0 0 auto;
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  justify-content: var(--slot-grid-justify);
+  gap: var(--slot-grid-gap);
+  min-height: 0;
 }
 
 .slot-row {
@@ -553,23 +643,88 @@ textarea {
 }
 
 .row-group + .row-group {
-  padding-left: 10px;
+  padding-left: 0;
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .row-slots {
+  flex: 1 1 auto;
+  height: 100%;
+  gap: 2px;
+  justify-items: stretch;
+  align-items: stretch;
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .row-group {
+  gap: 2px;
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-row {
+  flex: 1 1 0;
+  display: flex;
+  align-items: stretch;
+  padding: 1px 3px 3px;
+  border-radius: 4px;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0) 16%),
+    linear-gradient(180deg, rgba(42, 47, 54, 0.8), rgba(24, 29, 34, 0.94));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.24);
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .row-slots-flat-grouped {
+  position: relative;
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .row-metal-divider {
+  align-self: stretch;
+  justify-self: center;
+  position: relative;
+  width: 12px;
+  margin: -1px 0 0;
+  border-radius: 3px;
+  background:
+    linear-gradient(90deg, #48515a 0%, #b9c1c8 18%, #eef2f5 50%, #b4bcc4 82%, #515a63 100%);
+  box-shadow:
+    inset 1px 0 0 rgba(255, 255, 255, 0.45),
+    inset -1px 0 0 rgba(0, 0, 0, 0.42),
+    0 0 0 1px rgba(18, 22, 27, 0.5),
+    0 0 10px rgba(0, 0, 0, 0.12);
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .row-metal-divider::before,
+.chassis-shell[data-layout-mode^="top-loader"] .row-metal-divider::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  height: 3px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(255,255,255,0.16), rgba(255,255,255,0.68), rgba(255,255,255,0.16));
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .row-metal-divider::before {
+  top: 6px;
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .row-metal-divider::after {
+  bottom: 6px;
 }
 
 .row-group + .row-group::before {
   content: "";
   position: absolute;
-  left: 0;
-  top: 12px;
-  bottom: 12px;
-  width: 2px;
+  left: -3px;
+  top: 6px;
+  bottom: 6px;
+  width: 1px;
   border-radius: 999px;
-  background: linear-gradient(180deg, rgba(255,255,255,0.24), rgba(255,255,255,0.05));
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18);
+  background: linear-gradient(180deg, rgba(188, 195, 203, 0.05), rgba(188, 195, 203, 0.2), rgba(188, 195, 203, 0.05));
 }
 
 .slot-tile {
   position: relative;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -593,9 +748,30 @@ textarea {
 
 .chassis-shell[data-latch-edge="bottom"] .slot-tile,
 .chassis-shell[data-latch-edge="top"] .slot-tile {
-  width: min(100%, 148px);
+  width: min(100%, var(--slot-bay-width));
   height: auto;
-  aspect-ratio: 0.8 / 1;
+  aspect-ratio: var(--slot-bay-aspect);
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile {
+  width: 100%;
+  height: auto;
+  min-height: var(--slot-bay-height-fixed);
+  aspect-ratio: auto;
+  padding: 5px 4px 15px;
+  border-radius: 2px;
+  border-color: rgba(198, 208, 219, 0.24);
+  background:
+    linear-gradient(90deg, rgba(214, 222, 230, 0.24) 0 1px, transparent 1px calc(100% - 1px), rgba(214, 222, 230, 0.24) calc(100% - 1px) 100%),
+    linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0) 10%),
+    linear-gradient(180deg, #737d86 0%, #626a73 8%, #454d55 8%, #2c333a 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.42);
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile.group-divider-after {
+  margin-right: 0;
 }
 
 .chassis-shell[data-latch-edge="right"] .slot-tile {
@@ -804,6 +980,18 @@ textarea {
   pointer-events: none;
 }
 
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile:not(.state-empty)::before {
+  inset: 2px 2px 11px;
+  border-radius: 1px;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0) 12%),
+    linear-gradient(90deg, rgba(0,0,0,0.18), transparent 8%, transparent 92%, rgba(0,0,0,0.18)),
+    linear-gradient(180deg, #14191e 0%, #0c1014 16%, #0f1317 80%, #262d34 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.04),
+    inset 0 -10px 14px rgba(0,0,0,0.34);
+}
+
 .chassis-shell[data-latch-edge="right"] .slot-tile::before {
   inset: 5px 22px 5px 5px;
 }
@@ -881,6 +1069,14 @@ textarea {
     inset 0 -1px 0 rgba(0, 0, 0, 0.16);
 }
 
+.chassis-shell[data-layout-mode^="top-loader"] .slot-latch {
+  left: 4px;
+  right: 4px;
+  bottom: 3px;
+  height: 8px;
+  border-radius: 2px 2px 4px 4px;
+}
+
 .chassis-shell[data-latch-edge="right"] .slot-latch {
   left: auto;
   right: 8px;
@@ -952,6 +1148,28 @@ textarea {
 
 .slot-tile.state-empty .slot-latch {
   background: linear-gradient(180deg, #717981, #4c545d);
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty {
+  border-color: rgba(198, 208, 219, 0.24);
+  color: #c6ced7;
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty::before {
+  content: none;
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty .slot-device,
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty .slot-pool {
+  opacity: 0.72;
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty .slot-status-led {
+  opacity: 0.55;
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty .slot-latch {
+  display: none;
 }
 
 .slot-tile.state-identify {

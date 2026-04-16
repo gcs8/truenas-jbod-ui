@@ -205,6 +205,7 @@ class EnclosureProfileView(BaseModel):
     edge_label: str | None = None
     face_style: str = "generic"
     latch_edge: str = "bottom"
+    bay_size: str | None = None
     rows: int
     columns: int
     slot_layout: list[list[int]] = Field(default_factory=list)

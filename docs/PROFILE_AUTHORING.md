@@ -50,6 +50,10 @@ Optional fields:
   - `right`
   - `top`
   - `left`
+- `bay_size`: optional physical bay size used to keep tray geometry fixed for
+  the chassis profile:
+  - `3.5`
+  - `2.5`
 - `slot_layout`: explicit row-by-row slot ordering
 - `row_groups`: per-row grouping hints used to render divider blocks
 - `slot_hints`: per-slot matching hints for SSH-only or generic Linux systems
@@ -67,6 +71,7 @@ profiles:
     edge_label: Front of chassis
     face_style: front-drive
     latch_edge: right
+    bay_size: 3.5
     rows: 2
     columns: 4
     slot_layout:
@@ -118,6 +123,22 @@ Examples from the validated profiles:
 - the CORE `60`-bay top-loader uses `bottom`
 - the SCALE front `24` and rear `12` profiles use `right`
 - the Linux GPU-server NVMe profile uses `bottom`
+
+## Bay Size
+
+`bay_size` is optional.
+
+Use it when the chassis slot size is fixed regardless of the installed media.
+This is the preferred setting for validated profiles, because the enclosure
+should follow the bay hardware rather than whatever SMART happens to report
+for the currently installed disk.
+
+Examples:
+
+- a `60`-bay top-loading `3.5"` shelf should use `bay_size: 3.5`
+- a fixed `2`-slot NVMe/U.2 rear bay should use `bay_size: 2.5`
+- a custom profile can omit it and allow runtime inference if the hardware is
+  still being explored
 
 ## Row Group Rules
 
@@ -183,6 +204,9 @@ The selection order is:
 - `supermicro-ssg-6048r-front-24`
 - `supermicro-ssg-6048r-rear-12`
 - `supermicro-sys-2029gp-tr-right-nvme-2`
+- `supermicro-ssg-2028r-shared-front-24`
+- `ubiquiti-unvr-front-4`
+- `ubiquiti-unvr-pro-front-7`
 
 ## Limitations
 

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AppConfig(BaseModel):
@@ -65,11 +65,25 @@ class EnclosureProfileConfig(BaseModel):
     edge_label: str | None = None
     face_style: str = "generic"
     latch_edge: str = "bottom"
+    bay_size: str | None = None
     rows: int
     columns: int
     slot_layout: list[list[int]] | None = None
     row_groups: list[int] = Field(default_factory=list)
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
+
+    @field_validator("bay_size", mode="before")
+    @classmethod
+    def _normalize_bay_size(cls, value: Any) -> Any:
+        if value in {None, ""}:
+            return None
+        if isinstance(value, (int, float)):
+            normalized = f"{float(value):.1f}"
+        else:
+            normalized = str(value).strip()
+        if normalized not in {"3.5", "2.5"}:
+            raise ValueError("bay_size must be 3.5 or 2.5")
+        return normalized
 
 
 class LayoutConfig(BaseModel):

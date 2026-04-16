@@ -279,6 +279,79 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertIn("0:0:0:0", first.lookup_keys)
             self.assertIn("ZC14D9W1".lower(), first.lookup_keys)
 
+    def test_build_linux_disk_records_prefers_largest_data_volume_over_boot_and_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="linux-md-lvm",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {
+                        "name": "sda",
+                        "type": "disk",
+                        "path": "/dev/sda",
+                        "hctl": "0:0:0:0",
+                        "serial": "LINUXDATA01",
+                        "model": "GenericDisk",
+                        "size": "1.9T",
+                        "log-sec": 512,
+                        "phy-sec": 4096,
+                        "tran": "sata",
+                        "children": [
+                            {
+                                "name": "sda1",
+                                "type": "part",
+                                "path": "/dev/sda1",
+                                "size": "1G",
+                                "mountpoint": "/boot",
+                            },
+                            {
+                                "name": "sda2",
+                                "type": "part",
+                                "path": "/dev/sda2",
+                                "size": "8G",
+                                "fstype": "swap",
+                                "mountpoint": "[SWAP]",
+                            },
+                            {
+                                "name": "sda3",
+                                "type": "part",
+                                "path": "/dev/sda3",
+                                "size": "1.8T",
+                                "children": [
+                                    {
+                                        "name": "vg0-data",
+                                        "type": "lvm",
+                                        "path": "/dev/mapper/vg0-data",
+                                        "size": "1.8T",
+                                        "mountpoint": "/srv/media",
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            )
+
+            records = service._build_linux_disk_records(ssh_data)
+
+            self.assertEqual(len(records), 1)
+            record = records[0]
+            self.assertEqual(record.pool_name, "/srv/media")
+            self.assertEqual(record.raw["top_array_name"], "vg0-data")
+            self.assertEqual(record.raw["top_mountpoint"], "/srv/media")
+            self.assertEqual(record.raw["top_role"], "data")
+
     def test_build_linux_disk_records_preserves_ubntstorage_vendor_slots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
