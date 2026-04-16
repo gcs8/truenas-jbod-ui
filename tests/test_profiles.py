@@ -20,7 +20,7 @@ from app.services.profile_registry import (
 
 
 class ProfileRegistryTests(unittest.TestCase):
-    def test_builtin_core_profile_preserves_top_loader_grouping(self) -> None:
+    def test_builtin_core_profile_preserves_top_loader_layout(self) -> None:
         system = SystemConfig(id="archive-core", label="Archive CORE", truenas=TrueNASConfig(platform="core"))
         registry = ProfileRegistry(get_settings())
 
@@ -37,6 +37,7 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.id, CORE_CSE_946_PROFILE_ID)
         self.assertEqual(profile.row_groups, [6, 6, 3])
         self.assertEqual(profile.latch_edge, "bottom")
+        self.assertEqual(profile.bay_size, "3.5")
         self.assertEqual(profile.slot_layout[0], list(range(45, 60)))
         self.assertEqual(profile.slot_layout[-1], list(range(0, 15)))
 
@@ -78,12 +79,14 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertIsNotNone(front)
         self.assertEqual(front.id, SCALE_SSG_FRONT_24_PROFILE_ID)
         self.assertEqual(front.latch_edge, "right")
+        self.assertEqual(front.bay_size, "3.5")
         self.assertEqual(front.slot_layout[0], [5, 11, 17, 23])
         self.assertEqual(front.slot_layout[-1], [0, 6, 12, 18])
 
         self.assertIsNotNone(rear)
         self.assertEqual(rear.id, SCALE_SSG_REAR_12_PROFILE_ID)
         self.assertEqual(rear.latch_edge, "right")
+        self.assertEqual(rear.bay_size, "3.5")
         self.assertEqual(rear.slot_layout, [[2, 5, 8, 11], [1, 4, 7, 10], [0, 3, 6, 9]])
 
     def test_builtin_linux_gpu_profile_exposes_two_nvme_slot_hints(self) -> None:
@@ -102,6 +105,7 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertIsNotNone(profile)
         self.assertEqual(profile.id, LINUX_GPU_SERVER_NVME_PROFILE_ID)
         self.assertEqual(profile.latch_edge, "bottom")
+        self.assertEqual(profile.bay_size, "2.5")
         self.assertEqual(profile.slot_layout, [[0, 1]])
         self.assertEqual(profile.slot_hints[0], ["nvme0", "10000:01:00.0"])
         self.assertEqual(profile.slot_hints[1], ["nvme1", "10000:02:00.0"])
@@ -122,6 +126,7 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertIsNotNone(profile)
         self.assertEqual(profile.id, QUANTASTOR_SSG_SHARED_24_PROFILE_ID)
         self.assertEqual(profile.latch_edge, "top")
+        self.assertEqual(profile.bay_size, "3.5")
         self.assertEqual(profile.rows, 1)
         self.assertEqual(profile.columns, 24)
         self.assertEqual(profile.slot_layout, [list(range(24))])
@@ -148,6 +153,7 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.id, UNIFI_UNVR_FRONT_4_PROFILE_ID)
         self.assertEqual(profile.face_style, "unifi-drive")
         self.assertEqual(profile.latch_edge, "bottom")
+        self.assertEqual(profile.bay_size, "3.5")
         self.assertEqual(profile.slot_layout, [[0, 1, 2, 3]])
         self.assertEqual(profile.slot_hints[0], ["0:0:0:0"])
         self.assertEqual(profile.slot_hints[3], ["6:0:0:0"])
@@ -174,6 +180,7 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.id, UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID)
         self.assertEqual(profile.face_style, "unifi-drive")
         self.assertEqual(profile.latch_edge, "bottom")
+        self.assertEqual(profile.bay_size, "3.5")
         self.assertEqual(profile.slot_layout, [[0, 1, 2], [3, 4, 5, 6]])
         self.assertEqual(profile.slot_hints[0], ["7:0:0:0"])
         self.assertEqual(profile.slot_hints[1], ["5:0:0:0"])
@@ -196,6 +203,7 @@ class ProfileRegistryTests(unittest.TestCase):
                         "    edge_label: Front of chassis",
                         "    face_style: front-drive",
                         "    latch_edge: right",
+                        "    bay_size: 3.5",
                         "    rows: 2",
                         "    columns: 4",
                         "    slot_layout:",
@@ -243,6 +251,7 @@ class ProfileRegistryTests(unittest.TestCase):
             self.assertIsNotNone(profile)
             self.assertEqual(profile.id, "custom-lab-front-8")
             self.assertEqual(profile.latch_edge, "right")
+            self.assertEqual(profile.bay_size, "3.5")
             self.assertEqual(profile.row_groups, [2, 2])
             self.assertEqual(profile.slot_layout, [[4, 5, 6, 7], [0, 1, 2, 3]])
 

@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.3.1`.
+This file tracks the current intended release direction after `v0.6.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -145,6 +145,27 @@ Current status:
   and LED control
 - UNVR Pro support is solid for inventory/layout/SMART and still intentionally
   experimental for LED control until more bays are confirmed on real hardware
+
+## v0.7.0 - Layout Polish, Topology Truth, And Release Cleanup
+
+Goal:
+
+- make the currently validated platforms feel more intentional and better
+  documented before taking on another larger adapter or workflow jump
+
+Primary outcomes:
+
+- bay-size-aware enclosure geometry for validated profiles
+- a denser, more faithful CORE `60`-bay top-loader layout with visible divider
+  rails
+- Linux topology labeling that prefers practical mounted data volumes over boot
+  or swap noise
+- refreshed screenshots and release-facing docs for the current platform set
+
+Current status:
+
+- prepared as the local `0.7.0` release candidate
+- focused on polish and clarity rather than adding another large new platform
 
 ## Longer-Term Ideas
 

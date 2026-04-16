@@ -1,6 +1,6 @@
 # Profiles and Custom Layouts
 
-`0.4.0` moved enclosure rendering into a profile system.
+The app now uses a profile-driven enclosure layout system.
 
 That means the app can now describe:
 
@@ -60,6 +60,7 @@ profiles:
 - `edge_label`
 - `face_style`
 - `latch_edge`
+- `bay_size`
 - `rows`
 - `columns`
 - `slot_layout`

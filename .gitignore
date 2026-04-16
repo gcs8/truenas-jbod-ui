@@ -8,6 +8,7 @@ config/config.yaml
 config/ssh/*
 !config/ssh/.gitkeep
 data/slot_mappings.json
+data/support/
 logs/*.log
 
 # Editor and platform noise

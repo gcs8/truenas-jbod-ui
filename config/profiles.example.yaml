@@ -7,6 +7,7 @@ profiles:
     edge_label: Front of chassis
     face_style: front-drive
     latch_edge: right
+    bay_size: 3.5
     rows: 2
     columns: 4
     slot_layout:
@@ -22,6 +23,7 @@ profiles:
     edge_label: System front / latch edge
     face_style: top-loader
     latch_edge: bottom
+    bay_size: 3.5
     rows: 3
     columns: 4
     slot_layout:
@@ -38,6 +40,7 @@ profiles:
     edge_label: Rear of chassis
     face_style: rear-drive
     latch_edge: bottom
+    bay_size: 2.5
     rows: 1
     columns: 2
     slot_layout:

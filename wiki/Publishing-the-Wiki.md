@@ -38,3 +38,7 @@ git push
 - after a new platform guide lands
 - after a profile system change
 - after a setup flow becomes simpler or safer
+
+For the full repo release flow, use:
+
+- [`docs/RELEASE_CHECKLIST.md`](../docs/RELEASE_CHECKLIST.md)

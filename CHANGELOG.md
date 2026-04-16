@@ -2,7 +2,45 @@
 
 ## Unreleased
 
-Post-`v0.6.0` follow-up work will land here.
+Release-prep notes for the next tagged cut land here until they are moved into
+the final section below.
+
+## v0.7.0 - 2026-04-16
+
+Layout and topology release that tightens the profile-driven enclosure system,
+refreshes the CORE top-loader presentation against real hardware, and cleans up
+release-facing docs and screenshots around the currently validated platform set.
+
+### Added
+
+- Optional `bay_size` profile metadata so validated chassis can keep their
+  intended physical bay geometry regardless of the currently installed media
+- Refreshed screenshot capture script output for the currently validated
+  platform set: CORE, SCALE, GPU Linux, UniFi UNVR, UniFi UNVR Pro, and
+  Quantastor
+
+### Changed
+
+- The CORE `60`-bay top-loader presentation now uses denser row spacing,
+  restored `6 + 6 + 3` metal divider rails, and better vertical fill inside
+  the enclosure face
+- Linux storage-topology labeling now prefers the best observed mounted or
+  array-backed data volume over boot or swap partitions when naming pools and
+  topology context
+- The top summary pool card now describes pools as discovered from storage
+  topology rather than implying they only come from `pool.query`
+- Built-in validated profiles now declare `bay_size` explicitly where the bay
+  hardware is fixed
+- README, roadmap, wiki landing pages, profile docs, and sample config comments
+  now reflect the current `0.7.0` release direction instead of older milestone
+  wording
+
+### Fixed
+
+- CORE top-loader rows no longer leave large dead vertical gaps inside the
+  enclosure tray area after layout scaling
+- CORE top-loader row grouping now renders visible rail separators again after
+  the denser chassis pass
 
 ## v0.6.0 - 2026-04-15
 

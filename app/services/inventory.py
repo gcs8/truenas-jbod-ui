@@ -2973,22 +2973,13 @@ class InventoryService:
                 controller["lookup_keys"].update(normalize_lookup_keys(subsystem_meta.get("address")))
                 controller["lookup_keys"].update(normalize_lookup_keys(subsystem_meta.get("nqn")))
 
-            descendants = self._collect_linux_descendants(blockdevice)
-            raid_nodes = [node for node in descendants if str(node.get("type") or "").lower().startswith("raid")]
-            mountpoints = [
-                normalize_text(node.get("mountpoint"))
-                for node in descendants
-                if normalize_text(node.get("mountpoint"))
-            ]
-            top_array = raid_nodes[-1] if raid_nodes else None
-            top_array_name = normalize_device_name(top_array.get("name")) if top_array else None
-            top_array_path = normalize_text(top_array.get("path")) if top_array else None
-            top_mountpoint = next(
-                (mount for mount in mountpoints if mount not in {"/boot", "/boot/efi", "/"}),
-                mountpoints[0] if mountpoints else None,
-            )
-            top_role = "system" if top_mountpoint in {"/", "/boot", "/boot/efi"} else "data"
-            namespace_rank = self._linux_namespace_rank(top_mountpoint, top_array_name, namespace_name)
+            topology = self._describe_linux_storage_topology(blockdevice)
+            top_array_name = topology["top_array_name"]
+            top_array_path = topology["top_array_path"]
+            top_mountpoint = topology["top_mountpoint"]
+            top_role = topology["top_role"]
+            top_volume_type = topology["top_volume_type"]
+            namespace_rank = self._linux_namespace_rank(top_mountpoint, top_array_name, top_volume_type, namespace_name)
             if namespace_rank > controller["primary_rank"]:
                 controller["primary_rank"] = namespace_rank
                 controller["primary_namespace"] = namespace_name
@@ -2996,6 +2987,8 @@ class InventoryService:
                 controller["top_array_path"] = top_array_path
                 controller["top_mountpoint"] = top_mountpoint
                 controller["top_role"] = top_role
+                controller["pool_name"] = topology["pool_name"]
+                controller["top_volume_type"] = top_volume_type
                 if namespace_identifier:
                     controller["identifier"] = namespace_identifier
 
@@ -3011,22 +3004,12 @@ class InventoryService:
                 continue
             vendor_entry = ubntstorage_by_node.get(device_name.lower())
 
-            descendants = self._collect_linux_descendants(blockdevice)
-            raid_nodes = [node for node in descendants if str(node.get("type") or "").lower().startswith("raid")]
-            mountpoints = [
-                normalize_text(node.get("mountpoint"))
-                for node in descendants
-                if normalize_text(node.get("mountpoint"))
-            ]
-            top_array = raid_nodes[-1] if raid_nodes else None
-            top_array_name = normalize_device_name(top_array.get("name")) if top_array else None
-            top_array_path = normalize_text(top_array.get("path")) if top_array else None
-            top_mountpoint = next(
-                (mount for mount in mountpoints if mount not in {"/boot", "/boot/efi", "/"}),
-                mountpoints[0] if mountpoints else None,
-            )
-            role = "system" if top_mountpoint in {"/", "/boot", "/boot/efi"} else "data"
-            pool_name = top_mountpoint or top_array_name or "mdadm"
+            topology = self._describe_linux_storage_topology(blockdevice)
+            top_array_name = topology["top_array_name"]
+            top_array_path = topology["top_array_path"]
+            top_mountpoint = topology["top_mountpoint"]
+            role = topology["top_role"]
+            pool_name = topology["pool_name"]
             identifier, _identifier_label = resolve_persistent_id(
                 str(blockdevice.get("wwn")) if blockdevice.get("wwn") is not None else None,
                 str(blockdevice.get("ptuuid")) if blockdevice.get("ptuuid") is not None else None,
@@ -3054,6 +3037,7 @@ class InventoryService:
                         "top_array_path": top_array_path,
                         "top_mountpoint": top_mountpoint,
                         "top_role": role,
+                        "top_volume_type": topology["top_volume_type"],
                         "hctl": normalize_text(blockdevice.get("hctl")),
                         "transport": normalize_text(blockdevice.get("tran")),
                         "vendor_slot": vendor_slot,
@@ -3098,7 +3082,7 @@ class InventoryService:
             top_array_name = payload["top_array_name"]
             top_mountpoint = payload["top_mountpoint"]
             role = payload["top_role"] or "data"
-            pool_name = top_mountpoint or top_array_name or "mdadm"
+            pool_name = payload.get("pool_name") or top_mountpoint or top_array_name or "linux"
             lookup_keys = set(payload["lookup_keys"])
             lookup_keys.update(normalize_lookup_keys(controller_name))
             lookup_keys.update(normalize_lookup_keys(primary_namespace))
@@ -3112,6 +3096,7 @@ class InventoryService:
                         "top_array_name": top_array_name,
                         "top_mountpoint": top_mountpoint,
                         "top_role": role,
+                        "top_volume_type": payload.get("top_volume_type"),
                     },
                     device_name=controller_name,
                     path_device_name=primary_namespace,
@@ -3153,14 +3138,168 @@ class InventoryService:
         return descendants
 
     @staticmethod
-    def _linux_namespace_rank(mountpoint: str | None, top_array_name: str | None, namespace_name: str | None) -> int:
+    def _linux_is_boot_mount(mountpoint: str | None) -> bool:
+        return mountpoint in {"/boot", "/boot/efi"}
+
+    @staticmethod
+    def _linux_is_swap_mount(mountpoint: str | None) -> bool:
+        if not mountpoint:
+            return False
+        return mountpoint.strip().upper() == "[SWAP]"
+
+    @classmethod
+    def _linux_is_swap_node(cls, node: dict[str, Any]) -> bool:
+        mountpoint = normalize_text(node.get("mountpoint"))
+        if cls._linux_is_swap_mount(mountpoint):
+            return True
+        fstype = normalize_text(node.get("fstype"))
+        if fstype and "swap" in fstype.lower():
+            return True
+        label = normalize_text(node.get("label"))
+        if label and label.lower() == "swap":
+            return True
+        return False
+
+    @classmethod
+    def _describe_linux_storage_topology(cls, blockdevice: dict[str, Any]) -> dict[str, Any]:
+        mountpoints = [
+            normalize_text(node.get("mountpoint"))
+            for node in [blockdevice, *cls._collect_linux_descendants(blockdevice)]
+            if normalize_text(node.get("mountpoint"))
+        ]
+        non_system_mounts = [
+            mount
+            for mount in mountpoints
+            if mount and not cls._linux_is_boot_mount(mount) and not cls._linux_is_swap_mount(mount) and mount != "/"
+        ]
+        system_mounts = [mount for mount in mountpoints if mount in {"/", "/boot", "/boot/efi"}]
+        primary = cls._select_linux_primary_volume(blockdevice)
+        top_mountpoint = primary["mountpoint"] if primary else None
+        if top_mountpoint and cls._linux_is_swap_mount(top_mountpoint):
+            top_mountpoint = None
+        top_array_name = primary["name"] if primary else None
+        top_array_path = primary["path"] if primary else None
+        top_volume_type = primary["type"] if primary else None
+
+        if non_system_mounts:
+            top_role = "data"
+        elif system_mounts:
+            top_role = "system"
+        elif top_mountpoint:
+            top_role = "system" if top_mountpoint == "/" else "data"
+        else:
+            top_role = "data"
+
+        if top_mountpoint and top_mountpoint not in {"/", "/boot", "/boot/efi"}:
+            pool_name = top_mountpoint
+        else:
+            pool_name = top_array_name or top_mountpoint or normalize_device_name(blockdevice.get("name")) or "linux"
+
+        return {
+            "top_array_name": top_array_name,
+            "top_array_path": top_array_path,
+            "top_mountpoint": top_mountpoint,
+            "top_role": top_role,
+            "top_volume_type": top_volume_type,
+            "pool_name": pool_name,
+        }
+
+    @classmethod
+    def _select_linux_primary_volume(cls, blockdevice: dict[str, Any]) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
+
+        def visit(node: dict[str, Any], depth: int) -> None:
+            name = normalize_device_name(node.get("name"))
+            mountpoint = normalize_text(node.get("mountpoint"))
+            node_type = normalize_text(node.get("type")) or "unknown"
+            path = normalize_text(node.get("path"))
+            size_bytes = parse_size_to_bytes(node.get("size")) or 0
+            is_boot = cls._linux_is_boot_mount(mountpoint)
+            is_swap = cls._linux_is_swap_node(node)
+            has_data_mount = bool(
+                mountpoint
+                and mountpoint not in {"/", "/boot", "/boot/efi"}
+                and not cls._linux_is_swap_mount(mountpoint)
+            )
+
+            type_rank = 20
+            lowered_type = node_type.lower()
+            if has_data_mount:
+                type_rank = 70
+            elif lowered_type == "lvm":
+                type_rank = 60
+            elif lowered_type.startswith("raid"):
+                type_rank = 58
+            elif lowered_type in {"crypt", "dm", "mpath"}:
+                type_rank = 56
+            elif mountpoint == "/":
+                type_rank = 52
+            elif lowered_type == "part":
+                type_rank = 44
+            elif lowered_type == "disk":
+                type_rank = 36
+
+            candidates.append(
+                {
+                    "name": name,
+                    "mountpoint": mountpoint,
+                    "type": lowered_type,
+                    "path": path,
+                    "size_bytes": size_bytes,
+                    "is_boot": is_boot,
+                    "is_swap": is_swap,
+                    "score": (
+                        type_rank,
+                        size_bytes,
+                        1 if mountpoint else 0,
+                        depth,
+                    ),
+                }
+            )
+
+            children = node.get("children") if isinstance(node.get("children"), list) else []
+            for child in children:
+                if isinstance(child, dict):
+                    visit(child, depth + 1)
+
+        visit(blockdevice, 0)
+        usable = [
+            candidate
+            for candidate in candidates
+            if candidate["name"] or candidate["mountpoint"]
+        ]
+        candidate_sets = [
+            [candidate for candidate in usable if not candidate["is_boot"] and not candidate["is_swap"]],
+            [candidate for candidate in usable if not candidate["is_swap"]],
+            usable,
+        ]
+        for candidate_set in candidate_sets:
+            if candidate_set:
+                return max(candidate_set, key=lambda candidate: candidate["score"])
+        return None
+
+    @staticmethod
+    def _linux_namespace_rank(
+        mountpoint: str | None,
+        top_array_name: str | None,
+        top_volume_type: str | None,
+        namespace_name: str | None,
+    ) -> int:
         if mountpoint and mountpoint not in {"/", "/boot", "/boot/efi"}:
+            return 6
+        if top_volume_type == "lvm":
+            return 5
+        if top_volume_type and top_volume_type.startswith("raid"):
             return 4
         if top_array_name and top_array_name.startswith("md"):
+            return 4
+        if mountpoint == "/":
             return 3
+        if top_volume_type == "part":
+            return 2
         if namespace_name and namespace_name.endswith("n1"):
             return 1
-        return 2
+        return 0
 
     @staticmethod
     def _build_linux_topology_members(disk_records: list[DiskRecord]) -> dict[str, ZpoolMember]:
@@ -3171,21 +3310,16 @@ class InventoryService:
             role = normalize_text(disk.raw.get("top_role")) or "data"
             if not top_array_name and not top_mountpoint:
                 continue
-            pool_name = top_mountpoint or "mdadm"
-            topology_label = " > ".join(
-                filter(
-                    None,
-                    [
-                        pool_name,
-                        top_array_name,
-                        role,
-                    ],
-                )
-            )
+            pool_name = normalize_text(disk.pool_name) or top_mountpoint or top_array_name or "linux"
+            topology_parts = [pool_name]
+            if top_array_name and top_array_name != pool_name:
+                topology_parts.append(top_array_name)
+            topology_parts.append(role)
+            topology_label = " > ".join(filter(None, topology_parts))
             member = ZpoolMember(
                 pool_name=pool_name,
                 vdev_class=role,
-                vdev_name=top_array_name or disk.device_name,
+                vdev_name=top_array_name or pool_name or disk.device_name,
                 topology_label=topology_label,
                 health=disk.health,
                 raw_name=disk.device_name or "",

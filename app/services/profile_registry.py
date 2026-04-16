@@ -35,6 +35,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="System front / latch edge",
             face_style="top-loader",
             latch_edge="bottom",
+            bay_size="3.5",
             rows=4,
             columns=15,
             slot_layout=[
@@ -54,6 +55,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="Front of chassis",
             face_style="front-drive",
             latch_edge="right",
+            bay_size="3.5",
             rows=6,
             columns=4,
             slot_layout=[
@@ -74,6 +76,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="Rear of chassis",
             face_style="rear-drive",
             latch_edge="right",
+            bay_size="3.5",
             rows=3,
             columns=4,
             slot_layout=[
@@ -91,6 +94,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="Rear of chassis",
             face_style="rear-drive",
             latch_edge="bottom",
+            bay_size="2.5",
             rows=1,
             columns=2,
             slot_layout=[
@@ -110,6 +114,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="Front of chassis",
             face_style="unifi-drive",
             latch_edge="bottom",
+            bay_size="3.5",
             rows=1,
             columns=4,
             slot_layout=[
@@ -131,6 +136,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="Front of chassis",
             face_style="unifi-drive",
             latch_edge="bottom",
+            bay_size="3.5",
             rows=2,
             columns=4,
             slot_layout=[
@@ -154,6 +160,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="Front of chassis",
             face_style="front-drive",
             latch_edge="top",
+            bay_size="3.5",
             rows=1,
             columns=24,
             slot_layout=[
@@ -174,6 +181,7 @@ def _profile_to_view(profile: EnclosureProfileConfig) -> EnclosureProfileView:
         edge_label=profile.edge_label,
         face_style=profile.face_style,
         latch_edge=profile.latch_edge,
+        bay_size=profile.bay_size,
         rows=profile.rows,
         columns=profile.columns,
         slot_layout=slot_layout,
@@ -230,6 +238,7 @@ class ProfileRegistry:
                 edge_label="System front",
                 face_style="generic",
                 latch_edge="bottom",
+                bay_size=None,
                 rows=rows,
                 columns=columns,
                 slot_layout=slot_layout or default_slot_layout(rows, columns, slot_count or rows * columns),

@@ -71,8 +71,8 @@ It gives you:
 
 ## Current Direction
 
-- `0.4.0` is the chassis/profile release
-- `0.5.0` ships first-pass OSNexus Quantastor support
-- `0.6.0` ships UniFi UNVR-family support plus safer SSH/API defaults
-- next work is focused on hardening, polish, and whatever validated hardware
-  comes after the current platform set
+- `0.4.0` shipped the chassis/profile release
+- `0.5.0` shipped first-pass OSNexus Quantastor support
+- `0.6.0` shipped UniFi UNVR-family support plus safer SSH/API defaults
+- `0.7.0` is focused on layout polish, better topology wording, refreshed
+  screenshots, and release cleanup for the current validated platform set

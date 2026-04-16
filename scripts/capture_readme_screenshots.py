@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from urllib.parse import urlencode
 
 from playwright.sync_api import Page, sync_playwright
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app import __version__
+
 
 BASE_URL = "http://localhost:8080/"
-ROOT = Path(__file__).resolve().parents[1]
-IMAGES_DIR = ROOT / "docs" / "images"
+IMAGES_DIR = ROOT / "docs" / "images" / "screenshots"
+VERSION_TAG = f"v{__version__}"
 
 CORE_PARAMS = {
     "system_id": "archive-core",
@@ -17,6 +24,18 @@ CORE_PARAMS = {
 SCALE_PARAMS = {
     "system_id": "offsite-scale",
     "enclosure_id": "5003048001c1043f",
+}
+GPU_PARAMS = {
+    "system_id": "gpu-server",
+}
+UNVR_PARAMS = {
+    "system_id": "unvr",
+}
+UNVR_PRO_PARAMS = {
+    "system_id": "unvr-pro",
+}
+QUANTASTOR_PARAMS = {
+    "system_id": "qs-cryostorage",
 }
 
 
@@ -64,14 +83,42 @@ def capture_core(page: Page) -> None:
     open_and_select_slot(page, CORE_PARAMS, 21)
     for label in ("Read Cache", "Transport", "Link Rate"):
         wait_for_kv_value(page, label)
-    capture_app_shell(page, "core-overview-v0.4.0.png")
+    capture_app_shell(page, f"core-overview-{VERSION_TAG}.png")
 
 
 def capture_scale(page: Page) -> None:
     open_and_select_slot(page, SCALE_PARAMS, 0)
     for label in ("Temp", "Read Cache", "Transport", "Link Rate"):
         wait_for_kv_value(page, label)
-    capture_app_shell(page, "scale-overview-v0.4.0.png")
+    capture_app_shell(page, f"scale-overview-{VERSION_TAG}.png")
+
+
+def capture_gpu_server(page: Page) -> None:
+    open_and_select_slot(page, GPU_PARAMS, 0)
+    for label in ("Array", "Transport", "Endurance"):
+        wait_for_kv_value(page, label)
+    capture_app_shell(page, f"gpu-server-overview-{VERSION_TAG}.png")
+
+
+def capture_unvr(page: Page) -> None:
+    open_and_select_slot(page, UNVR_PARAMS, 0)
+    for label in ("Mount", "Array", "Transport"):
+        wait_for_kv_value(page, label)
+    capture_app_shell(page, f"unvr-overview-{VERSION_TAG}.png")
+
+
+def capture_unvr_pro(page: Page) -> None:
+    open_and_select_slot(page, UNVR_PRO_PARAMS, 0)
+    for label in ("Mount", "Array", "Transport"):
+        wait_for_kv_value(page, label)
+    capture_app_shell(page, f"unvr-pro-overview-{VERSION_TAG}.png")
+
+
+def capture_quantastor(page: Page) -> None:
+    open_and_select_slot(page, QUANTASTOR_PARAMS, 0)
+    for label in ("Presented By", "Pool Active On", "Transport"):
+        wait_for_kv_value(page, label)
+    capture_app_shell(page, f"quantastor-overview-{VERSION_TAG}.png")
 
 
 def main() -> None:
@@ -81,6 +128,10 @@ def main() -> None:
         page = browser.new_page(viewport={"width": 1900, "height": 2600}, device_scale_factor=1)
         capture_core(page)
         capture_scale(page)
+        capture_gpu_server(page)
+        capture_unvr(page)
+        capture_unvr_pro(page)
+        capture_quantastor(page)
         browser.close()
 
 

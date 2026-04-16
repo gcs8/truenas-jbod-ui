@@ -1,6 +1,6 @@
 # Quantastor Setup
 
-This page is the practical setup path for the current `v0.5.0` Quantastor
+This page is the practical setup path for the current first-pass Quantastor
 support.
 
 Validated target so far:
@@ -160,7 +160,7 @@ pretending the whole appliance is a single perfectly-abstracted enclosure.
 
 ## 6. Known Limits
 
-- Quantastor support is still first-pass in `v0.5.0`
+- Quantastor support is still intentionally first-pass in the current release
 - the documented REST and `qs` identify methods are still failing on the
   validated LSI path, so the app prefers `sg_ses`
 - SES host discovery is still based on the configured SSH host plus
