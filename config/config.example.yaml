@@ -217,5 +217,5 @@ layout:
 paths:
   mapping_file: /app/data/slot_mappings.json
   log_file: /app/logs/app.log
-  # Optional custom profile file for the v0.4.0 profile system.
+  # Optional custom profile file for profile-driven enclosure layouts.
   profile_file: /app/config/profiles.yaml

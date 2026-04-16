@@ -1,7 +1,7 @@
 # Enclosure Profile Authoring
 
-This guide documents the first-pass enclosure profile system introduced for
-`0.4.0`.
+This guide documents the profile-driven enclosure layout system used by the
+current app.
 
 Profiles let operators describe physical enclosure presentation without editing
 Python, JavaScript, or CSS.

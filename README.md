@@ -40,11 +40,18 @@ front and rear grids derived from Linux SES data and operator notes.
 
 ### Archive CORE
 
-![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/core-overview-v0.4.0.png)
+![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/screenshots/core-overview-v0.7.0.png)
 
 ### Offsite SCALE
 
-![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/scale-overview-v0.4.0.png)
+![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/screenshots/scale-overview-v0.7.0.png)
+
+### Additional Validated Platforms
+
+- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.7.0.png](docs/images/screenshots/gpu-server-overview-v0.7.0.png)
+- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.7.0.png](docs/images/screenshots/unvr-overview-v0.7.0.png)
+- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.7.0.png](docs/images/screenshots/unvr-pro-overview-v0.7.0.png)
+- Quantastor: [docs/images/screenshots/quantastor-overview-v0.7.0.png](docs/images/screenshots/quantastor-overview-v0.7.0.png)
 
 ## Features
 
@@ -685,11 +692,9 @@ multipath summary and simply omits controller/HBA labels.
 
 ## Future Improvements
 
-- `v0.4.x`: keep polishing the new enclosure-profile system and reduce the
-  remaining hardcoded chassis assumptions
-- `v0.6.0`: ship UniFi UNVR-family support and tighten SSH/API defaults
-- next: keep polishing validated platforms, then decide whether the next step
-  is broader Linux appliance support, richer topology context, or optional auth
+- keep polishing validated chassis geometry and platform-specific tray visuals
+- decide whether the next major step is broader Linux appliance support,
+  richer topology visualization, or optional auth / multi-user workflows
 - Richer topology visualization for pool and vdev ancestry beyond the current
   compact sibling-awareness panel
 - WebSocket or Server-Sent Events live updates
@@ -704,6 +709,7 @@ Current planning and SCALE-specific notes live here:
 - [docs/V0_3_SCALE_NOTES.md](docs/V0_3_SCALE_NOTES.md)
 - [docs/QUANTASTOR_NOTES.md](docs/QUANTASTOR_NOTES.md)
 - [docs/PROFILE_AUTHORING.md](docs/PROFILE_AUTHORING.md)
+- [wiki/Home.md](wiki/Home.md)
 
 ## License
 
