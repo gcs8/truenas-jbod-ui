@@ -59,9 +59,9 @@ tickets or audits without exposing live access to the running app.
 
 ## Recommended Screenshots
 
-- `docs/images/screenshots/history-drawer-v0.8.0.png`
-- `docs/images/screenshots/snapshot-export-dialog-v0.8.0.png`
-- `docs/images/screenshots/offline-snapshot-v0.8.0.png`
+- `docs/images/screenshots/history-drawer-v0.9.0.png`
+- `docs/images/screenshots/snapshot-export-dialog-v0.9.0.png`
+- `docs/images/screenshots/offline-snapshot-v0.9.0.png`
 
 ## Suggested GitHub Release Intro
 

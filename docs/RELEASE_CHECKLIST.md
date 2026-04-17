@@ -13,7 +13,18 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 ## Code And Runtime
 
 - run the targeted test suite:
-  - `.\.venv\Scripts\python -m unittest tests.test_profiles tests.test_inventory`
+  - `.\.venv\Scripts\python -m unittest tests.test_profiles tests.test_inventory tests.test_history_service tests.test_perf tests.test_perf_harness tests.test_snapshot_export`
+- run the browser smoke suite against the live app:
+  - `npx playwright test`
+- if the release includes recent Quantastor topology or cache work, sanity-check:
+  - switch away from and back to the active Quantastor view
+  - confirm mirrors do not briefly flatten into `disk > data`
+  - confirm history does not log fake topology churn after middleware restarts or upgrades
+- if the branch is carrying perf work or suspected slowdown risk, run the
+  read-only harness against a local app build and save the output for
+  comparison:
+  - `python scripts/run_perf_harness.py --base-url http://127.0.0.1:8080 --iterations 3 --format markdown --label release-candidate`
+  - compare the generated `data/perf/latest.md` and `data/perf/history.csv`
 - rebuild the Docker image from the current branch tip:
   - `docker compose up -d --build`
 - confirm the app is healthy:
@@ -36,15 +47,15 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - if the release changes operator-facing workflows beyond the README overview,
   capture and stage manual screenshots in `docs/images/screenshots/` before the
   tag is cut
-- for `0.8.0`, capture at least:
+- for `0.9.0`, capture at least:
   - history drawer open on a populated slot with temperature plus read/write
     history visible
   - export snapshot dialog with live size estimate visible
   - offline snapshot HTML opened locally with the frozen banner visible
 - use release-style filenames for those manual captures, for example:
-  - `history-drawer-v0.8.0.png`
-  - `snapshot-export-dialog-v0.8.0.png`
-  - `offline-snapshot-v0.8.0.png`
+  - `history-drawer-v0.9.0.png`
+  - `snapshot-export-dialog-v0.9.0.png`
+  - `offline-snapshot-v0.9.0.png`
 - decide whether each new screenshot is:
   - README-facing and should replace or extend repo image references
   - wiki-facing only and should still be staged in-repo before wiki publish
@@ -56,6 +67,7 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - bump `app/__init__.py` to the release version
 - add the release section to `CHANGELOG.md`
 - refresh any checked-in draft release-notes file if the repo is using one
+- refresh `docs/RELEASE_NOTES_0.9.0.md`
 - review `README.md` for stale version or milestone wording
 - review `docs/ROADMAP.md` for stale "current direction" text
 - review profile/config docs for dead or outdated comments
@@ -77,7 +89,7 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   - do release work on a `codex/` branch first
   - push that branch as a safety checkpoint before the cut
   - when satisfied, switch to `main` and merge locally with a release commit
-    such as `Release v0.8.0`
+    such as `Release v0.9.0`
   - tag the merged `main` commit, not the side branch tip
 - this repo does not require a PR to cut a release unless we explicitly decide
   to use one for review

@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.6.0`.
+This file tracks the current intended release direction after `v0.9.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -10,6 +10,8 @@ Detailed execution plans live here:
 - [`docs/V0_3_X_PLAN.md`](./V0_3_X_PLAN.md)
 - [`docs/V0_4_PROFILE_PLAN.md`](./V0_4_PROFILE_PLAN.md)
 - [`docs/V0_5_QUANTASTOR_PLAN.md`](./V0_5_QUANTASTOR_PLAN.md)
+- [`docs/V0_8_HISTORY_PLAN.md`](./V0_8_HISTORY_PLAN.md)
+- [`docs/V0_9_0_PLAN.md`](./V0_9_0_PLAN.md)
 - [`docs/PROFILE_AUTHORING.md`](./PROFILE_AUTHORING.md)
 
 ## Guiding Principle
@@ -194,6 +196,44 @@ Current status:
 - prepared as the local `0.8.0` release candidate
 - history sidecar, offline snapshot export, screenshots, and wiki walkthroughs
   are all in place for the cut
+
+## v0.9.0 - Perf Harness And Reusable Profiles
+
+Goal:
+
+- use the pre-`1.0` window to add practical performance observability and a
+  broader reusable profile base without turning the project into a full
+  telemetry stack or a giant vendor-import exercise
+
+Primary outcomes:
+
+- opt-in request and workflow timing for the expensive inventory and slot paths
+- a small repeatable perf harness to catch release-to-release slowdowns
+- measured cleanup of obvious duplicate or wasteful work
+- a batch of broadly reusable chassis / JBOD profiles derived from the
+  Quantastor layout references rather than from one-off hardcoded additions
+
+Why this comes next:
+
+- the app already has caching and refresh knobs, but it still lacks a clean
+  performance-observability story
+- current mutating workflows appear likely to rebuild snapshots more than once,
+  making perf cleanup a good candidate for measured low-risk wins
+- the external Quantastor reference set shows substantial overlap across common
+  `12`, `24`, `60`, `84`, and `106` bay shapes that can inform more reusable
+  profile coverage
+
+Current notes:
+
+- [`docs/V0_9_0_PLAN.md`](./V0_9_0_PLAN.md)
+
+Current status:
+
+- release-closeout is underway on the local `v0.9.0` branch
+- eBPF and other native profiler ideas remain optional investigation items, not
+  the required center of the milestone
+- broader Linux appliance support, richer topology graphs, and auth workflows
+  remain explicitly deferred for now
 
 ## Longer-Term Ideas
 

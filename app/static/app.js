@@ -2,14 +2,23 @@
   const bootstrap = window.APP_BOOTSTRAP || {};
   const supportedRefreshIntervals = [15, 30, 60, 300];
   const bootstrapRefreshInterval = Number(bootstrap.refreshIntervalSeconds) || 30;
-  const SMART_PREFETCH_DELAY_MS = 180;
-  const SMART_PREFETCH_CHUNK_SIZE = 8;
-  const SMART_PREFETCH_BATCH_CONCURRENCY = 2;
+  const SMART_BATCH_REQUEST_MAX_CONCURRENCY = Math.max(1, Number(bootstrap.smartBatchMaxConcurrency) || 12);
+  const SMART_PREFETCH_DELAY_MS = Math.max(1, Number(bootstrap.smartPrefetchDelayMs) || 120);
+  const SMART_PREFETCH_STRATEGY = ["auto", "single", "chunked"].includes(String(bootstrap.smartPrefetchStrategy || "").toLowerCase())
+    ? String(bootstrap.smartPrefetchStrategy).toLowerCase()
+    : "auto";
+  const SMART_PREFETCH_SINGLE_THRESHOLD = Math.max(1, Number(bootstrap.smartPrefetchSingleThreshold) || 128);
+  const SMART_PREFETCH_CHUNK_SIZE = Math.max(1, Number(bootstrap.smartPrefetchChunkSize) || 24);
+  const SMART_PREFETCH_BATCH_CONCURRENCY = Math.max(1, Number(bootstrap.smartPrefetchBatchConcurrency) || 2);
   const SMART_PREFETCH_STALE_MS = 15000;
+  const SMART_SUMMARY_CACHE_TTL_MS = 5 * 60 * 1000;
+  const HISTORY_STATUS_CACHE_TTL_MS = 15 * 1000;
   const DEFAULT_HISTORY_TIMEFRAME_HOURS = 24;
   const HISTORY_UI_STORAGE_KEY = "truenas-jbod-ui.history-ui.v1";
   const EXPORT_UI_STORAGE_KEY = "truenas-jbod-ui.export-ui.v1";
   const snapshotMode = Boolean(bootstrap.snapshotMode);
+  const UI_PERF_ENABLED = Boolean(bootstrap.uiPerfEnabled) && !snapshotMode;
+  const UI_PERF_HISTORY_LIMIT = 6;
   const persistedHistoryUi = snapshotMode ? null : loadStoredJson(HISTORY_UI_STORAGE_KEY);
   const persistedExportUi = snapshotMode ? null : loadStoredJson(EXPORT_UI_STORAGE_KEY);
   const initialHistoryWindowHours = bootstrap.initialHistoryTimeframeHours === null
@@ -40,10 +49,13 @@
     hoveredSlot: null,
     selectedSystemId: bootstrap.snapshot?.selected_system_id || null,
     selectedEnclosureId: bootstrap.snapshot?.selected_enclosure_id || null,
+    snapshotReuseCache: {},
     search: "",
     autoRefresh: snapshotMode ? false : true,
     refreshIntervalSeconds: supportedRefreshIntervals.includes(bootstrapRefreshInterval) ? bootstrapRefreshInterval : 30,
     timerId: null,
+    refreshesInFlight: 0,
+    latestRefreshToken: 0,
     smartSummaries: {},
     preloadedSmartSummariesBySlot,
     smartSummaryGeneration: 0,
@@ -68,6 +80,8 @@
       checked: snapshotMode,
       available: snapshotMode ? snapshotHistoryAvailable : false,
       loading: false,
+      statusFetchedAt: snapshotMode ? Date.now() : 0,
+      statusRefreshPromise: null,
       detail: snapshotMode ? null : null,
       counts: snapshotMode ? (preloadedHistorySummary.counts || {}) : {},
       collector: snapshotMode ? (preloadedHistorySummary.collector || {}) : {},
@@ -77,6 +91,12 @@
       panelLoading: false,
       panelError: null,
       slotCache: preloadedHistoryBySlot,
+    },
+    uiPerf: {
+      enabled: UI_PERF_ENABLED,
+      runCounter: 0,
+      currentRun: null,
+      recentRuns: [],
     },
   };
 
@@ -157,6 +177,9 @@
   const historyTemperatureChart = document.getElementById("history-temperature-chart");
   const historyIoChart = document.getElementById("history-io-chart");
   const historyEventList = document.getElementById("history-event-list");
+  const uiPerfPanel = document.getElementById("ui-perf-panel");
+  const uiPerfSummary = document.getElementById("ui-perf-summary");
+  const uiPerfRecent = document.getElementById("ui-perf-recent");
   const ledButtons = Array.from(document.querySelectorAll("[data-led-action]"));
 
   function getSlotById(slotNumber) {
@@ -231,12 +254,19 @@
     return null;
   }
 
+  function countLayoutSlots(rows) {
+    return (rows || []).reduce(
+      (total, row) => total + row.filter((slotNumber) => Number.isInteger(slotNumber)).length,
+      0
+    );
+  }
+
   function inferDominantDriveScale(profile) {
     if (profile.baySize === "3.5" || profile.baySize === "2.5") {
       return profile.baySize;
     }
 
-    const slotCount = Number(state.snapshot.layout_slot_count) || state.layoutRows.flat().length || 0;
+    const slotCount = Number(state.snapshot.layout_slot_count) || countLayoutSlots(state.layoutRows) || 0;
 
     if (profile.faceStyle === "unifi-drive") {
       return "3.5";
@@ -272,7 +302,7 @@
 
   function inferChassisLayoutMode(profile, driveScale) {
     const rowCount = state.layoutRows.length || 0;
-    const slotCount = Number(state.snapshot.layout_slot_count) || state.layoutRows.flat().length || 0;
+    const slotCount = Number(state.snapshot.layout_slot_count) || countLayoutSlots(state.layoutRows) || 0;
 
     if (profile.faceStyle === "unifi-drive") {
       return rowCount > 1 ? "unifi-2row" : "unifi-1row";
@@ -401,12 +431,71 @@
     return params.toString() ? `${url}?${params.toString()}` : url;
   }
 
+  function cloneJsonValue(value) {
+    return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  }
+
+  function snapshotReuseCacheKey(systemId, enclosureId = null) {
+    return `${systemId || "__system__"}::${enclosureId || "__auto__"}`;
+  }
+
+  function snapshotHasTrustedTopology(snapshot) {
+    if (!snapshot) {
+      return false;
+    }
+    const platform = String(snapshot.selected_system_platform || "").toLowerCase();
+    if (platform !== "quantastor") {
+      return true;
+    }
+    const platformContext = snapshot.platform_context;
+    if (!platformContext || typeof platformContext !== "object") {
+      return true;
+    }
+    return platformContext.topology_complete !== false;
+  }
+
+  function rememberReusableSnapshot(snapshot) {
+    if (!snapshot || !snapshot.selected_system_id || !snapshotHasTrustedTopology(snapshot)) {
+      return;
+    }
+    const cloned = cloneJsonValue(snapshot);
+    state.snapshotReuseCache[snapshotReuseCacheKey(snapshot.selected_system_id, snapshot.selected_enclosure_id || null)] = cloned;
+    state.snapshotReuseCache[snapshotReuseCacheKey(snapshot.selected_system_id, null)] = cloned;
+  }
+
+  function findReusableSnapshot(systemId, enclosureId = null) {
+    const exact = state.snapshotReuseCache[snapshotReuseCacheKey(systemId, enclosureId)];
+    if (exact) {
+      return cloneJsonValue(exact);
+    }
+    const fallback = state.snapshotReuseCache[snapshotReuseCacheKey(systemId, null)];
+    return fallback ? cloneJsonValue(fallback) : null;
+  }
+
+  function applyReusableSnapshot(systemId, enclosureId = null) {
+    const reusableSnapshot = findReusableSnapshot(systemId, enclosureId);
+    if (!reusableSnapshot) {
+      return false;
+    }
+    if (enclosureId) {
+      reusableSnapshot.selected_enclosure_id = enclosureId;
+      const selectedOption = (reusableSnapshot.enclosures || []).find((option) => option.id === enclosureId);
+      if (selectedOption) {
+        reusableSnapshot.selected_enclosure_label = selectedOption.label || reusableSnapshot.selected_enclosure_label;
+        reusableSnapshot.selected_enclosure_name = selectedOption.name || reusableSnapshot.selected_enclosure_name;
+      }
+    }
+    applySnapshot(reusableSnapshot);
+    renderAll();
+    return true;
+  }
+
   function applySnapshot(snapshot) {
+    rememberReusableSnapshot(snapshot);
     state.snapshot = snapshot;
     state.layoutRows = snapshot.layout_rows || state.layoutRows || [];
     state.selectedSystemId = snapshot.selected_system_id || state.selectedSystemId;
     state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
-    state.smartSummaryGeneration += 1;
     pruneSmartSummaryCache();
     if (state.selectedSlot !== null && !getSlotById(state.selectedSlot)) {
       state.selectedSlot = null;
@@ -417,8 +506,12 @@
     const validKeys = new Set(
       (state.snapshot.slots || []).map((slot) => getSmartCacheKey(slot))
     );
+    const currentScopePrefix = `${currentSmartPrefetchScopeKey()}|`;
     Object.keys(state.smartSummaries).forEach((key) => {
-      if (!validKeys.has(key)) {
+      const entry = state.smartSummaries[key];
+      const stale = smartSummaryAgeMs(entry) > SMART_SUMMARY_CACHE_TTL_MS && !isSmartEntryInFlight(entry);
+      const invalidForCurrentScope = key.startsWith(currentScopePrefix) && !validKeys.has(key);
+      if (stale || invalidForCurrentScope) {
         delete state.smartSummaries[key];
       }
     });
@@ -436,6 +529,285 @@
   function setStatus(message, tone = "info") {
     statusText.textContent = message;
     statusText.dataset.tone = tone;
+  }
+
+  function uiPerfNow() {
+    return window.performance && typeof window.performance.now === "function"
+      ? window.performance.now()
+      : Date.now();
+  }
+
+  function uiPerfRound(value) {
+    return Number.isFinite(value) ? Math.round(value * 10) / 10 : null;
+  }
+
+  function uiPerfElapsed(startedAt, finishedAt) {
+    return Number.isFinite(startedAt) && Number.isFinite(finishedAt)
+      ? uiPerfRound(finishedAt - startedAt)
+      : null;
+  }
+
+  function uiPerfReasonLabel(reason) {
+    switch (reason) {
+      case "system-switch":
+        return "System Switch";
+      case "enclosure-switch":
+        return "Enclosure Switch";
+      case "manual-refresh":
+        return "Manual Refresh";
+      case "auto-refresh":
+        return "Auto Refresh";
+      default:
+        return reason || "UI Timing";
+    }
+  }
+
+  function refreshStatusMessage(force, reason) {
+    if (reason === "system-switch") {
+      return "Loading system view...";
+    }
+    if (reason === "enclosure-switch") {
+      return "Loading enclosure view...";
+    }
+    return force ? "Refreshing inventory..." : "Auto-refreshing inventory...";
+  }
+
+  function uiPerfScopeLabel(summary) {
+    const systemPart = summary.systemId || "system";
+    const enclosurePart = summary.enclosureId || "auto";
+    return `${systemPart} / ${enclosurePart}`;
+  }
+
+  function uiPerfMetricDisplay(summary, key, fallback = "n/a") {
+    const value = summary[key];
+    if (Number.isFinite(value)) {
+      return `${value} ms`;
+    }
+    if (summary.status === "running") {
+      if (key === "historyReadyMs" && !summary.historyTracked) {
+        return fallback;
+      }
+      if (key === "smartReadyMs" && !summary.smartTracked) {
+        return fallback;
+      }
+      return "pending";
+    }
+    return fallback;
+  }
+
+  function buildUiPerfSummary(run, status = null) {
+    return {
+      id: run.id,
+      status: status || run.status || "running",
+      reason: run.reason,
+      reasonLabel: uiPerfReasonLabel(run.reason),
+      systemId: run.systemId || state.selectedSystemId || null,
+      enclosureId: run.enclosureId || state.selectedEnclosureId || null,
+      startedAtIso: run.startedAtIso,
+      requestMs: uiPerfElapsed(run.startedAt, run.inventoryResponseAt),
+      paintMs: uiPerfElapsed(run.startedAt, run.renderPaintAt),
+      historyReadyMs: uiPerfElapsed(run.startedAt, run.historyReadyAt),
+      smartReadyMs: uiPerfElapsed(run.startedAt, run.smartSettledAt),
+      settledMs: uiPerfElapsed(run.startedAt, run.settledAt),
+      historyTracked: Boolean(run.historyTracked),
+      smartTracked: Boolean(run.smartTracked),
+      error: run.error || null,
+    };
+  }
+
+  function syncUiPerfGlobal() {
+    window.__JBOD_UI_PERF = {
+      current: state.uiPerf.currentRun ? buildUiPerfSummary(state.uiPerf.currentRun) : null,
+      recentRuns: [...state.uiPerf.recentRuns],
+    };
+  }
+
+  function renderUiPerfCard(summary, current = false) {
+    return `
+      <div class="ui-perf-card${current ? " current" : ""}">
+        <div class="ui-perf-title">
+          <span class="ui-perf-label">${escapeHtml(summary.reasonLabel)}</span>
+          <span class="ui-perf-note">${escapeHtml(uiPerfScopeLabel(summary))}</span>
+        </div>
+        <div class="ui-perf-metrics">
+          <div class="ui-perf-metric">
+            <span class="ui-perf-metric-label">Request</span>
+            <span class="ui-perf-metric-value">${escapeHtml(uiPerfMetricDisplay(summary, "requestMs"))}</span>
+          </div>
+          <div class="ui-perf-metric">
+            <span class="ui-perf-metric-label">Paint</span>
+            <span class="ui-perf-metric-value">${escapeHtml(uiPerfMetricDisplay(summary, "paintMs"))}</span>
+          </div>
+          <div class="ui-perf-metric">
+            <span class="ui-perf-metric-label">History</span>
+            <span class="ui-perf-metric-value">${escapeHtml(uiPerfMetricDisplay(summary, "historyReadyMs"))}</span>
+          </div>
+          <div class="ui-perf-metric">
+            <span class="ui-perf-metric-label">SMART</span>
+            <span class="ui-perf-metric-value">${escapeHtml(uiPerfMetricDisplay(summary, "smartReadyMs"))}</span>
+          </div>
+          <div class="ui-perf-metric">
+            <span class="ui-perf-metric-label">Settled</span>
+            <span class="ui-perf-metric-value">${escapeHtml(uiPerfMetricDisplay(summary, "settledMs"))}</span>
+          </div>
+          <div class="ui-perf-metric">
+            <span class="ui-perf-metric-label">Status</span>
+            <span class="ui-perf-metric-value">${escapeHtml(summary.error ? `error: ${summary.error}` : summary.status)}</span>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderUiPerfPanel() {
+    if (!uiPerfPanel || !uiPerfSummary || !uiPerfRecent) {
+      return;
+    }
+    if (!state.uiPerf.enabled) {
+      uiPerfPanel.classList.add("hidden");
+      syncUiPerfGlobal();
+      return;
+    }
+
+    uiPerfPanel.classList.remove("hidden");
+    const currentSummary = state.uiPerf.currentRun ? buildUiPerfSummary(state.uiPerf.currentRun) : null;
+    const latestSummary = currentSummary || state.uiPerf.recentRuns[0] || null;
+    if (!latestSummary) {
+      uiPerfSummary.textContent = "Browser timing is idle.";
+      uiPerfRecent.innerHTML = "";
+      syncUiPerfGlobal();
+      return;
+    }
+
+    uiPerfSummary.textContent = currentSummary
+      ? `Current ${currentSummary.reasonLabel.toLowerCase()} on ${uiPerfScopeLabel(currentSummary)}: request ${uiPerfMetricDisplay(currentSummary, "requestMs")}, paint ${uiPerfMetricDisplay(currentSummary, "paintMs")}, history ${uiPerfMetricDisplay(currentSummary, "historyReadyMs")}, SMART ${uiPerfMetricDisplay(currentSummary, "smartReadyMs")}, settled ${uiPerfMetricDisplay(currentSummary, "settledMs")}.`
+      : `Last ${latestSummary.reasonLabel.toLowerCase()} on ${uiPerfScopeLabel(latestSummary)}: request ${uiPerfMetricDisplay(latestSummary, "requestMs")}, paint ${uiPerfMetricDisplay(latestSummary, "paintMs")}, history ${uiPerfMetricDisplay(latestSummary, "historyReadyMs")}, SMART ${uiPerfMetricDisplay(latestSummary, "smartReadyMs")}, settled ${uiPerfMetricDisplay(latestSummary, "settledMs")}.`;
+
+    const recentCards = [];
+    if (currentSummary) {
+      recentCards.push(renderUiPerfCard(currentSummary, true));
+    }
+    recentCards.push(
+      ...state.uiPerf.recentRuns
+        .slice(0, UI_PERF_HISTORY_LIMIT)
+        .map((summary) => renderUiPerfCard(summary))
+    );
+    uiPerfRecent.innerHTML = recentCards.join("");
+    syncUiPerfGlobal();
+  }
+
+  function archiveUiPerfRun(run, status = "done", error = null) {
+    if (!run) {
+      return;
+    }
+    run.status = status;
+    if (error) {
+      run.error = error;
+    }
+    if (!Number.isFinite(run.settledAt)) {
+      run.settledAt = Math.max(
+        run.renderPaintAt || 0,
+        run.historyReadyAt || 0,
+        run.smartSettledAt || 0,
+        uiPerfNow()
+      );
+    }
+    const summary = buildUiPerfSummary(run, status);
+    state.uiPerf.recentRuns.unshift(summary);
+    state.uiPerf.recentRuns = state.uiPerf.recentRuns.slice(0, UI_PERF_HISTORY_LIMIT);
+    if (state.uiPerf.currentRun && state.uiPerf.currentRun.id === run.id) {
+      state.uiPerf.currentRun = null;
+    }
+    renderUiPerfPanel();
+    console.info("[ui-perf]", summary);
+  }
+
+  function maybeFinalizeUiPerfRun(run) {
+    if (!run || !state.uiPerf.currentRun || state.uiPerf.currentRun.id !== run.id) {
+      return;
+    }
+    if (!Number.isFinite(run.renderPaintAt)) {
+      return;
+    }
+    if (run.historyTracked && !Number.isFinite(run.historyReadyAt)) {
+      return;
+    }
+    if (run.smartTracked && !Number.isFinite(run.smartSettledAt)) {
+      return;
+    }
+    run.settledAt = Math.max(
+      run.renderPaintAt || 0,
+      run.historyReadyAt || 0,
+      run.smartSettledAt || 0
+    );
+    archiveUiPerfRun(run, run.error ? "error" : "done");
+  }
+
+  function beginUiPerfRun(reason, details = {}) {
+    if (!state.uiPerf.enabled) {
+      return null;
+    }
+    if (state.uiPerf.currentRun) {
+      archiveUiPerfRun(state.uiPerf.currentRun, "superseded");
+    }
+    state.uiPerf.currentRun = {
+      id: `ui-perf-${++state.uiPerf.runCounter}`,
+      reason,
+      startedAt: uiPerfNow(),
+      startedAtIso: new Date().toISOString(),
+      systemId: details.systemId || null,
+      enclosureId: details.enclosureId || null,
+      inventoryResponseAt: null,
+      renderPaintAt: null,
+      historyReadyAt: null,
+      smartSettledAt: null,
+      settledAt: null,
+      historyTracked: false,
+      smartTracked: false,
+      smartScopeKey: null,
+      status: "running",
+      error: null,
+    };
+    renderUiPerfPanel();
+    return state.uiPerf.currentRun;
+  }
+
+  function completeUiPerfHistory(run) {
+    if (!run || !state.uiPerf.currentRun || state.uiPerf.currentRun.id !== run.id) {
+      return;
+    }
+    run.historyReadyAt = uiPerfNow();
+    renderUiPerfPanel();
+    maybeFinalizeUiPerfRun(run);
+  }
+
+  function setUiPerfSmartPending(run, tracked, scopeKey) {
+    if (!run || !state.uiPerf.currentRun || state.uiPerf.currentRun.id !== run.id) {
+      return;
+    }
+    run.smartTracked = tracked;
+    run.smartScopeKey = tracked ? scopeKey : null;
+    if (!tracked) {
+      run.smartSettledAt = uiPerfNow();
+      maybeFinalizeUiPerfRun(run);
+    }
+    renderUiPerfPanel();
+  }
+
+  function completeUiPerfSmart(scopeKey) {
+    const run = state.uiPerf.currentRun;
+    if (!run || !run.smartTracked || run.smartScopeKey !== scopeKey || Number.isFinite(run.smartSettledAt)) {
+      return;
+    }
+    run.smartSettledAt = uiPerfNow();
+    renderUiPerfPanel();
+    maybeFinalizeUiPerfRun(run);
+  }
+
+  function waitForNextPaint() {
+    return new Promise((resolve) => {
+      window.requestAnimationFrame(() => window.requestAnimationFrame(resolve));
+    });
   }
 
   function getBrowserTimeZone() {
@@ -570,8 +942,16 @@
     return `${systemPart}|${enclosurePart}`;
   }
 
+  function smartSummaryAgeMs(entry) {
+    const requestedAt = Number(entry?.requestedAt) || 0;
+    if (requestedAt <= 0) {
+      return Number.POSITIVE_INFINITY;
+    }
+    return Date.now() - requestedAt;
+  }
+
   function isSmartEntryCurrent(entry) {
-    return entry?.generation === state.smartSummaryGeneration;
+    return Boolean(entry?.data) && smartSummaryAgeMs(entry) <= SMART_SUMMARY_CACHE_TTL_MS;
   }
 
   function isSmartEntryInFlight(entry) {
@@ -603,7 +983,7 @@
 
   function updateSmartPrefetchViews() {
     const profile = buildViewProfile();
-    const slotCount = Number(state.snapshot.layout_slot_count) || state.layoutRows.flat().length || 0;
+    const slotCount = Number(state.snapshot.layout_slot_count) || countLayoutSlots(state.layoutRows) || 0;
     const usesStaticGeometry =
       profile.faceStyle === "top-loader" ||
       profile.faceStyle === "unifi-drive" ||
@@ -617,6 +997,73 @@
     if (state.hoveredSlot !== null) {
       refreshHoveredTooltip();
     }
+  }
+
+  function shouldUseSingleSmartPrefetchRequest(slots) {
+    if (SMART_PREFETCH_STRATEGY === "single") {
+      return true;
+    }
+    if (SMART_PREFETCH_STRATEGY === "chunked") {
+      return false;
+    }
+    return slots.length <= SMART_PREFETCH_SINGLE_THRESHOLD;
+  }
+
+  async function requestSmartBatchForSlots(slots) {
+    return sendScopedRequest("/api/slots/smart-batch", {
+      method: "POST",
+      body: JSON.stringify({
+        slots: slots.map((slot) => slot.slot),
+        max_concurrency: Math.min(SMART_BATCH_REQUEST_MAX_CONCURRENCY, slots.length),
+      }),
+    });
+  }
+
+  function applySmartPrefetchPayload(slots, payload) {
+    const seenSlots = new Set();
+    (payload.summaries || []).forEach((item) => {
+      const slot = getSlotById(item.slot);
+      if (!slot) {
+        return;
+      }
+      seenSlots.add(item.slot);
+      state.smartSummaries[getSmartCacheKey(slot)] = {
+        loading: false,
+        refreshing: false,
+        data: item.summary,
+        requestedAt: Date.now(),
+        generation: state.smartSummaryGeneration,
+      };
+    });
+    slots.forEach((slot) => {
+      if (seenSlots.has(slot.slot)) {
+        return;
+      }
+      const existingEntry = state.smartSummaries[getSmartCacheKey(slot)];
+      state.smartSummaries[getSmartCacheKey(slot)] = {
+        loading: false,
+        refreshing: false,
+        data: existingEntry?.data || { available: false, message: "SMART prefetch returned no data for this slot." },
+        requestedAt: Date.now(),
+        generation: state.smartSummaryGeneration,
+      };
+    });
+  }
+
+  function applySmartPrefetchError(slots, error) {
+    slots.forEach((slot) => {
+      const existingEntry = state.smartSummaries[getSmartCacheKey(slot)];
+      state.smartSummaries[getSmartCacheKey(slot)] = {
+        loading: false,
+        refreshing: false,
+        data: existingEntry?.data || {
+          available: false,
+          message: error.message || String(error),
+        },
+        requestedAt: Date.now(),
+        generation: state.smartSummaryGeneration,
+      };
+    });
   }
 
   async function runSmartPrefetch(runToken, scopeKey) {
@@ -644,82 +1091,66 @@
       });
       updateSmartPrefetchViews();
 
-      const chunks = [];
-      for (let index = 0; index < slots.length; index += SMART_PREFETCH_CHUNK_SIZE) {
-        chunks.push(slots.slice(index, index + SMART_PREFETCH_CHUNK_SIZE));
-      }
+      const chunkedFetch = async () => {
+        const chunks = [];
+        for (let index = 0; index < slots.length; index += SMART_PREFETCH_CHUNK_SIZE) {
+          chunks.push(slots.slice(index, index + SMART_PREFETCH_CHUNK_SIZE));
+        }
 
-      let nextChunkIndex = 0;
-      const processNextChunk = async () => {
-        while (nextChunkIndex < chunks.length) {
-          if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
-            return;
-          }
-          const chunk = chunks[nextChunkIndex];
-          nextChunkIndex += 1;
-        try {
-          const payload = await sendScopedRequest("/api/slots/smart-batch", {
-            method: "POST",
-            body: JSON.stringify({ slots: chunk.map((slot) => slot.slot) }),
-          });
-          if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
-            return;
-          }
-          const seenSlots = new Set();
-          (payload.summaries || []).forEach((item) => {
-            const slot = getSlotById(item.slot);
-            if (!slot) {
+        let nextChunkIndex = 0;
+        const processNextChunk = async () => {
+          while (nextChunkIndex < chunks.length) {
+            if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
               return;
             }
-            seenSlots.add(item.slot);
-            state.smartSummaries[getSmartCacheKey(slot)] = {
-              loading: false,
-              refreshing: false,
-              data: item.summary,
-              requestedAt: Date.now(),
-              generation: state.smartSummaryGeneration,
-            };
-          });
-          chunk.forEach((slot) => {
-            if (seenSlots.has(slot.slot)) {
-              return;
+            const chunk = chunks[nextChunkIndex];
+            nextChunkIndex += 1;
+            try {
+              const payload = await requestSmartBatchForSlots(chunk);
+              if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
+                return;
+              }
+              applySmartPrefetchPayload(chunk, payload);
+            } catch (error) {
+              console.error("SMART prefetch failed", error);
+              applySmartPrefetchError(chunk, error);
             }
-            const existingEntry = state.smartSummaries[getSmartCacheKey(slot)];
-            state.smartSummaries[getSmartCacheKey(slot)] = {
-              loading: false,
-              refreshing: false,
-              data: existingEntry?.data || { available: false, message: "SMART prefetch returned no data for this slot." },
-              requestedAt: Date.now(),
-              generation: state.smartSummaryGeneration,
-            };
-          });
-        } catch (error) {
-          console.error("SMART prefetch failed", error);
-          chunk.forEach((slot) => {
-            const existingEntry = state.smartSummaries[getSmartCacheKey(slot)];
-            state.smartSummaries[getSmartCacheKey(slot)] = {
-              loading: false,
-              refreshing: false,
-              data: existingEntry?.data || {
-                available: false,
-                message: error.message || String(error),
-              },
-              requestedAt: Date.now(),
-              generation: state.smartSummaryGeneration,
-            };
-          });
-        }
-        updateSmartPrefetchViews();
-        }
+            updateSmartPrefetchViews();
+          }
+        };
+
+        const workerCount = Math.min(SMART_PREFETCH_BATCH_CONCURRENCY, chunks.length);
+        await Promise.all(Array.from({ length: workerCount }, () => processNextChunk()));
       };
 
-      const workerCount = Math.min(SMART_PREFETCH_BATCH_CONCURRENCY, chunks.length);
-      await Promise.all(Array.from({ length: workerCount }, () => processNextChunk()));
+      const useSingleRequest = shouldUseSingleSmartPrefetchRequest(slots);
+      if (useSingleRequest) {
+        try {
+          const payload = await requestSmartBatchForSlots(slots);
+          if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
+            return;
+          }
+          applySmartPrefetchPayload(slots, payload);
+          updateSmartPrefetchViews();
+        } catch (error) {
+          console.error("SMART prefetch single-request path failed", error);
+          if (SMART_PREFETCH_STRATEGY === "single") {
+            applySmartPrefetchError(slots, error);
+            updateSmartPrefetchViews();
+          } else {
+            await chunkedFetch();
+          }
+        }
+      } else {
+        await chunkedFetch();
+      }
     } finally {
       if (runToken === state.smartPrefetchToken && scopeKey === state.smartPrefetchScopeKey) {
         state.smartPrefetchRunning = false;
         if (candidateSlotsForSmartPrefetch().length) {
           scheduleSmartPrefetch();
+        } else {
+          completeUiPerfSmart(scopeKey);
         }
       }
     }
@@ -1387,6 +1818,16 @@
       const flatGroupBreakpoints = rowGroupBreakpoints(rowGroups);
 
       const appendTile = (container, slotNumber, tileIndex = null, breakpoints = []) => {
+        if (!Number.isInteger(slotNumber)) {
+          const gapTile = document.createElement("div");
+          gapTile.className = "slot-gap";
+          if (tileIndex !== null && breakpoints.includes(tileIndex + 1)) {
+            gapTile.classList.add("group-divider-after");
+          }
+          gapTile.setAttribute("aria-hidden", "true");
+          container.appendChild(gapTile);
+          return;
+        }
         const slot = slotsByNumber.get(slotNumber) || {
           slot: slotNumber,
           slot_label: formatSlotLabel(slotNumber),
@@ -2606,6 +3047,11 @@
     renderHistoryEvents(payload.events || [], windowHours, referenceTimestampMs);
   }
 
+  function isHistoryStatusCurrent() {
+    const fetchedAt = Number(state.history.statusFetchedAt) || 0;
+    return state.history.checked && fetchedAt > 0 && Date.now() - fetchedAt <= HISTORY_STATUS_CACHE_TTL_MS;
+  }
+
   async function refreshHistoryStatus(silent = true) {
     if (state.snapshotMode) {
       state.history.loading = false;
@@ -2626,34 +3072,50 @@
       return;
     }
 
+    if (isHistoryStatusCurrent()) {
+      renderStatus();
+      renderHistoryPanel(getSlotById(state.selectedSlot));
+      return;
+    }
+
+    if (state.history.statusRefreshPromise) {
+      await state.history.statusRefreshPromise;
+      return;
+    }
+
     state.history.loading = true;
     renderStatus();
 
-    try {
-      const payload = await fetchJson("/api/history/status");
-      state.history.checked = true;
-      state.history.available = Boolean(payload.available);
-      state.history.detail = payload.detail || null;
-      state.history.counts = payload.counts || {};
-      state.history.collector = payload.collector || {};
-    } catch (error) {
-      state.history.checked = true;
-      state.history.available = false;
-      state.history.detail = error.message || String(error);
-      state.history.counts = {};
-      state.history.collector = {};
-      if (!silent) {
-        setStatus(`History status check failed: ${state.history.detail}`, "error");
+    state.history.statusRefreshPromise = (async () => {
+      try {
+        const payload = await fetchJson("/api/history/status");
+        state.history.checked = true;
+        state.history.available = Boolean(payload.available);
+        state.history.detail = payload.detail || null;
+        state.history.counts = payload.counts || {};
+        state.history.collector = payload.collector || {};
+      } catch (error) {
+        state.history.checked = true;
+        state.history.available = false;
+        state.history.detail = error.message || String(error);
+        state.history.counts = {};
+        state.history.collector = {};
+        if (!silent) {
+          setStatus(`History status check failed: ${state.history.detail}`, "error");
+        }
+      } finally {
+        state.history.loading = false;
+        state.history.statusFetchedAt = Date.now();
+        state.history.statusRefreshPromise = null;
       }
-    } finally {
-      state.history.loading = false;
-    }
-    if (!state.history.available) {
-      state.history.panelOpen = false;
-    }
+      if (!state.history.available) {
+        state.history.panelOpen = false;
+      }
 
-    renderStatus();
-    renderHistoryPanel(getSlotById(state.selectedSlot));
+      renderStatus();
+      renderHistoryPanel(getSlotById(state.selectedSlot));
+    })();
+    await state.history.statusRefreshPromise;
   }
 
   async function loadHistoryForSelectedSlot(force = false) {
@@ -3412,23 +3874,73 @@
     }
   }
 
-  async function refreshSnapshot(force = false) {
+  async function refreshSnapshot(force = false, reason = force ? "manual-refresh" : "auto-refresh") {
     if (state.snapshotMode) {
       setStatus("Offline snapshot export. Live refresh is disabled.", "error");
       return;
     }
+    const refreshToken = ++state.latestRefreshToken;
+    state.refreshesInFlight += 1;
+    cancelAutoRefreshTimer();
+    const perfRun = beginUiPerfRun(reason, {
+      systemId: state.selectedSystemId,
+      enclosureId: state.selectedEnclosureId,
+    });
     try {
-      setStatus(force ? "Refreshing inventory..." : "Auto-refreshing inventory...");
+      setStatus(refreshStatusMessage(force, reason));
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
       const snapshot = await fetchJson(`/api/inventory?${params.toString()}`);
+      if (refreshToken !== state.latestRefreshToken) {
+        if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
+          archiveUiPerfRun(perfRun, "superseded");
+        }
+        return;
+      }
+      if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
+        perfRun.inventoryResponseAt = uiPerfNow();
+      }
       applySnapshot(snapshot);
       renderAll();
+      await waitForNextPaint();
+      if (refreshToken !== state.latestRefreshToken) {
+        if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
+          archiveUiPerfRun(perfRun, "superseded");
+        }
+        return;
+      }
+      if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
+        perfRun.renderPaintAt = uiPerfNow();
+        perfRun.systemId = state.selectedSystemId;
+        perfRun.enclosureId = state.selectedEnclosureId;
+        perfRun.historyTracked = !state.snapshotMode && state.history.configured;
+      }
+      renderUiPerfPanel();
+      void refreshHistoryStatus(true).finally(() => {
+        if (refreshToken === state.latestRefreshToken) {
+          completeUiPerfHistory(perfRun);
+        }
+      });
+      setUiPerfSmartPending(
+        perfRun,
+        !state.snapshotMode && candidateSlotsForSmartPrefetch().length > 0,
+        currentSmartPrefetchScopeKey()
+      );
       scheduleSmartPrefetch();
-      void refreshHistoryStatus(true);
+      maybeFinalizeUiPerfRun(perfRun);
       setStatus("Inventory updated.");
     } catch (error) {
-      setStatus(`Refresh failed: ${error.message || error}`, "error");
+      if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
+        archiveUiPerfRun(perfRun, "error", error.message || String(error));
+      }
+      if (refreshToken === state.latestRefreshToken) {
+        setStatus(`Refresh failed: ${error.message || error}`, "error");
+      }
+    } finally {
+      state.refreshesInFlight = Math.max(0, state.refreshesInFlight - 1);
+      if (refreshToken === state.latestRefreshToken && state.refreshesInFlight === 0) {
+        scheduleAutoRefresh();
+      }
     }
   }
 
@@ -3652,13 +4164,31 @@
     }
   }
 
-  function resetTimer() {
+  function cancelAutoRefreshTimer() {
     if (state.timerId) {
-      window.clearInterval(state.timerId);
+      window.clearTimeout(state.timerId);
       state.timerId = null;
     }
-    if (state.snapshotMode || !state.autoRefresh) return;
-    state.timerId = window.setInterval(() => refreshSnapshot(false), state.refreshIntervalSeconds * 1000);
+  }
+
+  function scheduleAutoRefresh(delayMs = state.refreshIntervalSeconds * 1000) {
+    cancelAutoRefreshTimer();
+    if (state.snapshotMode || !state.autoRefresh) {
+      return;
+    }
+    const waitMs = Math.max(1000, Number.isFinite(delayMs) ? delayMs : state.refreshIntervalSeconds * 1000);
+    state.timerId = window.setTimeout(async () => {
+      state.timerId = null;
+      if (state.refreshesInFlight > 0) {
+        scheduleAutoRefresh();
+        return;
+      }
+      await refreshSnapshot(false, "auto-refresh");
+    }, waitMs);
+  }
+
+  function resetTimer() {
+    scheduleAutoRefresh();
   }
 
   searchBox.addEventListener("input", (event) => {
@@ -3666,20 +4196,22 @@
     renderGrid();
   });
 
-  refreshButton.addEventListener("click", () => refreshSnapshot(true));
+  refreshButton.addEventListener("click", () => refreshSnapshot(true, "manual-refresh"));
   if (systemSelect) {
     systemSelect.addEventListener("change", async (event) => {
       state.selectedSystemId = event.target.value || null;
       state.selectedEnclosureId = null;
       clearSelectedSlot();
-      await refreshSnapshot(true);
+      applyReusableSnapshot(state.selectedSystemId, null);
+      await refreshSnapshot(false, "system-switch");
     });
   }
   if (enclosureSelect) {
     enclosureSelect.addEventListener("change", async (event) => {
       state.selectedEnclosureId = event.target.value || null;
       clearSelectedSlot();
-      await refreshSnapshot(true);
+      applyReusableSnapshot(state.selectedSystemId, state.selectedEnclosureId);
+      await refreshSnapshot(false, "enclosure-switch");
     });
   }
   if (enclosureFace) {
@@ -3806,7 +4338,9 @@
     button.addEventListener("click", () => sendLedAction(button.dataset.ledAction));
   });
 
+  rememberReusableSnapshot(state.snapshot);
   renderAll();
+  renderUiPerfPanel();
   if (state.snapshotMode) {
     setStatus("Frozen offline snapshot loaded. Live actions are disabled.");
   }

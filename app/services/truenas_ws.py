@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import ssl
@@ -7,7 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from websockets.asyncio.client import ClientConnection, connect
@@ -19,6 +20,74 @@ logger = logging.getLogger(__name__)
 
 class TrueNASAPIError(RuntimeError):
     pass
+
+
+MethodCaller = Callable[[str, list[Any]], Awaitable[Any]]
+
+
+class _MiddlewareCallDispatcher:
+    def __init__(self, ws: ClientConnection) -> None:
+        self.ws = ws
+        self._pending: dict[str, tuple[str, asyncio.Future[Any]]] = {}
+        self._reader_task = asyncio.create_task(self._reader())
+
+    async def call(self, method: str, params: list[Any]) -> Any:
+        request_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        self._pending[request_id] = (method, future)
+        payload = {
+            "id": request_id,
+            "msg": "method",
+            "method": method,
+            "params": params,
+        }
+        logger.debug("Calling TrueNAS websocket method %s", method)
+        await self.ws.send(json.dumps(payload))
+        try:
+            return await future
+        finally:
+            self._pending.pop(request_id, None)
+
+    async def close(self) -> None:
+        if self._reader_task.done():
+            exc = self._reader_task.exception()
+            if exc is not None:
+                raise exc
+            return
+        self._reader_task.cancel()
+        try:
+            await self._reader_task
+        except asyncio.CancelledError:
+            pass
+
+    async def _reader(self) -> None:
+        try:
+            while True:
+                raw_message = await self.ws.recv()
+                message = json.loads(raw_message)
+                if message.get("msg") != "result":
+                    continue
+                request_id = message.get("id")
+                if not isinstance(request_id, str):
+                    continue
+                pending = self._pending.get(request_id)
+                if pending is None:
+                    continue
+                method, future = pending
+                if future.done():
+                    continue
+                if message.get("error"):
+                    future.set_exception(TrueNASAPIError(f"{method} failed: {message['error']}"))
+                else:
+                    future.set_result(message.get("result"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            for _method, future in self._pending.values():
+                if not future.done():
+                    future.set_exception(exc)
+            raise
 
 
 def build_websocket_url(host: str) -> str:
@@ -63,11 +132,17 @@ class TrueNASWebsocketClient:
 
     async def fetch_all(self) -> TrueNASRawData:
         async with self._session() as ws:
-            enclosures = await self._fetch_enclosures(ws)
-            disks = await self._fetch_disks(ws)
-            pools = await self._call(ws, "pool.query", [])
-            disk_temperatures = await self._fetch_disk_temperatures(ws)
-            smart_test_results = await self._fetch_smart_test_results(ws)
+            dispatcher = _MiddlewareCallDispatcher(ws)
+            try:
+                enclosures, disks, pools, disk_temperatures, smart_test_results = await asyncio.gather(
+                    self._fetch_enclosures(dispatcher.call),
+                    self._fetch_disks(dispatcher.call),
+                    self._fetch_pools(dispatcher.call),
+                    self._fetch_disk_temperatures(dispatcher.call),
+                    self._fetch_smart_test_results(dispatcher.call),
+                )
+            finally:
+                await dispatcher.close()
             return TrueNASRawData(
                 enclosures=self._ensure_list(enclosures),
                 disks=self._ensure_list(disks),
@@ -118,14 +193,14 @@ class TrueNASWebsocketClient:
         if authenticated is not True:
             raise TrueNASAPIError("TrueNAS API authentication failed.")
 
-    async def _fetch_enclosures(self, ws: ClientConnection) -> list[dict[str, Any]]:
+    async def _fetch_enclosures(self, call_method: MethodCaller) -> list[dict[str, Any]]:
         methods = ["enclosure.query", "enclosure2.query"]
         if self.config.platform == "scale":
             methods = ["enclosure2.query", "enclosure.query"]
 
         for method in methods:
             try:
-                result = await self._call(ws, method, [])
+                result = await call_method(method, [])
             except TrueNASAPIError:
                 continue
             return self._ensure_list(result)
@@ -133,18 +208,18 @@ class TrueNASWebsocketClient:
         logger.warning("No supported enclosure query method succeeded; continuing without enclosure rows.")
         return []
 
-    async def _fetch_disks(self, ws: ClientConnection) -> list[dict[str, Any]]:
+    async def _fetch_disks(self, call_method: MethodCaller) -> list[dict[str, Any]]:
         try:
-            query_disks = self._ensure_list(await self._call(ws, "disk.query", [[], {"extra": {"pools": True}}]))
+            query_disks = self._ensure_list(await call_method("disk.query", [[], {"extra": {"pools": True}}]))
         except TrueNASAPIError:
             logger.warning("disk.query with extra.pools failed; retrying without extra options.")
-            query_disks = self._ensure_list(await self._call(ws, "disk.query", [[]]))
+            query_disks = self._ensure_list(await call_method("disk.query", [[]]))
 
         if self.config.platform != "scale":
             return query_disks
 
         try:
-            details_payload = await self._call(ws, "disk.details", [])
+            details_payload = await call_method("disk.details", [])
         except TrueNASAPIError:
             logger.warning("disk.details failed on SCALE; continuing with disk.query only.")
             return query_disks
@@ -167,9 +242,12 @@ class TrueNASWebsocketClient:
                 merged.append(disk)
         return merged
 
-    async def _fetch_disk_temperatures(self, ws: ClientConnection) -> dict[str, int]:
+    async def _fetch_pools(self, call_method: MethodCaller) -> list[dict[str, Any]]:
+        return self._ensure_list(await call_method("pool.query", []))
+
+    async def _fetch_disk_temperatures(self, call_method: MethodCaller) -> dict[str, int]:
         try:
-            temperatures = await self._call(ws, "disk.temperatures", [[]])
+            temperatures = await call_method("disk.temperatures", [[]])
         except TrueNASAPIError:
             logger.warning("disk.temperatures failed; continuing without temperature overview.")
             return {}
@@ -182,9 +260,9 @@ class TrueNASWebsocketClient:
             }
         return {}
 
-    async def _fetch_smart_test_results(self, ws: ClientConnection) -> list[dict[str, Any]]:
+    async def _fetch_smart_test_results(self, call_method: MethodCaller) -> list[dict[str, Any]]:
         try:
-            results = await self._call(ws, "smart.test.results", [])
+            results = await call_method("smart.test.results", [])
         except TrueNASAPIError as exc:
             if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
                 logger.info("smart.test.results is unavailable on this SCALE system; continuing without SMART history.")

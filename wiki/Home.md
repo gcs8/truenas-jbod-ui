@@ -77,8 +77,10 @@ It gives you:
 - `0.6.0` shipped UniFi UNVR-family support plus safer SSH/API defaults
 - `0.7.0` shipped layout polish, better topology wording, refreshed
   screenshots, and release cleanup for the current validated platform set
-- `0.8.0` adds the optional history sidecar, the wide slot-history drawer in
-  the main UI, and frozen offline snapshot export
+- `0.8.0` shipped the optional history sidecar, the wide slot-history drawer
+  in the main UI, and frozen offline snapshot export
+- `0.9.0` ships practical perf instrumentation, cache-first switching,
+  browser QA coverage, and broader reusable chassis profiles ahead of `1.0`
 
 ## Visual Walkthrough
 

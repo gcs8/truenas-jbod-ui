@@ -163,6 +163,17 @@
     <div class="status-text" id="status-text">Ready.</div>
   </section>
 
+  <section id="ui-perf-panel" class="panel ui-perf-panel hidden" aria-live="polite">
+    <div class="panel-header compact">
+      <div>
+        <h2>UI Timing</h2>
+        <p class="subtle">Browser-side switch and render timing for the current page.</p>
+      </div>
+    </div>
+    <div id="ui-perf-summary" class="ui-perf-summary muted">Browser timing is idle.</div>
+    <div id="ui-perf-recent" class="ui-perf-recent"></div>
+  </section>
+
   <section class="summary-strip" id="summary-strip">
     <div class="summary-card">
       <span class="summary-label">Disks</span>
@@ -332,6 +343,8 @@
             </div>
           </section>
         </div>
+      </div>
+      <div class="history-events-row">
         <section class="history-card history-events-card">
           <div class="history-card-header">
             <h4>Recent Events</h4>
@@ -441,6 +454,13 @@
     snapshot: {{ initial_snapshot_json | safe }},
     layoutRows: {{ snapshot.layout_rows | tojson }},
     refreshIntervalSeconds: {{ snapshot.refresh_interval_seconds }},
+    smartBatchMaxConcurrency: {{ settings.app.smart_batch_max_concurrency }},
+    smartPrefetchDelayMs: {{ settings.app.smart_prefetch_delay_ms }},
+    smartPrefetchStrategy: {{ settings.app.smart_prefetch_strategy | tojson }},
+    smartPrefetchSingleThreshold: {{ settings.app.smart_prefetch_single_threshold }},
+    smartPrefetchChunkSize: {{ settings.app.smart_prefetch_chunk_size }},
+    smartPrefetchBatchConcurrency: {{ settings.app.smart_prefetch_batch_concurrency }},
+    uiPerfEnabled: {{ settings.perf.enabled | tojson }},
     slotCount: {{ snapshot.layout_slot_count or settings.layout.slot_count }},
     historyConfigured: {{ history_configured | tojson }},
     snapshotMode: {{ snapshot_mode | tojson }},

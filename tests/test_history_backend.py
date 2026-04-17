@@ -116,3 +116,63 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(payload["latest_values"]["annualized_bytes_written"])
         self.assertEqual(payload["latest_values"]["power_on_hours"], 10101)
         self.assertEqual(len(payload["events"]), 1)
+
+    async def test_get_scope_history_uses_scope_endpoint_when_available(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+
+        with patch.object(
+            client,
+            "_fetch_json",
+            AsyncMock(
+                return_value={
+                    "histories": {
+                        "5": {
+                            "slot": 5,
+                            "events": [{"observed_at": "2026-04-16T23:15:00+00:00"}],
+                            "metrics": {"temperature_c": [{"observed_at": "2026-04-16T23:10:00+00:00", "value": 31}]},
+                            "sample_counts": {"temperature_c": 1},
+                            "latest_values": {"temperature_c": 31},
+                        },
+                        "6": {
+                            "slot": 6,
+                            "events": [],
+                            "metrics": {"temperature_c": []},
+                            "sample_counts": {"temperature_c": 0},
+                            "latest_values": {"temperature_c": None},
+                        },
+                    }
+                }
+            ),
+        ) as fetch_json:
+            payload = await client.get_scope_history(system_id="archive-core", enclosure_id="front", slots=[5, 6])
+
+        self.assertEqual(payload[5]["latest_values"]["temperature_c"], 31)
+        self.assertEqual(payload[6]["sample_counts"]["temperature_c"], 0)
+        fetch_json.assert_awaited_once()
+
+    async def test_get_scope_history_falls_back_to_per_slot_fetch_on_scope_error(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+
+        per_slot_payload = {
+            "configured": True,
+            "available": True,
+            "detail": None,
+            "slot": 5,
+            "system_id": "archive-core",
+            "enclosure_id": "front",
+            "metrics": {},
+            "events": [],
+            "sample_counts": {},
+            "latest_values": {},
+        }
+
+        with patch.object(client, "_fetch_json", AsyncMock(side_effect=RuntimeError("boom"))):
+            with patch.object(client, "get_slot_history", AsyncMock(return_value=per_slot_payload)) as get_slot_history:
+                payload = await client.get_scope_history(system_id="archive-core", enclosure_id="front", slots=[5])
+
+        self.assertEqual(payload[5]["slot"], 5)
+        get_slot_history.assert_awaited_once_with(5, "archive-core", "front")

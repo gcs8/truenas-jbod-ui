@@ -1,0 +1,16 @@
+{
+  "name": "truenas-jbod-ui-browser-qa",
+  "private": true,
+  "version": "0.9.0-dev",
+  "description": "Lightweight browser QA smoke tests for truenas-jbod-ui.",
+  "scripts": {
+    "qa:ui": "playwright test",
+    "qa:ui:headed": "playwright test --headed",
+    "qa:ui:debug": "playwright test --debug",
+    "qa:ui:install": "playwright install chromium",
+    "qa:ui:report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
+  }
+}

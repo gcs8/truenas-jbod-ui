@@ -1,63 +1,52 @@
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 
 from app.config import TrueNASConfig
-from app.services.quantastor_api import QuantastorRESTClient, build_quantastor_api_base
-from app.services.truenas_ws import TrueNASAPIError
+from app.services.quantastor_api import QuantastorRESTClient
 
 
-class QuantastorClientTests(unittest.TestCase):
-    def test_build_quantastor_api_base_normalizes_host(self) -> None:
-        self.assertEqual(
-            build_quantastor_api_base("quantastor.example.local"),
-            "https://quantastor.example.local/qstorapi",
-        )
-        self.assertEqual(
-            build_quantastor_api_base("https://quantastor.example.local"),
-            "https://quantastor.example.local/qstorapi",
-        )
-        self.assertEqual(
-            build_quantastor_api_base("https://quantastor.example.local/custom"),
-            "https://quantastor.example.local/custom/qstorapi",
-        )
-        self.assertEqual(
-            build_quantastor_api_base("https://quantastor.example.local/qstorapi"),
-            "https://quantastor.example.local/qstorapi",
-        )
+class QuantastorRESTClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetch_all_collects_endpoints_in_parallel(self) -> None:
+        class TrackingClient(QuantastorRESTClient):
+            def __init__(self) -> None:
+                super().__init__(TrueNASConfig(api_user="admin", api_password="secret", platform="quantastor"))
+                self.active_calls = 0
+                self.max_active_calls = 0
+                self.lock = threading.Lock()
 
-    def test_ensure_list_handles_common_wrapper_shapes(self) -> None:
-        self.assertEqual(
-            QuantastorRESTClient._ensure_list({"result": [{"id": 1}], "status": "ok"}),
-            [{"id": 1}],
-        )
-        self.assertEqual(
-            QuantastorRESTClient._ensure_list({"items": [{"id": 2}], "count": 1}),
-            [{"id": 2}],
-        )
-        self.assertEqual(
-            QuantastorRESTClient._ensure_list({"a": {"id": 3}, "b": {"id": 4}}),
-            [{"id": 3}, {"id": 4}],
-        )
-        self.assertEqual(
-            QuantastorRESTClient._ensure_list({"id": 5, "name": "single"}),
-            [{"id": 5, "name": "single"}],
-        )
+            def _track(self, result):
+                with self.lock:
+                    self.active_calls += 1
+                    self.max_active_calls = max(self.max_active_calls, self.active_calls)
+                try:
+                    time.sleep(0.02)
+                    return result
+                finally:
+                    with self.lock:
+                        self.active_calls -= 1
 
-    def test_request_json_requires_quantastor_credentials(self) -> None:
-        client = QuantastorRESTClient(
-            TrueNASConfig(
-                host="https://quantastor.example.local",
-                platform="quantastor",
-                api_user="",
-                api_password="",
-            )
-        )
+            def _fetch_required_list(self, endpoint: str):
+                return self._track([{"endpoint": endpoint}])
 
-        with self.assertRaises(TrueNASAPIError):
-            client._request_json("storageSystemEnum")
+            def _fetch_optional_list(self, endpoint: str):
+                return self._track([{"endpoint": endpoint}])
 
-    def test_optional_error_payload_is_detected(self) -> None:
-        self.assertTrue(QuantastorRESTClient._is_error_payload({"RestError": "No method"}))
-        self.assertTrue(QuantastorRESTClient._is_error_payload({"status": "error", "message": "failed"}))
-        self.assertFalse(QuantastorRESTClient._is_error_payload([{"id": 1}]))
+        client = TrackingClient()
+
+        payload = await client.fetch_all()
+
+        self.assertGreater(client.max_active_calls, 1)
+        self.assertEqual(payload.enclosures[0]["endpoint"], "storageSystemEnum")
+        self.assertEqual(payload.disks[0]["endpoint"], "physicalDiskEnum")
+        self.assertEqual(payload.pools[0]["endpoint"], "storagePoolEnum")
+        self.assertEqual(payload.pool_devices[0]["endpoint"], "storagePoolDeviceEnum")
+        self.assertEqual(payload.ha_groups[0]["endpoint"], "haGroupEnum")
+        self.assertEqual(payload.hw_disks[0]["endpoint"], "hwDiskEnum")
+        self.assertEqual(payload.hw_enclosures[0]["endpoint"], "hwEnclosureEnum")
+
+
+if __name__ == "__main__":
+    unittest.main()

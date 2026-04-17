@@ -139,6 +139,102 @@ class HistoryBackendClient:
             "latest_values": latest_values,
         }
 
+    async def get_scope_history(
+        self,
+        *,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slots: list[int],
+    ) -> dict[int, dict[str, Any]]:
+        if not slots:
+            return {}
+        if not self.configured:
+            return {
+                slot: self._unconfigured_slot_payload(slot, system_id, enclosure_id)
+                for slot in slots
+            }
+
+        try:
+            payload = await self._fetch_json(
+                "/api/history/scopes/slots",
+                params={
+                    "system_id": system_id,
+                    "enclosure_id": enclosure_id,
+                    "slots": slots,
+                    "event_limit": 12,
+                },
+            )
+        except Exception:
+            return {
+                slot: history
+                for slot, history in zip(
+                    slots,
+                    await asyncio.gather(*(self.get_slot_history(slot, system_id, enclosure_id) for slot in slots)),
+                    strict=False,
+                )
+            }
+
+        histories = payload.get("histories")
+        if not isinstance(histories, dict):
+            return {
+                slot: history
+                for slot, history in zip(
+                    slots,
+                    await asyncio.gather(*(self.get_slot_history(slot, system_id, enclosure_id) for slot in slots)),
+                    strict=False,
+                )
+            }
+
+        normalized: dict[int, dict[str, Any]] = {}
+        for slot in slots:
+            history = histories.get(str(slot))
+            if isinstance(history, dict):
+                normalized[slot] = {
+                    "configured": True,
+                    "available": True,
+                    "detail": None,
+                    "slot": slot,
+                    "system_id": system_id,
+                    "enclosure_id": enclosure_id,
+                    "metrics": history.get("metrics", {}),
+                    "events": history.get("events", []),
+                    "sample_counts": history.get("sample_counts", {}),
+                    "latest_values": history.get("latest_values", {}),
+                }
+            else:
+                normalized[slot] = {
+                    "configured": True,
+                    "available": True,
+                    "detail": None,
+                    "slot": slot,
+                    "system_id": system_id,
+                    "enclosure_id": enclosure_id,
+                    "metrics": {},
+                    "events": [],
+                    "sample_counts": {},
+                    "latest_values": {},
+                }
+        return normalized
+
+    @staticmethod
+    def _unconfigured_slot_payload(
+        slot: int,
+        system_id: str | None,
+        enclosure_id: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "configured": False,
+            "available": False,
+            "detail": "History backend is not configured.",
+            "slot": slot,
+            "system_id": system_id,
+            "enclosure_id": enclosure_id,
+            "metrics": {},
+            "events": [],
+            "sample_counts": {},
+            "latest_values": {},
+        }
+
     async def _fetch_json(
         self,
         path: str,

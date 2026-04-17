@@ -85,6 +85,42 @@ async def slot_metrics(
     }
 
 
+@app.get("/api/history/scopes/slots")
+async def scope_slot_history(
+    system_id: str = Query(...),
+    enclosure_id: str | None = Query(default=None),
+    slots: list[int] = Query(default=[]),
+    event_limit: int = Query(default=12, ge=1, le=1000),
+) -> dict[str, object]:
+    histories = store.list_scope_history(
+        system_id,
+        enclosure_id,
+        slots=slots,
+        event_limit=event_limit,
+        metric_limits={
+            "temperature_c": 96,
+            "bytes_read": 60,
+            "bytes_written": 60,
+            "annualized_bytes_written": 60,
+            "power_on_hours": 60,
+        },
+    )
+    return {
+        "histories": {
+            str(slot): {
+                "slot": slot,
+                "system_id": system_id,
+                "enclosure_id": enclosure_id,
+                "events": payload.get("events", []),
+                "metrics": payload.get("metrics", {}),
+                "sample_counts": payload.get("sample_counts", {}),
+                "latest_values": payload.get("latest_values", {}),
+            }
+            for slot, payload in histories.items()
+        }
+    }
+
+
 def render_dashboard(
     status: dict[str, object],
     counts: dict[str, int],

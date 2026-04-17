@@ -102,7 +102,7 @@ class SESMapEnclosure:
     profile_id: str | None = None
     layout_rows: int | None = None
     layout_columns: int | None = None
-    slot_layout: list[list[int]] | None = None
+    slot_layout: list[list[int | None]] | None = None
     slots: dict[int, SESMapSlot] = field(default_factory=dict)
 
 
@@ -898,7 +898,7 @@ def _extract_sg_ses_device(command: str | None) -> str | None:
 def _infer_scale_enclosure_profile(
     enclosure: SESMapEnclosure,
     slot_count: int,
-) -> tuple[str | None, str | None, int | None, int | None, list[list[int]] | None]:
+) -> tuple[str | None, str | None, int | None, int | None, list[list[int | None]] | None]:
     name = (enclosure.enclosure_name or "").lower()
     ses_device = (enclosure.ses_device or "").lower()
 

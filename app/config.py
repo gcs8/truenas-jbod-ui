@@ -16,9 +16,27 @@ class AppConfig(BaseModel):
     port: int = 8080
     refresh_interval_seconds: int = 30
     cache_ttl_seconds: int = 10
+    startup_warm_cache_enabled: bool = False
+    startup_warm_smart_enabled: bool = False
+    smart_batch_max_concurrency: int = 12
+    smart_prefetch_delay_ms: int = 120
+    smart_prefetch_strategy: Literal["auto", "single", "chunked"] = "auto"
+    smart_prefetch_single_threshold: int = 128
+    smart_prefetch_chunk_size: int = 24
+    smart_prefetch_batch_concurrency: int = 2
+    export_history_concurrency: int = 12
+    export_cache_ttl_seconds: int = 60
+    export_cache_max_entries: int = 8
     log_level: str = "INFO"
     debug: bool = False
     verify_ssl: bool = True
+
+
+class PerfConfig(BaseModel):
+    enabled: bool = False
+    log_all_requests: bool = False
+    slow_request_ms: int = 1000
+    slow_stage_ms: int = 250
 
 
 class TrueNASConfig(BaseModel):
@@ -68,7 +86,7 @@ class EnclosureProfileConfig(BaseModel):
     bay_size: str | None = None
     rows: int
     columns: int
-    slot_layout: list[list[int]] | None = None
+    slot_layout: list[list[int | None]] | None = None
     row_groups: list[int] = Field(default_factory=list)
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
 
@@ -98,6 +116,7 @@ class PathConfig(BaseModel):
     mapping_file: str = "/app/data/slot_mappings.json"
     log_file: str = "/app/logs/app.log"
     profile_file: str = "/app/config/profiles.yaml"
+    slot_detail_cache_file: str = "/app/data/slot_detail_cache.json"
 
 
 class HistoryConfig(BaseModel):
@@ -116,6 +135,7 @@ class SystemConfig(BaseModel):
 
 class Settings(BaseModel):
     app: AppConfig = Field(default_factory=AppConfig)
+    perf: PerfConfig = Field(default_factory=PerfConfig)
     truenas: TrueNASConfig = Field(default_factory=TrueNASConfig)
     ssh: SSHConfig = Field(default_factory=SSHConfig)
     history: HistoryConfig = Field(default_factory=HistoryConfig)
@@ -132,10 +152,25 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "APP_PORT": ("app", "port"),
     "APP_REFRESH_INTERVAL": ("app", "refresh_interval_seconds"),
     "APP_CACHE_TTL": ("app", "cache_ttl_seconds"),
+    "APP_STARTUP_WARM_CACHE_ENABLED": ("app", "startup_warm_cache_enabled"),
+    "APP_STARTUP_WARM_SMART_ENABLED": ("app", "startup_warm_smart_enabled"),
+    "APP_SMART_BATCH_MAX_CONCURRENCY": ("app", "smart_batch_max_concurrency"),
+    "APP_SMART_PREFETCH_DELAY_MS": ("app", "smart_prefetch_delay_ms"),
+    "APP_SMART_PREFETCH_STRATEGY": ("app", "smart_prefetch_strategy"),
+    "APP_SMART_PREFETCH_SINGLE_THRESHOLD": ("app", "smart_prefetch_single_threshold"),
+    "APP_SMART_PREFETCH_CHUNK_SIZE": ("app", "smart_prefetch_chunk_size"),
+    "APP_SMART_PREFETCH_BATCH_CONCURRENCY": ("app", "smart_prefetch_batch_concurrency"),
+    "APP_EXPORT_HISTORY_CONCURRENCY": ("app", "export_history_concurrency"),
+    "APP_EXPORT_CACHE_TTL_SECONDS": ("app", "export_cache_ttl_seconds"),
+    "APP_EXPORT_CACHE_MAX_ENTRIES": ("app", "export_cache_max_entries"),
     "APP_LOG_LEVEL": ("app", "log_level"),
     "APP_DEBUG": ("app", "debug"),
     "APP_VERIFY_SSL": ("app", "verify_ssl"),
     "APP_CONFIG_PATH": ("config_file",),
+    "PERF_TIMING_ENABLED": ("perf", "enabled"),
+    "PERF_LOG_ALL_REQUESTS": ("perf", "log_all_requests"),
+    "PERF_SLOW_REQUEST_MS": ("perf", "slow_request_ms"),
+    "PERF_SLOW_STAGE_MS": ("perf", "slow_stage_ms"),
     "TRUENAS_HOST": ("truenas", "host"),
     "TRUENAS_API_KEY": ("truenas", "api_key"),
     "TRUENAS_API_USER": ("truenas", "api_user"),
@@ -167,6 +202,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "PATH_MAPPING_FILE": ("paths", "mapping_file"),
     "PATH_LOG_FILE": ("paths", "log_file"),
     "PATH_PROFILE_FILE": ("paths", "profile_file"),
+    "PATH_SLOT_DETAIL_CACHE_FILE": ("paths", "slot_detail_cache_file"),
 }
 
 
@@ -341,4 +377,5 @@ def get_settings() -> Settings:
     Path(settings.paths.mapping_file).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.paths.log_file).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.paths.profile_file).parent.mkdir(parents=True, exist_ok=True)
+    Path(settings.paths.slot_detail_cache_file).parent.mkdir(parents=True, exist_ok=True)
     return settings

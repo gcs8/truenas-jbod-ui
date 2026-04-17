@@ -2,10 +2,86 @@
 
 ## Unreleased
 
-Release-prep notes for the next tagged cut land here until they are moved into
-the final section below.
+Follow-up work after the `v0.9.0` cut lands here.
 
-No entries yet.
+## v0.9.0 - 2026-04-17
+
+Stabilization release focused on performance observability, cache-first scope
+switching, browser-visible regression coverage, and a broader reusable profile
+base before the next larger feature push.
+
+### Added
+
+- Opt-in request and workflow performance timing with `.env` toggles, staged
+  inventory / SMART / export timing, native `Server-Timing` headers, and
+  request ids in response headers when perf timing is enabled
+- Lightweight read-only perf harness script for comparing inventory, SMART
+  batch, and snapshot-export-estimate timing against a running local app
+- Local perf-history capture under `data/perf/` with rolling `latest` artifacts,
+  append-only JSONL / CSV history, and automatic compare-against-last-run output
+- Optional startup warmers and a standalone-safe persistent slot-detail cache
+  so stable slot facts and stable SMART detail can survive between refreshes
+  without depending on the optional history sidecar
+- Lightweight Playwright browser smoke coverage for scope switching, slot-detail
+  reset, and post-switch auto-refresh regressions against a running app
+- First reusable built-in generic profile batch from the Quantastor reference
+  set, covering common `1x24`, `3x4`, `4x15`, `5x12`, and `6x14` chassis
+  families without importing vendor artwork
+- Sparse layout support for explicit chassis gap cells, plus a second generic
+  profile batch for irregular `102`- and `106`-bay families so center beams
+  and sidecar-module voids render honestly instead of as packed rows
+- Release-prep browser QA coverage for a full configured-system and
+  enclosure-view sweep against a live app, so validated platform views can be
+  walked before a tagged cut instead of relying only on one-off manual checks
+
+### Changed
+
+- SMART batch loading now reuses one inventory snapshot per batch, supports
+  tunable batch concurrency, and can prefer a single whole-shelf browser
+  prefetch request with chunked fallback for faster system switching on large
+  enclosures
+- Snapshot export history collection now uses a scope-wide history sidecar read
+  path instead of one per-slot request, reducing export and estimate overhead
+  on large shelves
+- Snapshot export and estimate now share a short-lived in-process cache for
+  scope history payloads, rendered HTML, and ZIP bytes so repeated requests on
+  the same snapshot avoid rebuilding the full export every time
+- Read-only inventory and SMART routes can now return stale cached data fast
+  while refreshing in the background, which makes switching away from and back
+  to a large system feel much less expensive once it has been seen once
+- Enclosure/layout switching now reuses one shared per-system source bundle
+  across enclosure views, so changing chassis views does not need to redo the
+  full API and SSH collection every time
+- TrueNAS websocket inventory and Quantastor REST inventory now collect their
+  major fetch groups in parallel, lowering the cold first-hit floor for fresh
+  inventory builds
+- Perf-enabled browser sessions now show a lightweight `UI Timing` panel for
+  real switch and refresh measurements, including request, repaint, history,
+  SMART settle, and total page-settled timing
+- Auto-refresh now uses a one-shot schedule that resets after completed
+  refreshes and system switches, preventing an old timer tick from firing
+  immediately after a manual switch
+- System and enclosure switches now use the cached snapshot path before
+  background refresh, so moving between previously seen views no longer forces a
+  cold live rebuild every time
+- The browser now also keeps the last seen snapshot for each visited scope, so
+  switching back to a known system or enclosure can repaint immediately from
+  client memory before the live refresh settles
+- SMART summary cache entries now survive cross-system switches instead of being
+  pruned on every snapshot change, so revisiting a shelf can reuse warmed slot
+  summaries instead of immediately rebuilding them all again
+- History status checks now use a short-lived client cache, which keeps switch
+  settled time from paying the same sidecar status round-trip on every view hop
+- Quantastor topology now requires authoritative `storagePoolDeviceEnum` data
+  before replacing a trusted cached view, preventing transient middleware or
+  switch-back churn from flattening mirrors into fake `disk > data` topology
+  and from writing bogus topology events into history
+
+### Docs
+
+- Started `v0.9.0` planning with a dedicated release plan plus roadmap updates
+  centered on opt-in performance instrumentation, release-to-release slowdown
+  detection, and broader reusable enclosure-profile coverage
 
 ## v0.8.0 - 2026-04-16
 

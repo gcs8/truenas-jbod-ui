@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from app.models.domain import (
     SmartBatchResponse,
     SmartSummaryView,
 )
+from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
 from app.services.history_backend import HistoryBackendClient
 from app.services.inventory_registry import InventoryRegistry
 from app.services.snapshot_export import SnapshotExportService, SnapshotExportTooLargeError
@@ -60,13 +63,33 @@ def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings)
 
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        warm_task: asyncio.Task[None] | None = None
+        if settings.app.startup_warm_cache_enabled:
+            registry = get_inventory_registry()
+            warm_task = asyncio.create_task(
+                registry.prewarm_all(warm_smart=settings.app.startup_warm_smart_enabled)
+            )
+        try:
+            yield
+        finally:
+            if warm_task is not None and not warm_task.done():
+                warm_task.cancel()
+                try:
+                    await warm_task
+                except asyncio.CancelledError:
+                    pass
+
     app = FastAPI(
         title="TrueNAS JBOD Enclosure UI",
         version=__version__,
         docs_url="/docs" if settings.app.debug else None,
         redoc_url="/redoc" if settings.app.debug else None,
+        lifespan=lifespan,
     )
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+    install_perf_timing_middleware(app, settings)
 
     @app.get("/", response_class=HTMLResponse)
     async def index(
@@ -76,7 +99,11 @@ def create_app() -> FastAPI:
     ) -> HTMLResponse:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+        add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, enclosure_id=enclosure_id)
+        snapshot = await service.get_snapshot(
+            selected_enclosure_id=enclosure_id,
+            allow_stale_cache=True,
+        )
         return templates.TemplateResponse(
             request,
             "index.html",
@@ -96,7 +123,17 @@ def create_app() -> FastAPI:
     ) -> InventorySnapshot:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        return await service.get_snapshot(force_refresh=force, selected_enclosure_id=enclosure_id)
+        add_perf_metadata(
+            system_id=service.system.id,
+            platform=service.system.truenas.platform,
+            enclosure_id=enclosure_id,
+            force_refresh=force,
+        )
+        return await service.get_snapshot(
+            force_refresh=force,
+            selected_enclosure_id=enclosure_id,
+            allow_stale_cache=not force,
+        )
 
     @app.post("/api/slots/{slot}/led")
     async def set_slot_led(
@@ -108,11 +145,18 @@ def create_app() -> FastAPI:
         ensure_slot_bounds(settings, slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
+        add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         try:
-            await service.set_slot_led(slot, payload.action, selected_enclosure_id=enclosure_id)
+            await service.set_slot_led(
+                slot,
+                payload.action,
+                selected_enclosure_id=enclosure_id,
+                invalidate_snapshot=False,
+            )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
+        service.invalidate_snapshot_cache(reason="route.set_slot_led", invalidate_source_bundle=True)
+        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": True, "snapshot": snapshot.model_dump(mode="json")})
 
     @app.post("/api/slots/{slot}/mapping")
@@ -125,22 +169,37 @@ def create_app() -> FastAPI:
         ensure_slot_bounds(settings, slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
+        add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         mapping_payload = {
             "serial": payload.serial,
             "device_name": payload.device_name,
             "gptid": payload.gptid,
             "notes": payload.notes,
         }
-        mapping = await service.save_mapping(slot, mapping_payload, selected_enclosure_id=enclosure_id)
+        mapping = await service.save_mapping(
+            slot,
+            mapping_payload,
+            selected_enclosure_id=enclosure_id,
+            invalidate_snapshot=False,
+        )
 
         led_warning = None
         if payload.clear_identify_after_save:
             try:
-                await service.set_slot_led(slot, LedAction.clear, selected_enclosure_id=enclosure_id)
+                await service.set_slot_led(
+                    slot,
+                    LedAction.clear,
+                    selected_enclosure_id=enclosure_id,
+                    invalidate_snapshot=False,
+                )
             except Exception as exc:  # noqa: BLE001 - surface as non-fatal warning.
                 led_warning = str(exc)
 
-        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
+        service.invalidate_snapshot_cache(
+            reason="route.save_mapping",
+            invalidate_source_bundle=payload.clear_identify_after_save,
+        )
+        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
         return JSONResponse(
             {
                 "ok": True,
@@ -159,8 +218,11 @@ def create_app() -> FastAPI:
         ensure_slot_bounds(settings, slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        cleared = await service.clear_mapping(slot, selected_enclosure_id=enclosure_id)
-        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
+        add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
+        cleared = await service.clear_mapping(slot, selected_enclosure_id=enclosure_id, invalidate_snapshot=False)
+        if cleared:
+            service.invalidate_snapshot_cache(reason="route.clear_mapping")
+        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": cleared, "snapshot": snapshot.model_dump(mode="json")})
 
     @app.get("/api/mappings/export", response_model=MappingBundle)
@@ -180,8 +242,13 @@ def create_app() -> FastAPI:
     ) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        imported = await service.import_mapping_bundle(payload, selected_enclosure_id=enclosure_id)
-        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
+        imported = await service.import_mapping_bundle(
+            payload,
+            selected_enclosure_id=enclosure_id,
+            invalidate_snapshot=False,
+        )
+        service.invalidate_snapshot_cache(reason="route.import_mappings")
+        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
         return JSONResponse(
             {
                 "ok": True,
@@ -199,8 +266,13 @@ def create_app() -> FastAPI:
         ensure_slot_bounds(settings, slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
+        add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         try:
-            return await service.get_slot_smart_summary(slot, selected_enclosure_id=enclosure_id)
+            return await service.get_slot_smart_summary(
+                slot,
+                selected_enclosure_id=enclosure_id,
+                allow_stale_cache=True,
+            )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -214,8 +286,20 @@ def create_app() -> FastAPI:
             ensure_slot_bounds(settings, slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
+        add_perf_metadata(
+            system_id=service.system.id,
+            platform=service.system.truenas.platform,
+            enclosure_id=enclosure_id,
+            slot_count=len(payload.slots),
+            smart_batch_max_concurrency=payload.max_concurrency,
+        )
         try:
-            summaries = await service.get_slot_smart_summaries(payload.slots, selected_enclosure_id=enclosure_id)
+            summaries = await service.get_slot_smart_summaries(
+                payload.slots,
+                selected_enclosure_id=enclosure_id,
+                max_concurrency=payload.max_concurrency,
+                allow_stale_cache=True,
+            )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return SmartBatchResponse(summaries=summaries)
@@ -245,29 +329,33 @@ def create_app() -> FastAPI:
     ) -> Response:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
-        smart_summaries = await service.get_slot_smart_summaries(
-            [slot.slot for slot in snapshot.slots],
-            selected_enclosure_id=enclosure_id,
-        )
+        add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, enclosure_id=enclosure_id)
+        with perf_stage("route.export_snapshot.load_snapshot"):
+            snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+        with perf_stage("route.export_snapshot.load_smart_summaries", slot_count=len(snapshot.slots)):
+            smart_summaries = await service.get_slot_smart_summaries(
+                [slot.slot for slot in snapshot.slots],
+                selected_enclosure_id=enclosure_id,
+            )
         smart_summary_cache = {
             str(item.slot): item.summary.model_dump(mode="json")
             for item in smart_summaries
         }
         exporter = get_snapshot_export_service()
         try:
-            artifact = await exporter.build_enclosure_snapshot_export(
-                request=request,
-                snapshot=snapshot,
-                smart_summary_cache=smart_summary_cache,
-                selected_slot=payload.selected_slot,
-                history_window_hours=payload.history_window_hours,
-                history_panel_open=payload.history_panel_open,
-                io_chart_mode=payload.io_chart_mode,
-                redact_sensitive=payload.redact_sensitive,
-                packaging=payload.packaging,
-                allow_oversize=payload.allow_oversize,
-            )
+            with perf_stage("route.export_snapshot.build_artifact"):
+                artifact = await exporter.build_enclosure_snapshot_export(
+                    request=request,
+                    snapshot=snapshot,
+                    smart_summary_cache=smart_summary_cache,
+                    selected_slot=payload.selected_slot,
+                    history_window_hours=payload.history_window_hours,
+                    history_panel_open=payload.history_panel_open,
+                    io_chart_mode=payload.io_chart_mode,
+                    redact_sensitive=payload.redact_sensitive,
+                    packaging=payload.packaging,
+                    allow_oversize=payload.allow_oversize,
+                )
         except SnapshotExportTooLargeError as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
         return Response(
@@ -292,28 +380,32 @@ def create_app() -> FastAPI:
     ) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
-        smart_summaries = await service.get_slot_smart_summaries(
-            [slot.slot for slot in snapshot.slots],
-            selected_enclosure_id=enclosure_id,
-        )
+        add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, enclosure_id=enclosure_id)
+        with perf_stage("route.export_snapshot_estimate.load_snapshot"):
+            snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+        with perf_stage("route.export_snapshot_estimate.load_smart_summaries", slot_count=len(snapshot.slots)):
+            smart_summaries = await service.get_slot_smart_summaries(
+                [slot.slot for slot in snapshot.slots],
+                selected_enclosure_id=enclosure_id,
+            )
         smart_summary_cache = {
             str(item.slot): item.summary.model_dump(mode="json")
             for item in smart_summaries
         }
         exporter = get_snapshot_export_service()
-        estimate = await exporter.estimate_enclosure_snapshot_export(
-            request=request,
-            snapshot=snapshot,
-            smart_summary_cache=smart_summary_cache,
-            selected_slot=payload.selected_slot,
-            history_window_hours=payload.history_window_hours,
-            history_panel_open=payload.history_panel_open,
-            io_chart_mode=payload.io_chart_mode,
-            redact_sensitive=payload.redact_sensitive,
-            packaging=payload.packaging,
-            allow_oversize=payload.allow_oversize,
-        )
+        with perf_stage("route.export_snapshot_estimate.build_estimate"):
+            estimate = await exporter.estimate_enclosure_snapshot_export(
+                request=request,
+                snapshot=snapshot,
+                smart_summary_cache=smart_summary_cache,
+                selected_slot=payload.selected_slot,
+                history_window_hours=payload.history_window_hours,
+                history_panel_open=payload.history_panel_open,
+                io_chart_mode=payload.io_chart_mode,
+                redact_sensitive=payload.redact_sensitive,
+                packaging=payload.packaging,
+                allow_oversize=payload.allow_oversize,
+            )
         return JSONResponse(estimate)
 
     @app.get("/healthz")
