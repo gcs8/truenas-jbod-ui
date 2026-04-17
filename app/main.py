@@ -6,11 +6,11 @@ from functools import lru_cache
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app import __version__
 from app.logging_config import configure_logging
 from app.models.domain import (
@@ -19,11 +19,14 @@ from app.models.domain import (
     LedRequest,
     MappingBundle,
     MappingRequest,
+    SnapshotExportRequest,
     SmartBatchRequest,
     SmartBatchResponse,
     SmartSummaryView,
 )
+from app.services.history_backend import HistoryBackendClient
 from app.services.inventory_registry import InventoryRegistry
+from app.services.snapshot_export import SnapshotExportService, SnapshotExportTooLargeError
 from app.services.truenas_ws import TrueNASAPIError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -37,6 +40,20 @@ def get_inventory_registry() -> InventoryRegistry:
     settings = get_settings()
     configure_logging(settings)
     return InventoryRegistry(settings)
+
+
+@lru_cache
+def get_history_backend() -> HistoryBackendClient:
+    settings = get_settings()
+    configure_logging(settings)
+    return HistoryBackendClient(settings.history)
+
+
+@lru_cache
+def get_snapshot_export_service() -> SnapshotExportService:
+    settings = get_settings()
+    configure_logging(settings)
+    return SnapshotExportService(settings, get_history_backend(), templates)
 
 
 def create_app() -> FastAPI:
@@ -63,11 +80,12 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(
             request,
             "index.html",
-            {
-                "snapshot": snapshot,
-                "settings": settings,
-                "initial_snapshot_json": json.dumps(snapshot.model_dump(mode="json")),
-            },
+            build_index_context(
+                request=request,
+                snapshot=snapshot,
+                settings=settings,
+                history_configured=bool(settings.history.service_url),
+            ),
         )
 
     @app.get("/api/inventory", response_model=InventorySnapshot)
@@ -202,6 +220,102 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return SmartBatchResponse(summaries=summaries)
 
+    @app.get("/api/history/status")
+    async def get_history_status() -> JSONResponse:
+        history_backend = get_history_backend()
+        return JSONResponse(await history_backend.get_status())
+
+    @app.get("/api/slots/{slot}/history")
+    async def get_slot_history(
+        slot: int,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> JSONResponse:
+        ensure_slot_bounds(settings, slot)
+        history_backend = get_history_backend()
+        payload = await history_backend.get_slot_history(slot, system_id, enclosure_id)
+        return JSONResponse(payload)
+
+    @app.post("/api/export/enclosure-snapshot")
+    async def export_enclosure_snapshot(
+        request: Request,
+        payload: SnapshotExportRequest,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> Response:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+        smart_summaries = await service.get_slot_smart_summaries(
+            [slot.slot for slot in snapshot.slots],
+            selected_enclosure_id=enclosure_id,
+        )
+        smart_summary_cache = {
+            str(item.slot): item.summary.model_dump(mode="json")
+            for item in smart_summaries
+        }
+        exporter = get_snapshot_export_service()
+        try:
+            artifact = await exporter.build_enclosure_snapshot_export(
+                request=request,
+                snapshot=snapshot,
+                smart_summary_cache=smart_summary_cache,
+                selected_slot=payload.selected_slot,
+                history_window_hours=payload.history_window_hours,
+                history_panel_open=payload.history_panel_open,
+                io_chart_mode=payload.io_chart_mode,
+                redact_sensitive=payload.redact_sensitive,
+                packaging=payload.packaging,
+                allow_oversize=payload.allow_oversize,
+            )
+        except SnapshotExportTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        return Response(
+            content=artifact.content,
+            media_type=artifact.media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{artifact.filename}"',
+                "X-Export-Size-Bytes": str(artifact.size_bytes),
+                "X-Export-HTML-Size-Bytes": str(artifact.html_size_bytes),
+                "X-Export-Packaging": artifact.packaging,
+                "X-Export-Redaction": artifact.redaction,
+                "X-Export-Size-Limit-Bytes": str(artifact.size_limit_bytes),
+            },
+        )
+
+    @app.post("/api/export/enclosure-snapshot/estimate")
+    async def estimate_enclosure_snapshot(
+        request: Request,
+        payload: SnapshotExportRequest,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> JSONResponse:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+        smart_summaries = await service.get_slot_smart_summaries(
+            [slot.slot for slot in snapshot.slots],
+            selected_enclosure_id=enclosure_id,
+        )
+        smart_summary_cache = {
+            str(item.slot): item.summary.model_dump(mode="json")
+            for item in smart_summaries
+        }
+        exporter = get_snapshot_export_service()
+        estimate = await exporter.estimate_enclosure_snapshot_export(
+            request=request,
+            snapshot=snapshot,
+            smart_summary_cache=smart_summary_cache,
+            selected_slot=payload.selected_slot,
+            history_window_hours=payload.history_window_hours,
+            history_panel_open=payload.history_panel_open,
+            io_chart_mode=payload.io_chart_mode,
+            redact_sensitive=payload.redact_sensitive,
+            packaging=payload.packaging,
+            allow_oversize=payload.allow_oversize,
+        )
+        return JSONResponse(estimate)
+
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
         registry = get_inventory_registry()
@@ -229,6 +343,42 @@ def create_app() -> FastAPI:
         return JSONResponse({"ok": False, "detail": str(exc)}, status_code=500)
 
     return app
+
+
+def build_index_context(
+    *,
+    request: Request,
+    snapshot: InventorySnapshot,
+    settings: Settings,
+    history_configured: bool,
+    snapshot_mode: bool = False,
+    snapshot_export_meta: dict[str, object] | None = None,
+    snapshot_export_meta_json: str = "null",
+    preloaded_history_json: str = "{}",
+    preloaded_smart_summary_json: str = "{}",
+    preloaded_history_summary_json: str = "{\"counts\": {}, \"collector\": {}}",
+    initial_selected_slot_json: str = "null",
+    initial_history_timeframe_hours_json: str = "24",
+    initial_history_panel_open_json: str = "false",
+    initial_history_io_chart_mode_json: str = '"total"',
+) -> dict[str, object]:
+    return {
+        "request": request,
+        "snapshot": snapshot,
+        "settings": settings,
+        "initial_snapshot_json": json.dumps(snapshot.model_dump(mode="json")),
+        "history_configured": history_configured,
+        "snapshot_mode": snapshot_mode,
+        "snapshot_export_meta": snapshot_export_meta or {},
+        "snapshot_export_meta_json": snapshot_export_meta_json,
+        "preloaded_history_json": preloaded_history_json,
+        "preloaded_smart_summary_json": preloaded_smart_summary_json,
+        "preloaded_history_summary_json": preloaded_history_summary_json,
+        "initial_selected_slot_json": initial_selected_slot_json,
+        "initial_history_timeframe_hours_json": initial_history_timeframe_hours_json,
+        "initial_history_panel_open_json": initial_history_panel_open_json,
+        "initial_history_io_chart_mode_json": initial_history_io_chart_mode_json,
+    }
 
 
 def ensure_slot_bounds(settings: Settings, slot: int) -> None:

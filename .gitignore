@@ -9,6 +9,11 @@ config/ssh/*
 !config/ssh/.gitkeep
 data/slot_mappings.json
 data/support/
+history/*
+!history/backups/
+history/backups/*
+!history/.gitkeep
+!history/backups/.gitkeep
 logs/*.log
 
 # Editor and platform noise

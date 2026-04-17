@@ -15,6 +15,8 @@ Copy the page set in:
 
 ```bash
 cp wiki/*.md repo-wiki/
+mkdir -p repo-wiki/images
+cp wiki/images/* repo-wiki/images/
 ```
 
 Commit and push:
@@ -29,6 +31,7 @@ git push
 ## Recommended Maintainer Workflow
 
 - treat the repo `wiki/` folder as the source of truth
+- treat `wiki/images/` as the source of truth for wiki-embedded screenshots
 - review changes in normal PRs
 - publish to GitHub Wiki after the docs look right
 

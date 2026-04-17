@@ -5,6 +5,65 @@
 Release-prep notes for the next tagged cut land here until they are moved into
 the final section below.
 
+No entries yet.
+
+## v0.8.0 - 2026-04-16
+
+Optional-history release that adds a lightweight SQLite sidecar, integrated
+slot-history workflows inside the main UI, and frozen offline enclosure
+snapshot export without breaking the original single-container deployment path.
+
+### Added
+
+- Optional Docker Compose `history` sidecar profile that polls the main UI API
+  and persists lightweight slot history in SQLite without becoming a second
+  inventory implementation
+- Main-UI `History` button plus wide history drawer with a shared window picker,
+  temperature history, combined read/write history, average-rate view, and
+  change-only recent events
+- Slot-history capture for practical comparison fields: temperature, bytes
+  read, bytes written, annualized writes, power-on hours, topology context, and
+  multipath state changes
+- Self-contained offline HTML enclosure snapshot export with live size
+  estimates, optional ZIP packaging, current-slot carry-through, and offline
+  browsing across the selected enclosure
+- Snapshot redaction controls with stable aliases and partial identifier
+  masking, plus export-setting persistence in browser storage
+- In-repo screenshot capture flow and new wiki walkthrough for the history
+  drawer and snapshot export workflow
+
+### Changed
+
+- Main-UI timestamps now render with explicit browser-local timezone labeling
+  instead of leaving operators to infer whether they are looking at UTC
+- Slot history now opens in its own wide drawer under the enclosure instead of
+  stretching the right-hand detail rail
+- Snapshot exports now preserve the current History drawer window, selected
+  slot, and open-drawer state so shared artifacts match what the operator was
+  looking at when they exported
+- History backup handling now keeps short-term rotating SQLite snapshots under
+  `./history/backups` and also promotes weekly and monthly copies under
+  `./history/backups/long-term` by default
+
+### Fixed
+
+- Offline snapshot export now degrades cleanly when the optional history
+  sidecar is unavailable instead of stalling on doomed per-slot history fetches
+- Redacted snapshot exports now preserve preloaded history correctly by re-keying
+  the offline history cache to the redacted system and enclosure aliases
+- Unreadable history databases are quarantined before a fresh SQLite file is
+  created, reducing the chance of silent data loss after corruption
+- Snapshot export metadata, timezone presentation, and dialog guidance now make
+  it clearer when the artifact is frozen, which history window was used, and
+  whether history will be omitted
+
+### Docs
+
+- README, roadmap, release checklist, wiki pages, and release-facing screenshot
+  references now reflect the `0.8.0` history sidecar and snapshot export flow
+- Added a draft release-notes page for the `0.8.0` cut so GitHub release text
+  can be generated from a checked-in source instead of from memory
+
 ## v0.7.0 - 2026-04-16
 
 Layout and topology release that tightens the profile-driven enclosure system,

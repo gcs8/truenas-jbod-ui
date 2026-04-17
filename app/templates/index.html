@@ -41,15 +41,62 @@
       <div class="meta-card">
         <span class="meta-label">Last Updated</span>
         <span class="meta-value" id="last-updated">{{ snapshot.last_updated }}</span>
+        <span class="meta-note" id="timezone-label">Browser local time</span>
       </div>
     </div>
   </header>
+
+  {% if snapshot_mode %}
+  <section class="panel snapshot-banner">
+    <div class="snapshot-banner-copy">
+      <div class="snapshot-banner-badge">Frozen Offline Artifact</div>
+      <p class="eyebrow">Offline Snapshot</p>
+      <h2>Explorable Enclosure Snapshot</h2>
+      <p class="subtle">
+        Frozen point-in-time enclosure snapshot. Live actions are disabled, but you can still search, click slots, and inspect preloaded history offline.
+      </p>
+      <div class="snapshot-banner-facts">
+        <span class="snapshot-banner-fact">App v{{ snapshot_export_meta.app_version or "unknown" }}</span>
+        <span class="snapshot-banner-fact">{{ snapshot.layout_slot_count or (snapshot.slots | length) }} visible bays</span>
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.metric_sample_count or 0 }} metric samples</span>
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.smart_summary_count or 0 }} SMART summaries</span>
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.event_count or 0 }} events</span>
+        <span class="snapshot-banner-fact">Downsampling {{ snapshot_export_meta.downsampling_label or "None" }}</span>
+      </div>
+    </div>
+    <div class="snapshot-banner-meta">
+      <div class="summary-card compact">
+        <span class="summary-label">Scope</span>
+        <span class="summary-value">{{ snapshot_export_meta.scope_label or "Current Enclosure" }}</span>
+        <span class="summary-note">{{ snapshot_export_meta.system_label or "Selected system" }}</span>
+      </div>
+      <div class="summary-card compact">
+        <span class="summary-label">Window</span>
+        <span class="summary-value">{{ snapshot_export_meta.history_window_label or "24h" }}</span>
+        <span class="summary-note">history view preserved</span>
+      </div>
+      <div class="summary-card compact">
+        <span class="summary-label">Generated</span>
+        <span class="summary-value" id="snapshot-generated-value">{{ snapshot_export_meta.generated_at or snapshot.last_updated }}</span>
+        <span class="summary-note" id="snapshot-generated-note">re-rendered in viewer local time</span>
+      </div>
+      <div class="summary-card compact">
+        <span class="summary-label">Redaction</span>
+        <span class="summary-value">{{ snapshot_export_meta.redaction_label or "None" }}</span>
+        <span class="summary-note">{{ snapshot_export_meta.redaction_note or "Original identifiers included" }}</span>
+      </div>
+    </div>
+  </section>
+  {% endif %}
 
   <section class="toolbar">
     <label class="field grow">
       <span>Search</span>
       <input id="search-box" type="search" placeholder="serial, disk, persistent id, pool, vdev">
     </label>
+    {% if not snapshot_mode %}
+    <button id="export-snapshot-button" class="button secondary">Export Snapshot</button>
+    {% endif %}
     <button id="refresh-button" class="button">Refresh Now</button>
     <label class="toggle">
       <input id="auto-refresh-toggle" type="checkbox" checked>
@@ -66,9 +113,53 @@
     </label>
   </section>
 
+  {% if not snapshot_mode %}
+  <dialog id="export-snapshot-dialog" class="snapshot-export-dialog">
+    <form method="dialog" class="snapshot-export-form">
+      <div class="panel-header compact">
+        <div>
+          <h2>Export Enclosure Snapshot</h2>
+          <p class="subtle">Current enclosure, offline HTML by default, with optional redaction and ZIP packaging.</p>
+        </div>
+      </div>
+      <div class="snapshot-export-grid">
+        <label class="toggle snapshot-export-toggle">
+          <input id="export-redact-toggle" type="checkbox">
+          <span>Redact sensitive IDs</span>
+        </label>
+        <label class="field">
+          <span>Packaging</span>
+          <select id="export-packaging-select">
+            <option value="auto" selected>Auto (Recommended)</option>
+            <option value="html">Plain HTML</option>
+            <option value="zip">Force ZIP</option>
+          </select>
+        </label>
+        <label class="toggle snapshot-export-toggle">
+          <input id="export-allow-oversize-toggle" type="checkbox">
+          <span>Allow oversize export</span>
+        </label>
+      </div>
+      <p id="export-snapshot-note" class="subtle snapshot-export-note">
+        Default target stays under about 24 MiB. Auto will prefer HTML, then fall back to ZIP if needed.
+      </p>
+      <p id="export-snapshot-window-hint" class="snapshot-export-tip">
+        Snapshot history uses the current History window. Change it in the History drawer first if you want a different export range.
+      </p>
+      <div id="export-snapshot-estimate" class="snapshot-export-estimate" aria-live="polite"></div>
+      <div class="button-row">
+        <button class="button secondary" id="export-snapshot-cancel" type="button">Cancel</button>
+        <button class="button" id="export-snapshot-confirm" type="button">Download Snapshot</button>
+      </div>
+    </form>
+  </dialog>
+  {% endif %}
+
   <section class="status-strip" id="status-strip">
+    <div class="status-chip hidden" id="snapshot-status-chip">SNAPSHOT</div>
     <div class="status-chip" id="api-status-chip">API</div>
     <div class="status-chip" id="ssh-status-chip">SSH</div>
+    <div class="status-chip hidden" id="history-status-chip">HIST</div>
     <div class="status-text" id="status-text">Ready.</div>
   </section>
 
@@ -147,9 +238,12 @@
           <h2>Slot Details</h2>
           <p class="subtle">Select a bay to inspect metadata or calibrate mapping.</p>
         </div>
-        <div id="detail-led-controls" class="detail-led-controls hidden">
-          <button class="button small" data-led-action="IDENTIFY">Identify On</button>
-          <button class="button secondary small" data-led-action="CLEAR">Identify Off / Clear</button>
+        <div class="detail-panel-actions">
+          <button class="button secondary small hidden" id="history-toggle-button" type="button">History</button>
+          <div id="detail-led-controls" class="detail-led-controls hidden">
+            <button class="button small" data-led-action="IDENTIFY">Identify On</button>
+            <button class="button secondary small" data-led-action="CLEAR">Identify Off / Clear</button>
+          </div>
         </div>
       </div>
 
@@ -171,6 +265,83 @@
       </div>
     </aside>
   </main>
+
+  <section id="detail-history-panel" class="panel history-drawer hidden">
+    <div class="panel-header history-drawer-top">
+      <div class="history-drawer-meta">
+        <p class="eyebrow">Slot History</p>
+        <h2 id="history-drawer-title">Slot History</h2>
+        <p id="detail-history-summary" class="subtle history-drawer-subtitle"></p>
+      </div>
+      <div class="history-drawer-actions">
+        <p id="history-drawer-context" class="subtle history-drawer-context"></p>
+        <div class="history-drawer-controls">
+          <label class="history-timeframe-control" for="history-timeframe-select">
+            <span>Window</span>
+            <select id="history-timeframe-select" class="history-timeframe-select">
+              <option value="1">1h</option>
+              <option value="6">6h</option>
+              <option value="12">12h</option>
+              <option value="24" selected>24h</option>
+              <option value="72">3d</option>
+              <option value="168">7d</option>
+              <option value="336">14d</option>
+              <option value="720">30d</option>
+              <option value="1440">60d</option>
+              <option value="2160">90d</option>
+              <option value="4320">180d</option>
+              <option value="8760">1y</option>
+              <option value="all">All</option>
+            </select>
+          </label>
+          <button class="button secondary small" id="history-close-button" type="button">Hide History</button>
+        </div>
+      </div>
+    </div>
+    <div id="detail-history-empty" class="detail-empty compact">
+      Open history to load recent samples and slot events for this bay.
+    </div>
+    <div id="detail-history-loading" class="warning-item muted compact hidden">Loading history...</div>
+    <div id="detail-history-error" class="warning-item compact hidden"></div>
+    <div id="detail-history-content" class="history-content hidden">
+      <div id="history-metric-grid" class="history-metric-grid"></div>
+      <div class="history-main-grid">
+        <div class="history-chart-column">
+          <section class="history-card">
+            <div class="history-card-header">
+              <h4>Temperature</h4>
+              <span id="history-temperature-label" class="subtle"></span>
+            </div>
+            <div id="history-temperature-chart" class="history-chart-empty">
+              Temperature history will appear here after a few collection cycles.
+            </div>
+          </section>
+          <section class="history-card">
+            <div class="history-card-header">
+              <div class="history-card-title-row">
+                <h4>Read / Write History</h4>
+                <div id="history-io-mode-toggle" class="history-chart-toggle" role="group" aria-label="Read and write chart mode">
+                  <button class="history-chart-toggle-button active" type="button" data-history-io-mode="total">Total</button>
+                  <button class="history-chart-toggle-button" type="button" data-history-io-mode="average">Average</button>
+                </div>
+              </div>
+              <span id="history-io-label" class="subtle"></span>
+            </div>
+            <div id="history-io-chart" class="history-chart-empty">
+              Read and write history will appear here when those slower samples are collected.
+            </div>
+          </section>
+        </div>
+        <section class="history-card history-events-card">
+          <div class="history-card-header">
+            <h4>Recent Events</h4>
+            <span class="subtle">Change-only timeline</span>
+          </div>
+          <div id="history-event-list" class="history-event-list"></div>
+        </section>
+      </div>
+    </div>
+  </section>
 
   <section id="detail-secondary" class="detail-secondary">
     <div class="detail-secondary-grid">
@@ -271,6 +442,16 @@
     layoutRows: {{ snapshot.layout_rows | tojson }},
     refreshIntervalSeconds: {{ snapshot.refresh_interval_seconds }},
     slotCount: {{ snapshot.layout_slot_count or settings.layout.slot_count }},
+    historyConfigured: {{ history_configured | tojson }},
+    snapshotMode: {{ snapshot_mode | tojson }},
+    snapshotExportMeta: {{ snapshot_export_meta_json | safe }},
+    preloadedHistoryBySlot: {{ preloaded_history_json | safe }},
+    preloadedSmartSummariesBySlot: {{ preloaded_smart_summary_json | safe }},
+    preloadedHistorySummary: {{ preloaded_history_summary_json | safe }},
+    initialSelectedSlot: {{ initial_selected_slot_json | safe }},
+    initialHistoryTimeframeHours: {{ initial_history_timeframe_hours_json | safe }},
+    initialHistoryPanelOpen: {{ initial_history_panel_open_json | safe }},
+    initialHistoryIoChartMode: {{ initial_history_io_chart_mode_json | safe }},
   };
 </script>
 {% endblock %}

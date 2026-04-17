@@ -96,3 +96,20 @@ Use these pages when you are ready:
 - [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]]
 - [[Quantastor Setup|Quantastor-Setup]]
 - [[Generic Linux Setup|Generic-Linux-Setup]]
+
+## 9. Optional: Turn On History And Snapshot Export
+
+If you want historical slot lookback and the offline HTML snapshot export flow,
+start the optional history sidecar:
+
+```bash
+docker compose --profile history up -d --build
+```
+
+By default that stores the live history DB under `./history/history.db`, keeps
+short-term rotating backups under `./history/backups`, and promotes weekly plus
+monthly long-term copies under `./history/backups/long-term`.
+
+Then use:
+
+- [[History and Snapshot Export|History-and-Snapshot-Export]]

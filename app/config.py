@@ -100,6 +100,11 @@ class PathConfig(BaseModel):
     profile_file: str = "/app/config/profiles.yaml"
 
 
+class HistoryConfig(BaseModel):
+    service_url: str = ""
+    timeout_seconds: int = 10
+
+
 class SystemConfig(BaseModel):
     id: str = "default"
     label: str | None = None
@@ -113,6 +118,7 @@ class Settings(BaseModel):
     app: AppConfig = Field(default_factory=AppConfig)
     truenas: TrueNASConfig = Field(default_factory=TrueNASConfig)
     ssh: SSHConfig = Field(default_factory=SSHConfig)
+    history: HistoryConfig = Field(default_factory=HistoryConfig)
     systems: list[SystemConfig] = Field(default_factory=list)
     default_system_id: str | None = None
     layout: LayoutConfig = Field(default_factory=LayoutConfig)
@@ -150,6 +156,8 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_STRICT_HOST_KEY_CHECKING": ("ssh", "strict_host_key_checking"),
     "SSH_TIMEOUT": ("ssh", "timeout_seconds"),
     "SSH_COMMANDS_JSON": ("ssh", "commands"),
+    "HISTORY_BACKEND_URL": ("history", "service_url"),
+    "HISTORY_BACKEND_TIMEOUT": ("history", "timeout_seconds"),
     "SYSTEM_DEFAULT_ID": ("default_system_id",),
     "LAYOUT_SLOT_COUNT": ("layout", "slot_count"),
     "LAYOUT_ROWS": ("layout", "rows"),
