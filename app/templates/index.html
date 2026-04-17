@@ -46,11 +46,48 @@
     </div>
   </header>
 
+  {% if snapshot_mode %}
+  <section class="panel snapshot-banner">
+    <div class="snapshot-banner-copy">
+      <p class="eyebrow">Offline Snapshot</p>
+      <h2>Explorable Enclosure Export</h2>
+      <p class="subtle">
+        Frozen point-in-time enclosure snapshot. Live actions are disabled, but you can still search, click slots, and inspect preloaded history offline.
+      </p>
+    </div>
+    <div class="snapshot-banner-meta">
+      <div class="summary-card compact">
+        <span class="summary-label">Scope</span>
+        <span class="summary-value">{{ snapshot_export_meta.scope_label or "Current Enclosure" }}</span>
+        <span class="summary-note">{{ snapshot_export_meta.system_label or "Selected system" }}</span>
+      </div>
+      <div class="summary-card compact">
+        <span class="summary-label">Window</span>
+        <span class="summary-value">{{ snapshot_export_meta.history_window_label or "24h" }}</span>
+        <span class="summary-note">history view preserved</span>
+      </div>
+      <div class="summary-card compact">
+        <span class="summary-label">Generated</span>
+        <span class="summary-value">{{ snapshot_export_meta.generated_at or snapshot.last_updated }}</span>
+        <span class="summary-note">re-rendered in viewer local time</span>
+      </div>
+      <div class="summary-card compact">
+        <span class="summary-label">Redaction</span>
+        <span class="summary-value">{{ snapshot_export_meta.redaction or "full" }}</span>
+        <span class="summary-note">consistent aliases preserved</span>
+      </div>
+    </div>
+  </section>
+  {% endif %}
+
   <section class="toolbar">
     <label class="field grow">
       <span>Search</span>
       <input id="search-box" type="search" placeholder="serial, disk, persistent id, pool, vdev">
     </label>
+    {% if not snapshot_mode %}
+    <button id="export-snapshot-button" class="button secondary">Export Snapshot</button>
+    {% endif %}
     <button id="refresh-button" class="button">Refresh Now</button>
     <label class="toggle">
       <input id="auto-refresh-toggle" type="checkbox" checked>
@@ -66,6 +103,44 @@
       </select>
     </label>
   </section>
+
+  {% if not snapshot_mode %}
+  <dialog id="export-snapshot-dialog" class="snapshot-export-dialog">
+    <form method="dialog" class="snapshot-export-form">
+      <div class="panel-header compact">
+        <div>
+          <h2>Export Enclosure Snapshot</h2>
+          <p class="subtle">Current enclosure, offline HTML by default, with optional redaction and ZIP packaging.</p>
+        </div>
+      </div>
+      <div class="snapshot-export-grid">
+        <label class="toggle snapshot-export-toggle">
+          <input id="export-redact-toggle" type="checkbox">
+          <span>Redact sensitive IDs</span>
+        </label>
+        <label class="field">
+          <span>Packaging</span>
+          <select id="export-packaging-select">
+            <option value="auto" selected>Auto (Recommended)</option>
+            <option value="html">Plain HTML</option>
+            <option value="zip">Force ZIP</option>
+          </select>
+        </label>
+        <label class="toggle snapshot-export-toggle">
+          <input id="export-allow-oversize-toggle" type="checkbox">
+          <span>Allow oversize export</span>
+        </label>
+      </div>
+      <p id="export-snapshot-note" class="subtle snapshot-export-note">
+        Default target stays under about 24 MiB. Auto will prefer HTML, then fall back to ZIP if needed.
+      </p>
+      <div class="button-row">
+        <button class="button secondary" id="export-snapshot-cancel" type="button">Cancel</button>
+        <button class="button" id="export-snapshot-confirm" type="button">Download Snapshot</button>
+      </div>
+    </form>
+  </dialog>
+  {% endif %}
 
   <section class="status-strip" id="status-strip">
     <div class="status-chip" id="api-status-chip">API</div>
@@ -354,6 +429,14 @@
     refreshIntervalSeconds: {{ snapshot.refresh_interval_seconds }},
     slotCount: {{ snapshot.layout_slot_count or settings.layout.slot_count }},
     historyConfigured: {{ history_configured | tojson }},
+    snapshotMode: {{ snapshot_mode | tojson }},
+    snapshotExportMeta: {{ snapshot_export_meta_json | safe }},
+    preloadedHistoryBySlot: {{ preloaded_history_json | safe }},
+    preloadedHistorySummary: {{ preloaded_history_summary_json | safe }},
+    initialSelectedSlot: {{ initial_selected_slot_json | safe }},
+    initialHistoryTimeframeHours: {{ initial_history_timeframe_hours_json | safe }},
+    initialHistoryPanelOpen: {{ initial_history_panel_open_json | safe }},
+    initialHistoryIoChartMode: {{ initial_history_io_chart_mode_json | safe }},
   };
 </script>
 {% endblock %}

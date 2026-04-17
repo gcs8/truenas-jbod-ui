@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -272,3 +272,12 @@ class MappingBundle(BaseModel):
     system_id: str | None = None
     enclosure_id: str | None = None
     mappings: list[ManualMapping] = Field(default_factory=list)
+
+
+class SnapshotExportRequest(BaseModel):
+    selected_slot: int | None = None
+    history_window_hours: int | None = 24
+    io_chart_mode: str = "total"
+    redact_sensitive: bool = False
+    packaging: Literal["auto", "html", "zip"] = "auto"
+    allow_oversize: bool = False
