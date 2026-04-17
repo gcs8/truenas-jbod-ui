@@ -1,6 +1,6 @@
-# Release Notes Draft - v0.9.0
+# Release Notes - v0.9.0
 
-Release date target: April 17, 2026
+Release date: April 17, 2026
 
 ## Summary
 
