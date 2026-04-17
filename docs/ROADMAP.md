@@ -167,6 +167,28 @@ Current status:
 - prepared as the local `0.7.0` release candidate
 - focused on polish and clarity rather than adding another large new platform
 
+## v0.8.0 - Optional Slot History And Comparisons
+
+Goal:
+
+- add a lightweight historical lookback path without turning the main app into
+  a full monitoring suite
+
+Primary outcomes:
+
+- optional SQLite-backed sidecar collector in Docker Compose
+- low-cadence SMART metric sampling for a short list of operator-useful fields
+- change-only slot timeline for disk swaps, state drift, and pool / vdev moves
+- keep the main UI safe and standalone when the sidecar is disabled
+- expose slot history inside the main `:8080` UI instead of forcing operators
+  onto a separate sidecar page
+- keep the history store backup and inspection story simple with SQLite
+  snapshots on the existing bind mount
+
+Current notes:
+
+- [`docs/V0_8_HISTORY_PLAN.md`](./V0_8_HISTORY_PLAN.md)
+
 ## Longer-Term Ideas
 
 - broader chassis-profile sharing and import/export

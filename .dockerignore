@@ -5,7 +5,11 @@ __pycache__/
 .Python
 .env
 data/*
+history/*
+!history/backups/
+history/backups/*
 logs/*
 !data/.gitkeep
+!history/.gitkeep
+!history/backups/.gitkeep
 !logs/.gitkeep
-

@@ -6,6 +6,7 @@
   const SMART_PREFETCH_CHUNK_SIZE = 8;
   const SMART_PREFETCH_BATCH_CONCURRENCY = 2;
   const SMART_PREFETCH_STALE_MS = 15000;
+  const DEFAULT_HISTORY_TIMEFRAME_HOURS = 24;
   const state = {
     snapshot: bootstrap.snapshot || { slots: [], systems: [], enclosures: [] },
     layoutRows: bootstrap.layoutRows || [],
@@ -23,6 +24,21 @@
     smartPrefetchTimerId: null,
     smartPrefetchRunning: false,
     smartPrefetchScopeKey: null,
+    history: {
+      configured: Boolean(bootstrap.historyConfigured),
+      checked: false,
+      available: false,
+      loading: false,
+      detail: null,
+      counts: {},
+      collector: {},
+      panelOpen: false,
+      timeframeHours: DEFAULT_HISTORY_TIMEFRAME_HOURS,
+      ioChartMode: "total",
+      panelLoading: false,
+      panelError: null,
+      slotCache: {},
+    },
   };
 
   const grid = document.getElementById("slot-grid");
@@ -52,8 +68,10 @@
   const systemSelect = document.getElementById("system-select");
   const enclosureSelect = document.getElementById("enclosure-select");
   const lastUpdated = document.getElementById("last-updated");
+  const timezoneLabel = document.getElementById("timezone-label");
   const apiStatusChip = document.getElementById("api-status-chip");
   const sshStatusChip = document.getElementById("ssh-status-chip");
+  const historyStatusChip = document.getElementById("history-status-chip");
   const statusText = document.getElementById("status-text");
   const summaryDiskCount = document.getElementById("summary-disk-count");
   const summaryPoolCount = document.getElementById("summary-pool-count");
@@ -68,6 +86,25 @@
   const importMappingsButton = document.getElementById("import-mappings-button");
   const mappingImportFile = document.getElementById("mapping-import-file");
   const mappingEmpty = document.getElementById("mapping-empty");
+  const historyToggleButton = document.getElementById("history-toggle-button");
+  const detailHistoryPanel = document.getElementById("detail-history-panel");
+  const historyDrawerTitle = document.getElementById("history-drawer-title");
+  const historyDrawerContext = document.getElementById("history-drawer-context");
+  const historyCloseButton = document.getElementById("history-close-button");
+  const historyTimeframeSelect = document.getElementById("history-timeframe-select");
+  const detailHistorySummary = document.getElementById("detail-history-summary");
+  const detailHistoryEmpty = document.getElementById("detail-history-empty");
+  const detailHistoryLoading = document.getElementById("detail-history-loading");
+  const detailHistoryError = document.getElementById("detail-history-error");
+  const detailHistoryContent = document.getElementById("detail-history-content");
+  const historyMetricGrid = document.getElementById("history-metric-grid");
+  const historyTemperatureLabel = document.getElementById("history-temperature-label");
+  const historyIoLabel = document.getElementById("history-io-label");
+  const historyIoModeToggle = document.getElementById("history-io-mode-toggle");
+  const historyIoModeButtons = Array.from(document.querySelectorAll("[data-history-io-mode]"));
+  const historyTemperatureChart = document.getElementById("history-temperature-chart");
+  const historyIoChart = document.getElementById("history-io-chart");
+  const historyEventList = document.getElementById("history-event-list");
   const ledButtons = Array.from(document.querySelectorAll("[data-led-action]"));
 
   function getSlotById(slotNumber) {
@@ -341,10 +378,41 @@
     statusText.dataset.tone = tone;
   }
 
+  function getBrowserTimeZone() {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function renderTimezoneLabel() {
+    if (!timezoneLabel) {
+      return;
+    }
+    const timeZone = getBrowserTimeZone();
+    timezoneLabel.textContent = timeZone ? `Browser local time: ${timeZone}` : "Browser local time";
+  }
+
   function formatTimestamp(value) {
     if (!value) return "Unknown";
     const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+    if (Number.isNaN(date.getTime())) {
+      return value;
+    }
+    try {
+      return date.toLocaleString([], {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+        timeZoneName: "short",
+      });
+    } catch (error) {
+      return date.toLocaleString();
+    }
   }
 
   function stateLabel(slot) {
@@ -391,6 +459,12 @@
     const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
     const enclosurePart = state.snapshot.selected_enclosure_id || state.selectedEnclosureId || "all-enclosures";
     return `${systemPart}|${enclosurePart}|${slot.slot}|${slot.device_name || "unknown"}`;
+  }
+
+  function getHistoryCacheKey(slot) {
+    const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
+    const enclosurePart = state.snapshot.selected_enclosure_id || state.selectedEnclosureId || "all-enclosures";
+    return `${systemPart}|${enclosurePart}|${slot.slot}`;
   }
 
   function getSmartSummaryEntry(slot) {
@@ -1367,6 +1441,768 @@
     return value ?? "n/a";
   }
 
+  function isHistoryAvailable() {
+    return state.history.configured && state.history.available;
+  }
+
+  function historyEventTypeLabel(eventType) {
+    switch (eventType) {
+      case "slot_state_changed":
+        return "State Change";
+      case "slot_identity_changed":
+        return "Identity Change";
+      case "slot_topology_changed":
+        return "Topology Change";
+      case "slot_multipath_changed":
+        return "Multipath Change";
+      default:
+        return eventType || "History Event";
+    }
+  }
+
+  function formatHistoryScalar(value) {
+    if (value === null || value === undefined || value === "") {
+      return "n/a";
+    }
+    if (value === true) {
+      return "true";
+    }
+    if (value === false) {
+      return "false";
+    }
+    return String(value);
+  }
+
+  function formatHistoryMetricValue(metricName, value) {
+    if (!Number.isFinite(Number(value))) {
+      return "n/a";
+    }
+    const numericValue = Number(value);
+    switch (metricName) {
+      case "temperature_c":
+        return `${numericValue} C`;
+      case "bytes_read":
+      case "bytes_written":
+        return formatMetricBytes(numericValue) || "n/a";
+      case "annualized_bytes_written": {
+        const formatted = formatMetricBytes(numericValue);
+        return formatted ? `${formatted}/yr` : "n/a";
+      }
+      case "power_on_hours": {
+        const days = Math.floor(numericValue / 24);
+        return `${numericValue} hr (${days} d)`;
+      }
+      default:
+        return String(numericValue);
+    }
+  }
+
+  function sortHistorySamplesAscending(samples) {
+    return [...(samples || [])]
+      .filter((sample) => Number.isFinite(Number(sample?.value)))
+      .sort((left, right) => new Date(left.observed_at).getTime() - new Date(right.observed_at).getTime());
+  }
+
+  function sampleTimestampMs(sample) {
+    const timestamp = new Date(sample?.observed_at).getTime();
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+
+  function currentHistoryWindowHours() {
+    return state.history.timeframeHours;
+  }
+
+  function formatHistoryWindowLabel(windowHours) {
+    if (!Number.isFinite(Number(windowHours)) || Number(windowHours) <= 0) {
+      return "All";
+    }
+    const numericWindow = Number(windowHours);
+    if (numericWindow === 24) {
+      return "24h";
+    }
+    if (numericWindow < 24) {
+      return `${numericWindow}h`;
+    }
+    if (numericWindow === 24 * 365) {
+      return "1y";
+    }
+    if (numericWindow % 24 === 0) {
+      return `${numericWindow / 24}d`;
+    }
+    return `${numericWindow}h`;
+  }
+
+  function formatHistoryWindowDescription(windowHours) {
+    return Number.isFinite(Number(windowHours)) && Number(windowHours) > 0
+      ? formatHistoryWindowLabel(windowHours)
+      : "all history";
+  }
+
+  function historyWindowCutoffMs(windowHours, referenceTimestampMs = Date.now()) {
+    if (!Number.isFinite(Number(windowHours)) || Number(windowHours) <= 0) {
+      return null;
+    }
+    return referenceTimestampMs - Number(windowHours) * 3600000;
+  }
+
+  function filterHistorySamplesToWindow(samples, windowHours, referenceTimestampMs = Date.now()) {
+    const ordered = sortHistorySamplesAscending(samples);
+    const cutoff = historyWindowCutoffMs(windowHours, referenceTimestampMs);
+    if (!ordered.length || cutoff === null) {
+      return ordered;
+    }
+    return ordered.filter((sample) => {
+      const timestamp = sampleTimestampMs(sample);
+      return Number.isFinite(timestamp) && timestamp >= cutoff;
+    });
+  }
+
+  function sortHistoryEventsDescending(events) {
+    return [...(events || [])].sort(
+      (left, right) => new Date(right?.observed_at).getTime() - new Date(left?.observed_at).getTime()
+    );
+  }
+
+  function filterHistoryEventsToWindow(events, windowHours, referenceTimestampMs = Date.now()) {
+    const ordered = sortHistoryEventsDescending(events);
+    const cutoff = historyWindowCutoffMs(windowHours, referenceTimestampMs);
+    if (!ordered.length || cutoff === null) {
+      return ordered;
+    }
+    return ordered.filter((event) => {
+      const timestamp = new Date(event?.observed_at).getTime();
+      return Number.isFinite(timestamp) && timestamp >= cutoff;
+    });
+  }
+
+  function collectHistoryTimestamps(payload) {
+    const timestamps = [];
+    (payload?.events || []).forEach((event) => {
+      if (event?.observed_at) {
+        timestamps.push(event.observed_at);
+      }
+    });
+    Object.values(payload?.metrics || {}).forEach((samples) => {
+      (samples || []).forEach((sample) => {
+        if (sample?.observed_at) {
+          timestamps.push(sample.observed_at);
+        }
+      });
+    });
+    return timestamps;
+  }
+
+  function computeHistoryCounterAverage(samples, windowHours = null, referenceTimestampMs = Date.now()) {
+    const ordered = filterHistorySamplesToWindow(samples, windowHours, referenceTimestampMs);
+    if (ordered.length < 2) {
+      return null;
+    }
+
+    let totalDelta = 0;
+    let totalHours = 0;
+    for (let index = 1; index < ordered.length; index += 1) {
+      const previous = ordered[index - 1];
+      const current = ordered[index];
+      const previousValue = Number(previous?.value);
+      const currentValue = Number(current?.value);
+      const previousTimestamp = sampleTimestampMs(previous);
+      const currentTimestamp = sampleTimestampMs(current);
+      if (
+        !Number.isFinite(previousValue)
+        || !Number.isFinite(currentValue)
+        || currentValue < previousValue
+        || !Number.isFinite(previousTimestamp)
+        || !Number.isFinite(currentTimestamp)
+        || currentTimestamp <= previousTimestamp
+      ) {
+        continue;
+      }
+      totalDelta += currentValue - previousValue;
+      totalHours += (currentTimestamp - previousTimestamp) / 3600000;
+    }
+
+    if (!(totalHours > 0) || totalDelta <= 0) {
+      return null;
+    }
+
+    return totalDelta / totalHours;
+  }
+
+  function formatHistoryAverage(metricName, samples, windowHours = null, prefix = "Avg", referenceTimestampMs = Date.now()) {
+    const ratePerHour = computeHistoryCounterAverage(samples, windowHours, referenceTimestampMs);
+    if (!Number.isFinite(ratePerHour) || ratePerHour <= 0) {
+      return null;
+    }
+    if (metricName === "bytes_written" || metricName === "bytes_read") {
+      const formatted = formatMetricBytes(ratePerHour);
+      if (!formatted) {
+        return null;
+      }
+      const windowLabel = Number.isFinite(Number(windowHours)) && Number(windowHours) > 0
+        ? formatHistoryWindowLabel(windowHours)
+        : "";
+      return `${prefix}${windowLabel ? ` ${windowLabel}` : ""} +${formatted}/hr`;
+    }
+    return null;
+  }
+
+  function formatHistoryRateValue(value) {
+    if (!Number.isFinite(Number(value))) {
+      return "n/a";
+    }
+    const numericValue = Number(value);
+    if (numericValue === 0) {
+      return "0 B/hr";
+    }
+    const formatted = formatMetricBytes(numericValue);
+    return formatted ? `${formatted}/hr` : "n/a";
+  }
+
+  function historyMetricCard(label, metricName, payload, windowHours, referenceTimestampMs = Date.now()) {
+    const allSamples = payload?.metrics?.[metricName] || [];
+    const filteredSamples = filterHistorySamplesToWindow(allSamples, windowHours, referenceTimestampMs);
+    const latestValue = filteredSamples.length ? filteredSamples[filteredSamples.length - 1].value : null;
+    const sampleCount = filteredSamples.length;
+    const totalCount = payload?.sample_counts?.[metricName] ?? allSamples.length;
+    const noteParts = [];
+    if (sampleCount > 0) {
+      if (windowHours === null) {
+        noteParts.push(`${sampleCount} stored sample${sampleCount === 1 ? "" : "s"}`);
+      } else {
+        noteParts.push(`${sampleCount} sample${sampleCount === 1 ? "" : "s"} in ${formatHistoryWindowLabel(windowHours)}`);
+      }
+    } else if (windowHours === null) {
+      noteParts.push("No stored samples yet");
+    } else {
+      noteParts.push(`No samples in ${formatHistoryWindowLabel(windowHours)}`);
+    }
+    if (windowHours !== null && totalCount > sampleCount) {
+      noteParts.push(`${totalCount} total stored`);
+    }
+    const averageLabel = formatHistoryAverage(metricName, allSamples, windowHours, "Avg", referenceTimestampMs);
+    if (averageLabel) {
+      noteParts.push(averageLabel);
+    }
+    return `
+      <div class="history-metric-card">
+        <div class="history-metric-label">${escapeHtml(label)}</div>
+        <div class="history-metric-value">${escapeHtml(formatHistoryMetricValue(metricName, latestValue))}</div>
+        <div class="history-metric-note">${escapeHtml(noteParts.join(" | "))}</div>
+      </div>
+    `;
+  }
+
+  function buildHistorySummary(payload, windowHours, referenceTimestampMs = Date.now()) {
+    const allTimestamps = collectHistoryTimestamps(payload);
+    if (!allTimestamps.length) {
+      return "No slot-specific history collected yet.";
+    }
+    const windowLabel = formatHistoryWindowDescription(windowHours);
+    const cutoff = historyWindowCutoffMs(windowHours, referenceTimestampMs);
+    const filteredTimestamps = cutoff === null
+      ? [...allTimestamps]
+      : allTimestamps.filter((timestamp) => {
+        const numericTimestamp = new Date(timestamp).getTime();
+        return Number.isFinite(numericTimestamp) && numericTimestamp >= cutoff;
+      });
+    filteredTimestamps.sort((left, right) => new Date(right).getTime() - new Date(left).getTime());
+    if (filteredTimestamps.length) {
+      return `Showing ${windowLabel} • Latest point ${formatTimestamp(filteredTimestamps[0])}`;
+    }
+
+    allTimestamps.sort((left, right) => new Date(right).getTime() - new Date(left).getTime());
+    return `No history points in ${windowLabel}. Latest stored point ${formatTimestamp(allTimestamps[0])}`;
+  }
+
+  function buildHistoryDrawerContext(slot) {
+    if (!slot) {
+      return "";
+    }
+    const fragments = [`Slot ${slot.slot_label}`];
+    if (slot.device_name) {
+      fragments.push(slot.device_name);
+    } else if (slot.serial) {
+      fragments.push(slot.serial);
+    }
+    const systemLabel = getSelectedSystemOption()?.label || state.snapshot.selected_system_label || null;
+    const enclosureLabel =
+      getSelectedEnclosureOption()?.label ||
+      state.snapshot.selected_enclosure_label ||
+      slot.enclosure_label ||
+      slot.enclosure_name ||
+      slot.enclosure_id ||
+      null;
+    if (systemLabel) {
+      fragments.push(systemLabel);
+    }
+    if (enclosureLabel) {
+      fragments.push(enclosureLabel);
+    }
+    return fragments.join(" | ");
+  }
+
+  function buildHistoryChartScale(sampleGroups) {
+    const samples = sampleGroups
+      .flat()
+      .filter((sample) => Number.isFinite(Number(sample?.value)) && Number.isFinite(sampleTimestampMs(sample)));
+    if (!samples.length) {
+      return null;
+    }
+
+    const timestamps = samples.map((sample) => sampleTimestampMs(sample));
+    const values = samples.map((sample) => Number(sample.value));
+    return {
+      minTimestamp: Math.min(...timestamps),
+      maxTimestamp: Math.max(...timestamps),
+      minValue: Math.min(...values),
+      maxValue: Math.max(...values),
+    };
+  }
+
+  function buildHistoryRateSamples(samples) {
+    const ordered = sortHistorySamplesAscending(samples);
+    if (ordered.length < 2) {
+      return [];
+    }
+
+    const rateSamples = [];
+    for (let index = 1; index < ordered.length; index += 1) {
+      const previous = ordered[index - 1];
+      const current = ordered[index];
+      const previousValue = Number(previous?.value);
+      const currentValue = Number(current?.value);
+      const previousTimestamp = sampleTimestampMs(previous);
+      const currentTimestamp = sampleTimestampMs(current);
+      if (
+        !Number.isFinite(previousValue)
+        || !Number.isFinite(currentValue)
+        || currentValue < previousValue
+        || !Number.isFinite(previousTimestamp)
+        || !Number.isFinite(currentTimestamp)
+        || currentTimestamp <= previousTimestamp
+      ) {
+        continue;
+      }
+      const elapsedHours = (currentTimestamp - previousTimestamp) / 3600000;
+      rateSamples.push({
+        ...current,
+        value: elapsedHours > 0 ? (currentValue - previousValue) / elapsedHours : 0,
+      });
+    }
+    return rateSamples;
+  }
+
+  function buildHistoryChartPoints(samples, scale, width, height, padding) {
+    const innerWidth = width - padding * 2;
+    const innerHeight = height - padding * 2;
+    const timeRange = scale.maxTimestamp - scale.minTimestamp;
+    const valueRange = scale.maxValue - scale.minValue;
+    return samples.map((sample) => {
+      const timestamp = sampleTimestampMs(sample);
+      const x = samples.length === 1 || !(timeRange > 0)
+        ? width / 2
+        : padding + ((timestamp - scale.minTimestamp) / timeRange) * innerWidth;
+      const numericValue = Number(sample.value);
+      const scaled = valueRange > 0 ? (numericValue - scale.minValue) / valueRange : 0.5;
+      const y = padding + innerHeight - scaled * innerHeight;
+      return [x, y];
+    });
+  }
+
+  function escapeSvgTitle(value) {
+    return escapeHtml(String(value)).replaceAll("\n", "&#10;");
+  }
+
+  function buildHistoryPointHoverMarkup(pointPairs, samples, className, buildTitle) {
+    return pointPairs
+      .map(([x, y], index) => {
+        const title = buildTitle(samples[index], index);
+        return `
+          <circle class="${escapeHtml(className)}" cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="3.25"></circle>
+          <circle class="history-hit-dot" cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="7">
+            <title>${escapeSvgTitle(title)}</title>
+          </circle>
+        `;
+      })
+      .join("");
+  }
+
+  function renderHistoryChart(target, labelTarget, samples, metricName, emptyMessage, windowHours, referenceTimestampMs = Date.now()) {
+    if (!target) {
+      return;
+    }
+
+    const ordered = filterHistorySamplesToWindow(samples, windowHours, referenceTimestampMs);
+    if (labelTarget) {
+      labelTarget.textContent = ordered.length
+        ? `${ordered.length} sample${ordered.length === 1 ? "" : "s"} / ${formatHistoryWindowDescription(windowHours)}`
+        : formatHistoryWindowDescription(windowHours);
+    }
+    if (!ordered.length) {
+      const scopedMessage = windowHours === null
+        ? emptyMessage
+        : `No ${metricName === "temperature_c" ? "temperature" : "history"} samples in ${formatHistoryWindowLabel(windowHours)} yet.`;
+      target.innerHTML = `<div class="history-chart-empty">${escapeHtml(scopedMessage)}</div>`;
+      return;
+    }
+
+    const values = ordered.map((sample) => Number(sample.value));
+    const width = 320;
+    const height = 120;
+    const padding = 10;
+    const scale = buildHistoryChartScale([ordered]);
+    const pointPairs = buildHistoryChartPoints(ordered, scale, width, height, padding);
+    const pointString = pointPairs.map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
+    const latestValue = values[values.length - 1];
+    const areaPoints = [
+      `${pointPairs[0][0].toFixed(2)},${(height - padding).toFixed(2)}`,
+      pointString,
+      `${pointPairs[pointPairs.length - 1][0].toFixed(2)},${(height - padding).toFixed(2)}`,
+    ].join(" ");
+    const firstObserved = ordered[0]?.observed_at ? formatTimestamp(ordered[0].observed_at) : "n/a";
+    const lastObserved = ordered[ordered.length - 1]?.observed_at ? formatTimestamp(ordered[ordered.length - 1].observed_at) : "n/a";
+    const pointMarkup = buildHistoryPointHoverMarkup(
+      pointPairs,
+      ordered,
+      "history-dot",
+      (sample) => `${formatTimestamp(sample?.observed_at)}\n${formatHistoryMetricValue(metricName, sample?.value)}`
+    );
+
+    target.innerHTML = `
+      <div class="history-chart-shell">
+        <div class="history-chart-meta">
+          <span>Latest ${escapeHtml(formatHistoryMetricValue(metricName, latestValue))}</span>
+          <span>Min ${escapeHtml(formatHistoryMetricValue(metricName, scale.minValue))}</span>
+          <span>Max ${escapeHtml(formatHistoryMetricValue(metricName, scale.maxValue))}</span>
+        </div>
+        <svg viewBox="0 0 ${width} ${height}" class="history-chart-svg" role="img" aria-label="${escapeHtml(metricName)} history">
+          <line class="history-grid-line" x1="${padding}" y1="${padding}" x2="${width - padding}" y2="${padding}"></line>
+          <line class="history-grid-line" x1="${padding}" y1="${height / 2}" x2="${width - padding}" y2="${height / 2}"></line>
+          <line class="history-grid-line" x1="${padding}" y1="${height - padding}" x2="${width - padding}" y2="${height - padding}"></line>
+          <polygon class="history-area" points="${areaPoints}"></polygon>
+          <polyline class="history-line" points="${pointString}"></polyline>
+          ${pointMarkup}
+        </svg>
+        <div class="history-chart-meta">
+          <span>First ${escapeHtml(firstObserved)}</span>
+          <span>Latest ${escapeHtml(lastObserved)}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderHistoryReadWriteChart(
+    target,
+    labelTarget,
+    readSamples,
+    writeSamples,
+    mode = "total",
+    windowHours = null,
+    referenceTimestampMs = Date.now()
+  ) {
+    if (!target) {
+      return;
+    }
+
+    const orderedRead = mode === "average"
+      ? filterHistorySamplesToWindow(buildHistoryRateSamples(readSamples), windowHours, referenceTimestampMs)
+      : filterHistorySamplesToWindow(readSamples, windowHours, referenceTimestampMs);
+    const orderedWrite = mode === "average"
+      ? filterHistorySamplesToWindow(buildHistoryRateSamples(writeSamples), windowHours, referenceTimestampMs)
+      : filterHistorySamplesToWindow(writeSamples, windowHours, referenceTimestampMs);
+    if (labelTarget) {
+      const labelParts = [];
+      if (orderedRead.length) {
+        labelParts.push(`${orderedRead.length} ${mode === "average" ? "read rate" : "read"}`);
+      }
+      if (orderedWrite.length) {
+        labelParts.push(`${orderedWrite.length} ${mode === "average" ? "write rate" : "write"}`);
+      }
+      labelParts.push(formatHistoryWindowDescription(windowHours));
+      labelTarget.textContent = labelParts.join(" / ");
+    }
+    if (!orderedRead.length && !orderedWrite.length) {
+      const emptyMessage = mode === "average"
+        ? `Average read and write rates need at least two slower samples inside ${formatHistoryWindowDescription(windowHours)}.`
+        : `No read or write samples in ${formatHistoryWindowDescription(windowHours)} yet.`;
+      target.innerHTML = `<div class="history-chart-empty">${escapeHtml(emptyMessage)}</div>`;
+      return;
+    }
+
+    const width = 320;
+    const height = 120;
+    const padding = 10;
+    const scale = buildHistoryChartScale([orderedRead, orderedWrite]);
+    const writePoints = orderedWrite.length ? buildHistoryChartPoints(orderedWrite, scale, width, height, padding) : [];
+    const readPoints = orderedRead.length ? buildHistoryChartPoints(orderedRead, scale, width, height, padding) : [];
+    const firstObserved = [orderedWrite[0]?.observed_at, orderedRead[0]?.observed_at]
+      .filter(Boolean)
+      .sort((left, right) => new Date(left).getTime() - new Date(right).getTime())[0];
+    const lastObserved = [
+      orderedWrite[orderedWrite.length - 1]?.observed_at,
+      orderedRead[orderedRead.length - 1]?.observed_at,
+    ]
+      .filter(Boolean)
+      .sort((left, right) => new Date(right).getTime() - new Date(left).getTime())[0];
+    const writeLatestValue = orderedWrite.length ? Number(orderedWrite[orderedWrite.length - 1].value) : null;
+    const readLatestValue = orderedRead.length ? Number(orderedRead[orderedRead.length - 1].value) : null;
+    const writeAverage = formatHistoryAverage("bytes_written", writeSamples, windowHours, "Avg-W", referenceTimestampMs);
+    const readAverage = formatHistoryAverage("bytes_read", readSamples, windowHours, "Avg-R", referenceTimestampMs);
+    const readPrimaryLabel = mode === "average"
+      ? formatHistoryRateValue(readLatestValue)
+      : formatHistoryMetricValue("bytes_read", readLatestValue);
+    const writePrimaryLabel = mode === "average"
+      ? formatHistoryRateValue(writeLatestValue)
+      : formatHistoryMetricValue("bytes_written", writeLatestValue);
+    const chartAriaLabel = mode === "average" ? "Average read and write rate history" : "Read and write history";
+    const readPointMarkup = buildHistoryPointHoverMarkup(
+      readPoints,
+      orderedRead,
+      "history-dot history-dot-read",
+      (sample) => `${formatTimestamp(sample?.observed_at)}\nRead ${mode === "average" ? formatHistoryRateValue(sample?.value) : formatHistoryMetricValue("bytes_read", sample?.value)}`
+    );
+    const writePointMarkup = buildHistoryPointHoverMarkup(
+      writePoints,
+      orderedWrite,
+      "history-dot history-dot-write",
+      (sample) => `${formatTimestamp(sample?.observed_at)}\nWrite ${mode === "average" ? formatHistoryRateValue(sample?.value) : formatHistoryMetricValue("bytes_written", sample?.value)}`
+    );
+
+    target.innerHTML = `
+      <div class="history-chart-shell">
+        <div class="history-chart-meta">
+          ${readLatestValue !== null ? `<span class="history-legend-chip"><i class="history-legend-swatch read"></i>Read ${escapeHtml(readPrimaryLabel)}</span>` : ""}
+          ${readAverage ? `<span>${escapeHtml(readAverage)}</span>` : ""}
+          ${writeLatestValue !== null ? `<span class="history-legend-chip"><i class="history-legend-swatch write"></i>Write ${escapeHtml(writePrimaryLabel)}</span>` : ""}
+          ${writeAverage ? `<span>${escapeHtml(writeAverage)}</span>` : ""}
+        </div>
+        <svg viewBox="0 0 ${width} ${height}" class="history-chart-svg" role="img" aria-label="${escapeHtml(chartAriaLabel)}">
+          <line class="history-grid-line" x1="${padding}" y1="${padding}" x2="${width - padding}" y2="${padding}"></line>
+          <line class="history-grid-line" x1="${padding}" y1="${height / 2}" x2="${width - padding}" y2="${height / 2}"></line>
+          <line class="history-grid-line" x1="${padding}" y1="${height - padding}" x2="${width - padding}" y2="${height - padding}"></line>
+          ${writePoints.length ? `<polyline class="history-line history-line-write" points="${writePoints.map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" ")}"></polyline>` : ""}
+          ${readPoints.length ? `<polyline class="history-line history-line-read" points="${readPoints.map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" ")}"></polyline>` : ""}
+          ${writePointMarkup}
+          ${readPointMarkup}
+        </svg>
+        <div class="history-chart-meta">
+          <span>First ${escapeHtml(firstObserved ? formatTimestamp(firstObserved) : "n/a")}</span>
+          <span>Latest ${escapeHtml(lastObserved ? formatTimestamp(lastObserved) : "n/a")}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderHistoryEvents(events, windowHours, referenceTimestampMs = Date.now()) {
+    if (!historyEventList) {
+      return;
+    }
+    const filteredEvents = filterHistoryEventsToWindow(events, windowHours, referenceTimestampMs);
+    if (!filteredEvents.length) {
+      historyEventList.innerHTML = Array.isArray(events) && events.length && windowHours !== null
+        ? `<div class="warning-item muted compact">No slot-change events in ${escapeHtml(formatHistoryWindowLabel(windowHours))}.</div>`
+        : '<div class="warning-item muted compact">No slot-change events have been recorded for this bay yet.</div>';
+      return;
+    }
+
+    historyEventList.innerHTML = filteredEvents
+      .map((event) => {
+        let detailText = "";
+        try {
+          const details = JSON.parse(event.details_json || "{}");
+          const fragments = Object.values(details).map((detail) => {
+            const previousValue = formatHistoryScalar(detail?.previous);
+            const currentValue = formatHistoryScalar(detail?.current);
+            return `${detail?.label || "Value"}: ${previousValue} -> ${currentValue}`;
+          });
+          detailText = fragments.join(" | ");
+        } catch (error) {
+          detailText = "";
+        }
+
+        return `
+          <div class="history-event-item">
+            <div class="history-event-head">
+              <span class="history-event-type">${escapeHtml(historyEventTypeLabel(event.event_type))}</span>
+              <span class="history-event-time">${escapeHtml(formatTimestamp(event.observed_at))}</span>
+            </div>
+            <div class="history-event-summary">${escapeHtml(`${event.previous_value || "n/a"} -> ${event.current_value || "n/a"}`)}</div>
+            ${detailText ? `<div class="history-event-detail">${escapeHtml(detailText)}</div>` : ""}
+          </div>
+        `;
+      })
+      .join("");
+  }
+
+  function renderHistoryPanel(slot) {
+    if (!detailHistoryPanel || !historyToggleButton) {
+      return;
+    }
+
+    const windowHours = currentHistoryWindowHours();
+    const referenceTimestampMs = Date.now();
+    historyIoModeButtons.forEach((button) => {
+      button.classList.toggle("active", button.dataset.historyIoMode === state.history.ioChartMode);
+    });
+    if (historyTimeframeSelect) {
+      historyTimeframeSelect.value = windowHours === null ? "all" : String(windowHours);
+    }
+
+    const shouldShowButton = Boolean(slot) && isHistoryAvailable();
+    historyToggleButton.classList.toggle("hidden", !shouldShowButton);
+    historyToggleButton.textContent = state.history.panelOpen ? "Hide History" : "History";
+    if (historyDrawerTitle) {
+      historyDrawerTitle.textContent = slot ? `Slot ${slot.slot_label} History` : "Slot History";
+    }
+    if (historyDrawerContext) {
+      historyDrawerContext.textContent = buildHistoryDrawerContext(slot);
+    }
+    if (historyCloseButton) {
+      historyCloseButton.classList.toggle("hidden", !slot || !shouldShowButton || !state.history.panelOpen);
+    }
+
+    if (!slot || !shouldShowButton || !state.history.panelOpen) {
+      detailHistoryPanel.classList.add("hidden");
+      return;
+    }
+
+    detailHistoryPanel.classList.remove("hidden");
+    detailHistoryEmpty.classList.add("hidden");
+    detailHistoryLoading.classList.add("hidden");
+    detailHistoryError.classList.add("hidden");
+    detailHistoryContent.classList.add("hidden");
+    detailHistoryError.textContent = "";
+
+    const cacheKey = getHistoryCacheKey(slot);
+    const payload = state.history.slotCache[cacheKey];
+    detailHistorySummary.textContent = payload?.available ? buildHistorySummary(payload, windowHours, referenceTimestampMs) : "";
+
+    if (state.history.panelLoading) {
+      detailHistoryLoading.classList.remove("hidden");
+      detailHistorySummary.textContent = "Loading history...";
+      return;
+    }
+
+    if (state.history.panelError) {
+      detailHistoryError.textContent = state.history.panelError;
+      detailHistoryError.classList.remove("hidden");
+      detailHistorySummary.textContent = "History backend reachable, but this slot query failed.";
+      return;
+    }
+
+    if (!payload) {
+      detailHistoryEmpty.classList.remove("hidden");
+      return;
+    }
+
+    if (!payload.available) {
+      detailHistoryError.textContent = payload.detail || "History is unavailable for this slot.";
+      detailHistoryError.classList.remove("hidden");
+      return;
+    }
+
+    detailHistoryContent.classList.remove("hidden");
+    historyMetricGrid.innerHTML = [
+      historyMetricCard("Temperature", "temperature_c", payload, windowHours, referenceTimestampMs),
+      historyMetricCard("Bytes Read", "bytes_read", payload, windowHours, referenceTimestampMs),
+      historyMetricCard("Bytes Written", "bytes_written", payload, windowHours, referenceTimestampMs),
+      historyMetricCard("Annualized Write", "annualized_bytes_written", payload, windowHours, referenceTimestampMs),
+      historyMetricCard("Power On", "power_on_hours", payload, windowHours, referenceTimestampMs),
+    ].join("");
+
+    renderHistoryChart(
+      historyTemperatureChart,
+      historyTemperatureLabel,
+      payload.metrics?.temperature_c || [],
+      "temperature_c",
+      "Temperature history will appear here after a few collection cycles.",
+      windowHours,
+      referenceTimestampMs
+    );
+    renderHistoryReadWriteChart(
+      historyIoChart,
+      historyIoLabel,
+      payload.metrics?.bytes_read || [],
+      payload.metrics?.bytes_written || [],
+      state.history.ioChartMode,
+      windowHours,
+      referenceTimestampMs
+    );
+    renderHistoryEvents(payload.events || [], windowHours, referenceTimestampMs);
+  }
+
+  async function refreshHistoryStatus(silent = true) {
+    if (!state.history.configured) {
+      state.history.loading = false;
+      state.history.checked = true;
+      state.history.available = false;
+      state.history.detail = null;
+      state.history.counts = {};
+      state.history.collector = {};
+      renderStatus();
+      renderHistoryPanel(getSlotById(state.selectedSlot));
+      return;
+    }
+
+    state.history.loading = true;
+    renderStatus();
+
+    try {
+      const payload = await fetchJson("/api/history/status");
+      state.history.checked = true;
+      state.history.available = Boolean(payload.available);
+      state.history.detail = payload.detail || null;
+      state.history.counts = payload.counts || {};
+      state.history.collector = payload.collector || {};
+    } catch (error) {
+      state.history.checked = true;
+      state.history.available = false;
+      state.history.detail = error.message || String(error);
+      state.history.counts = {};
+      state.history.collector = {};
+      if (!silent) {
+        setStatus(`History status check failed: ${state.history.detail}`, "error");
+      }
+    } finally {
+      state.history.loading = false;
+    }
+
+    renderStatus();
+    renderHistoryPanel(getSlotById(state.selectedSlot));
+  }
+
+  async function loadHistoryForSelectedSlot(force = false) {
+    const slot = getSlotById(state.selectedSlot);
+    if (!slot || !isHistoryAvailable()) {
+      return;
+    }
+
+    const cacheKey = getHistoryCacheKey(slot);
+    if (!force && state.history.slotCache[cacheKey]) {
+      state.history.panelError = null;
+      renderHistoryPanel(slot);
+      return;
+    }
+
+    state.history.panelLoading = true;
+    state.history.panelError = null;
+    renderHistoryPanel(slot);
+
+    try {
+      const payload = await sendScopedRequest(`/api/slots/${slot.slot}/history`);
+      state.history.slotCache[cacheKey] = payload;
+      if (cacheKey !== getHistoryCacheKey(getSlotById(state.selectedSlot) || slot)) {
+        return;
+      }
+    } catch (error) {
+      state.history.panelError = error.message || String(error);
+    } finally {
+      state.history.panelLoading = false;
+    }
+
+    renderHistoryPanel(getSlotById(state.selectedSlot));
+  }
+
   function renderDetail() {
     const slot = getSlotById(state.selectedSlot);
     if (!slot) {
@@ -1387,6 +2223,12 @@
       ledButtons.forEach((button) => {
         button.disabled = true;
       });
+      if (historyToggleButton) {
+        historyToggleButton.classList.add("hidden");
+      }
+      if (detailHistoryPanel) {
+        detailHistoryPanel.classList.add("hidden");
+      }
       return;
     }
 
@@ -1510,6 +2352,10 @@
     ledButtons.forEach((button) => {
       button.disabled = !slot.led_supported;
     });
+    renderHistoryPanel(slot);
+    if (state.history.panelOpen && isHistoryAvailable()) {
+      void loadHistoryForSelectedSlot(false);
+    }
     void ensureSmartSummary(slot);
   }
 
@@ -1839,7 +2685,50 @@
     sshStatusChip.className = `status-chip ${sshClass}`;
     sshStatusChip.textContent = !ssh.enabled ? "SSH OFF" : ssh.ok ? "SSH OK" : "SSH ERR";
 
+    if (historyStatusChip) {
+      if (!state.history.configured) {
+        historyStatusChip.className = "status-chip hidden";
+        historyStatusChip.textContent = "HIST";
+        historyStatusChip.title = "";
+      } else {
+        let historyClass = "partial";
+        let historyText = "HIST ...";
+        if (state.history.available) {
+          historyClass = "ok";
+          historyText = "HIST OK";
+        } else if (state.history.checked && !state.history.loading) {
+          historyText = "HIST OFF";
+        }
+
+        const trackedSlots = state.history.counts?.tracked_slots;
+        const metricSamples = state.history.counts?.metric_sample_count;
+        const lastCompletedAt = state.history.collector?.last_success_at || state.history.collector?.last_completed_at;
+        const detailParts = [];
+        if (Number.isInteger(trackedSlots)) {
+          detailParts.push(`${trackedSlots} tracked slots`);
+        }
+        if (Number.isInteger(metricSamples)) {
+          detailParts.push(`${metricSamples} samples`);
+        }
+        if (lastCompletedAt) {
+          detailParts.push(`Last run ${formatTimestamp(lastCompletedAt)}`);
+        }
+        if (!detailParts.length && state.history.detail) {
+          detailParts.push(state.history.detail);
+        }
+        if (!detailParts.length && state.history.loading) {
+          detailParts.push("Checking optional history backend.");
+        }
+
+        historyStatusChip.className = `status-chip ${historyClass}`;
+        historyStatusChip.textContent = historyText;
+        historyStatusChip.title = detailParts.join(" | ");
+      }
+    }
+
     lastUpdated.textContent = formatTimestamp(state.snapshot.last_updated);
+    lastUpdated.title = "Rendered in your browser's local timezone.";
+    renderTimezoneLabel();
     syncLocation();
   }
 
@@ -1929,11 +2818,13 @@
 
   function selectSlot(slotNumber) {
     state.selectedSlot = slotNumber;
+    state.history.panelError = null;
     renderAll();
   }
 
   function clearSelectedSlot() {
     state.selectedSlot = null;
+    state.history.panelError = null;
     renderAll();
   }
 
@@ -1964,6 +2855,7 @@
       applySnapshot(snapshot);
       renderAll();
       scheduleSmartPrefetch();
+      void refreshHistoryStatus(true);
       setStatus("Inventory updated.");
     } catch (error) {
       setStatus(`Refresh failed: ${error.message || error}`, "error");
@@ -2231,12 +3123,51 @@
       importMappingsFromFile(file);
     });
   }
+  if (historyCloseButton) {
+    historyCloseButton.addEventListener("click", () => {
+      state.history.panelOpen = false;
+      renderHistoryPanel(getSlotById(state.selectedSlot));
+    });
+  }
+  if (historyToggleButton) {
+    historyToggleButton.addEventListener("click", () => {
+      if (!state.selectedSlot || !isHistoryAvailable()) {
+        return;
+      }
+      state.history.panelOpen = !state.history.panelOpen;
+      renderHistoryPanel(getSlotById(state.selectedSlot));
+      if (state.history.panelOpen) {
+        if (detailHistoryPanel) {
+          detailHistoryPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+        void loadHistoryForSelectedSlot(false);
+      }
+    });
+  }
+  if (historyTimeframeSelect) {
+    historyTimeframeSelect.addEventListener("change", () => {
+      const nextValue = historyTimeframeSelect.value;
+      state.history.timeframeHours = nextValue === "all" ? null : Number(nextValue) || DEFAULT_HISTORY_TIMEFRAME_HOURS;
+      renderHistoryPanel(getSlotById(state.selectedSlot));
+    });
+  }
+  historyIoModeButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextMode = button.dataset.historyIoMode === "average" ? "average" : "total";
+      if (state.history.ioChartMode === nextMode) {
+        return;
+      }
+      state.history.ioChartMode = nextMode;
+      renderHistoryPanel(getSlotById(state.selectedSlot));
+    });
+  });
 
   document.querySelectorAll("[data-led-action]").forEach((button) => {
     button.addEventListener("click", () => sendLedAction(button.dataset.ledAction));
   });
 
   renderAll();
+  void refreshHistoryStatus(true);
   scheduleSmartPrefetch();
   resetTimer();
 })();

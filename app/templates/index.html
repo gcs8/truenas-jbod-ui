@@ -41,6 +41,7 @@
       <div class="meta-card">
         <span class="meta-label">Last Updated</span>
         <span class="meta-value" id="last-updated">{{ snapshot.last_updated }}</span>
+        <span class="meta-note" id="timezone-label">Browser local time</span>
       </div>
     </div>
   </header>
@@ -69,6 +70,7 @@
   <section class="status-strip" id="status-strip">
     <div class="status-chip" id="api-status-chip">API</div>
     <div class="status-chip" id="ssh-status-chip">SSH</div>
+    <div class="status-chip hidden" id="history-status-chip">HIST</div>
     <div class="status-text" id="status-text">Ready.</div>
   </section>
 
@@ -147,9 +149,12 @@
           <h2>Slot Details</h2>
           <p class="subtle">Select a bay to inspect metadata or calibrate mapping.</p>
         </div>
-        <div id="detail-led-controls" class="detail-led-controls hidden">
-          <button class="button small" data-led-action="IDENTIFY">Identify On</button>
-          <button class="button secondary small" data-led-action="CLEAR">Identify Off / Clear</button>
+        <div class="detail-panel-actions">
+          <button class="button secondary small hidden" id="history-toggle-button" type="button">History</button>
+          <div id="detail-led-controls" class="detail-led-controls hidden">
+            <button class="button small" data-led-action="IDENTIFY">Identify On</button>
+            <button class="button secondary small" data-led-action="CLEAR">Identify Off / Clear</button>
+          </div>
         </div>
       </div>
 
@@ -171,6 +176,83 @@
       </div>
     </aside>
   </main>
+
+  <section id="detail-history-panel" class="panel history-drawer hidden">
+    <div class="panel-header history-drawer-top">
+      <div class="history-drawer-meta">
+        <p class="eyebrow">Slot History</p>
+        <h2 id="history-drawer-title">Slot History</h2>
+        <p id="detail-history-summary" class="subtle history-drawer-subtitle"></p>
+      </div>
+      <div class="history-drawer-actions">
+        <p id="history-drawer-context" class="subtle history-drawer-context"></p>
+        <div class="history-drawer-controls">
+          <label class="history-timeframe-control" for="history-timeframe-select">
+            <span>Window</span>
+            <select id="history-timeframe-select" class="history-timeframe-select">
+              <option value="1">1h</option>
+              <option value="6">6h</option>
+              <option value="12">12h</option>
+              <option value="24" selected>24h</option>
+              <option value="72">3d</option>
+              <option value="168">7d</option>
+              <option value="336">14d</option>
+              <option value="720">30d</option>
+              <option value="1440">60d</option>
+              <option value="2160">90d</option>
+              <option value="4320">180d</option>
+              <option value="8760">1y</option>
+              <option value="all">All</option>
+            </select>
+          </label>
+          <button class="button secondary small" id="history-close-button" type="button">Hide History</button>
+        </div>
+      </div>
+    </div>
+    <div id="detail-history-empty" class="detail-empty compact">
+      Open history to load recent samples and slot events for this bay.
+    </div>
+    <div id="detail-history-loading" class="warning-item muted compact hidden">Loading history...</div>
+    <div id="detail-history-error" class="warning-item compact hidden"></div>
+    <div id="detail-history-content" class="history-content hidden">
+      <div id="history-metric-grid" class="history-metric-grid"></div>
+      <div class="history-main-grid">
+        <div class="history-chart-column">
+          <section class="history-card">
+            <div class="history-card-header">
+              <h4>Temperature</h4>
+              <span id="history-temperature-label" class="subtle"></span>
+            </div>
+            <div id="history-temperature-chart" class="history-chart-empty">
+              Temperature history will appear here after a few collection cycles.
+            </div>
+          </section>
+          <section class="history-card">
+            <div class="history-card-header">
+              <div class="history-card-title-row">
+                <h4>Read / Write History</h4>
+                <div id="history-io-mode-toggle" class="history-chart-toggle" role="group" aria-label="Read and write chart mode">
+                  <button class="history-chart-toggle-button active" type="button" data-history-io-mode="total">Total</button>
+                  <button class="history-chart-toggle-button" type="button" data-history-io-mode="average">Average</button>
+                </div>
+              </div>
+              <span id="history-io-label" class="subtle"></span>
+            </div>
+            <div id="history-io-chart" class="history-chart-empty">
+              Read and write history will appear here when those slower samples are collected.
+            </div>
+          </section>
+        </div>
+        <section class="history-card history-events-card">
+          <div class="history-card-header">
+            <h4>Recent Events</h4>
+            <span class="subtle">Change-only timeline</span>
+          </div>
+          <div id="history-event-list" class="history-event-list"></div>
+        </section>
+      </div>
+    </div>
+  </section>
 
   <section id="detail-secondary" class="detail-secondary">
     <div class="detail-secondary-grid">
@@ -271,6 +353,7 @@
     layoutRows: {{ snapshot.layout_rows | tojson }},
     refreshIntervalSeconds: {{ snapshot.refresh_interval_seconds }},
     slotCount: {{ snapshot.layout_slot_count or settings.layout.slot_count }},
+    historyConfigured: {{ history_configured | tojson }},
   };
 </script>
 {% endblock %}

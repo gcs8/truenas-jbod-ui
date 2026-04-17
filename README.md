@@ -56,7 +56,10 @@ front and rear grids derived from Linux SES data and operator notes.
 ## Features
 
 - FastAPI app with server-rendered Jinja templates and light plain JavaScript
-- Single-container deployment with Docker Compose
+- Single-container default deployment with an optional Docker Compose history sidecar
+- When the optional history sidecar is reachable, the main UI exposes a slot-detail
+  `History` view in a wide drawer under the enclosure and renders on-screen
+  timestamps in the viewer's browser-local timezone
 - TrueNAS API collection using websocket middleware methods:
   - `enclosure.query`
   - `enclosure.set_slot_status`
@@ -211,6 +214,9 @@ truenas-jbod-ui/
 |  |- SSH_READ_ONLY_SETUP.md
 |  |- GPU_SERVER_NOTES.md
 |  |- V0_3_SCALE_NOTES.md
+|- history/
+|  \- .gitkeep
+|- history_service/
 |- logs/
 |  |- .gitkeep
 |- tests/
@@ -266,9 +272,25 @@ truenas-jbod-ui/
    docker compose up -d --build
    ```
 
-7. Open the UI:
+7. Optional if you want lightweight historical slot metrics and change events:
+
+   ```bash
+   docker compose --profile history up -d --build
+   ```
+
+   The history sidecar stays separate from the main UI, stores SQLite data under
+   `./history`, and binds its small status/API page to `127.0.0.1:8081` by
+   default. When it is healthy, the regular UI on `:8080` will surface a
+   `History` button in Slot Details, open a wide history drawer under the
+   enclosure, and proxy the history API through the main app so you do not need
+   a second desktop-visible port. The sidecar also keeps rotating SQLite
+   snapshots under `./history/backups` by default so the history store is not
+   just a single live file.
+
+8. Open the UI:
 
    - `http://your-docker-host:8080`
+   - optional direct history sidecar/API page: `http://127.0.0.1:8081`
 
 ## Systemd-Free Docker Deployment
 
@@ -281,6 +303,7 @@ Typical host-side layout:
 ./config
 ./config/ssh
 ./data
+./history
 ./logs
 ```
 
@@ -288,6 +311,7 @@ Useful commands:
 
 ```bash
 docker compose up -d --build
+docker compose --profile history up -d --build
 docker compose logs -f
 docker compose ps
 docker compose down

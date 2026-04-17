@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app import __version__
 from app.logging_config import configure_logging
 from app.models.domain import (
@@ -23,6 +23,7 @@ from app.models.domain import (
     SmartBatchResponse,
     SmartSummaryView,
 )
+from app.services.history_backend import HistoryBackendClient
 from app.services.inventory_registry import InventoryRegistry
 from app.services.truenas_ws import TrueNASAPIError
 
@@ -37,6 +38,13 @@ def get_inventory_registry() -> InventoryRegistry:
     settings = get_settings()
     configure_logging(settings)
     return InventoryRegistry(settings)
+
+
+@lru_cache
+def get_history_backend() -> HistoryBackendClient:
+    settings = get_settings()
+    configure_logging(settings)
+    return HistoryBackendClient(settings.history)
 
 
 def create_app() -> FastAPI:
@@ -67,6 +75,7 @@ def create_app() -> FastAPI:
                 "snapshot": snapshot,
                 "settings": settings,
                 "initial_snapshot_json": json.dumps(snapshot.model_dump(mode="json")),
+                "history_configured": bool(settings.history.service_url),
             },
         )
 
@@ -201,6 +210,22 @@ def create_app() -> FastAPI:
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return SmartBatchResponse(summaries=summaries)
+
+    @app.get("/api/history/status")
+    async def get_history_status() -> JSONResponse:
+        history_backend = get_history_backend()
+        return JSONResponse(await history_backend.get_status())
+
+    @app.get("/api/slots/{slot}/history")
+    async def get_slot_history(
+        slot: int,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> JSONResponse:
+        ensure_slot_bounds(settings, slot)
+        history_backend = get_history_backend()
+        payload = await history_backend.get_slot_history(slot, system_id, enclosure_id)
+        return JSONResponse(payload)
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:

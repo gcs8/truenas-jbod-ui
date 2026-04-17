@@ -5,6 +5,26 @@
 Release-prep notes for the next tagged cut land here until they are moved into
 the final section below.
 
+### Added
+
+- Optional Docker Compose `history` sidecar profile that can poll the main UI
+  API and persist lightweight slot history in SQLite without changing the core
+  single-container deployment path
+- First-pass history service with a tiny status page plus JSON endpoints for
+  per-slot change events and limited SMART metric samples
+- Main-UI slot-detail `History` button and inline history cards so the optional
+  sidecar can be used through the existing `:8080` app without exposing another
+  desktop-facing port
+- Rotating history database snapshots and broken-database quarantine so the
+  optional collector has a safer recovery path than a single live SQLite file
+
+### Changed
+
+- Main-UI timestamps now render with explicit browser-local timezone labeling
+  instead of leaving operators to infer whether they are looking at UTC
+- Slot history now opens in its own wide drawer under the enclosure instead of
+  stretching the right-hand detail rail
+
 ## v0.7.0 - 2026-04-16
 
 Layout and topology release that tightens the profile-driven enclosure system,
