@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from history_service.collector import HistoryCollector
+from history_service.collector import HistoryCollector, ScopeSnapshot
 from history_service.config import HistorySettings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events
 from history_service.store import HistoryStore
@@ -487,3 +488,203 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.topology_label, "tank > raidz2-0 > data")
         self.assertEqual(loaded.multipath_state, "OPTIMAL")
+
+    def test_run_once_skips_degraded_api_snapshot_without_event_noise(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        baseline = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=30,
+            slot_label="30",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="multipath/disk36",
+            serial="3FJ0NN6T",
+            model="WDC WUH721818AL5204",
+            gptid="gptid/8fadc7eb-fe53-11ec-b425-0cc47a8ff400",
+            pool_name="The-Repository",
+            vdev_name="raidz2-2",
+            health="ONLINE",
+            topology_label="The-Repository > raidz2-2 > data",
+            multipath_device="multipath/disk36",
+            multipath_mode="Active/Active",
+            multipath_state="DEGRADED",
+            multipath_lunid="5000cca2c271f220",
+            multipath_primary_path="da71",
+            multipath_alternate_path="da24",
+            multipath_active_paths="da71",
+            multipath_failed_paths="da24",
+            multipath_active_controllers="mpr1",
+            multipath_failed_controllers="mpr0",
+        )
+        degraded_snapshot = {
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+            "selected_system_platform": "core",
+            "sources": {
+                "api": {
+                    "enabled": True,
+                    "ok": False,
+                    "message": "timed out during opening handshake",
+                },
+                "ssh": {
+                    "enabled": True,
+                    "ok": True,
+                    "message": "SSH probe completed.",
+                },
+            },
+            "slots": [
+                {
+                    "slot": 30,
+                    "slot_label": "30",
+                    "enclosure_id": "enc-a",
+                    "enclosure_label": "Front Shelf",
+                    "present": True,
+                    "state": "unknown",
+                    "identify_active": False,
+                    "device_name": "da24",
+                    "serial": "3FJ0NN6T",
+                    "model": "WDC WUH721818AL5204",
+                    "gptid": None,
+                    "pool_name": None,
+                    "vdev_name": None,
+                    "health": "OK (0x01 0x00 0x00 0x00)",
+                }
+            ],
+        }
+
+        store.upsert_slot_state(baseline, "2026-04-17T05:52:26+00:00")
+
+        async def enumerate_scopes() -> list[ScopeSnapshot]:
+            return [
+                ScopeSnapshot(
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    snapshot=degraded_snapshot,
+                )
+            ]
+
+        collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once())
+
+        events = store.list_slot_events("archive-core", "enc-a", 30)
+        loaded = store.get_slot_state("archive-core", "enc-a", 30)
+
+        self.assertEqual(events, [])
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.device_name, "multipath/disk36")
+        self.assertEqual(loaded.gptid, "gptid/8fadc7eb-fe53-11ec-b425-0cc47a8ff400")
+        self.assertEqual(loaded.pool_name, "The-Repository")
+        self.assertEqual(loaded.multipath_state, "DEGRADED")
+
+    def test_run_once_skips_quantastor_snapshot_with_incomplete_topology(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        baseline = SlotStateRecord(
+            system_id="qs-cryostorage",
+            system_label="QS CryoStorage",
+            enclosure_key="node-a",
+            enclosure_id="node-a",
+            enclosure_label="QSOSN-Right",
+            slot=0,
+            slot_label="00",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="disk/by-id/scsi-SAMSUNG_MZILT3T8HALS0D3_S40BNF0M603885",
+            serial="S40BNF0M603885",
+            model="SAMSUNG MZILT3T8HALS0D3",
+            gptid="scsi-SAMSUNG_MZILT3T8HALS0D3_S40BNF0M603885",
+            pool_name="HA-Pool-R10",
+            vdev_name="mirror-0",
+            health="ONLINE",
+            topology_label="HA-Pool-R10 > mirror-0 > data (Active on QSOSN-Right)",
+        )
+        incomplete_snapshot = {
+            "selected_system_id": "qs-cryostorage",
+            "selected_system_label": "QS CryoStorage",
+            "selected_system_platform": "quantastor",
+            "platform_context": {
+                "topology_complete": False,
+            },
+            "sources": {
+                "api": {
+                    "enabled": True,
+                    "ok": True,
+                    "message": "Quantastor API reachable.",
+                },
+                "ssh": {
+                    "enabled": True,
+                    "ok": True,
+                    "message": "SSH probe completed.",
+                },
+            },
+            "slots": [
+                {
+                    "slot": 0,
+                    "slot_label": "00",
+                    "enclosure_id": "node-a",
+                    "enclosure_label": "QSOSN-Right",
+                    "present": True,
+                    "state": "healthy",
+                    "identify_active": False,
+                    "device_name": "disk/by-id/scsi-SAMSUNG_MZILT3T8HALS0D3_S40BNF0M603885",
+                    "serial": "S40BNF0M603885",
+                    "model": "SAMSUNG MZILT3T8HALS0D3",
+                    "gptid": "scsi-SAMSUNG_MZILT3T8HALS0D3_S40BNF0M603885",
+                    "pool_name": "HA-Pool-R10",
+                    "vdev_name": "disk",
+                    "health": "ONLINE",
+                    "topology_label": "HA-Pool-R10 > disk > data (Active on QSOSN-Right)",
+                }
+            ],
+        }
+
+        store.upsert_slot_state(baseline, "2026-04-17T03:20:00+00:00")
+
+        async def enumerate_scopes() -> list[ScopeSnapshot]:
+            return [
+                ScopeSnapshot(
+                    system_id="qs-cryostorage",
+                    system_label="QS CryoStorage",
+                    enclosure_id="node-a",
+                    enclosure_label="QSOSN-Right",
+                    snapshot=incomplete_snapshot,
+                )
+            ]
+
+        collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once())
+
+        events = store.list_slot_events("qs-cryostorage", "node-a", 0)
+        loaded = store.get_slot_state("qs-cryostorage", "node-a", 0)
+
+        self.assertEqual(events, [])
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.vdev_name, "mirror-0")
+        self.assertEqual(loaded.topology_label, "HA-Pool-R10 > mirror-0 > data (Active on QSOSN-Right)")

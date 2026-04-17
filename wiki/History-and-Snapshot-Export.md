@@ -43,7 +43,7 @@ place.
 Once the sidecar is healthy, pick a populated slot and use the `History`
 button in Slot Details.
 
-![Live slot history drawer](images/history-drawer-v0.8.0.png)
+![Live slot history drawer](images/history-drawer-v0.9.0.png)
 
 Things to notice:
 
@@ -56,7 +56,7 @@ Things to notice:
 
 Use `Export Snapshot` from the main toolbar.
 
-![Snapshot export dialog with live estimate](images/snapshot-export-dialog-v0.8.0.png)
+![Snapshot export dialog with live estimate](images/snapshot-export-dialog-v0.9.0.png)
 
 Things to notice:
 
@@ -73,7 +73,7 @@ History drawer first, then open the export dialog.
 The export produces a self-contained HTML file that opens locally without
 access to the live app.
 
-![Frozen offline enclosure snapshot](images/offline-snapshot-v0.8.0.png)
+![Frozen offline enclosure snapshot](images/offline-snapshot-v0.9.0.png)
 
 Things to notice:
 

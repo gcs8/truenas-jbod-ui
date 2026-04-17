@@ -28,6 +28,7 @@ from app.models.domain import (
     SourceStatus,
     SystemOption,
 )
+from app.perf import add_perf_metadata, perf_stage
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import (
     ProfileRegistry,
@@ -59,6 +60,7 @@ from app.services.parsers import (
     shift_hex_identifier,
 )
 from app.services.ssh_probe import SSHProbe
+from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebsocketClient
 
 logger = logging.getLogger(__name__)
@@ -67,14 +69,54 @@ UNIFI_GPIO_LED_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 }
+STABLE_SLOT_DETAIL_FIELDS = (
+    "device_name",
+    "smart_device_names",
+    "serial",
+    "model",
+    "size_bytes",
+    "size_human",
+    "gptid",
+    "persistent_id_label",
+    "multipath",
+    "logical_block_size",
+    "physical_block_size",
+    "logical_unit_id",
+    "sas_address",
+    "enclosure_id",
+    "enclosure_label",
+    "enclosure_name",
+    "enclosure_identifier",
+    "mapping_source",
+    "notes",
+    "operator_context",
+)
+STABLE_SMART_DETAIL_FIELDS = (
+    "logical_block_size",
+    "physical_block_size",
+    "power_on_hours",
+    "power_on_days",
+    "rotation_rate_rpm",
+    "form_factor",
+    "firmware_version",
+    "protocol_version",
+    "read_cache_enabled",
+    "writeback_cache_enabled",
+    "trim_supported",
+    "transport_protocol",
+    "logical_unit_id",
+    "sas_address",
+    "attached_sas_address",
+    "negotiated_link_rate",
+)
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def build_layout_rows(rows: int, columns: int, slot_count: int) -> list[list[int]]:
-    layout_rows: list[list[int]] = []
+def build_layout_rows(rows: int, columns: int, slot_count: int) -> list[list[int | None]]:
+    layout_rows: list[list[int | None]] = []
     for row_index in reversed(range(rows)):
         start = row_index * columns
         row_slots = [slot for slot in range(start, start + columns) if slot < slot_count]
@@ -83,9 +125,23 @@ def build_layout_rows(rows: int, columns: int, slot_count: int) -> list[list[int
     return layout_rows
 
 
-def infer_slot_count_from_layout(layout_rows: list[list[int]], fallback: int | None = None) -> int:
-    if layout_rows:
-        return max(slot for row in layout_rows for slot in row) + 1
+def copy_layout_rows(layout_rows: list[list[int | None]] | None) -> list[list[int | None]]:
+    return [list(row) for row in layout_rows or []]
+
+
+def layout_slot_positions(layout_rows: list[list[int | None]]) -> dict[int, tuple[int, int]]:
+    return {
+        slot_number: (row_index, column_index)
+        for row_index, row in enumerate(layout_rows)
+        for column_index, slot_number in enumerate(row)
+        if slot_number is not None
+    }
+
+
+def infer_slot_count_from_layout(layout_rows: list[list[int | None]], fallback: int | None = None) -> int:
+    slots = [slot for row in layout_rows for slot in row if slot is not None]
+    if slots:
+        return max(slots) + 1
     return fallback or 0
 
 
@@ -177,6 +233,16 @@ class DiskRecord:
     lookup_keys: set[str]
 
 
+@dataclass(slots=True)
+class InventorySourceBundle:
+    raw_data: TrueNASRawData
+    ssh_outputs: dict[str, str]
+    ssh_collected: bool
+    warnings: list[str]
+    sources: dict[str, SourceStatus]
+    quantastor_ses_data: ParsedSSHData
+
+
 class InventoryService:
     def __init__(
         self,
@@ -186,6 +252,7 @@ class InventoryService:
         ssh_probe: SSHProbe,
         mapping_store: MappingStore,
         profile_registry: ProfileRegistry,
+        slot_detail_store: SlotDetailStore | None = None,
     ) -> None:
         self.settings = settings
         self.system = system
@@ -193,38 +260,519 @@ class InventoryService:
         self.ssh_probe = ssh_probe
         self.mapping_store = mapping_store
         self.profile_registry = profile_registry
+        self.slot_detail_store = slot_detail_store
         self._cache: dict[str, InventorySnapshot] = {}
         self._cache_until: dict[str, datetime] = {}
         self._smart_cache: dict[str, SmartSummaryView] = {}
         self._smart_cache_until: dict[str, datetime] = {}
+        self._source_bundle: InventorySourceBundle | None = None
+        self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
+        self._snapshot_locks: dict[str, asyncio.Lock] = {}
+        self._source_bundle_lock = asyncio.Lock()
+        self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
+        self._smart_refresh_tasks: dict[str, asyncio.Task[None]] = {}
+        self._background_smart_refresh_semaphore = asyncio.Semaphore(
+            max(1, self.settings.app.smart_batch_max_concurrency)
+        )
         self._quantastor_preferred_ses_host: str | None = None
-        self._lock = asyncio.Lock()
 
     async def get_snapshot(
         self,
         force_refresh: bool = False,
         selected_enclosure_id: str | None = None,
+        allow_stale_cache: bool = False,
     ) -> InventorySnapshot:
-        async with self._lock:
-            now = utcnow()
-            cache_key = selected_enclosure_id or "__default__"
+        cache_key = selected_enclosure_id or "__default__"
+        cached = self._cache.get(cache_key)
+        cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
+        now = utcnow()
+        if not force_refresh and cached and now < cache_until:
+            add_perf_metadata(snapshot_cache="hit", snapshot_cache_key=cache_key)
+            return cached
+        if not force_refresh and allow_stale_cache and cached:
+            add_perf_metadata(snapshot_cache="stale-hit", snapshot_cache_key=cache_key)
+            self._schedule_background_snapshot_refresh(cache_key, selected_enclosure_id)
+            return cached
+
+        async with self._get_snapshot_lock(cache_key):
             cached = self._cache.get(cache_key)
             cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
+            now = utcnow()
             if not force_refresh and cached and now < cache_until:
+                add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
                 return cached
 
-            snapshot = await self._build_snapshot(selected_enclosure_id=selected_enclosure_id)
+            add_perf_metadata(
+                snapshot_cache="forced-refresh" if force_refresh else "miss",
+                snapshot_cache_key=cache_key,
+                system_id=self.system.id,
+                platform=self.system.truenas.platform,
+            )
+            with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=selected_enclosure_id):
+                snapshot = await self._build_snapshot(
+                    selected_enclosure_id=selected_enclosure_id,
+                    force_source_refresh=force_refresh,
+                )
+            if not self._snapshot_has_trusted_topology(snapshot):
+                add_perf_metadata(snapshot_topology="untrusted", snapshot_cache_key=cache_key)
+                if cached and self._snapshot_has_trusted_topology(cached):
+                    logger.warning(
+                        "Preserving previously trusted snapshot for %s because the refreshed topology is incomplete.",
+                        cache_key,
+                    )
+                    return cached
+                return snapshot
             self._cache[cache_key] = snapshot
-            self._cache_until[cache_key] = now + timedelta(seconds=self.settings.app.cache_ttl_seconds)
+            self._cache_until[cache_key] = utcnow() + timedelta(seconds=self.settings.app.cache_ttl_seconds)
             return snapshot
+
+    def invalidate_snapshot_cache(self, *, reason: str, invalidate_source_bundle: bool = False) -> None:
+        self._cache.clear()
+        self._cache_until.clear()
+        if invalidate_source_bundle:
+            self._source_bundle = None
+            self._source_bundle_until = datetime.min.replace(tzinfo=timezone.utc)
+        add_perf_metadata(snapshot_cache_invalidated=reason)
+
+    async def prewarm_cache(self, *, warm_smart: bool = False) -> None:
+        snapshot = await self.get_snapshot(force_refresh=True)
+        enclosure_ids: list[str | None] = [None]
+        seen_enclosures: set[str] = set()
+        for enclosure in snapshot.enclosures:
+            if not enclosure.id or enclosure.id in seen_enclosures:
+                continue
+            seen_enclosures.add(enclosure.id)
+            enclosure_ids.append(enclosure.id)
+
+        for enclosure_id in enclosure_ids:
+            warmed_snapshot = await self.get_snapshot(
+                selected_enclosure_id=enclosure_id,
+            )
+            if warm_smart and warmed_snapshot.slots:
+                await self.get_slot_smart_summaries(
+                    [slot.slot for slot in warmed_snapshot.slots],
+                    selected_enclosure_id=enclosure_id,
+                )
+
+    async def _get_inventory_source_bundle(self, *, force_refresh: bool = False) -> InventorySourceBundle:
+        now = utcnow()
+        if not force_refresh and self._source_bundle is not None and now < self._source_bundle_until:
+            add_perf_metadata(inventory_source_cache="hit", system_id=self.system.id)
+            return self._source_bundle
+
+        async with self._source_bundle_lock:
+            now = utcnow()
+            if not force_refresh and self._source_bundle is not None and now < self._source_bundle_until:
+                add_perf_metadata(inventory_source_cache="hit-after-wait", system_id=self.system.id)
+                return self._source_bundle
+
+            add_perf_metadata(
+                inventory_source_cache="forced-refresh" if force_refresh else "miss",
+                system_id=self.system.id,
+                platform=self.system.truenas.platform,
+            )
+            bundle = await self._collect_inventory_source_bundle()
+            self._source_bundle = bundle
+            self._source_bundle_until = utcnow() + timedelta(seconds=self.settings.app.cache_ttl_seconds)
+            return bundle
+
+    def _get_snapshot_lock(self, cache_key: str) -> asyncio.Lock:
+        lock = self._snapshot_locks.get(cache_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._snapshot_locks[cache_key] = lock
+        return lock
+
+    async def _collect_inventory_source_bundle(self) -> InventorySourceBundle:
+        warnings: list[str] = []
+        api_enabled = self.system.truenas.platform != "linux"
+        api_label = "Quantastor API" if self.system.truenas.platform == "quantastor" else "TrueNAS API"
+        sources = {
+            "api": SourceStatus(
+                enabled=api_enabled,
+                ok=not api_enabled,
+                message=f"{api_label} disabled for this SSH-only Linux system." if not api_enabled else None,
+            ),
+            "ssh": SourceStatus(enabled=self.system.ssh.enabled, ok=not self.system.ssh.enabled, message=None),
+        }
+
+        raw_data = TrueNASRawData(
+            enclosures=[],
+            disks=[],
+            pools=[],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+        ssh_outputs: dict[str, str] = {}
+        ssh_collected = False
+        ssh_failures: list[str] = []
+        quantastor_cli_loaded = False
+        quantastor_cli_failures: list[str] = []
+        quantastor_ses_loaded = False
+        quantastor_ses_data = ParsedSSHData()
+        quantastor_ses_failures: list[str] = []
+
+        async def load_api_data() -> TrueNASRawData | None:
+            if not api_enabled:
+                return None
+            with perf_stage("inventory.api.fetch_all", platform=self.system.truenas.platform):
+                return await self.truenas_client.fetch_all()
+
+        async def load_ssh_payload() -> tuple[dict[str, str], bool, list[str], SourceStatus]:
+            with perf_stage("inventory.ssh.run_commands"):
+                command_results = await self.ssh_probe.run_commands()
+                if self._should_probe_unifi_gpio_debug(command_results):
+                    command_results.append(await self.ssh_probe.run_command("cat /sys/kernel/debug/gpio"))
+            outputs = {item.command: item.stdout for item in command_results if item.ok}
+            failures = [item for item in command_results if not item.ok]
+            failure_messages = [
+                f"SSH command failed: {failure.command} (exit {failure.exit_code})"
+                for failure in failures
+            ]
+            return (
+                outputs,
+                True,
+                failure_messages,
+                SourceStatus(
+                    enabled=True,
+                    ok=not failures,
+                    message="SSH probe completed." if not failures else "Some SSH commands failed.",
+                ),
+            )
+
+        api_task = asyncio.create_task(load_api_data()) if api_enabled else None
+        ssh_task = asyncio.create_task(load_ssh_payload()) if self.system.ssh.enabled else None
+
+        if api_task is not None:
+            try:
+                api_result = await api_task
+            except Exception as exc:
+                logger.exception("Failed to fetch platform API data")
+                sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
+                warnings.append(f"{api_label} is unreachable. Slot details may be partial or unavailable.")
+            else:
+                if api_result is not None:
+                    raw_data = api_result
+                sources["api"] = SourceStatus(enabled=True, ok=True, message=f"{api_label} reachable.")
+
+        if ssh_task is not None:
+            try:
+                ssh_outputs, ssh_collected, ssh_failures, ssh_status = await ssh_task
+            except Exception as exc:
+                logger.exception("Failed to collect SSH diagnostics")
+                sources["ssh"] = SourceStatus(enabled=True, ok=False, message=str(exc))
+                warnings.append("SSH mode is enabled but could not collect fallback command output.")
+            else:
+                sources["ssh"] = ssh_status
+                warnings.extend(ssh_failures)
+
+        if self.system.truenas.platform == "quantastor" and ssh_collected:
+            try:
+                with perf_stage("inventory.quantastor.fetch_ses_overlay"):
+                    quantastor_ses_data, quantastor_ses_failures = await self._fetch_quantastor_ses_overlay()
+            except Exception:
+                logger.exception("Failed to collect Quantastor SES diagnostics")
+                quantastor_ses_failures.append(
+                    "Quantastor SSH SES enrichment failed unexpectedly. REST and CLI slot truth is still being used."
+                )
+            else:
+                quantastor_ses_loaded = bool(quantastor_ses_data.ses_enclosures)
+                warnings.extend(quantastor_ses_failures)
+
+            try:
+                with perf_stage("inventory.quantastor.fetch_cli_overlay"):
+                    quantastor_cli_overlay, quantastor_cli_failures = await self._fetch_quantastor_cli_overlay()
+            except Exception:
+                logger.exception("Failed to collect Quantastor CLI diagnostics")
+                quantastor_cli_failures.append(
+                    "Quantastor SSH CLI enrichment failed unexpectedly. REST data is still being used."
+                )
+            else:
+                raw_data.cli_disks = quantastor_cli_overlay.get("cli_disks", [])
+                raw_data.cli_hw_disks = quantastor_cli_overlay.get("cli_hw_disks", [])
+                raw_data.cli_hw_enclosures = quantastor_cli_overlay.get("cli_hw_enclosures", [])
+                quantastor_cli_loaded = any(
+                    (
+                        raw_data.cli_disks,
+                        raw_data.cli_hw_disks,
+                        raw_data.cli_hw_enclosures,
+                    )
+                )
+                warnings.extend(quantastor_cli_failures)
+
+            if quantastor_cli_loaded:
+                sources["ssh"] = SourceStatus(
+                    enabled=True,
+                    ok=not ssh_failures and not quantastor_cli_failures and not quantastor_ses_failures,
+                    message=(
+                        "SSH probe, Quantastor CLI enrichment, and SES overlay completed."
+                        if quantastor_ses_loaded and not ssh_failures and not quantastor_cli_failures and not quantastor_ses_failures
+                        else "SSH probe and Quantastor CLI enrichment completed."
+                        if not ssh_failures and not quantastor_cli_failures and not quantastor_ses_failures
+                        else "Quantastor CLI/SES enrichment completed with some failures."
+                    ),
+                )
+            elif quantastor_ses_loaded:
+                sources["ssh"] = SourceStatus(
+                    enabled=True,
+                    ok=not ssh_failures and not quantastor_ses_failures,
+                    message=(
+                        "SSH probe and Quantastor SES overlay completed."
+                        if not ssh_failures and not quantastor_ses_failures
+                        else "Quantastor SES overlay completed with some failures."
+                    ),
+                )
+
+        return InventorySourceBundle(
+            raw_data=raw_data,
+            ssh_outputs=ssh_outputs,
+            ssh_collected=ssh_collected,
+            warnings=warnings,
+            sources=sources,
+            quantastor_ses_data=quantastor_ses_data,
+        )
+
+    def _schedule_background_snapshot_refresh(self, cache_key: str, selected_enclosure_id: str | None) -> None:
+        existing = self._snapshot_refresh_tasks.get(cache_key)
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(self._background_snapshot_refresh(cache_key, selected_enclosure_id))
+        self._snapshot_refresh_tasks[cache_key] = task
+
+        def _cleanup(completed: asyncio.Task[None], *, key: str = cache_key) -> None:
+            if self._snapshot_refresh_tasks.get(key) is completed:
+                self._snapshot_refresh_tasks.pop(key, None)
+            if completed.cancelled():
+                return
+            exc = completed.exception()
+            if exc is not None:
+                logger.warning("Background snapshot refresh failed for %s: %s", key, exc)
+
+        task.add_done_callback(_cleanup)
+
+    async def _background_snapshot_refresh(self, cache_key: str, selected_enclosure_id: str | None) -> None:
+        try:
+            await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
+        except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
+            logger.exception("Background snapshot refresh failed for %s", cache_key)
+
+    @staticmethod
+    def _snapshot_has_trusted_topology(snapshot: InventorySnapshot) -> bool:
+        if (snapshot.selected_system_platform or "").lower() != "quantastor":
+            return True
+        return snapshot.platform_context.get("topology_complete") is not False
+
+    def _schedule_background_smart_refresh(self, cache_key: str, slot_view: SlotView) -> None:
+        existing = self._smart_refresh_tasks.get(cache_key)
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(self._background_refresh_smart_summary(cache_key, slot_view.model_copy(deep=True)))
+        self._smart_refresh_tasks[cache_key] = task
+
+        def _cleanup(completed: asyncio.Task[None], *, key: str = cache_key) -> None:
+            if self._smart_refresh_tasks.get(key) is completed:
+                self._smart_refresh_tasks.pop(key, None)
+            if completed.cancelled():
+                return
+            exc = completed.exception()
+            if exc is not None:
+                logger.warning("Background SMART refresh failed for %s: %s", key, exc)
+
+        task.add_done_callback(_cleanup)
+
+    async def _background_refresh_smart_summary(self, cache_key: str, slot_view: SlotView) -> None:
+        try:
+            async with self._background_smart_refresh_semaphore:
+                await self._get_slot_smart_summary_for_slot_view(slot_view, allow_stale_cache=False)
+        except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
+            logger.exception("Background SMART refresh failed for %s", cache_key)
+
+    def _apply_persisted_slot_details(self, slots: list[SlotView]) -> None:
+        if not self.slot_detail_store:
+            return
+
+        for slot_view in slots:
+            entry = self.slot_detail_store.get_entry(self.system.id, slot_view.enclosure_id, slot_view.slot)
+            if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
+                continue
+
+            for field_name in STABLE_SLOT_DETAIL_FIELDS:
+                cached_value = entry.slot_fields.get(field_name)
+                if cached_value is None:
+                    continue
+                current_value = getattr(slot_view, field_name)
+                if not self._slot_detail_field_missing(current_value):
+                    continue
+                if field_name == "multipath" and isinstance(cached_value, dict):
+                    setattr(slot_view, field_name, MultipathView.model_validate(cached_value))
+                else:
+                    setattr(slot_view, field_name, cached_value)
+
+            slot_view.search_text = " ".join(
+                filter(
+                    None,
+                    [
+                        slot_view.search_text,
+                        slot_view.device_name or "",
+                        slot_view.serial or "",
+                        slot_view.model or "",
+                        slot_view.gptid or "",
+                        slot_view.pool_name or "",
+                        slot_view.vdev_name or "",
+                        slot_view.vdev_class or "",
+                    ],
+                )
+            ).lower()
+
+    def _persist_slot_details(self, slots: list[SlotView]) -> None:
+        self._persist_slot_detail_entries((self._build_slot_detail_entry(slot_view, smart_summary=None) for slot_view in slots))
+
+    def _persist_slot_detail_cache(
+        self,
+        slot_view: SlotView,
+        *,
+        smart_summary: SmartSummaryView | None,
+    ) -> None:
+        self._persist_slot_detail_entries([self._build_slot_detail_entry(slot_view, smart_summary=smart_summary)])
+
+    def _persist_slot_detail_entries(self, entries: Any) -> None:
+        if not self.slot_detail_store:
+            return
+
+        normalized_entries = [entry for entry in entries if entry is not None]
+        if not normalized_entries:
+            return
+        self.slot_detail_store.save_entries(normalized_entries)
+
+    def _build_persisted_smart_summary(self, slot_view: SlotView) -> SmartSummaryView | None:
+        if not self.slot_detail_store:
+            return None
+        entry = self.slot_detail_store.get_entry(self.system.id, slot_view.enclosure_id, slot_view.slot)
+        if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
+            return None
+        if not entry.smart_fields:
+            return None
+        return self._merge_smart_summary(
+            slot_view,
+            SmartSummaryView.model_validate(entry.smart_fields),
+        )
+
+    def _merge_cached_smart_summary(
+        self,
+        slot_view: SlotView,
+        fallback: SmartSummaryView,
+    ) -> SmartSummaryView | None:
+        cached = self._build_persisted_smart_summary(slot_view)
+        if cached is None:
+            return None
+        return self._merge_missing_smart_fields(fallback, cached)
+
+    def _build_slot_detail_entry(
+        self,
+        slot_view: SlotView,
+        *,
+        smart_summary: SmartSummaryView | None,
+    ) -> SlotDetailCacheEntry | None:
+        identifiers = sorted(self._slot_detail_identifiers(slot_view))
+        if not identifiers:
+            return None
+
+        slot_fields: dict[str, Any] = {}
+        for field_name in STABLE_SLOT_DETAIL_FIELDS:
+            value = getattr(slot_view, field_name)
+            if self._slot_detail_field_missing(value):
+                continue
+            if field_name == "multipath" and isinstance(value, MultipathView):
+                slot_fields[field_name] = value.model_dump(mode="json")
+            else:
+                slot_fields[field_name] = value
+
+        smart_fields: dict[str, Any] = {}
+        if smart_summary is not None:
+            for field_name in STABLE_SMART_DETAIL_FIELDS:
+                value = getattr(smart_summary, field_name)
+                if self._slot_detail_field_missing(value):
+                    continue
+                smart_fields[field_name] = value
+            if smart_fields:
+                smart_fields["available"] = smart_summary.available
+
+        if not slot_fields and not smart_fields:
+            return None
+
+        return SlotDetailCacheEntry(
+            system_id=self.system.id,
+            enclosure_id=slot_view.enclosure_id,
+            slot=slot_view.slot,
+            identifiers=identifiers,
+            slot_fields=slot_fields,
+            smart_fields=smart_fields,
+        )
+
+    def _slot_detail_entry_matches(self, slot_view: SlotView, entry: SlotDetailCacheEntry) -> bool:
+        if slot_view.state == SlotState.empty or not slot_view.present:
+            return False
+        current_identifiers = self._slot_detail_identifiers(slot_view)
+        if not current_identifiers:
+            return False
+        return bool(current_identifiers.intersection({item.lower() for item in entry.identifiers}))
+
+    def _slot_detail_identifiers(self, slot_view: SlotView) -> set[str]:
+        identifiers: set[str] = set()
+        for value in (
+            slot_view.device_name,
+            slot_view.serial,
+            slot_view.gptid,
+            slot_view.logical_unit_id,
+            slot_view.sas_address,
+            slot_view.enclosure_identifier,
+            *slot_view.smart_device_names,
+        ):
+            identifiers.update(normalize_lookup_keys(str(value) if value is not None else None))
+
+        if slot_view.multipath:
+            for value in (
+                slot_view.multipath.name,
+                slot_view.multipath.device_name,
+                slot_view.multipath.path_device_name,
+                slot_view.multipath.alternate_path_device,
+                *(member.device_name for member in slot_view.multipath.members),
+            ):
+                identifiers.update(normalize_lookup_keys(str(value) if value is not None else None))
+
+        raw_status = slot_view.raw_status if isinstance(slot_view.raw_status, dict) else {}
+        device_names = raw_status.get("device_names") if isinstance(raw_status.get("device_names"), list) else []
+        for value in (
+            raw_status.get("device_hint"),
+            raw_status.get("gptid_hint"),
+            raw_status.get("sas_address_hint"),
+            *device_names,
+        ):
+            identifiers.update(normalize_lookup_keys(str(value) if value is not None else None))
+
+        return {item.lower() for item in identifiers if item}
+
+    @staticmethod
+    def _slot_detail_field_missing(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        if isinstance(value, (list, dict)):
+            return len(value) == 0
+        return False
 
     async def set_slot_led(
         self,
         slot: int,
         action: LedAction,
         selected_enclosure_id: str | None = None,
+        *,
+        invalidate_snapshot: bool = True,
     ) -> None:
-        snapshot = await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
+        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         if not slot_view:
             raise TrueNASAPIError(f"Slot {slot:02d} is not present in the current snapshot.")
@@ -252,16 +800,18 @@ class InventoryService:
                 slot_view.led_reason
                 or f"LED backend {slot_view.led_backend!r} is not supported for slot {slot:02d}."
             )
-
-        await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
+        if invalidate_snapshot:
+            self.invalidate_snapshot_cache(reason="set_slot_led", invalidate_source_bundle=True)
 
     async def save_mapping(
         self,
         slot: int,
         payload: dict[str, Any],
         selected_enclosure_id: str | None = None,
+        *,
+        invalidate_snapshot: bool = True,
     ) -> ManualMapping:
-        snapshot = await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
+        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         enclosure_id = slot_view.enclosure_id if slot_view else None
         mapping = ManualMapping(
@@ -271,27 +821,52 @@ class InventoryService:
             **payload,
         )
         saved = self.mapping_store.save_mapping(mapping)
-        await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
+        if invalidate_snapshot:
+            self.invalidate_snapshot_cache(reason="save_mapping")
         return saved
 
-    async def clear_mapping(self, slot: int, selected_enclosure_id: str | None = None) -> bool:
-        snapshot = await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
+    async def clear_mapping(
+        self,
+        slot: int,
+        selected_enclosure_id: str | None = None,
+        *,
+        invalidate_snapshot: bool = True,
+    ) -> bool:
+        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         enclosure_id = slot_view.enclosure_id if slot_view else None
         cleared = self.mapping_store.clear_mapping(self.system.id, enclosure_id, slot)
-        await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
+        if cleared and invalidate_snapshot:
+            self.invalidate_snapshot_cache(reason="clear_mapping")
         return cleared
 
     async def get_slot_smart_summary(
         self,
         slot: int,
         selected_enclosure_id: str | None = None,
+        *,
+        allow_stale_cache: bool = False,
     ) -> SmartSummaryView:
-        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
-        slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
-        if not slot_view:
-            raise TrueNASAPIError(f"Slot {slot:02d} is not present in the current snapshot.")
+        with perf_stage("smart.summary.total", slot=slot, platform=self.system.truenas.platform):
+            snapshot = await self.get_snapshot(
+                selected_enclosure_id=selected_enclosure_id,
+                allow_stale_cache=allow_stale_cache,
+            )
+            slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
+            if not slot_view:
+                raise TrueNASAPIError(f"Slot {slot:02d} is not present in the current snapshot.")
+            return await self._get_slot_smart_summary_for_slot_view(
+                slot_view,
+                allow_stale_cache=allow_stale_cache,
+            )
 
+    async def _get_slot_smart_summary_for_slot_view(
+        self,
+        slot_view: SlotView,
+        *,
+        allow_stale_cache: bool = False,
+    ) -> SmartSummaryView:
+        slot = slot_view.slot
         if self.system.truenas.platform == "quantastor":
             summary = self._merge_smart_summary(slot_view, self._build_quantastor_smart_summary(slot_view))
             candidates = self._smart_candidate_devices(slot_view)
@@ -307,30 +882,48 @@ class InventoryService:
                     )
             self._smart_cache[f"{self.system.id}|quantastor|{slot}"] = summary
             self._smart_cache_until[f"{self.system.id}|quantastor|{slot}"] = utcnow() + timedelta(minutes=5)
+            self._persist_slot_detail_cache(slot_view, smart_summary=summary)
             return summary
 
         candidates = self._smart_candidate_devices(slot_view)
         if not candidates:
-            return self._fallback_smart_summary(
+            fallback = self._fallback_smart_summary(
                 slot_view,
                 "No SMART-capable device path is available for this slot.",
             )
+            cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+            return cached_fallback or fallback
 
         cache_key = f"{self.system.id}|{'|'.join(candidates)}"
         cache_until = self._smart_cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
         cached = self._smart_cache.get(cache_key)
         if cached and utcnow() < cache_until:
+            add_perf_metadata(smart_cache="hit")
+            return cached
+        if cached and allow_stale_cache:
+            add_perf_metadata(smart_cache="stale-hit")
+            self._schedule_background_smart_refresh(cache_key, slot_view)
             return cached
 
+        persisted = self._build_persisted_smart_summary(slot_view)
+        if persisted is not None and allow_stale_cache:
+            add_perf_metadata(smart_cache="persistent-hit")
+            self._smart_cache[cache_key] = persisted
+            self._smart_cache_until[cache_key] = utcnow()
+            self._schedule_background_smart_refresh(cache_key, slot_view)
+            return persisted
+
+        add_perf_metadata(smart_cache="miss", smart_candidate_count=len(candidates))
         if self.system.truenas.platform in {"scale", "linux"}:
             summary, error_message = await self._fetch_smart_summary_over_ssh(candidates)
             if summary is not None:
                 summary = self._merge_smart_summary(slot_view, summary)
                 self._smart_cache[cache_key] = summary
                 self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
+                self._persist_slot_detail_cache(slot_view, smart_summary=summary)
                 return summary
 
-            return self._fallback_smart_summary(
+            fallback = self._fallback_smart_summary(
                 slot_view,
                 error_message
                 or (
@@ -339,13 +932,16 @@ class InventoryService:
                     else "Detailed SMART data is not available for this Linux slot."
                 ),
             )
+            cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+            return cached_fallback or fallback
 
         last_error: str | None = None
         api_summary: SmartSummaryView | None = None
         api_candidate: str | None = None
         for candidate in candidates:
             try:
-                payload = await self.truenas_client.fetch_disk_smartctl(candidate, ["-a", "-j"])
+                with perf_stage("smart.api.fetch_json", candidate=candidate):
+                    payload = await self.truenas_client.fetch_disk_smartctl(candidate, ["-a", "-j"])
             except TrueNASAPIError as exc:
                 last_error = str(exc)
                 continue
@@ -360,7 +956,8 @@ class InventoryService:
         if api_summary is not None:
             if api_candidate and self._summary_needs_ssh_enrichment(api_summary):
                 try:
-                    enrichment_payload = await self.truenas_client.fetch_disk_smartctl(api_candidate, ["-x"])
+                    with perf_stage("smart.api.fetch_text_enrichment", candidate=api_candidate):
+                        enrichment_payload = await self.truenas_client.fetch_disk_smartctl(api_candidate, ["-x"])
                 except TrueNASAPIError as exc:
                     last_error = str(exc)
                 else:
@@ -373,6 +970,7 @@ class InventoryService:
 
             self._smart_cache[cache_key] = api_summary
             self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
+            self._persist_slot_detail_cache(slot_view, smart_summary=api_summary)
             return api_summary
 
         if self.system.ssh.enabled:
@@ -381,45 +979,58 @@ class InventoryService:
                 ssh_summary = self._merge_smart_summary(slot_view, ssh_summary)
                 self._smart_cache[cache_key] = ssh_summary
                 self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
+                self._persist_slot_detail_cache(slot_view, smart_summary=ssh_summary)
                 return ssh_summary
             if ssh_error:
                 last_error = ssh_error
 
-        return self._fallback_smart_summary(
+        fallback = self._fallback_smart_summary(
             slot_view,
             last_error or "SMART summary is unavailable for this slot.",
         )
+        cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+        return cached_fallback or fallback
 
     async def get_slot_smart_summaries(
         self,
         slots: list[int],
         selected_enclosure_id: str | None = None,
-        max_concurrency: int = 4,
+        max_concurrency: int | None = None,
+        *,
+        allow_stale_cache: bool = False,
     ) -> list[SmartBatchItem]:
-        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
-        slot_lookup = {item.slot: item for item in snapshot.slots}
-        ordered_slots: list[int] = []
-        seen_slots: set[int] = set()
-        for slot in slots:
-            if slot in seen_slots or slot not in slot_lookup:
-                continue
-            seen_slots.add(slot)
-            ordered_slots.append(slot)
+        with perf_stage("smart.batch.total", requested_slot_count=len(slots)):
+            snapshot = await self.get_snapshot(
+                selected_enclosure_id=selected_enclosure_id,
+                allow_stale_cache=allow_stale_cache,
+            )
+            slot_lookup = {item.slot: item for item in snapshot.slots}
+            ordered_slots: list[int] = []
+            seen_slots: set[int] = set()
+            for slot in slots:
+                if slot in seen_slots or slot not in slot_lookup:
+                    continue
+                seen_slots.add(slot)
+                ordered_slots.append(slot)
 
-        if not ordered_slots:
-            return []
+            if not ordered_slots:
+                return []
 
-        semaphore = asyncio.Semaphore(max(1, max_concurrency))
+            effective_concurrency = max_concurrency or self.settings.app.smart_batch_max_concurrency
+            semaphore = asyncio.Semaphore(max(1, effective_concurrency))
 
-        async def load_summary(slot: int) -> SmartBatchItem:
-            async with semaphore:
-                try:
-                    summary = await self.get_slot_smart_summary(slot, selected_enclosure_id=selected_enclosure_id)
-                except TrueNASAPIError as exc:
-                    summary = self._fallback_smart_summary(slot_lookup.get(slot), str(exc))
-                return SmartBatchItem(slot=slot, summary=summary)
+            async def load_summary(slot: int) -> SmartBatchItem:
+                async with semaphore:
+                    try:
+                        summary = await self._get_slot_smart_summary_for_slot_view(
+                            slot_lookup[slot],
+                            allow_stale_cache=allow_stale_cache,
+                        )
+                    except TrueNASAPIError as exc:
+                        summary = self._fallback_smart_summary(slot_lookup.get(slot), str(exc))
+                    return SmartBatchItem(slot=slot, summary=summary)
 
-        return await asyncio.gather(*(load_summary(slot) for slot in ordered_slots))
+            return await asyncio.gather(*(load_summary(slot) for slot in ordered_slots))
 
     async def _fetch_smart_summary_over_ssh(
         self,
@@ -437,71 +1048,72 @@ class InventoryService:
         if not host_candidates:
             host_candidates = [None]
 
-        for target_host in host_candidates:
-            for candidate in candidates:
-                device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
-                for smartctl_binary in self._smartctl_binary_candidates():
-                    command = shlex.join(
-                        [
-                            "sudo",
-                            "-n",
-                            smartctl_binary,
-                            "-x",
-                            "-j",
-                            device_path,
-                        ]
-                    )
-                    result = await self._run_ssh_command(command, target_host)
-                    summary = None
-                    if result.stdout.strip():
-                        parsed = parse_smartctl_summary(result.stdout)
-                        candidate_summary = SmartSummaryView.model_validate(parsed)
-                        # smartctl commonly returns advisory non-zero exit codes even when the
-                        # JSON payload is intact and contains useful SMART data.
-                        if candidate_summary.available or candidate_summary.message != "SMART JSON parsing failed.":
-                            summary = candidate_summary
-                    if summary is None:
-                        detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH smartctl error."
-                        last_error = (
-                            f"{target_host}:{device_path}: {detail}"
-                            if target_host
-                            else f"{device_path}: {detail}"
+        with perf_stage("smart.ssh.fetch", candidate_count=len(candidates), host_count=len(host_candidates)):
+            for target_host in host_candidates:
+                for candidate in candidates:
+                    device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
+                    for smartctl_binary in self._smartctl_binary_candidates():
+                        command = shlex.join(
+                            [
+                                "sudo",
+                                "-n",
+                                smartctl_binary,
+                                "-x",
+                                "-j",
+                                device_path,
+                            ]
                         )
-                        if "command not found" in detail.lower():
-                            continue
-                        break
+                        result = await self._run_ssh_command(command, target_host)
+                        summary = None
+                        if result.stdout.strip():
+                            parsed = parse_smartctl_summary(result.stdout)
+                            candidate_summary = SmartSummaryView.model_validate(parsed)
+                            # smartctl commonly returns advisory non-zero exit codes even when the
+                            # JSON payload is intact and contains useful SMART data.
+                            if candidate_summary.available or candidate_summary.message != "SMART JSON parsing failed.":
+                                summary = candidate_summary
+                        if summary is None:
+                            detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH smartctl error."
+                            last_error = (
+                                f"{target_host}:{device_path}: {detail}"
+                                if target_host
+                                else f"{device_path}: {detail}"
+                            )
+                            if "command not found" in detail.lower():
+                                continue
+                            break
 
-                    text_command = shlex.join(
-                        [
-                            "sudo",
-                            "-n",
-                            smartctl_binary,
-                            "-x",
-                            device_path,
-                        ]
-                    )
-                    text_result = await self._run_ssh_command(text_command, target_host)
-                    if text_result.stdout.strip():
-                        summary = self._merge_missing_smart_fields(
-                            summary,
-                            SmartSummaryView.model_validate(
-                                parse_smartctl_text_enrichment(text_result.stdout)
-                            ),
+                        text_command = shlex.join(
+                            [
+                                "sudo",
+                                "-n",
+                                smartctl_binary,
+                                "-x",
+                                device_path,
+                            ]
                         )
-                    if self.system.truenas.platform == "linux":
-                        nvme_summary = await self._fetch_linux_nvme_enrichment_over_ssh(device_path, target_host)
-                        if nvme_summary is not None:
-                            summary = self._merge_missing_smart_fields(summary, nvme_summary)
-                    if summary.available or summary.message != "SMART JSON parsing failed.":
-                        if self.system.truenas.platform == "quantastor" and target_host:
-                            self._quantastor_preferred_ses_host = target_host
-                        return summary, None
-                    last_error = (
-                        f"{target_host}:{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
-                        if target_host
-                        else f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
-                    )
-                    break
+                        text_result = await self._run_ssh_command(text_command, target_host)
+                        if text_result.stdout.strip():
+                            summary = self._merge_missing_smart_fields(
+                                summary,
+                                SmartSummaryView.model_validate(
+                                    parse_smartctl_text_enrichment(text_result.stdout)
+                                ),
+                            )
+                        if self.system.truenas.platform == "linux":
+                            nvme_summary = await self._fetch_linux_nvme_enrichment_over_ssh(device_path, target_host)
+                            if nvme_summary is not None:
+                                summary = self._merge_missing_smart_fields(summary, nvme_summary)
+                        if summary.available or summary.message != "SMART JSON parsing failed.":
+                            if self.system.truenas.platform == "quantastor" and target_host:
+                                self._quantastor_preferred_ses_host = target_host
+                            return summary, None
+                        last_error = (
+                            f"{target_host}:{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                            if target_host
+                            else f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                        )
+                        break
 
         return None, last_error
 
@@ -564,6 +1176,8 @@ class InventoryService:
         self,
         bundle: MappingBundle,
         selected_enclosure_id: str | None = None,
+        *,
+        invalidate_snapshot: bool = True,
     ) -> int:
         rewritten: list[ManualMapping] = []
         for mapping in bundle.mappings:
@@ -579,131 +1193,36 @@ class InventoryService:
             )
 
         saved_count = self.mapping_store.replace_mappings(self.system.id, selected_enclosure_id, rewritten)
-        await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
+        if invalidate_snapshot:
+            self.invalidate_snapshot_cache(reason="import_mapping_bundle")
         return saved_count
 
-    async def _build_snapshot(self, selected_enclosure_id: str | None = None) -> InventorySnapshot:
-        warnings: list[str] = []
-        ssh_data = ParsedSSHData()
-        api_enabled = self.system.truenas.platform != "linux"
-        api_label = "Quantastor API" if self.system.truenas.platform == "quantastor" else "TrueNAS API"
+    async def _build_snapshot(
+        self,
+        selected_enclosure_id: str | None = None,
+        *,
+        force_source_refresh: bool = False,
+    ) -> InventorySnapshot:
+        source_bundle = await self._get_inventory_source_bundle(force_refresh=force_source_refresh)
+        warnings = list(source_bundle.warnings)
         sources = {
-            "api": SourceStatus(
-                enabled=api_enabled,
-                ok=not api_enabled,
-                message=f"{api_label} disabled for this SSH-only Linux system." if not api_enabled else None,
-            ),
-            "ssh": SourceStatus(enabled=self.system.ssh.enabled, ok=not self.system.ssh.enabled, message=None),
+            key: value.model_copy(deep=True)
+            for key, value in source_bundle.sources.items()
         }
-
-        raw_data = TrueNASRawData(
-            enclosures=[],
-            disks=[],
-            pools=[],
-            disk_temperatures={},
-            smart_test_results=[],
-        )
-        ssh_available = False
-        ssh_failures: list[str] = []
-        quantastor_cli_loaded = False
-        quantastor_cli_failures: list[str] = []
-        quantastor_ses_loaded = False
-        quantastor_ses_data = ParsedSSHData()
-        quantastor_ses_failures: list[str] = []
-        if api_enabled:
-            try:
-                raw_data = await self.truenas_client.fetch_all()
-                sources["api"] = SourceStatus(enabled=True, ok=True, message=f"{api_label} reachable.")
-            except Exception as exc:
-                logger.exception("Failed to fetch platform API data")
-                sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
-                warnings.append(f"{api_label} is unreachable. Slot details may be partial or unavailable.")
-
-        if self.system.ssh.enabled:
-            try:
-                command_results = await self.ssh_probe.run_commands()
-                if self._should_probe_unifi_gpio_debug(command_results):
-                    command_results.append(await self.ssh_probe.run_command("cat /sys/kernel/debug/gpio"))
-                outputs = {item.command: item.stdout for item in command_results if item.ok}
-                failures = [item for item in command_results if not item.ok]
-                ssh_available = True
+        raw_data = source_bundle.raw_data
+        quantastor_ses_data = source_bundle.quantastor_ses_data
+        ssh_data = ParsedSSHData()
+        if source_bundle.ssh_collected:
+            with perf_stage("inventory.ssh.parse_outputs", command_count=len(source_bundle.ssh_outputs)):
                 ssh_data = parse_ssh_outputs(
-                    outputs,
+                    source_bundle.ssh_outputs,
                     self.settings.layout.slot_count,
                     self.system.truenas.enclosure_filter,
                     selected_enclosure_id,
                 )
-                sources["ssh"] = SourceStatus(
-                    enabled=True,
-                    ok=not failures,
-                    message="SSH probe completed." if not failures else "Some SSH commands failed.",
-                )
-                for failure in failures:
-                    message = f"SSH command failed: {failure.command} (exit {failure.exit_code})"
-                    warnings.append(message)
-                    ssh_failures.append(message)
-            except Exception as exc:
-                logger.exception("Failed to collect SSH diagnostics")
-                sources["ssh"] = SourceStatus(enabled=True, ok=False, message=str(exc))
-                warnings.append("SSH mode is enabled but could not collect fallback command output.")
-
-        if self.system.truenas.platform == "quantastor" and ssh_available:
-            try:
-                quantastor_ses_data, quantastor_ses_failures = await self._fetch_quantastor_ses_overlay()
-            except Exception:
-                logger.exception("Failed to collect Quantastor SES diagnostics")
-                quantastor_ses_failures.append(
-                    "Quantastor SSH SES enrichment failed unexpectedly. REST and CLI slot truth is still being used."
-                )
-            else:
-                quantastor_ses_loaded = bool(quantastor_ses_data.ses_enclosures)
-                warnings.extend(quantastor_ses_failures)
-
-            try:
-                quantastor_cli_overlay, quantastor_cli_failures = await self._fetch_quantastor_cli_overlay()
-            except Exception:
-                logger.exception("Failed to collect Quantastor CLI diagnostics")
-                quantastor_cli_failures.append(
-                    "Quantastor SSH CLI enrichment failed unexpectedly. REST data is still being used."
-                )
-            else:
-                raw_data.cli_disks = quantastor_cli_overlay.get("cli_disks", [])
-                raw_data.cli_hw_disks = quantastor_cli_overlay.get("cli_hw_disks", [])
-                raw_data.cli_hw_enclosures = quantastor_cli_overlay.get("cli_hw_enclosures", [])
-                quantastor_cli_loaded = any(
-                    (
-                        raw_data.cli_disks,
-                        raw_data.cli_hw_disks,
-                        raw_data.cli_hw_enclosures,
-                    )
-                )
-                warnings.extend(quantastor_cli_failures)
-
-            if quantastor_cli_loaded:
-                sources["ssh"] = SourceStatus(
-                    enabled=True,
-                    ok=not ssh_failures and not quantastor_cli_failures and not quantastor_ses_failures,
-                    message=(
-                        "SSH probe, Quantastor CLI enrichment, and SES overlay completed."
-                        if quantastor_ses_loaded and not ssh_failures and not quantastor_cli_failures and not quantastor_ses_failures
-                        else "SSH probe and Quantastor CLI enrichment completed."
-                        if not ssh_failures and not quantastor_cli_failures and not quantastor_ses_failures
-                        else "Quantastor CLI/SES enrichment completed with some failures."
-                    ),
-                )
-            elif quantastor_ses_loaded:
-                sources["ssh"] = SourceStatus(
-                    enabled=True,
-                    ok=not ssh_failures and not quantastor_ses_failures,
-                    message=(
-                        "SSH probe and Quantastor SES overlay completed."
-                        if not ssh_failures and not quantastor_ses_failures
-                        else "Quantastor SES overlay completed with some failures."
-                    ),
-                )
 
         has_scale_linux_ses = self._has_scale_linux_ses(ssh_data)
-        if api_enabled and not raw_data.enclosures:
+        if self.system.truenas.platform != "linux" and not raw_data.enclosures:
             if self.system.truenas.platform == "scale" and has_scale_linux_ses:
                 warnings.append(
                     "TrueNAS SCALE did not return enclosure rows, so this view is using Linux SES AES page parsing "
@@ -726,13 +1245,14 @@ class InventoryService:
                     "but physical slot mapping on this system will require SSH enrichment or manual calibration."
                 )
 
-        slots, available_enclosures, selected_meta, layout_rows, layout_slot_count, layout_columns = self._correlate(
-            raw_data,
-            ssh_data,
-            warnings,
-            selected_enclosure_id=selected_enclosure_id,
-            quantastor_ses_data=quantastor_ses_data,
-        )
+        with perf_stage("inventory.correlate"):
+            slots, available_enclosures, selected_meta, layout_rows, layout_slot_count, layout_columns = self._correlate(
+                raw_data,
+                ssh_data,
+                warnings,
+                selected_enclosure_id=selected_enclosure_id,
+                quantastor_ses_data=quantastor_ses_data,
+            )
         option_by_id = {item.id: item for item in available_enclosures}
         resolved_enclosure_id = None
         if selected_enclosure_id and selected_enclosure_id in option_by_id:
@@ -743,15 +1263,16 @@ class InventoryService:
             resolved_enclosure_id = available_enclosures[0].id
 
         selected_option = option_by_id.get(resolved_enclosure_id) if resolved_enclosure_id else None
-        selected_profile = self.profile_registry.resolve_for_enclosure(
-            self.system,
-            selected_option,
-            fallback_label=selected_option.label if selected_option else selected_meta.get("label"),
-            fallback_rows=len(layout_rows) if layout_rows else None,
-            fallback_columns=layout_columns or None,
-            fallback_slot_count=layout_slot_count or None,
-            fallback_slot_layout=layout_rows or None,
-        )
+        with perf_stage("inventory.resolve_profile"):
+            selected_profile = self.profile_registry.resolve_for_enclosure(
+                self.system,
+                selected_option,
+                fallback_label=selected_option.label if selected_option else selected_meta.get("label"),
+                fallback_rows=len(layout_rows) if layout_rows else None,
+                fallback_columns=layout_columns or None,
+                fallback_slot_count=layout_slot_count or None,
+                fallback_slot_layout=layout_rows or None,
+            )
         selected_slot = None
         if resolved_enclosure_id:
             selected_slot = next((slot for slot in slots if slot.enclosure_id == resolved_enclosure_id), None)
@@ -783,8 +1304,14 @@ class InventoryService:
         platform_context: dict[str, Any] = {}
         if self.system.truenas.platform == "quantastor":
             selected_system_id = selected_option.id if selected_option else resolved_enclosure_id
-            platform_context = self._build_quantastor_platform_context(raw_data, selected_system_id)
-            self._annotate_quantastor_slot_context(slots, raw_data, selected_system_id, platform_context)
+            with perf_stage("inventory.quantastor.build_platform_context"):
+                platform_context = self._build_quantastor_platform_context(raw_data, selected_system_id)
+                self._annotate_quantastor_slot_context(slots, raw_data, selected_system_id, platform_context)
+
+        with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
+            self._apply_persisted_slot_details(slots)
+        with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
+            self._persist_slot_details(slots)
 
         summary = InventorySummary(
             disk_count=disk_count,
@@ -831,7 +1358,7 @@ class InventoryService:
         warnings: list[str],
         selected_enclosure_id: str | None = None,
         quantastor_ses_data: ParsedSSHData | None = None,
-    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int]], int, int]:
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         if self.system.truenas.platform == "linux":
             return self._correlate_linux_host(ssh_data, warnings, selected_enclosure_id)
         if self.system.truenas.platform == "quantastor":
@@ -877,9 +1404,9 @@ class InventoryService:
             else self.settings.layout.columns
         )
         layout_rows = (
-            [list(row) for row in selected_profile.slot_layout]
+            copy_layout_rows(selected_profile.slot_layout)
             if selected_profile and selected_profile.slot_layout
-            else selected_option.slot_layout if selected_option and selected_option.slot_layout
+            else copy_layout_rows(selected_option.slot_layout) if selected_option and selected_option.slot_layout
             else build_layout_rows(
                 selected_option.rows if selected_option and selected_option.rows else self.settings.layout.rows,
                 layout_columns,
@@ -890,11 +1417,7 @@ class InventoryService:
             layout_rows,
             selected_option.slot_count if selected_option and selected_option.slot_count else slot_count,
         )
-        slot_positions = {
-            slot_number: (row_index, column_index)
-            for row_index, row in enumerate(layout_rows)
-            for column_index, slot_number in enumerate(row)
-        }
+        slot_positions = layout_slot_positions(layout_rows)
         disk_records = self._build_disk_records(
             raw_data.disks,
             ssh_data,
@@ -961,7 +1484,7 @@ class InventoryService:
         ssh_data: ParsedSSHData,
         warnings: list[str],
         selected_enclosure_id: str | None,
-    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int]], int, int]:
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         available_enclosures = self._build_linux_enclosure_options()
         selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
         if selected_option is None:
@@ -981,14 +1504,10 @@ class InventoryService:
             warnings.append("This Linux host is missing an enclosure profile for rendering.")
             return [], available_enclosures, self._enclosure_option_meta(selected_option), [], 0, 0
 
-        layout_rows = [list(row) for row in selected_profile.slot_layout]
+        layout_rows = copy_layout_rows(selected_profile.slot_layout)
         layout_slot_count = infer_slot_count_from_layout(layout_rows, selected_option.slot_count)
         layout_columns = selected_profile.columns
-        slot_positions = {
-            slot_number: (row_index, column_index)
-            for row_index, row in enumerate(layout_rows)
-            for column_index, slot_number in enumerate(row)
-        }
+        slot_positions = layout_slot_positions(layout_rows)
 
         disk_records = self._build_linux_disk_records(ssh_data)
         disks_by_key: dict[str, DiskRecord] = {}
@@ -1088,7 +1607,7 @@ class InventoryService:
         ssh_data: ParsedSSHData,
         warnings: list[str],
         selected_enclosure_id: str | None,
-    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int]], int, int]:
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         available_enclosures = self._build_scale_linux_enclosure_options(ssh_data)
         selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
         if selected_option is None:
@@ -1152,16 +1671,13 @@ class InventoryService:
             else selected_option.columns or self.settings.layout.columns
         )
         layout_rows = (
-            [list(row) for row in selected_profile.slot_layout]
+            copy_layout_rows(selected_profile.slot_layout)
             if selected_profile and selected_profile.slot_layout
-            else selected_option.slot_layout or build_layout_rows(selected_option.rows or self.settings.layout.rows, columns, slot_count)
+            else copy_layout_rows(selected_option.slot_layout) if selected_option and selected_option.slot_layout
+            else build_layout_rows(selected_option.rows or self.settings.layout.rows, columns, slot_count)
         )
         slot_count = infer_slot_count_from_layout(layout_rows, slot_count)
-        slot_positions = {
-            slot_number: (row_index, column_index)
-            for row_index, row in enumerate(layout_rows)
-            for column_index, slot_number in enumerate(row)
-        }
+        slot_positions = layout_slot_positions(layout_rows)
         slot_views: list[SlotView] = []
 
         for slot in range(slot_count):
@@ -1208,7 +1724,7 @@ class InventoryService:
         warnings: list[str],
         selected_enclosure_id: str | None,
         quantastor_ses_data: ParsedSSHData,
-    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int]], int, int]:
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         available_enclosures = self._build_quantastor_enclosure_options(raw_data)
         preferred_enclosure_id = selected_enclosure_id or self._select_quantastor_default_enclosure_id(
             raw_data,
@@ -1234,14 +1750,10 @@ class InventoryService:
 
         warnings.extend(self._build_quantastor_cluster_warnings(raw_data, selected_option.id))
 
-        layout_rows = [list(row) for row in selected_profile.slot_layout]
+        layout_rows = copy_layout_rows(selected_profile.slot_layout)
         layout_slot_count = infer_slot_count_from_layout(layout_rows, selected_option.slot_count)
         layout_columns = selected_profile.columns
-        slot_positions = {
-            slot_number: (row_index, column_index)
-            for row_index, row in enumerate(layout_rows)
-            for column_index, slot_number in enumerate(row)
-        }
+        slot_positions = layout_slot_positions(layout_rows)
 
         disk_records = self._build_quantastor_disk_records(raw_data, selected_option.id)
         disks_by_key: dict[str, DiskRecord] = {}
@@ -1333,7 +1845,7 @@ class InventoryService:
             fallback_columns=24,
             fallback_slot_count=24,
         )
-        slot_layout = [list(row) for row in profile.slot_layout] if profile else None
+        slot_layout = copy_layout_rows(profile.slot_layout) if profile else None
         rows = profile.rows if profile else None
         columns = profile.columns if profile else None
         slot_count = infer_slot_count_from_layout(slot_layout or [], 24 if profile else None)
@@ -1780,7 +2292,7 @@ class InventoryService:
     def _build_quantastor_topology_members(
         self,
         raw_data: TrueNASRawData,
-        disk_records: list[DiskRecord],
+        _disk_records: list[DiskRecord],
     ) -> dict[str, ZpoolMember]:
         pool_index = {
             normalize_text(str(pool.get("id")) if pool.get("id") is not None else None): pool
@@ -1857,38 +2369,6 @@ class InventoryService:
                     for key in normalize_lookup_keys(str(value) if value is not None else None):
                         members[key] = member
 
-        if members:
-            return members
-
-        for disk in disk_records:
-            pool_id = normalize_text(
-                str(disk.raw.get("storagePoolId") or disk.raw.get("poolId"))
-                if (disk.raw.get("storagePoolId") or disk.raw.get("poolId")) is not None
-                else None
-            )
-            pool = pool_index.get(pool_id)
-            if pool is None:
-                continue
-            pool_name = normalize_text(
-                str(pool.get("name") or pool.get("description") or pool_id)
-                if (pool.get("name") or pool.get("description") or pool_id) is not None
-                else None
-            ) or "Pool"
-            owner_label = self._quantastor_pool_owner_label(pool, system_index)
-            topology_label = f"{pool_name} > disk > data"
-            if owner_label:
-                topology_label = f"{topology_label} ({owner_label})"
-            member = ZpoolMember(
-                pool_name=pool_name,
-                vdev_class="data",
-                vdev_name="disk",
-                topology_label=topology_label,
-                health=disk.health,
-                raw_name=normalize_text(disk.raw.get("name") or disk.raw.get("devicePath")),
-                raw_path=normalize_text(disk.raw.get("devicePath")),
-            )
-            for key in disk.lookup_keys:
-                members[key] = member
         return members
 
     @staticmethod
@@ -2007,6 +2487,7 @@ class InventoryService:
         raw_data: TrueNASRawData,
         selected_system_id: str | None,
     ) -> dict[str, Any]:
+        topology_complete = bool(raw_data.pool_devices)
         systems_by_id = {
             normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None): system_row
             for system_row in raw_data.systems
@@ -2015,7 +2496,10 @@ class InventoryService:
         system_labels = self._quantastor_system_label_index(raw_data)
         selected_row = systems_by_id.get(selected_system_id)
         if selected_row is None:
-            return {}
+            return {
+                "topology_complete": topology_complete,
+                "topology_source": "storagePoolDeviceEnum" if topology_complete else "incomplete",
+            }
 
         cluster_id = normalize_text(
             str(selected_row.get("storageSystemClusterId"))
@@ -2062,6 +2546,8 @@ class InventoryService:
             "cluster_id": cluster_id,
             "selected_view_id": selected_system_id,
             "selected_view_label": selected_label,
+            "topology_complete": topology_complete,
+            "topology_source": "storagePoolDeviceEnum" if topology_complete else "incomplete",
             "cluster_node_labels": [
                 system_labels.get(system_id) or system_id
                 for system_id in (

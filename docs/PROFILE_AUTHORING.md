@@ -207,6 +207,22 @@ The selection order is:
 - `supermicro-ssg-2028r-shared-front-24`
 - `ubiquiti-unvr-front-4`
 - `ubiquiti-unvr-pro-front-7`
+- `generic-front-24-1x24`
+- `generic-front-12-3x4`
+- `generic-top-60-4x15`
+- `generic-front-60-5x12`
+- `generic-front-84-6x14`
+- `generic-front-102-8x14`
+- `generic-front-106-8x14`
+
+The generic profiles are intended as reusable geometry-first starting points
+for common chassis families surfaced in the Quantastor reference set. They are
+best used when a built-in validated hardware-specific profile is not a match
+but the physical face shape is still a close fit.
+
+`slot_layout` now also supports explicit `null` cells for chassis gaps, center
+beams, airflow cutouts, or sidecar-module voids when a shelf face is not a
+fully packed rectangle.
 
 ## Limitations
 

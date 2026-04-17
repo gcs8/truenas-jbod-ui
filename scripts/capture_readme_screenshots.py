@@ -71,8 +71,20 @@ def capture_app_shell(page: Page, filename: str) -> None:
     page.locator(".app-shell").screenshot(path=str(target))
 
 
+def hide_debug_chrome(page: Page) -> None:
+    page.evaluate(
+        """() => {
+            const uiPerfPanel = document.getElementById('ui-perf-panel');
+            if (uiPerfPanel) {
+                uiPerfPanel.classList.add('hidden');
+            }
+        }"""
+    )
+
+
 def open_and_select_slot(page: Page, params: dict[str, str], slot: int) -> None:
     page.goto(f"{BASE_URL}?{urlencode(params)}", wait_until="networkidle")
+    hide_debug_chrome(page)
     tile = page.locator(f'#slot-grid .slot-tile[data-slot="{slot}"]')
     tile.wait_for(state="visible", timeout=120_000)
     tile.click()

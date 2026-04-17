@@ -16,7 +16,12 @@ from app.models.domain import (
     SourceStatus,
     SystemOption,
 )
-from app.services.snapshot_export import SnapshotExportService
+from app.services.snapshot_export import (
+    EXPORT_HISTORY_CACHE,
+    EXPORT_RENDER_CACHE,
+    EXPORT_ZIP_CACHE,
+    SnapshotExportService,
+)
 
 
 class FakeHistoryBackend:
@@ -61,6 +66,49 @@ class FakeHistoryBackend:
                 "power_on_hours": None,
             },
         }
+
+    async def get_scope_history(
+        self,
+        *,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slots: list[int],
+    ) -> dict[int, dict[str, object]]:
+        return {
+            slot: await self.get_slot_history(slot, system_id, enclosure_id)
+            for slot in slots
+        }
+
+
+class CountingHistoryBackend(FakeHistoryBackend):
+    def __init__(self) -> None:
+        self.status_calls = 0
+        self.scope_history_calls = 0
+
+    async def get_status(self) -> dict[str, object]:
+        self.status_calls += 1
+        return {
+            "configured": True,
+            "available": True,
+            "detail": None,
+            "counts": {},
+            "collector": {},
+            "scopes": [],
+        }
+
+    async def get_scope_history(
+        self,
+        *,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slots: list[int],
+    ) -> dict[int, dict[str, object]]:
+        self.scope_history_calls += 1
+        return await super().get_scope_history(
+            system_id=system_id,
+            enclosure_id=enclosure_id,
+            slots=slots,
+        )
 
 
 class DenseHistoryBackend:
@@ -153,6 +201,18 @@ class DenseHistoryBackend:
             },
         }
 
+    async def get_scope_history(
+        self,
+        *,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slots: list[int],
+    ) -> dict[int, dict[str, object]]:
+        return {
+            slot: await self.get_slot_history(slot, system_id, enclosure_id)
+            for slot in slots
+        }
+
 
 class UnavailableHistoryBackend:
     configured = True
@@ -186,6 +246,18 @@ class UnavailableHistoryBackend:
             "latest_values": {},
         }
 
+    async def get_scope_history(
+        self,
+        *,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slots: list[int],
+    ) -> dict[int, dict[str, object]]:
+        return {
+            slot: await self.get_slot_history(slot, system_id, enclosure_id)
+            for slot in slots
+        }
+
 
 class StatusUnavailableHistoryBackend:
     configured = True
@@ -207,6 +279,15 @@ class StatusUnavailableHistoryBackend:
         enclosure_id: str | None,
     ) -> dict[str, object]:
         raise AssertionError("Per-slot history fetch should be skipped when status is unavailable")
+
+    async def get_scope_history(
+        self,
+        *,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slots: list[int],
+    ) -> dict[int, dict[str, object]]:
+        raise AssertionError("Scope history fetch should be skipped when status is unavailable")
 
 
 def build_smart_summary_cache() -> dict[str, dict[str, object]]:
@@ -303,6 +384,11 @@ def build_request() -> Request:
 
 
 class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        EXPORT_HISTORY_CACHE.clear()
+        EXPORT_RENDER_CACHE.clear()
+        EXPORT_ZIP_CACHE.clear()
+
     async def test_service_builds_self_contained_html_snapshot(self) -> None:
         snapshot = build_snapshot()
         exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
@@ -534,6 +620,72 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("initialHistoryPanelOpen: false", closed_render.html)
         self.assertIn("initialHistoryPanelOpen: true", open_render.html)
+
+    async def test_estimate_and_export_reuse_cached_render_and_zip_artifacts(self) -> None:
+        snapshot = build_snapshot()
+        history_backend = CountingHistoryBackend()
+        exporter = SnapshotExportService(Settings(), history_backend, templates)
+        zip_build_calls = 0
+        original_build_zip_archive = exporter._build_zip_archive
+
+        def counting_build_zip_archive(html_filename: str, html_content: bytes) -> bytes:
+            nonlocal zip_build_calls
+            zip_build_calls += 1
+            return original_build_zip_archive(html_filename, html_content)
+
+        exporter._build_zip_archive = counting_build_zip_archive  # type: ignore[method-assign]
+
+        estimate = await exporter.estimate_enclosure_snapshot_export(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            io_chart_mode="total",
+            packaging="auto",
+        )
+        artifact = await exporter.build_enclosure_snapshot_export(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            io_chart_mode="total",
+            packaging="auto",
+        )
+
+        self.assertTrue(estimate["ok"])
+        self.assertGreater(artifact.size_bytes, 0)
+        self.assertEqual(history_backend.scope_history_calls, 1)
+        self.assertEqual(zip_build_calls, 1)
+
+    async def test_render_option_changes_reuse_cached_scope_history(self) -> None:
+        snapshot = build_snapshot()
+        history_backend = CountingHistoryBackend()
+        exporter = SnapshotExportService(Settings(), history_backend, templates)
+
+        narrow_window = await exporter.estimate_enclosure_snapshot_export(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            io_chart_mode="total",
+            packaging="auto",
+        )
+        wide_window = await exporter.estimate_enclosure_snapshot_export(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=None,
+            io_chart_mode="total",
+            packaging="auto",
+        )
+
+        self.assertTrue(narrow_window["ok"])
+        self.assertTrue(wide_window["ok"])
+        self.assertEqual(history_backend.scope_history_calls, 1)
 
     async def test_snapshot_export_omits_history_when_backend_is_unavailable(self) -> None:
         snapshot = build_snapshot()

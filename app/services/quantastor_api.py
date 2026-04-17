@@ -39,13 +39,15 @@ class QuantastorRESTClient:
         self.config = config
 
     async def fetch_all(self) -> TrueNASRawData:
-        systems = await asyncio.to_thread(self._fetch_required_list, "storageSystemEnum")
-        disks = await asyncio.to_thread(self._fetch_required_list, "physicalDiskEnum")
-        pools = await asyncio.to_thread(self._fetch_required_list, "storagePoolEnum")
-        pool_devices = await asyncio.to_thread(self._fetch_optional_list, "storagePoolDeviceEnum")
-        ha_groups = await asyncio.to_thread(self._fetch_optional_list, "haGroupEnum")
-        hw_disks = await asyncio.to_thread(self._fetch_optional_list, "hwDiskEnum")
-        hw_enclosures = await asyncio.to_thread(self._fetch_optional_list, "hwEnclosureEnum")
+        systems, disks, pools, pool_devices, ha_groups, hw_disks, hw_enclosures = await asyncio.gather(
+            asyncio.to_thread(self._fetch_required_list, "storageSystemEnum"),
+            asyncio.to_thread(self._fetch_required_list, "physicalDiskEnum"),
+            asyncio.to_thread(self._fetch_required_list, "storagePoolEnum"),
+            asyncio.to_thread(self._fetch_optional_list, "storagePoolDeviceEnum"),
+            asyncio.to_thread(self._fetch_optional_list, "haGroupEnum"),
+            asyncio.to_thread(self._fetch_optional_list, "hwDiskEnum"),
+            asyncio.to_thread(self._fetch_optional_list, "hwEnclosureEnum"),
+        )
         return TrueNASRawData(
             enclosures=systems,
             disks=disks,

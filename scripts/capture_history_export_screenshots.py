@@ -4,14 +4,17 @@ import os
 import tempfile
 from pathlib import Path
 from shutil import copy2
+import sys
 from urllib.parse import urlencode
 
 from playwright.sync_api import Page, sync_playwright
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from app import __version__
 
-
-ROOT = Path(__file__).resolve().parents[1]
 BASE_URL = "http://localhost:8080/"
 DOCS_IMAGES_DIR = ROOT / "docs" / "images" / "screenshots"
 WIKI_IMAGES_DIR = ROOT / "wiki" / "images"
@@ -54,8 +57,20 @@ def write_screenshot(locator, filename: str) -> Path:
     return docs_target
 
 
+def hide_debug_chrome(page: Page) -> None:
+    page.evaluate(
+        """() => {
+            const uiPerfPanel = document.getElementById('ui-perf-panel');
+            if (uiPerfPanel) {
+                uiPerfPanel.classList.add('hidden');
+            }
+        }"""
+    )
+
+
 def open_archive_core_slot(page: Page, slot: int) -> None:
     page.goto(f"{BASE_URL}?{urlencode(ARCHIVE_CORE_PARAMS)}", wait_until="networkidle")
+    hide_debug_chrome(page)
     slot_tile = page.locator(f'#slot-grid .slot-tile[data-slot="{slot}"]')
     slot_tile.wait_for(state="visible", timeout=120_000)
     slot_tile.click()
@@ -106,6 +121,7 @@ def capture_offline_snapshot(browser, page: Page) -> None:
 
     offline_page = browser.new_page(viewport={"width": 1900, "height": 2600}, device_scale_factor=1)
     offline_page.goto(download_path.as_uri(), wait_until="load")
+    hide_debug_chrome(offline_page)
     offline_page.locator(".snapshot-banner-badge").wait_for(state="visible", timeout=120_000)
     offline_page.locator("#detail-content").wait_for(state="visible", timeout=120_000)
     offline_page.locator("#detail-history-panel").wait_for(state="visible", timeout=120_000)

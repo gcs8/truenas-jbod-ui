@@ -115,6 +115,19 @@ class SmartSummaryView(BaseModel):
 
 class SmartBatchRequest(BaseModel):
     slots: list[int] = Field(default_factory=list)
+    max_concurrency: int | None = None
+
+    @field_validator("slots")
+    @classmethod
+    def validate_slots(cls, value: list[int]) -> list[int]:
+        return [int(slot) for slot in value]
+
+    @field_validator("max_concurrency")
+    @classmethod
+    def validate_max_concurrency(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        return max(1, min(int(value), 128))
 
 
 class SmartBatchItem(BaseModel):
@@ -193,7 +206,7 @@ class EnclosureOption(BaseModel):
     rows: int | None = None
     columns: int | None = None
     slot_count: int | None = None
-    slot_layout: list[list[int]] | None = None
+    slot_layout: list[list[int | None]] | None = None
 
 
 class EnclosureProfileView(BaseModel):
@@ -208,7 +221,7 @@ class EnclosureProfileView(BaseModel):
     bay_size: str | None = None
     rows: int
     columns: int
-    slot_layout: list[list[int]] = Field(default_factory=list)
+    slot_layout: list[list[int | None]] = Field(default_factory=list)
     row_groups: list[int] = Field(default_factory=list)
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
 
@@ -224,7 +237,7 @@ class InventorySummary(BaseModel):
 
 class InventorySnapshot(BaseModel):
     slots: list[SlotView]
-    layout_rows: list[list[int]] = Field(default_factory=list)
+    layout_rows: list[list[int | None]] = Field(default_factory=list)
     layout_slot_count: int = 0
     layout_columns: int = 0
     last_updated: datetime = Field(default_factory=utcnow)

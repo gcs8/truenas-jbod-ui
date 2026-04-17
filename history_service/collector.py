@@ -107,6 +107,13 @@ class HistoryCollector:
         )
 
         for scope in scopes:
+            if not self._should_record_scope_snapshot(scope.snapshot):
+                logger.warning(
+                    "Skipping history capture for %s%s because the inventory snapshot is degraded or untrusted.",
+                    scope.system_id,
+                    f" enclosure {scope.enclosure_id}" if scope.enclosure_id else "",
+                )
+                continue
             slot_records = [
                 SlotStateRecord.from_snapshot_slot(scope.snapshot, slot_payload)
                 for slot_payload in scope.snapshot.get("slots", [])
@@ -223,6 +230,20 @@ class HistoryCollector:
             "health",
         )
         return all(getattr(previous, field_name) == getattr(current, field_name) for field_name in stable_fields)
+
+    @staticmethod
+    def _should_record_scope_snapshot(snapshot: dict[str, Any]) -> bool:
+        sources = snapshot.get("sources")
+        if not isinstance(sources, dict):
+            sources = {}
+        api_source = sources.get("api")
+        if isinstance(api_source, dict) and api_source.get("enabled") and not api_source.get("ok"):
+            return False
+        if normalize_text(snapshot.get("selected_system_platform")) == "quantastor":
+            platform_context = snapshot.get("platform_context")
+            if isinstance(platform_context, dict) and platform_context.get("topology_complete") is False:
+                return False
+        return True
 
     def _build_metric_samples(
         self,

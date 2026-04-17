@@ -12,16 +12,52 @@ LINUX_GPU_SERVER_NVME_PROFILE_ID = "supermicro-sys-2029gp-tr-right-nvme-2"
 QUANTASTOR_SSG_SHARED_24_PROFILE_ID = "supermicro-ssg-2028r-shared-front-24"
 UNIFI_UNVR_FRONT_4_PROFILE_ID = "ubiquiti-unvr-front-4"
 UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID = "ubiquiti-unvr-pro-front-7"
+GENERIC_FRONT_24_1X24_PROFILE_ID = "generic-front-24-1x24"
+GENERIC_FRONT_12_3X4_PROFILE_ID = "generic-front-12-3x4"
+GENERIC_TOP_60_4X15_PROFILE_ID = "generic-top-60-4x15"
+GENERIC_FRONT_60_5X12_PROFILE_ID = "generic-front-60-5x12"
+GENERIC_FRONT_84_6X14_PROFILE_ID = "generic-front-84-6x14"
+GENERIC_FRONT_102_8X14_PROFILE_ID = "generic-front-102-8x14"
+GENERIC_FRONT_106_8X14_PROFILE_ID = "generic-front-106-8x14"
 
-
-def default_slot_layout(rows: int, columns: int, slot_count: int) -> list[list[int]]:
-    layout_rows: list[list[int]] = []
+def sparse_slot_layout(
+    rows: int,
+    columns: int,
+    *,
+    starting_slot: int = 0,
+    excluded_cells: set[tuple[int, int]] | None = None,
+) -> list[list[int | None]]:
+    layout_rows: list[list[int | None]] = [[None for _ in range(columns)] for _ in range(rows)]
+    next_slot = starting_slot
+    excluded = excluded_cells or set()
     for row_index in reversed(range(rows)):
-        start = row_index * columns
-        row_slots = [slot for slot in range(start, start + columns) if slot < slot_count]
-        if row_slots:
-            layout_rows.append(row_slots)
+        for column_index in range(columns):
+            if (row_index, column_index) in excluded:
+                continue
+            layout_rows[row_index][column_index] = next_slot
+            next_slot += 1
     return layout_rows
+
+
+def merge_slot_layout_sections(*sections: list[list[int | None]]) -> list[list[int | None]]:
+    if not sections:
+        return []
+    row_count = len(sections[0])
+    merged: list[list[int | None]] = []
+    for row_index in range(row_count):
+        row: list[int | None] = []
+        for section in sections:
+            row.extend(section[row_index])
+        merged.append(row)
+    return merged
+
+
+def default_slot_layout(rows: int, columns: int, slot_count: int) -> list[list[int | None]]:
+    full_layout = sparse_slot_layout(rows, columns)
+    return [
+        [slot for slot in row if isinstance(slot, int) and slot < slot_count]
+        for row in full_layout
+    ]
 
 
 def _built_in_profiles() -> list[EnclosureProfileConfig]:
@@ -167,6 +203,126 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
                 list(range(24)),
             ],
         ),
+        EnclosureProfileConfig(
+            id=GENERIC_FRONT_24_1X24_PROFILE_ID,
+            label="Generic Front 24",
+            eyebrow="Generic / 1 x 24 Front View",
+            summary="Reusable 1-by-24 front-drive profile for common 24-bay SFF and NVMe chassis.",
+            panel_title="Front 24 Bay",
+            edge_label="Front of chassis",
+            face_style="front-drive",
+            latch_edge="top",
+            bay_size="2.5",
+            rows=1,
+            columns=24,
+            slot_layout=default_slot_layout(1, 24, 24),
+        ),
+        EnclosureProfileConfig(
+            id=GENERIC_FRONT_12_3X4_PROFILE_ID,
+            label="Generic Front 12",
+            eyebrow="Generic / 3 x 4 Front View",
+            summary="Reusable 3-by-4 front-drive profile for common 12-bay LFF chassis and JBOD faces.",
+            panel_title="Front 12 Bay",
+            edge_label="Front of chassis",
+            face_style="front-drive",
+            latch_edge="right",
+            bay_size="3.5",
+            rows=3,
+            columns=4,
+            slot_layout=default_slot_layout(3, 4, 12),
+        ),
+        EnclosureProfileConfig(
+            id=GENERIC_TOP_60_4X15_PROFILE_ID,
+            label="Generic Top 60",
+            eyebrow="Generic / 4 x 15 Top View",
+            summary="Reusable 4-by-15 top-loading profile for common 60-bay chassis with a full top face.",
+            panel_title="Top 60 Bay",
+            edge_label="System front / latch edge",
+            face_style="top-loader",
+            latch_edge="bottom",
+            bay_size="3.5",
+            rows=4,
+            columns=15,
+            slot_layout=default_slot_layout(4, 15, 60),
+        ),
+        EnclosureProfileConfig(
+            id=GENERIC_FRONT_60_5X12_PROFILE_ID,
+            label="Generic Front 60",
+            eyebrow="Generic / 5 x 12 Front View",
+            summary="Reusable 5-by-12 front-drive profile for common 60-bay front-loading shelves.",
+            panel_title="Front 60 Bay",
+            edge_label="Front of chassis",
+            face_style="front-drive",
+            latch_edge="top",
+            bay_size="3.5",
+            rows=5,
+            columns=12,
+            slot_layout=default_slot_layout(5, 12, 60),
+        ),
+        EnclosureProfileConfig(
+            id=GENERIC_FRONT_84_6X14_PROFILE_ID,
+            label="Generic Front 84",
+            eyebrow="Generic / 6 x 14 Front View",
+            summary="Reusable 6-by-14 front-drive profile for common 84-bay dense shelves.",
+            panel_title="Front 84 Bay",
+            edge_label="Front of chassis",
+            face_style="front-drive",
+            latch_edge="top",
+            bay_size="3.5",
+            rows=6,
+            columns=14,
+            slot_layout=default_slot_layout(6, 14, 84),
+        ),
+        EnclosureProfileConfig(
+            id=GENERIC_FRONT_102_8X14_PROFILE_ID,
+            label="Generic Front 102",
+            eyebrow="Generic / 8 x 14 Front View",
+            summary="Reusable 8-by-14 front-drive profile for 102-bay shelves with an internal center beam or airflow gap.",
+            panel_title="Front 102 Bay",
+            edge_label="Front of chassis",
+            face_style="front-drive",
+            latch_edge="top",
+            bay_size="3.5",
+            rows=8,
+            columns=14,
+            slot_layout=sparse_slot_layout(
+                8,
+                14,
+                excluded_cells={
+                    (0, 6), (0, 7),
+                    (1, 6), (1, 7),
+                    (2, 6), (2, 7),
+                    (3, 6), (3, 7),
+                    (4, 6), (4, 7),
+                },
+            ),
+        ),
+        EnclosureProfileConfig(
+            id=GENERIC_FRONT_106_8X14_PROFILE_ID,
+            label="Generic Front 106",
+            eyebrow="Generic / 8 x 14 Front View",
+            summary="Reusable 8-by-14 front-drive profile for 106-bay shelves with a 96-drive main field and a 10-drive sidecar section.",
+            panel_title="Front 106 Bay",
+            edge_label="Front of chassis",
+            face_style="front-drive",
+            latch_edge="top",
+            bay_size="3.5",
+            rows=8,
+            columns=14,
+            slot_layout=merge_slot_layout_sections(
+                sparse_slot_layout(
+                    8,
+                    2,
+                    starting_slot=96,
+                    excluded_cells={
+                        (0, 0), (0, 1),
+                        (1, 0), (1, 1),
+                        (2, 0), (2, 1),
+                    },
+                ),
+                sparse_slot_layout(8, 12),
+            ),
+        ),
     ]
 
 
@@ -215,7 +371,7 @@ class ProfileRegistry:
         fallback_rows: int | None = None,
         fallback_columns: int | None = None,
         fallback_slot_count: int | None = None,
-        fallback_slot_layout: list[list[int]] | None = None,
+        fallback_slot_layout: list[list[int | None]] | None = None,
     ) -> EnclosureProfileView | None:
         profile_id = self._select_profile_id(system, enclosure)
         resolved = self.get(profile_id)

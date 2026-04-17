@@ -6,6 +6,7 @@ from app.services.mapping_store import MappingStore
 from app.services.profile_registry import ProfileRegistry
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.ssh_probe import SSHProbe
+from app.services.slot_detail_store import SlotDetailStore
 from app.services.truenas_ws import TrueNASWebsocketClient
 
 
@@ -16,6 +17,7 @@ class InventoryRegistry:
         self.settings = settings
         self.mapping_store = MappingStore(settings.paths.mapping_file)
         self.profile_registry = ProfileRegistry(settings)
+        self.slot_detail_store = SlotDetailStore(settings.paths.slot_detail_cache_file)
         self._services: dict[str, InventoryService] = {}
 
     def get_system(self, system_id: str | None) -> SystemConfig:
@@ -40,6 +42,12 @@ class InventoryRegistry:
                 ssh_probe=SSHProbe(system.ssh),
                 mapping_store=self.mapping_store,
                 profile_registry=self.profile_registry,
+                slot_detail_store=self.slot_detail_store,
             )
             self._services[system.id] = service
         return service
+
+    async def prewarm_all(self, *, warm_smart: bool = False) -> None:
+        for system in self.settings.systems:
+            service = self.get_service(system.id)
+            await service.prewarm_cache(warm_smart=warm_smart)

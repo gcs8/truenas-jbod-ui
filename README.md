@@ -40,24 +40,24 @@ front and rear grids derived from Linux SES data and operator notes.
 
 ### Archive CORE
 
-![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/screenshots/core-overview-v0.7.0.png)
+![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/screenshots/core-overview-v0.9.0.png)
 
 ### Offsite SCALE
 
-![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/screenshots/scale-overview-v0.7.0.png)
+![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/screenshots/scale-overview-v0.9.0.png)
 
 ### Additional Validated Platforms
 
-- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.7.0.png](docs/images/screenshots/gpu-server-overview-v0.7.0.png)
-- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.7.0.png](docs/images/screenshots/unvr-overview-v0.7.0.png)
-- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.7.0.png](docs/images/screenshots/unvr-pro-overview-v0.7.0.png)
-- Quantastor: [docs/images/screenshots/quantastor-overview-v0.7.0.png](docs/images/screenshots/quantastor-overview-v0.7.0.png)
+- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.9.0.png](docs/images/screenshots/gpu-server-overview-v0.9.0.png)
+- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.9.0.png](docs/images/screenshots/unvr-overview-v0.9.0.png)
+- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.9.0.png](docs/images/screenshots/unvr-pro-overview-v0.9.0.png)
+- Quantastor: [docs/images/screenshots/quantastor-overview-v0.9.0.png](docs/images/screenshots/quantastor-overview-v0.9.0.png)
 
 ### History And Snapshot Walkthroughs
 
-- Live history drawer: [docs/images/screenshots/history-drawer-v0.8.0.png](docs/images/screenshots/history-drawer-v0.8.0.png)
-- Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.8.0.png](docs/images/screenshots/snapshot-export-dialog-v0.8.0.png)
-- Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.8.0.png](docs/images/screenshots/offline-snapshot-v0.8.0.png)
+- Live history drawer: [docs/images/screenshots/history-drawer-v0.9.0.png](docs/images/screenshots/history-drawer-v0.9.0.png)
+- Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.9.0.png](docs/images/screenshots/snapshot-export-dialog-v0.9.0.png)
+- Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.9.0.png](docs/images/screenshots/offline-snapshot-v0.9.0.png)
 
 ## Features
 
@@ -424,6 +424,16 @@ Built-in validated profiles currently cover:
 - `supermicro-ssg-6048r-front-24`
 - `supermicro-ssg-6048r-rear-12`
 
+Built-in reusable generic families now also cover:
+
+- `generic-front-24-1x24`
+- `generic-front-12-3x4`
+- `generic-top-60-4x15`
+- `generic-front-60-5x12`
+- `generic-front-84-6x14`
+- `generic-front-102-8x14`
+- `generic-front-106-8x14`
+
 Custom profiles can be loaded from `paths.profile_file` / `PATH_PROFILE_FILE`
 without code changes.
 
@@ -723,6 +733,129 @@ multipath summary and simply omits controller/HBA labels.
 - The app should remain usable when fields are missing rather than refusing to
   render.
 
+## Optional Perf Timing
+
+For development and regression hunting, the app can emit request and workflow
+timing to the normal log output.
+
+Useful `.env` toggles:
+
+- `PERF_TIMING_ENABLED=true`
+- `PERF_LOG_ALL_REQUESTS=true`
+- `PERF_SLOW_REQUEST_MS=1000`
+- `PERF_SLOW_STAGE_MS=250`
+- `APP_STARTUP_WARM_CACHE_ENABLED=false`
+- `APP_STARTUP_WARM_SMART_ENABLED=false`
+- `APP_SMART_BATCH_MAX_CONCURRENCY=12`
+- `APP_SMART_PREFETCH_STRATEGY=auto`
+- `APP_SMART_PREFETCH_SINGLE_THRESHOLD=128`
+- `APP_SMART_PREFETCH_CHUNK_SIZE=24`
+- `APP_SMART_PREFETCH_BATCH_CONCURRENCY=2`
+- `APP_EXPORT_HISTORY_CONCURRENCY=12`
+- `APP_EXPORT_CACHE_TTL_SECONDS=60`
+- `APP_EXPORT_CACHE_MAX_ENTRIES=8`
+- `PATH_SLOT_DETAIL_CACHE_FILE=/app/data/slot_detail_cache.json`
+
+When enabled, the app logs request ids plus timing summaries for expensive
+paths such as inventory snapshot builds, SMART lookups, and enclosure snapshot
+export. This is intended as an opt-in debugging aid, not as always-on
+telemetry. Runtime timing entries go to the normal app log output and configured
+log file path, while the harness history below is stored separately under
+`data/perf/`. The HTTP responses also expose native `Server-Timing` headers
+when perf timing is enabled, so browser devtools and the harness can see which
+stages are dominating a slow request. The browser UI also exposes a small `UI
+Timing` panel when perf timing is enabled, which measures selector change or
+refresh start through inventory response, repaint, history-status refresh, SMART
+prefetch settle, and final "page feels done" time inside the real page.
+
+The SMART and export knobs above are useful when a large enclosure feels slow
+to repopulate after switching systems. The defaults now bias toward faster
+whole-shelf prefetch on CORE/SCALE while still keeping the fan-out tunable per
+environment. `APP_SMART_PREFETCH_STRATEGY=auto` will try a single whole-shelf
+SMART batch first and fall back to chunked requests if that path fails, while
+`chunked` keeps the older group-based behavior and `single` forces one request.
+`APP_STARTUP_WARM_CACHE_ENABLED` and `APP_STARTUP_WARM_SMART_ENABLED` let the
+container walk configured systems once at startup so the first switch back to a
+known shelf can reuse a warmed inventory / SMART cache instead of starting cold.
+
+For quick branch-to-branch comparison against a running local app, use:
+
+```bash
+python scripts/run_perf_harness.py --base-url http://127.0.0.1:8080 --iterations 3 --format markdown --label baseline
+```
+
+To compare large-enclosure SMART loading strategies directly, add the same
+prefetch knobs the browser uses:
+
+```bash
+python scripts/run_perf_harness.py --base-url http://127.0.0.1:8080 --smart-slot-count 24 --smart-prefetch-chunk-size 24 --smart-prefetch-batch-concurrency 2 --format markdown --label core-smart-prefetch
+```
+
+By default the harness also keeps a rolling local history under `data/perf/`:
+
+- `data/perf/latest.json` and `data/perf/latest.md`
+- `data/perf/history.csv`
+- `data/perf/history.jsonl`
+- timestamped `data/perf/runs/*.json` and `*.md`
+
+Each new run automatically compares itself against the previous `latest.json`
+unless you disable recording or point `--baseline` at a different JSON artifact.
+When the current exported mapping bundle is empty, the harness also times an
+empty-bundle import round-trip so the mutation path can be tracked without
+changing real slot mappings. The JSON and Markdown artifacts now keep per-
+workflow stage rollups pulled from `Server-Timing`, which makes it much easier
+to spot whether a slowdown came from API fetch, SSH collection, SMART fetch,
+or history/export work. Export and estimate now also share a small in-process
+cache for scope history, rendered HTML, and ZIP bytes, so repeating the same
+snapshot export options no longer has to reassemble the full history payload on
+every request. The main UI also keeps a local `slot_detail_cache.json` file for
+stable slot facts and stable SMART detail so large shelves do not have to
+rediscover every slowly changing identifier before the right rail becomes
+useful again. Inventory source collection is also shared per system across
+enclosure/layout switches, so moving between chassis views can usually reuse
+one appliance fetch instead of starting from scratch, while the selected
+profile geometry itself still comes from the configured or built-in profile
+definitions.
+
+## Browser QA Smoke
+
+There is now a lightweight Playwright smoke suite for the browser flows that
+are easiest to regress without noticing:
+
+- system switch
+- enclosure switch when a system exposes multiple views
+- selected-slot detail reset on scope change
+- no immediate auto-refresh tick after a manual system switch
+- history drawer open/load on a selected slot
+- snapshot export dialog estimate rendering
+
+Install the browser test dependency once:
+
+```bash
+npm install
+npm run qa:ui:install
+```
+
+Run the app locally or through Docker Compose, then point Playwright at it:
+
+```bash
+npm run qa:ui
+```
+
+Useful environment overrides:
+
+- `PLAYWRIGHT_BASE_URL=http://127.0.0.1:8080`
+
+The suite is intentionally environment-aware. If the current app instance only
+has one configured system or one enclosure view, the relevant switch test will
+skip instead of failing. When perf timing is enabled, the suite also inspects
+the in-page `UI Timing` telemetry so it can verify that a switch completed as a
+`system-switch` or `enclosure-switch` run instead of accidentally tripping a
+stale auto-refresh path. The export-dialog smoke test uses a mocked estimate
+response so the suite validates browser wiring without turning into a slow
+snapshot-size benchmark. Failures keep Playwright traces, screenshots, and
+video under `test-results/` and `playwright-report/`.
+
 ## Future Improvements
 
 - keep polishing validated chassis geometry and platform-specific tray visuals
@@ -736,6 +869,7 @@ multipath summary and simply omits controller/HBA labels.
 Current planning and SCALE-specific notes live here:
 
 - [docs/ROADMAP.md](docs/ROADMAP.md)
+- [docs/V0_9_0_PLAN.md](docs/V0_9_0_PLAN.md)
 - [docs/V0_3_X_PLAN.md](docs/V0_3_X_PLAN.md)
 - [docs/V0_4_PROFILE_PLAN.md](docs/V0_4_PROFILE_PLAN.md)
 - [docs/V0_5_QUANTASTOR_PLAN.md](docs/V0_5_QUANTASTOR_PLAN.md)

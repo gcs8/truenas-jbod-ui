@@ -9,6 +9,13 @@ from app.config import SystemConfig, TrueNASConfig, _load_profile_yaml, get_sett
 from app.models.domain import EnclosureOption
 from app.services.profile_registry import (
     CORE_CSE_946_PROFILE_ID,
+    GENERIC_FRONT_12_3X4_PROFILE_ID,
+    GENERIC_FRONT_24_1X24_PROFILE_ID,
+    GENERIC_FRONT_60_5X12_PROFILE_ID,
+    GENERIC_FRONT_84_6X14_PROFILE_ID,
+    GENERIC_FRONT_102_8X14_PROFILE_ID,
+    GENERIC_FRONT_106_8X14_PROFILE_ID,
+    GENERIC_TOP_60_4X15_PROFILE_ID,
     LINUX_GPU_SERVER_NVME_PROFILE_ID,
     QUANTASTOR_SSG_SHARED_24_PROFILE_ID,
     SCALE_SSG_FRONT_24_PROFILE_ID,
@@ -130,6 +137,101 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.rows, 1)
         self.assertEqual(profile.columns, 24)
         self.assertEqual(profile.slot_layout, [list(range(24))])
+
+    def test_builtin_generic_profiles_expose_reusable_reference_geometries(self) -> None:
+        registry = ProfileRegistry(get_settings())
+
+        expected_profiles = {
+            GENERIC_FRONT_24_1X24_PROFILE_ID: {
+                "face_style": "front-drive",
+                "latch_edge": "top",
+                "bay_size": "2.5",
+                "rows": 1,
+                "columns": 24,
+                "top_row": list(range(24)),
+                "bottom_row": list(range(24)),
+            },
+            GENERIC_FRONT_12_3X4_PROFILE_ID: {
+                "face_style": "front-drive",
+                "latch_edge": "right",
+                "bay_size": "3.5",
+                "rows": 3,
+                "columns": 4,
+                "top_row": [8, 9, 10, 11],
+                "bottom_row": [0, 1, 2, 3],
+            },
+            GENERIC_TOP_60_4X15_PROFILE_ID: {
+                "face_style": "top-loader",
+                "latch_edge": "bottom",
+                "bay_size": "3.5",
+                "rows": 4,
+                "columns": 15,
+                "top_row": list(range(45, 60)),
+                "bottom_row": list(range(0, 15)),
+            },
+            GENERIC_FRONT_60_5X12_PROFILE_ID: {
+                "face_style": "front-drive",
+                "latch_edge": "top",
+                "bay_size": "3.5",
+                "rows": 5,
+                "columns": 12,
+                "top_row": list(range(48, 60)),
+                "bottom_row": list(range(0, 12)),
+            },
+            GENERIC_FRONT_84_6X14_PROFILE_ID: {
+                "face_style": "front-drive",
+                "latch_edge": "top",
+                "bay_size": "3.5",
+                "rows": 6,
+                "columns": 14,
+                "top_row": list(range(70, 84)),
+                "bottom_row": list(range(0, 14)),
+            },
+            GENERIC_FRONT_102_8X14_PROFILE_ID: {
+                "face_style": "front-drive",
+                "latch_edge": "top",
+                "bay_size": "3.5",
+                "rows": 8,
+                "columns": 14,
+                "top_row": [90, 91, 92, 93, 94, 95, None, None, 96, 97, 98, 99, 100, 101],
+                "bottom_row": list(range(0, 14)),
+            },
+            GENERIC_FRONT_106_8X14_PROFILE_ID: {
+                "face_style": "front-drive",
+                "latch_edge": "top",
+                "bay_size": "3.5",
+                "rows": 8,
+                "columns": 14,
+                "top_row": [None, None, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95],
+                "bottom_row": [96, 97, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            },
+        }
+
+        listed_ids = {profile.id for profile in registry.list_profiles()}
+        for profile_id in expected_profiles:
+            self.assertIn(profile_id, listed_ids)
+
+        for profile_id, expected in expected_profiles.items():
+            with self.subTest(profile_id=profile_id):
+                profile = registry.get(profile_id)
+
+                self.assertIsNotNone(profile)
+                self.assertEqual(profile.face_style, expected["face_style"])
+                self.assertEqual(profile.latch_edge, expected["latch_edge"])
+                self.assertEqual(profile.bay_size, expected["bay_size"])
+                self.assertEqual(profile.rows, expected["rows"])
+                self.assertEqual(profile.columns, expected["columns"])
+                self.assertEqual(profile.slot_layout[0], expected["top_row"])
+                self.assertEqual(profile.slot_layout[-1], expected["bottom_row"])
+
+        profile_102 = registry.get(GENERIC_FRONT_102_8X14_PROFILE_ID)
+        self.assertIsNotNone(profile_102)
+        self.assertEqual(profile_102.slot_layout[4][6:8], [None, None])
+
+        profile_106 = registry.get(GENERIC_FRONT_106_8X14_PROFILE_ID)
+        self.assertIsNotNone(profile_106)
+        self.assertEqual(profile_106.slot_layout[0][:2], [None, None])
+        self.assertEqual(profile_106.slot_layout[3][:2], [104, 105])
 
     def test_builtin_unvr_profile_can_be_selected_explicitly_for_linux_hosts(self) -> None:
         system = SystemConfig(

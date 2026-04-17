@@ -159,9 +159,9 @@ Recommended manual screenshot set:
 
 Suggested release filenames:
 
-- `history-drawer-v0.8.0.png`
-- `snapshot-export-dialog-v0.8.0.png`
-- `offline-snapshot-v0.8.0.png`
+- `history-drawer-v0.9.0.png`
+- `snapshot-export-dialog-v0.9.0.png`
+- `offline-snapshot-v0.9.0.png`
 
 If the release notes or wiki call out degraded optional-history behavior, keep
 one extra screenshot of the history-unavailable state as reference material.

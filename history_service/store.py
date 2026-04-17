@@ -584,6 +584,145 @@ class HistoryStore:
             payload.append(item)
         return payload
 
+    def list_scope_history(
+        self,
+        system_id: str,
+        enclosure_id: str | None,
+        *,
+        slots: list[int] | None = None,
+        event_limit: int = 12,
+        metric_limits: dict[str, int] | None = None,
+    ) -> dict[int, dict[str, Any]]:
+        enclosure_key = enclosure_id or ""
+        slot_numbers = sorted({int(slot) for slot in (slots or [])})
+        metric_limits = metric_limits or {}
+        payload_by_slot: dict[int, dict[str, Any]] = {
+            slot: {
+                "events": [],
+                "metrics": {
+                    metric_name: []
+                    for metric_name in metric_limits
+                },
+                "sample_counts": {},
+                "latest_values": {},
+            }
+            for slot in slot_numbers
+        }
+
+        where_clauses = ["system_id = ?", "enclosure_key = ?"]
+        parameters: list[Any] = [system_id, enclosure_key]
+        if slot_numbers:
+            placeholders = ", ".join("?" for _ in slot_numbers)
+            where_clauses.append(f"slot IN ({placeholders})")
+            parameters.extend(slot_numbers)
+        scope_where = " AND ".join(where_clauses)
+
+        with closing(self._connect()) as connection:
+            slot_rows = connection.execute(
+                f"""
+                SELECT slot
+                FROM slot_state_current
+                WHERE {scope_where}
+                ORDER BY slot
+                """,
+                parameters,
+            ).fetchall()
+            for row in slot_rows:
+                slot = int(row["slot"])
+                payload_by_slot.setdefault(
+                    slot,
+                    {
+                        "events": [],
+                        "metrics": {
+                            metric_name: []
+                            for metric_name in metric_limits
+                        },
+                        "sample_counts": {},
+                        "latest_values": {},
+                    },
+                )
+
+            event_rows = connection.execute(
+                f"""
+                SELECT *
+                FROM (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY slot
+                            ORDER BY observed_at DESC, id DESC
+                        ) AS row_number
+                    FROM slot_events
+                    WHERE {scope_where}
+                )
+                WHERE row_number <= ?
+                ORDER BY slot, observed_at DESC, id DESC
+                """,
+                [*parameters, event_limit],
+            ).fetchall()
+            for row in event_rows:
+                item = dict(row)
+                slot = int(item["slot"])
+                item.pop("row_number", None)
+                payload_by_slot.setdefault(
+                    slot,
+                    {
+                        "events": [],
+                        "metrics": {
+                            metric_name: []
+                            for metric_name in metric_limits
+                        },
+                        "sample_counts": {},
+                        "latest_values": {},
+                    },
+                )["events"].append(item)
+
+            for metric_name, limit in metric_limits.items():
+                metric_rows = connection.execute(
+                    f"""
+                    SELECT *
+                    FROM (
+                        SELECT
+                            *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY slot, metric_name
+                                ORDER BY observed_at DESC, id DESC
+                            ) AS row_number
+                        FROM metric_samples
+                        WHERE {scope_where} AND metric_name = ?
+                    )
+                    WHERE row_number <= ?
+                    ORDER BY slot, observed_at DESC, id DESC
+                    """,
+                    [*parameters, metric_name, limit],
+                ).fetchall()
+                for row in metric_rows:
+                    item = dict(row)
+                    slot = int(item["slot"])
+                    item["value"] = item["value_integer"] if item["value_integer"] is not None else item["value_real"]
+                    item.pop("row_number", None)
+                    payload_by_slot.setdefault(
+                        slot,
+                        {
+                            "events": [],
+                            "metrics": {
+                                key: []
+                                for key in metric_limits
+                            },
+                            "sample_counts": {},
+                            "latest_values": {},
+                        },
+                    )["metrics"].setdefault(metric_name, []).append(item)
+
+        for slot, payload in payload_by_slot.items():
+            metrics = payload.setdefault("metrics", {})
+            for metric_name in metric_limits:
+                samples = metrics.setdefault(metric_name, [])
+                payload["sample_counts"][metric_name] = len(samples)
+                payload["latest_values"][metric_name] = samples[0]["value"] if samples else None
+
+        return payload_by_slot
+
     def list_scopes(self) -> list[dict[str, Any]]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
