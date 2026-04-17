@@ -73,6 +73,14 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - inspect `git status`
 - inspect the final commit set with `git log --oneline`
 - make a final release-prep commit if needed
+- preferred repo flow is:
+  - do release work on a `codex/` branch first
+  - push that branch as a safety checkpoint before the cut
+  - when satisfied, switch to `main` and merge locally with a release commit
+    such as `Release v0.8.0`
+  - tag the merged `main` commit, not the side branch tip
+- this repo does not require a PR to cut a release unless we explicitly decide
+  to use one for review
 - merge the release branch into `main` only when satisfied
 - create the annotated release tag after merge
 
@@ -82,6 +90,8 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - push the release tag
 - publish the repo `wiki/` pages if they changed
 - create the GitHub release notes from the final changelog section
+- if the GitHub plugin is available in Codex, prefer it for GitHub-side actions
+  like PRs, issues, or release-page prep
 
 ## After Release
 
