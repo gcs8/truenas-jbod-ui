@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import sqlite3
 import threading
 from contextlib import closing
@@ -193,6 +194,9 @@ class HistoryStore:
         *,
         snapshot_label: str | None = None,
         retention_count: int = 28,
+        long_term_backup_dir: str | Path | None = None,
+        weekly_retention_count: int = 0,
+        monthly_retention_count: int = 0,
     ) -> Path | None:
         backup_root = Path(backup_dir)
         backup_root.mkdir(parents=True, exist_ok=True)
@@ -207,6 +211,16 @@ class HistoryStore:
                     backup_connection.commit()
                 temp_path.replace(final_path)
                 self._prune_backup_snapshots(backup_root, retention_count)
+                try:
+                    self._promote_long_term_backups(
+                        final_path,
+                        snapshot_label=snapshot_label,
+                        long_term_backup_dir=long_term_backup_dir,
+                        weekly_retention_count=weekly_retention_count,
+                        monthly_retention_count=monthly_retention_count,
+                    )
+                except Exception as exc:  # noqa: BLE001 - best-effort archival path should not break local backup rotation.
+                    logger.warning("History long-term backup promotion failed for %s: %s", final_path, exc)
             finally:
                 if temp_path.exists():
                     temp_path.unlink(missing_ok=True)
@@ -215,15 +229,20 @@ class HistoryStore:
 
     @staticmethod
     def _backup_stamp(snapshot_label: str | None) -> str:
+        observed_at = HistoryStore._parse_snapshot_label(snapshot_label)
+        return observed_at.strftime("%Y%m%dT%H%M%SZ")
+
+    @staticmethod
+    def _parse_snapshot_label(snapshot_label: str | None) -> datetime:
         if snapshot_label:
             try:
                 observed_at = datetime.fromisoformat(snapshot_label)
                 if observed_at.tzinfo is None:
                     observed_at = observed_at.replace(tzinfo=timezone.utc)
-                return observed_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                return observed_at.astimezone(timezone.utc)
             except ValueError:
                 pass
-        return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return datetime.now(timezone.utc)
 
     def _prune_backup_snapshots(self, backup_root: Path, retention_count: int) -> None:
         if retention_count < 1:
@@ -231,6 +250,63 @@ class HistoryStore:
         snapshots = sorted(
             backup_root.glob(f"{self.file_path.stem}-*.sqlite3"),
             key=lambda candidate: candidate.stat().st_mtime,
+            reverse=True,
+        )
+        for stale_path in snapshots[retention_count:]:
+            stale_path.unlink(missing_ok=True)
+
+    def _promote_long_term_backups(
+        self,
+        source_backup_path: Path,
+        *,
+        snapshot_label: str | None,
+        long_term_backup_dir: str | Path | None,
+        weekly_retention_count: int,
+        monthly_retention_count: int,
+    ) -> None:
+        if not long_term_backup_dir:
+            return
+
+        observed_at = self._parse_snapshot_label(snapshot_label)
+        long_term_root = Path(long_term_backup_dir)
+        long_term_root.mkdir(parents=True, exist_ok=True)
+
+        if weekly_retention_count > 0:
+            iso_year, iso_week, _ = observed_at.isocalendar()
+            weekly_path = long_term_root / "weekly" / f"{self.file_path.stem}-weekly-{iso_year}-W{iso_week:02d}.sqlite3"
+            self._refresh_backup_copy(source_backup_path, weekly_path)
+            self._prune_named_backups(
+                weekly_path.parent,
+                f"{self.file_path.stem}-weekly-*.sqlite3",
+                weekly_retention_count,
+            )
+
+        if monthly_retention_count > 0:
+            monthly_path = long_term_root / "monthly" / f"{self.file_path.stem}-monthly-{observed_at:%Y-%m}.sqlite3"
+            self._refresh_backup_copy(source_backup_path, monthly_path)
+            self._prune_named_backups(
+                monthly_path.parent,
+                f"{self.file_path.stem}-monthly-*.sqlite3",
+                monthly_retention_count,
+            )
+
+    @staticmethod
+    def _refresh_backup_copy(source_backup_path: Path, target_path: Path) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = target_path.parent / f"{target_path.name}.tmp"
+        try:
+            shutil.copy2(source_backup_path, temp_path)
+            temp_path.replace(target_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _prune_named_backups(backup_root: Path, pattern: str, retention_count: int) -> None:
+        if retention_count < 1 or not backup_root.exists():
+            return
+        snapshots = sorted(
+            backup_root.glob(pattern),
+            key=lambda candidate: candidate.name,
             reverse=True,
         )
         for stale_path in snapshots[retention_count:]:

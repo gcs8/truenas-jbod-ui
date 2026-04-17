@@ -8,6 +8,7 @@ import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,21 @@ PARTIAL_ID_PATH_KEYS = {
     "uuid",
     "enclosure_identifier",
 }
+ROLLUP_INTERVAL_CHOICES_SECONDS = (
+    300,
+    900,
+    1800,
+    3600,
+    7200,
+    10800,
+    14400,
+    21600,
+    43200,
+    86400,
+    172800,
+    604800,
+)
+TEMPERATURE_METRIC_NAMES = {"temperature_c"}
 
 
 @dataclass(slots=True)
@@ -47,6 +63,7 @@ class RenderedSnapshotExport:
     size_bytes: int
     snapshot: InventorySnapshot
     history_cache: dict[str, dict[str, Any]]
+    smart_summary_cache: dict[str, dict[str, Any]]
     history_available: bool
     export_meta: dict[str, Any]
     history_summary: dict[str, Any]
@@ -80,13 +97,19 @@ class SnapshotExportTooLargeError(RuntimeError):
 
 
 class SnapshotRedactor:
-    def __init__(self, snapshot: InventorySnapshot, history_cache: dict[str, dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        snapshot: InventorySnapshot,
+        history_cache: dict[str, dict[str, Any]],
+        smart_summary_cache: dict[str, dict[str, Any]],
+    ) -> None:
         self.serial_values: list[str] = []
         self.partial_identifier_values: list[str] = []
         self.system_aliases = self._build_system_aliases(snapshot)
         self.enclosure_aliases = self._build_enclosure_aliases(snapshot)
         self._collect_known_values(snapshot.model_dump(mode="json"))
         self._collect_known_values(history_cache)
+        self._collect_known_values(smart_summary_cache)
         self.serial_suffix_counts = Counter(self._serial_suffix(value) for value in self.serial_values if self._serial_suffix(value))
         self.token_replacements = self._build_token_replacements()
 
@@ -96,6 +119,9 @@ class SnapshotRedactor:
 
     def redact_history_cache(self, history_cache: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         return self.redact_object(history_cache)
+
+    def redact_smart_summary_cache(self, smart_summary_cache: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        return self.redact_object(smart_summary_cache)
 
     def redact_object(self, value: Any, path: tuple[Any, ...] = ()) -> Any:
         if isinstance(value, dict):
@@ -306,8 +332,10 @@ class SnapshotExportService:
         *,
         request: Request,
         snapshot: InventorySnapshot,
+        smart_summary_cache: dict[str, dict[str, Any]] | None = None,
         selected_slot: int | None,
         history_window_hours: int | None,
+        history_panel_open: bool = False,
         io_chart_mode: str,
         redact_sensitive: bool = False,
         packaging: str = "auto",
@@ -316,8 +344,10 @@ class SnapshotExportService:
         rendered = await self.build_enclosure_snapshot_html(
             request=request,
             snapshot=snapshot,
+            smart_summary_cache=smart_summary_cache,
             selected_slot=selected_slot,
             history_window_hours=history_window_hours,
+            history_panel_open=history_panel_open,
             io_chart_mode=io_chart_mode,
             redact_sensitive=redact_sensitive,
             requested_packaging=packaging,
@@ -395,13 +425,82 @@ class SnapshotExportService:
             size_limit_bytes=self.size_limit_bytes,
         )
 
+    async def estimate_enclosure_snapshot_export(
+        self,
+        *,
+        request: Request,
+        snapshot: InventorySnapshot,
+        smart_summary_cache: dict[str, dict[str, Any]] | None = None,
+        selected_slot: int | None,
+        history_window_hours: int | None,
+        history_panel_open: bool = False,
+        io_chart_mode: str,
+        redact_sensitive: bool = False,
+        packaging: str = "auto",
+        allow_oversize: bool = False,
+    ) -> dict[str, Any]:
+        rendered = await self.build_enclosure_snapshot_html(
+            request=request,
+            snapshot=snapshot,
+            smart_summary_cache=smart_summary_cache,
+            selected_slot=selected_slot,
+            history_window_hours=history_window_hours,
+            history_panel_open=history_panel_open,
+            io_chart_mode=io_chart_mode,
+            redact_sensitive=redact_sensitive,
+            requested_packaging=packaging,
+        )
+        html_bytes = rendered.html.encode("utf-8")
+        html_size_bytes = len(html_bytes)
+        zip_size_bytes = len(self._build_zip_archive(rendered.filename, html_bytes))
+        normalized_packaging = self._normalize_packaging(packaging)
+        auto_packaging = self._determine_auto_packaging(html_size_bytes, zip_size_bytes)
+        effective_packaging = self._determine_estimated_packaging(
+            requested_packaging=normalized_packaging,
+            auto_packaging=auto_packaging,
+            allow_oversize=allow_oversize,
+        )
+        selected_size_bytes = self._size_for_packaging(effective_packaging, html_size_bytes, zip_size_bytes)
+        selected_within_limit = selected_size_bytes is not None and selected_size_bytes <= self.size_limit_bytes
+        selected_allowed = bool(selected_size_bytes is not None and (selected_within_limit or allow_oversize))
+        return {
+            "ok": True,
+            "scope_label": rendered.export_meta.get("scope_label"),
+            "selected_slot": rendered.export_meta.get("selected_slot"),
+            "html_size_bytes": html_size_bytes,
+            "html_size_label": format_bytes(html_size_bytes),
+            "html_within_limit": html_size_bytes <= self.size_limit_bytes,
+            "zip_size_bytes": zip_size_bytes,
+            "zip_size_label": format_bytes(zip_size_bytes),
+            "zip_within_limit": zip_size_bytes <= self.size_limit_bytes,
+            "selected_packaging": normalized_packaging,
+            "effective_packaging": effective_packaging,
+            "selected_size_bytes": selected_size_bytes,
+            "selected_size_label": format_bytes(selected_size_bytes) if selected_size_bytes is not None else None,
+            "selected_within_limit": selected_within_limit,
+            "selected_allowed": selected_allowed,
+            "auto_packaging": auto_packaging,
+            "auto_within_limit": auto_packaging in {"html", "zip"},
+            "size_limit_bytes": self.size_limit_bytes,
+            "size_limit_label": format_bytes(self.size_limit_bytes),
+            "redaction": rendered.export_meta.get("redaction"),
+            "redaction_label": rendered.export_meta.get("redaction_label"),
+            "downsampling_label": rendered.export_meta.get("downsampling_label"),
+            "downsampling_note": rendered.export_meta.get("downsampling_note"),
+            "metric_sample_count": rendered.export_meta.get("metric_sample_count"),
+            "event_count": rendered.export_meta.get("event_count"),
+            "allow_oversize": allow_oversize,
+        }
+
     async def build_enclosure_snapshot_html(
         self,
         *,
         request: Request,
         snapshot: InventorySnapshot,
+        smart_summary_cache: dict[str, dict[str, Any]] | None = None,
         selected_slot: int | None,
         history_window_hours: int | None,
+        history_panel_open: bool = False,
         io_chart_mode: str,
         redact_sensitive: bool = False,
         requested_packaging: str = "auto",
@@ -411,83 +510,365 @@ class SnapshotExportService:
         normalized_chart_mode = "average" if io_chart_mode == "average" else "total"
         generated_at = datetime.now(timezone.utc)
 
-        history_cache = await self._collect_slot_histories(snapshot)
-        snapshot_for_export = snapshot
-        history_cache_for_export = history_cache
-        if redact_sensitive:
-            redactor = SnapshotRedactor(snapshot, history_cache)
-            snapshot_for_export = redactor.redact_snapshot(snapshot)
-            history_cache_for_export = redactor.redact_history_cache(history_cache)
-
-        tracked_slots = sum(1 for payload in history_cache_for_export.values() if payload.get("available"))
-        metric_sample_count = sum(
-            len(samples)
-            for payload in history_cache_for_export.values()
-            for samples in (payload.get("metrics") or {}).values()
-        )
-        history_available = tracked_slots > 0
-
-        export_meta = {
-            "generated_at": generated_at.isoformat(),
-            "app_version": __version__,
-            "scope_kind": "enclosure",
-            "scope_label": snapshot_for_export.selected_enclosure_label or snapshot_for_export.selected_enclosure_id or "Current Enclosure",
-            "system_label": snapshot_for_export.selected_system_label,
-            "history_window_hours": normalized_window_hours,
-            "history_window_label": self._format_history_window_label(normalized_window_hours),
-            "history_available": history_available,
-            "tracked_slots": tracked_slots,
-            "metric_sample_count": metric_sample_count,
-            "selected_slot": normalized_slot,
-            "io_chart_mode": normalized_chart_mode,
-            "requested_packaging": self._normalize_packaging(requested_packaging),
-            "redaction": "redacted" if redact_sensitive else "full",
-            "offline": True,
-            "size_limit_bytes": self.size_limit_bytes,
-            "size_limit_label": format_bytes(self.size_limit_bytes),
+        raw_history_cache = await self._collect_slot_histories(snapshot)
+        base_smart_summary_cache = {
+            str(slot_number): summary
+            for slot_number, summary in (smart_summary_cache or {}).items()
         }
-        history_summary = {
-            "counts": {
+        template = self.templates.env.get_template("index.html")
+        rendered_candidate: RenderedSnapshotExport | None = None
+        for strategy in self._build_downsampling_strategies():
+            history_cache_for_export, downsampling_meta = self._prepare_history_cache_for_export(
+                raw_history_cache,
+                history_window_hours=normalized_window_hours,
+                reference_time=generated_at,
+                target_points_per_series=strategy["target_points_per_series"],
+                max_events_per_slot=strategy["max_events_per_slot"],
+            )
+            smart_summary_cache_for_export = dict(base_smart_summary_cache)
+            snapshot_for_export = snapshot
+            if redact_sensitive:
+                redactor = SnapshotRedactor(snapshot, history_cache_for_export, smart_summary_cache_for_export)
+                snapshot_for_export = redactor.redact_snapshot(snapshot)
+                history_cache_for_export = redactor.redact_history_cache(history_cache_for_export)
+                history_cache_for_export = self._rekey_history_cache(history_cache_for_export)
+                smart_summary_cache_for_export = redactor.redact_smart_summary_cache(smart_summary_cache_for_export)
+
+            tracked_slots = sum(1 for payload in history_cache_for_export.values() if payload.get("available"))
+            metric_sample_count = sum(
+                len(samples)
+                for payload in history_cache_for_export.values()
+                for samples in (payload.get("metrics") or {}).values()
+            )
+            smart_summary_count = sum(1 for payload in smart_summary_cache_for_export.values() if payload)
+            event_count = sum(len(payload.get("events") or []) for payload in history_cache_for_export.values())
+            history_available = tracked_slots > 0
+            redaction_level = "partial" if redact_sensitive else "none"
+            redaction_label = "Partial" if redact_sensitive else "None"
+            redaction_note = (
+                "Host aliases and partial identifier masking applied"
+                if redact_sensitive
+                else "Original identifiers included"
+            )
+
+            export_meta = {
+                "generated_at": generated_at.isoformat(),
+                "app_version": __version__,
+                "scope_kind": "enclosure",
+                "scope_label": snapshot_for_export.selected_enclosure_label or snapshot_for_export.selected_enclosure_id or "Current Enclosure",
+                "system_label": snapshot_for_export.selected_system_label,
+                "history_window_hours": normalized_window_hours,
+                "history_window_label": self._format_history_window_label(normalized_window_hours),
+                "history_available": history_available,
                 "tracked_slots": tracked_slots,
                 "metric_sample_count": metric_sample_count,
-            },
-            "collector": {
-                "last_completed_at": generated_at.isoformat(),
-            },
-        }
+                "smart_summary_count": smart_summary_count,
+                "event_count": event_count,
+                "selected_slot": normalized_slot,
+                "io_chart_mode": normalized_chart_mode,
+                "requested_packaging": self._normalize_packaging(requested_packaging),
+                "redaction": redaction_level,
+                "redaction_label": redaction_label,
+                "redaction_note": redaction_note,
+                "downsampling_label": downsampling_meta["label"],
+                "downsampling_note": downsampling_meta["note"],
+                "offline": True,
+                "size_limit_bytes": self.size_limit_bytes,
+                "size_limit_label": format_bytes(self.size_limit_bytes),
+            }
+            history_summary = {
+                "counts": {
+                    "tracked_slots": tracked_slots,
+                    "metric_sample_count": metric_sample_count,
+                    "smart_summary_count": smart_summary_count,
+                    "event_count": event_count,
+                },
+                "collector": {
+                    "last_completed_at": generated_at.isoformat(),
+                },
+            }
 
-        context = {
-            "request": request,
-            "snapshot": snapshot_for_export,
-            "settings": self.settings,
-            "initial_snapshot_json": json.dumps(snapshot_for_export.model_dump(mode="json")),
-            "history_configured": history_available,
-            "snapshot_mode": True,
-            "snapshot_export_meta": export_meta,
-            "snapshot_export_meta_json": json.dumps(export_meta),
-            "preloaded_history_json": json.dumps(history_cache_for_export),
-            "preloaded_history_summary_json": json.dumps(history_summary),
-            "initial_selected_slot_json": json.dumps(normalized_slot),
-            "initial_history_timeframe_hours_json": json.dumps(normalized_window_hours),
-            "initial_history_panel_open_json": json.dumps(bool(normalized_slot is not None and history_available)),
-            "initial_history_io_chart_mode_json": json.dumps(normalized_chart_mode),
-        }
+            context = {
+                "request": request,
+                "snapshot": snapshot_for_export,
+                "settings": self.settings,
+                "initial_snapshot_json": json.dumps(snapshot_for_export.model_dump(mode="json")),
+                "history_configured": history_available,
+                "snapshot_mode": True,
+                "snapshot_export_meta": export_meta,
+                "snapshot_export_meta_json": json.dumps(export_meta),
+                "preloaded_history_json": json.dumps(history_cache_for_export),
+                "preloaded_smart_summary_json": json.dumps(smart_summary_cache_for_export),
+                "preloaded_history_summary_json": json.dumps(history_summary),
+                "initial_selected_slot_json": json.dumps(normalized_slot),
+                "initial_history_timeframe_hours_json": json.dumps(normalized_window_hours),
+                "initial_history_panel_open_json": json.dumps(
+                    bool(history_panel_open and normalized_slot is not None and history_available)
+                ),
+                "initial_history_io_chart_mode_json": json.dumps(normalized_chart_mode),
+            }
 
-        template = self.templates.env.get_template("index.html")
-        html = template.render(context)
-        html = self._inline_static_assets(request, html)
+            html = self._inline_static_assets(request, template.render(context))
+            filename = self._build_filename(snapshot_for_export, generated_at)
+            rendered_candidate = RenderedSnapshotExport(
+                filename=filename,
+                html=html,
+                size_bytes=len(html.encode("utf-8")),
+                snapshot=snapshot_for_export,
+                history_cache=history_cache_for_export,
+                smart_summary_cache=smart_summary_cache_for_export,
+                history_available=history_available,
+                export_meta=export_meta,
+                history_summary=history_summary,
+            )
+            if rendered_candidate.size_bytes <= self.size_limit_bytes:
+                break
 
-        filename = self._build_filename(snapshot_for_export, generated_at)
-        return RenderedSnapshotExport(
-            filename=filename,
-            html=html,
-            size_bytes=len(html.encode("utf-8")),
-            snapshot=snapshot_for_export,
-            history_cache=history_cache_for_export,
-            history_available=history_available,
-            export_meta=export_meta,
-            history_summary=history_summary,
+        if rendered_candidate is None:
+            raise RuntimeError("Unable to render enclosure snapshot export.")
+        return rendered_candidate
+
+    @staticmethod
+    def _build_downsampling_strategies() -> list[dict[str, int | None]]:
+        return [
+            {"target_points_per_series": None, "max_events_per_slot": None},
+            {"target_points_per_series": 96, "max_events_per_slot": 50},
+            {"target_points_per_series": 48, "max_events_per_slot": 25},
+            {"target_points_per_series": 24, "max_events_per_slot": 10},
+        ]
+
+    def _prepare_history_cache_for_export(
+        self,
+        raw_history_cache: dict[str, dict[str, Any]],
+        *,
+        history_window_hours: int | None,
+        reference_time: datetime,
+        target_points_per_series: int | None,
+        max_events_per_slot: int | None,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        prepared_cache: dict[str, dict[str, Any]] = {}
+        rollup_seconds_used = 0
+        metric_rollup_applied = False
+        event_trim_applied = False
+
+        for cache_key, payload in raw_history_cache.items():
+            metrics: dict[str, list[dict[str, Any]]] = {}
+            for metric_name, raw_samples in (payload.get("metrics") or {}).items():
+                filtered_samples = self._filter_history_samples_for_window(
+                    raw_samples,
+                    history_window_hours=history_window_hours,
+                    reference_time=reference_time,
+                )
+                rolled_samples, rollup_seconds, changed = self._downsample_metric_samples(
+                    metric_name,
+                    filtered_samples,
+                    target_points_per_series=target_points_per_series,
+                )
+                metrics[metric_name] = rolled_samples
+                metric_rollup_applied = metric_rollup_applied or changed
+                rollup_seconds_used = max(rollup_seconds_used, rollup_seconds or 0)
+
+            filtered_events = self._filter_history_events_for_window(
+                payload.get("events") or [],
+                history_window_hours=history_window_hours,
+                reference_time=reference_time,
+            )
+            exported_events = filtered_events
+            if max_events_per_slot is not None and len(filtered_events) > max_events_per_slot:
+                exported_events = filtered_events[-max_events_per_slot:]
+                event_trim_applied = True
+
+            exported_payload = dict(payload)
+            exported_payload["metrics"] = metrics
+            exported_payload["events"] = exported_events
+            exported_payload["sample_counts"] = {
+                metric_name: len(samples)
+                for metric_name, samples in metrics.items()
+            }
+            exported_payload["latest_values"] = {
+                metric_name: self._history_sample_value(samples[-1]) if samples else None
+                for metric_name, samples in metrics.items()
+            }
+            prepared_cache[cache_key] = exported_payload
+
+        return prepared_cache, self._build_downsampling_meta(
+            history_window_hours=history_window_hours,
+            rollup_seconds=rollup_seconds_used or None,
+            metric_rollup_applied=metric_rollup_applied,
+            event_trim_applied=event_trim_applied,
+            max_events_per_slot=max_events_per_slot,
         )
+
+    def _build_downsampling_meta(
+        self,
+        *,
+        history_window_hours: int | None,
+        rollup_seconds: int | None,
+        metric_rollup_applied: bool,
+        event_trim_applied: bool,
+        max_events_per_slot: int | None,
+    ) -> dict[str, str]:
+        if not metric_rollup_applied and not event_trim_applied:
+            return {
+                "label": "None",
+                "note": "No rollups or downsampling applied",
+            }
+
+        note_parts: list[str] = []
+        if history_window_hours is not None:
+            note_parts.append(f"Filtered to the exported {self._format_history_window_label(history_window_hours)} window")
+        if metric_rollup_applied and rollup_seconds:
+            label = f"{self._format_rollup_interval_label(rollup_seconds)} rollups"
+            note_parts.append(f"Metric samples grouped into {label.lower()}")
+        else:
+            label = "Event cap"
+        if event_trim_applied and max_events_per_slot is not None:
+            note_parts.append(f"Recent events limited to {max_events_per_slot} per slot")
+
+        return {
+            "label": label,
+            "note": ". ".join(note_parts) + ".",
+        }
+
+    def _filter_history_samples_for_window(
+        self,
+        samples: list[dict[str, Any]],
+        *,
+        history_window_hours: int | None,
+        reference_time: datetime,
+    ) -> list[dict[str, Any]]:
+        ordered = sorted(
+            samples,
+            key=lambda sample: self._history_timestamp(sample) or datetime.min.replace(tzinfo=timezone.utc),
+        )
+        if history_window_hours is None:
+            return ordered
+        cutoff = reference_time.timestamp() - (history_window_hours * 3600)
+        before_cutoff: list[dict[str, Any]] = []
+        within_window: list[dict[str, Any]] = []
+        for sample in ordered:
+            timestamp = self._history_timestamp(sample)
+            if timestamp is None:
+                continue
+            if timestamp.timestamp() < cutoff:
+                before_cutoff.append(sample)
+            else:
+                within_window.append(sample)
+        if before_cutoff:
+            return [before_cutoff[-1], *within_window]
+        return within_window
+
+    def _filter_history_events_for_window(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        history_window_hours: int | None,
+        reference_time: datetime,
+    ) -> list[dict[str, Any]]:
+        ordered = sorted(
+            events,
+            key=lambda event: self._history_timestamp(event) or datetime.min.replace(tzinfo=timezone.utc),
+        )
+        if history_window_hours is None:
+            return ordered
+        cutoff = reference_time.timestamp() - (history_window_hours * 3600)
+        return [
+            event
+            for event in ordered
+            if (timestamp := self._history_timestamp(event)) is not None and timestamp.timestamp() >= cutoff
+        ]
+
+    def _downsample_metric_samples(
+        self,
+        metric_name: str,
+        samples: list[dict[str, Any]],
+        *,
+        target_points_per_series: int | None,
+    ) -> tuple[list[dict[str, Any]], int | None, bool]:
+        ordered = [
+            sample for sample in samples
+            if self._history_timestamp(sample) is not None and self._history_sample_value(sample) is not None
+        ]
+        if target_points_per_series is None or len(ordered) <= target_points_per_series:
+            return ordered, None, False
+
+        first_timestamp = self._history_timestamp(ordered[0])
+        last_timestamp = self._history_timestamp(ordered[-1])
+        if first_timestamp is None or last_timestamp is None:
+            return ordered, None, False
+        span_seconds = max(1, int((last_timestamp - first_timestamp).total_seconds()))
+        bucket_seconds = self._select_rollup_interval_seconds(span_seconds, target_points_per_series)
+        buckets: dict[int, list[dict[str, Any]]] = {}
+        for sample in ordered:
+            timestamp = self._history_timestamp(sample)
+            if timestamp is None:
+                continue
+            bucket_key = int(timestamp.timestamp()) // bucket_seconds
+            buckets.setdefault(bucket_key, []).append(sample)
+
+        aggregated = [
+            self._aggregate_metric_bucket(metric_name, bucket_samples)
+            for _, bucket_samples in sorted(buckets.items())
+        ]
+        return aggregated, bucket_seconds, len(aggregated) < len(ordered)
+
+    def _aggregate_metric_bucket(self, metric_name: str, bucket_samples: list[dict[str, Any]]) -> dict[str, Any]:
+        representative = dict(bucket_samples[-1])
+        representative["rolled_up"] = True
+        representative["rollup_count"] = len(bucket_samples)
+        if metric_name in TEMPERATURE_METRIC_NAMES:
+            numeric_values = [
+                float(value)
+                for sample in bucket_samples
+                if (value := self._history_sample_value(sample)) is not None
+            ]
+            if numeric_values:
+                averaged_value = round(sum(numeric_values) / len(numeric_values))
+                representative["value"] = averaged_value
+                if "value_integer" in representative:
+                    representative["value_integer"] = averaged_value
+                if "value_real" in representative:
+                    representative["value_real"] = None
+        return representative
+
+    @staticmethod
+    def _history_sample_value(sample: dict[str, Any]) -> Any:
+        if "value" in sample:
+            return sample.get("value")
+        if sample.get("value_integer") is not None:
+            return sample.get("value_integer")
+        return sample.get("value_real")
+
+    @staticmethod
+    def _history_timestamp(item: dict[str, Any]) -> datetime | None:
+        observed_at = item.get("observed_at")
+        if not observed_at:
+            return None
+        try:
+            return datetime.fromisoformat(str(observed_at))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _select_rollup_interval_seconds(span_seconds: int, target_points_per_series: int) -> int:
+        desired_interval = max(60, ceil(span_seconds / max(1, target_points_per_series)))
+        for candidate in ROLLUP_INTERVAL_CHOICES_SECONDS:
+            if candidate >= desired_interval:
+                return candidate
+        return desired_interval
+
+    @staticmethod
+    def _format_rollup_interval_label(interval_seconds: int) -> str:
+        if interval_seconds % 86400 == 0:
+            days = interval_seconds // 86400
+            return f"~{days}d"
+        if interval_seconds % 3600 == 0:
+            hours = interval_seconds // 3600
+            return f"~{hours}h"
+        if interval_seconds % 60 == 0:
+            minutes = interval_seconds // 60
+            return f"~{minutes}m"
+        return f"~{interval_seconds}s"
 
     async def _collect_slot_histories(self, snapshot: InventorySnapshot) -> dict[str, dict[str, Any]]:
         if not self.history_backend.configured:
@@ -495,6 +876,21 @@ class SnapshotExportService:
 
         system_id = snapshot.selected_system_id
         enclosure_id = snapshot.selected_enclosure_id
+        get_status = getattr(self.history_backend, "get_status", None)
+        if callable(get_status):
+            status = await get_status()
+            if not status.get("available"):
+                detail = status.get("detail") or "History backend is unavailable."
+                return {
+                    self._build_history_cache_key(system_id, enclosure_id, slot.slot): self._build_unavailable_history_payload(
+                        slot=slot.slot,
+                        system_id=system_id,
+                        enclosure_id=enclosure_id,
+                        detail=detail,
+                    )
+                    for slot in snapshot.slots
+                }
+
         semaphore = asyncio.Semaphore(EXPORT_HISTORY_CONCURRENCY)
 
         async def fetch(slot_number: int) -> tuple[str, dict[str, Any]]:
@@ -504,6 +900,27 @@ class SnapshotExportService:
 
         results = await asyncio.gather(*(fetch(slot.slot) for slot in snapshot.slots))
         return {key: payload for key, payload in results}
+
+    @staticmethod
+    def _build_unavailable_history_payload(
+        *,
+        slot: int,
+        system_id: str | None,
+        enclosure_id: str | None,
+        detail: str,
+    ) -> dict[str, Any]:
+        return {
+            "configured": True,
+            "available": False,
+            "detail": detail,
+            "slot": slot,
+            "system_id": system_id,
+            "enclosure_id": enclosure_id,
+            "metrics": {},
+            "events": [],
+            "sample_counts": {},
+            "latest_values": {},
+        }
 
     def _inline_static_assets(self, request: Request, html: str) -> str:
         inline_css = (STATIC_DIR / "style.css").read_text(encoding="utf-8")
@@ -529,6 +946,54 @@ class SnapshotExportService:
         with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
             archive.writestr(html_filename, html_content)
         return buffer.getvalue()
+
+    @classmethod
+    def _rekey_history_cache(cls, history_cache: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        rekeyed: dict[str, dict[str, Any]] = {}
+        for original_key, payload in history_cache.items():
+            slot_number = payload.get("slot")
+            if not isinstance(slot_number, int):
+                rekeyed[original_key] = payload
+                continue
+            cache_key = cls._build_history_cache_key(
+                payload.get("system_id"),
+                payload.get("enclosure_id"),
+                slot_number,
+            )
+            rekeyed[cache_key] = payload
+        return rekeyed
+
+    def _determine_auto_packaging(self, html_size_bytes: int, zip_size_bytes: int) -> str:
+        if html_size_bytes <= self.size_limit_bytes:
+            return "html"
+        if zip_size_bytes <= self.size_limit_bytes:
+            return "zip"
+        return "oversize"
+
+    @staticmethod
+    def _size_for_packaging(packaging: str, html_size_bytes: int, zip_size_bytes: int) -> int | None:
+        if packaging == "html":
+            return html_size_bytes
+        if packaging == "zip":
+            return zip_size_bytes
+        return None
+
+    @staticmethod
+    def _determine_estimated_packaging(
+        *,
+        requested_packaging: str,
+        auto_packaging: str,
+        allow_oversize: bool,
+    ) -> str | None:
+        if requested_packaging == "html":
+            return "html"
+        if requested_packaging == "zip":
+            return "zip"
+        if auto_packaging in {"html", "zip"}:
+            return auto_packaging
+        if allow_oversize:
+            return "zip"
+        return None
 
     @staticmethod
     def _replace_once(content: str, needle: str, replacement: str) -> str:

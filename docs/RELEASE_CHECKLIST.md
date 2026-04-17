@@ -30,13 +30,32 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 
 - regenerate tracked screenshots:
   - `python scripts/capture_readme_screenshots.py`
+  - `python scripts/capture_history_export_screenshots.py`
 - verify output in `docs/images/screenshots/`
 - confirm README image references point at the current release filenames
+- if the release changes operator-facing workflows beyond the README overview,
+  capture and stage manual screenshots in `docs/images/screenshots/` before the
+  tag is cut
+- for `0.8.0`, capture at least:
+  - history drawer open on a populated slot with temperature plus read/write
+    history visible
+  - export snapshot dialog with live size estimate visible
+  - offline snapshot HTML opened locally with the frozen banner visible
+- use release-style filenames for those manual captures, for example:
+  - `history-drawer-v0.8.0.png`
+  - `snapshot-export-dialog-v0.8.0.png`
+  - `offline-snapshot-v0.8.0.png`
+- decide whether each new screenshot is:
+  - README-facing and should replace or extend repo image references
+  - wiki-facing only and should still be staged in-repo before wiki publish
+- if the docs mention degraded history behavior, capture one optional
+  history-unavailable state before release as reference material
 
 ## Release Notes And Docs
 
 - bump `app/__init__.py` to the release version
 - add the release section to `CHANGELOG.md`
+- refresh any checked-in draft release-notes file if the repo is using one
 - review `README.md` for stale version or milestone wording
 - review `docs/ROADMAP.md` for stale "current direction" text
 - review profile/config docs for dead or outdated comments

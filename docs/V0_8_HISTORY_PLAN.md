@@ -146,3 +146,22 @@ Phase 3:
 - downsampling / rollups if operators keep long histories
 - optional export of slot event timelines
 
+## Release Prep Notes
+
+Before cutting `0.8.0`, refresh the release checklist screenshot pass so the
+new operator-visible flows are captured in-repo before any wiki publish.
+
+Recommended manual screenshot set:
+
+- populated slot with the history drawer open
+- export snapshot dialog with the live estimate cards visible
+- frozen offline snapshot HTML opened locally
+
+Suggested release filenames:
+
+- `history-drawer-v0.8.0.png`
+- `snapshot-export-dialog-v0.8.0.png`
+- `offline-snapshot-v0.8.0.png`
+
+If the release notes or wiki call out degraded optional-history behavior, keep
+one extra screenshot of the history-unavailable state as reference material.

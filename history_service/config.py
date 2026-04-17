@@ -16,6 +16,9 @@ class HistorySettings(BaseModel):
     sqlite_path: str = "/app/history/history.db"
     backup_dir: str = "/app/history/backups"
     backup_retention_count: int = 28
+    long_term_backup_dir: str | None = "/app/history/backups/long-term"
+    weekly_backup_retention_count: int = 4
+    monthly_backup_retention_count: int = 3
     poll_interval_seconds: int = 300
     fast_interval_seconds: int = 300
     slow_interval_seconds: int = 21600
@@ -31,6 +34,9 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_SQLITE_PATH": "sqlite_path",
     "HISTORY_BACKUP_DIR": "backup_dir",
     "HISTORY_BACKUP_RETENTION_COUNT": "backup_retention_count",
+    "HISTORY_LONG_TERM_BACKUP_DIR": "long_term_backup_dir",
+    "HISTORY_WEEKLY_BACKUP_RETENTION_COUNT": "weekly_backup_retention_count",
+    "HISTORY_MONTHLY_BACKUP_RETENTION_COUNT": "monthly_backup_retention_count",
     "HISTORY_POLL_INTERVAL_SECONDS": "poll_interval_seconds",
     "HISTORY_FAST_INTERVAL_SECONDS": "fast_interval_seconds",
     "HISTORY_SLOW_INTERVAL_SECONDS": "slow_interval_seconds",
@@ -64,4 +70,6 @@ def get_history_settings() -> HistorySettings:
     settings = HistorySettings.model_validate(payload)
     Path(settings.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.backup_dir).mkdir(parents=True, exist_ok=True)
+    if settings.long_term_backup_dir:
+        Path(settings.long_term_backup_dir).mkdir(parents=True, exist_ok=True)
     return settings

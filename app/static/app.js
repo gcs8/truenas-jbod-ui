@@ -7,11 +7,25 @@
   const SMART_PREFETCH_BATCH_CONCURRENCY = 2;
   const SMART_PREFETCH_STALE_MS = 15000;
   const DEFAULT_HISTORY_TIMEFRAME_HOURS = 24;
+  const HISTORY_UI_STORAGE_KEY = "truenas-jbod-ui.history-ui.v1";
+  const EXPORT_UI_STORAGE_KEY = "truenas-jbod-ui.export-ui.v1";
   const snapshotMode = Boolean(bootstrap.snapshotMode);
+  const persistedHistoryUi = snapshotMode ? null : loadStoredJson(HISTORY_UI_STORAGE_KEY);
+  const persistedExportUi = snapshotMode ? null : loadStoredJson(EXPORT_UI_STORAGE_KEY);
   const initialHistoryWindowHours = bootstrap.initialHistoryTimeframeHours === null
     ? null
     : Number(bootstrap.initialHistoryTimeframeHours) || DEFAULT_HISTORY_TIMEFRAME_HOURS;
+  const restoredHistoryWindowHours = snapshotMode
+    ? initialHistoryWindowHours
+    : normalizePersistedHistoryWindowHours(
+        persistedHistoryUi?.timeframeHours,
+        initialHistoryWindowHours
+      );
+  const restoredHistoryIoChartMode = snapshotMode
+    ? (bootstrap.initialHistoryIoChartMode === "average" ? "average" : "total")
+    : normalizePersistedIoChartMode(persistedHistoryUi?.ioChartMode);
   const preloadedHistoryBySlot = bootstrap.preloadedHistoryBySlot || {};
+  const preloadedSmartSummariesBySlot = bootstrap.preloadedSmartSummariesBySlot || {};
   const preloadedHistorySummary = bootstrap.preloadedHistorySummary || { counts: {}, collector: {} };
   const snapshotHistoryAvailable = Boolean(bootstrap.historyConfigured);
   const initialSelectedSlot = Number.isInteger(bootstrap.initialSelectedSlot)
@@ -31,16 +45,23 @@
     refreshIntervalSeconds: supportedRefreshIntervals.includes(bootstrapRefreshInterval) ? bootstrapRefreshInterval : 30,
     timerId: null,
     smartSummaries: {},
+    preloadedSmartSummariesBySlot,
     smartSummaryGeneration: 0,
     smartPrefetchToken: 0,
     smartPrefetchTimerId: null,
     smartPrefetchRunning: false,
     smartPrefetchScopeKey: null,
     export: {
-      redactSensitive: false,
-      packaging: "auto",
-      allowOversize: false,
+      redactSensitive: Boolean(persistedExportUi?.redactSensitive),
+      packaging: normalizePersistedPackaging(persistedExportUi?.packaging),
+      allowOversize: Boolean(persistedExportUi?.allowOversize),
       running: false,
+      estimate: {
+        loading: false,
+        error: null,
+        data: null,
+        requestToken: 0,
+      },
     },
     history: {
       configured: snapshotMode ? snapshotHistoryAvailable : Boolean(bootstrap.historyConfigured),
@@ -51,8 +72,8 @@
       counts: snapshotMode ? (preloadedHistorySummary.counts || {}) : {},
       collector: snapshotMode ? (preloadedHistorySummary.collector || {}) : {},
       panelOpen: snapshotMode ? Boolean(bootstrap.initialHistoryPanelOpen) : false,
-      timeframeHours: initialHistoryWindowHours,
-      ioChartMode: bootstrap.initialHistoryIoChartMode === "average" ? "average" : "total",
+      timeframeHours: restoredHistoryWindowHours,
+      ioChartMode: restoredHistoryIoChartMode,
       panelLoading: false,
       panelError: null,
       slotCache: preloadedHistoryBySlot,
@@ -87,6 +108,9 @@
   const enclosureSelect = document.getElementById("enclosure-select");
   const lastUpdated = document.getElementById("last-updated");
   const timezoneLabel = document.getElementById("timezone-label");
+  const snapshotGeneratedValue = document.getElementById("snapshot-generated-value");
+  const snapshotGeneratedNote = document.getElementById("snapshot-generated-note");
+  const snapshotStatusChip = document.getElementById("snapshot-status-chip");
   const apiStatusChip = document.getElementById("api-status-chip");
   const sshStatusChip = document.getElementById("ssh-status-chip");
   const historyStatusChip = document.getElementById("history-status-chip");
@@ -112,6 +136,8 @@
   const exportSnapshotConfirm = document.getElementById("export-snapshot-confirm");
   const exportSnapshotCancel = document.getElementById("export-snapshot-cancel");
   const exportSnapshotNote = document.getElementById("export-snapshot-note");
+  const exportSnapshotWindowHint = document.getElementById("export-snapshot-window-hint");
+  const exportSnapshotEstimate = document.getElementById("export-snapshot-estimate");
   const historyToggleButton = document.getElementById("history-toggle-button");
   const detailHistoryPanel = document.getElementById("detail-history-panel");
   const historyDrawerTitle = document.getElementById("history-drawer-title");
@@ -449,6 +475,21 @@
     }
   }
 
+  function renderSnapshotBanner() {
+    if (!snapshotGeneratedValue || !state.snapshotMode) {
+      return;
+    }
+    const generatedAt = state.snapshotExportMeta?.generated_at || state.snapshot?.last_updated || null;
+    snapshotGeneratedValue.textContent = generatedAt ? formatTimestamp(generatedAt) : "Unknown";
+    snapshotGeneratedValue.title = generatedAt || "";
+    if (snapshotGeneratedNote) {
+      const browserTimeZone = getBrowserTimeZone();
+      snapshotGeneratedNote.textContent = browserTimeZone
+        ? `Rendered in viewer local time (${browserTimeZone})`
+        : "Rendered in viewer local time";
+    }
+  }
+
   function stateLabel(slot) {
     return (slot.state || "unknown").replace("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
   }
@@ -503,7 +544,24 @@
 
   function getSmartSummaryEntry(slot) {
     if (!slot) return null;
-    return state.smartSummaries[getSmartCacheKey(slot)] || null;
+    const liveEntry = state.smartSummaries[getSmartCacheKey(slot)] || null;
+    if (liveEntry) {
+      return liveEntry;
+    }
+    const preloadedSummary =
+      state.preloadedSmartSummariesBySlot[String(slot.slot)] ||
+      state.preloadedSmartSummariesBySlot[slot.slot] ||
+      null;
+    if (!preloadedSummary) {
+      return null;
+    }
+    return {
+      loading: false,
+      refreshing: false,
+      data: preloadedSummary,
+      requestedAt: 0,
+      generation: state.smartSummaryGeneration,
+    };
   }
 
   function currentSmartPrefetchScopeKey() {
@@ -1604,6 +1662,269 @@
     return `${(mib / 1024).toFixed(1)} GiB`;
   }
 
+  function loadStoredJson(storageKey) {
+    try {
+      const rawValue = window.localStorage.getItem(storageKey);
+      return rawValue ? JSON.parse(rawValue) : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function storeJson(storageKey, payload) {
+    if (state.snapshotMode) {
+      return;
+    }
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(payload));
+    } catch (error) {
+      // Ignore storage write failures and keep the UI functional.
+    }
+  }
+
+  function normalizePersistedPackaging(value) {
+    return value === "zip" ? "zip" : value === "html" ? "html" : "auto";
+  }
+
+  function normalizePersistedHistoryWindowHours(value, fallbackValue = DEFAULT_HISTORY_TIMEFRAME_HOURS) {
+    if (value === null || value === "all") {
+      return null;
+    }
+    const numericValue = Number(value);
+    return Number.isFinite(numericValue) && numericValue > 0
+      ? numericValue
+      : fallbackValue;
+  }
+
+  function normalizePersistedIoChartMode(value) {
+    return value === "average" ? "average" : "total";
+  }
+
+  function persistHistoryUiPreferences() {
+    storeJson(HISTORY_UI_STORAGE_KEY, {
+      timeframeHours: state.history.timeframeHours,
+      ioChartMode: state.history.ioChartMode,
+    });
+  }
+
+  function persistExportUiPreferences() {
+    storeJson(EXPORT_UI_STORAGE_KEY, {
+      redactSensitive: state.export.redactSensitive,
+      packaging: state.export.packaging,
+      allowOversize: state.export.allowOversize,
+    });
+  }
+
+  function snapshotExportRequestPayload() {
+    const includeHistoryPanel = Boolean(state.history.panelOpen && isHistoryAvailable());
+    return {
+      selected_slot: state.selectedSlot,
+      history_window_hours: currentHistoryWindowHours(),
+      history_panel_open: includeHistoryPanel,
+      io_chart_mode: state.history.ioChartMode,
+      redact_sensitive: state.export.redactSensitive,
+      packaging: state.export.packaging,
+      allow_oversize: state.export.allowOversize,
+    };
+  }
+
+  function estimatePackagingLabel(packaging) {
+    if (packaging === "zip") {
+      return "ZIP";
+    }
+    if (packaging === "html") {
+      return "HTML";
+    }
+    if (packaging === "oversize") {
+      return "Oversize";
+    }
+    return "n/a";
+  }
+
+  function estimateCurrentPackagingLabel(estimate) {
+    if (!estimate) {
+      return "n/a";
+    }
+    if (estimate.selected_packaging === "auto") {
+      if (estimate.auto_packaging === "html") {
+        return "Auto -> HTML";
+      }
+      if (estimate.auto_packaging === "zip") {
+        return "Auto -> ZIP";
+      }
+      if (estimate.allow_oversize) {
+        return "Auto -> Oversize ZIP";
+      }
+      return "Auto -> Over target";
+    }
+    return estimatePackagingLabel(estimate.effective_packaging || estimate.selected_packaging);
+  }
+
+  function estimateCurrentPackagingMeta(estimate) {
+    if (!estimate) {
+      return "Needs adjustment";
+    }
+    if (estimate.selected_size_label) {
+      if (estimate.selected_within_limit) {
+        return estimate.selected_size_label;
+      }
+      if (estimate.selected_allowed) {
+        return `${estimate.selected_size_label} (over target)`;
+      }
+    }
+    if (estimate.auto_packaging === "oversize") {
+      return `ZIP ${estimate.zip_size_label || "n/a"} (over target)`;
+    }
+    return "Needs adjustment";
+  }
+
+  function buildEstimateAdvice(estimate) {
+    if (!estimate) {
+      return "Live estimate is unavailable right now. Export can still run with the current settings.";
+    }
+    const targetLabel = estimate.size_limit_label || "24 MiB";
+    const downsamplingPart =
+      estimate.downsampling_label && estimate.downsampling_label !== "None"
+        ? ` ${estimate.downsampling_note || `Adaptive ${estimate.downsampling_label} will be applied.`}`
+        : "";
+
+    if (estimate.selected_packaging === "auto") {
+      if (estimate.auto_packaging === "html") {
+        return `Auto should stay in HTML and fit under ${targetLabel}.${downsamplingPart}`;
+      }
+      if (estimate.auto_packaging === "zip") {
+        return `Auto is expected to switch to ZIP to stay under ${targetLabel}.${downsamplingPart}`;
+      }
+      if (estimate.allow_oversize) {
+        return `Even after adaptive rollups, both HTML and ZIP are still over ${targetLabel}. Oversize export is enabled, so Auto will continue as ZIP at about ${estimate.zip_size_label || "n/a"}.${downsamplingPart}`;
+      }
+      return `Even after adaptive rollups, both HTML and ZIP are still over ${targetLabel}. Try a shorter history window, enable redaction, or allow oversize.`;
+    }
+
+    if (estimate.selected_packaging === "html") {
+      if (estimate.selected_within_limit) {
+        return `Plain HTML is estimated to fit under ${targetLabel}.${downsamplingPart}`;
+      }
+      if (estimate.selected_allowed) {
+        return `Plain HTML is estimated at ${estimate.selected_size_label || estimate.html_size_label} and exceeds ${targetLabel}. Oversize export is enabled, so it can still continue.${downsamplingPart}`;
+      }
+      return `Plain HTML is estimated at ${estimate.selected_size_label || estimate.html_size_label} and would exceed ${targetLabel}. Try Auto, Force ZIP, a shorter history window, or allow oversize.`;
+    }
+
+    if (estimate.selected_packaging === "zip") {
+      if (estimate.selected_within_limit) {
+        return `ZIP is estimated to fit under ${targetLabel}.${downsamplingPart}`;
+      }
+      if (estimate.selected_allowed) {
+        return `ZIP is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and exceeds ${targetLabel}. Oversize export is enabled, so it can still continue.${downsamplingPart}`;
+      }
+      return `ZIP is estimated at ${estimate.selected_size_label || estimate.zip_size_label} and still exceeds ${targetLabel}. Try a shorter history window, enable redaction, or allow oversize.`;
+    }
+
+    return "Estimate ready.";
+  }
+
+  function renderSnapshotExportEstimate() {
+    if (!exportSnapshotEstimate) {
+      return;
+    }
+    const estimateState = state.export.estimate;
+    if (estimateState.loading && !estimateState.data) {
+      exportSnapshotEstimate.innerHTML = '<p class="snapshot-export-estimate-message">Estimating export size...</p>';
+      return;
+    }
+    if (estimateState.error && !estimateState.data) {
+      exportSnapshotEstimate.innerHTML = `<p class="snapshot-export-estimate-message warning">${escapeHtml(estimateState.error)}</p>`;
+      return;
+    }
+    const estimate = estimateState.data;
+    if (!estimate) {
+      exportSnapshotEstimate.innerHTML = "";
+      return;
+    }
+
+    const selectedTone = estimate.selected_within_limit
+      ? "ok"
+      : estimate.selected_allowed
+        ? "warning"
+        : "error";
+    const adviceClass = estimate.selected_within_limit
+      ? "snapshot-export-estimate-message"
+      : `snapshot-export-estimate-message ${selectedTone === "error" ? "error" : "warning"}`;
+    exportSnapshotEstimate.innerHTML = `
+      <div class="snapshot-export-estimate-grid">
+        <div class="snapshot-export-estimate-card">
+          <span class="snapshot-export-estimate-label">HTML</span>
+          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.html_size_label || "n/a")}</span>
+          <span class="snapshot-export-estimate-meta">${escapeHtml(estimate.html_within_limit ? "Fits target" : "Over target")}</span>
+        </div>
+        <div class="snapshot-export-estimate-card">
+          <span class="snapshot-export-estimate-label">ZIP</span>
+          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.zip_size_label || "n/a")}</span>
+          <span class="snapshot-export-estimate-meta">${escapeHtml(estimate.zip_within_limit ? "Fits target" : "Over target")}</span>
+        </div>
+        <div class="snapshot-export-estimate-card ${selectedTone === "error" ? "error" : selectedTone === "warning" ? "warning" : ""}">
+          <span class="snapshot-export-estimate-label">Current Choice</span>
+          <span class="snapshot-export-estimate-value">${escapeHtml(estimateCurrentPackagingLabel(estimate))}</span>
+          <span class="snapshot-export-estimate-meta">${escapeHtml(estimateCurrentPackagingMeta(estimate))}</span>
+        </div>
+        <div class="snapshot-export-estimate-card">
+          <span class="snapshot-export-estimate-label">Downsampling</span>
+          <span class="snapshot-export-estimate-value">${escapeHtml(estimate.downsampling_label || "None")}</span>
+          <span class="snapshot-export-estimate-meta">${escapeHtml(`${estimate.metric_sample_count ?? 0} samples / ${estimate.event_count ?? 0} events`)}</span>
+        </div>
+      </div>
+      <p class="${adviceClass}">${escapeHtml(buildEstimateAdvice(estimate))}</p>
+    `;
+  }
+
+  async function refreshSnapshotExportEstimate() {
+    if (state.snapshotMode || !exportSnapshotDialog || !exportSnapshotDialog.open) {
+      return;
+    }
+    const nextToken = state.export.estimate.requestToken + 1;
+    state.export.estimate.requestToken = nextToken;
+    state.export.estimate.loading = true;
+    state.export.estimate.error = null;
+    state.export.estimate.data = null;
+    syncSnapshotExportDialog();
+
+    try {
+      const response = await fetch(buildScopedUrl("/api/export/enclosure-snapshot/estimate"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(snapshotExportRequestPayload()),
+      });
+      if (!response.ok) {
+        let detail = `Estimate failed with ${response.status}`;
+        try {
+          const payload = await response.json();
+          detail = payload.detail || detail;
+        } catch (error) {
+          // Ignore parsing issues and use the HTTP status.
+        }
+        throw new Error(detail);
+      }
+      const estimate = await response.json();
+      if (nextToken !== state.export.estimate.requestToken) {
+        return;
+      }
+      state.export.estimate.data = estimate;
+      state.export.estimate.error = null;
+    } catch (error) {
+      if (nextToken !== state.export.estimate.requestToken) {
+        return;
+      }
+      state.export.estimate.error = `Live estimate unavailable: ${error.message || error}`;
+      state.export.estimate.data = null;
+    } finally {
+      if (nextToken === state.export.estimate.requestToken) {
+        state.export.estimate.loading = false;
+        syncSnapshotExportDialog();
+      }
+    }
+  }
+
   function syncSnapshotExportDialog() {
     if (!exportSnapshotNote) {
       return;
@@ -1630,9 +1951,37 @@
         : "Full identifiers will be included.",
     ];
     if (slot) {
-      parts.push(`Slot ${slot.slot_label} will open by default in the snapshot.`);
+      parts.push(`Slot ${slot.slot_label} is currently selected and will stay selected in the snapshot.`);
+      if (!isHistoryAvailable()) {
+        parts.push("History is currently unavailable, so the snapshot will omit history data and hide the History action.");
+      } else if (state.history.panelOpen) {
+        parts.push("The history drawer is open now and will open in the snapshot too.");
+      } else {
+        parts.push("The history drawer is closed now and will stay closed in the snapshot.");
+      }
+    } else {
+      parts.push("No slot is currently selected, so the snapshot will open with no bay preselected.");
+    }
+    if (state.export.estimate.data?.downsampling_label && state.export.estimate.data.downsampling_label !== "None") {
+      parts.push(`Adaptive ${state.export.estimate.data.downsampling_label.toLowerCase()} will be used to stay closer to the size target.`);
+    }
+    if (state.export.estimate.error) {
+      parts.push(state.export.estimate.error);
     }
     exportSnapshotNote.textContent = parts.join(" ");
+    if (exportSnapshotWindowHint) {
+      if (isHistoryAvailable()) {
+        exportSnapshotWindowHint.textContent = `Snapshot history uses the current History window (${formatHistoryWindowDescription(currentHistoryWindowHours())}). Change it in the History drawer first if you want a different export range. New sessions default to 24h.`;
+      } else {
+        exportSnapshotWindowHint.textContent = "History is currently unavailable, so this snapshot will be exported without historical samples or events.";
+      }
+    }
+    renderSnapshotExportEstimate();
+    if (exportSnapshotConfirm) {
+      const estimate = state.export.estimate.data;
+      const shouldBlock = Boolean(estimate && !estimate.selected_allowed);
+      exportSnapshotConfirm.disabled = state.export.running || state.export.estimate.loading || shouldBlock;
+    }
   }
 
   function openSnapshotExportDialog() {
@@ -1655,6 +2004,7 @@
         exportSnapshotDialog.showModal();
       }
     }
+    void refreshSnapshotExportEstimate();
   }
 
   function closeSnapshotExportDialog() {
@@ -2298,6 +2648,9 @@
     } finally {
       state.history.loading = false;
     }
+    if (!state.history.available) {
+      state.history.panelOpen = false;
+    }
 
     renderStatus();
     renderHistoryPanel(getSlotById(state.selectedSlot));
@@ -2810,6 +3163,21 @@
     const api = state.snapshot.sources?.api || { ok: false, message: "Unavailable" };
     const ssh = state.snapshot.sources?.ssh || { enabled: false, ok: true, message: "Disabled" };
 
+    if (snapshotStatusChip) {
+      if (state.snapshotMode) {
+        const generatedAt = state.snapshotExportMeta?.generated_at;
+        snapshotStatusChip.className = "status-chip snapshot";
+        snapshotStatusChip.textContent = "SNAPSHOT";
+        snapshotStatusChip.title = generatedAt
+          ? `Frozen offline artifact generated ${formatTimestamp(generatedAt)}.`
+          : "Frozen offline artifact.";
+      } else {
+        snapshotStatusChip.className = "status-chip hidden";
+        snapshotStatusChip.textContent = "SNAPSHOT";
+        snapshotStatusChip.title = "";
+      }
+    }
+
     apiStatusChip.className = `status-chip ${api.ok ? "ok" : "error"}`;
     apiStatusChip.textContent = api.ok ? "API OK" : "API ERR";
 
@@ -2866,6 +3234,7 @@
     lastUpdated.textContent = formatTimestamp(state.snapshot.last_updated);
     lastUpdated.title = "Rendered in your browser's local timezone.";
     renderTimezoneLabel();
+    renderSnapshotBanner();
     syncLocation();
   }
 
@@ -3006,14 +3375,7 @@
       const response = await fetch(buildScopedUrl("/api/export/enclosure-snapshot"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          selected_slot: state.selectedSlot,
-          history_window_hours: currentHistoryWindowHours(),
-          io_chart_mode: state.history.ioChartMode,
-          redact_sensitive: state.export.redactSensitive,
-          packaging: state.export.packaging,
-          allow_oversize: state.export.allowOversize,
-        }),
+        body: JSON.stringify(snapshotExportRequestPayload()),
       });
       if (!response.ok) {
         let detail = `Request failed with ${response.status}`;
@@ -3036,7 +3398,8 @@
       window.URL.revokeObjectURL(objectUrl);
       closeSnapshotExportDialog();
       const packaging = (response.headers.get("X-Export-Packaging") || "html").toUpperCase();
-      const redaction = response.headers.get("X-Export-Redaction") === "redacted" ? "redacted " : "";
+      const redactionMode = response.headers.get("X-Export-Redaction") || "none";
+      const redaction = redactionMode === "partial" ? "partially redacted " : "";
       const sizeLabel = formatArtifactSize(response.headers.get("X-Export-Size-Bytes"));
       setStatus(`Exported ${redaction}${packaging} snapshot (${sizeLabel}).`);
     } catch (error) {
@@ -3367,7 +3730,9 @@
   if (exportRedactToggle) {
     exportRedactToggle.addEventListener("change", (event) => {
       state.export.redactSensitive = Boolean(event.target.checked);
+      persistExportUiPreferences();
       syncSnapshotExportDialog();
+      void refreshSnapshotExportEstimate();
     });
   }
   if (exportPackagingSelect) {
@@ -3377,13 +3742,17 @@
         : event.target.value === "html"
           ? "html"
           : "auto";
+      persistExportUiPreferences();
       syncSnapshotExportDialog();
+      void refreshSnapshotExportEstimate();
     });
   }
   if (exportAllowOversizeToggle) {
     exportAllowOversizeToggle.addEventListener("change", (event) => {
       state.export.allowOversize = Boolean(event.target.checked);
+      persistExportUiPreferences();
       syncSnapshotExportDialog();
+      void refreshSnapshotExportEstimate();
     });
   }
   if (exportSnapshotDialog) {
@@ -3417,6 +3786,7 @@
     historyTimeframeSelect.addEventListener("change", () => {
       const nextValue = historyTimeframeSelect.value;
       state.history.timeframeHours = nextValue === "all" ? null : Number(nextValue) || DEFAULT_HISTORY_TIMEFRAME_HOURS;
+      persistHistoryUiPreferences();
       renderHistoryPanel(getSlotById(state.selectedSlot));
     });
   }
@@ -3427,6 +3797,7 @@
         return;
       }
       state.history.ioChartMode = nextMode;
+      persistHistoryUiPreferences();
       renderHistoryPanel(getSlotById(state.selectedSlot));
     });
   });
@@ -3437,7 +3808,7 @@
 
   renderAll();
   if (state.snapshotMode) {
-    setStatus("Offline snapshot export loaded. Live actions are disabled.");
+    setStatus("Frozen offline snapshot loaded. Live actions are disabled.");
   }
   void refreshHistoryStatus(true);
   scheduleSmartPrefetch();

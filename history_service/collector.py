@@ -144,6 +144,9 @@ class HistoryCollector:
                     self.settings.backup_dir,
                     snapshot_label=observed_at,
                     retention_count=self.settings.backup_retention_count,
+                    long_term_backup_dir=self.settings.long_term_backup_dir,
+                    weekly_retention_count=self.settings.weekly_backup_retention_count,
+                    monthly_retention_count=self.settings.monthly_backup_retention_count,
                 )
                 if backup_path:
                     self.last_backup_at = observed_at

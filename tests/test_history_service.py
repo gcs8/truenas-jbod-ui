@@ -231,6 +231,119 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(metric_count, 1)
         self.assertEqual(len(remaining_backups), 2)
 
+    def test_store_promotes_weekly_and_monthly_long_term_backups(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid="gptid/5",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+        )
+
+        store.upsert_slot_state(record, "2026-01-05T22:05:00+00:00")
+        store.create_backup(
+            temp_dir / "backups",
+            snapshot_label="2026-01-05T22:05:00+00:00",
+            retention_count=8,
+            long_term_backup_dir=temp_dir / "long-term",
+            weekly_retention_count=4,
+            monthly_retention_count=3,
+        )
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-01-06T22:10:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name="temperature_c",
+                    value_integer=31,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                )
+            ]
+        )
+        store.create_backup(
+            temp_dir / "backups",
+            snapshot_label="2026-01-06T22:10:00+00:00",
+            retention_count=8,
+            long_term_backup_dir=temp_dir / "long-term",
+            weekly_retention_count=4,
+            monthly_retention_count=3,
+        )
+
+        current_weekly = temp_dir / "long-term" / "weekly" / "history-weekly-2026-W02.sqlite3"
+        current_monthly = temp_dir / "long-term" / "monthly" / "history-monthly-2026-01.sqlite3"
+        weekly_connection = sqlite3.connect(current_weekly)
+        monthly_connection = sqlite3.connect(current_monthly)
+        try:
+            weekly_metric_count = weekly_connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0]
+            monthly_metric_count = monthly_connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0]
+        finally:
+            weekly_connection.close()
+            monthly_connection.close()
+
+        self.assertEqual(weekly_metric_count, 1)
+        self.assertEqual(monthly_metric_count, 1)
+
+        for snapshot_label in (
+            "2026-01-12T22:10:00+00:00",
+            "2026-01-19T22:10:00+00:00",
+            "2026-01-26T22:10:00+00:00",
+            "2026-02-02T22:10:00+00:00",
+            "2026-03-02T22:10:00+00:00",
+            "2026-04-06T22:10:00+00:00",
+        ):
+            store.create_backup(
+                temp_dir / "backups",
+                snapshot_label=snapshot_label,
+                retention_count=8,
+                long_term_backup_dir=temp_dir / "long-term",
+                weekly_retention_count=4,
+                monthly_retention_count=3,
+            )
+
+        weekly_backups = sorted((temp_dir / "long-term" / "weekly").glob("history-weekly-*.sqlite3"))
+        monthly_backups = sorted((temp_dir / "long-term" / "monthly").glob("history-monthly-*.sqlite3"))
+        self.assertEqual(
+            [path.name for path in weekly_backups],
+            [
+                "history-weekly-2026-W05.sqlite3",
+                "history-weekly-2026-W06.sqlite3",
+                "history-weekly-2026-W10.sqlite3",
+                "history-weekly-2026-W15.sqlite3",
+            ],
+        )
+        self.assertEqual(
+            [path.name for path in monthly_backups],
+            [
+                "history-monthly-2026-02.sqlite3",
+                "history-monthly-2026-03.sqlite3",
+                "history-monthly-2026-04.sqlite3",
+            ],
+        )
+
     def test_store_migrates_existing_state_table_before_upserts(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         db_path = temp_dir / "history.db"

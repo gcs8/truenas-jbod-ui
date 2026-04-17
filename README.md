@@ -53,6 +53,12 @@ front and rear grids derived from Linux SES data and operator notes.
 - UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.7.0.png](docs/images/screenshots/unvr-pro-overview-v0.7.0.png)
 - Quantastor: [docs/images/screenshots/quantastor-overview-v0.7.0.png](docs/images/screenshots/quantastor-overview-v0.7.0.png)
 
+### History And Snapshot Walkthroughs
+
+- Live history drawer: [docs/images/screenshots/history-drawer-v0.8.0.png](docs/images/screenshots/history-drawer-v0.8.0.png)
+- Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.8.0.png](docs/images/screenshots/snapshot-export-dialog-v0.8.0.png)
+- Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.8.0.png](docs/images/screenshots/offline-snapshot-v0.8.0.png)
+
 ## Features
 
 - FastAPI app with server-rendered Jinja templates and light plain JavaScript
@@ -285,7 +291,9 @@ truenas-jbod-ui/
    enclosure, and proxy the history API through the main app so you do not need
    a second desktop-visible port. The sidecar also keeps rotating SQLite
    snapshots under `./history/backups` by default so the history store is not
-   just a single live file.
+   just a single live file, and it promotes one weekly snapshot for four weeks
+   plus one monthly snapshot for three months under
+   `./history/backups/long-term` unless you override that path.
 
 8. Open the UI:
 
@@ -338,6 +346,7 @@ The repo now includes a GitHub-wiki-ready page set under:
 - [`wiki/Quantastor-Setup.md`](wiki/Quantastor-Setup.md)
 - [`wiki/Generic-Linux-Setup.md`](wiki/Generic-Linux-Setup.md)
 - [`wiki/SSH-Setup-and-Sudo.md`](wiki/SSH-Setup-and-Sudo.md)
+- [`wiki/History-and-Snapshot-Export.md`](wiki/History-and-Snapshot-Export.md)
 - [`wiki/Profiles-and-Custom-Layouts.md`](wiki/Profiles-and-Custom-Layouts.md)
 - [`wiki/Advanced-Configuration.md`](wiki/Advanced-Configuration.md)
 - [`wiki/Troubleshooting.md`](wiki/Troubleshooting.md)

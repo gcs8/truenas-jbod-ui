@@ -9,6 +9,11 @@ The app supports:
 - a simple single-system env-driven flow
 - a richer multi-system YAML config
 
+If you want the optional history sidecar or the offline snapshot export flow,
+use:
+
+- [[History and Snapshot Export|History-and-Snapshot-Export]]
+
 If you want one app instance to manage multiple hosts, use `systems:` in
 `config/config.yaml`.
 
@@ -123,6 +128,26 @@ That means:
 - they survive container rebuilds
 - they are easy to back up
 - they can be exported and imported in the UI
+
+## History Sidecar Retention Knobs
+
+If you are running the optional history sidecar, the main retention knobs are:
+
+- `HISTORY_BACKUP_DIR`
+- `HISTORY_BACKUP_RETENTION_COUNT`
+- `HISTORY_LONG_TERM_BACKUP_DIR`
+- `HISTORY_WEEKLY_BACKUP_RETENTION_COUNT`
+- `HISTORY_MONTHLY_BACKUP_RETENTION_COUNT`
+
+The default behavior is:
+
+- keep short-term rotating SQLite snapshots under `./history/backups`
+- keep `4` weekly promoted copies
+- keep `3` monthly promoted copies
+
+If you want longer-lived copies on a different disk or NAS later, point
+`HISTORY_LONG_TERM_BACKUP_DIR` at that mounted path and leave the short-term
+local backup path alone.
 
 ## When To Use `enclosure_profiles`
 

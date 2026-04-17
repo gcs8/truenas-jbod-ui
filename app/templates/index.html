@@ -49,11 +49,20 @@
   {% if snapshot_mode %}
   <section class="panel snapshot-banner">
     <div class="snapshot-banner-copy">
+      <div class="snapshot-banner-badge">Frozen Offline Artifact</div>
       <p class="eyebrow">Offline Snapshot</p>
-      <h2>Explorable Enclosure Export</h2>
+      <h2>Explorable Enclosure Snapshot</h2>
       <p class="subtle">
         Frozen point-in-time enclosure snapshot. Live actions are disabled, but you can still search, click slots, and inspect preloaded history offline.
       </p>
+      <div class="snapshot-banner-facts">
+        <span class="snapshot-banner-fact">App v{{ snapshot_export_meta.app_version or "unknown" }}</span>
+        <span class="snapshot-banner-fact">{{ snapshot.layout_slot_count or (snapshot.slots | length) }} visible bays</span>
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.metric_sample_count or 0 }} metric samples</span>
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.smart_summary_count or 0 }} SMART summaries</span>
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.event_count or 0 }} events</span>
+        <span class="snapshot-banner-fact">Downsampling {{ snapshot_export_meta.downsampling_label or "None" }}</span>
+      </div>
     </div>
     <div class="snapshot-banner-meta">
       <div class="summary-card compact">
@@ -68,13 +77,13 @@
       </div>
       <div class="summary-card compact">
         <span class="summary-label">Generated</span>
-        <span class="summary-value">{{ snapshot_export_meta.generated_at or snapshot.last_updated }}</span>
-        <span class="summary-note">re-rendered in viewer local time</span>
+        <span class="summary-value" id="snapshot-generated-value">{{ snapshot_export_meta.generated_at or snapshot.last_updated }}</span>
+        <span class="summary-note" id="snapshot-generated-note">re-rendered in viewer local time</span>
       </div>
       <div class="summary-card compact">
         <span class="summary-label">Redaction</span>
-        <span class="summary-value">{{ snapshot_export_meta.redaction or "full" }}</span>
-        <span class="summary-note">consistent aliases preserved</span>
+        <span class="summary-value">{{ snapshot_export_meta.redaction_label or "None" }}</span>
+        <span class="summary-note">{{ snapshot_export_meta.redaction_note or "Original identifiers included" }}</span>
       </div>
     </div>
   </section>
@@ -134,6 +143,10 @@
       <p id="export-snapshot-note" class="subtle snapshot-export-note">
         Default target stays under about 24 MiB. Auto will prefer HTML, then fall back to ZIP if needed.
       </p>
+      <p id="export-snapshot-window-hint" class="snapshot-export-tip">
+        Snapshot history uses the current History window. Change it in the History drawer first if you want a different export range.
+      </p>
+      <div id="export-snapshot-estimate" class="snapshot-export-estimate" aria-live="polite"></div>
       <div class="button-row">
         <button class="button secondary" id="export-snapshot-cancel" type="button">Cancel</button>
         <button class="button" id="export-snapshot-confirm" type="button">Download Snapshot</button>
@@ -143,6 +156,7 @@
   {% endif %}
 
   <section class="status-strip" id="status-strip">
+    <div class="status-chip hidden" id="snapshot-status-chip">SNAPSHOT</div>
     <div class="status-chip" id="api-status-chip">API</div>
     <div class="status-chip" id="ssh-status-chip">SSH</div>
     <div class="status-chip hidden" id="history-status-chip">HIST</div>
@@ -432,6 +446,7 @@
     snapshotMode: {{ snapshot_mode | tojson }},
     snapshotExportMeta: {{ snapshot_export_meta_json | safe }},
     preloadedHistoryBySlot: {{ preloaded_history_json | safe }},
+    preloadedSmartSummariesBySlot: {{ preloaded_smart_summary_json | safe }},
     preloadedHistorySummary: {{ preloaded_history_summary_json | safe }},
     initialSelectedSlot: {{ initial_selected_slot_json | safe }},
     initialHistoryTimeframeHours: {{ initial_history_timeframe_hours_json | safe }},

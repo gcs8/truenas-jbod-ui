@@ -277,6 +277,7 @@ class MappingBundle(BaseModel):
 class SnapshotExportRequest(BaseModel):
     selected_slot: int | None = None
     history_window_hours: int | None = 24
+    history_panel_open: bool = False
     io_chart_mode: str = "total"
     redact_sensitive: bool = False
     packaging: Literal["auto", "html", "zip"] = "auto"

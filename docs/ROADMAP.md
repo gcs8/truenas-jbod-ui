@@ -167,7 +167,7 @@ Current status:
 - prepared as the local `0.7.0` release candidate
 - focused on polish and clarity rather than adding another large new platform
 
-## v0.8.0 - Optional Slot History And Comparisons
+## v0.8.0 - Optional Slot History And Snapshot Export
 
 Goal:
 
@@ -188,6 +188,12 @@ Primary outcomes:
 Current notes:
 
 - [`docs/V0_8_HISTORY_PLAN.md`](./V0_8_HISTORY_PLAN.md)
+
+Current status:
+
+- prepared as the local `0.8.0` release candidate
+- history sidecar, offline snapshot export, screenshots, and wiki walkthroughs
+  are all in place for the cut
 
 ## Longer-Term Ideas
 

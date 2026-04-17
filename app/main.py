@@ -246,13 +246,23 @@ def create_app() -> FastAPI:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+        smart_summaries = await service.get_slot_smart_summaries(
+            [slot.slot for slot in snapshot.slots],
+            selected_enclosure_id=enclosure_id,
+        )
+        smart_summary_cache = {
+            str(item.slot): item.summary.model_dump(mode="json")
+            for item in smart_summaries
+        }
         exporter = get_snapshot_export_service()
         try:
             artifact = await exporter.build_enclosure_snapshot_export(
                 request=request,
                 snapshot=snapshot,
+                smart_summary_cache=smart_summary_cache,
                 selected_slot=payload.selected_slot,
                 history_window_hours=payload.history_window_hours,
+                history_panel_open=payload.history_panel_open,
                 io_chart_mode=payload.io_chart_mode,
                 redact_sensitive=payload.redact_sensitive,
                 packaging=payload.packaging,
@@ -272,6 +282,39 @@ def create_app() -> FastAPI:
                 "X-Export-Size-Limit-Bytes": str(artifact.size_limit_bytes),
             },
         )
+
+    @app.post("/api/export/enclosure-snapshot/estimate")
+    async def estimate_enclosure_snapshot(
+        request: Request,
+        payload: SnapshotExportRequest,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> JSONResponse:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+        smart_summaries = await service.get_slot_smart_summaries(
+            [slot.slot for slot in snapshot.slots],
+            selected_enclosure_id=enclosure_id,
+        )
+        smart_summary_cache = {
+            str(item.slot): item.summary.model_dump(mode="json")
+            for item in smart_summaries
+        }
+        exporter = get_snapshot_export_service()
+        estimate = await exporter.estimate_enclosure_snapshot_export(
+            request=request,
+            snapshot=snapshot,
+            smart_summary_cache=smart_summary_cache,
+            selected_slot=payload.selected_slot,
+            history_window_hours=payload.history_window_hours,
+            history_panel_open=payload.history_panel_open,
+            io_chart_mode=payload.io_chart_mode,
+            redact_sensitive=payload.redact_sensitive,
+            packaging=payload.packaging,
+            allow_oversize=payload.allow_oversize,
+        )
+        return JSONResponse(estimate)
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
@@ -312,6 +355,7 @@ def build_index_context(
     snapshot_export_meta: dict[str, object] | None = None,
     snapshot_export_meta_json: str = "null",
     preloaded_history_json: str = "{}",
+    preloaded_smart_summary_json: str = "{}",
     preloaded_history_summary_json: str = "{\"counts\": {}, \"collector\": {}}",
     initial_selected_slot_json: str = "null",
     initial_history_timeframe_hours_json: str = "24",
@@ -328,6 +372,7 @@ def build_index_context(
         "snapshot_export_meta": snapshot_export_meta or {},
         "snapshot_export_meta_json": snapshot_export_meta_json,
         "preloaded_history_json": preloaded_history_json,
+        "preloaded_smart_summary_json": preloaded_smart_summary_json,
         "preloaded_history_summary_json": preloaded_history_summary_json,
         "initial_selected_slot_json": initial_selected_slot_json,
         "initial_history_timeframe_hours_json": initial_history_timeframe_hours_json,
