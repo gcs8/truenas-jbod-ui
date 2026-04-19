@@ -97,7 +97,26 @@ Use these pages when you are ready:
 - [[Quantastor Setup|Quantastor-Setup]]
 - [[Generic Linux Setup|Generic-Linux-Setup]]
 
-## 9. Optional: Turn On History And Snapshot Export
+## 9. Optional: Turn On The Admin UI
+
+If you want the guided setup, runtime control, backup/restore, or storage-view
+editing flow, start the optional admin sidecar:
+
+```bash
+docker compose --profile admin up -d --build enclosure-admin
+```
+
+Then open:
+
+```text
+http://your-docker-host:8082
+```
+
+Use this page for the walkthrough:
+
+- [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
+
+## 10. Optional: Turn On History And Snapshot Export
 
 If you want historical slot lookback and the offline HTML snapshot export flow,
 start the optional history sidecar:

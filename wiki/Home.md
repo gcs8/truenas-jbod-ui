@@ -26,6 +26,7 @@ If you want to control what the enclosure looks like, use:
 
 If you want to really tune things, use:
 
+- [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[Advanced Configuration|Advanced-Configuration]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
