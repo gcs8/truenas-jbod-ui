@@ -22,6 +22,7 @@ from history_service.domain import (
 from history_service.store import HistoryStore
 
 logger = logging.getLogger(__name__)
+STORAGE_VIEW_SCOPE_PREFIX = "storage-view:"
 
 FAST_METRIC_FIELDS = ("temperature_c",)
 SLOW_METRIC_FIELDS = (
@@ -321,6 +322,12 @@ class HistoryCollector:
                             snapshot=system_snapshot,
                         )
                     )
+                for scope in await self._enumerate_storage_view_scopes(system_id, system_snapshot):
+                    storage_scope_key = (scope.system_id, scope.enclosure_id)
+                    if storage_scope_key in seen:
+                        continue
+                    seen.add(storage_scope_key)
+                    scopes.append(scope)
                 continue
 
             selected_enclosure_id = normalize_text(system_snapshot.get("selected_enclosure_id"))
@@ -346,6 +353,12 @@ class HistoryCollector:
                         snapshot=snapshot,
                     )
                 )
+            for scope in await self._enumerate_storage_view_scopes(system_id, system_snapshot):
+                scope_key = (scope.system_id, scope.enclosure_id)
+                if scope_key in seen:
+                    continue
+                seen.add(scope_key)
+                scopes.append(scope)
         return scopes
 
     async def _fetch_inventory(
@@ -360,12 +373,111 @@ class HistoryCollector:
             params["enclosure_id"] = enclosure_id
         return await self._fetch_json("/api/inventory", params=params)
 
+    async def _fetch_storage_views(
+        self,
+        system_id: str,
+        enclosure_id: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"system_id": system_id}
+        if enclosure_id:
+            params["enclosure_id"] = enclosure_id
+        return await self._fetch_json("/api/storage-views", params=params)
+
+    async def _enumerate_storage_view_scopes(
+        self,
+        system_id: str,
+        system_snapshot: dict[str, Any],
+    ) -> list[ScopeSnapshot]:
+        payload = await self._fetch_storage_views(system_id=system_id)
+        system_label = normalize_text(payload.get("system_label")) or normalize_text(system_snapshot.get("selected_system_label"))
+        platform = normalize_text(system_snapshot.get("selected_system_platform"))
+        sources = system_snapshot.get("sources") if isinstance(system_snapshot.get("sources"), dict) else {}
+        scopes: list[ScopeSnapshot] = []
+        for view_payload in payload.get("views") or []:
+            if not isinstance(view_payload, dict):
+                continue
+            if normalize_text(view_payload.get("source")) != "inventory_binding":
+                continue
+            view_id = normalize_text(view_payload.get("id"))
+            view_label = normalize_text(view_payload.get("label"))
+            if not view_id or not view_label:
+                continue
+            slot_payloads = []
+            occupied_count = 0
+            for slot_payload in view_payload.get("slots") or []:
+                if not isinstance(slot_payload, dict):
+                    continue
+                try:
+                    slot_index = int(slot_payload.get("slot_index"))
+                except (TypeError, ValueError):
+                    continue
+                occupied = bool(slot_payload.get("occupied"))
+                if occupied:
+                    occupied_count += 1
+                slot_payloads.append(
+                    {
+                        "slot": slot_index,
+                        "slot_label": normalize_text(slot_payload.get("slot_label")) or f"{slot_index:02d}",
+                        "enclosure_id": f"{STORAGE_VIEW_SCOPE_PREFIX}{view_id}",
+                        "enclosure_label": view_label,
+                        "present": occupied,
+                        "state": normalize_text(slot_payload.get("state")) or ("matched" if occupied else "empty"),
+                        "identify_active": False,
+                        "device_name": normalize_text(slot_payload.get("device_name")),
+                        "serial": normalize_text(slot_payload.get("serial")),
+                        "model": normalize_text(slot_payload.get("model")),
+                        "gptid": normalize_text(slot_payload.get("gptid")),
+                        "pool_name": normalize_text(slot_payload.get("pool_name")),
+                        "vdev_name": None,
+                        "health": normalize_text(slot_payload.get("health")),
+                        "topology_label": normalize_text(slot_payload.get("description"))
+                        or normalize_text(slot_payload.get("placement_key")),
+                    }
+                )
+            if not slot_payloads or occupied_count == 0:
+                continue
+            scopes.append(
+                ScopeSnapshot(
+                    system_id=system_id,
+                    system_label=system_label,
+                    enclosure_id=f"{STORAGE_VIEW_SCOPE_PREFIX}{view_id}",
+                    enclosure_label=view_label,
+                    snapshot={
+                        "selected_system_id": system_id,
+                        "selected_system_label": system_label,
+                        "selected_system_platform": platform,
+                        "selected_enclosure_id": f"{STORAGE_VIEW_SCOPE_PREFIX}{view_id}",
+                        "selected_enclosure_label": view_label,
+                        "storage_view_id": view_id,
+                        "storage_view_backing_enclosure_id": normalize_text(view_payload.get("backing_enclosure_id")),
+                        "sources": sources,
+                        "slots": slot_payloads,
+                    },
+                )
+            )
+        return scopes
+
     async def _fetch_smart_summaries(
         self,
         scope: ScopeSnapshot,
         slot_numbers: list[int],
     ) -> dict[int, dict[str, Any]]:
         summaries: dict[int, dict[str, Any]] = {}
+        storage_view_id = normalize_text(scope.snapshot.get("storage_view_id"))
+        if storage_view_id:
+            backing_enclosure_id = normalize_text(scope.snapshot.get("storage_view_backing_enclosure_id"))
+            for slot_number in slot_numbers:
+                payload = await self._fetch_json(
+                    f"/api/storage-views/{urllib.parse.quote(storage_view_id)}/slots/{slot_number}/smart",
+                    params={
+                        "system_id": scope.system_id,
+                        "enclosure_id": backing_enclosure_id,
+                    },
+                )
+                if isinstance(payload, dict):
+                    summaries[slot_number] = payload
+            return summaries
+
         batch_size = max(1, self.settings.smart_batch_size)
         for offset in range(0, len(slot_numbers), batch_size):
             chunk = slot_numbers[offset : offset + batch_size]

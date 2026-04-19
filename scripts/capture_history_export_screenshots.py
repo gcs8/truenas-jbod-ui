@@ -22,9 +22,9 @@ SCREENSHOT_TAG = os.environ.get("SCREENSHOT_TAG", f"v{__version__}")
 
 ARCHIVE_CORE_PARAMS = {
     "system_id": "archive-core",
-    "enclosure_id": "500304801f715f3f+500304801f5a003f",
 }
-HISTORY_SLOT = 30
+HISTORY_STORAGE_VIEW_ID = "boot-doms"
+HISTORY_SLOT = 0
 HISTORY_WINDOW_VALUE = "72"
 
 
@@ -68,9 +68,32 @@ def hide_debug_chrome(page: Page) -> None:
     )
 
 
+def wait_for_storage_view_options(page: Page) -> None:
+    page.wait_for_function(
+        """() => Array.from(document.querySelectorAll('#enclosure-select option'))
+            .some((option) => (option.value || '').startsWith('view:'))""",
+        timeout=120_000,
+    )
+
+
+def select_storage_view(page: Page, storage_view_id: str) -> None:
+    wait_for_storage_view_options(page)
+    page.locator("#enclosure-select").select_option(f"view:{storage_view_id}")
+    page.wait_for_function(
+        """([value]) => {
+            const select = document.getElementById('enclosure-select');
+            return select && select.value === value;
+        }""",
+        arg=[f"view:{storage_view_id}"],
+        timeout=120_000,
+    )
+    page.wait_for_timeout(1200)
+
+
 def open_archive_core_slot(page: Page, slot: int) -> None:
     page.goto(f"{BASE_URL}?{urlencode(ARCHIVE_CORE_PARAMS)}", wait_until="networkidle")
     hide_debug_chrome(page)
+    select_storage_view(page, HISTORY_STORAGE_VIEW_ID)
     slot_tile = page.locator(f'#slot-grid .slot-tile[data-slot="{slot}"]')
     slot_tile.wait_for(state="visible", timeout=120_000)
     slot_tile.click()

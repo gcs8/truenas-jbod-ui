@@ -601,7 +601,10 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
         if in_extra_status and "LED=locate" in stripped:
             current_slot.identify_active = True
 
-    return [item for item in enclosures if item.slots]
+    parsed = [item for item in enclosures if item.slots]
+    for enclosure in parsed:
+        _apply_inferred_ses_profile(enclosure)
+    return parsed
 
 
 def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
@@ -672,7 +675,10 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
             present=bool(device_name) and "not installed" not in status_lower,
         )
 
-    return [item for item in enclosures if item.slots]
+    parsed = [item for item in enclosures if item.slots]
+    for enclosure in parsed:
+        _apply_inferred_ses_profile(enclosure)
+    return parsed
 
 
 def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure | None:
@@ -765,17 +771,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     if not enclosure.slots:
         return None
 
-    slot_count = max(enclosure.slots) + 1
-    (
-        enclosure.profile_id,
-        enclosure.enclosure_label,
-        enclosure.layout_rows,
-        enclosure.layout_columns,
-        enclosure.slot_layout,
-    ) = _infer_scale_enclosure_profile(
-        enclosure,
-        slot_count,
-    )
+    _apply_inferred_ses_profile(enclosure)
     return enclosure
 
 
@@ -874,17 +870,7 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
     if not enclosure.slots:
         return None
 
-    slot_count = max(enclosure.slots) + 1
-    (
-        enclosure.profile_id,
-        enclosure.enclosure_label,
-        enclosure.layout_rows,
-        enclosure.layout_columns,
-        enclosure.slot_layout,
-    ) = _infer_scale_enclosure_profile(
-        enclosure,
-        slot_count,
-    )
+    _apply_inferred_ses_profile(enclosure)
     return enclosure
 
 
@@ -893,6 +879,30 @@ def _extract_sg_ses_device(command: str | None) -> str | None:
         return None
     match = re.search(r"(/dev/sg\d+)", command)
     return normalize_text(match.group(1)) if match else None
+
+
+def _infer_ses_slot_count(enclosure: SESMapEnclosure) -> int:
+    if not enclosure.slots:
+        return 0
+    slot_numbers = sorted(enclosure.slots)
+    slot_base = 0 if slot_numbers[0] == 0 else 1
+    return slot_numbers[-1] - slot_base + 1
+
+
+def _apply_inferred_ses_profile(enclosure: SESMapEnclosure) -> None:
+    slot_count = _infer_ses_slot_count(enclosure)
+    (
+        enclosure.profile_id,
+        inferred_label,
+        enclosure.layout_rows,
+        enclosure.layout_columns,
+        enclosure.slot_layout,
+    ) = _infer_scale_enclosure_profile(
+        enclosure,
+        slot_count,
+    )
+    if enclosure.profile_id or slot_count not in {30, 60}:
+        enclosure.enclosure_label = inferred_label
 
 
 def _infer_scale_enclosure_profile(
@@ -1070,25 +1080,27 @@ def _merge_control_targets(
     overlay: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
-    seen: set[tuple[str | None, int | None]] = set()
+    seen: set[tuple[str | None, str | None, int | None]] = set()
     for item in base + overlay:
         if not isinstance(item, dict):
             continue
+        ssh_host = normalize_text(item.get("ssh_host"))
         ses_device = normalize_text(item.get("ses_device"))
         ses_element_id = item.get("ses_element_id")
-        pair = (ses_device, ses_element_id if isinstance(ses_element_id, int) else None)
-        if not pair[0] or pair[1] is None or pair in seen:
+        pair = (ssh_host, ses_device, ses_element_id if isinstance(ses_element_id, int) else None)
+        if not pair[1] or pair[2] is None or pair in seen:
             continue
         seen.add(pair)
-        merged.append(
-            {
-                "ses_device": pair[0],
-                "ses_element_id": pair[1],
-                "ses_slot_number": item.get("ses_slot_number")
-                if isinstance(item.get("ses_slot_number"), int)
-                else None,
-            }
-        )
+        payload = {
+            "ses_device": pair[1],
+            "ses_element_id": pair[2],
+            "ses_slot_number": item.get("ses_slot_number")
+            if isinstance(item.get("ses_slot_number"), int)
+            else None,
+        }
+        if pair[0]:
+            payload["ssh_host"] = pair[0]
+        merged.append(payload)
     return merged
 
 
@@ -1110,23 +1122,28 @@ def merge_slot_candidate_maps(
                 existing = target.get(key, [])
                 if isinstance(existing, list) and isinstance(value, list):
                     combined = []
-                    seen: set[tuple[str | None, int | None]] = set()
+                    seen: set[tuple[str | None, str | None, int | None]] = set()
                     for item in existing + value:
                         if not isinstance(item, dict):
                             continue
-                        pair = (normalize_text(item.get("ses_device")), item.get("ses_element_id"))
+                        pair = (
+                            normalize_text(item.get("ssh_host")),
+                            normalize_text(item.get("ses_device")),
+                            item.get("ses_element_id"),
+                        )
                         if pair in seen:
                             continue
                         seen.add(pair)
-                        combined.append(
-                            {
-                                "ses_device": pair[0],
-                                "ses_element_id": pair[1],
-                                "ses_slot_number": item.get("ses_slot_number")
-                                if isinstance(item.get("ses_slot_number"), int)
-                                else None,
-                            }
-                        )
+                        payload = {
+                            "ses_device": pair[1],
+                            "ses_element_id": pair[2],
+                            "ses_slot_number": item.get("ses_slot_number")
+                            if isinstance(item.get("ses_slot_number"), int)
+                            else None,
+                        }
+                        if pair[0]:
+                            payload["ssh_host"] = pair[0]
+                        combined.append(payload)
                     target[key] = combined
                 continue
             if key in {"identify_active", "present"}:

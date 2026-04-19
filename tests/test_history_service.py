@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from history_service.collector import HistoryCollector, ScopeSnapshot
 from history_service.config import HistorySettings
@@ -431,6 +432,86 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(loaded.topology_label, "tank > raidz2-0 > data")
         self.assertEqual(loaded.multipath_passive_paths, "da44")
 
+    def test_store_retries_write_after_readonly_database_error(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid="gptid/5",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+        )
+
+        failing_connection = MagicMock()
+        failing_connection.execute.side_effect = sqlite3.OperationalError(
+            "attempt to write a readonly database"
+        )
+        working_connection = MagicMock()
+
+        with (
+            patch.object(store, "_connect", side_effect=[failing_connection, working_connection]),
+            patch.object(store, "_attempt_readonly_database_repair", return_value=True) as repair,
+        ):
+            store.upsert_slot_state(record, "2026-04-19T09:10:28+00:00")
+
+        repair.assert_called_once()
+        working_connection.execute.assert_called_once()
+        working_connection.commit.assert_called_once()
+
+    def test_restore_backup_normalizes_database_permissions(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        store = HistoryStore(str(db_path))
+        record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid="gptid/5",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+        )
+        store.upsert_slot_state(record, "2026-04-16T22:05:00+00:00")
+        backup_path = store.create_backup(temp_dir / "backups", retention_count=1)
+        self.assertIsNotNone(backup_path)
+
+        db_path.write_text("placeholder", encoding="utf-8")
+        wal_path = Path(f"{db_path}-wal")
+        shm_path = Path(f"{db_path}-shm")
+        wal_path.write_text("wal", encoding="utf-8")
+        shm_path.write_text("shm", encoding="utf-8")
+
+        with patch.object(store, "_normalize_database_permissions") as normalize_permissions:
+            store.restore_backup(backup_path)
+
+        normalize_permissions.assert_called_once()
+        self.assertTrue(db_path.exists())
+        self.assertFalse(wal_path.exists())
+        self.assertFalse(shm_path.exists())
+
 
 class HistoryCollectorTests(unittest.TestCase):
     def test_record_slot_changes_backfills_extended_state_without_event_noise(self) -> None:
@@ -488,6 +569,182 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.topology_label, "tank > raidz2-0 > data")
         self.assertEqual(loaded.multipath_state, "OPTIMAL")
+
+    def test_enumerate_scopes_includes_inventory_bound_storage_views(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        root_snapshot = {
+            "systems": [
+                {
+                    "id": "archive-core",
+                    "label": "Archive CORE",
+                }
+            ]
+        }
+        system_snapshot = {
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+            "selected_system_platform": "core",
+            "sources": {
+                "api": {
+                    "enabled": True,
+                    "ok": True,
+                    "message": "TrueNAS API reachable.",
+                }
+            },
+            "enclosures": [],
+        }
+        storage_views_payload = {
+            "system_label": "Archive CORE",
+            "views": [
+                {
+                    "id": "boot-doms",
+                    "label": "Boot SATADOMs",
+                    "source": "inventory_binding",
+                    "backing_enclosure_id": "enc-a",
+                    "slots": [
+                        {
+                            "slot_index": 0,
+                            "slot_label": "DOM-A",
+                            "occupied": True,
+                            "state": "matched",
+                            "device_name": "ada0",
+                            "serial": "SER-DOM-0",
+                            "model": "SATADOM 0",
+                            "gptid": "gptid/dom-a",
+                            "pool_name": "freenas-boot",
+                            "health": "ONLINE",
+                            "placement_key": "device match: ada0",
+                        }
+                    ],
+                },
+                {
+                    "id": "primary-chassis",
+                    "label": "Primary Chassis",
+                    "source": "selected_enclosure_snapshot",
+                    "slots": [
+                        {
+                            "slot_index": 0,
+                            "slot_label": "00",
+                            "occupied": True,
+                            "state": "healthy",
+                            "device_name": "da0",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        collector._fetch_inventory = AsyncMock(side_effect=[root_snapshot, system_snapshot])  # type: ignore[method-assign]
+        collector._fetch_storage_views = AsyncMock(return_value=storage_views_payload)  # type: ignore[method-assign]
+
+        scopes = asyncio.run(collector._enumerate_scopes())
+
+        storage_scope = next((scope for scope in scopes if scope.enclosure_id == "storage-view:boot-doms"), None)
+        self.assertIsNotNone(storage_scope)
+        self.assertNotIn("storage-view:primary-chassis", [scope.enclosure_id for scope in scopes])
+        self.assertEqual(storage_scope.snapshot["slots"][0]["slot"], 0)
+        self.assertEqual(storage_scope.snapshot["slots"][0]["device_name"], "ada0")
+        self.assertEqual(storage_scope.snapshot["storage_view_backing_enclosure_id"], "enc-a")
+
+    def test_run_once_records_inventory_bound_storage_view_metrics(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        storage_view_snapshot = {
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+            "selected_system_platform": "core",
+            "selected_enclosure_id": "storage-view:boot-doms",
+            "selected_enclosure_label": "Boot SATADOMs",
+            "storage_view_id": "boot-doms",
+            "storage_view_backing_enclosure_id": "enc-a",
+            "sources": {
+                "api": {
+                    "enabled": True,
+                    "ok": True,
+                    "message": "TrueNAS API reachable.",
+                }
+            },
+            "slots": [
+                {
+                    "slot": 0,
+                    "slot_label": "DOM-A",
+                    "enclosure_id": "storage-view:boot-doms",
+                    "enclosure_label": "Boot SATADOMs",
+                    "present": True,
+                    "state": "matched",
+                    "identify_active": False,
+                    "device_name": "ada0",
+                    "serial": "SER-DOM-0",
+                    "model": "SATADOM 0",
+                    "gptid": "gptid/dom-a",
+                    "pool_name": "freenas-boot",
+                    "health": "ONLINE",
+                    "topology_label": "device match: ada0",
+                }
+            ],
+        }
+
+        async def enumerate_scopes() -> list[ScopeSnapshot]:
+            return [
+                ScopeSnapshot(
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_id="storage-view:boot-doms",
+                    enclosure_label="Boot SATADOMs",
+                    snapshot=storage_view_snapshot,
+                )
+            ]
+
+        collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
+        collector._fetch_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "available": True,
+                "temperature_c": 31,
+                "bytes_read": 100,
+                "bytes_written": 200,
+                "annualized_bytes_written": None,
+                "power_on_hours": 48,
+            }
+        )
+
+        asyncio.run(collector.run_once())
+
+        temperature_samples = store.list_metric_samples(
+            "archive-core",
+            "storage-view:boot-doms",
+            0,
+            metric_name="temperature_c",
+        )
+        read_samples = store.list_metric_samples(
+            "archive-core",
+            "storage-view:boot-doms",
+            0,
+            metric_name="bytes_read",
+        )
+
+        self.assertEqual(len(temperature_samples), 1)
+        self.assertEqual(len(read_samples), 1)
+        self.assertEqual(
+            collector._fetch_json.await_args_list[0].args[0],  # type: ignore[attr-defined]
+            "/api/storage-views/boot-doms/slots/0/smart",
+        )
 
     def test_run_once_skips_degraded_api_snapshot_without_event_noise(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

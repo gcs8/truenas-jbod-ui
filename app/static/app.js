@@ -36,14 +36,22 @@
   const preloadedHistoryBySlot = bootstrap.preloadedHistoryBySlot || {};
   const preloadedSmartSummariesBySlot = bootstrap.preloadedSmartSummariesBySlot || {};
   const preloadedHistorySummary = bootstrap.preloadedHistorySummary || { counts: {}, collector: {} };
+  const availableSetupProfiles = Array.isArray(bootstrap.availableSetupProfiles) ? bootstrap.availableSetupProfiles : [];
+  const setupPlatformDefaults = bootstrap.setupPlatformDefaults || {};
   const snapshotHistoryAvailable = Boolean(bootstrap.historyConfigured);
   const initialSelectedSlot = Number.isInteger(bootstrap.initialSelectedSlot)
     ? bootstrap.initialSelectedSlot
     : null;
+  const initialStorageViewId = snapshotMode
+    ? ""
+    : (new URLSearchParams(window.location.search).get("storage_view_id") || "");
   const state = {
     snapshotMode,
     snapshotExportMeta: bootstrap.snapshotExportMeta || null,
     snapshot: bootstrap.snapshot || { slots: [], systems: [], enclosures: [] },
+    storageViewsRuntime: bootstrap.storageViewsRuntime || { system_id: bootstrap.snapshot?.selected_system_id || null, views: [] },
+    selectedStorageViewRuntimeId: initialStorageViewId,
+    storageViewsRuntimeLoading: false,
     layoutRows: bootstrap.layoutRows || [],
     selectedSlot: initialSelectedSlot,
     hoveredSlot: null,
@@ -90,7 +98,18 @@
       ioChartMode: restoredHistoryIoChartMode,
       panelLoading: false,
       panelError: null,
-      slotCache: preloadedHistoryBySlot,
+        slotCache: preloadedHistoryBySlot,
+      },
+    setup: {
+      step: 0,
+      exportRunning: false,
+      importRunning: false,
+      createRunning: false,
+      defaultsLoadedForPlatform: null,
+      backupPackaging: "tar.zst",
+      sshKeys: [],
+      sshKeysLoading: false,
+      sshKeyMode: "reuse",
     },
     uiPerf: {
       enabled: UI_PERF_ENABLED,
@@ -141,6 +160,15 @@
   const summaryMappedSlotCount = document.getElementById("summary-mapped-slot-count");
   const summaryManualMappingCount = document.getElementById("summary-manual-mapping-count");
   const summarySshSlotHintCount = document.getElementById("summary-ssh-slot-hint-count");
+  const storageViewsSummary = document.getElementById("storage-views-summary");
+  const storageViewList = document.getElementById("storage-view-list");
+  const storageViewEmpty = document.getElementById("storage-view-empty");
+  const storageViewContent = document.getElementById("storage-view-content");
+  const storageViewTitle = document.getElementById("storage-view-title");
+  const storageViewNote = document.getElementById("storage-view-note");
+  const storageViewMeta = document.getElementById("storage-view-meta");
+  const storageViewGrid = document.getElementById("storage-view-grid");
+  const storageViewMappingList = document.getElementById("storage-view-mapping-list");
   const mappingForm = document.getElementById("mapping-form");
   const clearMappingButton = document.getElementById("clear-mapping-button");
   const prefillMappingButton = document.getElementById("prefill-mapping-button");
@@ -158,6 +186,51 @@
   const exportSnapshotNote = document.getElementById("export-snapshot-note");
   const exportSnapshotWindowHint = document.getElementById("export-snapshot-window-hint");
   const exportSnapshotEstimate = document.getElementById("export-snapshot-estimate");
+  const systemSetupButton = document.getElementById("system-setup-button");
+  const systemSetupDialog = document.getElementById("system-setup-dialog");
+  const systemSetupClose = document.getElementById("system-setup-close");
+  const systemBackupPackagingSelect = document.getElementById("system-backup-packaging-select");
+  const systemBackupEncryptToggle = document.getElementById("system-backup-encrypt-toggle");
+  const systemBackupExportPassphrase = document.getElementById("system-backup-export-passphrase");
+  const systemBackupImportPassphrase = document.getElementById("system-backup-import-passphrase");
+  const exportSystemBackupButton = document.getElementById("export-system-backup-button");
+  const importSystemBackupButton = document.getElementById("import-system-backup-button");
+  const systemBackupImportFile = document.getElementById("system-backup-import-file");
+  const setupStepIndicators = Array.from(document.querySelectorAll("[data-setup-step-indicator]"));
+  const setupStepPanels = Array.from(document.querySelectorAll("[data-setup-step-panel]"));
+  const setupPrevButton = document.getElementById("setup-prev-button");
+  const setupNextButton = document.getElementById("setup-next-button");
+  const setupCreateButton = document.getElementById("setup-create-button");
+  const setupPlatformHelp = document.getElementById("setup-platform-help");
+  const setupSystemLabel = document.getElementById("setup-system-label");
+  const setupSystemId = document.getElementById("setup-system-id");
+  const setupPlatformSelect = document.getElementById("setup-platform-select");
+  const setupProfileSelect = document.getElementById("setup-profile-select");
+  const setupMakeDefaultToggle = document.getElementById("setup-make-default-toggle");
+  const setupTruenasHost = document.getElementById("setup-truenas-host");
+  const setupVerifySslToggle = document.getElementById("setup-verify-ssl-toggle");
+  const setupEnclosureFilter = document.getElementById("setup-enclosure-filter");
+  const setupApiKey = document.getElementById("setup-api-key");
+  const setupApiUser = document.getElementById("setup-api-user");
+  const setupApiPassword = document.getElementById("setup-api-password");
+  const setupSshEnabledToggle = document.getElementById("setup-ssh-enabled-toggle");
+  const setupSshHost = document.getElementById("setup-ssh-host");
+  const setupSshUser = document.getElementById("setup-ssh-user");
+  const setupSshPort = document.getElementById("setup-ssh-port");
+  const setupSshKeyMode = document.getElementById("setup-ssh-key-mode");
+  const setupSshExistingKeySelect = document.getElementById("setup-ssh-existing-key-select");
+  const setupRefreshSshKeysButton = document.getElementById("setup-refresh-ssh-keys-button");
+  const setupGenerateSshKeyButton = document.getElementById("setup-generate-ssh-key-button");
+  const setupSshGenerateName = document.getElementById("setup-ssh-generate-name");
+  const setupSshKeyPath = document.getElementById("setup-ssh-key-path");
+  const setupSshKeyHelp = document.getElementById("setup-ssh-key-help");
+  const setupSshKeyModePanels = Array.from(document.querySelectorAll("[data-setup-ssh-key-mode-panel]"));
+  const setupSshPassword = document.getElementById("setup-ssh-password");
+  const setupSshSudoPassword = document.getElementById("setup-ssh-sudo-password");
+  const setupSshKnownHostsPath = document.getElementById("setup-ssh-known-hosts-path");
+  const setupSshStrictHostKeyToggle = document.getElementById("setup-ssh-strict-host-key-toggle");
+  const setupSshCommands = document.getElementById("setup-ssh-commands");
+  const setupLoadPlatformCommandsButton = document.getElementById("setup-load-platform-commands-button");
   const historyToggleButton = document.getElementById("history-toggle-button");
   const detailHistoryPanel = document.getElementById("detail-history-panel");
   const historyDrawerTitle = document.getElementById("history-drawer-title");
@@ -204,6 +277,14 @@
     return (state.snapshot.enclosures || []).find((enclosure) => enclosure.id === state.selectedEnclosureId) || null;
   }
 
+  function currentLiveEnclosureId() {
+    return state.selectedEnclosureId || state.snapshot.selected_enclosure_id || null;
+  }
+
+  function currentLiveEnclosureLabel() {
+    return getSelectedEnclosureOption()?.label || state.snapshot.selected_enclosure_label || null;
+  }
+
   function getSelectedProfile() {
     return state.snapshot.selected_profile || null;
   }
@@ -216,16 +297,597 @@
     return state.snapshot.platform_context || {};
   }
 
+  function storageViewRuntimeViews() {
+    const views = Array.isArray(state.storageViewsRuntime?.views) ? state.storageViewsRuntime.views : [];
+    return [...views].sort((left, right) => (Number(left.order) || 0) - (Number(right.order) || 0));
+  }
+
+  function getMainUiStorageViewRuntimeOptions() {
+    return storageViewRuntimeViews().filter((view) => view.enabled !== false);
+  }
+
+  function getStorageViewRuntimeById(viewId) {
+    return storageViewRuntimeViews().find((view) => view.id === viewId) || null;
+  }
+
+  function ensureStorageViewRuntimeSelection(preferVisible = false) {
+    const views = storageViewRuntimeViews();
+    if (!views.length) {
+      state.selectedStorageViewRuntimeId = "";
+      return null;
+    }
+    if (state.selectedStorageViewRuntimeId && views.some((view) => view.id === state.selectedStorageViewRuntimeId)) {
+      return getStorageViewRuntimeById(state.selectedStorageViewRuntimeId);
+    }
+    if (preferVisible) {
+      const preferredVisible = getMainUiStorageViewRuntimeOptions()[0] || views[0];
+      state.selectedStorageViewRuntimeId = preferredVisible?.id || "";
+      return preferredVisible || null;
+    }
+    state.selectedStorageViewRuntimeId = "";
+    return null;
+  }
+
+  function getSelectedStorageViewRuntime() {
+    return ensureStorageViewRuntimeSelection(false);
+  }
+
+  function getSelectedStorageViewRuntimeSlot(slotIndex) {
+    const selectedView = getSelectedStorageViewRuntime();
+    if (!selectedView) {
+      return null;
+    }
+    return (selectedView.slots || []).find((slot) => Number(slot.slot_index) === Number(slotIndex)) || null;
+  }
+
+  function activeLayoutRows() {
+    const selectedView = getSelectedStorageViewRuntime();
+    return Array.isArray(selectedView?.slot_layout) && selectedView.slot_layout.length
+      ? selectedView.slot_layout
+      : (state.layoutRows || []);
+  }
+
+  function currentLayoutSlotCount() {
+    const selectedView = getSelectedStorageViewRuntime();
+    if (selectedView) {
+      return Number(selectedView.slot_count) || countLayoutSlots(activeLayoutRows()) || 0;
+    }
+    return Number(state.snapshot.layout_slot_count) || countLayoutSlots(activeLayoutRows()) || 0;
+  }
+
+  function storageViewRuntimeMeta(view) {
+    if (!view) {
+      return [];
+    }
+    return [
+      view.kind ? view.kind.replace(/_/g, " ") : null,
+      view.template_label || view.template_id || null,
+      Number.isFinite(Number(view.slot_count)) ? `${Number(view.slot_count)} slots` : null,
+      Number.isFinite(Number(view.matched_count)) ? `${Number(view.matched_count)} matched` : null,
+      view.binding?.mode ? `binding: ${view.binding.mode}` : null,
+      view.render?.show_in_main_ui === false ? "maintenance-only view" : "main UI view",
+      view.backing_enclosure_label ? `live: ${view.backing_enclosure_label}` : null,
+      view.source === "selected_enclosure_snapshot" ? "live enclosure snapshot" : "inventory binding",
+    ].filter(Boolean);
+  }
+
+  function selectorLabelForEnclosureOption(enclosure) {
+    return `Live Enclosure · ${enclosure?.label || enclosure?.id || "Unknown enclosure"}`;
+  }
+
+  function isSavedChassisView(view) {
+    return view?.kind === "ses_enclosure";
+  }
+
+  function storageViewKindLabel(view) {
+    return isSavedChassisView(view) ? "Saved Chassis View" : "Virtual Storage View";
+  }
+
+  function selectorLabelForStorageViewOption(view) {
+    const suffixes = [];
+    if (view?.render?.show_in_main_ui === false) {
+      suffixes.push("maintenance");
+    }
+    if (isSavedChassisView(view) && view?.backing_enclosure_label) {
+      suffixes.push(`mirrors ${view.backing_enclosure_label}`);
+    }
+    return `${storageViewKindLabel(view)} · ${view?.label || view?.id || "Storage View"}${suffixes.length ? ` (${suffixes.join(" / ")})` : ""}`;
+  }
+
+  function storageViewRuntimeTilePrimary(slot, selectedView) {
+    if (!slot?.occupied) {
+      return selectedView?.kind === "nvme_carrier" ? "Unmapped slot" : "Empty";
+    }
+    if (selectedView?.kind === "nvme_carrier" || selectedView?.kind === "boot_devices") {
+      return slot.device_name || slot.serial || slot.pool_name || "Matched disk";
+    }
+    return slot.serial || slot.device_name || slot.pool_name || "Matched disk";
+  }
+
+  function storageViewRuntimeTileSummary(slot, selectedView) {
+    if (!slot?.occupied) {
+      return selectedView?.kind === "nvme_carrier"
+        ? "No live disk matched yet."
+        : "No live disk is currently landing in this storage-view slot.";
+    }
+    if (selectedView?.kind === "nvme_carrier") {
+      return [
+        slot.device_name && slot.serial ? slot.serial : null,
+        slot.pool_name ? `pool ${slot.pool_name}` : null,
+      ].filter(Boolean).join(" • ") || "Matched from live inventory.";
+    }
+    return [
+      slot.device_name || null,
+      slot.pool_name ? `pool ${slot.pool_name}` : null,
+      slot.transport_address || null,
+    ].filter(Boolean).join(" • ");
+  }
+
+  function buildNvmeRuntimeTileMarkup(slot, selectedView) {
+    const slotLabel = slot?.slot_label || `Slot ${Number(slot?.slot_index ?? 0) + 1}`;
+    const slotSize = slot?.slot_size || "";
+    const primary = storageViewRuntimeTilePrimary(slot, selectedView);
+    const summary = storageViewRuntimeTileSummary(slot, selectedView);
+    const lengthTag = formatNvmeFormFactorTag(slotSize);
+    return `
+      <span class="slot-status-led" aria-hidden="true"></span>
+      <div class="storage-view-runtime-card storage-view-runtime-card--nvme" data-slot-size="${escapeHtml(slotSize)}">
+        <span class="storage-view-runtime-card-hole" aria-hidden="true"></span>
+        <div class="storage-view-runtime-card-content">
+          <div class="storage-view-runtime-card-head">
+            <span class="storage-view-runtime-card-slot">${escapeHtml(slotLabel)}</span>
+            <span class="storage-view-runtime-card-size-chip">${escapeHtml(lengthTag)}</span>
+          </div>
+          <span class="storage-view-runtime-card-device">${escapeHtml(primary)}</span>
+          <span class="storage-view-runtime-card-summary">${escapeHtml(summary)}</span>
+        </div>
+        <span class="storage-view-runtime-card-latch" aria-hidden="true"></span>
+      </div>
+    `;
+  }
+
+  function formatNvmeFormFactorTag(slotSize) {
+    const text = String(slotSize || "").trim();
+    if (!text) {
+      return "Form Factor: auto";
+    }
+    if (/^22\d{2,3}$/.test(text)) {
+      return `Form Factor: ${text}`;
+    }
+    return `Form Factor: ${text}`;
+  }
+
+  const NVME_CARRIER_BOARD_LAYOUT = {
+    width: 902,
+    height: 526,
+    connectorRight: 638,
+    cardHeight: 56,
+    holeInset: 8,
+    rowCenters: [55, 151, 247, 342],
+    screwCenters: {
+      "2242": 458,
+      "2230": 506,
+      "2260": 381,
+      "2280": 312,
+      "22110": 186,
+      default: 312,
+    },
+  };
+
+  function nvmeCarrierSlotMetrics(slot, orderIndex) {
+    const slotSize = String(slot?.slot_size || "").trim();
+    const screwCenterPx =
+      NVME_CARRIER_BOARD_LAYOUT.screwCenters[slotSize]
+      || NVME_CARRIER_BOARD_LAYOUT.screwCenters.default;
+    const widthPx = NVME_CARRIER_BOARD_LAYOUT.connectorRight - screwCenterPx + NVME_CARRIER_BOARD_LAYOUT.holeInset;
+    const centerPx =
+      NVME_CARRIER_BOARD_LAYOUT.rowCenters[orderIndex]
+      ?? NVME_CARRIER_BOARD_LAYOUT.rowCenters[NVME_CARRIER_BOARD_LAYOUT.rowCenters.length - 1];
+    const topPx = centerPx - (NVME_CARRIER_BOARD_LAYOUT.cardHeight / 2);
+    const leftPx = NVME_CARRIER_BOARD_LAYOUT.connectorRight - widthPx;
+    return {
+      left: `${(leftPx / NVME_CARRIER_BOARD_LAYOUT.width) * 100}%`,
+      top: `${(topPx / NVME_CARRIER_BOARD_LAYOUT.height) * 100}%`,
+      width: `${(widthPx / NVME_CARRIER_BOARD_LAYOUT.width) * 100}%`,
+      minHeight: `${(NVME_CARRIER_BOARD_LAYOUT.cardHeight / NVME_CARRIER_BOARD_LAYOUT.height) * 100}%`,
+    };
+  }
+
+  function bindStorageViewTileInteractions(tile, slot, selectedView) {
+    tile.addEventListener("mouseenter", (event) => {
+      state.hoveredSlot = slot.slot_index;
+      if (slotTooltipEl) {
+        slotTooltipEl.innerHTML = buildStorageViewRuntimeTooltip(slot, selectedView)
+          .split("\n")
+          .map((line, index) => `<div class="${index === 0 ? "slot-tooltip-title" : "slot-tooltip-line"}">${escapeHtml(line)}</div>`)
+          .join("");
+        slotTooltipEl.classList.remove("hidden");
+        slotTooltipEl.setAttribute("aria-hidden", "false");
+        positionSlotTooltip(event.clientX, event.clientY);
+      }
+    });
+    tile.addEventListener("mousemove", (event) => {
+      if (state.hoveredSlot === slot.slot_index) {
+        positionSlotTooltip(event.clientX, event.clientY);
+      }
+    });
+    tile.addEventListener("mouseleave", () => {
+      if (state.hoveredSlot === slot.slot_index) {
+        state.hoveredSlot = null;
+      }
+      hideSlotTooltip();
+    });
+    tile.addEventListener("focus", () => {
+      state.hoveredSlot = slot.slot_index;
+      if (slotTooltipEl) {
+        slotTooltipEl.innerHTML = buildStorageViewRuntimeTooltip(slot, selectedView)
+          .split("\n")
+          .map((line, index) => `<div class="${index === 0 ? "slot-tooltip-title" : "slot-tooltip-line"}">${escapeHtml(line)}</div>`)
+          .join("");
+        slotTooltipEl.classList.remove("hidden");
+        slotTooltipEl.setAttribute("aria-hidden", "false");
+        positionSlotTooltipFromElement(tile);
+      }
+    });
+    tile.addEventListener("blur", () => {
+      if (state.hoveredSlot === slot.slot_index) {
+        state.hoveredSlot = null;
+      }
+      hideSlotTooltip();
+    });
+    tile.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (state.selectedSlot === slot.slot_index) {
+        clearSelectedSlot();
+        return;
+      }
+      selectSlot(slot.slot_index);
+    });
+  }
+
+  function storageViewRuntimeShortLabel(slot) {
+    if (!slot) {
+      return "Empty";
+    }
+    return slot.serial || slot.device_name || slot.pool_name || "Matched disk";
+  }
+
+  function storageViewRuntimeSecondaryLabel(slot) {
+    if (!slot || !slot.occupied) {
+      return "No live disk is currently landing in this storage-view slot.";
+    }
+    return [
+      slot.device_name || null,
+      slot.pool_name ? `pool ${slot.pool_name}` : null,
+      slot.transport_address || null,
+    ].filter(Boolean).join(" • ");
+  }
+
+  function storageViewRuntimeTertiaryLabel(slot) {
+    if (!slot?.occupied) {
+      return slot?.slot_size || "";
+    }
+    return [
+      slot.slot_size || null,
+      slot.placement_key || null,
+    ].filter(Boolean).join(" • ");
+  }
+
+  function storageViewRuntimeMatchesFilter(slot) {
+    if (!state.search) {
+      return true;
+    }
+    const haystack = [
+      slot?.slot_label,
+      slot?.serial,
+      slot?.device_name,
+      slot?.pool_name,
+      slot?.transport_address,
+      slot?.placement_key,
+      slot?.model,
+      slot?.description,
+    ].filter(Boolean).join(" ").toLowerCase();
+    return haystack.includes(state.search);
+  }
+
+  function buildStorageViewRuntimeTooltip(slot, selectedView) {
+    if (!slot) {
+      return "";
+    }
+    const lines = [
+      `${selectedView?.label || "Storage View"} • ${slot.slot_label}`,
+      slot.occupied ? (slot.serial || slot.device_name || "Matched disk") : "No live disk matched",
+      slot.device_name ? `Device ${slot.device_name}` : null,
+      slot.pool_name ? `Pool ${slot.pool_name}` : null,
+      slot.transport_address ? `PCIe ${slot.transport_address}` : null,
+      slot.slot_size ? `Size ${slot.slot_size}` : null,
+      slot.placement_key ? `Placement ${slot.placement_key}` : null,
+    ].filter(Boolean);
+    return lines.join("\n");
+  }
+
+  function renderStorageViewGrid(selectedView) {
+    hideSlotTooltip();
+    grid.innerHTML = "";
+    const slotLayout = Array.isArray(selectedView?.slot_layout) ? selectedView.slot_layout : [];
+    const slotsByIndex = new Map((selectedView?.slots || []).map((slot) => [Number(slot.slot_index), slot]));
+
+    if (selectedView.kind === "nvme_carrier") {
+      const board = document.createElement("div");
+      board.className = "nvme-carrier-canvas";
+      const boardImage = document.createElement("img");
+      boardImage.className = "nvme-carrier-board-image";
+      boardImage.src = "/static/images/hyper-m2-gen3-card.png";
+      boardImage.alt = "";
+      boardImage.setAttribute("aria-hidden", "true");
+      board.appendChild(boardImage);
+      const orderedSlots = slotLayout.flat().filter((slotValue) => Number.isInteger(slotValue));
+
+      orderedSlots.forEach((slotValue, orderIndex) => {
+        const slot = slotsByIndex.get(Number(slotValue)) || {
+          slot_index: Number(slotValue),
+          slot_label: `Slot ${Number(slotValue) + 1}`,
+          occupied: false,
+          state: "empty",
+          slot_size: null,
+        };
+        const visualState = slot.state === "matched" ? "healthy" : slot.state;
+        const tile = document.createElement("button");
+        tile.type = "button";
+        tile.className = `slot-tile state-${visualState} storage-view-slot storage-view-slot-nvme storage-view-slot-nvme-absolute`;
+        tile.dataset.slot = String(slot.slot_index);
+        tile.dataset.slotOrder = String(orderIndex);
+        if (slot.slot_size) {
+          tile.dataset.slotSize = String(slot.slot_size);
+        } else {
+          delete tile.dataset.slotSize;
+        }
+        const metrics = nvmeCarrierSlotMetrics(slot, orderIndex);
+        tile.style.left = metrics.left;
+        tile.style.top = metrics.top;
+        tile.style.width = metrics.width;
+        tile.style.minHeight = metrics.minHeight;
+        if (!storageViewRuntimeMatchesFilter(slot)) {
+          tile.classList.add("filtered-out");
+        }
+        if (state.selectedSlot === slot.slot_index) {
+          tile.classList.add("selected");
+        }
+        tile.setAttribute("aria-label", buildStorageViewRuntimeTooltip(slot, selectedView));
+        tile.innerHTML = buildNvmeRuntimeTileMarkup(slot, selectedView);
+        bindStorageViewTileInteractions(tile, slot, selectedView);
+        board.appendChild(tile);
+      });
+
+      const edgeNote = document.createElement("div");
+      edgeNote.className = "nvme-carrier-edge-note";
+      edgeNote.textContent = "PCIe edge / slot 1";
+      board.appendChild(edgeNote);
+
+      grid.appendChild(board);
+      return;
+    }
+
+    slotLayout.forEach((row) => {
+      const rowWrapper = document.createElement("div");
+      rowWrapper.className = "slot-row";
+      const rowSlots = document.createElement("div");
+      rowSlots.className = "row-slots";
+      rowSlots.dataset.slotCount = String(row.length);
+      rowSlots.style.gridTemplateColumns = `repeat(${row.length || 1}, minmax(0, 1fr))`;
+
+      row.forEach((slotValue) => {
+        if (!Number.isInteger(slotValue)) {
+          const gapTile = document.createElement("div");
+          gapTile.className = "slot-gap";
+          gapTile.setAttribute("aria-hidden", "true");
+          rowSlots.appendChild(gapTile);
+          return;
+        }
+
+        const slot = slotsByIndex.get(Number(slotValue)) || {
+          slot_index: Number(slotValue),
+          slot_label: `Slot ${Number(slotValue) + 1}`,
+          occupied: false,
+          state: "empty",
+          slot_size: null,
+        };
+        const visualState = slot.state === "matched" ? "healthy" : slot.state;
+        const tile = document.createElement("button");
+        tile.type = "button";
+        tile.className = `slot-tile state-${visualState} storage-view-slot`;
+        if (selectedView.kind === "nvme_carrier") {
+          tile.classList.add("storage-view-slot-nvme");
+        }
+        if (selectedView.kind === "boot_devices") {
+          tile.classList.add("storage-view-slot-boot");
+        }
+        if (!storageViewRuntimeMatchesFilter(slot)) {
+          tile.classList.add("filtered-out");
+        }
+        if (state.selectedSlot === slot.slot_index) {
+          tile.classList.add("selected");
+        }
+        tile.dataset.slot = String(slot.slot_index);
+        if (slot.slot_size) {
+          tile.dataset.slotSize = String(slot.slot_size);
+        } else {
+          delete tile.dataset.slotSize;
+        }
+        tile.setAttribute("aria-label", buildStorageViewRuntimeTooltip(slot, selectedView));
+        tile.innerHTML =
+          selectedView.kind === "nvme_carrier"
+            ? buildNvmeRuntimeTileMarkup(slot, selectedView)
+            : `
+              <span class="slot-status-led" aria-hidden="true"></span>
+              <span class="slot-number">${escapeHtml(slot.slot_label)}</span>
+              <span class="slot-device">${escapeHtml(storageViewRuntimeShortLabel(slot))}</span>
+              <span class="slot-pool">${escapeHtml(storageViewRuntimeSecondaryLabel(slot) || storageViewRuntimeTertiaryLabel(slot) || stateLabel(slot))}</span>
+              <span class="slot-tertiary">${escapeHtml(storageViewRuntimeTertiaryLabel(slot))}</span>
+              <span class="slot-latch" aria-hidden="true"></span>
+            `;
+        bindStorageViewTileInteractions(tile, slot, selectedView);
+        rowSlots.appendChild(tile);
+      });
+
+      rowWrapper.appendChild(rowSlots);
+      grid.appendChild(rowWrapper);
+    });
+  }
+
+  function renderStorageViewsRuntime() {
+    if (!storageViewList || !storageViewEmpty || !storageViewContent || !storageViewTitle || !storageViewNote || !storageViewMeta || !storageViewGrid || !storageViewMappingList) {
+      return;
+    }
+
+    const views = storageViewRuntimeViews();
+    const selectedView = ensureStorageViewRuntimeSelection();
+    if (storageViewsSummary) {
+      if (state.storageViewsRuntimeLoading) {
+        storageViewsSummary.textContent = `Inspecting runtime storage-view matches on ${state.selectedSystemId || state.snapshot.selected_system_id || "the selected system"}...`;
+      } else if (!views.length) {
+        storageViewsSummary.textContent = "No saved chassis or virtual storage views are configured for this system yet. Live discovered enclosures still show up in the selector above.";
+      } else {
+        storageViewsSummary.textContent = `Read-only runtime mapping for ${views.length} saved chassis or virtual storage view${views.length === 1 ? "" : "s"} on ${state.storageViewsRuntime?.system_label || state.snapshot.selected_system_label || state.selectedSystemId || "the selected system"}.`;
+      }
+    }
+
+    storageViewList.innerHTML = views
+      .map((view) => `
+        <button
+          class="storage-view-card${view.id === state.selectedStorageViewRuntimeId ? " is-selected" : ""}${view.render?.show_in_main_ui === false ? " is-hidden" : ""}"
+          type="button"
+          data-storage-view-runtime-id="${escapeHtml(view.id)}"
+        >
+          <div class="storage-view-card-header">
+            <div>
+              <h4>${escapeHtml(view.label || view.id)}</h4>
+              <p class="subtle">${escapeHtml(view.notes?.[0] || "Runtime storage-view mapping.")}</p>
+            </div>
+            <span class="state-pill state-${view.enabled === false ? "empty" : "healthy"}">${escapeHtml(view.enabled === false ? "Disabled" : "Enabled")}</span>
+          </div>
+          <div class="profile-preview-meta">
+            ${storageViewRuntimeMeta(view).map((item) => `<span class="meta-chip">${escapeHtml(item)}</span>`).join("")}
+          </div>
+        </button>
+      `)
+      .join("");
+
+    if (!selectedView) {
+      storageViewEmpty.classList.remove("hidden");
+      storageViewContent.classList.add("hidden");
+      return;
+    }
+
+    storageViewEmpty.classList.add("hidden");
+    storageViewContent.classList.remove("hidden");
+    storageViewTitle.textContent = selectedView.label || selectedView.id;
+    storageViewNote.textContent = (selectedView.notes || []).join(" ");
+    storageViewMeta.innerHTML = storageViewRuntimeMeta(selectedView)
+      .map((item) => `<span class="meta-chip">${escapeHtml(item)}</span>`)
+      .join("");
+
+    const slotLayout = Array.isArray(selectedView.slot_layout) ? selectedView.slot_layout : [];
+    const columnCount = Math.max(1, ...slotLayout.map((row) => (Array.isArray(row) ? row.length : 0)), 1);
+    const slotsByIndex = new Map((selectedView.slots || []).map((slot) => [Number(slot.slot_index), slot]));
+    storageViewGrid.style.gridTemplateColumns = `repeat(${columnCount}, minmax(0, 1fr))`;
+    storageViewGrid.classList.toggle("is-nvme-carrier", selectedView.kind === "nvme_carrier");
+    storageViewGrid.innerHTML = slotLayout
+      .flat()
+      .map((slotIndex) => {
+        if (!Number.isInteger(slotIndex)) {
+          return '<div class="storage-view-runtime-cell is-gap" aria-hidden="true"></div>';
+        }
+        const slot = slotsByIndex.get(Number(slotIndex));
+        const stateClass = slot?.state || "empty";
+        return `
+          <article class="storage-view-runtime-cell state-${escapeHtml(stateClass)}${selectedView.kind === "ses_enclosure" ? " is-ses" : ""}${selectedView.kind === "nvme_carrier" ? " is-nvme" : ""}">
+            ${selectedView.kind === "nvme_carrier"
+              ? `
+                <div class="storage-view-runtime-cell-card">
+                  <div class="storage-view-runtime-card storage-view-runtime-card--nvme" data-slot-size="${escapeHtml(slot?.slot_size || "")}">
+                    <span class="storage-view-runtime-card-hole" aria-hidden="true"></span>
+                    <div class="storage-view-runtime-card-content">
+                      <span class="storage-view-runtime-card-slot">${escapeHtml(slot?.slot_label || `Slot ${Number(slotIndex) + 1}`)}</span>
+                      <span class="storage-view-runtime-card-size">${escapeHtml(slot?.slot_size || "auto")}</span>
+                      <span class="storage-view-runtime-card-device">${escapeHtml(storageViewRuntimeTilePrimary(slot, selectedView))}</span>
+                      <span class="storage-view-runtime-card-summary">${escapeHtml(storageViewRuntimeTileSummary(slot, selectedView))}</span>
+                    </div>
+                    <span class="storage-view-runtime-card-latch" aria-hidden="true"></span>
+                  </div>
+                </div>
+              `
+              : `
+                <span class="storage-view-runtime-slot-label">${escapeHtml(slot?.slot_label || `Slot ${Number(slotIndex) + 1}`)}</span>
+                <div class="storage-view-runtime-device">${escapeHtml(storageViewRuntimeShortLabel(slot))}</div>
+                <div class="storage-view-runtime-secondary">${escapeHtml(storageViewRuntimeSecondaryLabel(slot))}</div>
+              `}
+          </article>
+        `;
+      })
+      .join("");
+
+    storageViewMappingList.innerHTML = (selectedView.slots || [])
+      .map((slot) => `
+        <article class="storage-view-mapping-item${slot.occupied ? "" : " is-empty"}">
+          <div class="storage-view-mapping-slot">${escapeHtml(slot.slot_label)}</div>
+          <div class="storage-view-mapping-body">
+            <div class="storage-view-mapping-title">${escapeHtml(storageViewRuntimeShortLabel(slot))}</div>
+            <div class="storage-view-mapping-copy">
+              ${escapeHtml(
+                slot.occupied
+                  ? [
+                      slot.device_name ? `device ${slot.device_name}` : null,
+                      slot.pool_name ? `pool ${slot.pool_name}` : null,
+                      slot.transport_address ? `PCIe ${slot.transport_address}` : null,
+                      slot.snapshot_slot !== null && slot.snapshot_slot !== undefined ? `live slot ${slot.snapshot_slot}` : null,
+                      slot.placement_key ? `placement ${slot.placement_key}` : null,
+                      Array.isArray(slot.match_reasons) && slot.match_reasons.length ? `matched by ${slot.match_reasons.join(", ")}` : null,
+                    ].filter(Boolean).join(" • ")
+                  : "No live disk is currently matched to this layout slot."
+              )}
+            </div>
+          </div>
+        </article>
+      `)
+      .join("");
+  }
+
   function usesGenericPersistentIdLabel() {
     return ["scale", "linux"].includes(currentPlatform());
   }
 
   function buildViewProfile() {
+    const selectedStorageView = getSelectedStorageViewRuntime();
     const profile = getSelectedProfile();
     const system = getSelectedSystemOption();
     const enclosure = getSelectedEnclosureOption();
-    const enclosureLabel = enclosure?.label || state.snapshot.selected_enclosure_label || "Enclosure";
+    const enclosureLabel = enclosure?.label || currentLiveEnclosureLabel() || "Enclosure";
     const systemLabel = system?.label || state.snapshot.selected_system_label || "TrueNAS JBOD Enclosure UI";
+    if (selectedStorageView) {
+      const baseSummary =
+        selectedStorageView.kind === "nvme_carrier"
+          ? "Runtime storage-view map for an internal 4x NVMe carrier card."
+          : selectedStorageView.kind === "boot_devices"
+            ? "Runtime storage-view map for internal boot media."
+            : selectedStorageView.backing_enclosure_label
+              ? `Saved chassis view layered on top of the live enclosure ${selectedStorageView.backing_enclosure_label}.`
+              : "Runtime storage-view map for the selected saved hardware view.";
+      return {
+        eyebrow: `${systemLabel} / ${storageViewKindLabel(selectedStorageView)}`,
+        summary: selectedStorageView.notes?.[0] || baseSummary,
+        enclosureTitle: selectedStorageView.label || selectedStorageView.id,
+        edgeLabel: selectedStorageView.kind === "nvme_carrier" ? "PCIe edge / slot 1" : "Storage view",
+        faceStyle:
+          selectedStorageView.kind === "nvme_carrier"
+            ? "nvme-carrier"
+            : selectedStorageView.kind === "boot_devices"
+              ? "boot-devices"
+              : "generic",
+        latchEdge: "bottom",
+        baySize: selectedStorageView.kind === "ses_enclosure" ? (profile?.bay_size || null) : "2.5",
+      };
+    }
     return {
       eyebrow: profile?.eyebrow || systemLabel,
       summary: profile?.summary || "Drive-bay map with API-or-SSH enrichment for the selected enclosure.",
@@ -266,7 +928,7 @@
       return profile.baySize;
     }
 
-    const slotCount = Number(state.snapshot.layout_slot_count) || countLayoutSlots(state.layoutRows) || 0;
+    const slotCount = currentLayoutSlotCount();
 
     if (profile.faceStyle === "unifi-drive") {
       return "3.5";
@@ -301,8 +963,16 @@
   }
 
   function inferChassisLayoutMode(profile, driveScale) {
-    const rowCount = state.layoutRows.length || 0;
-    const slotCount = Number(state.snapshot.layout_slot_count) || countLayoutSlots(state.layoutRows) || 0;
+    const rowCount = activeLayoutRows().length || 0;
+    const slotCount = currentLayoutSlotCount();
+
+    if (profile.faceStyle === "nvme-carrier") {
+      return "nvme-carrier";
+    }
+
+    if (profile.faceStyle === "boot-devices") {
+      return "boot-devices";
+    }
 
     if (profile.faceStyle === "unifi-drive") {
       return rowCount > 1 ? "unifi-2row" : "unifi-1row";
@@ -336,7 +1006,7 @@
     const layoutMode = inferChassisLayoutMode(profile, scale);
     chassisShell.dataset.driveScale = scale;
     chassisShell.dataset.layoutMode = layoutMode;
-    chassisShell.dataset.layoutRows = String(state.layoutRows.length || 0);
+    chassisShell.dataset.layoutRows = String(activeLayoutRows().length || 0);
   }
 
   function splitRowIntoGroups(row) {
@@ -415,13 +1085,17 @@
       .join(" ");
   }
 
-  function buildSelectionParams() {
+  function buildSelectionParams({ includeStorageView = false } = {}) {
     const params = new URLSearchParams();
     if (state.selectedSystemId) {
       params.set("system_id", state.selectedSystemId);
     }
-    if (state.selectedEnclosureId) {
-      params.set("enclosure_id", state.selectedEnclosureId);
+    const liveEnclosureId = currentLiveEnclosureId();
+    if (liveEnclosureId) {
+      params.set("enclosure_id", liveEnclosureId);
+    }
+    if (includeStorageView && state.selectedStorageViewRuntimeId) {
+      params.set("storage_view_id", state.selectedStorageViewRuntimeId);
     }
     return params;
   }
@@ -429,6 +1103,689 @@
   function buildScopedUrl(url) {
     const params = buildSelectionParams();
     return params.toString() ? `${url}?${params.toString()}` : url;
+  }
+
+  function platformSetupCopy(platform) {
+    switch (String(platform || "").toLowerCase()) {
+      case "scale":
+        return "TrueNAS SCALE usually wants an API key plus optional SSH enrichment for SES and smartctl detail.";
+      case "linux":
+        return "Generic Linux can run inventory-only over SSH, or you can pair it with a light API endpoint if you have one.";
+      case "quantastor":
+        return "Quantastor usually authenticates with API user/password, then optionally adds SSH for qs and SES detail.";
+      default:
+        return "TrueNAS CORE usually wants an API key, with SSH as the optional fallback for enclosure mapping and LED control.";
+    }
+  }
+
+  function defaultSetupSshCommands(platform) {
+    const normalizedPlatform = String(platform || "core").toLowerCase();
+    const commands = setupPlatformDefaults?.[normalizedPlatform]?.ssh_commands;
+    return Array.isArray(commands) ? commands : [];
+  }
+
+  function recommendedSetupSshUser() {
+    return "jbodmap";
+  }
+
+  function renderSetupProfileOptions() {
+    if (!setupProfileSelect) {
+      return;
+    }
+    const selectedValue = setupProfileSelect.value || "";
+    const options = [
+      '<option value="">Auto-select from platform</option>',
+      ...availableSetupProfiles.map((profile) => {
+        const summary = profile.summary ? ` data-summary="${escapeHtml(profile.summary)}"` : "";
+        const selected = profile.id === selectedValue ? " selected" : "";
+        return `<option value="${escapeHtml(profile.id)}"${summary}${selected}>${escapeHtml(profile.label)}</option>`;
+      }),
+    ];
+    setupProfileSelect.innerHTML = options.join("");
+    if (selectedValue) {
+      setupProfileSelect.value = selectedValue;
+    }
+  }
+
+  function syncSetupPlatformHelp() {
+    if (!setupPlatformHelp || !setupPlatformSelect) {
+      return;
+    }
+    setupPlatformHelp.textContent = platformSetupCopy(setupPlatformSelect.value || "core");
+  }
+
+  function formatBackupPackaging(packaging) {
+    if (packaging === "zip") {
+      return "ZIP";
+    }
+    if (packaging === "7z") {
+      return "7Z";
+    }
+    if (packaging === "tar.gz") {
+      return "TAR.GZ";
+    }
+    return "TAR.ZST";
+  }
+
+  function normalizeSetupSshKeyMode(value) {
+    if (value === "generate" || value === "manual") {
+      return value;
+    }
+    return "reuse";
+  }
+
+  function normalizeSetupSshKeyName(value) {
+    return String(value || "")
+      .trim()
+      .replace(/[^a-zA-Z0-9._-]+/g, "-")
+      .replace(/^[._-]+|[._-]+$/g, "")
+      .toLowerCase()
+      .slice(0, 128);
+  }
+
+  function suggestedSetupSshKeyName() {
+    const systemIdCandidate = normalizeSetupSshKeyName(setupSystemId?.value);
+    const labelCandidate = normalizeSetupSshKeyName(setupSystemLabel?.value).toLowerCase();
+    const hostCandidate = normalizeSetupSshKeyName(
+      (setupTruenasHost?.value || "")
+        .replace(/^https?:\/\//i, "")
+        .split("/")[0]
+        .split(":")[0]
+    ).toLowerCase();
+    if (systemIdCandidate) {
+      return `id_${systemIdCandidate}`;
+    }
+    if (labelCandidate) {
+      return `id_${labelCandidate}`;
+    }
+    if (hostCandidate) {
+      return `id_${hostCandidate}`;
+    }
+    return "id_truenas";
+  }
+
+  function getSetupSshKeyByName(name) {
+    return (state.setup.sshKeys || []).find((key) => key.name === name) || null;
+  }
+
+  function preferredSetupSshKeyName(preferredName = null) {
+    if (preferredName && getSetupSshKeyByName(preferredName)) {
+      return preferredName;
+    }
+    const selectedValue = setupSshExistingKeySelect?.value || "";
+    if (selectedValue && getSetupSshKeyByName(selectedValue)) {
+      return selectedValue;
+    }
+    const currentPath = setupSshKeyPath?.value?.trim() || "";
+    if (currentPath) {
+      const matchingKey = (state.setup.sshKeys || []).find(
+        (key) => key.runtime_private_path === currentPath || key.private_path === currentPath
+      );
+      if (matchingKey) {
+        return matchingKey.name;
+      }
+    }
+    if (getSetupSshKeyByName("id_truenas")) {
+      return "id_truenas";
+    }
+    return state.setup.sshKeys[0]?.name || "";
+  }
+
+  function renderSetupSshKeyOptions(preferredName = null) {
+    if (!setupSshExistingKeySelect) {
+      return;
+    }
+    const selectedName = preferredSetupSshKeyName(preferredName);
+    if (!state.setup.sshKeys.length) {
+      setupSshExistingKeySelect.innerHTML = '<option value="">No SSH keys found under config/ssh</option>';
+      setupSshExistingKeySelect.value = "";
+      return;
+    }
+    setupSshExistingKeySelect.innerHTML = state.setup.sshKeys
+      .map((key) => `<option value="${escapeHtml(key.name)}">${escapeHtml(key.name)} (${escapeHtml(key.algorithm || "ssh")})</option>`)
+      .join("");
+    setupSshExistingKeySelect.value = selectedName;
+  }
+
+  function applySelectedExistingSshKey() {
+    if (!setupSshKeyPath || state.setup.sshKeyMode !== "reuse") {
+      return;
+    }
+    const selectedKey = getSetupSshKeyByName(setupSshExistingKeySelect?.value || "");
+    if (!selectedKey) {
+      return;
+    }
+    setupSshKeyPath.value = selectedKey.runtime_private_path || selectedKey.private_path || setupSshKeyPath.value;
+  }
+
+  function syncSetupSshKeyHelp() {
+    if (!setupSshKeyHelp) {
+      return;
+    }
+    if (!setupSshEnabledToggle?.checked) {
+      setupSshKeyHelp.textContent = "SSH key controls unlock after SSH enrichment is enabled for this system.";
+      return;
+    }
+    if (state.setup.sshKeysLoading) {
+      setupSshKeyHelp.textContent = "Loading SSH key pairs from config/ssh...";
+      return;
+    }
+
+    if (state.setup.sshKeyMode === "reuse") {
+      if (!state.setup.sshKeys.length) {
+        setupSshKeyHelp.textContent = "No reusable keys were found under config/ssh yet. Generate one here or switch to a manual path.";
+        return;
+      }
+      const selectedKey = getSetupSshKeyByName(setupSshExistingKeySelect?.value || "");
+      if (!selectedKey) {
+        setupSshKeyHelp.textContent = "Choose an existing key pair to populate the runtime SSH key path automatically.";
+        return;
+      }
+      const publicPath = selectedKey.public_path ? ` Public key: ${selectedKey.public_path}.` : "";
+      setupSshKeyHelp.textContent = `Using ${selectedKey.runtime_private_path || selectedKey.private_path} (${selectedKey.fingerprint}).${publicPath}`;
+      return;
+    }
+
+    if (state.setup.sshKeyMode === "generate") {
+      const suggestedName = normalizeSetupSshKeyName(setupSshGenerateName?.value) || suggestedSetupSshKeyName();
+      setupSshKeyHelp.textContent = `New Ed25519 key pairs are written under config/ssh and become available at /run/ssh immediately. Suggested name: ${suggestedName}.`;
+      return;
+    }
+
+    const currentPath = setupSshKeyPath?.value?.trim() || "/run/ssh/id_truenas";
+    setupSshKeyHelp.textContent = `Manual mode leaves the key path editable. Current path: ${currentPath}.`;
+  }
+
+  function syncSetupSshKeyMode(preferredName = null) {
+    state.setup.sshKeyMode = normalizeSetupSshKeyMode(setupSshKeyMode?.value);
+    if (setupSshKeyMode) {
+      setupSshKeyMode.value = state.setup.sshKeyMode;
+    }
+    renderSetupSshKeyOptions(preferredName);
+    setupSshKeyModePanels.forEach((panel) => {
+      panel.classList.toggle("hidden", panel.dataset.setupSshKeyModePanel !== state.setup.sshKeyMode);
+    });
+    if (setupSshGenerateName && state.setup.sshKeyMode === "generate" && !setupSshGenerateName.value.trim()) {
+      setupSshGenerateName.value = suggestedSetupSshKeyName();
+    }
+    if (setupSshKeyPath) {
+      setupSshKeyPath.readOnly = state.setup.sshKeyMode !== "manual";
+      setupSshKeyPath.classList.toggle("is-readonly", state.setup.sshKeyMode !== "manual");
+    }
+    applySelectedExistingSshKey();
+    syncSetupSshKeyHelp();
+  }
+
+  function syncSystemBackupControls() {
+    state.setup.backupPackaging = systemBackupPackagingSelect?.value === "zip"
+      ? "zip"
+      : systemBackupPackagingSelect?.value === "tar.gz"
+        ? "tar.gz"
+        : "tar.zst";
+    if (systemBackupPackagingSelect) {
+      systemBackupPackagingSelect.value = state.setup.backupPackaging;
+    }
+    if (systemBackupExportPassphrase) {
+      systemBackupExportPassphrase.disabled = !Boolean(systemBackupEncryptToggle?.checked);
+    }
+  }
+
+  function syncSetupSshFields() {
+    const sshEnabled = Boolean(setupSshEnabledToggle?.checked);
+    document.querySelectorAll("[data-setup-ssh-field]").forEach((element) => {
+      element.disabled = !sshEnabled;
+    });
+    if (setupLoadPlatformCommandsButton) {
+      setupLoadPlatformCommandsButton.disabled = !sshEnabled;
+    }
+    if (setupRefreshSshKeysButton) {
+      setupRefreshSshKeysButton.disabled = !sshEnabled || state.setup.sshKeysLoading;
+    }
+    if (setupGenerateSshKeyButton) {
+      setupGenerateSshKeyButton.disabled = !sshEnabled || state.setup.sshKeysLoading;
+    }
+    if (setupSshKeyMode) {
+      setupSshKeyMode.disabled = !sshEnabled || state.setup.sshKeysLoading;
+    }
+    if (setupSshExistingKeySelect) {
+      setupSshExistingKeySelect.disabled = !sshEnabled
+        || state.setup.sshKeysLoading
+        || state.setup.sshKeyMode !== "reuse"
+        || !state.setup.sshKeys.length;
+    }
+    if (setupSshGenerateName) {
+      setupSshGenerateName.disabled = !sshEnabled || state.setup.sshKeyMode !== "generate";
+    }
+    syncSetupSshKeyMode();
+  }
+
+  async function loadSetupSshKeys({ preferredName = null, silent = false } = {}) {
+    if (state.snapshotMode || state.setup.sshKeysLoading) {
+      return;
+    }
+    try {
+      state.setup.sshKeysLoading = true;
+      syncSetupSshFields();
+      if (!silent) {
+        setStatus("Loading SSH key pairs for setup...");
+      }
+      const result = await fetchJson("/api/system-setup/ssh-keys");
+      state.setup.sshKeys = Array.isArray(result.keys) ? result.keys : [];
+      syncSetupSshKeyMode(preferredName);
+      if (!silent) {
+        setStatus(
+          state.setup.sshKeys.length
+            ? `Loaded ${state.setup.sshKeys.length} reusable SSH key pair${state.setup.sshKeys.length === 1 ? "" : "s"}.`
+            : "No reusable SSH key pairs were found under config/ssh."
+        );
+      }
+    } catch (error) {
+      if (!silent) {
+        setStatus(`SSH key lookup failed: ${error.message || error}`, "error");
+      }
+    } finally {
+      state.setup.sshKeysLoading = false;
+      syncSetupSshFields();
+    }
+  }
+
+  async function generateSetupSshKey() {
+    if (state.snapshotMode || state.setup.sshKeysLoading) {
+      return;
+    }
+    const requestedName = normalizeSetupSshKeyName(setupSshGenerateName?.value) || suggestedSetupSshKeyName();
+    if (!requestedName) {
+      setStatus("Enter a key name before generating an SSH key pair.", "error");
+      return;
+    }
+    try {
+      state.setup.sshKeysLoading = true;
+      syncSetupSshFields();
+      setStatus(`Generating SSH key pair ${requestedName}...`);
+      const result = await fetchJson("/api/system-setup/ssh-keys/generate", {
+        method: "POST",
+        body: JSON.stringify({ name: requestedName }),
+      });
+      state.setup.sshKeys = Array.isArray(result.keys) ? result.keys : state.setup.sshKeys;
+      if (setupSshGenerateName) {
+        setupSshGenerateName.value = requestedName;
+      }
+      if (setupSshKeyMode) {
+        setupSshKeyMode.value = "reuse";
+      }
+      syncSetupSshKeyMode(result.key?.name || requestedName);
+      setStatus(`Generated SSH key pair ${result.key?.name || requestedName}.`);
+    } catch (error) {
+      setStatus(`SSH key generation failed: ${error.message || error}`, "error");
+    } finally {
+      state.setup.sshKeysLoading = false;
+      syncSetupSshFields();
+    }
+  }
+
+  function maybeLoadRecommendedSetupCommands(force = false) {
+    if (!setupSshCommands || !setupPlatformSelect) {
+      return;
+    }
+    const platform = setupPlatformSelect.value || "core";
+    const recommendedText = defaultSetupSshCommands(platform).join("\n");
+    const previousRecommended = defaultSetupSshCommands(state.setup.defaultsLoadedForPlatform || platform).join("\n");
+    const currentText = (setupSshCommands.value || "").trim();
+    if (force || !currentText || currentText === previousRecommended.trim()) {
+      setupSshCommands.value = recommendedText;
+      state.setup.defaultsLoadedForPlatform = platform;
+    }
+  }
+
+  function syncSystemSetupStep() {
+    const currentStep = Math.max(0, Math.min(state.setup.step, setupStepPanels.length - 1));
+    state.setup.step = currentStep;
+    setupStepPanels.forEach((panel, index) => {
+      panel.classList.toggle("hidden", index !== currentStep);
+    });
+    setupStepIndicators.forEach((indicator, index) => {
+      indicator.classList.toggle("is-active", index === currentStep);
+      indicator.classList.toggle("is-complete", index < currentStep);
+    });
+    if (setupPrevButton) {
+      setupPrevButton.disabled = currentStep === 0 || state.setup.createRunning;
+    }
+    if (setupNextButton) {
+      setupNextButton.classList.toggle("hidden", currentStep >= setupStepPanels.length - 1);
+      setupNextButton.disabled = state.setup.createRunning;
+    }
+    if (setupCreateButton) {
+      setupCreateButton.classList.toggle("hidden", currentStep < setupStepPanels.length - 1);
+      setupCreateButton.disabled = state.setup.createRunning;
+    }
+  }
+
+  function setSystemSetupStep(nextStep) {
+    state.setup.step = Math.max(0, Math.min(Number(nextStep) || 0, setupStepPanels.length - 1));
+    syncSystemSetupStep();
+  }
+
+  function initializeSystemSetupForm() {
+    if (!setupPlatformSelect) {
+      return;
+    }
+    renderSetupProfileOptions();
+    setupPlatformSelect.value = currentPlatform() || "core";
+    if (setupSystemLabel) {
+      setupSystemLabel.value = "";
+    }
+    if (setupSystemId) {
+      setupSystemId.value = "";
+    }
+    if (setupProfileSelect) {
+      setupProfileSelect.value = "";
+    }
+    if (setupMakeDefaultToggle) {
+      setupMakeDefaultToggle.checked = false;
+    }
+    if (setupTruenasHost) {
+      setupTruenasHost.value = "";
+    }
+    if (setupVerifySslToggle) {
+      setupVerifySslToggle.checked = true;
+    }
+    if (setupEnclosureFilter) {
+      setupEnclosureFilter.value = "";
+    }
+    if (setupApiKey) {
+      setupApiKey.value = "";
+    }
+    if (setupApiUser) {
+      setupApiUser.value = "";
+    }
+    if (setupApiPassword) {
+      setupApiPassword.value = "";
+    }
+    if (setupSshEnabledToggle) {
+      setupSshEnabledToggle.checked = false;
+    }
+    if (setupSshHost) {
+      setupSshHost.value = "";
+    }
+    if (setupSshUser) {
+      setupSshUser.value = recommendedSetupSshUser();
+    }
+    if (setupSshPort) {
+      setupSshPort.value = "22";
+    }
+    if (setupSshKeyMode) {
+      setupSshKeyMode.value = "reuse";
+    }
+    state.setup.sshKeyMode = "reuse";
+    if (setupSshGenerateName) {
+      setupSshGenerateName.value = suggestedSetupSshKeyName();
+    }
+    if (setupSshKeyPath) {
+      setupSshKeyPath.value = "/run/ssh/id_truenas";
+    }
+    if (setupSshPassword) {
+      setupSshPassword.value = "";
+    }
+    if (setupSshSudoPassword) {
+      setupSshSudoPassword.value = "";
+    }
+    if (setupSshKnownHostsPath) {
+      setupSshKnownHostsPath.value = "/app/data/known_hosts";
+    }
+    if (setupSshStrictHostKeyToggle) {
+      setupSshStrictHostKeyToggle.checked = true;
+    }
+    if (systemBackupEncryptToggle) {
+      systemBackupEncryptToggle.checked = false;
+    }
+    state.setup.backupPackaging = "tar.zst";
+    if (systemBackupPackagingSelect) {
+      systemBackupPackagingSelect.value = state.setup.backupPackaging;
+    }
+    if (systemBackupExportPassphrase) {
+      systemBackupExportPassphrase.value = "";
+    }
+    if (systemBackupImportPassphrase) {
+      systemBackupImportPassphrase.value = "";
+    }
+    state.setup.defaultsLoadedForPlatform = null;
+    maybeLoadRecommendedSetupCommands(true);
+    syncSetupPlatformHelp();
+    syncSystemBackupControls();
+    syncSetupSshFields();
+    setSystemSetupStep(0);
+  }
+
+  function openSystemSetupDialog() {
+    if (!systemSetupDialog) {
+      return;
+    }
+    if (systemSetupDialog.open) {
+      return;
+    }
+    if (typeof systemSetupDialog.showModal === "function") {
+      systemSetupDialog.showModal();
+    } else {
+      systemSetupDialog.setAttribute("open", "open");
+    }
+    syncSetupPlatformHelp();
+    syncSystemBackupControls();
+    syncSetupSshFields();
+    syncSystemSetupStep();
+    void loadSetupSshKeys({ silent: true });
+  }
+
+  function closeSystemSetupDialog() {
+    if (!systemSetupDialog) {
+      return;
+    }
+    if (!systemSetupDialog.open) {
+      return;
+    }
+    if (typeof systemSetupDialog.close === "function") {
+      systemSetupDialog.close();
+    } else {
+      systemSetupDialog.removeAttribute("open");
+    }
+  }
+
+  function collectSystemSetupPayload() {
+    const sshEnabled = Boolean(setupSshEnabledToggle?.checked);
+    if (sshEnabled) {
+      applySelectedExistingSshKey();
+    }
+    return {
+      system_id: setupSystemId?.value?.trim() || null,
+      label: setupSystemLabel?.value?.trim() || "",
+      platform: setupPlatformSelect?.value || "core",
+      truenas_host: setupTruenasHost?.value?.trim() || "",
+      api_key: setupApiKey?.value?.trim() || null,
+      api_user: setupApiUser?.value?.trim() || null,
+      api_password: setupApiPassword?.value || null,
+      verify_ssl: Boolean(setupVerifySslToggle?.checked),
+      enclosure_filter: setupEnclosureFilter?.value?.trim() || null,
+      ssh_enabled: sshEnabled,
+      ssh_host: setupSshHost?.value?.trim() || null,
+      ssh_port: Number(setupSshPort?.value) || 22,
+      ssh_user: setupSshUser?.value?.trim() || null,
+      ssh_key_path: setupSshKeyPath?.value?.trim() || null,
+      ssh_password: setupSshPassword?.value || null,
+      ssh_sudo_password: setupSshSudoPassword?.value || null,
+      ssh_known_hosts_path: setupSshKnownHostsPath?.value?.trim() || null,
+      ssh_strict_host_key_checking: Boolean(setupSshStrictHostKeyToggle?.checked),
+      ssh_commands: (setupSshCommands?.value || "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean),
+      default_profile_id: setupProfileSelect?.value || null,
+      make_default: Boolean(setupMakeDefaultToggle?.checked),
+    };
+  }
+
+  function readOptionalSecretValue(field) {
+    const value = field?.value;
+    return value === undefined || value === null || value === "" ? null : value;
+  }
+
+  function encodeUtf8Base64(value) {
+    const text = String(value ?? "");
+    const bytes = new TextEncoder().encode(text);
+    let binary = "";
+    bytes.forEach((byte) => {
+      binary += String.fromCharCode(byte);
+    });
+    return window.btoa(binary);
+  }
+
+  async function exportSystemBackup() {
+    if (state.snapshotMode) {
+      setStatus("Full backup export is disabled in an offline snapshot export.", "error");
+      return;
+    }
+    if (state.setup.exportRunning) {
+      return;
+    }
+    const encrypt = Boolean(systemBackupEncryptToggle?.checked);
+    const passphrase = readOptionalSecretValue(systemBackupExportPassphrase);
+    const packaging = systemBackupPackagingSelect?.value || state.setup.backupPackaging || "tar.zst";
+    if (encrypt && !passphrase) {
+      setStatus("Enter a passphrase before exporting an encrypted full backup.", "error");
+      return;
+    }
+    try {
+      state.setup.exportRunning = true;
+      if (exportSystemBackupButton) {
+        exportSystemBackupButton.disabled = true;
+      }
+      setStatus("Preparing full config and database backup...");
+      const response = await fetch("/api/system-backup/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          encrypt,
+          passphrase,
+          packaging,
+        }),
+      });
+      if (!response.ok) {
+        let detail = `Request failed with ${response.status}`;
+        try {
+          const payload = await response.json();
+          detail = payload.detail || detail;
+        } catch (error) {
+          // Ignore JSON parsing failures and fall back to the HTTP status.
+        }
+        throw new Error(detail);
+      }
+      const blob = await response.blob();
+      const objectUrl = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      const resolvedPackaging = response.headers.get("X-Backup-Packaging") || packaging;
+      anchor.download = resolveDownloadFilename(
+        response,
+        `jbod-system-backup${resolvedPackaging === "tar.zst" ? ".tar.zst" : resolvedPackaging === "tar.gz" ? ".tar.gz" : `.${resolvedPackaging}`}`
+      );
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(objectUrl);
+      setStatus(
+        encrypt
+          ? `Encrypted ${formatBackupPackaging(resolvedPackaging)} full backup exported.`
+          : `${formatBackupPackaging(resolvedPackaging)} full backup exported.`
+      );
+    } catch (error) {
+      setStatus(`Full backup export failed: ${error.message || error}`, "error");
+    } finally {
+      state.setup.exportRunning = false;
+      if (exportSystemBackupButton) {
+        exportSystemBackupButton.disabled = false;
+      }
+    }
+  }
+
+  async function importSystemBackupFromFile(file) {
+    if (state.snapshotMode) {
+      setStatus("Full backup import is disabled in an offline snapshot export.", "error");
+      return;
+    }
+    if (!file || state.setup.importRunning) {
+      return;
+    }
+    try {
+      state.setup.importRunning = true;
+      if (importSystemBackupButton) {
+        importSystemBackupButton.disabled = true;
+      }
+      setStatus(`Importing full backup from ${file.name}...`);
+      const passphrase = readOptionalSecretValue(systemBackupImportPassphrase);
+      const response = await fetch("/api/system-backup/import", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          ...(passphrase !== null
+            ? { "X-Backup-Passphrase-Base64": encodeUtf8Base64(passphrase) }
+            : {}),
+        },
+        body: await file.arrayBuffer(),
+      });
+      const result = await response.json();
+      if (!response.ok || result.ok === false) {
+        throw new Error(result.detail || `Request failed with ${response.status}`);
+      }
+      const nextSystemId = result.default_system_id || result.system?.id || result.systems?.[0]?.id || null;
+      if (nextSystemId) {
+        state.selectedSystemId = nextSystemId;
+      }
+      state.selectedEnclosureId = null;
+      state.snapshotReuseCache = {};
+      closeSystemSetupDialog();
+      await refreshSnapshot(false, "system-backup-import");
+      setStatus(
+        `Imported full backup${result.restored_history_database ? " and restored history database" : ""}.`
+      );
+    } catch (error) {
+      setStatus(`Full backup import failed: ${error.message || error}`, "error");
+    } finally {
+      state.setup.importRunning = false;
+      if (importSystemBackupButton) {
+        importSystemBackupButton.disabled = false;
+      }
+      if (systemBackupImportFile) {
+        systemBackupImportFile.value = "";
+      }
+    }
+  }
+
+  async function createSystemFromWalkthrough() {
+    if (state.setup.createRunning) {
+      return;
+    }
+    try {
+      state.setup.createRunning = true;
+      syncSystemSetupStep();
+      const payload = collectSystemSetupPayload();
+      if (!payload.label || !payload.truenas_host) {
+        throw new Error("System label and host are required.");
+      }
+      setStatus(`Creating system entry for ${payload.label}...`);
+      const result = await fetchJson("/api/system-setup", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      state.selectedSystemId = result.system?.id || state.selectedSystemId;
+      state.selectedEnclosureId = null;
+      state.snapshotReuseCache = {};
+      closeSystemSetupDialog();
+      await refreshSnapshot(false, "system-setup");
+      setStatus(`Created system ${result.system?.label || payload.label}.`);
+    } catch (error) {
+      setStatus(`System setup failed: ${error.message || error}`, "error");
+    } finally {
+      state.setup.createRunning = false;
+      syncSystemSetupStep();
+    }
   }
 
   function cloneJsonValue(value) {
@@ -497,7 +1854,7 @@
     state.selectedSystemId = snapshot.selected_system_id || state.selectedSystemId;
     state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
     pruneSmartSummaryCache();
-    if (state.selectedSlot !== null && !getSlotById(state.selectedSlot)) {
+    if (state.selectedSlot !== null && !getSlotById(state.selectedSlot) && !getSelectedStorageViewRuntimeSlot(state.selectedSlot)) {
       state.selectedSlot = null;
     }
   }
@@ -521,7 +1878,7 @@
     if (state.snapshotMode) {
       return;
     }
-    const params = buildSelectionParams();
+    const params = buildSelectionParams({ includeStorageView: true });
     const query = params.toString();
     window.history.replaceState({}, "", query ? `/?${query}` : "/");
   }
@@ -617,6 +1974,7 @@
 
   function syncUiPerfGlobal() {
     window.__JBOD_UI_PERF = {
+      enabled: Boolean(state.uiPerf.enabled),
       current: state.uiPerf.currentRun ? buildUiPerfSummary(state.uiPerf.currentRun) : null,
       recentRuns: [...state.uiPerf.recentRuns],
     };
@@ -910,8 +2268,64 @@
 
   function getHistoryCacheKey(slot) {
     const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
-    const enclosurePart = state.snapshot.selected_enclosure_id || state.selectedEnclosureId || "all-enclosures";
+    const enclosurePart =
+      slot?.enclosure_id ||
+      state.snapshot.selected_enclosure_id ||
+      state.selectedEnclosureId ||
+      "all-enclosures";
     return `${systemPart}|${enclosurePart}|${slot.slot}`;
+  }
+
+  function getStorageViewSmartCacheKey(view, slot) {
+    const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
+    return `${systemPart}|storage-view|${view.id}|${slot.slot_index}|${slot.device_name || slot.serial || "unknown"}`;
+  }
+
+  function buildStorageViewHistoryContextSlot(view, slot) {
+    if (!view || !slot) {
+      return null;
+    }
+    const usesLiveSlotHistory = Number.isInteger(slot.snapshot_slot);
+    return {
+      slot: usesLiveSlotHistory ? slot.snapshot_slot : slot.slot_index,
+      slot_label: slot.slot_label,
+      device_name: slot.device_name || null,
+      serial: slot.serial || null,
+      enclosure_id: usesLiveSlotHistory
+        ? (view.backing_enclosure_id || currentLiveEnclosureId() || `${view.id}`)
+        : `storage-view:${view.id}`,
+      enclosure_label: usesLiveSlotHistory
+        ? (view.backing_enclosure_label || view.label || null)
+        : view.label,
+      enclosure_name: view.label || null,
+      history_scope_label: view.label || null,
+      history_source_label: usesLiveSlotHistory ? (view.backing_enclosure_label || null) : null,
+    };
+  }
+
+  function getSelectedHistoryTarget() {
+    const selectedStorageView = getSelectedStorageViewRuntime();
+    const storageViewSlot = selectedStorageView ? getSelectedStorageViewRuntimeSlot(state.selectedSlot) : null;
+    if (selectedStorageView && storageViewSlot) {
+      const slot = buildStorageViewHistoryContextSlot(selectedStorageView, storageViewSlot);
+      const params = buildSelectionParams();
+      const baseUrl = `/api/storage-views/${encodeURIComponent(selectedStorageView.id)}/slots/${storageViewSlot.slot_index}/history`;
+      return {
+        slot,
+        cacheKey: getHistoryCacheKey(slot),
+        fetchUrl: params.toString() ? `${baseUrl}?${params.toString()}` : baseUrl,
+      };
+    }
+
+    const slot = getSlotById(state.selectedSlot);
+    if (!slot) {
+      return null;
+    }
+    return {
+      slot,
+      cacheKey: getHistoryCacheKey(slot),
+      fetchUrl: buildScopedUrl(`/api/slots/${slot.slot}/history`),
+    };
   }
 
   function getSmartSummaryEntry(slot) {
@@ -934,6 +2348,11 @@
       requestedAt: 0,
       generation: state.smartSummaryGeneration,
     };
+  }
+
+  function getStorageViewSmartSummaryEntry(view, slot) {
+    if (!view || !slot) return null;
+    return state.smartSummaries[getStorageViewSmartCacheKey(view, slot)] || null;
   }
 
   function currentSmartPrefetchScopeKey() {
@@ -983,10 +2402,12 @@
 
   function updateSmartPrefetchViews() {
     const profile = buildViewProfile();
-    const slotCount = Number(state.snapshot.layout_slot_count) || countLayoutSlots(state.layoutRows) || 0;
+    const slotCount = currentLayoutSlotCount();
     const usesStaticGeometry =
       profile.faceStyle === "top-loader" ||
       profile.faceStyle === "unifi-drive" ||
+      profile.faceStyle === "nvme-carrier" ||
+      profile.faceStyle === "boot-devices" ||
       slotCount <= 2;
     if (!usesStaticGeometry) {
       applyChassisDriveScale(profile);
@@ -1775,6 +3196,9 @@
   }
 
   function getSelectedPeerContext() {
+    if (getSelectedStorageViewRuntime()) {
+      return { active: false, peerSlots: new Set() };
+    }
     const slot = getSlotById(state.selectedSlot);
     if (!slot || !slot.pool_name || !slot.vdev_name) {
       return { active: false, peerSlots: new Set() };
@@ -1798,12 +3222,17 @@
   }
 
   function renderGrid() {
+    const selectedStorageView = getSelectedStorageViewRuntime();
+    if (selectedStorageView) {
+      renderStorageViewGrid(selectedStorageView);
+      return;
+    }
     hideSlotTooltip();
     grid.innerHTML = "";
     const slotsByNumber = new Map(state.snapshot.slots.map((slot) => [slot.slot, slot]));
     const peerContext = getSelectedPeerContext();
 
-    state.layoutRows.forEach((row) => {
+    activeLayoutRows().forEach((row) => {
       const rowWrapper = document.createElement("div");
       rowWrapper.className = "slot-row";
 
@@ -2641,18 +4070,24 @@
       fragments.push(slot.serial);
     }
     const systemLabel = getSelectedSystemOption()?.label || state.snapshot.selected_system_label || null;
+    const scopeLabel = slot.history_scope_label || null;
+    const sourceLabel = slot.history_source_label || null;
     const enclosureLabel =
-      getSelectedEnclosureOption()?.label ||
-      state.snapshot.selected_enclosure_label ||
+      scopeLabel ||
       slot.enclosure_label ||
       slot.enclosure_name ||
       slot.enclosure_id ||
+      getSelectedEnclosureOption()?.label ||
+      state.snapshot.selected_enclosure_label ||
       null;
     if (systemLabel) {
       fragments.push(systemLabel);
     }
     if (enclosureLabel) {
       fragments.push(enclosureLabel);
+    }
+    if (sourceLabel && sourceLabel !== enclosureLabel) {
+      fragments.push(sourceLabel);
     }
     return fragments.join(" | ");
   }
@@ -2950,11 +4385,13 @@
       .join("");
   }
 
-  function renderHistoryPanel(slot) {
+  function renderHistoryPanel() {
     if (!detailHistoryPanel || !historyToggleButton) {
       return;
     }
 
+    const historyTarget = getSelectedHistoryTarget();
+    const slot = historyTarget?.slot || null;
     const windowHours = currentHistoryWindowHours();
     const referenceTimestampMs = currentHistoryReferenceTimestampMs();
     historyIoModeButtons.forEach((button) => {
@@ -2989,8 +4426,7 @@
     detailHistoryContent.classList.add("hidden");
     detailHistoryError.textContent = "";
 
-    const cacheKey = getHistoryCacheKey(slot);
-    const payload = state.history.slotCache[cacheKey];
+    const payload = historyTarget ? state.history.slotCache[historyTarget.cacheKey] : null;
     detailHistorySummary.textContent = payload?.available ? buildHistorySummary(payload, windowHours, referenceTimestampMs) : "";
 
     if (state.history.panelLoading) {
@@ -3057,7 +4493,7 @@
       state.history.loading = false;
       state.history.checked = true;
       renderStatus();
-      renderHistoryPanel(getSlotById(state.selectedSlot));
+      renderHistoryPanel();
       return;
     }
     if (!state.history.configured) {
@@ -3068,13 +4504,13 @@
       state.history.counts = {};
       state.history.collector = {};
       renderStatus();
-      renderHistoryPanel(getSlotById(state.selectedSlot));
+      renderHistoryPanel();
       return;
     }
 
     if (isHistoryStatusCurrent()) {
       renderStatus();
-      renderHistoryPanel(getSlotById(state.selectedSlot));
+      renderHistoryPanel();
       return;
     }
 
@@ -3113,37 +4549,38 @@
       }
 
       renderStatus();
-      renderHistoryPanel(getSlotById(state.selectedSlot));
+      renderHistoryPanel();
     })();
     await state.history.statusRefreshPromise;
   }
 
   async function loadHistoryForSelectedSlot(force = false) {
-    const slot = getSlotById(state.selectedSlot);
-    if (!slot || !isHistoryAvailable()) {
+    const historyTarget = getSelectedHistoryTarget();
+    if (!historyTarget || !historyTarget.slot || !isHistoryAvailable()) {
       return;
     }
 
-    const cacheKey = getHistoryCacheKey(slot);
+    const { slot, cacheKey, fetchUrl } = historyTarget;
     if (state.snapshotMode) {
       state.history.panelError = null;
-      renderHistoryPanel(slot);
+      renderHistoryPanel();
       return;
     }
     if (!force && state.history.slotCache[cacheKey]) {
       state.history.panelError = null;
-      renderHistoryPanel(slot);
+      renderHistoryPanel();
       return;
     }
 
     state.history.panelLoading = true;
     state.history.panelError = null;
-    renderHistoryPanel(slot);
+    renderHistoryPanel();
 
     try {
-      const payload = await sendScopedRequest(`/api/slots/${slot.slot}/history`);
+      const payload = await fetchJson(fetchUrl);
       state.history.slotCache[cacheKey] = payload;
-      if (cacheKey !== getHistoryCacheKey(getSlotById(state.selectedSlot) || slot)) {
+      const activeTarget = getSelectedHistoryTarget();
+      if (!activeTarget || cacheKey !== activeTarget.cacheKey) {
         return;
       }
     } catch (error) {
@@ -3152,12 +4589,126 @@
       state.history.panelLoading = false;
     }
 
-    renderHistoryPanel(getSlotById(state.selectedSlot));
+    renderHistoryPanel();
+  }
+
+  function buildSmartNoteText(slotLike, smartEntry) {
+    const smartMessage = smartEntry?.data?.message;
+    const ataVolumeCounterNote = (
+      smartEntry?.data?.transport_protocol === "ATA"
+      && (Number.isInteger(smartEntry?.data?.bytes_read) || Number.isInteger(smartEntry?.data?.bytes_written))
+    )
+      ? "ATA read/write totals are lifetime SMART host counters and can exceed current pool usage, especially after array initialization, parity build, or rebuild."
+      : null;
+    const lowHourAnnualizedNote = (
+      Number.isInteger(smartEntry?.data?.power_on_hours)
+      && smartEntry.data.power_on_hours < (24 * 30)
+      && Number.isInteger(smartEntry?.data?.bytes_written)
+    )
+      ? "Annualized write is hidden until the disk has at least about 30 days of power-on time."
+      : null;
+    const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
+      ? "Estimated write-endurance values extrapolate current writes against the NVMe percentage-used SMART field."
+      : null;
+    return [smartMessage, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
   }
 
   function renderDetail() {
+    const selectedStorageView = getSelectedStorageViewRuntime();
+    const storageViewSlot = selectedStorageView ? getSelectedStorageViewRuntimeSlot(state.selectedSlot) : null;
+    if (selectedStorageView) {
+      if (!storageViewSlot) {
+        detailEmpty.textContent = "Select a storage-view slot to inspect how a live disk landed in this saved layout.";
+        detailEmpty.classList.remove("hidden");
+        detailContent.classList.add("hidden");
+        detailSmartNote.classList.add("hidden");
+        detailSmartNote.textContent = "";
+        detailSecondary.classList.add("hidden");
+        detailLedControls.classList.add("hidden");
+        if (historyToggleButton) {
+          historyToggleButton.classList.add("hidden");
+        }
+        if (detailHistoryPanel) {
+          detailHistoryPanel.classList.add("hidden");
+        }
+        renderTopologyContext(null);
+        renderMultipathContext(null);
+        resetMappingForm();
+        if (mappingEmpty) {
+          mappingEmpty.classList.remove("hidden");
+        }
+        mappingForm.classList.add("hidden");
+        setMappingFormEnabled(false);
+        renderHistoryPanel();
+        return;
+      }
+
+      const smartEntry = getStorageViewSmartSummaryEntry(selectedStorageView, storageViewSlot);
+      if (!state.snapshotMode) {
+        void ensureStorageViewSmartSummary(selectedStorageView, storageViewSlot);
+      }
+
+      detailEmpty.classList.add("hidden");
+      detailContent.classList.remove("hidden");
+      detailSecondary.classList.add("hidden");
+      detailLedControls.classList.add("hidden");
+      detailSlotTitle.textContent = `${selectedStorageView.label} / ${storageViewSlot.slot_label}`;
+      detailStatePill.textContent = stateLabel(storageViewSlot);
+      detailStatePill.className = `state-pill state-${storageViewSlot.state === "matched" ? "healthy" : (storageViewSlot.state || "unknown")}`;
+      detailKvGrid.innerHTML = [
+        kvRow("Storage View", selectedStorageView.label),
+        kvRow("Template", selectedStorageView.template_label || selectedStorageView.template_id),
+        kvRow("Slot", storageViewSlot.slot_label),
+        kvRowIfMeaningful("Configured Size", storageViewSlot.slot_size),
+        kvRow("State", stateLabel(storageViewSlot)),
+        kvRow("Device", storageViewSlot.device_name),
+        kvRow("Serial", storageViewSlot.serial, true),
+        kvRowIfMeaningful("Model", storageViewSlot.model),
+        kvRowIfMeaningful("Capacity", storageViewSlot.size_human),
+        kvRowIfMeaningful("Pool", storageViewSlot.pool_name),
+        kvRowIfMeaningful("Health", storageViewSlot.health),
+        kvRow("Temp", formatTemperatureValue(storageViewSlot, smartEntry)),
+        kvRow("SMART Status", formatSmartHealthStatusValue(smartEntry)),
+        kvRow("Last SMART Test", formatLastSmartTestValue(storageViewSlot, smartEntry)),
+        kvRow("Power On", formatPowerOnValue(smartEntry)),
+        kvRow("Sector Size", formatSectorSizeValue(storageViewSlot, smartEntry)),
+        kvRowIfMeaningful("SMART Form Factor", formatFormFactorValue(smartEntry)),
+        kvRowIfMeaningful("Transport", formatTransportValue(smartEntry)),
+        kvRowIfMeaningful("Logical Unit ID", formatLogicalUnitIdValue(storageViewSlot, smartEntry)),
+        kvRowIfMeaningful("SAS Address", formatSasAddressValue(storageViewSlot, smartEntry)),
+        kvRowIfMeaningful("Transport Address", storageViewSlot.transport_address),
+        kvRowIfMeaningful("Placement", storageViewSlot.placement_key),
+        kvRowIfMeaningful("Matched By", Array.isArray(storageViewSlot.match_reasons) ? storageViewSlot.match_reasons.join(", ") : null),
+        kvRowIfMeaningful("Assignment Rank", storageViewSlot.assignment_rank),
+        kvRowIfMeaningful("Source", storageViewSlot.source),
+        kvRowIfMeaningful("Notes", storageViewRuntimeSecondaryLabel(storageViewSlot)),
+      ].filter(Boolean).join("");
+      const smartNoteText = buildSmartNoteText(storageViewSlot, smartEntry);
+      if (smartNoteText) {
+        detailSmartNote.textContent = smartNoteText;
+        detailSmartNote.classList.remove("hidden");
+      } else {
+        detailSmartNote.classList.add("hidden");
+        detailSmartNote.textContent = "";
+      }
+      renderTopologyContext(null);
+      renderMultipathContext(null);
+      resetMappingForm();
+      if (mappingEmpty) {
+        mappingEmpty.classList.remove("hidden");
+      }
+      mappingForm.classList.add("hidden");
+      setMappingFormEnabled(false);
+      renderHistoryPanel();
+      if (state.history.panelOpen && isHistoryAvailable()) {
+        void loadHistoryForSelectedSlot(false);
+      }
+      return;
+    }
+
     const slot = getSlotById(state.selectedSlot);
     if (!slot) {
+      detailEmpty.textContent = "Select a slot tile to view disk, pool, and mapping details.";
       detailEmpty.classList.remove("hidden");
       detailContent.classList.add("hidden");
       detailSmartNote.classList.add("hidden");
@@ -3181,6 +4732,7 @@
       if (detailHistoryPanel) {
         detailHistoryPanel.classList.add("hidden");
       }
+      renderHistoryPanel();
       return;
     }
 
@@ -3256,24 +4808,7 @@
       kvRow("Notes", slot.notes),
     ].filter(Boolean).join("");
 
-    const smartMessage = smartEntry?.data?.message;
-    const ataVolumeCounterNote = (
-      smartEntry?.data?.transport_protocol === "ATA"
-      && (Number.isInteger(smartEntry?.data?.bytes_read) || Number.isInteger(smartEntry?.data?.bytes_written))
-    )
-      ? "ATA read/write totals are lifetime SMART host counters and can exceed current pool usage, especially after array initialization, parity build, or rebuild."
-      : null;
-    const lowHourAnnualizedNote = (
-      Number.isInteger(smartEntry?.data?.power_on_hours)
-      && smartEntry.data.power_on_hours < (24 * 30)
-      && Number.isInteger(smartEntry?.data?.bytes_written)
-    )
-      ? "Annualized write is hidden until the disk has at least about 30 days of power-on time."
-      : null;
-    const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
-      ? "Estimated write-endurance values extrapolate current writes against the NVMe percentage-used SMART field."
-      : null;
-    const smartNoteText = [smartMessage, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
+    const smartNoteText = buildSmartNoteText(slot, smartEntry);
     if (smartNoteText) {
       detailSmartNote.textContent = smartNoteText;
       detailSmartNote.classList.remove("hidden");
@@ -3304,7 +4839,7 @@
     ledButtons.forEach((button) => {
       button.disabled = state.snapshotMode || !slot.led_supported;
     });
-    renderHistoryPanel(slot);
+    renderHistoryPanel();
     if (state.history.panelOpen && isHistoryAvailable()) {
       void loadHistoryForSelectedSlot(false);
     }
@@ -3745,6 +5280,7 @@
   function renderSelectors() {
     const systems = state.snapshot.systems || [];
     const enclosures = state.snapshot.enclosures || [];
+    const storageViews = getMainUiStorageViewRuntimeOptions();
 
     if (systemSelect) {
       systemSelect.innerHTML = systems
@@ -3760,18 +5296,35 @@
     }
 
     if (enclosureSelect) {
-      if (!enclosures.length) {
+      if (!enclosures.length && !storageViews.length) {
         enclosureSelect.innerHTML = '<option value="">Auto-selected</option>';
       } else {
-        enclosureSelect.innerHTML = enclosures
-          .map((enclosure) => {
-            const selected = enclosure.id === state.selectedEnclosureId ? " selected" : "";
-            return `<option value="${escapeHtml(enclosure.id)}"${selected}>${escapeHtml(enclosure.label)}</option>`;
-          })
+        const enclosureOptions = enclosures
+          .map((enclosure) => `<option value="enclosure:${escapeHtml(enclosure.id)}">${escapeHtml(selectorLabelForEnclosureOption(enclosure))}</option>`)
           .join("");
+        const savedChassisViewOptions = storageViews
+          .filter((view) => isSavedChassisView(view))
+          .map((view) => `<option value="view:${escapeHtml(view.id)}">${escapeHtml(selectorLabelForStorageViewOption(view))}</option>`)
+          .join("");
+        const virtualStorageViewOptions = storageViews
+          .filter((view) => !isSavedChassisView(view))
+          .map((view) => `<option value="view:${escapeHtml(view.id)}">${escapeHtml(selectorLabelForStorageViewOption(view))}</option>`)
+          .join("");
+        enclosureSelect.innerHTML = [
+          enclosureOptions ? `<optgroup label="Live Enclosures">${enclosureOptions}</optgroup>` : "",
+          savedChassisViewOptions ? `<optgroup label="Saved Chassis Views">${savedChassisViewOptions}</optgroup>` : "",
+          virtualStorageViewOptions ? `<optgroup label="Virtual Storage Views">${virtualStorageViewOptions}</optgroup>` : "",
+        ].filter(Boolean).join("");
       }
-      enclosureSelect.value = state.selectedEnclosureId || "";
-      enclosureSelect.disabled = state.snapshotMode || enclosures.length <= 1;
+      const selectedValue = state.selectedStorageViewRuntimeId
+        ? `view:${state.selectedStorageViewRuntimeId}`
+        : (currentLiveEnclosureId() ? `enclosure:${currentLiveEnclosureId()}` : "");
+      if (selectedValue) {
+        enclosureSelect.value = selectedValue;
+      } else if (!enclosureSelect.value && enclosureSelect.options.length) {
+        enclosureSelect.selectedIndex = 0;
+      }
+      enclosureSelect.disabled = state.snapshotMode || (enclosures.length + storageViews.length) <= 1;
     }
   }
 
@@ -3779,6 +5332,7 @@
     renderViewChrome();
     renderGrid();
     renderDetail();
+    renderStorageViewsRuntime();
     renderWarnings();
     renderStatus();
     renderSummary();
@@ -3812,6 +5366,40 @@
 
   async function sendScopedRequest(url, options = {}) {
     return fetchJson(buildScopedUrl(url), options);
+  }
+
+  function applyStorageViewRuntime(payload) {
+    state.storageViewsRuntime = payload || {
+      system_id: state.selectedSystemId || state.snapshot.selected_system_id || null,
+      system_label: state.snapshot.selected_system_label || state.selectedSystemId || null,
+      views: [],
+    };
+    ensureStorageViewRuntimeSelection();
+  }
+
+  async function fetchStorageViewRuntime(force = false, quiet = true) {
+    if (state.snapshotMode) {
+      return;
+    }
+    try {
+      state.storageViewsRuntimeLoading = true;
+      renderAll();
+      const params = buildSelectionParams();
+      params.set("force", force ? "true" : "false");
+      const payload = await fetchJson(`/api/storage-views?${params.toString()}`);
+      applyStorageViewRuntime(payload);
+      renderAll();
+      if (!quiet) {
+        setStatus(`Loaded ${Array.isArray(payload.views) ? payload.views.length : 0} storage view${Array.isArray(payload.views) && payload.views.length === 1 ? "" : "s"} for ${payload.system_label || payload.system_id || "the selected system"}.`);
+      }
+    } catch (error) {
+      if (!quiet) {
+        setStatus(`Storage view refresh failed: ${error.message || error}`, "error");
+      }
+    } finally {
+      state.storageViewsRuntimeLoading = false;
+      renderAll();
+    }
   }
 
   function resolveDownloadFilename(response, fallbackName) {
@@ -3902,6 +5490,7 @@
       }
       applySnapshot(snapshot);
       renderAll();
+      void fetchStorageViewRuntime(force, true);
       await waitForNextPaint();
       if (refreshToken !== state.latestRefreshToken) {
         if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
@@ -3934,6 +5523,8 @@
         archiveUiPerfRun(perfRun, "error", error.message || String(error));
       }
       if (refreshToken === state.latestRefreshToken) {
+        state.storageViewsRuntimeLoading = false;
+        renderStorageViewsRuntime();
         setStatus(`Refresh failed: ${error.message || error}`, "error");
       }
     } finally {
@@ -4149,6 +5740,51 @@
     }
   }
 
+  async function ensureStorageViewSmartSummary(view, slot) {
+    if (state.snapshotMode || !view || !slot) {
+      return;
+    }
+    const cacheKey = getStorageViewSmartCacheKey(view, slot);
+    const entry = state.smartSummaries[cacheKey];
+    if (isSmartEntryCurrent(entry) && (entry?.data || isSmartEntryInFlight(entry))) {
+      return;
+    }
+
+    state.smartSummaries[cacheKey] = {
+      loading: !entry?.data,
+      refreshing: Boolean(entry?.data),
+      data: entry?.data || null,
+      requestedAt: Date.now(),
+      generation: state.smartSummaryGeneration,
+    };
+    try {
+      const params = buildSelectionParams();
+      const scopedUrl = params.toString()
+        ? `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart?${params.toString()}`
+        : `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart`;
+      const payload = await fetchJson(scopedUrl);
+      state.smartSummaries[cacheKey] = {
+        loading: false,
+        refreshing: false,
+        data: payload,
+        requestedAt: Date.now(),
+        generation: state.smartSummaryGeneration,
+      };
+    } catch (error) {
+      state.smartSummaries[cacheKey] = {
+        loading: false,
+        refreshing: false,
+        data: entry?.data || { available: false, message: error.message || String(error) },
+        requestedAt: Date.now(),
+        generation: state.smartSummaryGeneration,
+      };
+    }
+
+    if (state.selectedStorageViewRuntimeId === view.id && state.selectedSlot === slot.slot_index) {
+      renderDetail();
+    }
+  }
+
   function formatRefreshInterval(seconds) {
     switch (seconds) {
       case 15:
@@ -4201,6 +5837,13 @@
     systemSelect.addEventListener("change", async (event) => {
       state.selectedSystemId = event.target.value || null;
       state.selectedEnclosureId = null;
+      state.storageViewsRuntime = {
+        system_id: state.selectedSystemId,
+        system_label: getSelectedSystemOption()?.label || state.selectedSystemId,
+        views: [],
+      };
+      state.storageViewsRuntimeLoading = true;
+      state.selectedStorageViewRuntimeId = "";
       clearSelectedSlot();
       applyReusableSnapshot(state.selectedSystemId, null);
       await refreshSnapshot(false, "system-switch");
@@ -4208,8 +5851,18 @@
   }
   if (enclosureSelect) {
     enclosureSelect.addEventListener("change", async (event) => {
-      state.selectedEnclosureId = event.target.value || null;
+      const rawValue = event.target.value || "";
       clearSelectedSlot();
+      if (rawValue.startsWith("view:")) {
+        state.selectedStorageViewRuntimeId = rawValue.slice("view:".length);
+        state.selectedEnclosureId = currentLiveEnclosureId();
+        renderAll();
+        syncLocation();
+        return;
+      }
+      state.selectedStorageViewRuntimeId = "";
+      state.selectedEnclosureId = rawValue.startsWith("enclosure:") ? rawValue.slice("enclosure:".length) : (rawValue || null);
+      state.storageViewsRuntimeLoading = true;
       applyReusableSnapshot(state.selectedSystemId, state.selectedEnclosureId);
       await refreshSnapshot(false, "enclosure-switch");
     });
@@ -4220,6 +5873,16 @@
         return;
       }
       clearSelectedSlot();
+    });
+  }
+  if (storageViewList) {
+    storageViewList.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-storage-view-runtime-id]");
+      if (!button) {
+        return;
+      }
+      state.selectedStorageViewRuntimeId = button.dataset.storageViewRuntimeId || "";
+      renderStorageViewsRuntime();
     });
   }
   autoRefreshToggle.addEventListener("change", (event) => {
@@ -4293,19 +5956,135 @@
       closeSnapshotExportDialog();
     });
   }
+  if (systemSetupButton) {
+    systemSetupButton.addEventListener("click", openSystemSetupDialog);
+  }
+  if (systemSetupClose) {
+    systemSetupClose.addEventListener("click", closeSystemSetupDialog);
+  }
+  if (systemSetupDialog) {
+    systemSetupDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeSystemSetupDialog();
+    });
+  }
+  if (systemBackupPackagingSelect) {
+    systemBackupPackagingSelect.addEventListener("change", () => {
+      syncSystemBackupControls();
+    });
+  }
+  if (systemBackupEncryptToggle) {
+    systemBackupEncryptToggle.addEventListener("change", syncSystemBackupControls);
+  }
+  if (exportSystemBackupButton) {
+    exportSystemBackupButton.addEventListener("click", () => {
+      void exportSystemBackup();
+    });
+  }
+  if (importSystemBackupButton && systemBackupImportFile) {
+    importSystemBackupButton.addEventListener("click", () => systemBackupImportFile.click());
+    systemBackupImportFile.addEventListener("change", (event) => {
+      const [file] = event.target.files || [];
+      if (!file) return;
+      void importSystemBackupFromFile(file);
+    });
+  }
+  if (setupPlatformSelect) {
+    setupPlatformSelect.addEventListener("change", () => {
+      syncSetupPlatformHelp();
+      maybeLoadRecommendedSetupCommands();
+    });
+  }
+  if (setupSshEnabledToggle) {
+    setupSshEnabledToggle.addEventListener("change", () => {
+      syncSetupSshFields();
+      if (setupSshEnabledToggle.checked && setupSshHost && !setupSshHost.value.trim() && setupTruenasHost?.value.trim()) {
+        setupSshHost.value = setupTruenasHost.value.trim();
+      }
+      if (setupSshEnabledToggle.checked && !state.setup.sshKeys.length) {
+        void loadSetupSshKeys({ silent: true });
+      }
+    });
+  }
+  if (setupSshKeyMode) {
+    setupSshKeyMode.addEventListener("change", () => {
+      syncSetupSshKeyMode();
+      syncSetupSshFields();
+    });
+  }
+  if (setupSshExistingKeySelect) {
+    setupSshExistingKeySelect.addEventListener("change", () => {
+      applySelectedExistingSshKey();
+      syncSetupSshKeyHelp();
+    });
+  }
+  if (setupRefreshSshKeysButton) {
+    setupRefreshSshKeysButton.addEventListener("click", () => {
+      void loadSetupSshKeys();
+    });
+  }
+  if (setupGenerateSshKeyButton) {
+    setupGenerateSshKeyButton.addEventListener("click", () => {
+      void generateSetupSshKey();
+    });
+  }
+  if (setupSshGenerateName) {
+    setupSshGenerateName.addEventListener("input", syncSetupSshKeyHelp);
+  }
+  if (setupSshKeyPath) {
+    setupSshKeyPath.addEventListener("input", syncSetupSshKeyHelp);
+  }
+  if (setupTruenasHost && setupSshHost) {
+    setupTruenasHost.addEventListener("change", () => {
+      if (setupSshEnabledToggle?.checked && !setupSshHost.value.trim()) {
+        setupSshHost.value = setupTruenasHost.value.trim();
+      }
+      if (state.setup.sshKeyMode === "generate" && setupSshGenerateName && !normalizeSetupSshKeyName(setupSshGenerateName.value)) {
+        setupSshGenerateName.value = suggestedSetupSshKeyName();
+      }
+      syncSetupSshKeyHelp();
+    });
+  }
+  [setupSystemLabel, setupSystemId].forEach((element) => {
+    if (!element) {
+      return;
+    }
+    element.addEventListener("input", () => {
+      if (state.setup.sshKeyMode === "generate" && setupSshGenerateName && !normalizeSetupSshKeyName(setupSshGenerateName.value)) {
+        setupSshGenerateName.value = suggestedSetupSshKeyName();
+      }
+      syncSetupSshKeyHelp();
+    });
+  });
+  if (setupLoadPlatformCommandsButton) {
+    setupLoadPlatformCommandsButton.addEventListener("click", () => {
+      maybeLoadRecommendedSetupCommands(true);
+    });
+  }
+  if (setupPrevButton) {
+    setupPrevButton.addEventListener("click", () => setSystemSetupStep(state.setup.step - 1));
+  }
+  if (setupNextButton) {
+    setupNextButton.addEventListener("click", () => setSystemSetupStep(state.setup.step + 1));
+  }
+  if (setupCreateButton) {
+    setupCreateButton.addEventListener("click", () => {
+      void createSystemFromWalkthrough();
+    });
+  }
   if (historyCloseButton) {
     historyCloseButton.addEventListener("click", () => {
       state.history.panelOpen = false;
-      renderHistoryPanel(getSlotById(state.selectedSlot));
+      renderHistoryPanel();
     });
   }
   if (historyToggleButton) {
     historyToggleButton.addEventListener("click", () => {
-      if (!state.selectedSlot || !isHistoryAvailable()) {
+      if (!Number.isInteger(state.selectedSlot) || !isHistoryAvailable()) {
         return;
       }
       state.history.panelOpen = !state.history.panelOpen;
-      renderHistoryPanel(getSlotById(state.selectedSlot));
+      renderHistoryPanel();
       if (state.history.panelOpen) {
         if (detailHistoryPanel) {
           detailHistoryPanel.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -4319,7 +6098,7 @@
       const nextValue = historyTimeframeSelect.value;
       state.history.timeframeHours = nextValue === "all" ? null : Number(nextValue) || DEFAULT_HISTORY_TIMEFRAME_HOURS;
       persistHistoryUiPreferences();
-      renderHistoryPanel(getSlotById(state.selectedSlot));
+      renderHistoryPanel();
     });
   }
   historyIoModeButtons.forEach((button) => {
@@ -4330,7 +6109,7 @@
       }
       state.history.ioChartMode = nextMode;
       persistHistoryUiPreferences();
-      renderHistoryPanel(getSlotById(state.selectedSlot));
+      renderHistoryPanel();
     });
   });
 
@@ -4339,11 +6118,14 @@
   });
 
   rememberReusableSnapshot(state.snapshot);
+  initializeSystemSetupForm();
+  syncSystemBackupControls();
   renderAll();
   renderUiPerfPanel();
   if (state.snapshotMode) {
     setStatus("Frozen offline snapshot loaded. Live actions are disabled.");
   }
+  void fetchStorageViewRuntime(false, true);
   void refreshHistoryStatus(true);
   scheduleSmartPrefetch();
   resetTimer();

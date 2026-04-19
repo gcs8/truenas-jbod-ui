@@ -43,7 +43,7 @@ place.
 Once the sidecar is healthy, pick a populated slot and use the `History`
 button in Slot Details.
 
-![Live slot history drawer](images/history-drawer-v0.9.0.png)
+![Live slot history drawer](images/history-drawer-v0.10.0.png)
 
 Things to notice:
 
@@ -52,11 +52,16 @@ Things to notice:
 - the read/write chart supports both total and average views
 - recent events stay in the same place as you move between slots
 
+`0.10.0` also makes the same history drawer available for inventory-bound
+storage views such as `Boot SATADOMs` and the internal NVMe carrier:
+
+![Storage-view history on Boot SATADOMs](images/storage-view-history-v0.10.0.png)
+
 ## What The Snapshot Export Dialog Looks Like
 
 Use `Export Snapshot` from the main toolbar.
 
-![Snapshot export dialog with live estimate](images/snapshot-export-dialog-v0.9.0.png)
+![Snapshot export dialog with live estimate](images/snapshot-export-dialog-v0.10.0.png)
 
 Things to notice:
 
@@ -73,7 +78,7 @@ History drawer first, then open the export dialog.
 The export produces a self-contained HTML file that opens locally without
 access to the live app.
 
-![Frozen offline enclosure snapshot](images/offline-snapshot-v0.9.0.png)
+![Frozen offline enclosure snapshot](images/offline-snapshot-v0.10.0.png)
 
 Things to notice:
 

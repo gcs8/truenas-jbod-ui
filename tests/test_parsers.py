@@ -11,6 +11,7 @@ from app.services.parsers import (
     parse_nvme_list_subsys_json,
     parse_nvme_smart_log_summary,
     parse_ssh_outputs,
+    parse_sesutil_show_enclosures,
     parse_ubntstorage_json,
     parse_sg_ses_aes,
     parse_sg_ses_enclosure_status,
@@ -273,6 +274,25 @@ Enclosure status diagnostic page:
         self.assertEqual(parsed.slots[0].control_targets[0]["ses_slot_number"], 0)
         self.assertEqual(parsed.slots[1].identify_active, False)
         self.assertFalse(parsed.slots[1].present)
+
+    def test_parse_sesutil_show_assigns_24_bay_profile_metadata(self) -> None:
+        output = """
+ses2:  <LSI SAS3x40 0601>; ID: 50030480090c4f7f
+Desc  Device  Model  Serial  Status
+Slot 00  da0  Samsung SSD  SER000  OK
+Slot 06  -  -  -  Not installed
+""".strip()
+
+        parsed = parse_sesutil_show_enclosures(output)
+
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].profile_id, "supermicro-ssg-6048r-front-24")
+        self.assertEqual(parsed[0].enclosure_label, "Front 24 Bay")
+        self.assertEqual(parsed[0].layout_rows, 6)
+        self.assertEqual(parsed[0].layout_columns, 4)
+        self.assertEqual(parsed[0].slot_layout, [[5, 11, 17, 23], [4, 10, 16, 22], [3, 9, 15, 21], [2, 8, 14, 20], [1, 7, 13, 19], [0, 6, 12, 18]])
+        self.assertTrue(parsed[0].slots[0].present)
+        self.assertFalse(parsed[0].slots[6].present)
 
     def test_parse_ssh_outputs_preserves_scale_profile_id_after_ses_merge(self) -> None:
         aes_output = """

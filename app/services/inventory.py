@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app import __version__
-from app.config import Settings, SystemConfig
+from app.config import Settings, StorageViewConfig, SystemConfig
 from app.models.domain import (
     EnclosureOption,
     InventorySnapshot,
@@ -25,6 +25,9 @@ from app.models.domain import (
     SmartSummaryView,
     SlotState,
     SlotView,
+    StorageViewRuntimePayload,
+    StorageViewRuntimeSlot,
+    StorageViewRuntimeView,
     SourceStatus,
     SystemOption,
 )
@@ -35,10 +38,20 @@ from app.services.profile_registry import (
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 )
+from app.services.storage_view_templates import get_storage_view_template
+from app.services.storage_views import (
+    build_storage_view_rows,
+    ordered_storage_view_slot_indices,
+    resolve_storage_view_profile,
+    resolve_system_storage_views,
+    storage_view_slot_label,
+    storage_view_slot_size,
+)
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.parsers import (
     ParsedSSHData,
     ZpoolMember,
+    _merge_ses_enclosures,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
     extract_nvme_controller_name,
@@ -46,6 +59,7 @@ from app.services.parsers import (
     format_bytes,
     merge_slot_candidate_maps,
     normalize_device_name,
+    normalize_gptid,
     normalize_hex_identifier,
     normalize_lookup_keys,
     normalize_text,
@@ -240,6 +254,7 @@ class InventorySourceBundle:
     ssh_collected: bool
     warnings: list[str]
     sources: dict[str, SourceStatus]
+    scale_ses_data: ParsedSSHData
     quantastor_ses_data: ParsedSSHData
 
 
@@ -274,6 +289,7 @@ class InventoryService:
         self._background_smart_refresh_semaphore = asyncio.Semaphore(
             max(1, self.settings.app.smart_batch_max_concurrency)
         )
+        self._scale_preferred_ses_host: str | None = None
         self._quantastor_preferred_ses_host: str | None = None
 
     async def get_snapshot(
@@ -325,6 +341,580 @@ class InventoryService:
             self._cache[cache_key] = snapshot
             self._cache_until[cache_key] = utcnow() + timedelta(seconds=self.settings.app.cache_ttl_seconds)
             return snapshot
+
+    async def get_storage_view_candidates(
+        self,
+        *,
+        force_refresh: bool = False,
+        selected_enclosure_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        source_bundle = await self._get_inventory_source_bundle(force_refresh=force_refresh)
+        snapshot = await self.get_snapshot(
+            force_refresh=force_refresh,
+            selected_enclosure_id=selected_enclosure_id,
+            allow_stale_cache=not force_refresh,
+        )
+        ssh_data = parse_ssh_outputs(
+            source_bundle.ssh_outputs,
+            self.settings.layout.slot_count,
+            self.system.truenas.enclosure_filter,
+            selected_enclosure_id=snapshot.selected_enclosure_id,
+        )
+        disk_records = self._build_storage_view_candidate_records(
+            source_bundle.raw_data,
+            ssh_data,
+            snapshot.selected_enclosure_id,
+        )
+        assigned_lookup_keys = self._collect_assigned_lookup_keys(snapshot.slots)
+
+        candidates: list[dict[str, Any]] = []
+        seen_candidate_ids: set[str] = set()
+        for disk in disk_records:
+            if self._disk_record_has_physical_slot_assignment(disk):
+                continue
+            if disk.lookup_keys & assigned_lookup_keys:
+                continue
+            serialized = self._serialize_storage_view_candidate(disk)
+            candidate_id = serialized.get("candidate_id")
+            if not candidate_id or candidate_id in seen_candidate_ids:
+                continue
+            seen_candidate_ids.add(candidate_id)
+            candidates.append(serialized)
+
+        candidates.sort(
+            key=lambda item: (
+                item.get("pool_name") or "",
+                item.get("bus") or "",
+                item.get("label") or item.get("candidate_id") or "",
+            )
+        )
+        return candidates
+
+    async def get_storage_view_runtime(
+        self,
+        *,
+        force_refresh: bool = False,
+        selected_enclosure_id: str | None = None,
+        snapshot: InventorySnapshot | None = None,
+    ) -> StorageViewRuntimePayload:
+        active_snapshot = snapshot or await self.get_snapshot(
+            force_refresh=force_refresh,
+            selected_enclosure_id=selected_enclosure_id,
+            allow_stale_cache=not force_refresh,
+        )
+        source_bundle = await self._get_inventory_source_bundle(force_refresh=force_refresh)
+        ssh_data = parse_ssh_outputs(
+            source_bundle.ssh_outputs,
+            self.settings.layout.slot_count,
+            self.system.truenas.enclosure_filter,
+            selected_enclosure_id=active_snapshot.selected_enclosure_id,
+        )
+        disk_records = self._build_storage_view_candidate_records(
+            source_bundle.raw_data,
+            ssh_data,
+            active_snapshot.selected_enclosure_id,
+        )
+        assigned_lookup_keys = self._collect_assigned_lookup_keys(active_snapshot.slots)
+        candidate_payloads = []
+        seen_candidate_ids: set[str] = set()
+        for disk in disk_records:
+            if self._disk_record_has_physical_slot_assignment(disk):
+                continue
+            if disk.lookup_keys & assigned_lookup_keys:
+                continue
+            serialized = self._serialize_storage_view_candidate(disk)
+            candidate_id = normalize_text(serialized.get("candidate_id"))
+            if not candidate_id or candidate_id in seen_candidate_ids:
+                continue
+            seen_candidate_ids.add(candidate_id)
+            candidate_payloads.append(serialized)
+
+        runtime_views = self._serialize_storage_views_runtime(active_snapshot, candidate_payloads)
+        return StorageViewRuntimePayload(
+            system_id=self.system.id,
+            system_label=self.system.label or self.system.id,
+            views=runtime_views,
+        )
+
+    async def get_storage_view_slot_smart_summary(
+        self,
+        view_id: str,
+        slot_index: int,
+        selected_enclosure_id: str | None = None,
+        *,
+        allow_stale_cache: bool = False,
+    ) -> SmartSummaryView:
+        runtime = await self.get_storage_view_runtime(
+            force_refresh=False,
+            selected_enclosure_id=selected_enclosure_id,
+        )
+        runtime_view = next((view for view in runtime.views if view.id == view_id), None)
+        if not runtime_view:
+            raise TrueNASAPIError(f"Storage view {view_id!r} is not present for this system.")
+        runtime_slot = next((slot for slot in runtime_view.slots if slot.slot_index == slot_index), None)
+        if not runtime_slot:
+            raise TrueNASAPIError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
+
+        if runtime_slot.snapshot_slot is not None:
+            return await self.get_slot_smart_summary(
+                runtime_slot.snapshot_slot,
+                selected_enclosure_id=selected_enclosure_id or runtime_view.backing_enclosure_id,
+                allow_stale_cache=allow_stale_cache,
+            )
+
+        synthetic_slot = self._build_slot_view_from_storage_view_runtime_slot(runtime_view, runtime_slot)
+        return await self._get_slot_smart_summary_for_slot_view(
+            synthetic_slot,
+            allow_stale_cache=allow_stale_cache,
+        )
+
+    async def resolve_storage_view_slot_history_target(
+        self,
+        view_id: str,
+        slot_index: int,
+        selected_enclosure_id: str | None = None,
+    ) -> tuple[int, str | None]:
+        runtime = await self.get_storage_view_runtime(
+            force_refresh=False,
+            selected_enclosure_id=selected_enclosure_id,
+        )
+        runtime_view = next((view for view in runtime.views if view.id == view_id), None)
+        if not runtime_view:
+            raise TrueNASAPIError(f"Storage view {view_id!r} is not present for this system.")
+        runtime_slot = next((slot for slot in runtime_view.slots if slot.slot_index == slot_index), None)
+        if not runtime_slot:
+            raise TrueNASAPIError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
+
+        if runtime_slot.snapshot_slot is not None:
+            return runtime_slot.snapshot_slot, selected_enclosure_id or runtime_view.backing_enclosure_id
+
+        return runtime_slot.slot_index, f"storage-view:{runtime_view.id}"
+
+    def _build_slot_view_from_storage_view_runtime_slot(
+        self,
+        runtime_view: StorageViewRuntimeView,
+        runtime_slot: StorageViewRuntimeSlot,
+    ) -> SlotView:
+        synthetic_slot_number = 10_000 + int(runtime_slot.slot_index)
+        search_text = " ".join(
+            filter(
+                None,
+                [
+                    runtime_view.label,
+                    runtime_slot.slot_label,
+                    runtime_slot.device_name,
+                    runtime_slot.serial,
+                    runtime_slot.model,
+                    runtime_slot.pool_name,
+                    runtime_slot.gptid,
+                    runtime_slot.transport_address,
+                ],
+            )
+        ).lower()
+        return SlotView(
+            slot=synthetic_slot_number,
+            slot_label=runtime_slot.slot_label,
+            row_index=0,
+            column_index=max(0, int(runtime_slot.assignment_rank or runtime_slot.slot_index)),
+            enclosure_id=f"storage-view:{runtime_view.id}",
+            enclosure_label=runtime_view.label,
+            enclosure_name=runtime_view.label,
+            present=runtime_slot.occupied,
+            state=SlotState.healthy if runtime_slot.occupied else SlotState.empty,
+            device_name=runtime_slot.device_name,
+            smart_device_names=list(runtime_slot.smart_device_names),
+            serial=runtime_slot.serial,
+            model=runtime_slot.model,
+            size_bytes=runtime_slot.size_bytes,
+            size_human=runtime_slot.size_human,
+            gptid=runtime_slot.gptid,
+            pool_name=runtime_slot.pool_name,
+            topology_label=runtime_slot.description or runtime_slot.placement_key or runtime_view.label,
+            health=runtime_slot.health,
+            temperature_c=runtime_slot.temperature_c,
+            last_smart_test_type=runtime_slot.last_smart_test_type,
+            last_smart_test_status=runtime_slot.last_smart_test_status,
+            last_smart_test_lifetime_hours=runtime_slot.last_smart_test_lifetime_hours,
+            logical_block_size=runtime_slot.logical_block_size,
+            physical_block_size=runtime_slot.physical_block_size,
+            logical_unit_id=runtime_slot.logical_unit_id,
+            sas_address=runtime_slot.sas_address,
+            notes=runtime_slot.description,
+            search_text=search_text,
+            raw_status={
+                "attached_sas_address": runtime_slot.attached_sas_address,
+                "transport_address": runtime_slot.transport_address,
+            },
+        )
+
+    def _serialize_storage_views_runtime(
+        self,
+        snapshot: InventorySnapshot,
+        candidate_payloads: list[dict[str, Any]],
+    ) -> list[StorageViewRuntimeView]:
+        storage_views = resolve_system_storage_views(self.system, self.profile_registry)
+        claimed_candidate_ids: set[str] = set()
+        runtime_views: list[StorageViewRuntimeView] = []
+        for storage_view in storage_views:
+            if storage_view.kind == "ses_enclosure":
+                runtime_views.append(self._build_ses_storage_view_runtime(storage_view, snapshot))
+                continue
+
+            runtime_view = self._build_candidate_storage_view_runtime(
+                storage_view,
+                snapshot,
+                candidate_payloads,
+                claimed_candidate_ids,
+            )
+            runtime_views.append(runtime_view)
+            for slot in runtime_view.slots:
+                if not slot.occupied:
+                    continue
+                candidate_key = (
+                    normalize_text(slot.serial)
+                    or normalize_text(slot.device_name)
+                    or normalize_text(slot.transport_address)
+                )
+                if candidate_key:
+                    claimed_candidate_ids.add(candidate_key)
+        return runtime_views
+
+    def _build_ses_storage_view_runtime(
+        self,
+        storage_view: StorageViewConfig,
+        snapshot: InventorySnapshot,
+    ) -> StorageViewRuntimeView:
+        storage_view_profile = resolve_storage_view_profile(
+            storage_view,
+            profile_registry=self.profile_registry,
+            selected_profile=snapshot.selected_profile,
+        )
+        layout_rows = build_storage_view_rows(storage_view, selected_profile=storage_view_profile)
+        slots_by_number = {slot.slot: slot for slot in snapshot.slots}
+        runtime_slots: list[StorageViewRuntimeSlot] = []
+        for slot_value in [value for row in layout_rows for value in row if isinstance(value, int)]:
+            slot = slots_by_number.get(slot_value)
+            label = (
+                slot.slot_label
+                if slot
+                else storage_view_slot_label(storage_view, slot_value, selected_profile=storage_view_profile)
+            )
+            runtime_slots.append(
+                StorageViewRuntimeSlot(
+                    slot_index=slot_value,
+                    slot_label=label,
+                    occupied=bool(slot and slot.present),
+                    state=(slot.state.value if slot and isinstance(slot.state, SlotState) else str(slot.state) if slot else "empty"),
+                    source="snapshot_slot",
+                    match_reasons=["selected enclosure snapshot"],
+                    placement_key="live enclosure slot",
+                    snapshot_slot=slot.slot if slot else slot_value,
+                    device_name=slot.device_name if slot else None,
+                    smart_device_names=list(slot.smart_device_names) if slot else [],
+                    serial=slot.serial if slot else None,
+                    pool_name=slot.pool_name if slot else None,
+                    model=slot.model if slot else None,
+                    size_bytes=slot.size_bytes if slot else None,
+                    bus=None,
+                    size_human=slot.size_human if slot else None,
+                    gptid=slot.gptid if slot else None,
+                    health=slot.health if slot else None,
+                    temperature_c=slot.temperature_c if slot else None,
+                    last_smart_test_type=slot.last_smart_test_type if slot else None,
+                    last_smart_test_status=slot.last_smart_test_status if slot else None,
+                    last_smart_test_lifetime_hours=slot.last_smart_test_lifetime_hours if slot else None,
+                    logical_block_size=slot.logical_block_size if slot else None,
+                    physical_block_size=slot.physical_block_size if slot else None,
+                    logical_unit_id=slot.logical_unit_id if slot else None,
+                    sas_address=slot.sas_address if slot else None,
+                    attached_sas_address=normalize_text(slot.raw_status.get("attached_sas_address")) if slot else None,
+                    description=slot.topology_label if slot else None,
+                    led_supported=bool(slot and slot.led_supported),
+                    slot_size=storage_view_slot_size(storage_view, slot_value),
+                )
+            )
+
+        visible_slot_count = sum(1 for row in layout_rows for value in row if isinstance(value, int))
+        template = get_storage_view_template(storage_view.template_id)
+        notes = []
+        if snapshot.selected_enclosure_label and storage_view_profile:
+            notes.append(
+                f"Saved chassis view layered on top of the live enclosure {snapshot.selected_enclosure_label}, rendered through the {storage_view_profile.label} profile."
+            )
+        elif snapshot.selected_enclosure_label:
+            notes.append(
+                f"Saved chassis view layered on top of the live enclosure {snapshot.selected_enclosure_label}."
+            )
+        elif storage_view_profile:
+            notes.append(
+                f"Saved chassis view layered on top of the current live enclosure, rendered through the {storage_view_profile.label} profile."
+            )
+        return StorageViewRuntimeView(
+            id=storage_view.id,
+            label=storage_view.label,
+            kind=storage_view.kind,
+            template_id=storage_view.template_id,
+            profile_id=storage_view_profile.id if storage_view_profile else storage_view.profile_id,
+            profile_label=storage_view_profile.label if storage_view_profile else None,
+            enabled=storage_view.enabled,
+            render=storage_view.render.model_dump(mode="json"),
+            binding=storage_view.binding.model_dump(mode="json"),
+            order=storage_view.order,
+            template_label=template.label if template else storage_view.template_id,
+            slot_layout=layout_rows,
+            source="selected_enclosure_snapshot",
+            backing_enclosure_id=snapshot.selected_enclosure_id,
+            backing_enclosure_label=snapshot.selected_enclosure_label,
+            notes=notes,
+            matched_count=sum(1 for slot in runtime_slots if slot.occupied),
+            slot_count=visible_slot_count,
+            slots=runtime_slots,
+        )
+
+    def _build_candidate_storage_view_runtime(
+        self,
+        storage_view: StorageViewConfig,
+        snapshot: InventorySnapshot,
+        candidate_payloads: list[dict[str, Any]],
+        claimed_candidate_ids: set[str],
+    ) -> StorageViewRuntimeView:
+        storage_view_profile = resolve_storage_view_profile(
+            storage_view,
+            profile_registry=self.profile_registry,
+            selected_profile=snapshot.selected_profile,
+        )
+        layout_rows = build_storage_view_rows(storage_view, selected_profile=storage_view_profile)
+        ordered_candidates = self._ordered_storage_view_candidates(storage_view, candidate_payloads, claimed_candidate_ids)
+        visible_slots = ordered_storage_view_slot_indices(storage_view, selected_profile=storage_view_profile)
+        runtime_slots: list[StorageViewRuntimeSlot] = []
+        for assignment_rank, slot_value in enumerate(visible_slots, start=1):
+            candidate = ordered_candidates[assignment_rank - 1] if assignment_rank - 1 < len(ordered_candidates) else None
+            label = storage_view_slot_label(storage_view, slot_value, selected_profile=storage_view_profile)
+            runtime_slots.append(
+                self._build_candidate_runtime_slot(
+                    storage_view,
+                    slot_value,
+                    label,
+                    assignment_rank,
+                    candidate,
+                )
+            )
+
+        template = get_storage_view_template(storage_view.template_id)
+        notes = [
+            "Placement follows your saved binding order first, then falls back to live inventory sort for any remaining matches.",
+        ]
+        if storage_view.render.show_in_main_ui is False:
+            notes.append("This view is marked maintenance-only in config, but is still shown here for runtime inspection.")
+        return StorageViewRuntimeView(
+            id=storage_view.id,
+            label=storage_view.label,
+            kind=storage_view.kind,
+            template_id=storage_view.template_id,
+            profile_id=storage_view_profile.id if storage_view_profile else storage_view.profile_id,
+            profile_label=storage_view_profile.label if storage_view_profile else None,
+            enabled=storage_view.enabled,
+            render=storage_view.render.model_dump(mode="json"),
+            binding=storage_view.binding.model_dump(mode="json"),
+            order=storage_view.order,
+            template_label=template.label if template else storage_view.template_id,
+            slot_layout=layout_rows,
+            source="inventory_binding",
+            backing_enclosure_id=snapshot.selected_enclosure_id,
+            backing_enclosure_label=snapshot.selected_enclosure_label,
+            notes=notes,
+            matched_count=sum(1 for slot in runtime_slots if slot.occupied),
+            slot_count=len(visible_slots),
+            slots=runtime_slots,
+        )
+
+    def _build_candidate_runtime_slot(
+        self,
+        storage_view: StorageViewConfig,
+        slot_value: int,
+        slot_label: str,
+        assignment_rank: int,
+        candidate: dict[str, Any] | None,
+    ) -> StorageViewRuntimeSlot:
+        if not candidate:
+            return StorageViewRuntimeSlot(
+                slot_index=slot_value,
+                slot_label=slot_label,
+                occupied=False,
+                state="empty",
+                source="placeholder",
+                assignment_rank=assignment_rank,
+                placement_key=f"layout slot {assignment_rank}",
+                slot_size=storage_view_slot_size(storage_view, slot_value),
+            )
+
+        match_reasons = self._candidate_match_reasons(storage_view, candidate)
+        placement_key = candidate.get("_placement_key")
+        return StorageViewRuntimeSlot(
+            slot_index=slot_value,
+            slot_label=slot_label,
+            occupied=True,
+            state="matched",
+            source="inventory_candidate",
+            match_reasons=match_reasons,
+            placement_key=placement_key,
+            assignment_rank=assignment_rank,
+            device_name=(candidate.get("device_names") or [None])[0],
+            smart_device_names=list(candidate.get("smart_device_names") or []),
+            serial=candidate.get("serial"),
+            pool_name=candidate.get("pool_name"),
+            model=candidate.get("model"),
+            size_bytes=candidate.get("size_bytes"),
+            bus=candidate.get("bus"),
+            size_human=candidate.get("size_human"),
+            gptid=candidate.get("gptid"),
+            health=candidate.get("health"),
+            temperature_c=candidate.get("temperature_c"),
+            last_smart_test_type=candidate.get("last_smart_test_type"),
+            last_smart_test_status=candidate.get("last_smart_test_status"),
+            last_smart_test_lifetime_hours=candidate.get("last_smart_test_lifetime_hours"),
+            logical_block_size=candidate.get("logical_block_size"),
+            physical_block_size=candidate.get("physical_block_size"),
+            logical_unit_id=candidate.get("logical_unit_id"),
+            sas_address=candidate.get("sas_address"),
+            attached_sas_address=candidate.get("attached_sas_address"),
+            transport_address=candidate.get("transport_address"),
+            description=candidate.get("description"),
+            slot_size=storage_view_slot_size(storage_view, slot_value),
+        )
+
+    def _ordered_storage_view_candidates(
+        self,
+        storage_view: StorageViewConfig,
+        candidate_payloads: list[dict[str, Any]],
+        claimed_candidate_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        available_candidates = []
+        for candidate in candidate_payloads:
+            candidate_key = self._candidate_identity_key(candidate)
+            if candidate_key and candidate_key in claimed_candidate_ids:
+                continue
+            if not self._candidate_matches_storage_view(storage_view, candidate):
+                continue
+            available_candidates.append(candidate)
+
+        remaining_candidates = list(available_candidates)
+        ordered_candidates: list[dict[str, Any]] = []
+        for field_name, token in self._storage_view_binding_sequence(storage_view):
+            matched_for_token = [
+                candidate
+                for candidate in remaining_candidates
+                if self._candidate_matches_binding_token(candidate, field_name, token)
+            ]
+            matched_for_token.sort(key=self._candidate_sort_key)
+            for candidate in matched_for_token:
+                candidate["_placement_key"] = f"{field_name} match: {token}"
+                ordered_candidates.append(candidate)
+                remaining_candidates.remove(candidate)
+
+        remaining_candidates.sort(key=self._candidate_sort_key)
+        for candidate in remaining_candidates:
+            candidate["_placement_key"] = "fallback inventory order"
+        ordered_candidates.extend(remaining_candidates)
+        return ordered_candidates
+
+    def _storage_view_binding_sequence(
+        self,
+        storage_view: StorageViewConfig,
+    ) -> list[tuple[str, str]]:
+        binding = storage_view.binding
+        sequence: list[tuple[str, str]] = []
+        sequence.extend(("serial", normalize_text(value)) for value in binding.serials if normalize_text(value))
+        sequence.extend(("pcie", normalize_text(value)) for value in binding.pcie_addresses if normalize_text(value))
+        sequence.extend(
+            ("device", normalize_device_name(value) or normalize_text(value))
+            for value in binding.device_names
+            if (normalize_device_name(value) or normalize_text(value))
+        )
+        sequence.extend(("pool", normalize_text(value)) for value in binding.pool_names if normalize_text(value))
+        return sequence
+
+    def _candidate_identity_key(self, candidate: dict[str, Any]) -> str | None:
+        return (
+            normalize_text(candidate.get("candidate_id"))
+            or normalize_text(candidate.get("serial"))
+            or normalize_text((candidate.get("device_names") or [None])[0])
+            or normalize_text(candidate.get("transport_address"))
+        )
+
+    def _candidate_sort_key(self, candidate: dict[str, Any]) -> tuple[str, str, str, str, str]:
+        return (
+            normalize_text(candidate.get("pool_name")) or "",
+            normalize_text(candidate.get("bus")) or "",
+            normalize_text(candidate.get("transport_address")) or "",
+            normalize_text((candidate.get("device_names") or [None])[0]) or "",
+            normalize_text(candidate.get("serial")) or normalize_text(candidate.get("candidate_id")) or "",
+        )
+
+    def _candidate_matches_storage_view(
+        self,
+        storage_view: StorageViewConfig,
+        candidate: dict[str, Any],
+    ) -> bool:
+        reasons = self._candidate_match_reasons(storage_view, candidate)
+        if storage_view.binding.mode == "auto":
+            return bool(reasons)
+        if storage_view.binding.mode == "pool":
+            return "pool" in reasons or bool([reason for reason in reasons if reason != "pool"])
+        if storage_view.binding.mode == "serial":
+            return bool([reason for reason in reasons if reason in {"serial", "device", "pcie"}])
+        return bool(reasons)
+
+    def _candidate_match_reasons(
+        self,
+        storage_view: StorageViewConfig,
+        candidate: dict[str, Any],
+    ) -> list[str]:
+        binding = storage_view.binding
+        candidate_serial = normalize_text(candidate.get("serial"))
+        candidate_pool = normalize_text(candidate.get("pool_name"))
+        candidate_pcie = normalize_text(candidate.get("transport_address"))
+        candidate_device_names = {
+            normalize_device_name(device) or normalize_text(device)
+            for device in (candidate.get("device_names") or [])
+            if (normalize_device_name(device) or normalize_text(device))
+        }
+
+        reasons: list[str] = []
+        if candidate_serial and candidate_serial in {normalize_text(value) for value in binding.serials if normalize_text(value)}:
+            reasons.append("serial")
+        if candidate_pcie and candidate_pcie in {normalize_text(value) for value in binding.pcie_addresses if normalize_text(value)}:
+            reasons.append("pcie")
+        normalized_device_bindings = {
+            normalize_device_name(value) or normalize_text(value)
+            for value in binding.device_names
+            if (normalize_device_name(value) or normalize_text(value))
+        }
+        if candidate_device_names & normalized_device_bindings:
+            reasons.append("device")
+        if candidate_pool and candidate_pool in {normalize_text(value) for value in binding.pool_names if normalize_text(value)}:
+            reasons.append("pool")
+        return reasons
+
+    def _candidate_matches_binding_token(
+        self,
+        candidate: dict[str, Any],
+        field_name: str,
+        token: str,
+    ) -> bool:
+        if field_name == "serial":
+            return normalize_text(candidate.get("serial")) == token
+        if field_name == "pcie":
+            return normalize_text(candidate.get("transport_address")) == token
+        if field_name == "device":
+            return token in {
+                normalize_device_name(device) or normalize_text(device)
+                for device in (candidate.get("device_names") or [])
+                if (normalize_device_name(device) or normalize_text(device))
+            }
+        if field_name == "pool":
+            return normalize_text(candidate.get("pool_name")) == token
+        return False
 
     def invalidate_snapshot_cache(self, *, reason: str, invalidate_source_bundle: bool = False) -> None:
         self._cache.clear()
@@ -408,6 +998,9 @@ class InventoryService:
         ssh_failures: list[str] = []
         quantastor_cli_loaded = False
         quantastor_cli_failures: list[str] = []
+        scale_ses_loaded = False
+        scale_ses_data = ParsedSSHData()
+        scale_ses_failures: list[str] = []
         quantastor_ses_loaded = False
         quantastor_ses_data = ParsedSSHData()
         quantastor_ses_failures: list[str] = []
@@ -465,6 +1058,30 @@ class InventoryService:
             else:
                 sources["ssh"] = ssh_status
                 warnings.extend(ssh_failures)
+
+        if self.system.truenas.platform == "scale" and ssh_collected:
+            try:
+                with perf_stage("inventory.scale.fetch_ses_overlay"):
+                    scale_ses_data, scale_ses_failures = await self._fetch_scale_ses_overlay()
+            except Exception:
+                logger.exception("Failed to collect SCALE SES diagnostics")
+                scale_ses_failures.append(
+                    "TrueNAS SCALE SSH SES rediscovery failed unexpectedly. API disk and pool data is still being used."
+                )
+            else:
+                scale_ses_loaded = bool(scale_ses_data.ses_enclosures)
+                warnings.extend(scale_ses_failures)
+
+            if scale_ses_loaded:
+                sources["ssh"] = SourceStatus(
+                    enabled=True,
+                    ok=not ssh_failures and not scale_ses_failures,
+                    message=(
+                        "SSH probe and SCALE SES rediscovery completed."
+                        if not ssh_failures and not scale_ses_failures
+                        else "SCALE SES rediscovery completed with some failures."
+                    ),
+                )
 
         if self.system.truenas.platform == "quantastor" and ssh_collected:
             try:
@@ -529,6 +1146,7 @@ class InventoryService:
             ssh_collected=ssh_collected,
             warnings=warnings,
             sources=sources,
+            scale_ses_data=scale_ses_data,
             quantastor_ses_data=quantastor_ses_data,
         )
 
@@ -1074,6 +1692,7 @@ class InventoryService:
                                 summary = candidate_summary
                         if summary is None:
                             detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH smartctl error."
+                            detail = self._describe_smartctl_ssh_failure(detail, device_path)
                             last_error = (
                                 f"{target_host}:{device_path}: {detail}"
                                 if target_host
@@ -1116,6 +1735,22 @@ class InventoryService:
                         break
 
         return None, last_error
+
+    def _describe_smartctl_ssh_failure(self, detail: str, device_path: str) -> str:
+        lowered = detail.lower()
+        if "not allowed to execute" in lowered and "smartctl" in lowered:
+            service_user = normalize_text(self.system.ssh.user) or "the SSH service account"
+            return (
+                f"{service_user} is missing sudo permission for smartctl on {device_path}. "
+                "Grant /usr/local/sbin/smartctl and /usr/sbin/smartctl for both `-x -j` and `-x`, "
+                "or rerun the admin bootstrap to refresh the service-account sudo rules."
+            )
+        if "a password is required" in lowered or "password is required" in lowered:
+            return (
+                "SSH smartctl requires a sudo password on this host. Set SSH_SUDO_PASSWORD or update the "
+                "service-account sudo rules to allow the command-limited smartctl probes."
+            )
+        return detail
 
     def _smartctl_binary_candidates(self) -> tuple[str, ...]:
         if self.system.truenas.platform == "core":
@@ -1210,6 +1845,7 @@ class InventoryService:
             for key, value in source_bundle.sources.items()
         }
         raw_data = source_bundle.raw_data
+        scale_ses_data = source_bundle.scale_ses_data
         quantastor_ses_data = source_bundle.quantastor_ses_data
         ssh_data = ParsedSSHData()
         if source_bundle.ssh_collected:
@@ -1220,6 +1856,8 @@ class InventoryService:
                     self.system.truenas.enclosure_filter,
                     selected_enclosure_id,
                 )
+        if self.system.truenas.platform == "scale" and scale_ses_data.ses_enclosures:
+            ssh_data = self._merge_ses_overlay_data(ssh_data, scale_ses_data)
 
         has_scale_linux_ses = self._has_scale_linux_ses(ssh_data)
         if self.system.truenas.platform != "linux" and not raw_data.enclosures:
@@ -1295,7 +1933,7 @@ class InventoryService:
         else:
             disk_count = len(raw_data.disks)
             pool_count = len(raw_data.pools)
-            enclosure_count = len(raw_data.enclosures)
+            enclosure_count = max(len(raw_data.enclosures), len(available_enclosures))
             ssh_slot_hint_count = max(
                 len(ssh_data.ses_slot_candidates),
                 sum(len(enclosure.slots) for enclosure in ssh_data.ses_enclosures),
@@ -1478,6 +2116,123 @@ class InventoryService:
             layout_slot_count,
             layout_columns,
         )
+
+    def _build_storage_view_candidate_records(
+        self,
+        raw_data: TrueNASRawData,
+        ssh_data: ParsedSSHData,
+        selected_enclosure_id: str | None,
+    ) -> list[DiskRecord]:
+        if self.system.truenas.platform == "linux":
+            return self._build_linux_disk_records(ssh_data)
+        if self.system.truenas.platform == "quantastor":
+            return self._build_quantastor_disk_records(raw_data, selected_enclosure_id)
+        return self._build_disk_records(
+            raw_data.disks,
+            ssh_data,
+            raw_data.disk_temperatures,
+            parse_smart_test_results(raw_data.smart_test_results),
+        )
+
+    @staticmethod
+    def _collect_assigned_lookup_keys(slots: list[SlotView]) -> set[str]:
+        assigned_lookup_keys: set[str] = set()
+        for slot in slots:
+            raw_device_names = (
+                slot.raw_status.get("device_names")
+                if isinstance(slot.raw_status.get("device_names"), list)
+                else []
+            )
+            for value in (
+                slot.device_name,
+                slot.serial,
+                slot.gptid,
+                slot.logical_unit_id,
+                slot.sas_address,
+                *slot.smart_device_names,
+                *raw_device_names,
+            ):
+                assigned_lookup_keys.update(normalize_lookup_keys(value))
+        return assigned_lookup_keys
+
+    @staticmethod
+    def _disk_record_has_physical_slot_assignment(disk: DiskRecord) -> bool:
+        return bool(
+            disk.enclosure_id is not None
+            or disk.slot is not None
+            or isinstance(disk.raw.get("vendor_slot"), int)
+        )
+
+    @staticmethod
+    def _record_transport_address(disk: DiskRecord) -> str | None:
+        return normalize_text(
+            disk.raw.get("transport_address")
+            or disk.raw.get("pcie_address")
+            or disk.raw.get("pci_address")
+            or disk.raw.get("hctl")
+        )
+
+    def _serialize_storage_view_candidate(self, disk: DiskRecord) -> dict[str, Any]:
+        device_names = [
+            device
+            for device in dict.fromkeys(
+                filter(
+                    None,
+                    [
+                        disk.device_name,
+                        disk.path_device_name,
+                        disk.multipath_name,
+                        disk.multipath_member,
+                        *disk.smart_devices,
+                    ],
+                )
+            )
+        ]
+        transport_address = self._record_transport_address(disk)
+        size_human = format_bytes(disk.size_bytes)
+        candidate_id = (
+            normalize_text(disk.serial)
+            or normalize_text(disk.identifier)
+            or normalize_text(device_names[0] if device_names else None)
+        )
+        description_parts = [
+            normalize_text(disk.bus),
+            normalize_text(disk.model),
+            size_human,
+            f"pool {disk.pool_name}" if disk.pool_name else None,
+            transport_address,
+        ]
+        return {
+            "candidate_id": candidate_id,
+            "label": normalize_text(disk.serial) or normalize_text(device_names[0] if device_names else None) or "Inventory candidate",
+            "serial": disk.serial,
+            "identifier": disk.identifier,
+            "model": disk.model,
+            "pool_name": disk.pool_name,
+            "bus": disk.bus,
+            "size_bytes": disk.size_bytes,
+            "size_human": size_human,
+            "device_names": device_names,
+            "smart_device_names": list(disk.smart_devices),
+            "gptid": normalize_gptid(disk.identifier),
+            "health": disk.health,
+            "temperature_c": disk.temperature_c,
+            "last_smart_test_type": disk.last_smart_test_type,
+            "last_smart_test_status": disk.last_smart_test_status,
+            "last_smart_test_lifetime_hours": disk.last_smart_test_lifetime_hours,
+            "logical_block_size": disk.logical_block_size,
+            "physical_block_size": disk.physical_block_size,
+            "logical_unit_id": normalize_text(disk.lunid),
+            "sas_address": normalize_hex_identifier(disk.raw.get("sasAddress") or disk.raw.get("sas_address")),
+            "attached_sas_address": normalize_hex_identifier(disk.raw.get("attachedSasAddress") or disk.raw.get("attached_sas_address")),
+            "transport_address": transport_address,
+            "description": ", ".join(part for part in description_parts if part),
+            "recommended_binding": {
+                "serials": [disk.serial] if disk.serial else [],
+                "pcie_addresses": [transport_address] if transport_address else [],
+                "device_names": device_names,
+            },
+        }
 
     def _correlate_linux_host(
         self,
@@ -2910,19 +3665,43 @@ class InventoryService:
         return best_overlay, []
 
     async def _fetch_quantastor_ses_overlay(self) -> tuple[ParsedSSHData, list[str]]:
+        overlay, failures, best_host = await self._fetch_sg_ses_overlay(
+            self._build_quantastor_ssh_hosts(),
+            failure_prefix="Quantastor SSH SES",
+        )
+        if best_host:
+            self._quantastor_preferred_ses_host = best_host
+            return overlay, []
+        return overlay, failures
+
+    async def _fetch_scale_ses_overlay(self) -> tuple[ParsedSSHData, list[str]]:
+        overlay, failures, best_host = await self._fetch_sg_ses_overlay(
+            self._build_scale_ssh_hosts(),
+            failure_prefix="TrueNAS SCALE SSH SES",
+        )
+        if best_host:
+            self._scale_preferred_ses_host = best_host
+            return overlay, []
+        return overlay, failures
+
+    async def _fetch_sg_ses_overlay(
+        self,
+        hosts: list[str],
+        *,
+        failure_prefix: str,
+    ) -> tuple[ParsedSSHData, list[str], str | None]:
         best_overlay = ParsedSSHData()
         best_score = 0
         best_host: str | None = None
         failures: list[str] = []
-        preferred_host = normalize_text(self._quantastor_preferred_ses_host)
 
-        for host in self._build_quantastor_ssh_hosts():
-            device_discovery = await self._run_ssh_command(self._build_quantastor_ses_discovery_command(), host)
+        for host in hosts:
+            device_discovery = await self._run_ssh_command(self._build_sg_ses_discovery_command(), host)
             if not device_discovery.ok:
                 detail = normalize_text(device_discovery.stderr) or normalize_text(device_discovery.stdout) or (
                     f"exit {device_discovery.exit_code}"
                 )
-                failures.append(f"Quantastor SSH SES discovery failed on {host}: {detail}")
+                failures.append(f"{failure_prefix} discovery failed on {host}: {detail}")
                 continue
 
             devices = [
@@ -2931,11 +3710,10 @@ class InventoryService:
                 if normalize_text(line) and normalize_text(line).startswith("/dev/sg")
             ]
             if not devices:
-                failures.append(f"Quantastor SSH SES discovery found no usable sg_ses devices on {host}.")
+                failures.append(f"{failure_prefix} discovery found no usable sg_ses devices on {host}.")
                 continue
 
             host_overlay = ParsedSSHData()
-            host_score = 0
             host_failures: list[str] = []
             for device in devices:
                 aes_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "aes", device])
@@ -2944,7 +3722,7 @@ class InventoryService:
                     detail = normalize_text(aes_result.stderr) or normalize_text(aes_result.stdout) or (
                         f"exit {aes_result.exit_code}"
                     )
-                    host_failures.append(f"Quantastor AES page probe failed on {host} {device}: {detail}")
+                    host_failures.append(f"{failure_prefix} AES page probe failed on {host} {device}: {detail}")
                     continue
 
                 outputs = {aes_command: aes_result.stdout}
@@ -2954,28 +3732,30 @@ class InventoryService:
                     outputs[ec_command] = ec_result.stdout
 
                 parsed = parse_ssh_outputs(outputs, self.settings.layout.slot_count, None, None)
-                score = sum(len(enclosure.slots) for enclosure in parsed.ses_enclosures)
-                if score <= 0:
+                if not parsed.ses_enclosures:
                     continue
-                self._tag_quantastor_ses_overlay(parsed, host)
-                if score > host_score:
-                    host_overlay = parsed
-                    host_score = score
+                self._tag_ses_overlay(parsed, host)
+                host_overlay = self._merge_ses_overlay_data(host_overlay, parsed)
 
             if host_failures:
                 failures.extend(host_failures)
+            host_score = sum(len(enclosure.slots) for enclosure in host_overlay.ses_enclosures)
             if host_score > best_score:
                 best_overlay = host_overlay
                 best_score = host_score
                 best_host = host
-            if preferred_host and host == preferred_host and host_score > 0:
-                self._quantastor_preferred_ses_host = preferred_host
-                return host_overlay, []
 
         if best_score <= 0:
-            return ParsedSSHData(), failures
-        self._quantastor_preferred_ses_host = best_host
-        return best_overlay, []
+            return ParsedSSHData(), failures, None
+        return best_overlay, [], best_host
+
+    def _build_scale_ssh_hosts(self) -> list[str]:
+        hosts: list[str] = []
+        for value in [self._scale_preferred_ses_host, self.system.ssh.host, *(self.system.ssh.extra_hosts or [])]:
+            host = normalize_text(value)
+            if host and host not in hosts:
+                hosts.append(host)
+        return hosts
 
     def _build_quantastor_ssh_hosts(self) -> list[str]:
         hosts: list[str] = []
@@ -3036,12 +3816,12 @@ class InventoryService:
             target["present"] = ses_candidate.get("present")
 
     @staticmethod
-    def _build_quantastor_ses_discovery_command() -> str:
+    def _build_sg_ses_discovery_command() -> str:
         script = 'for dev in /dev/sg*; do if sudo -n /usr/bin/sg_ses -p aes "$dev" >/dev/null 2>&1; then echo "$dev"; fi; done'
         return shlex.join(["/bin/sh", "-lc", script])
 
     @staticmethod
-    def _tag_quantastor_ses_overlay(ssh_data: ParsedSSHData, host: str) -> None:
+    def _tag_ses_overlay(ssh_data: ParsedSSHData, host: str) -> None:
         tagged_host = normalize_text(host)
         if not tagged_host:
             return
@@ -3071,6 +3851,28 @@ class InventoryService:
                     tagged_targets.append(tagged)
                 if tagged_targets:
                     slot.control_targets = tagged_targets
+
+    @staticmethod
+    def _merge_ses_overlay_data(base: ParsedSSHData, overlay: ParsedSSHData) -> ParsedSSHData:
+        merged = ParsedSSHData(
+            glabel=base.glabel,
+            zpool_members=dict(base.zpool_members),
+            multipath_info=dict(base.multipath_info),
+            ses_slot_to_device=dict(base.ses_slot_to_device),
+            camcontrol_models=dict(base.camcontrol_models),
+            camcontrol_controllers=dict(base.camcontrol_controllers),
+            camcontrol_peer_devices=dict(base.camcontrol_peer_devices),
+            ses_slot_candidates=merge_slot_candidate_maps(base.ses_slot_candidates, overlay.ses_slot_candidates),
+            ses_selected_meta=InventoryService._merge_enclosure_meta(base.ses_selected_meta, overlay.ses_selected_meta),
+            ses_enclosures=_merge_ses_enclosures([*base.ses_enclosures, *overlay.ses_enclosures]),
+            linux_blockdevices=list(base.linux_blockdevices),
+            linux_mdadm_arrays=dict(base.linux_mdadm_arrays),
+            linux_nvme_subsystems=dict(base.linux_nvme_subsystems),
+            ubntstorage_disks=list(base.ubntstorage_disks),
+            ubntstorage_spaces=list(base.ubntstorage_spaces),
+            unifi_led_states=dict(base.unifi_led_states),
+        )
+        return merged
 
     def _build_quantastor_cli_command(self, subcommand: str) -> str:
         args = ["/usr/bin/qs", subcommand, "--json"]
@@ -3234,6 +4036,69 @@ class InventoryService:
                 )
             )
 
+        selected_id = normalize_text(selected_meta.get("id"))
+        selected_ids = {
+            item
+            for item in (
+                normalize_text(value)
+                for value in (selected_id.split("+") if selected_id else [])
+            )
+            if item
+        }
+
+        if self.system.truenas.platform == "core":
+            _primary_candidates, primary_meta = build_slot_candidates_from_ses_enclosures(
+                ssh_data.ses_enclosures,
+                self.settings.layout.slot_count,
+                self.system.truenas.enclosure_filter,
+                None,
+            )
+            primary_id = normalize_text(primary_meta.get("id"))
+            primary_ids = {
+                item
+                for item in (
+                    normalize_text(value)
+                    for value in (primary_id.split("+") if primary_id else [])
+                )
+                if item
+            }
+            selected_option = next(
+                (
+                    option
+                    for option in (self._ses_enclosure_to_option(enclosure) for enclosure in ssh_data.ses_enclosures)
+                    if option is not None and option.id == selected_id
+                ),
+                None,
+            )
+            if selected_id and selected_id != primary_id and selected_id not in seen_ids:
+                seen_ids.add(selected_id)
+                options.append(
+                    selected_option
+                    or EnclosureOption(
+                        id=selected_id,
+                        label=normalize_text(selected_meta.get("label")) or selected_id,
+                        name=normalize_text(selected_meta.get("name")),
+                    )
+                )
+            if primary_id and primary_id not in seen_ids:
+                seen_ids.add(primary_id)
+                options.append(
+                    EnclosureOption(
+                        id=primary_id,
+                        label=normalize_text(primary_meta.get("label")) or primary_id,
+                        name=normalize_text(primary_meta.get("name")),
+                    )
+                )
+            for enclosure in self._build_core_ssh_enclosure_options(
+                ssh_data,
+                filter_value=filter_value,
+                excluded_ids=primary_ids | selected_ids,
+            ):
+                if enclosure.id in seen_ids:
+                    continue
+                seen_ids.add(enclosure.id)
+                options.append(enclosure)
+
         if self.system.truenas.platform == "scale":
             for enclosure in self._build_scale_linux_enclosure_options(ssh_data):
                 if enclosure.id in seen_ids:
@@ -3241,7 +4106,6 @@ class InventoryService:
                 seen_ids.add(enclosure.id)
                 options.append(enclosure)
 
-        selected_id = normalize_text(selected_meta.get("id"))
         if selected_id and selected_id not in seen_ids:
             options.append(
                 EnclosureOption(
@@ -3253,24 +4117,60 @@ class InventoryService:
 
         return options
 
+    @staticmethod
+    def _ses_enclosure_to_option(enclosure) -> EnclosureOption | None:
+        if not enclosure.enclosure_id:
+            return None
+        slot_numbers = sorted(enclosure.slots) if enclosure.slots else []
+        slot_base = 0 if slot_numbers and slot_numbers[0] == 0 else 1
+        slot_count = slot_numbers[-1] - slot_base + 1 if slot_numbers else 0
+        return EnclosureOption(
+            id=enclosure.enclosure_id,
+            label=enclosure.enclosure_label or enclosure.enclosure_name or enclosure.enclosure_id,
+            name=enclosure.enclosure_name,
+            profile_id=enclosure.profile_id,
+            rows=enclosure.layout_rows,
+            columns=enclosure.layout_columns,
+            slot_count=slot_count,
+            slot_layout=enclosure.slot_layout,
+        )
+
+    def _build_core_ssh_enclosure_options(
+        self,
+        ssh_data: ParsedSSHData,
+        *,
+        filter_value: str | None,
+        excluded_ids: set[str],
+    ) -> list[EnclosureOption]:
+        options: list[EnclosureOption] = []
+        for enclosure in ssh_data.ses_enclosures:
+            option = self._ses_enclosure_to_option(enclosure)
+            if option is None:
+                continue
+            if option.id in excluded_ids:
+                continue
+            if option.slot_count and option.slot_count < 12:
+                continue
+            haystack = " ".join(filter(None, [option.id, option.name, option.label])).lower()
+            if filter_value and filter_value not in haystack:
+                continue
+            options.append(option)
+        return sorted(
+            options,
+            key=lambda item: (
+                0 if "front" in item.label.lower() else 1 if "rear" in item.label.lower() else 2,
+                item.slot_count or 0,
+                item.label,
+            ),
+        )
+
     def _build_scale_linux_enclosure_options(self, ssh_data: ParsedSSHData) -> list[EnclosureOption]:
         options: list[EnclosureOption] = []
         for enclosure in ssh_data.ses_enclosures:
-            if not enclosure.enclosure_id:
+            option = self._ses_enclosure_to_option(enclosure)
+            if option is None:
                 continue
-            slot_count = max(enclosure.slots) + 1 if enclosure.slots else 0
-            options.append(
-                EnclosureOption(
-                    id=enclosure.enclosure_id,
-                    label=enclosure.enclosure_label or enclosure.enclosure_name or enclosure.enclosure_id,
-                    name=enclosure.enclosure_name,
-                    profile_id=enclosure.profile_id,
-                    rows=enclosure.layout_rows,
-                    columns=enclosure.layout_columns,
-                    slot_count=slot_count,
-                    slot_layout=enclosure.slot_layout,
-                )
-            )
+            options.append(option)
 
         return sorted(
             options,

@@ -63,6 +63,16 @@ class SSHProbe:
             )
         return await asyncio.to_thread(self._run_command_sync, command)
 
+    def run_command_sync(self, command: str) -> SSHCommandResult:
+        if not self.config.enabled:
+            return SSHCommandResult(
+                command=command,
+                ok=False,
+                stderr="SSH fallback is disabled.",
+                exit_code=1,
+            )
+        return self._run_command_sync(command)
+
     def _run_commands_sync(self) -> list[SSHCommandResult]:
         results: list[SSHCommandResult] = []
         try:

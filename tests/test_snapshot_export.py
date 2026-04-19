@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from starlette.datastructures import URLPath
 from starlette.requests import Request
@@ -33,6 +34,11 @@ class FakeHistoryBackend:
         system_id: str | None,
         enclosure_id: str | None,
     ) -> dict[str, object]:
+        base_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        samples = [
+            {"observed_at": (base_time - timedelta(minutes=10)).isoformat(), "value": 36},
+            {"observed_at": (base_time - timedelta(minutes=5)).isoformat(), "value": 37},
+        ]
         return {
             "configured": True,
             "available": True,
@@ -41,10 +47,7 @@ class FakeHistoryBackend:
             "system_id": system_id,
             "enclosure_id": enclosure_id,
             "metrics": {
-                "temperature_c": [
-                    {"observed_at": "2026-04-17T00:30:00+00:00", "value": 36},
-                    {"observed_at": "2026-04-17T00:35:00+00:00", "value": 37},
-                ],
+                "temperature_c": samples,
                 "bytes_read": [],
                 "bytes_written": [],
                 "annualized_bytes_written": [],
@@ -122,11 +125,10 @@ class DenseHistoryBackend:
     ) -> dict[str, object]:
         base_read = 1_000_000_000_000
         base_write = 250_000_000_000
+        base_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         samples = []
         for index in range(288):
-            hour = index // 12
-            minute = (index % 12) * 5
-            observed_at = f"2026-04-16T{hour:02d}:{minute:02d}:00+00:00"
+            observed_at = (base_time - timedelta(minutes=(287 - index) * 5)).isoformat()
             samples.append(
                 {
                     "observed_at": observed_at,

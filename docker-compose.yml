@@ -9,6 +9,10 @@ services:
     environment:
       HISTORY_BACKEND_URL: http://enclosure-history:8001
       HISTORY_BACKEND_TIMEOUT: ${HISTORY_BACKEND_TIMEOUT:-10}
+      ADMIN_SERVICE_URL: http://enclosure-admin:8002
+      ADMIN_PORT: ${ADMIN_PORT:-8082}
+      ADMIN_BIND_ADDRESS: ${ADMIN_BIND_ADDRESS:-0.0.0.0}
+      ADMIN_TIMEOUT_SECONDS: ${ADMIN_TIMEOUT_SECONDS:-0.75}
     ports:
       - "${APP_PORT:-8080}:8000"
     volumes:
@@ -31,6 +35,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: truenas-jbod-history
+    user: "0:0"
     command: ["uvicorn", "history_service.main:app", "--host", "0.0.0.0", "--port", "8001"]
     environment:
       HISTORY_SOURCE_BASE_URL: http://enclosure-ui:8000
@@ -60,3 +65,42 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  enclosure-admin:
+    profiles:
+      - admin
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: truenas-jbod-admin
+    user: "0:0"
+    command: ["uvicorn", "admin_service.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    env_file:
+      - .env
+    environment:
+      HISTORY_SQLITE_PATH: /app/history/history.db
+      HISTORY_BACKUP_DIR: ${HISTORY_BACKUP_DIR:-/app/history/backups}
+      HISTORY_LONG_TERM_BACKUP_DIR: ${HISTORY_LONG_TERM_BACKUP_DIR:-/app/history/backups/long-term}
+      ADMIN_PORT: 8002
+      ADMIN_BIND_ADDRESS: ${ADMIN_BIND_ADDRESS:-0.0.0.0}
+      ADMIN_AUTO_STOP_SECONDS: ${ADMIN_AUTO_STOP_SECONDS:-3600}
+      ADMIN_CONTAINER_UI_NAME: truenas-jbod-ui
+      ADMIN_CONTAINER_HISTORY_NAME: truenas-jbod-history
+      ADMIN_CONTAINER_ADMIN_NAME: truenas-jbod-admin
+      ADMIN_CLEAN_BACKUP_TARGETS_JSON: '${ADMIN_CLEAN_BACKUP_TARGETS_JSON:-["ui","history"]}'
+    ports:
+      - "${ADMIN_BIND_ADDRESS:-0.0.0.0}:${ADMIN_PORT:-8082}:8002"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./history:/app/history
+      - ./logs:/app/logs
+      - ./config/ssh:/run/ssh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

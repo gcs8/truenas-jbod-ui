@@ -11,6 +11,20 @@ That means the app can now describe:
 
 without creating a new one-off render path every time.
 
+## Profiles Are Not Storage Views
+
+Profiles define how a chassis should look.
+
+They do not decide whether something is:
+
+- a `Live Enclosure` discovered from the host
+- a `Saved Chassis View` that mirrors a live enclosure
+- a `Virtual Storage View` for internal disks such as NVMe carriers or SATADOMs
+
+If you want the runtime selector mental model, use:
+
+- [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
+
 ## Built-In Profiles Right Now
 
 - `supermicro-cse-946-top-60`

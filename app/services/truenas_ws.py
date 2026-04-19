@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 from websockets.asyncio.client import ClientConnection, connect
 
 from app.config import TrueNASConfig
+from app.services.tls_context import build_tls_client_context, resolve_tls_server_name
 
 logger = logging.getLogger(__name__)
 
@@ -174,14 +175,7 @@ class TrueNASWebsocketClient:
         websocket_url = build_websocket_url(self.config.host)
         if not websocket_url.startswith("wss://"):
             return None
-
-        if self.config.verify_ssl:
-            return ssl.create_default_context()
-
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        return context
+        return build_tls_client_context(self.config)
 
     async def _perform_handshake(self, ws: ClientConnection) -> None:
         await ws.send(json.dumps({"msg": "connect", "version": "1", "support": ["1"]}))
@@ -314,6 +308,7 @@ class TrueNASWebsocketClient:
         async with connect(
             websocket_url,
             ssl=ssl_context,
+            server_hostname=resolve_tls_server_name(self.config) if ssl_context else None,
             open_timeout=self.config.timeout_seconds,
             close_timeout=self.config.timeout_seconds,
             ping_interval=20,

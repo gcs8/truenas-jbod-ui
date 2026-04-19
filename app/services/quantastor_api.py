@@ -8,9 +8,14 @@ import ssl
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from app.config import TrueNASConfig
+from app.services.tls_context import (
+    build_tls_client_context,
+    resolve_tls_server_name,
+    urlopen_with_tls_config,
+)
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
 
 logger = logging.getLogger(__name__)
@@ -102,13 +107,15 @@ class QuantastorRESTClient:
 
         ssl_context = None
         if target.startswith("https://"):
-            ssl_context = ssl.create_default_context()
-            if not self.config.verify_ssl:
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
+            ssl_context = build_tls_client_context(self.config)
 
         try:
-            with urlopen(request, timeout=self.config.timeout_seconds, context=ssl_context) as response:
+            with urlopen_with_tls_config(
+                request,
+                timeout=self.config.timeout_seconds,
+                context=ssl_context,
+                server_hostname=resolve_tls_server_name(self.config),
+            ) as response:
                 charset = response.headers.get_content_charset() or "utf-8"
                 payload = response.read().decode(charset)
         except HTTPError as exc:

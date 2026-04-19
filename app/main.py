@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -25,6 +27,7 @@ from app.models.domain import (
     SmartBatchRequest,
     SmartBatchResponse,
     SmartSummaryView,
+    StorageViewRuntimePayload,
 )
 from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
 from app.services.history_backend import HistoryBackendClient
@@ -60,16 +63,16 @@ def get_snapshot_export_service() -> SnapshotExportService:
 
 
 def create_app() -> FastAPI:
-    settings = get_settings()
-    configure_logging(settings)
+    startup_settings = get_settings()
+    configure_logging(startup_settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         warm_task: asyncio.Task[None] | None = None
-        if settings.app.startup_warm_cache_enabled:
+        if startup_settings.app.startup_warm_cache_enabled:
             registry = get_inventory_registry()
             warm_task = asyncio.create_task(
-                registry.prewarm_all(warm_smart=settings.app.startup_warm_smart_enabled)
+                registry.prewarm_all(warm_smart=startup_settings.app.startup_warm_smart_enabled)
             )
         try:
             yield
@@ -84,12 +87,12 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="TrueNAS JBOD Enclosure UI",
         version=__version__,
-        docs_url="/docs" if settings.app.debug else None,
-        redoc_url="/redoc" if settings.app.debug else None,
+        docs_url="/docs" if startup_settings.app.debug else None,
+        redoc_url="/redoc" if startup_settings.app.debug else None,
         lifespan=lifespan,
     )
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
-    install_perf_timing_middleware(app, settings)
+    install_perf_timing_middleware(app, startup_settings)
 
     @app.get("/", response_class=HTMLResponse)
     async def index(
@@ -97,12 +100,18 @@ def create_app() -> FastAPI:
         system_id: str | None = None,
         enclosure_id: str | None = None,
     ) -> HTMLResponse:
+        current_settings = get_settings()
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
+        admin_launch_url = await asyncio.to_thread(resolve_admin_launch_url, request, current_settings)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, enclosure_id=enclosure_id)
         snapshot = await service.get_snapshot(
             selected_enclosure_id=enclosure_id,
             allow_stale_cache=True,
+        )
+        storage_view_runtime = await service.get_storage_view_runtime(
+            selected_enclosure_id=enclosure_id,
+            snapshot=snapshot,
         )
         return templates.TemplateResponse(
             request,
@@ -110,8 +119,10 @@ def create_app() -> FastAPI:
             build_index_context(
                 request=request,
                 snapshot=snapshot,
-                settings=settings,
-                history_configured=bool(settings.history.service_url),
+                storage_view_runtime=storage_view_runtime,
+                settings=current_settings,
+                history_configured=bool(current_settings.history.service_url),
+                admin_launch_url=admin_launch_url,
             ),
         )
 
@@ -135,6 +146,25 @@ def create_app() -> FastAPI:
             allow_stale_cache=not force,
         )
 
+    @app.get("/api/storage-views", response_model=StorageViewRuntimePayload)
+    async def get_storage_views(
+        force: bool = False,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> StorageViewRuntimePayload:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        add_perf_metadata(
+            system_id=service.system.id,
+            platform=service.system.truenas.platform,
+            enclosure_id=enclosure_id,
+            force_refresh=force,
+        )
+        return await service.get_storage_view_runtime(
+            force_refresh=force,
+            selected_enclosure_id=enclosure_id,
+        )
+
     @app.post("/api/slots/{slot}/led")
     async def set_slot_led(
         slot: int,
@@ -142,7 +172,7 @@ def create_app() -> FastAPI:
         system_id: str | None = None,
         enclosure_id: str | None = None,
     ) -> JSONResponse:
-        ensure_slot_bounds(settings, slot)
+        ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
@@ -166,7 +196,7 @@ def create_app() -> FastAPI:
         system_id: str | None = None,
         enclosure_id: str | None = None,
     ) -> JSONResponse:
-        ensure_slot_bounds(settings, slot)
+        ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
@@ -215,7 +245,7 @@ def create_app() -> FastAPI:
         system_id: str | None = None,
         enclosure_id: str | None = None,
     ) -> JSONResponse:
-        ensure_slot_bounds(settings, slot)
+        ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
@@ -263,7 +293,7 @@ def create_app() -> FastAPI:
         system_id: str | None = None,
         enclosure_id: str | None = None,
     ) -> SmartSummaryView:
-        ensure_slot_bounds(settings, slot)
+        ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
@@ -276,6 +306,62 @@ def create_app() -> FastAPI:
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.get("/api/storage-views/{view_id}/slots/{slot_index}/smart", response_model=SmartSummaryView)
+    async def get_storage_view_slot_smart_summary(
+        view_id: str,
+        slot_index: int,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> SmartSummaryView:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        add_perf_metadata(
+            system_id=service.system.id,
+            platform=service.system.truenas.platform,
+            storage_view_id=view_id,
+            slot=slot_index,
+            enclosure_id=enclosure_id,
+        )
+        try:
+            return await service.get_storage_view_slot_smart_summary(
+                view_id,
+                slot_index,
+                selected_enclosure_id=enclosure_id,
+                allow_stale_cache=True,
+            )
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/storage-views/{view_id}/slots/{slot_index}/history")
+    async def get_storage_view_slot_history(
+        view_id: str,
+        slot_index: int,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> JSONResponse:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        history_slot, history_enclosure_id = await service.resolve_storage_view_slot_history_target(
+            view_id,
+            slot_index,
+            selected_enclosure_id=enclosure_id,
+        )
+        add_perf_metadata(
+            system_id=service.system.id,
+            platform=service.system.truenas.platform,
+            storage_view_id=view_id,
+            slot=slot_index,
+            history_slot=history_slot,
+            enclosure_id=history_enclosure_id,
+        )
+        history_backend = get_history_backend()
+        payload = await history_backend.get_slot_history(
+            history_slot,
+            service.system.id,
+            history_enclosure_id,
+        )
+        return JSONResponse(payload)
+
     @app.post("/api/slots/smart-batch", response_model=SmartBatchResponse)
     async def get_slot_smart_summaries(
         payload: SmartBatchRequest,
@@ -283,7 +369,7 @@ def create_app() -> FastAPI:
         enclosure_id: str | None = None,
     ) -> SmartBatchResponse:
         for slot in payload.slots:
-            ensure_slot_bounds(settings, slot)
+            ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         add_perf_metadata(
@@ -315,7 +401,7 @@ def create_app() -> FastAPI:
         system_id: str | None = None,
         enclosure_id: str | None = None,
     ) -> JSONResponse:
-        ensure_slot_bounds(settings, slot)
+        ensure_slot_bounds(get_settings(), slot)
         history_backend = get_history_backend()
         payload = await history_backend.get_slot_history(slot, system_id, enclosure_id)
         return JSONResponse(payload)
@@ -441,8 +527,10 @@ def build_index_context(
     *,
     request: Request,
     snapshot: InventorySnapshot,
+    storage_view_runtime: StorageViewRuntimePayload,
     settings: Settings,
     history_configured: bool,
+    admin_launch_url: str | None = None,
     snapshot_mode: bool = False,
     snapshot_export_meta: dict[str, object] | None = None,
     snapshot_export_meta_json: str = "null",
@@ -457,8 +545,10 @@ def build_index_context(
     return {
         "request": request,
         "snapshot": snapshot,
+        "storage_view_runtime": storage_view_runtime,
         "settings": settings,
         "initial_snapshot_json": json.dumps(snapshot.model_dump(mode="json")),
+        "initial_storage_view_runtime_json": json.dumps(storage_view_runtime.model_dump(mode="json")),
         "history_configured": history_configured,
         "snapshot_mode": snapshot_mode,
         "snapshot_export_meta": snapshot_export_meta or {},
@@ -470,12 +560,32 @@ def build_index_context(
         "initial_history_timeframe_hours_json": initial_history_timeframe_hours_json,
         "initial_history_panel_open_json": initial_history_panel_open_json,
         "initial_history_io_chart_mode_json": initial_history_io_chart_mode_json,
+        "admin_launch_url": admin_launch_url,
     }
 
 
 def ensure_slot_bounds(settings: Settings, slot: int) -> None:
     if slot < 0 or slot >= settings.layout.slot_count:
         raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
+
+
+def resolve_admin_launch_url(request: Request, settings: Settings) -> str | None:
+    service_url = str(settings.admin.service_url or "").strip()
+    if not service_url:
+        return None
+
+    health_url = f"{service_url.rstrip('/')}/healthz"
+    try:
+        with urllib.request.urlopen(health_url, timeout=settings.admin.timeout_seconds) as response:
+            if getattr(response, "status", 200) >= 400:
+                return None
+    except (urllib.error.URLError, ValueError):
+        return None
+
+    public_url = str(settings.admin.public_url or "").strip()
+    if public_url:
+        return public_url.rstrip("/")
+    return f"{request.url.scheme}://{request.url.hostname}:{settings.admin.port}"
 
 
 app = create_app()

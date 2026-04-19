@@ -46,6 +46,8 @@ class TrueNASConfig(BaseModel):
     api_password: str = ""
     platform: Literal["core", "scale", "linux", "quantastor"] = "core"
     verify_ssl: bool = True
+    tls_ca_bundle_path: str | None = None
+    tls_server_name: str | None = None
     timeout_seconds: int = 15
     enclosure_filter: str | None = None
 
@@ -104,6 +106,130 @@ class EnclosureProfileConfig(BaseModel):
         return normalized
 
 
+StorageViewKind = Literal["ses_enclosure", "nvme_carrier", "boot_devices", "manual"]
+StorageViewBindingMode = Literal["auto", "pool", "serial", "hybrid"]
+
+
+class StorageViewRenderConfig(BaseModel):
+    show_in_main_ui: bool = True
+    show_in_admin_ui: bool = True
+    default_collapsed: bool = False
+
+
+class StorageViewBindingConfig(BaseModel):
+    mode: StorageViewBindingMode = "auto"
+    enclosure_ids: list[str] = Field(default_factory=list)
+    pool_names: list[str] = Field(default_factory=list)
+    serials: list[str] = Field(default_factory=list)
+    pcie_addresses: list[str] = Field(default_factory=list)
+    device_names: list[str] = Field(default_factory=list)
+
+
+class StorageViewLayoutOverridesConfig(BaseModel):
+    slot_labels: dict[int, str] = Field(default_factory=dict)
+    slot_sizes: dict[int, str] = Field(default_factory=dict)
+
+    @field_validator("slot_labels", mode="before")
+    @classmethod
+    def _normalize_slot_labels(cls, value: Any) -> dict[int, str]:
+        if value is None or value == "":
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("slot_labels must be a mapping of slot numbers to labels")
+
+        normalized: dict[int, str] = {}
+        for raw_key, raw_label in value.items():
+            try:
+                slot_number = int(raw_key)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("slot label keys must be integers") from exc
+            if slot_number < 0:
+                continue
+            label = normalize_text(str(raw_label) if raw_label is not None else None)
+            if label:
+                normalized[slot_number] = label[:128]
+        return normalized
+
+    @field_validator("slot_sizes", mode="before")
+    @classmethod
+    def _normalize_slot_sizes(cls, value: Any) -> dict[int, str]:
+        if value is None or value == "":
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("slot_sizes must be a mapping of slot numbers to M.2 lengths")
+
+        allowed_sizes = {"2230", "2242", "2260", "2280", "22110"}
+        normalized: dict[int, str] = {}
+        for raw_key, raw_size in value.items():
+            try:
+                slot_number = int(raw_key)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("slot size keys must be integers") from exc
+            if slot_number < 0:
+                continue
+            size_label = normalize_text(str(raw_size) if raw_size is not None else None)
+            if size_label in allowed_sizes:
+                normalized[slot_number] = size_label
+        return normalized
+
+
+class StorageViewConfig(BaseModel):
+    id: str
+    label: str
+    kind: StorageViewKind
+    template_id: str
+    profile_id: str | None = None
+    enabled: bool = True
+    order: int = 10
+    render: StorageViewRenderConfig = Field(default_factory=StorageViewRenderConfig)
+    binding: StorageViewBindingConfig = Field(default_factory=StorageViewBindingConfig)
+    layout_overrides: StorageViewLayoutOverridesConfig | None = None
+
+    @field_validator("id", "label", "template_id", mode="before")
+    @classmethod
+    def _normalize_text_fields(cls, value: Any) -> str:
+        normalized = normalize_text(str(value) if value is not None else None)
+        return normalized or ""
+
+    @field_validator("profile_id", mode="before")
+    @classmethod
+    def _normalize_optional_profile_id(cls, value: Any) -> str | None:
+        return normalize_text(str(value) if value is not None else None)
+
+    @field_validator("order", mode="before")
+    @classmethod
+    def _normalize_order(cls, value: Any) -> int:
+        if value in {None, ""}:
+            return 10
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 10
+
+    @field_validator("binding", mode="after")
+    @classmethod
+    def _normalize_binding(cls, value: StorageViewBindingConfig) -> StorageViewBindingConfig:
+        def _clean_list(values: list[str]) -> list[str]:
+            cleaned: list[str] = []
+            seen: set[str] = set()
+            for item in values or []:
+                normalized = normalize_text(str(item) if item is not None else None)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    cleaned.append(normalized)
+            return cleaned
+
+        return value.model_copy(
+            update={
+                "enclosure_ids": _clean_list(value.enclosure_ids),
+                "pool_names": _clean_list(value.pool_names),
+                "serials": _clean_list(value.serials),
+                "pcie_addresses": _clean_list(value.pcie_addresses),
+                "device_names": _clean_list(value.device_names),
+            }
+        )
+
+
 class LayoutConfig(BaseModel):
     slot_count: int = 60
     rows: int = 4
@@ -124,6 +250,13 @@ class HistoryConfig(BaseModel):
     timeout_seconds: int = 10
 
 
+class AdminSurfaceConfig(BaseModel):
+    service_url: str = ""
+    public_url: str | None = None
+    port: int = 8082
+    timeout_seconds: float = 0.75
+
+
 class SystemConfig(BaseModel):
     id: str = "default"
     label: str | None = None
@@ -131,6 +264,7 @@ class SystemConfig(BaseModel):
     ssh: SSHConfig = Field(default_factory=SSHConfig)
     default_profile_id: str | None = None
     enclosure_profiles: dict[str, str] = Field(default_factory=dict)
+    storage_views: list[StorageViewConfig] = Field(default_factory=list)
 
 
 class Settings(BaseModel):
@@ -139,6 +273,7 @@ class Settings(BaseModel):
     truenas: TrueNASConfig = Field(default_factory=TrueNASConfig)
     ssh: SSHConfig = Field(default_factory=SSHConfig)
     history: HistoryConfig = Field(default_factory=HistoryConfig)
+    admin: AdminSurfaceConfig = Field(default_factory=AdminSurfaceConfig)
     systems: list[SystemConfig] = Field(default_factory=list)
     default_system_id: str | None = None
     layout: LayoutConfig = Field(default_factory=LayoutConfig)
@@ -177,6 +312,8 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "TRUENAS_API_PASSWORD": ("truenas", "api_password"),
     "TRUENAS_PLATFORM": ("truenas", "platform"),
     "TRUENAS_VERIFY_SSL": ("truenas", "verify_ssl"),
+    "TRUENAS_TLS_CA_BUNDLE_PATH": ("truenas", "tls_ca_bundle_path"),
+    "TRUENAS_TLS_SERVER_NAME": ("truenas", "tls_server_name"),
     "TRUENAS_TIMEOUT": ("truenas", "timeout_seconds"),
     "TRUENAS_ENCLOSURE_FILTER": ("truenas", "enclosure_filter"),
     "SSH_ENABLED": ("ssh", "enabled"),
@@ -193,6 +330,10 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_COMMANDS_JSON": ("ssh", "commands"),
     "HISTORY_BACKEND_URL": ("history", "service_url"),
     "HISTORY_BACKEND_TIMEOUT": ("history", "timeout_seconds"),
+    "ADMIN_SERVICE_URL": ("admin", "service_url"),
+    "ADMIN_PUBLIC_URL": ("admin", "public_url"),
+    "ADMIN_PORT": ("admin", "port"),
+    "ADMIN_TIMEOUT_SECONDS": ("admin", "timeout_seconds"),
     "SYSTEM_DEFAULT_ID": ("default_system_id",),
     "LAYOUT_SLOT_COUNT": ("layout", "slot_count"),
     "LAYOUT_ROWS": ("layout", "rows"),
@@ -286,6 +427,39 @@ def normalize_text(value: str | None) -> str | None:
     return normalized or None
 
 
+def _normalize_storage_view_id(value: str | None, fallback_index: int) -> str:
+    text = normalize_text(value)
+    if not text:
+        return f"storage-view-{fallback_index}"
+    normalized = re.sub(r"[^a-zA-Z0-9_-]+", "-", text.strip()).strip("-_").lower()
+    return normalized or f"storage-view-{fallback_index}"
+
+
+def _normalize_storage_views(storage_views: list[StorageViewConfig] | None) -> list[StorageViewConfig]:
+    normalized_views: list[StorageViewConfig] = []
+    seen_ids: set[str] = set()
+    for index, storage_view in enumerate(storage_views or [], start=1):
+        storage_view_id = _normalize_storage_view_id(storage_view.id, index)
+        if storage_view_id in seen_ids:
+            suffix = 2
+            while f"{storage_view_id}-{suffix}" in seen_ids:
+                suffix += 1
+            storage_view_id = f"{storage_view_id}-{suffix}"
+        seen_ids.add(storage_view_id)
+        normalized_views.append(
+            storage_view.model_copy(
+                update={
+                    "id": storage_view_id,
+                    "label": normalize_text(storage_view.label) or storage_view_id.replace("-", " ").title(),
+                    "template_id": normalize_text(storage_view.template_id) or "manual-4",
+                    "profile_id": normalize_text(storage_view.profile_id),
+                    "order": storage_view.order if isinstance(storage_view.order, int) else index * 10,
+                }
+            )
+        )
+    return sorted(normalized_views, key=lambda view: (view.order, view.label.lower(), view.id))
+
+
 def _normalize_systems(settings: Settings) -> Settings:
     systems = list(settings.systems)
     if not systems:
@@ -331,6 +505,7 @@ def _normalize_systems(settings: Settings) -> Settings:
                         for key, value in (system.enclosure_profiles or {}).items()
                         if normalize_text(str(key)) and normalize_text(str(value))
                     },
+                    "storage_views": _normalize_storage_views(system.storage_views),
                 }
             )
         )

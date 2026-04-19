@@ -7,6 +7,7 @@ __pycache__/
 config/config.yaml
 config/ssh/*
 !config/ssh/.gitkeep
+config/tls/*
 data/slot_mappings.json
 data/slot_detail_cache.json
 data/perf/*
@@ -17,7 +18,7 @@ history/*
 history/backups/*
 !history/.gitkeep
 !history/backups/.gitkeep
-logs/*.log
+logs/*.log*
 node_modules/
 playwright-report/
 test-results/

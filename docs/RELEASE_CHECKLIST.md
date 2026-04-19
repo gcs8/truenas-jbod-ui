@@ -29,6 +29,11 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   - `docker compose up -d --build`
 - confirm the app is healthy:
   - `curl http://localhost:8080/healthz`
+- validate the optional-sidecar runtime modes:
+  - stop `enclosure-admin` and `enclosure-history`, then confirm
+    `enclosure-ui` still works as a standalone deployment
+  - bring `enclosure-history` back while keeping `enclosure-admin` stopped, and
+    confirm the UI still works normally with history-enhanced paths available
 - sanity-check the validated platform views in the live UI:
   - CORE
   - SCALE
@@ -47,15 +52,26 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - if the release changes operator-facing workflows beyond the README overview,
   capture and stage manual screenshots in `docs/images/screenshots/` before the
   tag is cut
-- for `0.9.0`, capture at least:
-  - history drawer open on a populated slot with temperature plus read/write
-    history visible
-  - export snapshot dialog with live size estimate visible
-  - offline snapshot HTML opened locally with the frozen banner visible
+- for `0.10.0`, capture at least:
+  - admin sidecar system-setup view showing the profile catalog and grouped
+    `Add Storage View` picker
+  - main UI selector showing `Live Enclosures`, `Saved Chassis Views`, and
+    `Virtual Storage Views`
+  - if the validated host intentionally has no saved chassis view configured
+    by default, note that the runtime selector may only show the live and
+    virtual groups while the admin add picker still carries the saved chassis
+    layout catalog
+  - storage-view history open on a populated internal view such as the NVMe
+    carrier or `Boot SATADOMs`
+  - the separate CORE `Front 24 Bay` live enclosure on `archive-core`
+  - export snapshot dialog with live size estimate visible if that workflow is
+    still featured in the README/wiki
 - use release-style filenames for those manual captures, for example:
-  - `history-drawer-v0.9.0.png`
-  - `snapshot-export-dialog-v0.9.0.png`
-  - `offline-snapshot-v0.9.0.png`
+  - `admin-setup-v0.10.0.png`
+  - `live-vs-storage-views-v0.10.0.png`
+  - `storage-view-history-v0.10.0.png`
+  - `archive-core-front-24-v0.10.0.png`
+  - `snapshot-export-dialog-v0.10.0.png`
 - decide whether each new screenshot is:
   - README-facing and should replace or extend repo image references
   - wiki-facing only and should still be staged in-repo before wiki publish
@@ -67,7 +83,7 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - bump `app/__init__.py` to the release version
 - add the release section to `CHANGELOG.md`
 - refresh any checked-in draft release-notes file if the repo is using one
-- refresh `docs/RELEASE_NOTES_0.9.0.md`
+- refresh `docs/RELEASE_NOTES_0.10.0.md`
 - review `README.md` for stale version or milestone wording
 - review `docs/ROADMAP.md` for stale "current direction" text
 - review profile/config docs for dead or outdated comments
@@ -89,7 +105,7 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   - do release work on a `codex/` branch first
   - push that branch as a safety checkpoint before the cut
   - when satisfied, switch to `main` and merge locally with a release commit
-    such as `Release v0.9.0`
+    such as `Release v0.10.0`
   - tag the merged `main` commit, not the side branch tip
 - this repo does not require a PR to cut a release unless we explicitly decide
   to use one for review

@@ -1,0 +1,689 @@
+{% extends "base.html" %}
+{% block title %}System Setup And Recovery{% endblock %}
+{% block body %}
+<div class="admin-shell">
+  <header class="hero panel">
+    <div class="hero-copy">
+      <p class="eyebrow">Optional Maintenance Sidecar</p>
+      <h1>System Setup And Recovery</h1>
+      <p class="hero-summary">
+        Keep the main enclosure UI read-mostly. This sidecar handles full backup/import,
+        guided system setup, SSH key prep, profile previewing, and runtime stop/start work
+        when you want a cleaner maintenance window.
+      </p>
+      <div class="hero-actions">
+        <button id="refresh-state-button" class="button secondary" type="button">Refresh State</button>
+        <a id="admin-origin-link" class="button ghost" href="#" target="_blank" rel="noopener">Open Another Admin Tab</a>
+      </div>
+    </div>
+    <div class="hero-meta">
+      <div class="hero-stat">
+        <span class="hero-stat-label">Session Countdown</span>
+        <span id="admin-countdown" class="hero-stat-value">Calculating...</span>
+      </div>
+      <div class="hero-stat">
+        <span class="hero-stat-label">Started</span>
+        <span id="admin-started-at" class="hero-stat-value">-</span>
+      </div>
+      <div class="hero-stat">
+        <span class="hero-stat-label">Expires</span>
+        <span id="admin-expires-at" class="hero-stat-value">-</span>
+      </div>
+      <div class="hero-stat">
+        <span class="hero-stat-label">Configured Systems</span>
+        <span id="admin-system-count" class="hero-stat-value">0</span>
+      </div>
+      <div class="hero-stat">
+        <span class="hero-stat-label">Profile Catalog</span>
+        <span id="admin-profile-count" class="hero-stat-value">0</span>
+      </div>
+    </div>
+  </header>
+
+  <div id="admin-status-banner" class="status-banner" role="status" aria-live="polite">
+    Admin sidecar ready.
+  </div>
+
+  <main class="admin-layout">
+    <section class="panel runtime-panel">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Runtime Control</p>
+          <h2>Containers</h2>
+          <p class="panel-copy">
+            Stop the read UI or history sidecar here before a maintenance action, or let the
+            backup actions below do it automatically for a cleaner snapshot.
+          </p>
+        </div>
+      </div>
+      <p id="runtime-detail" class="subtle"></p>
+      <div id="runtime-cards" class="runtime-cards"></div>
+    </section>
+
+    <section class="panel backup-panel">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Full Backup Bundle</p>
+          <h2>Export And Import</h2>
+          <p class="panel-copy">
+            Packages the config file, profile overrides, mapping/cache JSON, and the history
+            SQLite database into one portable archive. Encrypted exports switch to a standard
+            <code>.7z</code> container so common tools can open them too.
+          </p>
+        </div>
+      </div>
+
+      <div class="backup-layout">
+        <div class="backup-column">
+          <h3>Included Paths</h3>
+          <ul id="backup-path-list" class="path-list"></ul>
+
+          <div class="form-grid compact-grid">
+            <label class="field">
+              <span>Bundle Format</span>
+              <select id="backup-packaging">
+                <option value="tar.zst">tar.zst / ZSTD-9 (Recommended)</option>
+                <option value="zip">.zip / Deflate</option>
+                <option value="tar.gz">.tar.gz / Gzip-9</option>
+                <option value="7z">.7z / 7-Zip</option>
+              </select>
+            </label>
+            <label class="toggle field-span">
+              <input id="backup-encrypt-toggle" type="checkbox">
+              <span>Encrypt exported archive with a passphrase</span>
+            </label>
+            <label class="field field-span">
+              <span>Export Passphrase</span>
+              <input id="backup-export-passphrase" type="password" placeholder="Required when export encryption is enabled">
+            </label>
+            <p class="subtle action-note field-span">Passphrases are used exactly as entered, including spaces in the middle or trailing padding. When encryption is on, export locks to a portable <code>.7z</code> bundle.</p>
+          </div>
+
+          <div class="toggle-group">
+            <label class="toggle">
+              <input id="backup-export-stop-toggle" type="checkbox">
+              <span>Stop read UI and history before export</span>
+            </label>
+            <label class="toggle">
+              <input id="backup-export-restart-toggle" type="checkbox" checked>
+              <span>Restart anything stopped after export</span>
+            </label>
+          </div>
+
+          <div class="button-row">
+            <button id="backup-export-button" class="button" type="button">Export Full Backup</button>
+          </div>
+          <p id="backup-export-result" class="subtle action-note">
+            Exports can stay live, or you can pause the read surfaces first for a cleaner point-in-time bundle.
+          </p>
+        </div>
+
+        <div class="backup-column">
+          <h3>Restore Bundle</h3>
+          <div class="import-picker">
+            <input id="backup-import-file" type="file" accept=".7z,.zip,.gz,.zst,application/x-7z-compressed,application/zip,application/gzip,application/zstd,application/octet-stream" class="hidden">
+            <button id="backup-import-pick-button" class="button secondary" type="button">Choose Backup File</button>
+            <span id="backup-import-file-label" class="file-label">No file selected</span>
+          </div>
+
+          <div class="form-grid compact-grid">
+            <label class="field field-span">
+              <span>Import Passphrase</span>
+              <input id="backup-import-passphrase" type="password" placeholder="Only needed for encrypted bundles">
+            </label>
+            <p class="subtle action-note field-span">Trailing spaces are preserved on import too, so padded passphrases round-trip cleanly.</p>
+          </div>
+
+          <div class="toggle-group">
+            <label class="toggle">
+              <input id="backup-import-stop-toggle" type="checkbox" checked>
+              <span>Stop read UI and history before import</span>
+            </label>
+            <label class="toggle">
+              <input id="backup-import-restart-toggle" type="checkbox" checked>
+              <span>Restart anything stopped after import</span>
+            </label>
+          </div>
+
+          <div class="button-row">
+            <button id="backup-import-button" class="button danger" type="button">Import Full Backup</button>
+          </div>
+          <p id="backup-import-result" class="subtle action-note">
+            Import replaces the mounted config/data/history state with the contents of the selected bundle.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel setup-panel">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Guided Walkthrough</p>
+          <h2>Create Or Revise A System</h2>
+          <p class="panel-copy">
+            Start fresh for a new host or load an existing saved system into the form, preview the
+            profile you are about to pin, and prep or reuse an SSH key before saving back into the
+            shared config.
+          </p>
+        </div>
+      </div>
+
+      <div class="setup-layout">
+        <div class="setup-form-column">
+          <section class="setup-step">
+            <div class="setup-step-header">
+              <span class="step-index">1</span>
+              <div>
+                <h3>Basics</h3>
+                <p class="subtle">Name the system, pick a platform, and decide whether to pin a default enclosure profile.</p>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label class="field">
+                <span>System Label</span>
+                <input id="setup-system-label" type="text" placeholder="Archive CORE">
+              </label>
+              <label class="field">
+                <span>System ID</span>
+                <input id="setup-system-id" type="text" placeholder="Optional, derived from label if blank">
+              </label>
+              <label class="field">
+                <span>Platform</span>
+                <select id="setup-platform">
+                  <option value="core">TrueNAS CORE</option>
+                  <option value="scale">TrueNAS SCALE</option>
+                  <option value="linux">Generic Linux</option>
+                  <option value="quantastor">Quantastor</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Default Profile</span>
+                <select id="setup-profile">
+                  <option value="">Auto-select from platform</option>
+                </select>
+              </label>
+            </div>
+            <label class="toggle">
+              <input id="setup-make-default" type="checkbox">
+              <span>Make this the default selected system</span>
+            </label>
+            <p id="setup-platform-help" class="subtle"></p>
+          </section>
+
+          <section class="setup-step">
+            <div class="setup-step-header">
+              <span class="step-index">2</span>
+              <div>
+                <h3>API And Scope</h3>
+                <p class="subtle">Point the new system at the right host and auth path before you decide how much SSH enrichment to add.</p>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label class="field field-span">
+                <span>Host</span>
+                <input id="setup-truenas-host" type="text" placeholder="https://truenas.example.local">
+              </label>
+              <label class="toggle">
+                <input id="setup-verify-ssl" type="checkbox" checked>
+                <span>Verify against trusted TLS cert store</span>
+              </label>
+              <p id="setup-verify-ssl-help" class="subtle action-note field-span">
+                Uses normal CA and hostname validation from the sidecar trust store. This works with public CAs and private CAs you install into the container, but it does not do certificate-thumbprint pinning yet.
+              </p>
+              <label class="field field-span">
+                <span>Custom TLS Trust Bundle Path</span>
+                <input id="setup-tls-ca-bundle-path" type="text" placeholder="Optional PEM bundle path, for example /app/config/tls/archive-core.pem">
+              </label>
+              <label class="field field-span">
+                <span>TLS Verify Hostname</span>
+                <input id="setup-tls-server-name" type="text" placeholder="Optional cert DNS name, for example truenas.example.local">
+              </label>
+              <p id="setup-tls-server-name-help" class="subtle action-note field-span">
+                Use this when you connect to an IP or alternate address, but the certificate is issued to a DNS name.
+              </p>
+              <div id="setup-tls-server-name-suggestions" class="tls-server-name-suggestions field-span"></div>
+              <label class="field">
+                <span>Enclosure Filter</span>
+                <input id="setup-enclosure-filter" type="text" placeholder="Optional substring match">
+              </label>
+              <label class="field">
+                <span>API Key</span>
+                <input id="setup-api-key" type="password" placeholder="CORE/SCALE usually use this">
+              </label>
+              <label class="field">
+                <span>API User</span>
+                <input id="setup-api-user" type="text" placeholder="Quantastor usually uses this">
+              </label>
+              <label class="field">
+                <span>API Password</span>
+                <input id="setup-api-password" type="password" placeholder="Optional unless the platform needs it">
+              </label>
+            </div>
+            <div class="key-mode-panel">
+              <div class="setup-step-header">
+                <span class="badge">TLS</span>
+                <div>
+                  <h3>Certificate Trust Tools</h3>
+                  <p class="subtle">
+                    Inspect the remote HTTPS certificate first so you can compare fingerprints out of band,
+                    then save the presented remote certificate material for future verified connections, or import a private CA bundle for future validated connections.
+                  </p>
+                </div>
+              </div>
+              <div class="button-row">
+                <button id="setup-inspect-tls-button" class="button secondary small" type="button">Inspect Remote TLS Cert</button>
+                <button id="setup-trust-remote-tls-button" class="button secondary small" type="button">Save Remote Cert For Verification</button>
+              </div>
+              <div class="tls-trust-summary">
+                <span class="subtle">Saved Remote Cert</span>
+                <span id="setup-tls-trust-pill" class="tls-trust-pill is-untrusted">Untrusted</span>
+              </div>
+              <p id="setup-tls-trust-detail" class="subtle action-note">
+                No saved TLS certificate bundle has been validated for this host yet.
+              </p>
+              <div id="setup-tls-inspection-meta" class="profile-preview-meta"></div>
+              <p id="setup-tls-inspection-result" class="subtle action-note">
+                This fetches the presented leaf certificate, and the full chain when the runtime exposes it, without trusting anything first so you can review SHA-256 and SHA-1 fingerprints before importing.
+              </p>
+              <div class="tls-cert-grid">
+                <div class="tls-cert-card">
+                  <h4>Presented Leaf Certificate</h4>
+                  <div id="setup-tls-leaf-details" class="tls-detail-list subtle">
+                    No certificate inspected yet.
+                  </div>
+                </div>
+                <div class="tls-cert-card">
+                  <h4>Import Private CA / PEM Bundle</h4>
+                  <div class="import-picker">
+                    <input id="setup-tls-ca-file" type="file" accept=".pem,.crt,.cer,text/plain" class="hidden">
+                    <button id="setup-tls-ca-pick-button" class="button secondary small" type="button">Choose PEM File</button>
+                    <span id="setup-tls-ca-file-label" class="file-label">No file selected</span>
+                  </div>
+                  <div class="button-row">
+                    <button id="setup-tls-import-ca-button" class="button secondary small" type="button">Import PEM Into Trust Store</button>
+                  </div>
+                  <p id="setup-tls-import-result" class="subtle action-note">
+                    Import a PEM CA or certificate chain here when your TrueNAS or Quantastor host uses a private CA.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="setup-step">
+            <div class="setup-step-header">
+              <span class="step-index">3</span>
+              <div>
+                <h3>SSH Enrichment</h3>
+                <p class="subtle">Reuse an existing key pair, generate a fresh Ed25519 pair, or point at a manual runtime path.</p>
+              </div>
+            </div>
+
+            <label class="toggle">
+              <input id="setup-ssh-enabled" type="checkbox">
+              <span>Enable SSH enrichment for this system</span>
+            </label>
+
+            <div class="form-grid">
+              <label class="field">
+                <span>SSH Host</span>
+                <input id="setup-ssh-host" data-ssh-field type="text" placeholder="Defaults to the same host">
+              </label>
+              <label class="field">
+                <span>SSH User</span>
+                <input id="setup-ssh-user" data-ssh-field type="text" placeholder="jbodmap">
+              </label>
+              <label class="field">
+                <span>SSH Port</span>
+                <input id="setup-ssh-port" data-ssh-field type="number" min="1" max="65535" value="22">
+              </label>
+              <label class="field">
+                <span>SSH Key Source</span>
+                <select id="setup-ssh-key-mode" data-ssh-field>
+                  <option value="reuse">Reuse Existing Key Pair</option>
+                  <option value="generate">Generate New Ed25519 Key Pair</option>
+                  <option value="manual">Manual Path</option>
+                </select>
+              </label>
+              <label class="field field-span">
+                <span>SSH Key Path</span>
+                <input id="setup-ssh-key-path" data-ssh-field type="text" value="/run/ssh/id_truenas">
+              </label>
+              <label class="field">
+                <span>Saved SSH Password</span>
+                <input id="setup-ssh-password" data-ssh-field type="password" placeholder="Persist only if the final service account still uses password auth">
+              </label>
+              <label class="field">
+                <span>Saved SSH Sudo Password</span>
+                <input id="setup-ssh-sudo-password" data-ssh-field type="password" placeholder="Persist only if the final service account needs a sudo password">
+              </label>
+              <label class="field">
+                <span>Known Hosts Path</span>
+                <input id="setup-ssh-known-hosts" data-ssh-field type="text" value="/app/data/known_hosts">
+              </label>
+              <label class="toggle">
+                <input id="setup-ssh-strict-host-key" data-ssh-field type="checkbox" checked>
+                <span>Strict host key checking</span>
+              </label>
+            </div>
+
+            <div class="key-manager">
+              <div id="setup-reuse-key-panel" class="key-mode-panel">
+                <div class="inline-grid">
+                  <label class="field">
+                    <span>Existing SSH Key Pair</span>
+                    <select id="setup-ssh-existing-key" data-ssh-field></select>
+                  </label>
+                  <button id="setup-refresh-keys-button" class="button secondary small" data-ssh-field type="button">Refresh Key List</button>
+                </div>
+              </div>
+
+              <div id="setup-generate-key-panel" class="key-mode-panel hidden">
+                <div class="inline-grid">
+                  <label class="field">
+                    <span>New Key Name</span>
+                    <input id="setup-generate-key-name" data-ssh-field type="text" placeholder="id_truenas_offsite">
+                  </label>
+                  <button id="setup-generate-key-button" class="button secondary small" data-ssh-field type="button">Generate Ed25519 Key Pair</button>
+                </div>
+              </div>
+
+              <div id="setup-manual-key-panel" class="key-mode-panel hidden">
+                <p class="subtle">
+                  Manual mode leaves the runtime path editable, which is useful when your private key is mounted from somewhere outside <code>config/ssh</code>.
+                </p>
+              </div>
+            </div>
+
+            <p id="setup-ssh-key-help" class="subtle action-note"></p>
+
+            <div class="key-mode-panel">
+              <div class="setup-step-header">
+                <span class="badge">Optional</span>
+                <div>
+                  <h3>One-Time Bootstrap</h3>
+                  <p class="subtle">
+                    Use temporary root or installer credentials once to create the final service account,
+                    install the selected public key, and optionally write limited sudo rules.
+                  </p>
+                </div>
+              </div>
+              <label class="toggle bootstrap-toggle">
+                <input id="setup-bootstrap-enabled" data-ssh-field type="checkbox">
+                <span>Enable one-time bootstrap for this edit session</span>
+              </label>
+              <div id="setup-bootstrap-fields">
+              <div class="form-grid">
+                <label class="field">
+                  <span>Bootstrap Host</span>
+                  <input id="setup-bootstrap-host" data-ssh-field data-bootstrap-field type="text" placeholder="Defaults to the SSH host above">
+                </label>
+                <label class="field">
+                  <span>Bootstrap Login User</span>
+                  <input id="setup-bootstrap-user" data-ssh-field data-bootstrap-field type="text" value="root" placeholder="root or a sudo-capable installer user">
+                </label>
+                <label class="field">
+                  <span>Bootstrap Password</span>
+                  <input id="setup-bootstrap-password" data-ssh-field data-bootstrap-field type="password" placeholder="One-time only">
+                </label>
+                <label class="field">
+                  <span>Bootstrap Key Path</span>
+                  <input id="setup-bootstrap-key-path" data-ssh-field data-bootstrap-field type="text" placeholder="Optional instead of a password, for example /run/ssh/id_installer">
+                </label>
+                <label class="field">
+                  <span>Bootstrap Sudo Password</span>
+                  <input id="setup-bootstrap-sudo-password" data-ssh-field data-bootstrap-field type="password" placeholder="Only if the bootstrap user needs sudo">
+                </label>
+                <label class="toggle">
+                  <input id="setup-bootstrap-install-sudo" data-ssh-field data-bootstrap-field type="checkbox" checked>
+                  <span>Install command-limited sudo rules for the final service account</span>
+                </label>
+              </div>
+              <p class="subtle action-note">
+                These bootstrap credentials are used for this action only. They are never written into <code>config.yaml</code>.
+                Leave the saved SSH password fields above blank if you want the final service account to stay key-only.
+              </p>
+              <div class="button-row">
+                <button id="setup-bootstrap-button" class="button secondary" data-ssh-field data-bootstrap-field type="button">Bootstrap Service Account</button>
+              </div>
+              <p id="setup-bootstrap-result" class="subtle action-note">
+                Bootstrap is off by default for saved systems. Enable it only when you intend to run one-time service-account setup.
+              </p>
+              <div class="sudoers-preview-panel">
+                <div class="preview-card-header">
+                  <h4>Proposed Sudoers File</h4>
+                  <span id="setup-bootstrap-sudoers-name" class="badge">truenas-jbod-ui-jbodmap</span>
+                </div>
+                <p id="setup-bootstrap-sudoers-detail" class="subtle action-note">
+                  This is the exact command-limited sudoers content bootstrap would write for the final service account.
+                </p>
+                <pre id="setup-bootstrap-sudoers-preview" class="sudoers-preview"># Building sudoers preview...</pre>
+              </div>
+              </div>
+            </div>
+
+            <label class="field">
+              <span>SSH Runtime Commands</span>
+              <textarea id="setup-ssh-commands" data-ssh-field rows="7" placeholder="One command per line"></textarea>
+            </label>
+            <p class="subtle action-note">
+              These are the exact SSH commands the app runs. When you use the one-time bootstrap, any
+              <code>sudo -n ...</code> lines here are also converted into <code>NOPASSWD</code> sudo rules
+              for the final service account, with the platform's on-demand smartctl and LED-control
+              extras kept in place.
+            </p>
+            <div class="button-row">
+              <button id="setup-load-recommended-button" class="button secondary small" data-ssh-field type="button">Load Recommended Runtime Commands</button>
+            </div>
+          </section>
+
+          <section class="setup-step">
+            <div class="setup-step-header">
+              <span class="step-index">4</span>
+              <div>
+                <h3>Storage Views</h3>
+                <p class="subtle">
+                  Live discovered enclosures auto-populate in the main UI. Add storage views here only
+                  when you want a saved chassis layout or a virtual internal group on this same host.
+                </p>
+              </div>
+            </div>
+            <div class="inline-grid">
+              <label class="field">
+                <span>Add Layout Or Template</span>
+                <select id="setup-storage-view-template"></select>
+              </label>
+              <button id="setup-storage-view-add-button" class="button secondary small" type="button">Add Storage View</button>
+            </div>
+            <p id="setup-storage-view-help" class="subtle action-note">
+              Storage views stay attached to one system, so internal carrier cards and boot media do not need to become separate systems. Live SES enclosures still show up on their own later, and a saved chassis view is only needed when you want a curated layout for that hardware.
+            </p>
+            <div class="storage-view-layout">
+              <div class="storage-view-list-panel">
+                <div class="preview-card-header">
+                  <h4>Configured Views</h4>
+                  <span id="setup-storage-view-count" class="badge">0 views</span>
+                </div>
+                <div id="setup-storage-view-list" class="storage-view-list"></div>
+              </div>
+              <div class="storage-view-editor-panel">
+                <div class="preview-card-header">
+                  <h4>Selected View</h4>
+                  <span id="setup-storage-view-template-badge" class="badge">No view selected</span>
+                </div>
+                <p id="setup-storage-view-empty" class="subtle action-note">
+                  Add a saved chassis view or virtual internal group for this host when the live discovered enclosure alone is not enough.
+                </p>
+                <div id="setup-storage-view-editor" class="hidden">
+                  <div class="form-grid">
+                    <label class="field">
+                      <span>View Label</span>
+                      <input id="setup-storage-view-label" type="text" placeholder="Front Bays">
+                    </label>
+                    <label class="field">
+                      <span>View ID</span>
+                      <input id="setup-storage-view-id" type="text" placeholder="front-bays">
+                    </label>
+                    <label class="field">
+                      <span>Template</span>
+                      <select id="setup-storage-view-template-select"></select>
+                    </label>
+                    <label class="field">
+                      <span>Saved Chassis Layout</span>
+                      <select id="setup-storage-view-profile"></select>
+                    </label>
+                    <label class="field">
+                      <span>Binding Mode</span>
+                      <select id="setup-storage-view-binding-mode">
+                        <option value="auto">Auto</option>
+                        <option value="pool">Pool</option>
+                        <option value="serial">Serial</option>
+                        <option value="hybrid">Hybrid</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>Display Order</span>
+                      <input id="setup-storage-view-order" type="number" min="0" step="10" value="10">
+                    </label>
+                    <label class="toggle">
+                      <input id="setup-storage-view-enabled" type="checkbox" checked>
+                      <span>Enable this storage view</span>
+                    </label>
+                    <label class="toggle">
+                      <input id="setup-storage-view-show-main" type="checkbox" checked>
+                      <span>Show in main read UI later</span>
+                    </label>
+                    <label class="toggle">
+                      <input id="setup-storage-view-show-admin" type="checkbox" checked>
+                      <span>Show in admin UI</span>
+                    </label>
+                    <label class="toggle">
+                      <input id="setup-storage-view-collapsed" type="checkbox">
+                      <span>Start collapsed by default</span>
+                    </label>
+                    <label class="field field-span">
+                      <span>Enclosure IDs</span>
+                      <textarea id="setup-storage-view-enclosure-ids" rows="2" placeholder="One per line or comma separated"></textarea>
+                    </label>
+                    <label class="field field-span">
+                      <span>Pool Names</span>
+                      <textarea id="setup-storage-view-pool-names" rows="2" placeholder="One per line or comma separated"></textarea>
+                    </label>
+                    <label class="field field-span">
+                      <span>Disk Serials</span>
+                      <textarea id="setup-storage-view-serials" rows="2" placeholder="Optional explicit members"></textarea>
+                    </label>
+                    <label class="field field-span">
+                      <span>PCIe Addresses</span>
+                      <textarea id="setup-storage-view-pcie-addresses" rows="2" placeholder="Optional NVMe or carrier hints"></textarea>
+                    </label>
+                    <label class="field field-span">
+                      <span>Device Names</span>
+                      <textarea id="setup-storage-view-device-names" rows="2" placeholder="Fallback only, for example nvme0n1"></textarea>
+                    </label>
+                    <label class="field field-span">
+                      <span>Slot Label Overrides</span>
+                      <textarea id="setup-storage-view-slot-labels" rows="3" placeholder="0=M2-1&#10;1=M2-2"></textarea>
+                    </label>
+                    <label class="field field-span">
+                      <span>M.2 Size Overrides</span>
+                      <textarea id="setup-storage-view-slot-sizes" rows="3" placeholder="0=2280&#10;1=22110"></textarea>
+                    </label>
+                  </div>
+                  <div class="storage-view-candidate-panel">
+                    <div class="preview-card-header">
+                      <h4>Unmapped Inventory Candidates</h4>
+                      <div class="button-row compact-button-row">
+                        <button id="setup-storage-view-candidates-refresh-button" class="button secondary small" type="button">Refresh Candidates</button>
+                        <button id="setup-storage-view-candidates-add-all-button" class="button secondary small" type="button">Add All To View</button>
+                      </div>
+                    </div>
+                    <p id="setup-storage-view-candidates-help" class="subtle action-note">
+                      Load a saved system first, then pull in live disks that are not already sitting in mapped slots. These candidate shortcuts mainly help virtual internal views; live SES enclosures already auto-populate separately.
+                    </p>
+                    <div id="setup-storage-view-candidates-list" class="storage-view-candidate-list"></div>
+                  </div>
+                  <div class="button-row">
+                    <button id="setup-storage-view-move-up-button" class="button secondary small" type="button">Move Up</button>
+                    <button id="setup-storage-view-move-down-button" class="button secondary small" type="button">Move Down</button>
+                    <button id="setup-storage-view-duplicate-button" class="button secondary small" type="button">Duplicate</button>
+                    <button id="setup-storage-view-remove-button" class="button danger small" type="button">Remove</button>
+                  </div>
+                  <p id="setup-storage-view-editor-help" class="subtle action-note">
+                    The template defines the physical shape. Live discovered enclosures still auto-populate separately, while saved views here control curated chassis layouts and virtual groupings.
+                  </p>
+                  <div class="storage-view-preview-card">
+                    <div class="preview-card-header">
+                      <h4>Storage View Preview</h4>
+                      <span id="setup-storage-view-kind-badge" class="badge">manual</span>
+                    </div>
+                    <p id="setup-storage-view-preview-summary" class="subtle">
+                      This preview shows the template shape and any slot-label overrides saved with the view.
+                    </p>
+                    <div id="setup-storage-view-preview-grid" class="profile-preview-grid storage-view-preview-grid" aria-label="Selected storage view preview"></div>
+                    <div id="setup-storage-view-preview-meta" class="profile-preview-meta"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <div class="button-row">
+            <button id="setup-create-button" class="button" type="button">Create System Entry</button>
+          </div>
+          <p id="setup-result" class="subtle action-note">
+            Saving here updates the mounted config file; restart the read UI after a new system is added so it picks the new list up cleanly.
+          </p>
+        </div>
+
+        <aside class="setup-preview-column">
+          <section class="preview-card">
+            <div class="preview-card-header">
+              <h3>Profile Preview</h3>
+              <span id="profile-preview-badge" class="badge">Preview</span>
+            </div>
+            <p id="profile-preview-summary" class="subtle">
+              Pick a profile to pin a known chassis layout, or leave it on auto-select if you only want the platform defaults. Live discovered enclosures still surface on their own either way.
+            </p>
+            <div id="profile-preview-grid" class="profile-preview-grid" aria-label="Selected enclosure profile preview"></div>
+            <div id="profile-preview-meta" class="profile-preview-meta"></div>
+          </section>
+
+          <section class="preview-card">
+            <div class="preview-card-header">
+              <h3>Profile Catalog</h3>
+              <span id="profile-catalog-count" class="badge">0 profiles</span>
+            </div>
+            <div id="profile-catalog" class="profile-catalog"></div>
+          </section>
+
+          <section class="preview-card">
+            <div class="preview-card-header">
+              <h3>Existing Systems</h3>
+              <span id="current-default-system" class="badge">Default pending</span>
+            </div>
+            <p class="subtle">
+              Load one saved system into the form to revise it. Saving with the same system id updates that entry in place, and changing the id lets you clone it into a new one.
+            </p>
+            <div class="inline-grid">
+              <label class="field">
+                <span>Saved System</span>
+                <select id="existing-system-select"></select>
+              </label>
+              <button id="existing-system-load-button" class="button secondary small" type="button">Load Into Form</button>
+              <button id="existing-system-reset-button" class="button secondary small" type="button">Start Fresh</button>
+            </div>
+            <p id="existing-system-help" class="subtle action-note"></p>
+            <div id="existing-system-summary" class="profile-preview-meta"></div>
+            <div id="current-systems-list" class="pill-list"></div>
+          </section>
+        </aside>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+  window.ADMIN_BOOTSTRAP = {{ admin_bootstrap_json | safe }};
+</script>
+{% endblock %}

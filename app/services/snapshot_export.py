@@ -639,8 +639,16 @@ class SnapshotExportService:
             context = {
                 "request": request,
                 "snapshot": snapshot_for_export,
+                "storage_view_runtime": {"system_id": snapshot_for_export.selected_system_id, "system_label": snapshot_for_export.selected_system_label, "views": []},
                 "settings": self.settings,
                 "initial_snapshot_json": json.dumps(snapshot_for_export.model_dump(mode="json")),
+                "initial_storage_view_runtime_json": json.dumps(
+                    {
+                        "system_id": snapshot_for_export.selected_system_id,
+                        "system_label": snapshot_for_export.selected_system_label,
+                        "views": [],
+                    }
+                ),
                 "history_configured": history_available,
                 "snapshot_mode": True,
                 "snapshot_export_meta": export_meta,

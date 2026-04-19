@@ -16,6 +16,7 @@ Configuration
 
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 - [[Profiles and Custom Layouts|Profiles-and-Custom-Layouts]]
+- [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
 - [[Advanced Configuration|Advanced-Configuration]]
 
 Maintainers

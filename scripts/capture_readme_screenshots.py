@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 from urllib.parse import urlencode
@@ -15,7 +16,7 @@ from app import __version__
 
 BASE_URL = "http://localhost:8080/"
 IMAGES_DIR = ROOT / "docs" / "images" / "screenshots"
-VERSION_TAG = f"v{__version__}"
+SCREENSHOT_TAG = os.environ.get("SCREENSHOT_TAG", f"v{__version__}")
 
 CORE_PARAMS = {
     "system_id": "archive-core",
@@ -95,42 +96,42 @@ def capture_core(page: Page) -> None:
     open_and_select_slot(page, CORE_PARAMS, 21)
     for label in ("Read Cache", "Transport", "Link Rate"):
         wait_for_kv_value(page, label)
-    capture_app_shell(page, f"core-overview-{VERSION_TAG}.png")
+    capture_app_shell(page, f"core-overview-{SCREENSHOT_TAG}.png")
 
 
 def capture_scale(page: Page) -> None:
     open_and_select_slot(page, SCALE_PARAMS, 0)
     for label in ("Temp", "Read Cache", "Transport", "Link Rate"):
         wait_for_kv_value(page, label)
-    capture_app_shell(page, f"scale-overview-{VERSION_TAG}.png")
+    capture_app_shell(page, f"scale-overview-{SCREENSHOT_TAG}.png")
 
 
 def capture_gpu_server(page: Page) -> None:
     open_and_select_slot(page, GPU_PARAMS, 0)
     for label in ("Array", "Transport", "Endurance"):
         wait_for_kv_value(page, label)
-    capture_app_shell(page, f"gpu-server-overview-{VERSION_TAG}.png")
+    capture_app_shell(page, f"gpu-server-overview-{SCREENSHOT_TAG}.png")
 
 
 def capture_unvr(page: Page) -> None:
     open_and_select_slot(page, UNVR_PARAMS, 0)
     for label in ("Mount", "Array", "Transport"):
         wait_for_kv_value(page, label)
-    capture_app_shell(page, f"unvr-overview-{VERSION_TAG}.png")
+    capture_app_shell(page, f"unvr-overview-{SCREENSHOT_TAG}.png")
 
 
 def capture_unvr_pro(page: Page) -> None:
     open_and_select_slot(page, UNVR_PRO_PARAMS, 0)
     for label in ("Mount", "Array", "Transport"):
         wait_for_kv_value(page, label)
-    capture_app_shell(page, f"unvr-pro-overview-{VERSION_TAG}.png")
+    capture_app_shell(page, f"unvr-pro-overview-{SCREENSHOT_TAG}.png")
 
 
 def capture_quantastor(page: Page) -> None:
     open_and_select_slot(page, QUANTASTOR_PARAMS, 0)
     for label in ("Presented By", "Pool Active On", "Transport"):
         wait_for_kv_value(page, label)
-    capture_app_shell(page, f"quantastor-overview-{VERSION_TAG}.png")
+    capture_app_shell(page, f"quantastor-overview-{SCREENSHOT_TAG}.png")
 
 
 def main() -> None:

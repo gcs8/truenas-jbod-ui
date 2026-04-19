@@ -248,9 +248,27 @@ class HistoryBackendClient:
         path: str,
         params: dict[str, Any],
     ) -> dict[str, Any]:
+        payload_bytes, _ = self._request_bytes_sync(path, params=params)
+        try:
+            payload = json.loads(payload_bytes)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("History backend returned invalid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("History backend returned a non-object JSON payload.")
+        return payload
+
+    def _request_bytes_sync(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        method: str = "GET",
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[bytes, dict[str, str]]:
         filtered_params = {
             key: value
-            for key, value in params.items()
+            for key, value in (params or {}).items()
             if value not in {None, ""}
         }
         query = urllib.parse.urlencode(filtered_params, doseq=True)
@@ -258,16 +276,12 @@ class HistoryBackendClient:
         if query:
             url = f"{url}?{query}"
 
-        request = urllib.request.Request(url, method="GET")
+        request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
         try:
             with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
-                payload = json.load(response)
+                return response.read(), dict(response.headers.items())
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"History backend returned HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"History backend request failed: {exc.reason}") from exc
-
-        if not isinstance(payload, dict):
-            raise RuntimeError("History backend returned a non-object JSON payload.")
-        return payload

@@ -36,28 +36,59 @@ The CORE layout groups each 15-bay row as `6 + 6 + 3` to better match the
 physical divider layout of the chassis. The SCALE layout uses chassis-specific
 front and rear grids derived from Linux SES data and operator notes.
 
+## Live Enclosures Vs Storage Views
+
+The selector can now surface three different kinds of runtime targets:
+
+- `Live Enclosure`: real hardware discovered at runtime from the API and/or SSH
+- `Saved Chassis View`: a saved overlay that mirrors a live enclosure through a
+  chosen profile or layout
+- `Virtual Storage View`: a saved internal grouping such as an NVMe carrier
+  card or SATADOM pair that does not come from SES enclosure discovery
+
+Live discovered enclosures auto-populate on their own. The admin sidecar only
+persists saved views and bindings; it does not invent new live hardware.
+
+In admin, the single `Add Storage View` flow now covers both profile-backed
+saved chassis layouts and the virtual/internal templates. Saved `ses_enclosure`
+views can pin their own profile so a generic `Front 24` or other common layout
+keeps its shape even when the currently selected live enclosure is using a
+different profile.
+
 ## Screenshots
 
 ### Archive CORE
 
-![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/screenshots/core-overview-v0.9.0.png)
+![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/screenshots/core-overview-v0.10.0.png)
 
 ### Offsite SCALE
 
-![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/screenshots/scale-overview-v0.9.0.png)
+![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/screenshots/scale-overview-v0.10.0.png)
 
 ### Additional Validated Platforms
 
-- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.9.0.png](docs/images/screenshots/gpu-server-overview-v0.9.0.png)
-- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.9.0.png](docs/images/screenshots/unvr-overview-v0.9.0.png)
-- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.9.0.png](docs/images/screenshots/unvr-pro-overview-v0.9.0.png)
-- Quantastor: [docs/images/screenshots/quantastor-overview-v0.9.0.png](docs/images/screenshots/quantastor-overview-v0.9.0.png)
+- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.10.0.png](docs/images/screenshots/gpu-server-overview-v0.10.0.png)
+- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.10.0.png](docs/images/screenshots/unvr-overview-v0.10.0.png)
+- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.10.0.png](docs/images/screenshots/unvr-pro-overview-v0.10.0.png)
+- Quantastor: [docs/images/screenshots/quantastor-overview-v0.10.0.png](docs/images/screenshots/quantastor-overview-v0.10.0.png)
 
 ### History And Snapshot Walkthroughs
 
-- Live history drawer: [docs/images/screenshots/history-drawer-v0.9.0.png](docs/images/screenshots/history-drawer-v0.9.0.png)
-- Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.9.0.png](docs/images/screenshots/snapshot-export-dialog-v0.9.0.png)
-- Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.9.0.png](docs/images/screenshots/offline-snapshot-v0.9.0.png)
+- Live history drawer: [docs/images/screenshots/history-drawer-v0.10.0.png](docs/images/screenshots/history-drawer-v0.10.0.png)
+- Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.10.0.png](docs/images/screenshots/snapshot-export-dialog-v0.10.0.png)
+- Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.10.0.png](docs/images/screenshots/offline-snapshot-v0.10.0.png)
+
+### 0.10.0 Workflow Highlights
+
+- Grouped runtime selector on `archive-core`: [docs/images/screenshots/live-vs-storage-views-v0.10.0.png](docs/images/screenshots/live-vs-storage-views-v0.10.0.png)
+- Storage-view history on `Boot SATADOMs`: [docs/images/screenshots/storage-view-history-v0.10.0.png](docs/images/screenshots/storage-view-history-v0.10.0.png)
+- Separate CORE `Front 24 Bay` live enclosure: [docs/images/screenshots/archive-core-front-24-v0.10.0.png](docs/images/screenshots/archive-core-front-24-v0.10.0.png)
+- Admin sidecar grouped `Add Storage View` flow: [docs/images/screenshots/admin-setup-v0.10.0.png](docs/images/screenshots/admin-setup-v0.10.0.png)
+
+`archive-core` currently does not ship with a saved chassis view enabled by
+default, so the runtime selector screenshot shows the live and virtual groups
+that are present today, while the admin screenshot shows the grouped saved
+chassis layout catalog that can be added when needed.
 
 ## Features
 
@@ -75,6 +106,9 @@ front and rear grids derived from Linux SES data and operator notes.
   when available through API or SSH
 - Multi-system and multi-enclosure pickers so CORE shelves and SCALE front/rear
   views can live in the same app
+- Live discovered enclosures auto-populate in the selector, while saved chassis
+  views and virtual storage views stay optional overlays for curated layouts or
+  internal disk groups
 - Profile-driven enclosure rendering so validated hardware and custom layouts
   can share the same slot-map UI
 - First-pass TrueNAS SCALE support with split front/rear enclosure pickers when

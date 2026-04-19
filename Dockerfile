@@ -8,10 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends 7zip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app /app/app
 COPY history_service /app/history_service
+COPY admin_service /app/admin_service
 COPY config/config.example.yaml /app/config/config.example.yaml
 
 RUN addgroup --system app && adduser --system --ingroup app app \

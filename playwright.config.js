@@ -5,7 +5,8 @@ const baseURL = process.env.PLAYWRIGHT_BASE_URL || "http://127.0.0.1:8080";
 module.exports = defineConfig({
   testDir: "./qa",
   testMatch: "**/*.spec.js",
-  fullyParallel: true,
+  fullyParallel: false,
+  workers: process.env.CI ? 2 : 1,
   timeout: 30_000,
   expect: {
     timeout: 15_000,

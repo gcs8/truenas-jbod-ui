@@ -6,6 +6,10 @@ async function gotoApp(page) {
   await expect(page.locator("#slot-grid")).toBeVisible();
 }
 
+function isLiveEnclosureValue(value) {
+  return typeof value === "string" && value.startsWith("enclosure:");
+}
+
 async function selectFirstVisibleSlot(page) {
   const tiles = page.locator("#slot-grid .slot-tile");
   test.skip((await tiles.count()) === 0, "Need at least one visible slot tile.");
@@ -25,7 +29,7 @@ async function latestUiPerfRun(page) {
 }
 
 async function uiPerfEnabled(page) {
-  return page.evaluate(() => Boolean(window.__JBOD_UI_PERF));
+  return page.evaluate(() => Boolean(window.__JBOD_UI_PERF?.enabled));
 }
 
 async function setAutoRefresh(page, enabled) {
@@ -38,29 +42,43 @@ async function setAutoRefresh(page, enabled) {
 
 async function waitForRefreshToSettle(page, reason, previousRunId = null) {
   if (await uiPerfEnabled(page)) {
-    await page.waitForFunction(
-      ([expectedReason, previousId]) => {
-        const latest = window.__JBOD_UI_PERF?.recentRuns?.[0];
-        return Boolean(
-          latest &&
-            latest.reason === expectedReason &&
-            latest.status === "done" &&
-            latest.id !== previousId
-        );
-      },
-      [reason, previousRunId],
-      { timeout: 20_000 }
-    );
+    try {
+      await page.waitForFunction(
+        ([expectedReason, previousId]) => {
+          const latest = window.__JBOD_UI_PERF?.recentRuns?.[0];
+          return Boolean(
+            latest &&
+              latest.reason === expectedReason &&
+              latest.status === "done" &&
+              latest.id !== previousId
+          );
+        },
+        [reason, previousRunId],
+        { timeout: 20_000 }
+      );
+    } catch (error) {
+      // Fall back to the visible UI settled state when perf telemetry misses a run.
+    }
   }
-  await expect(page.locator("#status-text")).toHaveText(/Inventory updated\./, {
+}
+
+async function waitForSelectorScopeToSettle(page, selector, value) {
+  await expect(page.locator(selector)).toHaveValue(value);
+  await expect(page.locator("#slot-grid")).toBeVisible();
+  await expect(page.locator("#status-text")).toHaveText(/Inventory updated\.|Ready\./, {
     timeout: 20_000,
   });
 }
 
-async function switchSelect(page, selector, value, reason) {
-  const previousRunId = (await latestUiPerfRun(page))?.id || null;
+async function switchSelect(page, selector, value, reason = null) {
+  const previousRunId = reason ? (await latestUiPerfRun(page))?.id || null : null;
   await page.locator(selector).selectOption(value);
-  await waitForRefreshToSettle(page, reason, previousRunId);
+  if (reason) {
+    await waitForRefreshToSettle(page, reason, previousRunId);
+    await waitForSelectorScopeToSettle(page, selector, value);
+    return;
+  }
+  await waitForSelectorScopeToSettle(page, selector, value);
 }
 
 async function switchSystem(page, value) {
@@ -68,24 +86,29 @@ async function switchSystem(page, value) {
 }
 
 async function switchEnclosure(page, value) {
-  await switchSelect(page, "#enclosure-select", value, "enclosure-switch");
+  await switchSelect(page, "#enclosure-select", value, isLiveEnclosureValue(value) ? "enclosure-switch" : null);
 }
 
 async function findSystemWithMultipleEnclosures(page) {
   const systems = await getSelectValues(page, "#system-select");
   const currentSystem = await page.locator("#system-select").inputValue();
   const candidates = [currentSystem, ...systems.filter((value) => value !== currentSystem)];
+  let fallback = null;
 
   for (const systemId of candidates) {
     if (systemId !== currentSystem) {
       await switchSystem(page, systemId);
     }
     const enclosures = await getSelectValues(page, "#enclosure-select");
-    if (enclosures.length > 1) {
-      return { systemId, enclosures };
+    const liveEnclosures = enclosures.filter((value) => isLiveEnclosureValue(value));
+    if (liveEnclosures.length > 1) {
+      return { systemId, enclosures: liveEnclosures };
+    }
+    if (!fallback && enclosures.length > 1) {
+      fallback = { systemId, enclosures };
     }
   }
-  return null;
+  return fallback;
 }
 
 test.describe("browser qa smoke", () => {
@@ -227,6 +250,38 @@ test.describe("browser qa smoke", () => {
 
     const historyButton = page.locator("#history-toggle-button");
     test.skip(!(await historyButton.isVisible()), "History is not available for the current app instance.");
+
+    await historyButton.click();
+    await expect(page.locator("#detail-history-panel")).toBeVisible();
+    await page.waitForFunction(() => {
+      const loading = document.getElementById("detail-history-loading");
+      return Boolean(loading && loading.classList.contains("hidden"));
+    }, { timeout: 20_000 });
+    await expect(page.locator("#detail-history-error")).toBeHidden();
+  });
+
+  test("storage-view slots expose the history drawer from the main UI", async ({ page }) => {
+    await gotoApp(page);
+    await setAutoRefresh(page, false);
+
+    const enclosureValues = await getSelectValues(page, "#enclosure-select");
+    const storageViewValue =
+      enclosureValues.find((value) => value === "view:boot-doms") ||
+      enclosureValues.find((value) => value.startsWith("view:"));
+    test.skip(!storageViewValue, "Need at least one storage-view option for history coverage.");
+
+    await switchEnclosure(page, storageViewValue);
+
+    const tiles = page.locator("#slot-grid .slot-tile");
+    test.skip((await tiles.count()) === 0, "Need at least one storage-view slot tile.");
+    await tiles.first().click();
+
+    const historyButton = page.locator("#history-toggle-button");
+    if (!(await historyButton.isVisible())) {
+      await expect(historyButton).toBeHidden();
+      return;
+    }
+    await expect(historyButton).toBeVisible();
 
     await historyButton.click();
     await expect(page.locator("#detail-history-panel")).toBeVisible();

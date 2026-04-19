@@ -22,6 +22,7 @@ If you already know what kind of host you are targeting, jump to:
 If you want to control what the enclosure looks like, use:
 
 - [[Profiles and Custom Layouts|Profiles-and-Custom-Layouts]]
+- [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
 
 If you want to really tune things, use:
 

@@ -2,7 +2,90 @@
 
 ## Unreleased
 
-Follow-up work after the `v0.9.0` cut lands here.
+- Follow-up work after the `v0.10.0` cut lands here.
+
+## v0.10.0 - 2026-04-19
+
+### Added
+
+- Dedicated optional `admin` sidecar profile with a full-page maintenance UI
+  for full backup import/export, guided system setup, profile previewing, and
+  SSH key management without embedding write paths into the main enclosure UI
+- Full backup export/import that packages config, profile overrides,
+  mapping/cache JSON, and the history SQLite database into one bundle, with
+  selectable `tar.zst`, `zip`, `tar.gz`, or `.7z` packaging plus optional
+  passphrase protection
+- SSH key management for the admin walkthrough, including reusable `config/ssh`
+  key discovery and one-click Ed25519 keypair generation that resolves
+  directly onto `/run/ssh/...` runtime paths
+- TLS trust inspection and import tooling in the admin sidecar so operators can
+  inspect presented remote certificates, compare fingerprints, and then save
+  either the remote chain or a private CA bundle for future verified
+  connections
+- Admin-side service-account bootstrap helpers, including sudoers preview
+  generation and a clearer split between one-time bootstrap actions and the
+  final saved runtime connection details
+- Runtime control inside the admin sidecar so the read UI and history sidecar
+  can be stopped or restarted around clean backup/import work
+- Portable encrypted backups now use standard `.7z` archives instead of an
+  app-only encrypted wrapper format
+- Saved storage views as first-class runtime selector options alongside live
+  enclosures, including separate `Saved Chassis Views` and
+  `Virtual Storage Views` groupings in the main UI
+- Dedicated storage-view SMART and history runtime routes so inventory-bound
+  views like `Boot SATADOMs` and the NVMe carrier can participate in the main
+  detail/history flows instead of staying metadata-only
+
+### Changed
+
+- The main enclosure UI now only shows a `System Setup` launch button when the
+  admin sidecar is reachable, and that button opens the standalone admin page
+  in a new tab instead of rendering embedded setup dialogs in the read UI
+- The optional history sidecar is back to being history-only; complete backup
+  and config mutation workflows now live behind the separate admin sidecar
+- Saved `ses_enclosure` storage views now persist their own `profile_id`, and
+  runtime/admin preview use that saved profile instead of always borrowing the
+  currently selected live enclosure profile
+- The admin storage-view workflow now uses one grouped `Add Storage View` flow
+  instead of a separate mirror-only shortcut, and the add picker can now hide
+  profile-backed saved chassis layouts that already auto-populate as live
+  discovered hardware on the loaded system
+- CORE live discovery now surfaces the separate `24`-bay "brain" chassis on
+  `archive-core` as a peer live enclosure option next to the combined `60`-bay
+  shelf, while still keeping the small internal AHCI SGPIO shelf out of the
+  main selector
+- The main UI and admin copy now make the runtime model explicit:
+  `Live Enclosures`, `Saved Chassis Views`, and `Virtual Storage Views` are
+  related but intentionally different things
+- The history sidecar compose path now runs as `root` on the validated Docker
+  Desktop bind-mount setup, and the underlying history store now also tries to
+  self-heal readonly SQLite write failures instead of silently stalling
+
+### Fixed
+
+- Quantastor systems with `verify_ssl: false` no longer fail certificate
+  verification because the REST client now bypasses the custom verified-HTTPS
+  path when TLS verification is intentionally disabled
+- CORE SSH SMART fallback now reports missing `smartctl` sudo permission with a
+  clear remediation hint instead of bubbling raw `sudo` stderr back into the
+  UI
+- The history collector now recovers from the validated readonly-history-DB
+  failure mode that previously left storage-view history blank for NVMe and
+  SATADOM views after admin-side or root-owned SQLite file changes
+- Browser QA and UI switching logic now treat saved `view:` selectors as peer
+  scope switches instead of assuming every non-system selector change is a live
+  enclosure refresh
+
+### Docs
+
+- Added checked-in `0.10.0` draft release notes and refreshed the release
+  checklist toward the current admin/storage-view/history scope
+- Added a dedicated wiki page for `Live Enclosures and Storage Views` and
+  refreshed README/wiki/admin copy so the discovered-versus-saved mental model
+  is spelled out instead of implied
+- Updated `docs/SSH_READ_ONLY_SETUP.md` to match the current validated CORE
+  `jbodmap` path on `The-Archive`, including the command-limited
+  `sudo_nopasswd=true` allow-list with `/usr/local/sbin/smartctl`
 
 ## v0.9.0 - 2026-04-17
 

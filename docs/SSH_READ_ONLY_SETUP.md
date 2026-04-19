@@ -264,14 +264,14 @@ Important detail for this CORE build:
 That means the current working-shaped payload for this system is:
 
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show"]}'
 ```
 
 If you want the full current web UI feature set on this CORE box, use this
 combined allow-list:
 
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/usr/local/sbin/smartctl -x -j *","/usr/local/sbin/smartctl -x *"]}'
 ```
 
 That enables:
@@ -281,44 +281,68 @@ That enables:
 - SSH identify LED control through `sesutil locate`
 - multipath controller labels such as `mpr0` and `mpr1` through
   `camcontrol devlist -v`
+- on-demand per-slot SMART detail through `smartctl`
+
+On `The-Archive` as of April 19, 2026:
+
+- `midclt` rejects nonexistent command paths in `sudo_commands`
+- `/usr/local/sbin/smartctl` exists
+- `/usr/sbin/smartctl` does not exist
+
+So the working host-specific allow-list above includes only the
+`/usr/local/sbin/smartctl` entries. On another CORE build, check the real path
+first, for example with:
+
+```bash
+find /usr -name smartctl
+```
 
 This wildcard guidance for `sesutil locate` is an inference from standard
 `sudoers` command matching, which supports shell-style wildcards in command
 arguments. Validate it on your specific CORE build before relying on it
 broadly.
 
+On `The-Archive`, that wildcard-shaped `sesutil locate` allowance was manually
+validated on April 19, 2026 by toggling the slot identify LEDs successfully on
+slots `0` and `6`.
+
 ## Important Behavior On This CORE Build
 
-On this system, the middleware accepts:
+On `The-Archive` as of April 19, 2026, the middleware accepts:
 
 - `sudo=true`
-- `sudo_commands=["/usr/sbin/sesutil map","/usr/sbin/sesutil show"]`
-- `sudo_nopasswd=false`
+- `sudo_nopasswd=true`
+- exact `sudo_commands` entries for `sesutil`, `camcontrol`, and
+  `/usr/local/sbin/smartctl`
 
-and the resulting SSH behavior still prompts for a password:
+and the resulting SSH behavior now supports passwordless command-limited sudo:
 
-- `sudo /usr/sbin/sesutil show` requires the user's local password
+- `su - jbodmap -c 'sudo -n /usr/local/sbin/smartctl -x -j /dev/da95'`
+  returns SMART JSON successfully
 
-Earlier failed attempts on this same system showed:
+What still matters on this same system:
 
-- `sudo_commands=["/usr/sbin/sesutil"]` was too broad in the wrong way and did
-  not match the exact subcommands we needed
-- `sesutil locate` also needs to be matched explicitly enough for your chosen
+- `sudo_commands=["/usr/sbin/sesutil"]` is too broad in the wrong way and does
+  not match the exact subcommands we need
+- `sesutil locate` still needs to be matched explicitly enough for your chosen
   sudo pattern
-- `sudo=false` with `sudo_commands=[...]` still produced `not allowed to execute`
-- `sudo_nopasswd=true` did not yield passwordless command-limited sudo on this
-  build
+- `sudo=false` with `sudo_commands=[...]` still produces `not allowed to execute`
+- `sudo -n` still fails immediately if `sudo_nopasswd=false`
+- `midclt` rejects nonexistent command paths such as `/usr/sbin/smartctl` on
+  this host
 
-Because of that, the safest remaining least-privilege path is:
+Because of that, the preferred least-privilege path on this system is:
 
 1. keep the dedicated non-root key-based SSH user
 2. set `sudo=true`
-3. keep `sudo_commands` restricted to the exact SES commands needed
-4. set a strong local password on the user
-5. keep using SSH keys for login
-6. have the app feed that password only to the limited `sudo` commands
+3. set `sudo_nopasswd=true`
+4. keep `sudo_commands` restricted to the exact SES, `camcontrol`, and
+   `smartctl` commands needed
+5. use only command paths that actually exist on the host
+6. validate with `sudo -n` before relying on the app
 
-This preserves the narrow command list and avoids broad passwordless sudo.
+That preserves the narrow command list while removing the need to store or
+prompt for a sudo password on this host.
 
 ## Last-Resort Root Option
 
@@ -390,8 +414,8 @@ Optional:
 `camcontrol devlist -v` is the safest optional add-on if you want the app to
 label multipath member paths with controller names such as `mpr0` and `mpr1`.
 
-If your TrueNAS CORE build requires passworded command-limited sudo instead of
-`nopasswd`, keep the same command list and also set:
+If another TrueNAS CORE build requires passworded command-limited sudo instead
+of `nopasswd`, keep the same command list and also set:
 
 ```env
 SSH_SUDO_PASSWORD=your-long-random-password

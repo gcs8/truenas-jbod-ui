@@ -362,6 +362,13 @@ class ProfileRegistry:
         profile = self._profiles.get(profile_id)
         return _profile_to_view(profile) if profile else None
 
+    def select_profile_id(
+        self,
+        system: SystemConfig,
+        enclosure: EnclosureOption | None = None,
+    ) -> str | None:
+        return self._select_profile_id(system, enclosure)
+
     def resolve_for_enclosure(
         self,
         system: SystemConfig,

@@ -6,15 +6,39 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
-from app.models.domain import InventorySnapshot, LedAction, ManualMapping, MappingBundle, MultipathView, SlotState, SlotView, SmartSummaryView
-from app.services.inventory import DiskRecord, InventoryService, build_lunid_aliases, infer_slot_count_from_layout, resolve_persistent_id
+from app.models.domain import (
+    InventorySnapshot,
+    LedAction,
+    ManualMapping,
+    MappingBundle,
+    MultipathView,
+    SlotState,
+    SlotView,
+    SmartSummaryView,
+    StorageViewRuntimePayload,
+    StorageViewRuntimeSlot,
+    StorageViewRuntimeView,
+)
+from app.services.inventory import DiskRecord, InventoryService, InventorySourceBundle, build_lunid_aliases, infer_slot_count_from_layout, resolve_persistent_id
 from app.services.mapping_store import MappingStore
-from app.services.parsers import ParsedSSHData, ZpoolMember, parse_ssh_outputs
+from app.services.parsers import (
+    ParsedSSHData,
+    SESMapEnclosure,
+    SESMapSlot,
+    ZpoolMember,
+    build_slot_candidates_from_ses_enclosures,
+    parse_ssh_outputs,
+)
 from app.services.profile_registry import ProfileRegistry
-from app.services.profile_registry import UNIFI_UNVR_FRONT_4_PROFILE_ID, UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID
+from app.services.profile_registry import (
+    CORE_CSE_946_PROFILE_ID,
+    SCALE_SSG_FRONT_24_PROFILE_ID,
+    UNIFI_UNVR_FRONT_4_PROFILE_ID,
+    UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+)
 from app.services.ssh_probe import SSHCommandResult
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
@@ -118,6 +142,679 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(summary.physical_block_size, 4096)
         self.assertEqual(summary.logical_unit_id, "5000cca264d473d4")
         self.assertEqual(summary.sas_address, "5000cca264d473d5")
+
+
+class InventoryStorageViewCandidateTests(unittest.TestCase):
+    def test_get_storage_view_candidates_excludes_disks_already_tied_to_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                label="Archive CORE",
+                truenas=TrueNASConfig(
+                    host="https://archive-core.local",
+                    api_key="token",
+                    platform="core",
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[
+                        SlotView(
+                            slot=0,
+                            slot_label="00",
+                            row_index=0,
+                            column_index=0,
+                            device_name="da0",
+                            serial="SER-DA0",
+                        )
+                    ],
+                    refresh_interval_seconds=30,
+                    selected_system_id="archive-core",
+                    selected_system_label="Archive CORE",
+                )
+            )
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[],
+                        disks=[],
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    ),
+                    ssh_outputs={},
+                    ssh_collected=True,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+            service._build_storage_view_candidate_records = MagicMock(
+                return_value=[
+                    DiskRecord(
+                        raw={},
+                        device_name="da0",
+                        path_device_name="da0",
+                        multipath_name=None,
+                        multipath_member=None,
+                        serial="SER-DA0",
+                        model="Front Disk",
+                        size_bytes=10_000_000_000,
+                        identifier=None,
+                        health="ONLINE",
+                        pool_name="archive",
+                        lunid=None,
+                        bus="SATA",
+                        temperature_c=None,
+                        last_smart_test_type=None,
+                        last_smart_test_status=None,
+                        last_smart_test_lifetime_hours=None,
+                        logical_block_size=None,
+                        physical_block_size=None,
+                        enclosure_id=None,
+                        slot=None,
+                        smart_devices=["da0"],
+                        lookup_keys={"da0", "ser-da0"},
+                    ),
+                    DiskRecord(
+                        raw={"transport_address": "0000:5e:00.0"},
+                        device_name="nvd0",
+                        path_device_name="nvd0",
+                        multipath_name=None,
+                        multipath_member=None,
+                        serial="SER-NVME-1",
+                        model="Samsung 970 EVO",
+                        size_bytes=2_000_000_000_000,
+                        identifier=None,
+                        health="ONLINE",
+                        pool_name="fast",
+                        lunid=None,
+                        bus="NVME",
+                        temperature_c=None,
+                        last_smart_test_type=None,
+                        last_smart_test_status=None,
+                        last_smart_test_lifetime_hours=None,
+                        logical_block_size=None,
+                        physical_block_size=None,
+                        enclosure_id=None,
+                        slot=None,
+                        smart_devices=["nvd0"],
+                        lookup_keys={"nvd0", "ser-nvme-1", "0000:5e:00.0"},
+                    ),
+                ]
+            )
+
+            candidates = asyncio.run(service.get_storage_view_candidates())
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["serial"], "SER-NVME-1")
+        self.assertEqual(candidates[0]["transport_address"], "0000:5e:00.0")
+        self.assertEqual(candidates[0]["recommended_binding"]["serials"], ["SER-NVME-1"])
+        self.assertEqual(candidates[0]["recommended_binding"]["device_names"], ["nvd0"])
+
+    def test_get_storage_view_runtime_orders_internal_matches_by_saved_binding_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                label="Archive CORE",
+                storage_views=[
+                    {
+                        "id": "nvme-carrier",
+                        "label": "4x NVMe Carrier Card",
+                        "kind": "nvme_carrier",
+                        "template_id": "nvme-carrier-4",
+                        "enabled": True,
+                        "order": 20,
+                        "render": {
+                            "show_in_main_ui": True,
+                            "show_in_admin_ui": True,
+                            "default_collapsed": False,
+                        },
+                        "binding": {
+                            "mode": "serial",
+                            "enclosure_ids": [],
+                            "pool_names": [],
+                            "serials": [],
+                            "pcie_addresses": [],
+                            "device_names": ["nvd2", "nvd0"],
+                        },
+                        "layout_overrides": {
+                            "slot_sizes": {
+                                0: "2280",
+                                1: "2280",
+                                2: "2280",
+                                3: "22110",
+                            }
+                        },
+                    },
+                    {
+                        "id": "boot-doms",
+                        "label": "Boot SATADOMs",
+                        "kind": "boot_devices",
+                        "template_id": "satadom-pair-2",
+                        "enabled": True,
+                        "order": 30,
+                        "render": {
+                            "show_in_main_ui": False,
+                            "show_in_admin_ui": True,
+                            "default_collapsed": True,
+                        },
+                        "binding": {
+                            "mode": "serial",
+                            "enclosure_ids": [],
+                            "pool_names": [],
+                            "serials": [],
+                            "pcie_addresses": [],
+                            "device_names": ["ada0", "ada1"],
+                        },
+                    },
+                ],
+                truenas=TrueNASConfig(
+                    host="https://archive-core.local",
+                    api_key="token",
+                    platform="core",
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_system_id="archive-core",
+                    selected_system_label="Archive CORE",
+                    selected_enclosure_id="ses-combined-60",
+                    selected_enclosure_label="LSI-F SAS3x48Front 0c04 + LSI-R SAS3x48Rear 0c04",
+                )
+            )
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[],
+                        disks=[],
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    ),
+                    ssh_outputs={},
+                    ssh_collected=True,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+            service._build_storage_view_candidate_records = MagicMock(
+                return_value=[
+                    DiskRecord(
+                        raw={"transport_address": "0000:5f:00.0"},
+                        device_name="nvd0",
+                        path_device_name="nvd0",
+                        multipath_name=None,
+                        multipath_member=None,
+                        serial="SER-NVME-0",
+                        model="Samsung NVMe 0",
+                        size_bytes=2_000_000_000_000,
+                        identifier=None,
+                        health="ONLINE",
+                        pool_name="flash",
+                        lunid=None,
+                        bus="NVME",
+                        temperature_c=None,
+                        last_smart_test_type=None,
+                        last_smart_test_status=None,
+                        last_smart_test_lifetime_hours=None,
+                        logical_block_size=None,
+                        physical_block_size=None,
+                        enclosure_id=None,
+                        slot=None,
+                        smart_devices=["nvd0"],
+                        lookup_keys={"nvd0", "ser-nvme-0"},
+                    ),
+                    DiskRecord(
+                        raw={"transport_address": "0000:5e:00.0"},
+                        device_name="nvd2",
+                        path_device_name="nvd2",
+                        multipath_name=None,
+                        multipath_member=None,
+                        serial="SER-NVME-2",
+                        model="Samsung NVMe 2",
+                        size_bytes=2_000_000_000_000,
+                        identifier=None,
+                        health="ONLINE",
+                        pool_name="flash",
+                        lunid=None,
+                        bus="NVME",
+                        temperature_c=None,
+                        last_smart_test_type=None,
+                        last_smart_test_status=None,
+                        last_smart_test_lifetime_hours=None,
+                        logical_block_size=None,
+                        physical_block_size=None,
+                        enclosure_id=None,
+                        slot=None,
+                        smart_devices=["nvd2"],
+                        lookup_keys={"nvd2", "ser-nvme-2"},
+                    ),
+                    DiskRecord(
+                        raw={},
+                        device_name="ada0",
+                        path_device_name="ada0",
+                        multipath_name=None,
+                        multipath_member=None,
+                        serial="SER-DOM-0",
+                        model="SATADOM 0",
+                        size_bytes=64_000_000_000,
+                        identifier=None,
+                        health="ONLINE",
+                        pool_name="freenas-boot",
+                        lunid=None,
+                        bus="SATA",
+                        temperature_c=None,
+                        last_smart_test_type=None,
+                        last_smart_test_status=None,
+                        last_smart_test_lifetime_hours=None,
+                        logical_block_size=None,
+                        physical_block_size=None,
+                        enclosure_id=None,
+                        slot=None,
+                        smart_devices=["ada0"],
+                        lookup_keys={"ada0", "ser-dom-0"},
+                    ),
+                    DiskRecord(
+                        raw={},
+                        device_name="ada1",
+                        path_device_name="ada1",
+                        multipath_name=None,
+                        multipath_member=None,
+                        serial="SER-DOM-1",
+                        model="SATADOM 1",
+                        size_bytes=64_000_000_000,
+                        identifier=None,
+                        health="ONLINE",
+                        pool_name="freenas-boot",
+                        lunid=None,
+                        bus="SATA",
+                        temperature_c=None,
+                        last_smart_test_type=None,
+                        last_smart_test_status=None,
+                        last_smart_test_lifetime_hours=None,
+                        logical_block_size=None,
+                        physical_block_size=None,
+                        enclosure_id=None,
+                        slot=None,
+                        smart_devices=["ada1"],
+                        lookup_keys={"ada1", "ser-dom-1"},
+                    ),
+                ]
+            )
+
+            runtime = asyncio.run(service.get_storage_view_runtime())
+
+        self.assertEqual(runtime.system_id, "archive-core")
+        self.assertEqual(len(runtime.views), 2)
+        nvme_view = next(view for view in runtime.views if view.id == "nvme-carrier")
+        self.assertEqual(nvme_view.slot_layout, [[3], [2], [1], [0]])
+        self.assertEqual([slot.slot_label for slot in nvme_view.slots[:2]], ["M2-1", "M2-2"])
+        self.assertEqual([slot.device_name for slot in nvme_view.slots[:2]], ["nvd2", "nvd0"])
+        self.assertEqual([slot.placement_key for slot in nvme_view.slots[:2]], ["device match: nvd2", "device match: nvd0"])
+        self.assertEqual([slot.slot_size for slot in nvme_view.slots], ["2280", "2280", "2280", "22110"])
+        self.assertEqual(nvme_view.backing_enclosure_id, "ses-combined-60")
+        self.assertEqual(nvme_view.backing_enclosure_label, "LSI-F SAS3x48Front 0c04 + LSI-R SAS3x48Rear 0c04")
+        satadom_view = next(view for view in runtime.views if view.id == "boot-doms")
+        self.assertEqual([slot.slot_label for slot in satadom_view.slots], ["DOM-A", "DOM-B"])
+        self.assertEqual([slot.device_name for slot in satadom_view.slots], ["ada0", "ada1"])
+
+    def test_get_storage_view_runtime_uses_saved_ses_profile_instead_of_live_selected_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                label="Archive CORE",
+                storage_views=[
+                    {
+                        "id": "front-24",
+                        "label": "Front 24 Bay",
+                        "kind": "ses_enclosure",
+                        "template_id": "ses-auto",
+                        "profile_id": "generic-front-24-1x24",
+                        "enabled": True,
+                        "order": 10,
+                        "render": {
+                            "show_in_main_ui": True,
+                            "show_in_admin_ui": True,
+                            "default_collapsed": False,
+                        },
+                        "binding": {
+                            "mode": "auto",
+                            "enclosure_ids": [],
+                            "pool_names": [],
+                            "serials": [],
+                            "pcie_addresses": [],
+                            "device_names": [],
+                        },
+                    }
+                ],
+                truenas=TrueNASConfig(
+                    host="https://archive-core.local",
+                    api_key="token",
+                    platform="core",
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            live_profile = service.profile_registry.get(CORE_CSE_946_PROFILE_ID)
+
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[
+                        SlotView(
+                            slot=0,
+                            slot_label="00",
+                            row_index=0,
+                            column_index=0,
+                            present=True,
+                            state=SlotState.healthy,
+                            device_name="da0",
+                        ),
+                        SlotView(
+                            slot=23,
+                            slot_label="23",
+                            row_index=0,
+                            column_index=23,
+                            present=True,
+                            state=SlotState.healthy,
+                            device_name="da23",
+                        ),
+                    ],
+                    refresh_interval_seconds=30,
+                    selected_system_id="archive-core",
+                    selected_system_label="Archive CORE",
+                    selected_enclosure_id="ses-combined-60",
+                    selected_enclosure_label="Combined 60 Bay",
+                    selected_profile=live_profile,
+                )
+            )
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[],
+                        disks=[],
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    ),
+                    ssh_outputs={},
+                    ssh_collected=True,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+            service._build_storage_view_candidate_records = MagicMock(return_value=[])
+
+            runtime = asyncio.run(service.get_storage_view_runtime())
+
+        saved_view = next(view for view in runtime.views if view.id == "front-24")
+        self.assertEqual(saved_view.profile_id, "generic-front-24-1x24")
+        self.assertEqual(saved_view.profile_label, "Generic Front 24")
+        self.assertEqual(saved_view.slot_count, 24)
+        self.assertEqual(saved_view.slot_layout, [list(range(24))])
+        self.assertEqual(saved_view.slots[0].slot_label, "00")
+        self.assertEqual(saved_view.slots[-1].slot_label, "23")
+        self.assertIn("Generic Front 24", saved_view.notes[0])
+
+    def test_get_storage_view_slot_smart_summary_reuses_snapshot_slot_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                label="Archive CORE",
+                truenas=TrueNASConfig(
+                    host="https://archive-core.local",
+                    api_key="token",
+                    platform="core",
+                ),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service.get_storage_view_runtime = AsyncMock(
+                return_value=StorageViewRuntimePayload(
+                    system_id="archive-core",
+                    views=[
+                        StorageViewRuntimeView(
+                            id="primary-chassis",
+                            label="Primary Chassis",
+                            kind="ses_enclosure",
+                            template_id="ses-auto",
+                            source="selected_enclosure_snapshot",
+                            backing_enclosure_id="enc-a",
+                            slots=[
+                                StorageViewRuntimeSlot(
+                                    slot_index=0,
+                                    slot_label="00",
+                                    occupied=True,
+                                    source="snapshot_slot",
+                                    snapshot_slot=12,
+                                    device_name="da12",
+                                )
+                            ],
+                        )
+                    ],
+                )
+            )
+            expected_summary = SmartSummaryView(available=True, power_on_hours=1200)
+            service.get_slot_smart_summary = AsyncMock(return_value=expected_summary)
+
+            summary = asyncio.run(
+                service.get_storage_view_slot_smart_summary(
+                    "primary-chassis",
+                    0,
+                    selected_enclosure_id="enc-a",
+                    allow_stale_cache=True,
+                )
+            )
+
+        self.assertIs(summary, expected_summary)
+        service.get_slot_smart_summary.assert_awaited_once_with(
+            12,
+            selected_enclosure_id="enc-a",
+            allow_stale_cache=True,
+        )
+
+    def test_get_storage_view_slot_smart_summary_builds_synthetic_slot_for_inventory_bound_view(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                label="Archive CORE",
+                truenas=TrueNASConfig(
+                    host="https://archive-core.local",
+                    api_key="token",
+                    platform="core",
+                ),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service.get_storage_view_runtime = AsyncMock(
+                return_value=StorageViewRuntimePayload(
+                    system_id="archive-core",
+                    views=[
+                        StorageViewRuntimeView(
+                            id="boot-doms",
+                            label="Boot SATADOMs",
+                            kind="boot_devices",
+                            template_id="satadom-pair-2",
+                            source="inventory_binding",
+                            backing_enclosure_id="enc-a",
+                            slots=[
+                                StorageViewRuntimeSlot(
+                                    slot_index=0,
+                                    slot_label="DOM-A",
+                                    occupied=True,
+                                    source="inventory_candidate",
+                                    assignment_rank=1,
+                                    placement_key="device match: ada0",
+                                    device_name="ada0",
+                                    smart_device_names=["ada0"],
+                                    serial="SER-DOM-0",
+                                    pool_name="freenas-boot",
+                                    model="SATADOM 0",
+                                    size_bytes=64_000_000_000,
+                                    size_human="59.6 GiB",
+                                    gptid="gptid/dom-a",
+                                    health="ONLINE",
+                                    temperature_c=31,
+                                    logical_block_size=512,
+                                    physical_block_size=4096,
+                                    slot_size="dom",
+                                )
+                            ],
+                        )
+                    ],
+                )
+            )
+            expected_summary = SmartSummaryView(available=True, temperature_c=31, power_on_hours=24)
+            service._get_slot_smart_summary_for_slot_view = AsyncMock(return_value=expected_summary)
+
+            summary = asyncio.run(
+                service.get_storage_view_slot_smart_summary(
+                    "boot-doms",
+                    0,
+                    selected_enclosure_id="enc-a",
+                    allow_stale_cache=True,
+                )
+            )
+
+        self.assertIs(summary, expected_summary)
+        synthetic_slot = service._get_slot_smart_summary_for_slot_view.await_args.args[0]
+        self.assertEqual(synthetic_slot.enclosure_id, "storage-view:boot-doms")
+        self.assertEqual(synthetic_slot.enclosure_label, "Boot SATADOMs")
+        self.assertEqual(synthetic_slot.device_name, "ada0")
+        self.assertEqual(synthetic_slot.smart_device_names, ["ada0"])
+        self.assertEqual(synthetic_slot.pool_name, "freenas-boot")
+        self.assertEqual(synthetic_slot.gptid, "gptid/dom-a")
+        self.assertEqual(synthetic_slot.logical_block_size, 512)
+        self.assertEqual(synthetic_slot.physical_block_size, 4096)
+
+    def test_resolve_storage_view_slot_history_target_reuses_snapshot_slot_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                label="Archive CORE",
+                truenas=TrueNASConfig(
+                    host="https://archive-core.local",
+                    api_key="token",
+                    platform="core",
+                ),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service.get_storage_view_runtime = AsyncMock(
+                return_value=StorageViewRuntimePayload(
+                    system_id="archive-core",
+                    views=[
+                        StorageViewRuntimeView(
+                            id="primary-chassis",
+                            label="Primary Chassis",
+                            kind="ses_enclosure",
+                            template_id="ses-auto",
+                            source="selected_enclosure_snapshot",
+                            backing_enclosure_id="enc-a",
+                            slots=[
+                                StorageViewRuntimeSlot(
+                                    slot_index=0,
+                                    slot_label="00",
+                                    occupied=True,
+                                    source="snapshot_slot",
+                                    snapshot_slot=12,
+                                    device_name="da12",
+                                )
+                            ],
+                        )
+                    ],
+                )
+            )
+
+            target = asyncio.run(
+                service.resolve_storage_view_slot_history_target(
+                    "primary-chassis",
+                    0,
+                    selected_enclosure_id="enc-a",
+                )
+            )
+
+        self.assertEqual(target, (12, "enc-a"))
+
+    def test_resolve_storage_view_slot_history_target_uses_storage_view_scope_for_inventory_bound_view(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                label="Archive CORE",
+                truenas=TrueNASConfig(
+                    host="https://archive-core.local",
+                    api_key="token",
+                    platform="core",
+                ),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service.get_storage_view_runtime = AsyncMock(
+                return_value=StorageViewRuntimePayload(
+                    system_id="archive-core",
+                    views=[
+                        StorageViewRuntimeView(
+                            id="boot-doms",
+                            label="Boot SATADOMs",
+                            kind="boot_devices",
+                            template_id="satadom-pair-2",
+                            source="inventory_binding",
+                            backing_enclosure_id="enc-a",
+                            slots=[
+                                StorageViewRuntimeSlot(
+                                    slot_index=0,
+                                    slot_label="DOM-A",
+                                    occupied=True,
+                                    source="inventory_candidate",
+                                    device_name="ada0",
+                                    serial="SER-DOM-0",
+                                )
+                            ],
+                        )
+                    ],
+                )
+            )
+
+            target = asyncio.run(
+                service.resolve_storage_view_slot_history_target(
+                    "boot-doms",
+                    0,
+                    selected_enclosure_id="enc-a",
+                )
+            )
+
+        self.assertEqual(target, (0, "storage-view:boot-doms"))
 
     def test_resolve_persistent_id_prefers_partuuid_leaf(self) -> None:
         value, label = resolve_persistent_id("/dev/disk/by-partuuid/83672e59-1b7c-40a0-970a-15ad0776ddda")
@@ -752,6 +1449,214 @@ class InventoryHelpersTests(unittest.TestCase):
 
 
 class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _build_core_ses_enclosures() -> list[SESMapEnclosure]:
+        def make_enclosure(
+            enclosure_id: str,
+            enclosure_name: str,
+            ses_device: str,
+            slot_numbers: range,
+            *,
+            profile_id: str | None = None,
+            rows: int | None = None,
+            columns: int | None = None,
+            slot_layout: list[list[int | None]] | None = None,
+        ) -> SESMapEnclosure:
+            slots = {
+                slot_number: SESMapSlot(
+                    slot_number=slot_number,
+                    element_id=slot_number,
+                    ses_device=ses_device,
+                    description=f"Slot {slot_number:02d}",
+                )
+                for slot_number in slot_numbers
+            }
+            return SESMapEnclosure(
+                ses_device=ses_device,
+                enclosure_id=enclosure_id,
+                enclosure_name=enclosure_name,
+                profile_id=profile_id,
+                layout_rows=rows,
+                layout_columns=columns,
+                slot_layout=slot_layout,
+                slots=slots,
+            )
+
+        return [
+            make_enclosure(
+                "3061686369656d30",
+                "AHCI SGPIO Enclosure 2.00",
+                "/dev/ses0",
+                range(0, 6),
+            ),
+            make_enclosure(
+                "50030480090c4f7f",
+                "LSI SAS3x40 0601",
+                "/dev/ses2",
+                range(0, 24),
+                profile_id=SCALE_SSG_FRONT_24_PROFILE_ID,
+                rows=6,
+                columns=4,
+                slot_layout=[
+                    [5, 11, 17, 23],
+                    [4, 10, 16, 22],
+                    [3, 9, 15, 21],
+                    [2, 8, 14, 20],
+                    [1, 7, 13, 19],
+                    [0, 6, 12, 18],
+                ],
+            ),
+            make_enclosure(
+                "500304801f715f3f",
+                "LSI-F SAS3x48Front 0c04",
+                "/dev/ses4",
+                range(1, 31),
+            ),
+            make_enclosure(
+                "500304801f5a003f",
+                "LSI-R SAS3x48Rear 0c04",
+                "/dev/ses5",
+                range(1, 31),
+            ),
+        ]
+
+    async def test_core_snapshot_exposes_extra_ssh_enclosure_as_peer_live_option(self) -> None:
+        def fake_parse_ssh_outputs(_outputs, slot_count, enclosure_filter, selected_enclosure_id=None):
+            enclosures = self._build_core_ses_enclosures()
+            slot_candidates, selected_meta = build_slot_candidates_from_ses_enclosures(
+                enclosures,
+                slot_count,
+                enclosure_filter,
+                selected_enclosure_id,
+            )
+            return ParsedSSHData(
+                ses_enclosures=enclosures,
+                ses_slot_candidates=slot_candidates,
+                ses_selected_meta=selected_meta,
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                label="Archive CORE",
+                truenas=TrueNASConfig(
+                    host="https://archive-core.local",
+                    api_key="token",
+                    platform="core",
+                ),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[],
+                        disks=[],
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    ),
+                    ssh_outputs={"sesutil map": "stub"},
+                    ssh_collected=True,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+
+            with patch("app.services.inventory.parse_ssh_outputs", side_effect=fake_parse_ssh_outputs):
+                snapshot = await service.get_snapshot(force_refresh=True)
+
+        self.assertEqual(snapshot.selected_enclosure_id, "500304801f715f3f+500304801f5a003f")
+        self.assertEqual(snapshot.selected_profile.id, CORE_CSE_946_PROFILE_ID)
+        self.assertEqual(snapshot.summary.enclosure_count, 2)
+        self.assertEqual(
+            [option.id for option in snapshot.enclosures],
+            [
+                "500304801f715f3f+500304801f5a003f",
+                "50030480090c4f7f",
+            ],
+        )
+        self.assertFalse(any(option.id == "3061686369656d30" for option in snapshot.enclosures))
+
+    async def test_core_snapshot_selects_extra_ssh_enclosure_with_24_bay_profile(self) -> None:
+        def fake_parse_ssh_outputs(_outputs, slot_count, enclosure_filter, selected_enclosure_id=None):
+            enclosures = self._build_core_ses_enclosures()
+            slot_candidates, selected_meta = build_slot_candidates_from_ses_enclosures(
+                enclosures,
+                slot_count,
+                enclosure_filter,
+                selected_enclosure_id,
+            )
+            return ParsedSSHData(
+                ses_enclosures=enclosures,
+                ses_slot_candidates=slot_candidates,
+                ses_selected_meta=selected_meta,
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                label="Archive CORE",
+                truenas=TrueNASConfig(
+                    host="https://archive-core.local",
+                    api_key="token",
+                    platform="core",
+                ),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[],
+                        disks=[],
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    ),
+                    ssh_outputs={"sesutil map": "stub"},
+                    ssh_collected=True,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+
+            with patch("app.services.inventory.parse_ssh_outputs", side_effect=fake_parse_ssh_outputs):
+                snapshot = await service.get_snapshot(
+                    selected_enclosure_id="50030480090c4f7f",
+                    force_refresh=True,
+                )
+
+        self.assertEqual(snapshot.selected_enclosure_id, "50030480090c4f7f")
+        self.assertEqual(snapshot.selected_enclosure_label, "LSI SAS3x40 0601")
+        self.assertEqual(snapshot.selected_profile.id, SCALE_SSG_FRONT_24_PROFILE_ID)
+        self.assertEqual(snapshot.layout_slot_count, 24)
+        self.assertEqual(
+            [option.id for option in snapshot.enclosures],
+            [
+                "50030480090c4f7f",
+                "500304801f715f3f+500304801f5a003f",
+            ],
+        )
+
     async def test_quantastor_snapshot_renders_storage_system_view_and_pool_members(self) -> None:
         class DummyQuantastorClient:
             async def fetch_all(self) -> TrueNASRawData:
@@ -1797,7 +2702,7 @@ Enclosure Status diagnostic page:
                 None,
                 None,
             )
-            service._tag_quantastor_ses_overlay(ses_overlay, "10.0.0.20")
+            service._tag_ses_overlay(ses_overlay, "10.0.0.20")
             service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ses_overlay, []))
 
             snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
@@ -1809,6 +2714,83 @@ Enclosure Status diagnostic page:
             self.assertTrue(slot0.identify_active)
             self.assertEqual(slot0.ssh_ses_targets[0]["ssh_host"], "10.0.0.20")
             self.assertEqual(slot0.ssh_ses_targets[0]["ses_device"], "/dev/sg11")
+
+    async def test_scale_snapshot_uses_dynamic_ses_rediscovery_for_led_control(self) -> None:
+        class DummyScaleClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                return TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="offsite-scale",
+                label="Offsite SCALE",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", extra_hosts=["10.0.0.20"], user="jbodmap", commands=[]),
+            )
+            ssh_probe = AsyncMock()
+            ssh_probe.run_commands.return_value = []
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyScaleClient(),
+                ssh_probe,
+                temp_dir,
+            )
+
+            aes_output = """  SMCDRS2U  SAS3x40           0701
+  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 0
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5003048026b2ff7f
+          SAS address: 0x5002538b496a5512
+          phy identifier: 0x0
+"""
+            ec_output = """  SMCDRS2U  SAS3x40           0701
+Enclosure Status diagnostic page:
+  generation code: 0x0
+  status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Overall descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+      Element 0 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+        Ready to insert=0, RMV=0, Ident=1, Report=0
+"""
+            ses_overlay = parse_ssh_outputs(
+                {
+                    "sudo -n /usr/bin/sg_ses -p aes /dev/sg27": aes_output,
+                    "sudo -n /usr/bin/sg_ses -p ec /dev/sg27": ec_output,
+                },
+                60,
+                None,
+                None,
+            )
+            service._tag_ses_overlay(ses_overlay, "10.0.0.20")
+            service._fetch_scale_ses_overlay = AsyncMock(return_value=(ses_overlay, []))
+
+            snapshot = await service.get_snapshot()
+
+            self.assertEqual(snapshot.sources["ssh"].message, "SSH probe and SCALE SES rediscovery completed.")
+            slot0 = next(slot for slot in snapshot.slots if slot.slot == 0)
+            self.assertTrue(slot0.led_supported)
+            self.assertEqual(slot0.led_backend, "scale_sg_ses")
+            self.assertTrue(slot0.identify_active)
+            self.assertEqual(slot0.ssh_ses_targets[0]["ssh_host"], "10.0.0.20")
+            self.assertEqual(slot0.ssh_ses_targets[0]["ses_device"], "/dev/sg27")
 
     async def test_quantastor_cli_enrichment_surfaces_in_smart_summary(self) -> None:
         class DummyQuantastorClient:
@@ -2607,6 +3589,67 @@ Enclosure Status diagnostic page:
             self.assertEqual(summary.sas_address, "0x5000cca2c272c1b9")
             self.assertEqual(summary.attached_sas_address, "0x500304801f715f3f")
             self.assertEqual(summary.negotiated_link_rate, "phy enabled; 12 Gbps")
+
+    async def test_core_smart_summary_reports_missing_smartctl_sudo_permission_cleanly(self) -> None:
+        class DummyTrueNASClient:
+            async def fetch_disk_smartctl(self, *_args, **_kwargs):
+                raise TrueNASAPIError("api smartctl unavailable")
+
+        class DummySSHProbe:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            async def run_command(self, command: str) -> SSHCommandResult:
+                self.commands.append(command)
+                return SSHCommandResult(
+                    command=command,
+                    ok=False,
+                    stdout="",
+                    stderr=(
+                        "Sorry, user jbodmap is not allowed to execute "
+                        "'/usr/local/sbin/smartctl -x -j /dev/da95' as root on The-Archive.gcs8.com."
+                    ),
+                    exit_code=1,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True, user="jbodmap"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                DummySSHProbe(),
+                temp_dir,
+            )
+            slot = SlotView(
+                slot=95,
+                slot_label="95",
+                row_index=0,
+                column_index=0,
+                device_name="da95",
+                temperature_c=31,
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[slot],
+                    refresh_interval_seconds=30,
+                )
+            )
+
+            summary = await service.get_slot_smart_summary(95)
+
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.temperature_c, 31)
+            self.assertIsNotNone(summary.message)
+            assert summary.message is not None
+            self.assertIn("jbodmap is missing sudo permission for smartctl", summary.message)
+            self.assertIn("/usr/local/sbin/smartctl", summary.message)
+            self.assertIn("/usr/sbin/smartctl", summary.message)
 
     async def test_scale_smart_summary_falls_back_to_ssh_smartctl(self) -> None:
         class DummyTrueNASClient:

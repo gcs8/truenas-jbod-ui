@@ -4,11 +4,24 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def trim_optional_text(value: str | None, *, max_length: int) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned[:max_length] if cleaned else None
+
+
+def preserve_optional_secret(value: str | None, *, max_length: int) -> str | None:
+    if value is None:
+        return None
+    return str(value)[:max_length]
 
 
 class SlotState(str, Enum):
@@ -295,3 +308,460 @@ class SnapshotExportRequest(BaseModel):
     redact_sensitive: bool = False
     packaging: Literal["auto", "html", "zip"] = "auto"
     allow_oversize: bool = False
+
+
+class SystemBackupExportRequest(BaseModel):
+    encrypt: bool = False
+    passphrase: str | None = None
+    packaging: Literal["tar.zst", "zip", "tar.gz", "7z"] = "tar.zst"
+
+    @field_validator("passphrase")
+    @classmethod
+    def sanitize_passphrase(cls, value: str | None) -> str | None:
+        return preserve_optional_secret(value, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_encryption_requirements(self) -> "SystemBackupExportRequest":
+        if self.encrypt and not self.passphrase:
+            raise ValueError("A passphrase is required when encryption is enabled.")
+        return self
+
+
+StorageViewKind = Literal["ses_enclosure", "nvme_carrier", "boot_devices", "manual"]
+StorageViewBindingMode = Literal["auto", "pool", "serial", "hybrid"]
+
+
+class StorageViewRenderRequest(BaseModel):
+    show_in_main_ui: bool = True
+    show_in_admin_ui: bool = True
+    default_collapsed: bool = False
+
+
+class StorageViewBindingRequest(BaseModel):
+    mode: StorageViewBindingMode = "auto"
+    enclosure_ids: list[str] = Field(default_factory=list)
+    pool_names: list[str] = Field(default_factory=list)
+    serials: list[str] = Field(default_factory=list)
+    pcie_addresses: list[str] = Field(default_factory=list)
+    device_names: list[str] = Field(default_factory=list)
+
+    @field_validator("enclosure_ids", "pool_names", "serials", "pcie_addresses", "device_names")
+    @classmethod
+    def sanitize_lists(cls, value: list[str]) -> list[str]:
+        cleaned_items: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            cleaned = trim_optional_text(str(item), max_length=256)
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                cleaned_items.append(cleaned)
+        return cleaned_items
+
+
+class StorageViewLayoutOverridesRequest(BaseModel):
+    slot_labels: dict[int, str] = Field(default_factory=dict)
+    slot_sizes: dict[int, str] = Field(default_factory=dict)
+
+    @field_validator("slot_labels", mode="before")
+    @classmethod
+    def sanitize_slot_labels(cls, value: Any) -> dict[int, str]:
+        if value is None or value == "":
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("slot_labels must be a mapping.")
+        cleaned: dict[int, str] = {}
+        for raw_key, raw_label in value.items():
+            try:
+                slot_number = int(raw_key)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("slot label keys must be integers.") from exc
+            if slot_number < 0:
+                continue
+            label = trim_optional_text(str(raw_label) if raw_label is not None else None, max_length=128)
+            if label:
+                cleaned[slot_number] = label
+        return cleaned
+
+    @field_validator("slot_sizes", mode="before")
+    @classmethod
+    def sanitize_slot_sizes(cls, value: Any) -> dict[int, str]:
+        if value is None or value == "":
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("slot_sizes must be a mapping.")
+        allowed_sizes = {"2230", "2242", "2260", "2280", "22110"}
+        cleaned: dict[int, str] = {}
+        for raw_key, raw_size in value.items():
+            try:
+                slot_number = int(raw_key)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("slot size keys must be integers.") from exc
+            if slot_number < 0:
+                continue
+            size_label = trim_optional_text(str(raw_size) if raw_size is not None else None, max_length=16)
+            if size_label in allowed_sizes:
+                cleaned[slot_number] = size_label
+        return cleaned
+
+
+class StorageViewRequest(BaseModel):
+    id: str | None = None
+    label: str
+    kind: StorageViewKind
+    template_id: str
+    profile_id: str | None = None
+    enabled: bool = True
+    order: int = 10
+    render: StorageViewRenderRequest = Field(default_factory=StorageViewRenderRequest)
+    binding: StorageViewBindingRequest = Field(default_factory=StorageViewBindingRequest)
+    layout_overrides: StorageViewLayoutOverridesRequest | None = None
+
+    @field_validator("id", "label", "template_id", "profile_id")
+    @classmethod
+    def sanitize_text_fields(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=256)
+
+    @field_validator("order")
+    @classmethod
+    def sanitize_order(cls, value: int) -> int:
+        return max(0, min(int(value), 100000))
+
+    @model_validator(mode="after")
+    def validate_storage_view(self) -> "StorageViewRequest":
+        if not self.label:
+            raise ValueError("A storage view label is required.")
+        if not self.template_id:
+            raise ValueError("A storage view template is required.")
+        return self
+
+
+class StorageViewRuntimeSlot(BaseModel):
+    slot_index: int
+    slot_label: str
+    occupied: bool = False
+    state: str = "empty"
+    source: Literal["snapshot_slot", "inventory_candidate", "placeholder"] = "placeholder"
+    match_reasons: list[str] = Field(default_factory=list)
+    placement_key: str | None = None
+    assignment_rank: int | None = None
+    snapshot_slot: int | None = None
+    device_name: str | None = None
+    smart_device_names: list[str] = Field(default_factory=list)
+    serial: str | None = None
+    pool_name: str | None = None
+    model: str | None = None
+    size_bytes: int | None = None
+    bus: str | None = None
+    size_human: str | None = None
+    gptid: str | None = None
+    health: str | None = None
+    temperature_c: int | None = None
+    last_smart_test_type: str | None = None
+    last_smart_test_status: str | None = None
+    last_smart_test_lifetime_hours: int | None = None
+    logical_block_size: int | None = None
+    physical_block_size: int | None = None
+    logical_unit_id: str | None = None
+    sas_address: str | None = None
+    attached_sas_address: str | None = None
+    transport_address: str | None = None
+    description: str | None = None
+    led_supported: bool = False
+    slot_size: str | None = None
+
+
+class StorageViewRuntimeView(BaseModel):
+    id: str
+    label: str
+    kind: StorageViewKind
+    template_id: str
+    profile_id: str | None = None
+    profile_label: str | None = None
+    enabled: bool = True
+    render: StorageViewRenderRequest = Field(default_factory=StorageViewRenderRequest)
+    binding: StorageViewBindingRequest = Field(default_factory=StorageViewBindingRequest)
+    order: int = 10
+    template_label: str | None = None
+    slot_layout: list[list[int | None]] = Field(default_factory=list)
+    source: Literal["selected_enclosure_snapshot", "inventory_binding"] = "inventory_binding"
+    backing_enclosure_id: str | None = None
+    backing_enclosure_label: str | None = None
+    notes: list[str] = Field(default_factory=list)
+    matched_count: int = 0
+    slot_count: int = 0
+    slots: list[StorageViewRuntimeSlot] = Field(default_factory=list)
+
+
+class StorageViewRuntimePayload(BaseModel):
+    system_id: str | None = None
+    system_label: str | None = None
+    views: list[StorageViewRuntimeView] = Field(default_factory=list)
+
+
+class SystemSetupRequest(BaseModel):
+    system_id: str | None = None
+    label: str
+    platform: Literal["core", "scale", "linux", "quantastor"] = "core"
+    truenas_host: str
+    api_key: str | None = None
+    api_user: str | None = None
+    api_password: str | None = None
+    verify_ssl: bool = True
+    tls_ca_bundle_path: str | None = None
+    tls_server_name: str | None = None
+    enclosure_filter: str | None = None
+    timeout_seconds: int = 15
+    ssh_enabled: bool = False
+    ssh_host: str | None = None
+    ssh_extra_hosts: list[str] = Field(default_factory=list)
+    ssh_port: int = 22
+    ssh_user: str | None = None
+    ssh_key_path: str | None = "/run/ssh/id_truenas"
+    ssh_password: str | None = None
+    ssh_sudo_password: str | None = None
+    ssh_known_hosts_path: str | None = "/app/data/known_hosts"
+    ssh_strict_host_key_checking: bool = True
+    ssh_timeout_seconds: int = 15
+    ssh_commands: list[str] = Field(default_factory=list)
+    default_profile_id: str | None = None
+    storage_views: list[StorageViewRequest] | None = None
+    replace_existing: bool = False
+    make_default: bool = False
+
+    @field_validator(
+        "system_id",
+        "label",
+        "truenas_host",
+        "api_key",
+        "api_user",
+        "enclosure_filter",
+        "tls_ca_bundle_path",
+        "tls_server_name",
+        "ssh_host",
+        "ssh_user",
+        "ssh_key_path",
+        "ssh_known_hosts_path",
+        "default_profile_id",
+    )
+    @classmethod
+    def sanitize_text_fields(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=1024)
+
+    @field_validator("api_password", "ssh_password", "ssh_sudo_password")
+    @classmethod
+    def sanitize_secret_fields(cls, value: str | None) -> str | None:
+        return preserve_optional_secret(value, max_length=1024)
+
+    @field_validator("ssh_extra_hosts", "ssh_commands")
+    @classmethod
+    def sanitize_string_lists(cls, value: list[str]) -> list[str]:
+        cleaned_items: list[str] = []
+        for item in value:
+            cleaned = str(item).strip()
+            if cleaned:
+                cleaned_items.append(cleaned[:1024])
+        return cleaned_items
+
+    @field_validator("timeout_seconds", "ssh_timeout_seconds")
+    @classmethod
+    def clamp_timeout(cls, value: int) -> int:
+        return max(1, min(int(value), 300))
+
+    @field_validator("ssh_port")
+    @classmethod
+    def clamp_ssh_port(cls, value: int) -> int:
+        return max(1, min(int(value), 65535))
+
+    @model_validator(mode="after")
+    def validate_required_fields(self) -> "SystemSetupRequest":
+        if not self.label:
+            raise ValueError("A system label is required.")
+        if not self.truenas_host:
+            raise ValueError("A host is required.")
+        if self.ssh_enabled and not self.ssh_host:
+            self.ssh_host = self.truenas_host
+        if self.ssh_enabled and not self.ssh_user:
+            raise ValueError("An SSH user is required when SSH enrichment is enabled.")
+        return self
+
+
+class TLSCertificateInspectRequest(BaseModel):
+    host: str
+    timeout_seconds: int = 10
+    tls_server_name: str | None = None
+
+    @field_validator("host", "tls_server_name")
+    @classmethod
+    def sanitize_host(cls, value: str | None) -> str:
+        return trim_optional_text(value, max_length=1024) or ""
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def clamp_timeout(cls, value: int) -> int:
+        return max(1, min(int(value), 300))
+
+    @model_validator(mode="after")
+    def validate_host(self) -> "TLSCertificateInspectRequest":
+        if not self.host:
+            raise ValueError("A TLS host is required.")
+        return self
+
+
+class TLSCertificateImportRequest(BaseModel):
+    pem_text: str
+    bundle_name: str | None = None
+    system_id: str | None = None
+    host: str | None = None
+    tls_server_name: str | None = None
+
+    @field_validator("bundle_name", "system_id", "host", "tls_server_name")
+    @classmethod
+    def sanitize_optional_text(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=1024)
+
+    @field_validator("pem_text")
+    @classmethod
+    def sanitize_pem_text(cls, value: str) -> str:
+        return str(value or "")[:262144]
+
+    @model_validator(mode="after")
+    def validate_payload(self) -> "TLSCertificateImportRequest":
+        if not self.pem_text.strip():
+            raise ValueError("PEM certificate text is required.")
+        return self
+
+
+class TLSRemoteCertificateTrustRequest(BaseModel):
+    host: str
+    timeout_seconds: int = 10
+    bundle_name: str | None = None
+    system_id: str | None = None
+    tls_server_name: str | None = None
+
+    @field_validator("host", "bundle_name", "system_id", "tls_server_name")
+    @classmethod
+    def sanitize_text_fields(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=1024)
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def clamp_timeout(cls, value: int) -> int:
+        return max(1, min(int(value), 300))
+
+    @model_validator(mode="after")
+    def validate_host(self) -> "TLSRemoteCertificateTrustRequest":
+        if not self.host:
+            raise ValueError("A TLS host is required.")
+        return self
+
+
+class SSHKeyGenerateRequest(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def sanitize_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        return cleaned[:128] if cleaned else ""
+
+    @model_validator(mode="after")
+    def validate_name(self) -> "SSHKeyGenerateRequest":
+        if not self.name:
+            raise ValueError("A key name is required.")
+        return self
+
+
+class SystemSetupBootstrapRequest(BaseModel):
+    platform: Literal["core", "scale", "linux", "quantastor"] = "core"
+    host: str
+    port: int = 22
+    bootstrap_user: str
+    bootstrap_password: str | None = None
+    bootstrap_sudo_password: str | None = None
+    bootstrap_key_path: str | None = None
+    bootstrap_known_hosts_path: str | None = "/app/data/known_hosts"
+    bootstrap_strict_host_key_checking: bool = True
+    timeout_seconds: int = 15
+    service_user: str = "jbodmap"
+    service_shell: str = "/bin/sh"
+    service_key_name: str | None = None
+    service_key_path: str | None = None
+    service_public_key: str | None = None
+    install_sudo_rules: bool = True
+    sudo_commands: list[str] = Field(default_factory=list)
+
+    @field_validator(
+        "host",
+        "bootstrap_user",
+        "bootstrap_key_path",
+        "bootstrap_known_hosts_path",
+        "service_user",
+        "service_shell",
+        "service_key_name",
+        "service_key_path",
+        "service_public_key",
+    )
+    @classmethod
+    def sanitize_bootstrap_text_fields(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=4096)
+
+    @field_validator("bootstrap_password", "bootstrap_sudo_password")
+    @classmethod
+    def sanitize_bootstrap_secret_fields(cls, value: str | None) -> str | None:
+        return preserve_optional_secret(value, max_length=4096)
+
+    @field_validator("sudo_commands")
+    @classmethod
+    def sanitize_bootstrap_command_list(cls, value: list[str]) -> list[str]:
+        cleaned_items: list[str] = []
+        for item in value:
+            cleaned = str(item).strip()
+            if cleaned:
+                cleaned_items.append(cleaned[:1024])
+        return cleaned_items
+
+    @field_validator("port")
+    @classmethod
+    def clamp_port(cls, value: int) -> int:
+        return max(1, min(int(value), 65535))
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def clamp_timeout(cls, value: int) -> int:
+        return max(1, min(int(value), 300))
+
+    @model_validator(mode="after")
+    def validate_bootstrap_requirements(self) -> "SystemSetupBootstrapRequest":
+        if not self.host:
+            raise ValueError("A bootstrap host is required.")
+        if not self.bootstrap_user:
+            raise ValueError("A one-time bootstrap username is required.")
+        if not self.bootstrap_password and not self.bootstrap_key_path:
+            raise ValueError("Provide either a bootstrap password or a bootstrap key path.")
+        if not self.service_user:
+            raise ValueError("A target service-account user is required.")
+        if not self.service_key_name and not self.service_key_path and not self.service_public_key:
+            raise ValueError("Select or provide the SSH key that should be installed for the service account.")
+        return self
+
+
+class SystemSetupSudoPreviewRequest(BaseModel):
+    platform: Literal["core", "scale", "linux", "quantastor"] = "core"
+    service_user: str = "jbodmap"
+    install_sudo_rules: bool = True
+    sudo_commands: list[str] = Field(default_factory=list)
+
+    @field_validator("service_user")
+    @classmethod
+    def sanitize_service_user(cls, value: str | None) -> str:
+        return trim_optional_text(value, max_length=256) or "jbodmap"
+
+    @field_validator("sudo_commands")
+    @classmethod
+    def sanitize_preview_command_list(cls, value: list[str]) -> list[str]:
+        cleaned_items: list[str] = []
+        for item in value:
+            cleaned = str(item).strip()
+            if cleaned:
+                cleaned_items.append(cleaned[:1024])
+        return cleaned_items

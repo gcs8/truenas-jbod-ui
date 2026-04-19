@@ -25,7 +25,7 @@
         </select>
       </div>
       <div class="meta-card meta-select-card">
-        <label class="meta-label" for="enclosure-select">Enclosure</label>
+        <label class="meta-label" for="enclosure-select">Enclosure / View</label>
         <select class="meta-select" id="enclosure-select">
           {% if snapshot.enclosures %}
             {% for enclosure in snapshot.enclosures %}
@@ -95,6 +95,9 @@
       <input id="search-box" type="search" placeholder="serial, disk, persistent id, pool, vdev">
     </label>
     {% if not snapshot_mode %}
+    {% if admin_launch_url %}
+    <a class="button secondary" href="{{ admin_launch_url }}" target="_blank" rel="noopener">System Setup</a>
+    {% endif %}
     <button id="export-snapshot-button" class="button secondary">Export Snapshot</button>
     {% endif %}
     <button id="refresh-button" class="button">Refresh Now</button>
@@ -277,6 +280,37 @@
     </aside>
   </main>
 
+  <section id="storage-views-panel" class="panel storage-views-panel hidden">
+      <div class="panel-header">
+        <div>
+          <h2>Storage Views</h2>
+          <p id="storage-views-summary" class="subtle">
+          Read-only runtime mapping for saved chassis overlays and virtual internal storage groups. Live discovered enclosures stay in the main selector above.
+          </p>
+        </div>
+      </div>
+      <div class="storage-views-layout">
+        <div id="storage-view-list" class="storage-view-list" aria-label="Configured saved chassis and virtual storage views"></div>
+        <div class="storage-view-runtime-detail">
+          <div id="storage-view-empty" class="detail-empty compact">
+          No saved chassis or virtual storage views are configured for this system yet.
+          </div>
+        <div id="storage-view-content" class="storage-view-content hidden">
+          <div class="storage-view-runtime-head">
+            <div>
+              <p class="eyebrow">Selected Storage View</p>
+              <h3 id="storage-view-title">Storage View</h3>
+              <p id="storage-view-note" class="subtle"></p>
+            </div>
+            <div id="storage-view-meta" class="profile-preview-meta"></div>
+          </div>
+          <div id="storage-view-grid" class="storage-view-runtime-grid" aria-label="Storage view runtime layout"></div>
+          <div id="storage-view-mapping-list" class="storage-view-mapping-list"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section id="detail-history-panel" class="panel history-drawer hidden">
     <div class="panel-header history-drawer-top">
       <div class="history-drawer-meta">
@@ -452,6 +486,7 @@
 <script>
   window.APP_BOOTSTRAP = {
     snapshot: {{ initial_snapshot_json | safe }},
+    storageViewsRuntime: {{ initial_storage_view_runtime_json | safe }},
     layoutRows: {{ snapshot.layout_rows | tojson }},
     refreshIntervalSeconds: {{ snapshot.refresh_interval_seconds }},
     smartBatchMaxConcurrency: {{ settings.app.smart_batch_max_concurrency }},
