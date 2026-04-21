@@ -23,10 +23,13 @@ from app.config import (
 )
 from app.main import app as main_app
 from app.main import resolve_admin_launch_url
-from app.models.domain import SystemSetupSudoPreviewRequest
 from app.models.domain import EnclosureOption
+from app.models.domain import HistoryAdoptRequest
+from app.models.domain import QuantastorNodeDiscoveryRequest
+from app.models.domain import SystemSetupSudoPreviewRequest
 from history_service.config import HistorySettings
 from history_service.main import app as history_app
+from app.services.truenas_ws import TrueNASRawData
 
 
 def make_request(host: str = "localhost", port: int = 8082) -> Request:
@@ -52,6 +55,10 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertIn("/api/admin/system-setup/bootstrap", paths)
         self.assertIn("/api/admin/system-setup/sudoers-preview", paths)
+        self.assertIn("/api/admin/system-setup/{system_id}", paths)
+        self.assertIn("/api/admin/history/purge-orphaned", paths)
+        self.assertIn("/api/admin/history/orphaned", paths)
+        self.assertIn("/api/admin/history/adopt-removed-system", paths)
 
     def test_main_app_does_not_expose_embedded_admin_routes(self) -> None:
         paths = {route.path for route in main_app.routes}
@@ -258,6 +265,90 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(payload["paths"]["history_db"], "/tmp/history/history.db")
         self.assertEqual(payload["paths"]["tls_dir"], str(Path("C:/tmp/config") / "tls"))
 
+    def test_build_admin_state_payload_includes_quantastor_ha_nodes(self) -> None:
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="qsosn-ha",
+                    label="QSOSN HA",
+                    truenas=TrueNASConfig(
+                        host="https://10.13.37.40",
+                        api_user="jbodmap",
+                        api_password="secret",
+                        platform="quantastor",
+                        verify_ssl=False,
+                    ),
+                    ssh=SSHConfig(
+                        enabled=True,
+                        host="10.13.37.30",
+                        extra_hosts=["10.13.37.31"],
+                        ha_enabled=True,
+                        ha_nodes=[
+                            {
+                                "system_id": "node-a",
+                                "label": "QSOSN Left",
+                                "host": "10.13.37.30",
+                            },
+                            {
+                                "system_id": "node-b",
+                                "label": "QSOSN Right",
+                                "host": "10.13.37.31",
+                            },
+                        ],
+                        user="jbodmap",
+                        key_path="/run/ssh/id_truenas",
+                    ),
+                    storage_views=[
+                        {
+                            "id": "boot-doms-b",
+                            "label": "Boot SATADOMs B",
+                            "kind": "boot_devices",
+                            "template_id": "satadom-pair-2",
+                            "enabled": True,
+                            "order": 30,
+                            "render": {
+                                "show_in_main_ui": True,
+                                "show_in_admin_ui": True,
+                                "default_collapsed": False,
+                            },
+                            "binding": {
+                                "mode": "hybrid",
+                                "target_system_id": "node-b",
+                                "enclosure_ids": [],
+                                "pool_names": ["QSOSN-BOOT-B"],
+                                "serials": [],
+                                "pcie_addresses": [],
+                                "device_names": ["sda", "sdb"],
+                            },
+                        }
+                    ],
+                )
+            ],
+            default_system_id="qsosn-ha",
+        )
+        runtime_service = MagicMock()
+        runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
+        key_manager = MagicMock()
+        key_manager.list_keys.return_value = []
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+                        with patch(
+                            "admin_service.main.get_history_settings",
+                            return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
+                        ):
+                            payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
+
+        self.assertTrue(payload["systems"][0]["ha_enabled"])
+        self.assertEqual(payload["systems"][0]["ha_nodes"][0]["system_id"], "node-a")
+        self.assertEqual(payload["systems"][0]["ha_nodes"][1]["host"], "10.13.37.31")
+        self.assertEqual(
+            payload["systems"][0]["storage_views"][0]["binding"]["target_system_id"],
+            "node-b",
+        )
+
     def test_build_admin_state_payload_seeds_primary_chassis_view_for_auto_profile_legacy_systems(self) -> None:
         settings = Settings(
             systems=[
@@ -355,6 +446,273 @@ class AdminStatePayloadTests(unittest.TestCase):
 
 
 class AdminSudoPreviewRouteTests(unittest.TestCase):
+    def test_delete_system_route_returns_updated_system_list(self) -> None:
+        route = next(
+            route for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/{system_id}" and "DELETE" in getattr(route, "methods", set())
+        )
+        initial_settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="qs-cryostorage",
+                    label="QS CryoStorage",
+                    truenas=TrueNASConfig(
+                        host="https://10.13.37.40",
+                        platform="quantastor",
+                    ),
+                ),
+                SystemConfig(
+                    id="archive-core",
+                    label="Archive CORE",
+                    truenas=TrueNASConfig(
+                        host="https://archive-core.local",
+                        platform="core",
+                    ),
+                ),
+            ],
+            default_system_id="qs-cryostorage",
+        )
+        refreshed_settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="archive-core",
+                    label="Archive CORE",
+                    truenas=TrueNASConfig(
+                        host="https://archive-core.local",
+                        platform="core",
+                    ),
+                )
+            ],
+            default_system_id="archive-core",
+        )
+        setup_service = MagicMock()
+        setup_service.delete_system.return_value = ("QS CryoStorage", "archive-core")
+        runtime_service = MagicMock()
+        runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
+
+        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.main.SystemSetupService", return_value=setup_service):
+                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+                    response = asyncio.run(route.endpoint(system_id="qs-cryostorage"))
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["system_id"], "qs-cryostorage")
+        self.assertEqual(payload["deleted_label"], "QS CryoStorage")
+        self.assertEqual(payload["default_system_id"], "archive-core")
+        self.assertFalse(payload["history_purge"]["requested"])
+        self.assertEqual([system["id"] for system in payload["systems"]], ["archive-core"])
+        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+
+    def test_delete_system_route_can_purge_matching_history(self) -> None:
+        route = next(
+            route for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/{system_id}" and "DELETE" in getattr(route, "methods", set())
+        )
+        initial_settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="qs-cryostorage",
+                    label="QS CryoStorage",
+                    truenas=TrueNASConfig(
+                        host="https://10.13.37.40",
+                        platform="quantastor",
+                    ),
+                ),
+                SystemConfig(
+                    id="archive-core",
+                    label="Archive CORE",
+                    truenas=TrueNASConfig(
+                        host="https://archive-core.local",
+                        platform="core",
+                    ),
+                ),
+            ],
+            default_system_id="qs-cryostorage",
+        )
+        refreshed_settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="archive-core",
+                    label="Archive CORE",
+                    truenas=TrueNASConfig(
+                        host="https://archive-core.local",
+                        platform="core",
+                    ),
+                )
+            ],
+            default_system_id="archive-core",
+        )
+        setup_service = MagicMock()
+        setup_service.delete_system.return_value = ("QS CryoStorage", "archive-core")
+        runtime_service = MagicMock()
+        runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
+        history_store = MagicMock()
+        history_store.delete_system_history.return_value = {
+            "tracked_slots": 1,
+            "event_count": 2,
+            "metric_sample_count": 3,
+            "total_rows": 6,
+            "removed_system_ids": ["qs-cryostorage"],
+        }
+
+        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.main.SystemSetupService", return_value=setup_service):
+                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+                    with patch("admin_service.main.get_history_store", return_value=history_store):
+                        response = asyncio.run(route.endpoint(system_id="qs-cryostorage", purge_history=True))
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["history_purge"]["requested"])
+        self.assertTrue(payload["history_purge"]["ok"])
+        self.assertEqual(payload["history_purge"]["summary"]["total_rows"], 6)
+        history_store.delete_system_history.assert_called_once_with("qs-cryostorage")
+        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+
+    def test_purge_orphaned_history_route_returns_cleanup_summary(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/purge-orphaned")
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="archive-core",
+                    label="Archive CORE",
+                    truenas=TrueNASConfig(
+                        host="https://archive-core.local",
+                        platform="core",
+                    ),
+                )
+            ],
+            default_system_id="archive-core",
+        )
+        history_store = MagicMock()
+        history_store.purge_orphaned_history.return_value = {
+            "tracked_slots": 1,
+            "event_count": 2,
+            "metric_sample_count": 5,
+            "total_rows": 8,
+            "removed_system_ids": ["qs-cryostorage"],
+        }
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_history_store", return_value=history_store):
+                response = asyncio.run(route.endpoint())
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["summary"]["removed_system_ids"], ["qs-cryostorage"])
+        self.assertEqual(payload["valid_system_ids"], ["archive-core"])
+        history_store.purge_orphaned_history.assert_called_once_with(["archive-core"])
+
+    def test_list_orphaned_history_route_returns_history_sources(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned")
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="archive-core",
+                    label="Archive CORE",
+                    truenas=TrueNASConfig(
+                        host="https://archive-core.local",
+                        platform="core",
+                    ),
+                )
+            ],
+            default_system_id="archive-core",
+        )
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.return_value = [
+            {
+                "system_id": "qs-cryostorage",
+                "system_label": "QS CryoStorage",
+                "tracked_slots": 1,
+                "event_count": 2,
+                "metric_sample_count": 5,
+                "total_rows": 8,
+            }
+        ]
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_history_store", return_value=history_store):
+                response = asyncio.run(route.endpoint())
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["orphaned_systems"][0]["system_id"], "qs-cryostorage")
+        self.assertEqual(payload["valid_system_ids"], ["archive-core"])
+        history_store.list_history_system_summaries.assert_called_once_with(["archive-core"])
+
+    def test_adopt_removed_system_history_route_rehomes_orphaned_history(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="qsosn-ha",
+                    label="QSOSN HA",
+                    truenas=TrueNASConfig(
+                        host="https://10.13.37.40",
+                        platform="quantastor",
+                    ),
+                )
+            ],
+            default_system_id="qsosn-ha",
+        )
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.side_effect = [
+            [
+                {
+                    "system_id": "qs-cryostorage",
+                    "system_label": "QS CryoStorage",
+                    "tracked_slots": 2,
+                    "event_count": 3,
+                    "metric_sample_count": 4,
+                    "total_rows": 9,
+                }
+            ],
+            [],
+        ]
+        history_store.adopt_system_history.return_value = {
+            "source_system_id": "qs-cryostorage",
+            "target_system_id": "qsosn-ha",
+            "target_system_label": "QSOSN HA",
+            "tracked_slots": 2,
+            "event_count": 3,
+            "metric_sample_count": 4,
+            "total_rows": 9,
+            "slot_state_conflicts": 1,
+        }
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_history_store", return_value=history_store):
+                response = asyncio.run(
+                    route.endpoint(
+                        payload=HistoryAdoptRequest(
+                            source_system_id="qs-cryostorage",
+                            target_system_id="qsosn-ha",
+                        )
+                    )
+                )
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["summary"]["total_rows"], 9)
+        self.assertEqual(payload["target_system_id"], "qsosn-ha")
+        self.assertEqual(payload["orphaned_systems"], [])
+        history_store.adopt_system_history.assert_called_once_with(
+            "qs-cryostorage",
+            "qsosn-ha",
+            target_system_label="QSOSN HA",
+        )
+
     def test_storage_view_candidate_route_returns_unmapped_inventory_candidates(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/storage-views/candidates")
         settings = Settings(
@@ -401,7 +759,50 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["system_id"], "archive-core")
         self.assertEqual(payload["candidates"][0]["serial"], "SER-NVME-1")
-        service.get_storage_view_candidates.assert_awaited_once_with(force_refresh=True)
+        service.get_storage_view_candidates.assert_awaited_once_with(force_refresh=True, target_system_id=None)
+
+    def test_quantastor_node_discovery_route_returns_hardware_backed_nodes(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/quantastor-nodes")
+        client = AsyncMock()
+        client.fetch_all.return_value = TrueNASRawData(
+            enclosures=[],
+            systems=[
+                {"id": "cluster", "name": "Cluster View", "storageSystemClusterId": "cluster-a"},
+                {"id": "node-a", "name": "QSOSN Left", "hostname": "10.13.37.30", "storageSystemClusterId": "cluster-a"},
+                {"id": "node-b", "name": "QSOSN Right", "hostname": "10.13.37.31", "storageSystemClusterId": "cluster-a", "isMaster": True},
+                {"id": "qs-cryostorage", "name": "QS CryoStorage", "hostname": "10.88.88.30", "storageSystemClusterId": "cluster-a"},
+            ],
+            disks=[],
+            pools=[],
+            pool_devices=[],
+            ha_groups=[],
+            hw_disks=[],
+            hw_enclosures=[
+                {"id": "enc-a", "storageSystemId": "node-a"},
+                {"id": "enc-b", "storageSystemId": "node-b"},
+            ],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+
+        with patch("admin_service.main.QuantastorRESTClient", return_value=client):
+            response = asyncio.run(
+                route.endpoint(
+                    QuantastorNodeDiscoveryRequest(
+                        truenas_host="https://10.13.37.40",
+                        api_user="jbodmap",
+                        api_password="secret",
+                        verify_ssl=False,
+                    )
+                )
+            )
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual([node["system_id"] for node in payload["nodes"]], ["node-a", "node-b"])
+        self.assertEqual(payload["nodes"][1]["host"], "10.13.37.31")
 
     def test_live_enclosures_route_returns_resolved_profile_info(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/storage-views/live-enclosures")

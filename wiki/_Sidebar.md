@@ -18,6 +18,8 @@ Configuration
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 - [[Profiles and Custom Layouts|Profiles-and-Custom-Layouts]]
 - [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
+- [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
 - [[Advanced Configuration|Advanced-Configuration]]
 
 Maintainers

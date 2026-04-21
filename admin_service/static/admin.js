@@ -37,11 +37,21 @@
       || (Array.isArray(bootstrap.systems) && bootstrap.systems[0]?.id)
       || "",
     loadedSystemId: null,
+    sshCommandsAutoPlatform: null,
     sshKeysLoading: false,
     refreshInFlight: false,
     countdownTimerId: null,
     sudoersPreviewTimerId: null,
     sudoersPreviewRequestSeq: 0,
+    haNodes: [],
+    haNodesLoading: false,
+    orphanedHistory: [],
+    orphanedHistoryLoading: false,
+    selectedHistoryAdoptSourceId: "",
+    selectedHistoryAdoptTargetId:
+      (Array.isArray(bootstrap.systems) && bootstrap.systems.find((system) => system.id === bootstrap.default_system_id)?.id)
+      || (Array.isArray(bootstrap.systems) && bootstrap.systems[0]?.id)
+      || "",
   };
 
   const elements = {
@@ -71,6 +81,12 @@
     backupImportRestartToggle: document.getElementById("backup-import-restart-toggle"),
     backupImportButton: document.getElementById("backup-import-button"),
     backupImportResult: document.getElementById("backup-import-result"),
+    historyPurgeOrphanedButton: document.getElementById("history-purge-orphaned-button"),
+    historyPurgeOrphanedResult: document.getElementById("history-purge-orphaned-result"),
+    historyAdoptSourceSelect: document.getElementById("history-adopt-source-select"),
+    historyAdoptTargetSelect: document.getElementById("history-adopt-target-select"),
+    historyAdoptButton: document.getElementById("history-adopt-button"),
+    historyAdoptResult: document.getElementById("history-adopt-result"),
     setupSystemLabel: document.getElementById("setup-system-label"),
     setupSystemId: document.getElementById("setup-system-id"),
     setupPlatform: document.getElementById("setup-platform"),
@@ -102,6 +118,10 @@
     setupTlsImportResult: document.getElementById("setup-tls-import-result"),
     setupSshEnabled: document.getElementById("setup-ssh-enabled"),
     setupSshHost: document.getElementById("setup-ssh-host"),
+    setupHaEnabled: document.getElementById("setup-ha-enabled"),
+    setupHaPanel: document.getElementById("setup-ha-panel"),
+    setupDiscoverHaNodesButton: document.getElementById("setup-discover-ha-nodes-button"),
+    setupHaNodesResult: document.getElementById("setup-ha-nodes-result"),
     setupSshUser: document.getElementById("setup-ssh-user"),
     setupSshPort: document.getElementById("setup-ssh-port"),
     setupSshKeyMode: document.getElementById("setup-ssh-key-mode"),
@@ -145,6 +165,7 @@
     setupStorageViewTemplateSelect: document.getElementById("setup-storage-view-template-select"),
     setupStorageViewProfile: document.getElementById("setup-storage-view-profile"),
     setupStorageViewBindingMode: document.getElementById("setup-storage-view-binding-mode"),
+    setupStorageViewTargetSystem: document.getElementById("setup-storage-view-target-system"),
     setupStorageViewOrder: document.getElementById("setup-storage-view-order"),
     setupStorageViewEnabled: document.getElementById("setup-storage-view-enabled"),
     setupStorageViewShowMain: document.getElementById("setup-storage-view-show-main"),
@@ -174,6 +195,8 @@
     setupResult: document.getElementById("setup-result"),
     existingSystemSelect: document.getElementById("existing-system-select"),
     existingSystemLoadButton: document.getElementById("existing-system-load-button"),
+    existingSystemDeleteButton: document.getElementById("existing-system-delete-button"),
+    existingSystemDeleteHistoryToggle: document.getElementById("existing-system-delete-history-toggle"),
     existingSystemResetButton: document.getElementById("existing-system-reset-button"),
     existingSystemHelp: document.getElementById("existing-system-help"),
     existingSystemSummary: document.getElementById("existing-system-summary"),
@@ -454,6 +477,175 @@
     return state.systems.find((system) => system.id === systemId) || null;
   }
 
+  function renderHistoryMaintenance() {
+    const orphanedSystems = Array.isArray(state.orphanedHistory) ? state.orphanedHistory : [];
+    const savedSystems = Array.isArray(state.systems) ? state.systems : [];
+    const sourceSelect = elements.historyAdoptSourceSelect;
+    const targetSelect = elements.historyAdoptTargetSelect;
+    const adoptButton = elements.historyAdoptButton;
+    const adoptResult = elements.historyAdoptResult;
+
+    if (sourceSelect) {
+      sourceSelect.innerHTML = "";
+      if (!orphanedSystems.length) {
+        sourceSelect.innerHTML = '<option value="">No removed-system history found</option>';
+        sourceSelect.value = "";
+        state.selectedHistoryAdoptSourceId = "";
+      } else {
+        const currentSourceId = orphanedSystems.some((item) => item.system_id === state.selectedHistoryAdoptSourceId)
+          ? state.selectedHistoryAdoptSourceId
+          : orphanedSystems[0].system_id;
+        state.selectedHistoryAdoptSourceId = currentSourceId;
+        sourceSelect.innerHTML = orphanedSystems.map((item) => {
+          const label = item.system_label || item.system_id;
+          const totalRows = Number(item.total_rows || 0);
+          return `<option value="${escapeHtml(item.system_id)}">${escapeHtml(label)} (${totalRows} rows)</option>`;
+        }).join("");
+        sourceSelect.value = currentSourceId;
+      }
+      sourceSelect.disabled = state.orphanedHistoryLoading || !orphanedSystems.length;
+    }
+
+    if (targetSelect) {
+      targetSelect.innerHTML = "";
+      if (!savedSystems.length) {
+        targetSelect.innerHTML = '<option value="">No saved systems available</option>';
+        targetSelect.value = "";
+        state.selectedHistoryAdoptTargetId = "";
+      } else {
+        const currentTargetId = savedSystems.some((item) => item.id === state.selectedHistoryAdoptTargetId)
+          ? state.selectedHistoryAdoptTargetId
+          : (state.defaultSystemId || savedSystems[0].id);
+        state.selectedHistoryAdoptTargetId = currentTargetId;
+        targetSelect.innerHTML = savedSystems.map((item) => (
+          `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label || item.id)}</option>`
+        )).join("");
+        targetSelect.value = currentTargetId;
+      }
+      targetSelect.disabled = state.orphanedHistoryLoading || !savedSystems.length;
+    }
+
+    if (adoptButton) {
+      adoptButton.disabled = state.orphanedHistoryLoading || !orphanedSystems.length || !savedSystems.length;
+    }
+  }
+
+  function currentSetupPlatform() {
+    return String(elements.setupPlatform?.value || "core").toLowerCase();
+  }
+
+  function normalizeHaNode(rawNode) {
+    const systemId = String(rawNode?.system_id || "").trim();
+    const label = String(rawNode?.label || "").trim();
+    const host = String(rawNode?.host || "").trim();
+    if (!systemId && !label && !host) {
+      return null;
+    }
+    return {
+      system_id: systemId || "",
+      label: label || "",
+      host: host || "",
+    };
+  }
+
+  function normalizeHaNodes(rawNodes) {
+    const seen = new Set();
+    return (Array.isArray(rawNodes) ? rawNodes : [])
+      .map((node) => normalizeHaNode(node))
+      .filter(Boolean)
+      .filter((node) => {
+        const dedupeKey = `${node.system_id}::${node.host}`;
+        if (seen.has(dedupeKey)) {
+          return false;
+        }
+        seen.add(dedupeKey);
+        return true;
+      })
+      .slice(0, 3);
+  }
+
+  function haNodeFieldValue(index, kind) {
+    return document.querySelector(`[data-ha-node-${kind}="${index}"]`);
+  }
+
+  function readHaNodesFromInputs() {
+    const rows = [0, 1, 2].map((index) => ({
+      system_id: haNodeFieldValue(index, "system-id")?.value || "",
+      label: haNodeFieldValue(index, "label")?.value || "",
+      host: haNodeFieldValue(index, "host")?.value || "",
+    }));
+    return normalizeHaNodes(rows);
+  }
+
+  function currentQuantastorHaNodes() {
+    return normalizeHaNodes(state.haNodes);
+  }
+
+  function haTargetOptions() {
+    return currentQuantastorHaNodes().map((node, index) => ({
+      system_id: node.system_id || "",
+      label: node.label || node.system_id || node.host || `Node ${index + 1}`,
+      host: node.host || "",
+    })).filter((node) => node.system_id || node.label || node.host);
+  }
+
+  function syncHaNodesFromInputs({ rerenderStorageViews = false } = {}) {
+    state.haNodes = readHaNodesFromInputs();
+    if (rerenderStorageViews) {
+      renderStorageViews();
+    }
+  }
+
+  function renderQuantastorHaSection() {
+    const quantastor = currentSetupPlatform() === "quantastor";
+    const haEnabled = quantastor && Boolean(elements.setupHaEnabled?.checked);
+    if (elements.setupHaEnabled) {
+      elements.setupHaEnabled.disabled = !quantastor;
+    }
+    if (elements.setupHaPanel) {
+      elements.setupHaPanel.classList.toggle("hidden", !haEnabled);
+    }
+    [0, 1, 2].forEach((index) => {
+      const node = currentQuantastorHaNodes()[index] || { system_id: "", label: "", host: "" };
+      const systemIdField = haNodeFieldValue(index, "system-id");
+      const labelField = haNodeFieldValue(index, "label");
+      const hostField = haNodeFieldValue(index, "host");
+      if (systemIdField && systemIdField.value !== node.system_id) {
+        systemIdField.value = node.system_id;
+      }
+      if (labelField && labelField.value !== node.label) {
+        labelField.value = node.label;
+      }
+      if (hostField && hostField.value !== node.host) {
+        hostField.value = node.host;
+      }
+      [systemIdField, labelField, hostField].forEach((field) => {
+        if (field) {
+          field.disabled = !haEnabled;
+        }
+      });
+    });
+    if (elements.setupDiscoverHaNodesButton) {
+      elements.setupDiscoverHaNodesButton.disabled = !haEnabled || state.haNodesLoading;
+    }
+    if (elements.setupHaNodesResult) {
+      if (!quantastor) {
+        elements.setupHaNodesResult.textContent = "This HA-node helper only applies to Quantastor systems.";
+      } else if (!haEnabled) {
+        elements.setupHaNodesResult.textContent = "Enable HA mode when this Quantastor entry should model multiple shared-SES nodes under one cluster-style system.";
+      } else if (state.haNodesLoading) {
+        elements.setupHaNodesResult.textContent = "Inspecting Quantastor node metadata from the current API settings...";
+      } else if (currentQuantastorHaNodes().length) {
+        const nodesMissingHosts = currentQuantastorHaNodes().filter((node) => !node.host).length;
+        elements.setupHaNodesResult.textContent = nodesMissingHosts
+          ? `Loaded ${currentQuantastorHaNodes().length} Quantastor HA node row${currentQuantastorHaNodes().length === 1 ? "" : "s"}. Quantastor did not publish ${nodesMissingHosts} SSH host${nodesMissingHosts === 1 ? "" : "s"}, so fill those node host fields manually when you want node-targeted SSH.`
+          : `Loaded ${currentQuantastorHaNodes().length} Quantastor HA node row${currentQuantastorHaNodes().length === 1 ? "" : "s"}. Shared SSH auth settings above are reused for every listed node host.`;
+      } else {
+        elements.setupHaNodesResult.textContent = "Use up to three HA node rows. Shared SSH auth settings above are reused for every listed node host.";
+      }
+    }
+  }
+
   function ensureExistingSystemSelection() {
     const availableIds = state.systems.map((system) => system.id);
     if (state.selectedExistingSystemId && availableIds.includes(state.selectedExistingSystemId)) {
@@ -636,6 +828,15 @@
     if (elements.existingSystemLoadButton) {
       elements.existingSystemLoadButton.disabled = !selectedSystem;
     }
+    if (elements.existingSystemDeleteButton) {
+      elements.existingSystemDeleteButton.disabled = !selectedSystem;
+    }
+    if (elements.existingSystemDeleteHistoryToggle) {
+      elements.existingSystemDeleteHistoryToggle.disabled = !selectedSystem;
+      if (!selectedSystem) {
+        elements.existingSystemDeleteHistoryToggle.checked = false;
+      }
+    }
     if (elements.existingSystemResetButton) {
       elements.existingSystemResetButton.disabled = !state.loadedSystemId;
     }
@@ -643,9 +844,9 @@
       if (!selectedSystem) {
         elements.existingSystemHelp.textContent = "No saved systems yet. This walkthrough will create the first one.";
       } else if (isEditingLoadedSystem()) {
-        elements.existingSystemHelp.textContent = `Editing ${selectedSystem.label || selectedSystem.id}. Save with the same system id to update it in place, or change the id to make a copy.`;
+        elements.existingSystemHelp.textContent = `Editing ${selectedSystem.label || selectedSystem.id}. Save with the same system id to update it in place, change the id to make a copy, or use Delete + Purge History if you want a fully clean re-add under a new id.`;
       } else {
-        elements.existingSystemHelp.textContent = `Load ${selectedSystem.label || selectedSystem.id} into the form to revise it, compare settings, or clone it into a new system id.`;
+        elements.existingSystemHelp.textContent = `Load ${selectedSystem.label || selectedSystem.id} into the form to revise it, compare settings, clone it into a new system id, delete only the saved config entry, or pair delete with history cleanup when you want a fresh start.`;
       }
     }
     if (elements.existingSystemSummary) {
@@ -655,6 +856,7 @@
             selectedSystem.truenas_host ? `Host: ${selectedSystem.truenas_host}` : null,
             selectedSystem.default_profile_id ? `Profile: ${selectedSystem.default_profile_id}` : "Profile: auto",
             `${Array.isArray(selectedSystem.storage_views) ? selectedSystem.storage_views.length : 0} storage views`,
+            selectedSystem.ha_enabled ? `${Array.isArray(selectedSystem.ha_nodes) ? selectedSystem.ha_nodes.length : 0} HA nodes` : null,
             selectedSystem.verify_ssl ? "TLS verify on" : "TLS verify off",
             selectedSystem.tls_server_name ? `Verify as: ${selectedSystem.tls_server_name}` : null,
             selectedSystem.tls_ca_bundle_path ? "Custom TLS trust bundle" : "System/public trust only",
@@ -671,6 +873,7 @@
             const extra = [
               system.platform,
               `${Array.isArray(system.storage_views) ? system.storage_views.length : 0} views`,
+              system.ha_enabled ? `${Array.isArray(system.ha_nodes) ? system.ha_nodes.length : 0} HA nodes` : null,
               system.ssh_enabled ? "SSH enabled" : "SSH optional",
             ].filter(Boolean).join(" / ");
             const classes = ["pill"];
@@ -1076,10 +1279,21 @@
     return options.join("");
   }
 
+  function storageViewTargetOptionsHtml() {
+    const options = ['<option value="">Follow current live node</option>'];
+    haTargetOptions().filter((node) => node.system_id).forEach((node) => {
+      const detail = node.host ? ` (${node.host})` : "";
+      const value = node.system_id || "";
+      options.push(`<option value="${escapeHtml(value)}">${escapeHtml(`${node.label}${detail}`)}</option>`);
+    });
+    return options.join("");
+  }
+
   function renderStorageViewTemplateOptions() {
     const addOptionsHtml = storageViewAddOptionsHtml();
     const templateOptionsHtml = storageViewTemplateOptionsHtml();
     const profileOptionsHtml = storageViewProfileOptionsHtml();
+    const targetOptionsHtml = storageViewTargetOptionsHtml();
     if (elements.setupStorageViewTemplate) {
       const selectedValue = elements.setupStorageViewTemplate.value || storageViewAddDefaultValue();
       elements.setupStorageViewTemplate.innerHTML = addOptionsHtml;
@@ -1103,6 +1317,14 @@
       );
       elements.setupStorageViewProfile.value = availableValues.has(selectedValue) ? selectedValue : "";
       elements.setupStorageViewProfile.disabled = !state.profiles.length;
+    }
+    if (elements.setupStorageViewTargetSystem) {
+      const selectedValue = elements.setupStorageViewTargetSystem.value || getSelectedStorageView()?.binding?.target_system_id || "";
+      elements.setupStorageViewTargetSystem.innerHTML = targetOptionsHtml;
+      const availableValues = new Set(
+        [...elements.setupStorageViewTargetSystem.options].map((option) => option.value)
+      );
+      elements.setupStorageViewTargetSystem.value = availableValues.has(selectedValue) ? selectedValue : "";
     }
     if (elements.setupStorageViewAddButton) {
       elements.setupStorageViewAddButton.disabled = !elements.setupStorageViewTemplate?.options.length;
@@ -1161,6 +1383,7 @@
     };
     const binding = {
       mode: rawView?.binding?.mode || defaultBinding.mode || "auto",
+      target_system_id: String(rawView?.binding?.target_system_id || defaultBinding.target_system_id || "").trim(),
       enclosure_ids: Array.isArray(rawView?.binding?.enclosure_ids) ? rawView.binding.enclosure_ids.filter(Boolean) : Array.isArray(defaultBinding.enclosure_ids) ? defaultBinding.enclosure_ids.filter(Boolean) : [],
       pool_names: Array.isArray(rawView?.binding?.pool_names) ? rawView.binding.pool_names.filter(Boolean) : Array.isArray(defaultBinding.pool_names) ? defaultBinding.pool_names.filter(Boolean) : [],
       serials: Array.isArray(rawView?.binding?.serials) ? rawView.binding.serials.filter(Boolean) : Array.isArray(defaultBinding.serials) ? defaultBinding.serials.filter(Boolean) : [],
@@ -1169,9 +1392,14 @@
     };
     const slotLabels = normalizeSlotLabelMap(rawView?.layout_overrides?.slot_labels);
     const slotSizes = normalizeSlotSizeMap(rawView?.layout_overrides?.slot_sizes);
+    const rawLabel = rawView?.label;
+    const normalizedLabel =
+      rawLabel === undefined || rawLabel === null || rawLabel === ""
+        ? String(template?.default_label || storageViewId)
+        : String(rawLabel);
     return {
       id: storageViewId,
-      label: String(rawView?.label || template?.default_label || storageViewId).trim(),
+      label: normalizedLabel,
       kind: rawView?.kind || template?.kind || "manual",
       template_id: rawView?.template_id || template?.id || "manual-4",
       profile_id: rawView?.kind === "ses_enclosure" || rawView?.template_id === "ses-auto"
@@ -1381,11 +1609,15 @@
     const profileChip = storageView?.kind === "ses_enclosure" && selectedProfile
       ? `profile: ${selectedProfile.label}${storageView?.profile_id ? "" : " (live fallback)"}`
       : null;
+    const targetNode = storageView?.binding?.target_system_id
+      ? (haTargetOptions().find((node) => node.system_id === storageView.binding.target_system_id)?.label || storageView.binding.target_system_id)
+      : null;
     return [
       storageView ? storageViewKindLabel(storageView) : null,
       template?.label || null,
       `${visibleSlots} slots`,
       storageView?.binding?.mode ? `binding: ${storageView.binding.mode}` : null,
+      targetNode ? `target: ${targetNode}` : null,
       profileChip,
       storageView?.kind === "nvme_carrier" ? "slot 1 nearest PCIe edge" : null,
       template?.supports_auto_discovery ? "auto-discovery" : null,
@@ -1487,6 +1719,15 @@
       elements.setupStorageViewProfile.value = selectedProfile?.id || storageView.profile_id || "";
       elements.setupStorageViewProfile.disabled = storageView.kind !== "ses_enclosure" || !state.profiles.length;
     }
+    if (elements.setupStorageViewTargetSystem) {
+      elements.setupStorageViewTargetSystem.value = storageView.binding?.target_system_id || "";
+      elements.setupStorageViewTargetSystem.disabled = !(
+        currentSetupPlatform() === "quantastor"
+        && Boolean(elements.setupHaEnabled?.checked)
+        && storageView.kind !== "ses_enclosure"
+        && haTargetOptions().length
+      );
+    }
     if (elements.setupStorageViewBindingMode) {
       elements.setupStorageViewBindingMode.value = storageView.binding?.mode || "auto";
     }
@@ -1535,13 +1776,18 @@
       const duplicateLiveEnclosures = storageView.kind === "ses_enclosure"
         ? liveEnclosureMatchesForProfile(storageView.profile_id)
         : [];
+      const targetNode = haTargetOptions().find((node) => node.system_id === storageView.binding?.target_system_id)?.label
+        || storageView.binding?.target_system_id
+        || "";
       elements.setupStorageViewEditorHelp.textContent = storageView.kind === "ses_enclosure"
         ? (duplicateLiveEnclosures.length
           ? `This saved chassis view duplicates the live discovered enclosure${duplicateLiveEnclosures.length === 1 ? "" : "s"} ${duplicateLiveEnclosures.map((enclosure) => enclosure.label).join(", ")}. The live hardware already auto-populates separately, so keep this only if you still want a curated overlay.`
           : storageView.profile_id
             ? "This saved chassis view keeps its own profile-backed layout while the real enclosure still appears separately in runtime discovery."
             : "This legacy saved chassis view follows the current live profile until you pin a specific saved chassis layout here.")
-        : (template?.summary || "The template defines the physical shape. Binding hints decide how disks or enclosures should land inside that shape later.");
+        : (targetNode
+          ? `${template?.summary || "The template defines the physical shape."} Binding hints and candidate matching are currently scoped to ${targetNode}.`
+          : (template?.summary || "The template defines the physical shape. Binding hints decide how disks or enclosures should land inside that shape later."));
     }
     if (elements.setupStorageViewMoveUpButton) {
       elements.setupStorageViewMoveUpButton.disabled = state.storageViews[0]?.id === storageView.id;
@@ -1618,17 +1864,21 @@
     if (!selected) {
       return;
     }
-    mutator(selected);
-    const selectedId = state.selectedStorageViewId;
+    const preferredId = mutator(selected) || selected.id || state.selectedStorageViewId;
     state.storageViews = normalizeStorageViews(state.storageViews);
-    state.selectedStorageViewId = state.storageViews.find((storageView) => storageView.id === selectedId)?.id || state.storageViews[0]?.id || "";
+    state.selectedStorageViewId =
+      state.storageViews.find((storageView) => storageView.id === preferredId)?.id
+      || state.storageViews[0]?.id
+      || "";
     renderStorageViews();
   }
 
   function saveStorageViewEditorToState() {
     updateSelectedStorageView((storageView) => {
       const previousId = storageView.id;
-      storageView.label = elements.setupStorageViewLabel?.value?.trim() || storageView.label;
+      const editedLabel = String(elements.setupStorageViewLabel?.value || "");
+      const existingLabel = String(storageView.label || "");
+      storageView.label = editedLabel || existingLabel;
       storageView.id = uniqueStorageViewId(elements.setupStorageViewId?.value?.trim() || storageView.label, previousId);
       storageView.template_id = elements.setupStorageViewTemplateSelect?.value || storageView.template_id;
       storageView.kind = getStorageViewTemplate(storageView.template_id)?.kind || storageView.kind || "manual";
@@ -1644,6 +1894,7 @@
       };
       storageView.binding = {
         mode: elements.setupStorageViewBindingMode?.value || "auto",
+        target_system_id: elements.setupStorageViewTargetSystem?.value || "",
         enclosure_ids: splitDelimitedLines(elements.setupStorageViewEnclosureIds?.value),
         pool_names: splitDelimitedLines(elements.setupStorageViewPoolNames?.value),
         serials: splitDelimitedLines(elements.setupStorageViewSerials?.value),
@@ -1656,12 +1907,20 @@
         Object.keys(slotLabels).length || Object.keys(slotSizes).length
           ? { slot_labels: slotLabels, slot_sizes: slotSizes }
           : null;
+      return storageView.id;
     });
   }
 
   function currentStorageViewSystemId() {
     const explicitId = state.loadedSystemId || elements.setupSystemId?.value?.trim() || state.selectedExistingSystemId || "";
     return getSystemById(explicitId)?.id || "";
+  }
+
+  function currentStorageViewTargetSystemId(storageView = getSelectedStorageView()) {
+    if (currentSetupPlatform() !== "quantastor") {
+      return "";
+    }
+    return String(storageView?.binding?.target_system_id || "").trim();
   }
 
   function resetLiveEnclosureState() {
@@ -1779,6 +2038,8 @@
     }
     const selectedStorageView = getSelectedStorageView();
     const systemId = currentStorageViewSystemId();
+    const targetSystemId = currentStorageViewTargetSystemId(selectedStorageView);
+    const targetLabel = haTargetOptions().find((node) => node.system_id === targetSystemId)?.label || targetSystemId;
     const availableCandidates = visibleStorageViewCandidates(selectedStorageView);
     const claimedElsewhereCount = state.storageViewCandidates.length - availableCandidates.length;
     elements.setupStorageViewCandidatesAddAllButton.disabled =
@@ -1794,7 +2055,7 @@
       return;
     }
     if (state.storageViewCandidatesLoading) {
-      elements.setupStorageViewCandidatesHelp.textContent = `Inspecting live inventory on ${systemId} for disks that are not already sitting in mapped slots...`;
+      elements.setupStorageViewCandidatesHelp.textContent = `Inspecting live inventory on ${systemId}${targetLabel ? ` for ${targetLabel}` : ""} for disks that are not already sitting in mapped slots...`;
       elements.setupStorageViewCandidatesList.innerHTML = "";
       return;
     }
@@ -1805,9 +2066,9 @@
         return;
       }
       if (claimedElsewhereCount > 0) {
-        elements.setupStorageViewCandidatesHelp.textContent = `All currently discovered unmapped candidates are already attached to other saved storage views on ${systemId}, so this view is intentionally not re-offering them.`;
+        elements.setupStorageViewCandidatesHelp.textContent = `All currently discovered unmapped candidates are already attached to other saved storage views on ${systemId}${targetLabel ? ` for ${targetLabel}` : ""}, so this view is intentionally not re-offering them.`;
       } else {
-        elements.setupStorageViewCandidatesHelp.textContent = `No unmapped inventory candidates were found for ${systemId}. That usually means everything visible is already tied to a slot, or this host needs a manual binding for the next internal group.`;
+        elements.setupStorageViewCandidatesHelp.textContent = `No unmapped inventory candidates were found for ${systemId}${targetLabel ? ` on ${targetLabel}` : ""}. That usually means everything visible is already tied to a slot, or this host needs a manual binding for the next internal group.`;
       }
       elements.setupStorageViewCandidatesList.innerHTML = "";
       return;
@@ -1815,8 +2076,8 @@
     elements.setupStorageViewCandidatesHelp.textContent = selectedStorageView.kind === "ses_enclosure"
       ? `These candidates come from live inventory on ${systemId}, but this saved chassis view already mirrors a separately discovered live enclosure. Candidate shortcuts are usually more useful for virtual internal views.`
       : claimedElsewhereCount > 0
-        ? `These candidates come from live inventory on ${systemId}, exclude disks already sitting in mapped slots, and also hide disks already claimed by a different saved storage view.`
-        : `These candidates come from live inventory on ${systemId} and exclude disks already sitting in mapped slots. Use them as a safer shortcut for internal NVMe or boot-device views.`;
+        ? `These candidates come from live inventory on ${systemId}${targetLabel ? ` for ${targetLabel}` : ""}, exclude disks already sitting in mapped slots, and also hide disks already claimed by a different saved storage view.`
+        : `These candidates come from live inventory on ${systemId}${targetLabel ? ` for ${targetLabel}` : ""} and exclude disks already sitting in mapped slots. Use them as a safer shortcut for internal NVMe or boot-device views.`;
     elements.setupStorageViewCandidatesList.innerHTML = availableCandidates
       .map((candidate) => {
         const attached = candidateBindingAlreadyAttached(candidate, selectedStorageView);
@@ -1854,6 +2115,7 @@
 
   async function fetchStorageViewCandidates({ force = false, quiet = false } = {}) {
     const systemId = currentStorageViewSystemId();
+    const targetSystemId = currentStorageViewTargetSystemId();
     if (!systemId) {
       state.storageViewCandidates = [];
       state.storageViewCandidatesSystemId = null;
@@ -1865,6 +2127,9 @@
     renderStorageViewCandidates();
     try {
       const params = new URLSearchParams({ system_id: systemId });
+      if (targetSystemId) {
+        params.set("target_system_id", targetSystemId);
+      }
       if (force) {
         params.set("force", "true");
       }
@@ -1872,7 +2137,8 @@
       state.storageViewCandidates = Array.isArray(payload.candidates) ? payload.candidates : [];
       state.storageViewCandidatesSystemId = payload.system_id || systemId;
       if (!quiet) {
-        setBanner(`Loaded ${state.storageViewCandidates.length} unmapped inventory candidate${state.storageViewCandidates.length === 1 ? "" : "s"} for ${state.storageViewCandidatesSystemId}.`, "success");
+        const targetSuffix = targetSystemId ? ` targeting ${targetSystemId}` : "";
+        setBanner(`Loaded ${state.storageViewCandidates.length} unmapped inventory candidate${state.storageViewCandidates.length === 1 ? "" : "s"} for ${state.storageViewCandidatesSystemId}${targetSuffix}.`, "success");
       }
     } catch (error) {
       state.storageViewCandidates = [];
@@ -1988,6 +2254,27 @@
     return Array.isArray(commands) ? commands : [];
   }
 
+  function normalizeCommandText(text) {
+    return String(text || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  function commandsTextForPlatform(platform) {
+    return defaultCommands(platform).join("\n");
+  }
+
+  function setRecommendedCommands(platform) {
+    if (!elements.setupSshCommands) {
+      return;
+    }
+    elements.setupSshCommands.value = commandsTextForPlatform(platform);
+    state.sshCommandsAutoPlatform = String(platform || "core").toLowerCase();
+    scheduleSudoersPreviewRefresh(0);
+  }
+
   function syncPlatformHelp() {
     if (!elements.setupPlatformHelp || !elements.setupPlatform) {
       return;
@@ -1999,12 +2286,19 @@
     if (!elements.setupSshCommands || !elements.setupPlatform) {
       return;
     }
-    const currentValue = elements.setupSshCommands.value.trim();
+    const platform = elements.setupPlatform.value || "core";
+    const currentValue = normalizeCommandText(elements.setupSshCommands.value);
     if (!force && currentValue) {
-      return;
+      const previousPlatform = state.sshCommandsAutoPlatform;
+      if (!previousPlatform || previousPlatform === String(platform).toLowerCase()) {
+        return;
+      }
+      const previousRecommended = normalizeCommandText(commandsTextForPlatform(previousPlatform));
+      if (currentValue !== previousRecommended) {
+        return;
+      }
     }
-    elements.setupSshCommands.value = defaultCommands(elements.setupPlatform.value).join("\n");
-    scheduleSudoersPreviewRefresh(0);
+    setRecommendedCommands(platform);
   }
 
   function collectSetupCommands() {
@@ -2367,6 +2661,8 @@
     state.loadedSystemId = null;
     state.selectedProfileId = "";
     state.tlsInspection = null;
+    state.haNodes = [];
+    state.haNodesLoading = false;
     state.storageViews = [];
     state.storageViewCandidates = [];
     state.storageViewCandidatesSystemId = null;
@@ -2415,6 +2711,9 @@
     if (elements.setupSshEnabled) {
       elements.setupSshEnabled.checked = false;
     }
+    if (elements.setupHaEnabled) {
+      elements.setupHaEnabled.checked = false;
+    }
     if (elements.setupSshHost) {
       elements.setupSshHost.value = "";
     }
@@ -2443,7 +2742,7 @@
       elements.setupSshStrictHostKey.checked = true;
     }
     if (elements.setupSshCommands) {
-      elements.setupSshCommands.value = defaultCommands("core").join("\n");
+      setRecommendedCommands("core");
     }
     if (elements.setupBootstrapHost) {
       elements.setupBootstrapHost.value = "";
@@ -2489,6 +2788,7 @@
     renderProfileOptions();
     renderProfilePreview();
     renderProfileCatalog();
+    renderQuantastorHaSection();
     renderStorageViews();
     renderTlsInspection();
     syncSshFields();
@@ -2504,6 +2804,8 @@
     state.loadedSystemId = system.id || null;
     state.selectedExistingSystemId = system.id || state.selectedExistingSystemId;
     state.selectedProfileId = system.default_profile_id || "";
+    state.haNodes = normalizeHaNodes(system.ha_nodes || []);
+    state.haNodesLoading = false;
     replaceStorageViewState(system.storage_views || []);
     if (elements.setupSystemLabel) {
       elements.setupSystemLabel.value = system.label || system.id || "";
@@ -2548,6 +2850,9 @@
     if (elements.setupSshEnabled) {
       elements.setupSshEnabled.checked = Boolean(system.ssh_enabled);
     }
+    if (elements.setupHaEnabled) {
+      elements.setupHaEnabled.checked = Boolean(system.ha_enabled);
+    }
     if (elements.setupSshHost) {
       elements.setupSshHost.value = system.ssh_host || "";
     }
@@ -2571,6 +2876,11 @@
     }
     if (elements.setupSshCommands) {
       elements.setupSshCommands.value = Array.isArray(system.ssh_commands) ? system.ssh_commands.join("\n") : "";
+      const systemPlatform = system.platform || "core";
+      state.sshCommandsAutoPlatform =
+        normalizeCommandText(elements.setupSshCommands.value) === normalizeCommandText(commandsTextForPlatform(systemPlatform))
+          ? String(systemPlatform).toLowerCase()
+          : null;
     }
     if (elements.setupBootstrapHost) {
       elements.setupBootstrapHost.value = "";
@@ -2622,6 +2932,7 @@
     renderTlsServerNameSuggestions();
     renderProfilePreview();
     renderProfileCatalog();
+    renderQuantastorHaSection();
     renderStorageViews();
     renderTlsInspection();
     syncSshFields();
@@ -2654,6 +2965,10 @@
       enclosure_filter: elements.setupEnclosureFilter?.value?.trim() || null,
       ssh_enabled: sshEnabled,
       ssh_host: sshHost,
+      ha_enabled: currentSetupPlatform() === "quantastor" && Boolean(elements.setupHaEnabled?.checked),
+      ha_nodes: currentSetupPlatform() === "quantastor" && Boolean(elements.setupHaEnabled?.checked)
+        ? currentQuantastorHaNodes()
+        : [],
       ssh_port: Number(elements.setupSshPort?.value) || 22,
       ssh_user: sshUser,
       ssh_key_path: elements.setupSshKeyPath?.value?.trim() || null,
@@ -2681,6 +2996,7 @@
           },
           binding: {
             mode: storageView.binding?.mode || "auto",
+            target_system_id: storageView.binding?.target_system_id || null,
             enclosure_ids: Array.isArray(storageView.binding?.enclosure_ids) ? storageView.binding.enclosure_ids : [],
             pool_names: Array.isArray(storageView.binding?.pool_names) ? storageView.binding.pool_names : [],
             serials: Array.isArray(storageView.binding?.serials) ? storageView.binding.serials : [],
@@ -2699,6 +3015,42 @@
       replace_existing: Boolean(state.loadedSystemId && normalizedSystemId === state.loadedSystemId),
       make_default: Boolean(elements.setupMakeDefault?.checked),
     };
+  }
+
+  async function discoverQuantastorHaNodes() {
+    if (currentSetupPlatform() !== "quantastor" || !elements.setupHaEnabled?.checked) {
+      setBanner("Enable Quantastor HA mode first so the discovered node list has somewhere to land.", "error");
+      return;
+    }
+    state.haNodesLoading = true;
+    renderQuantastorHaSection();
+    renderStorageViews();
+    try {
+      const payload = await fetchJson("/api/admin/system-setup/quantastor-nodes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          truenas_host: elements.setupTruenasHost?.value?.trim() || "",
+          api_user: elements.setupApiUser?.value?.trim() || "",
+          api_password: elements.setupApiPassword?.value || "",
+          verify_ssl: Boolean(elements.setupVerifySsl?.checked),
+          tls_ca_bundle_path: elements.setupTlsCaBundlePath?.value?.trim() || null,
+          tls_server_name: collectTlsServerName() || null,
+        }),
+      });
+      state.haNodes = normalizeHaNodes(payload.nodes || []);
+      renderQuantastorHaSection();
+      renderStorageViews();
+      setBanner(
+        `Loaded ${state.haNodes.length} Quantastor HA node row${state.haNodes.length === 1 ? "" : "s"} from the appliance API.`,
+        "success"
+      );
+    } catch (error) {
+      setBanner(`Unable to load Quantastor HA nodes: ${error.message || error}`, "error");
+    } finally {
+      state.haNodesLoading = false;
+      renderQuantastorHaSection();
+    }
   }
 
   function resolveBootstrapServiceKey() {
@@ -2993,6 +3345,7 @@
       state.runtime = payload.runtime || { available: false, detail: null, containers: [] };
       state.backupDefaults = payload.backup_defaults || state.backupDefaults;
       state.paths = payload.paths || state.paths;
+      await loadOrphanedHistory({ quiet: true, render: false });
       renderAll();
       if (state.loadedSystemId) {
         void fetchLiveEnclosures({ quiet: true });
@@ -3147,6 +3500,139 @@
       if (elements.backupImportButton) {
         elements.backupImportButton.disabled = false;
       }
+    }
+  }
+
+  async function purgeOrphanedHistory() {
+    if (elements.historyPurgeOrphanedButton) {
+      elements.historyPurgeOrphanedButton.disabled = true;
+    }
+    if (elements.historyPurgeOrphanedResult) {
+      elements.historyPurgeOrphanedResult.textContent = "Scanning for orphaned history rows...";
+    }
+    try {
+      const payload = await fetchJson("/api/admin/history/purge-orphaned", {
+        method: "POST",
+      });
+      await loadOrphanedHistory({ quiet: true });
+      if (elements.historyPurgeOrphanedResult) {
+        elements.historyPurgeOrphanedResult.textContent = payload.detail || "Orphaned history scan finished.";
+      }
+      if (Number(payload.summary?.total_rows || 0) > 0) {
+        setBanner("Purged orphaned history rows for removed systems.", "success");
+      } else {
+        setBanner("No orphaned history rows matched the current config.", "info");
+      }
+    } catch (error) {
+      if (elements.historyPurgeOrphanedResult) {
+        elements.historyPurgeOrphanedResult.textContent = `Orphaned history purge failed: ${error.message || error}`;
+      }
+      setBanner(`Orphaned history purge failed: ${error.message || error}`, "error");
+    } finally {
+      if (elements.historyPurgeOrphanedButton) {
+        elements.historyPurgeOrphanedButton.disabled = false;
+      }
+    }
+  }
+
+  async function loadOrphanedHistory({ quiet = false, render = true } = {}) {
+    state.orphanedHistoryLoading = true;
+    if (elements.historyAdoptButton) {
+      elements.historyAdoptButton.disabled = true;
+    }
+    if (elements.historyAdoptResult && !quiet) {
+      elements.historyAdoptResult.textContent = "Scanning for removed-system history that can be adopted...";
+    }
+    try {
+      const payload = await fetchJson("/api/admin/history/orphaned");
+      state.orphanedHistory = Array.isArray(payload.orphaned_systems) ? payload.orphaned_systems : [];
+      if (elements.historyAdoptResult) {
+        elements.historyAdoptResult.textContent = state.orphanedHistory.length
+          ? "Pick one removed system id and one current saved system id to rewrite the saved history ownership."
+          : "No orphaned history rows are available to adopt right now.";
+      }
+      if (render) {
+        renderHistoryMaintenance();
+      }
+    } catch (error) {
+      state.orphanedHistory = [];
+      if (elements.historyAdoptResult) {
+        elements.historyAdoptResult.textContent = `Unable to inspect removed-system history: ${error.message || error}`;
+      }
+      if (!quiet) {
+        setBanner(`Unable to inspect removed-system history: ${error.message || error}`, "error");
+      }
+    } finally {
+      state.orphanedHistoryLoading = false;
+      if (render) {
+        renderHistoryMaintenance();
+      }
+    }
+  }
+
+  async function adoptRemovedSystemHistory() {
+    const sourceSystem = (Array.isArray(state.orphanedHistory) ? state.orphanedHistory : []).find(
+      (item) => item.system_id === (elements.historyAdoptSourceSelect?.value || state.selectedHistoryAdoptSourceId)
+    );
+    const targetSystem = getSystemById(elements.historyAdoptTargetSelect?.value || state.selectedHistoryAdoptTargetId);
+    if (!sourceSystem) {
+      setBanner("Choose removed-system history to adopt first.", "error");
+      return;
+    }
+    if (!targetSystem) {
+      setBanner("Choose the saved system that should own the adopted history.", "error");
+      return;
+    }
+
+    const confirmation = window.confirm(
+      `Adopt saved history from ${sourceSystem.system_label || sourceSystem.system_id} into ${targetSystem.label || targetSystem.id}?\n\nThis rewrites the saved history ownership from the removed system id into the selected saved system id.`
+    );
+    if (!confirmation) {
+      return;
+    }
+
+    if (elements.historyAdoptButton) {
+      elements.historyAdoptButton.disabled = true;
+    }
+    if (elements.historyAdoptSourceSelect) {
+      elements.historyAdoptSourceSelect.disabled = true;
+    }
+    if (elements.historyAdoptTargetSelect) {
+      elements.historyAdoptTargetSelect.disabled = true;
+    }
+    if (elements.historyAdoptResult) {
+      elements.historyAdoptResult.textContent = `Adopting ${sourceSystem.system_label || sourceSystem.system_id} into ${targetSystem.label || targetSystem.id}...`;
+    }
+
+    try {
+      const payload = await fetchJson("/api/admin/history/adopt-removed-system", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source_system_id: sourceSystem.system_id,
+          target_system_id: targetSystem.id,
+        }),
+      });
+      state.orphanedHistory = Array.isArray(payload.orphaned_systems) ? payload.orphaned_systems : [];
+      state.selectedHistoryAdoptSourceId = state.orphanedHistory[0]?.system_id || "";
+      state.selectedHistoryAdoptTargetId = targetSystem.id;
+      renderHistoryMaintenance();
+      if (elements.historyAdoptResult) {
+        elements.historyAdoptResult.textContent = payload.detail || "Removed-system history adopted.";
+      }
+      setBanner(
+        Number(payload.summary?.total_rows || 0) > 0
+          ? `Adopted saved history from ${sourceSystem.system_label || sourceSystem.system_id} into ${targetSystem.label || targetSystem.id}.`
+          : `No saved history rows matched ${sourceSystem.system_id}.`,
+        Number(payload.summary?.total_rows || 0) > 0 ? "success" : "info"
+      );
+    } catch (error) {
+      if (elements.historyAdoptResult) {
+        elements.historyAdoptResult.textContent = `History adoption failed: ${error.message || error}`;
+      }
+      setBanner(`History adoption failed: ${error.message || error}`, "error");
+    } finally {
+      renderHistoryMaintenance();
     }
   }
 
@@ -3312,14 +3798,113 @@
     }
   }
 
+  async function deleteSelectedSystem() {
+    const selectedSystem = getSystemById(elements.existingSystemSelect?.value || state.selectedExistingSystemId);
+    if (!selectedSystem) {
+      setBanner("Choose a saved system first.", "error");
+      return;
+    }
+
+    const deletingLoadedSystem = selectedSystem.id === state.loadedSystemId;
+    const deletingDefaultSystem = selectedSystem.id === state.defaultSystemId;
+    const purgeHistory = Boolean(elements.existingSystemDeleteHistoryToggle?.checked);
+    const warningBits = [
+      deletingLoadedSystem ? "It is currently loaded into the editor." : null,
+      deletingDefaultSystem ? "It is the current default system." : null,
+      "This removes the saved config entry from config.yaml.",
+      purgeHistory ? "This also purges matching rows from the history sidecar database." : null,
+    ].filter(Boolean);
+    const confirmation = window.confirm(
+      `Delete ${selectedSystem.label || selectedSystem.id}?\n\n${warningBits.join(" ")}`
+    );
+    if (!confirmation) {
+      return;
+    }
+
+    if (elements.existingSystemDeleteButton) {
+      elements.existingSystemDeleteButton.disabled = true;
+    }
+    if (elements.existingSystemDeleteHistoryToggle) {
+      elements.existingSystemDeleteHistoryToggle.disabled = true;
+    }
+    if (elements.setupResult) {
+      elements.setupResult.textContent = purgeHistory
+        ? `Deleting ${selectedSystem.label || selectedSystem.id} and purging matching history rows...`
+        : `Deleting ${selectedSystem.label || selectedSystem.id} from the saved config...`;
+    }
+
+    try {
+      const params = new URLSearchParams();
+      if (purgeHistory) {
+        params.set("purge_history", "true");
+      }
+      const payload = await fetchJson(
+        `/api/admin/system-setup/${encodeURIComponent(selectedSystem.id)}${params.size ? `?${params.toString()}` : ""}`,
+        {
+          method: "DELETE",
+        }
+      );
+      state.systems = Array.isArray(payload.systems) ? payload.systems : [];
+      state.defaultSystemId = payload.default_system_id || null;
+      state.runtime = payload.runtime || state.runtime;
+
+      if (deletingLoadedSystem) {
+        resetSetupForm();
+      } else {
+        if (state.selectedExistingSystemId === selectedSystem.id) {
+          state.selectedExistingSystemId = state.defaultSystemId || state.systems[0]?.id || "";
+        }
+        renderAll();
+      }
+
+      if (elements.setupResult) {
+        elements.setupResult.textContent = payload.detail || `Removed ${payload.deleted_label || selectedSystem.label || selectedSystem.id}. Restart the read UI when you are ready to drop it from the live runtime list too.`;
+      }
+      if (elements.existingSystemDeleteHistoryToggle) {
+        elements.existingSystemDeleteHistoryToggle.checked = false;
+      }
+      if (payload.history_purge?.requested && !payload.history_purge.ok) {
+        setBanner(
+          `Deleted system ${payload.deleted_label || selectedSystem.label || selectedSystem.id}, but ${payload.history_purge.detail || "saved history purge failed"}`,
+          "error"
+        );
+      } else if (payload.history_purge?.requested) {
+        const suffix = Number(payload.history_purge.summary?.total_rows || 0) > 0
+          ? " and purged matching history"
+          : " and found no matching saved history";
+        setBanner(`Deleted system ${payload.deleted_label || selectedSystem.label || selectedSystem.id}${suffix}.`, "success");
+      } else {
+        setBanner(`Deleted system ${payload.deleted_label || selectedSystem.label || selectedSystem.id}.`, "success");
+      }
+    } catch (error) {
+      if (elements.setupResult) {
+        elements.setupResult.textContent = `System delete failed: ${error.message || error}`;
+      }
+      setBanner(`System delete failed: ${error.message || error}`, "error");
+    } finally {
+      const currentSelectedSystem = getSystemById(elements.existingSystemSelect?.value || state.selectedExistingSystemId);
+      if (elements.existingSystemDeleteButton) {
+        elements.existingSystemDeleteButton.disabled = !currentSelectedSystem;
+      }
+      if (elements.existingSystemDeleteHistoryToggle) {
+        elements.existingSystemDeleteHistoryToggle.disabled = !currentSelectedSystem;
+        if (!currentSelectedSystem) {
+          elements.existingSystemDeleteHistoryToggle.checked = false;
+        }
+      }
+    }
+  }
+
   function renderAll() {
     updateAdminMeta();
     renderBackupPaths();
+    renderHistoryMaintenance();
     renderRuntimeCards();
     renderExistingSystems();
     renderProfileOptions();
     renderProfilePreview();
     renderProfileCatalog();
+    renderQuantastorHaSection();
     renderStorageViews();
     syncPlatformHelp();
     syncVerifySslHelp();
@@ -3369,10 +3954,24 @@
     elements.backupImportButton?.addEventListener("click", () => {
       void importBackup();
     });
+    elements.historyPurgeOrphanedButton?.addEventListener("click", () => {
+      void purgeOrphanedHistory();
+    });
+    elements.historyAdoptButton?.addEventListener("click", () => {
+      void adoptRemovedSystemHistory();
+    });
+    elements.historyAdoptSourceSelect?.addEventListener("change", () => {
+      state.selectedHistoryAdoptSourceId = elements.historyAdoptSourceSelect?.value || "";
+    });
+    elements.historyAdoptTargetSelect?.addEventListener("change", () => {
+      state.selectedHistoryAdoptTargetId = elements.historyAdoptTargetSelect?.value || "";
+    });
 
     elements.setupPlatform?.addEventListener("change", () => {
       syncPlatformHelp();
       maybeLoadRecommendedCommands();
+      renderQuantastorHaSection();
+      renderStorageViews();
       updateCreateButton();
       scheduleSudoersPreviewRefresh();
     });
@@ -3425,6 +4024,20 @@
       renderProfileCatalog();
       renderStorageViews();
     });
+    elements.setupHaEnabled?.addEventListener("change", () => {
+      renderQuantastorHaSection();
+      renderStorageViews();
+    });
+    elements.setupDiscoverHaNodesButton?.addEventListener("click", () => {
+      void discoverQuantastorHaNodes();
+    });
+    document.querySelectorAll("[data-ha-node-system-id], [data-ha-node-label], [data-ha-node-host]").forEach((field) => {
+      const eventName = field.matches("select") ? "change" : "input";
+      field.addEventListener(eventName, () => {
+        syncHaNodesFromInputs({ rerenderStorageViews: true });
+        renderQuantastorHaSection();
+      });
+    });
     elements.profileCatalog?.addEventListener("click", (event) => {
       const card = event.target.closest("[data-profile-id]");
       if (!card || !elements.setupProfile) {
@@ -3476,6 +4089,7 @@
       elements.setupStorageViewTemplateSelect,
       elements.setupStorageViewProfile,
       elements.setupStorageViewBindingMode,
+      elements.setupStorageViewTargetSystem,
       elements.setupStorageViewOrder,
       elements.setupStorageViewEnabled,
       elements.setupStorageViewShowMain,
@@ -3503,6 +4117,9 @@
     });
     elements.existingSystemLoadButton?.addEventListener("click", () => {
       loadSystemIntoForm(getSystemById(elements.existingSystemSelect?.value || state.selectedExistingSystemId));
+    });
+    elements.existingSystemDeleteButton?.addEventListener("click", () => {
+      void deleteSelectedSystem();
     });
     elements.existingSystemResetButton?.addEventListener("click", resetSetupForm);
     elements.currentSystemsList?.addEventListener("click", (event) => {
@@ -3538,6 +4155,7 @@
       scheduleSudoersPreviewRefresh();
     });
     elements.setupSshCommands?.addEventListener("input", () => {
+      state.sshCommandsAutoPlatform = null;
       scheduleSudoersPreviewRefresh();
     });
     elements.setupSshKeyMode?.addEventListener("change", syncKeyMode);
@@ -3639,6 +4257,7 @@
 
   bindEvents();
   renderAll();
+  void loadOrphanedHistory({ quiet: true });
   maybeLoadRecommendedCommands();
   startCountdownTimer();
 })();

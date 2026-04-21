@@ -35,6 +35,23 @@ git push
 - review changes in normal PRs
 - publish to GitHub Wiki after the docs look right
 
+## Refresh Screenshots Before A Release-Oriented Publish
+
+If the release changed operator-facing flows, regenerate the tracked screenshot
+set before you copy `wiki/images/` into the GitHub wiki repo.
+
+From the repo root in PowerShell:
+
+```powershell
+$env:SCREENSHOT_TAG='v0.11.0'
+.\.venv\Scripts\python.exe scripts\capture_readme_screenshots.py
+.\.venv\Scripts\python.exe scripts\capture_history_export_screenshots.py
+.\.venv\Scripts\python.exe scripts\capture_release_workflow_screenshots.py
+```
+
+That refreshes the repo screenshots under `docs/images/screenshots/` and the
+wiki-facing copies under `wiki/images/`.
+
 ## Good Times To Refresh The Wiki
 
 - after a release

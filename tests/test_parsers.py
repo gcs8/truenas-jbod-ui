@@ -456,6 +456,126 @@ Enclosure status diagnostic page:
         self.assertEqual(parsed["bytes_read"], 302427648)
         self.assertIsNone(parsed["annualized_bytes_written"])
 
+    def test_parse_smartctl_summary_extracts_ata_host_counters_with_32mib_units(self) -> None:
+        output = """
+{
+  "device": {"protocol": "ATA"},
+  "power_on_time": {"hours": 61405},
+  "logical_block_size": 512,
+  "ata_smart_attributes": {
+    "table": [
+      {"id": 241, "name": "Host_Writes_32MiB", "raw": {"value": 6139}},
+      {"id": 242, "name": "Host_Reads_32MiB", "raw": {"value": 5882}}
+    ]
+  }
+}
+""".strip()
+
+        parsed = parse_smartctl_summary(output)
+
+        self.assertEqual(parsed["bytes_written"], 205990658048)
+        self.assertEqual(parsed["bytes_read"], 197367169024)
+        self.assertEqual(parsed["annualized_bytes_written"], 29386502149)
+
+    def test_parse_smartctl_summary_prefers_ata_device_statistics_over_vendor_host_units(self) -> None:
+        output = """
+{
+  "device": {"protocol": "ATA"},
+  "logical_block_size": 512,
+  "power_on_time": {"hours": 61405},
+  "ata_smart_attributes": {
+    "table": [
+      {"id": 241, "name": "Host_Writes_32MiB", "raw": {"value": 6139}},
+      {"id": 242, "name": "Host_Reads_32MiB", "raw": {"value": 5882}}
+    ]
+  },
+  "ata_device_statistics": {
+    "pages": [
+      {
+        "number": 1,
+        "name": "General Statistics",
+        "revision": 2,
+        "table": [
+          {"offset": 24, "name": "Logical Sectors Written", "size": 6, "value": 4286460901},
+          {"offset": 40, "name": "Logical Sectors Read", "size": 6, "value": 3747432196}
+        ]
+      }
+    ]
+  }
+}
+""".strip()
+
+        parsed = parse_smartctl_summary(output)
+
+        self.assertEqual(parsed["bytes_written"], 2194667981312)
+        self.assertEqual(parsed["bytes_read"], 1918685284352)
+
+    def test_parse_smartctl_summary_extracts_ata_endurance_and_command_counters(self) -> None:
+        output = """
+{
+  "device": {"protocol": "ATA"},
+  "logical_block_size": 512,
+  "power_on_time": {"hours": 1000},
+  "ata_smart_attributes": {
+    "table": [
+      {"id": 12, "name": "Power_Cycle_Count", "raw": {"value": 33}},
+      {"id": 199, "name": "UDMA_CRC_Error_Count", "raw": {"value": 2}},
+      {"id": 232, "name": "Available_Reservd_Space", "raw": {"value": 90}}
+    ]
+  },
+  "ata_device_statistics": {
+    "pages": [
+      {
+        "number": 1,
+        "name": "General Statistics",
+        "revision": 2,
+        "table": [
+          {"offset": 8, "name": "Lifetime Power-On Resets", "size": 4, "value": 12},
+          {"offset": 24, "name": "Logical Sectors Written", "size": 6, "value": 1024},
+          {"offset": 32, "name": "Number of Write Commands", "size": 6, "value": 900},
+          {"offset": 40, "name": "Logical Sectors Read", "size": 6, "value": 2048},
+          {"offset": 48, "name": "Number of Read Commands", "size": 6, "value": 450}
+        ]
+      },
+      {
+        "number": 6,
+        "name": "Transport Statistics",
+        "revision": 1,
+        "table": [
+          {"offset": 8, "name": "Number of Hardware Resets", "size": 4, "value": 5},
+          {"offset": 24, "name": "Number of Interface CRC Errors", "size": 4, "value": 2}
+        ]
+      },
+      {
+        "number": 7,
+        "name": "Solid State Device Statistics",
+        "revision": 1,
+        "table": [
+          {"offset": 8, "name": "Percentage Used Endurance Indicator", "size": 1, "value": 10}
+        ]
+      }
+    ]
+  }
+}
+""".strip()
+
+        parsed = parse_smartctl_summary(output)
+
+        self.assertEqual(parsed["power_cycle_count"], 33)
+        self.assertEqual(parsed["power_on_resets"], 12)
+        self.assertEqual(parsed["available_spare_percent"], 90)
+        self.assertEqual(parsed["endurance_used_percent"], 10)
+        self.assertEqual(parsed["endurance_remaining_percent"], 90)
+        self.assertEqual(parsed["bytes_written"], 524288)
+        self.assertEqual(parsed["bytes_read"], 1048576)
+        self.assertEqual(parsed["annualized_bytes_written"], 4592762)
+        self.assertEqual(parsed["estimated_lifetime_bytes_written"], 5242880)
+        self.assertEqual(parsed["estimated_remaining_bytes_written"], 4718592)
+        self.assertEqual(parsed["write_commands"], 900)
+        self.assertEqual(parsed["read_commands"], 450)
+        self.assertEqual(parsed["hardware_resets"], 5)
+        self.assertEqual(parsed["interface_crc_errors"], 2)
+
     def test_parse_smartctl_summary_extracts_scsi_self_test_history(self) -> None:
         output = """
 {
@@ -529,6 +649,7 @@ Enclosure status diagnostic page:
         output = """
 === START OF INFORMATION SECTION ===
 SMART overall-health self-assessment test result: PASSED
+TRIM Command: Available, deterministic, zeroed
 SATA Version is: SATA 3.1, 6.0 Gb/s (current: 6.0 Gb/s)
 Rd look-ahead is: Enabled
 Write cache is: Enabled
@@ -538,6 +659,7 @@ Write cache is: Enabled
 
         self.assertTrue(parsed["available"])
         self.assertEqual(parsed["smart_health_status"], "PASSED")
+        self.assertTrue(parsed["trim_supported"])
         self.assertEqual(parsed["protocol_version"], "SATA 3.1, 6.0 Gb/s")
         self.assertEqual(parsed["negotiated_link_rate"], "6.0 Gb/s")
         self.assertTrue(parsed["read_cache_enabled"])

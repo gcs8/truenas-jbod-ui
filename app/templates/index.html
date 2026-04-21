@@ -317,6 +317,7 @@
         <p class="eyebrow">Slot History</p>
         <h2 id="history-drawer-title">Slot History</h2>
         <p id="detail-history-summary" class="subtle history-drawer-subtitle"></p>
+        <div id="detail-history-note" class="warning-item compact hidden"></div>
       </div>
       <div class="history-drawer-actions">
         <p id="history-drawer-context" class="subtle history-drawer-context"></p>
@@ -364,16 +365,16 @@
           <section class="history-card">
             <div class="history-card-header">
               <div class="history-card-title-row">
-                <h4>Read / Write History</h4>
+                <h4>Read / Write Counters</h4>
                 <div id="history-io-mode-toggle" class="history-chart-toggle" role="group" aria-label="Read and write chart mode">
-                  <button class="history-chart-toggle-button active" type="button" data-history-io-mode="total">Total</button>
-                  <button class="history-chart-toggle-button" type="button" data-history-io-mode="average">Average</button>
+                  <button class="history-chart-toggle-button active" type="button" data-history-io-mode="total">Lifetime</button>
+                  <button class="history-chart-toggle-button" type="button" data-history-io-mode="average">Rate</button>
                 </div>
               </div>
               <span id="history-io-label" class="subtle"></span>
             </div>
             <div id="history-io-chart" class="history-chart-empty">
-              Read and write history will appear here when those slower samples are collected.
+              Read and write lifetime counters will appear here when those slower SMART samples are collected.
             </div>
           </section>
         </div>

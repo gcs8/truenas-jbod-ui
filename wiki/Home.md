@@ -29,6 +29,7 @@ If you want to really tune things, use:
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[Advanced Configuration|Advanced-Configuration]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 
 If something is wrong, use:
@@ -74,15 +75,12 @@ It gives you:
 
 ## Current Direction
 
-- `0.4.0` shipped the chassis/profile release
-- `0.5.0` shipped first-pass OSNexus Quantastor support
-- `0.6.0` shipped UniFi UNVR-family support plus safer SSH/API defaults
-- `0.7.0` shipped layout polish, better topology wording, refreshed
-  screenshots, and release cleanup for the current validated platform set
-- `0.8.0` shipped the optional history sidecar, the wide slot-history drawer
-  in the main UI, and frozen offline snapshot export
-- `0.9.0` ships practical perf instrumentation, cache-first switching,
-  browser QA coverage, and broader reusable chassis profiles ahead of `1.0`
+- `0.10.0` shipped the admin sidecar, the grouped storage-view setup flow,
+  broader in-repo/wiki release documentation, and the first public
+  storage-view history/export walkthrough
+- `0.11.0` ships Quantastor HA-node modeling, inventory-bound storage-view
+  parity for history and SMART detail, and the admin maintenance actions for
+  purging or adopting saved history after system deletes or renames
 
 ## Visual Walkthrough
 
@@ -95,3 +93,5 @@ That page shows:
 - the live history drawer on a populated slot
 - the export snapshot dialog with live size estimates
 - the frozen offline snapshot HTML after export
+- the maintenance/recovery follow-up lives on
+  [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]

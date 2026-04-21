@@ -34,6 +34,9 @@ class HistoryDomainTests(unittest.TestCase):
             pool_name="tank",
             vdev_name="raidz2-0",
             health="ONLINE",
+            persistent_id_label="GPTID",
+            logical_unit_id="0x5000cca27c7f1111",
+            sas_address="0x5000cca27c7f1111",
         )
         current = SlotStateRecord(
             system_id="archive-core",
@@ -53,6 +56,9 @@ class HistoryDomainTests(unittest.TestCase):
             pool_name="tank",
             vdev_name="spare-0",
             health="DEGRADED",
+            persistent_id_label="WWN",
+            logical_unit_id="0x5000cca27c7f2229",
+            sas_address="0x5000cca27c7f2229",
             topology_label="tank > spare-0",
             multipath_device="multipath/disk12",
             multipath_mode="Active/Passive",
@@ -77,6 +83,11 @@ class HistoryDomainTests(unittest.TestCase):
                 "slot_multipath_changed",
             },
         )
+        identity_event = next(event for event in events if event.event_type == "slot_identity_changed")
+        self.assertEqual(identity_event.gptid, "gptid/new")
+        self.assertEqual(identity_event.persistent_id_label, "WWN")
+        self.assertEqual(identity_event.logical_unit_id, "0x5000cca27c7f2229")
+        self.assertEqual(identity_event.sas_address, "0x5000cca27c7f2229")
 
 
 class HistoryStoreTests(unittest.TestCase):
@@ -97,10 +108,13 @@ class HistoryStoreTests(unittest.TestCase):
             device_name="da5",
             serial="SERIAL-5",
             model="Drive 5",
-            gptid="gptid/5",
+            gptid="eui.000000000000001000a075012b91c7cf",
             pool_name="tank",
             vdev_name="raidz2-0",
             health="ONLINE",
+            persistent_id_label="EUI64",
+            logical_unit_id="0x5000cca27c7f0005",
+            sas_address="0x5000cca27c7f1005",
         )
 
         store.upsert_slot_state(record, "2026-04-16T22:05:00+00:00")
@@ -126,22 +140,797 @@ class HistoryStoreTests(unittest.TestCase):
                     serial="SERIAL-5",
                     model="Drive 5",
                     state="healthy",
+                    gptid="eui.000000000000001000a075012b91c7cf",
+                    persistent_id_label="EUI64",
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
                 )
             ]
         )
 
+        loaded = store.get_slot_state("archive-core", "enc-a", 5)
         events = store.list_slot_events("archive-core", "enc-a", 5)
         samples = store.list_metric_samples("archive-core", "enc-a", 5, metric_name="temperature_c")
         scopes = store.list_scopes()
         counts = store.counts()
 
+        self.assertIsNotNone(loaded)
         self.assertEqual(len(events), 1)
         self.assertEqual(len(samples), 1)
         self.assertEqual(samples[0]["value"], 31)
+        self.assertEqual(samples[0]["gptid"], "eui.000000000000001000a075012b91c7cf")
+        self.assertEqual(samples[0]["persistent_id_label"], "EUI64")
+        self.assertEqual(samples[0]["logical_unit_id"], "0x5000cca27c7f0005")
+        self.assertEqual(samples[0]["sas_address"], "0x5000cca27c7f1005")
+        self.assertEqual(events[0]["gptid"], "eui.000000000000001000a075012b91c7cf")
+        self.assertEqual(events[0]["persistent_id_label"], "EUI64")
+        self.assertEqual(events[0]["logical_unit_id"], "0x5000cca27c7f0005")
+        self.assertEqual(events[0]["sas_address"], "0x5000cca27c7f1005")
+        self.assertEqual(loaded.gptid, "eui.000000000000001000a075012b91c7cf")
+        self.assertEqual(loaded.persistent_id_label, "EUI64")
+        self.assertEqual(loaded.logical_unit_id, "0x5000cca27c7f0005")
+        self.assertEqual(loaded.sas_address, "0x5000cca27c7f1005")
         self.assertEqual(len(scopes), 1)
         self.assertEqual(counts["tracked_slots"], 1)
         self.assertEqual(counts["event_count"], 1)
         self.assertEqual(counts["metric_sample_count"], 1)
+
+    def test_get_slot_history_bundle_auto_follows_matching_disk_metrics_across_homes(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        persistent_id = "eui.000000000000001000a075012b91c7cf"
+        legacy_record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid=persistent_id,
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+            persistent_id_label="EUI64",
+            logical_unit_id="0x5000cca27c7f0005",
+            sas_address="0x5000cca27c7f1005",
+        )
+        current_record = SlotStateRecord(
+            system_id="archive-scale",
+            system_label="Archive SCALE",
+            enclosure_key="enc-b",
+            enclosure_id="enc-b",
+            enclosure_label="Rear Shelf",
+            slot=11,
+            slot_label="11",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="sdm",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid=persistent_id,
+            pool_name="tank",
+            vdev_name="mirror-1",
+            health="ONLINE",
+            persistent_id_label="EUI64",
+            logical_unit_id="0x5000cca27c7f0005",
+            sas_address="0x5000cca27c7f1005",
+        )
+
+        store.upsert_slot_state(legacy_record, "2026-04-10T22:00:00+00:00")
+        store.upsert_slot_state(current_record, "2026-04-20T22:00:00+00:00")
+        store.insert_events(
+            build_slot_events(
+                current_record,
+                replace(current_record, health="DEGRADED"),
+                "2026-04-20T23:00:00+00:00",
+            )
+        )
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-10T23:00:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name="bytes_written",
+                    value_integer=100,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                    gptid=persistent_id,
+                    persistent_id_label="EUI64",
+                    disk_identity_key=legacy_record.disk_identity_key,
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
+                ),
+                MetricSample(
+                    observed_at="2026-04-20T23:00:00+00:00",
+                    system_id="archive-scale",
+                    system_label="Archive SCALE",
+                    enclosure_key="enc-b",
+                    enclosure_id="enc-b",
+                    enclosure_label="Rear Shelf",
+                    slot=11,
+                    slot_label="11",
+                    metric_name="bytes_written",
+                    value_integer=200,
+                    value_real=None,
+                    device_name="sdm",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                    gptid=persistent_id,
+                    persistent_id_label="EUI64",
+                    disk_identity_key=current_record.disk_identity_key,
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
+                ),
+            ]
+        )
+        with sqlite3.connect(store.file_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO metric_samples (
+                    observed_at,
+                    system_id,
+                    system_label,
+                    enclosure_key,
+                    enclosure_id,
+                    enclosure_label,
+                    slot,
+                    slot_label,
+                    metric_name,
+                    value_integer,
+                    value_real,
+                    device_name,
+                    serial,
+                    model,
+                    state,
+                    gptid,
+                    persistent_id_label,
+                    disk_identity_key,
+                    logical_unit_id,
+                    sas_address
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "2026-04-20T22:30:00+00:00",
+                    "archive-scale",
+                    "Archive SCALE",
+                    "enc-b",
+                    "enc-b",
+                    "Rear Shelf",
+                    11,
+                    "11",
+                    "bytes_written",
+                    150,
+                    None,
+                    "sdm",
+                    "SERIAL-5",
+                    "Drive 5",
+                    "healthy",
+                    persistent_id,
+                    "EUI64",
+                    None,
+                    "0x5000cca27c7f0005",
+                    "0x5000cca27c7f1005",
+                ),
+            )
+
+        payload = store.get_slot_history_bundle(
+            "archive-scale",
+            "enc-b",
+            11,
+            metric_limits={"bytes_written": 10},
+        )
+
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertEqual(
+            [sample["value"] for sample in payload["metrics"]["bytes_written"]],
+            [200, 150, 100],
+        )
+        self.assertTrue(payload["disk_history"]["identity_available"])
+        self.assertTrue(payload["disk_history"]["followed"])
+        self.assertEqual(payload["disk_history"]["prior_home_count"], 1)
+
+    def test_get_slot_history_bundle_uses_requested_window_before_following_older_home(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        persistent_id = "wwn-0x5000cca27c7f0005"
+        legacy_record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid=persistent_id,
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+            persistent_id_label="WWN",
+            logical_unit_id="0x5000cca27c7f0005",
+            sas_address="0x5000cca27c7f1005",
+        )
+        current_record = replace(
+            legacy_record,
+            system_id="archive-scale",
+            system_label="Archive SCALE",
+            enclosure_key="enc-b",
+            enclosure_id="enc-b",
+            enclosure_label="Rear Shelf",
+            slot=11,
+            slot_label="11",
+            device_name="sdm",
+        )
+
+        store.upsert_slot_state(legacy_record, "2026-04-10T22:00:00+00:00")
+        store.upsert_slot_state(current_record, "2026-04-20T22:00:00+00:00")
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-10T23:00:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name="bytes_written",
+                    value_integer=100,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                    gptid=persistent_id,
+                    persistent_id_label="WWN",
+                    disk_identity_key=legacy_record.disk_identity_key,
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
+                ),
+                MetricSample(
+                    observed_at="2026-04-20T23:00:00+00:00",
+                    system_id="archive-scale",
+                    system_label="Archive SCALE",
+                    enclosure_key="enc-b",
+                    enclosure_id="enc-b",
+                    enclosure_label="Rear Shelf",
+                    slot=11,
+                    slot_label="11",
+                    metric_name="bytes_written",
+                    value_integer=200,
+                    value_real=None,
+                    device_name="sdm",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                    gptid=persistent_id,
+                    persistent_id_label="WWN",
+                    disk_identity_key=current_record.disk_identity_key,
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
+                ),
+            ]
+        )
+
+        payload = store.get_slot_history_bundle(
+            "archive-scale",
+            "enc-b",
+            11,
+            metric_limits={"bytes_written": 10},
+            since="2026-04-19T00:00:00+00:00",
+        )
+
+        self.assertEqual(
+            [sample["value"] for sample in payload["metrics"]["bytes_written"]],
+            [200],
+        )
+        self.assertFalse(payload["disk_history"]["followed"])
+        self.assertEqual(len(payload["disk_history"]["homes"]), 1)
+
+    def test_get_slot_history_bundle_keeps_slot_zero_as_current_home(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        current_record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="storage-view:boot-doms",
+            enclosure_id="storage-view:boot-doms",
+            enclosure_label="Boot SATADOMs",
+            slot=0,
+            slot_label="DOM-A",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="ada0",
+            serial="SERIAL-0",
+            model="SATADOM",
+            gptid="eui.000000000000001000a075012b91c700",
+            pool_name="boot",
+            vdev_name="mirror-0",
+            health="ONLINE",
+            persistent_id_label="EUI64",
+            logical_unit_id="0x5000cca27c7f0000",
+            sas_address="0x5000cca27c7f1000",
+        )
+
+        store.upsert_slot_state(current_record, "2026-04-20T22:00:00+00:00")
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-20T23:00:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="storage-view:boot-doms",
+                    enclosure_id="storage-view:boot-doms",
+                    enclosure_label="Boot SATADOMs",
+                    slot=0,
+                    slot_label="DOM-A",
+                    metric_name="bytes_written",
+                    value_integer=200,
+                    value_real=None,
+                    device_name="ada0",
+                    serial="SERIAL-0",
+                    model="SATADOM",
+                    state="healthy",
+                    gptid="eui.000000000000001000a075012b91c700",
+                    persistent_id_label="EUI64",
+                    disk_identity_key=current_record.disk_identity_key,
+                    logical_unit_id="0x5000cca27c7f0000",
+                    sas_address="0x5000cca27c7f1000",
+                ),
+            ]
+        )
+
+        payload = store.get_slot_history_bundle(
+            "archive-core",
+            "storage-view:boot-doms",
+            0,
+            metric_limits={"bytes_written": 10},
+        )
+
+        self.assertFalse(payload["disk_history"]["followed"])
+        self.assertEqual(payload["disk_history"]["prior_home_count"], 0)
+        self.assertIsNotNone(payload["disk_history"]["current_home"])
+        self.assertEqual(payload["disk_history"]["current_home"]["slot"], 0)
+
+    def test_delete_system_history_removes_only_matching_system_rows(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        archive_record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid="gptid/5",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+            persistent_id_label="GPTID",
+            logical_unit_id="0x5000cca27c7f0005",
+            sas_address="0x5000cca27c7f1005",
+        )
+        quantastor_record = SlotStateRecord(
+            system_id="qs-cryostorage",
+            system_label="QS CryoStorage",
+            enclosure_key="node-a",
+            enclosure_id="node-a",
+            enclosure_label="QSOSN Left",
+            slot=0,
+            slot_label="DOM-A",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="sdx",
+            serial="QS-DOM-0",
+            model="SATADOM",
+            gptid="gptid/dom-a",
+            pool_name=None,
+            vdev_name=None,
+            health="ONLINE",
+        )
+
+        store.upsert_slot_state(archive_record, "2026-04-16T22:05:00+00:00")
+        store.upsert_slot_state(quantastor_record, "2026-04-16T22:05:00+00:00")
+        store.insert_events(
+            build_slot_events(archive_record, replace(archive_record, health="DEGRADED"), "2026-04-16T22:10:00+00:00")
+        )
+        store.insert_events(
+            build_slot_events(
+                quantastor_record,
+                replace(quantastor_record, health="DEGRADED"),
+                "2026-04-16T22:10:00+00:00",
+            )
+        )
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-16T22:10:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name="temperature_c",
+                    value_integer=31,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                ),
+                MetricSample(
+                    observed_at="2026-04-16T22:10:00+00:00",
+                    system_id="qs-cryostorage",
+                    system_label="QS CryoStorage",
+                    enclosure_key="node-a",
+                    enclosure_id="node-a",
+                    enclosure_label="QSOSN Left",
+                    slot=0,
+                    slot_label="DOM-A",
+                    metric_name="temperature_c",
+                    value_integer=29,
+                    value_real=None,
+                    device_name="sdx",
+                    serial="QS-DOM-0",
+                    model="SATADOM",
+                    state="healthy",
+                ),
+            ]
+        )
+
+        summary = store.delete_system_history("qs-cryostorage")
+
+        self.assertEqual(summary["removed_system_ids"], ["qs-cryostorage"])
+        self.assertEqual(summary["tracked_slots"], 1)
+        self.assertEqual(summary["event_count"], 1)
+        self.assertEqual(summary["metric_sample_count"], 1)
+        self.assertEqual(summary["total_rows"], 3)
+        self.assertIsNotNone(store.get_slot_state("archive-core", "enc-a", 5))
+        self.assertIsNone(store.get_slot_state("qs-cryostorage", "node-a", 0))
+        self.assertEqual(len(store.list_slot_events("archive-core", "enc-a", 5)), 1)
+        self.assertEqual(len(store.list_slot_events("qs-cryostorage", "node-a", 0)), 0)
+        self.assertEqual(len(store.list_metric_samples("archive-core", "enc-a", 5, metric_name="temperature_c")), 1)
+        self.assertEqual(
+            len(store.list_metric_samples("qs-cryostorage", "node-a", 0, metric_name="temperature_c")),
+            0,
+        )
+
+    def test_purge_orphaned_history_removes_missing_system_rows_even_without_current_slot_state(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        archive_record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid="gptid/5",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+            persistent_id_label="GPTID",
+            logical_unit_id="0x5000cca27c7f0005",
+            sas_address="0x5000cca27c7f1005",
+        )
+        quantastor_record = SlotStateRecord(
+            system_id="qs-cryostorage",
+            system_label="QS CryoStorage",
+            enclosure_key="node-a",
+            enclosure_id="node-a",
+            enclosure_label="QSOSN Left",
+            slot=0,
+            slot_label="DOM-A",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="sdx",
+            serial="QS-DOM-0",
+            model="SATADOM",
+            gptid="gptid/dom-a",
+            pool_name=None,
+            vdev_name=None,
+            health="ONLINE",
+        )
+        ghost_record = SlotStateRecord(
+            system_id="ghost-system",
+            system_label="Ghost System",
+            enclosure_key="ghost-enc",
+            enclosure_id="ghost-enc",
+            enclosure_label="Ghost Shelf",
+            slot=7,
+            slot_label="07",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="sdghost",
+            serial="GHOST-7",
+            model="Ghost Disk",
+            gptid="gptid/ghost-7",
+            pool_name=None,
+            vdev_name=None,
+            health="ONLINE",
+        )
+
+        store.upsert_slot_state(archive_record, "2026-04-16T22:05:00+00:00")
+        store.upsert_slot_state(quantastor_record, "2026-04-16T22:05:00+00:00")
+        store.insert_events(
+            build_slot_events(archive_record, replace(archive_record, health="DEGRADED"), "2026-04-16T22:10:00+00:00")
+        )
+        store.insert_events(
+            build_slot_events(
+                quantastor_record,
+                replace(quantastor_record, health="DEGRADED"),
+                "2026-04-16T22:10:00+00:00",
+            )
+        )
+        store.insert_events(
+            build_slot_events(
+                ghost_record,
+                replace(ghost_record, health="DEGRADED"),
+                "2026-04-16T22:10:00+00:00",
+            )
+        )
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-16T22:10:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name="temperature_c",
+                    value_integer=31,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                ),
+                MetricSample(
+                    observed_at="2026-04-16T22:10:00+00:00",
+                    system_id="qs-cryostorage",
+                    system_label="QS CryoStorage",
+                    enclosure_key="node-a",
+                    enclosure_id="node-a",
+                    enclosure_label="QSOSN Left",
+                    slot=0,
+                    slot_label="DOM-A",
+                    metric_name="temperature_c",
+                    value_integer=29,
+                    value_real=None,
+                    device_name="sdx",
+                    serial="QS-DOM-0",
+                    model="SATADOM",
+                    state="healthy",
+                ),
+                MetricSample(
+                    observed_at="2026-04-16T22:10:00+00:00",
+                    system_id="ghost-system",
+                    system_label="Ghost System",
+                    enclosure_key="ghost-enc",
+                    enclosure_id="ghost-enc",
+                    enclosure_label="Ghost Shelf",
+                    slot=7,
+                    slot_label="07",
+                    metric_name="temperature_c",
+                    value_integer=40,
+                    value_real=None,
+                    device_name="sdghost",
+                    serial="GHOST-7",
+                    model="Ghost Disk",
+                    state="healthy",
+                ),
+            ]
+        )
+
+        summary = store.purge_orphaned_history(["archive-core"])
+        counts = store.counts()
+
+        self.assertEqual(summary["removed_system_ids"], ["ghost-system", "qs-cryostorage"])
+        self.assertEqual(summary["tracked_slots"], 1)
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(summary["metric_sample_count"], 2)
+        self.assertEqual(summary["total_rows"], 5)
+        self.assertEqual(counts["tracked_slots"], 1)
+        self.assertEqual(counts["event_count"], 1)
+        self.assertEqual(counts["metric_sample_count"], 1)
+        self.assertIsNotNone(store.get_slot_state("archive-core", "enc-a", 5))
+        self.assertIsNone(store.get_slot_state("qs-cryostorage", "node-a", 0))
+        self.assertEqual(len(store.list_slot_events("ghost-system", "ghost-enc", 7)), 0)
+        self.assertEqual(len(store.list_metric_samples("ghost-system", "ghost-enc", 7, metric_name="temperature_c")), 0)
+
+    def test_adopt_system_history_rehomes_removed_rows_into_target_system(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        source_record = SlotStateRecord(
+            system_id="qs-cryostorage",
+            system_label="QS CryoStorage",
+            enclosure_key="node-a",
+            enclosure_id="node-a",
+            enclosure_label="QSOSN Left",
+            slot=0,
+            slot_label="DOM-A",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="sda",
+            serial="QS-DOM-A",
+            model="SATADOM",
+            gptid="gptid/dom-a",
+            pool_name=None,
+            vdev_name=None,
+            health="ONLINE",
+            persistent_id_label="GPTID",
+        )
+        second_source_record = SlotStateRecord(
+            system_id="qs-cryostorage",
+            system_label="QS CryoStorage",
+            enclosure_key="node-b",
+            enclosure_id="node-b",
+            enclosure_label="QSOSN Right",
+            slot=1,
+            slot_label="DOM-B",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="sdb",
+            serial="QS-DOM-B",
+            model="SATADOM",
+            gptid="gptid/dom-b",
+            pool_name=None,
+            vdev_name=None,
+            health="ONLINE",
+            persistent_id_label="GPTID",
+        )
+        target_record = SlotStateRecord(
+            system_id="qsosn-ha",
+            system_label="QSOSN HA",
+            enclosure_key="node-a",
+            enclosure_id="node-a",
+            enclosure_label="QSOSN Left",
+            slot=0,
+            slot_label="DOM-A",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="sda",
+            serial="QS-DOM-A-NEW",
+            model="SATADOM",
+            gptid="gptid/dom-a-new",
+            pool_name=None,
+            vdev_name=None,
+            health="ONLINE",
+            persistent_id_label="GPTID",
+        )
+
+        store.upsert_slot_state(source_record, "2026-04-16T22:05:00+00:00")
+        store.upsert_slot_state(second_source_record, "2026-04-16T22:06:00+00:00")
+        store.upsert_slot_state(target_record, "2026-04-20T22:05:00+00:00")
+        store.insert_events(
+            build_slot_events(
+                source_record,
+                replace(source_record, health="DEGRADED"),
+                "2026-04-16T22:10:00+00:00",
+            )
+        )
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-16T22:10:00+00:00",
+                    system_id="qs-cryostorage",
+                    system_label="QS CryoStorage",
+                    enclosure_key="node-a",
+                    enclosure_id="node-a",
+                    enclosure_label="QSOSN Left",
+                    slot=0,
+                    slot_label="DOM-A",
+                    metric_name="bytes_written",
+                    value_integer=10,
+                    value_real=None,
+                    device_name="sda",
+                    serial="QS-DOM-A",
+                    model="SATADOM",
+                    state="healthy",
+                    gptid="gptid/dom-a",
+                    persistent_id_label="GPTID",
+                ),
+                MetricSample(
+                    observed_at="2026-04-16T22:11:00+00:00",
+                    system_id="qs-cryostorage",
+                    system_label="QS CryoStorage",
+                    enclosure_key="node-b",
+                    enclosure_id="node-b",
+                    enclosure_label="QSOSN Right",
+                    slot=1,
+                    slot_label="DOM-B",
+                    metric_name="bytes_written",
+                    value_integer=20,
+                    value_real=None,
+                    device_name="sdb",
+                    serial="QS-DOM-B",
+                    model="SATADOM",
+                    state="healthy",
+                    gptid="gptid/dom-b",
+                    persistent_id_label="GPTID",
+                ),
+            ]
+        )
+
+        summary = store.adopt_system_history(
+            "qs-cryostorage",
+            "qsosn-ha",
+            target_system_label="QSOSN HA",
+        )
+
+        self.assertEqual(summary["tracked_slots"], 2)
+        self.assertEqual(summary["event_count"], 1)
+        self.assertEqual(summary["metric_sample_count"], 2)
+        self.assertEqual(summary["slot_state_conflicts"], 1)
+        self.assertEqual(summary["total_rows"], 5)
+        self.assertIsNone(store.get_slot_state("qs-cryostorage", "node-a", 0))
+        self.assertIsNone(store.get_slot_state("qs-cryostorage", "node-b", 1))
+        adopted_slot = store.get_slot_state("qsosn-ha", "node-b", 1)
+        preserved_slot = store.get_slot_state("qsosn-ha", "node-a", 0)
+        self.assertIsNotNone(adopted_slot)
+        self.assertEqual(adopted_slot.system_label, "QSOSN HA")
+        self.assertIsNotNone(preserved_slot)
+        self.assertEqual(preserved_slot.serial, "QS-DOM-A-NEW")
+        target_events = store.list_slot_events("qsosn-ha", "node-a", 0)
+        target_metrics = store.list_metric_samples("qsosn-ha", "node-a", 0, metric_name="bytes_written")
+        self.assertEqual(len(target_events), 1)
+        self.assertEqual(target_events[0]["system_label"], "QSOSN HA")
+        self.assertEqual(len(target_metrics), 1)
+        self.assertEqual(target_metrics[0]["system_label"], "QSOSN HA")
+        self.assertEqual(
+            [summary["system_id"] for summary in store.list_history_system_summaries(["qsosn-ha"])],
+            [],
+        )
 
     def test_store_recovers_from_unreadable_database_file(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -205,6 +994,10 @@ class HistoryStoreTests(unittest.TestCase):
                     serial="SERIAL-5",
                     model="Drive 5",
                     state="healthy",
+                    gptid="gptid/5",
+                    persistent_id_label="GPTID",
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
                 )
             ]
         )
@@ -283,6 +1076,10 @@ class HistoryStoreTests(unittest.TestCase):
                     serial="SERIAL-5",
                     model="Drive 5",
                     state="healthy",
+                    gptid="gptid/5",
+                    persistent_id_label="GPTID",
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
                 )
             ]
         )
@@ -346,7 +1143,7 @@ class HistoryStoreTests(unittest.TestCase):
             ],
         )
 
-    def test_store_migrates_existing_state_table_before_upserts(self) -> None:
+    def test_store_migrates_existing_history_tables_before_writes(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         db_path = temp_dir / "history.db"
 
@@ -375,6 +1172,41 @@ class HistoryStoreTests(unittest.TestCase):
                     last_seen_at TEXT NOT NULL,
                     PRIMARY KEY (system_id, enclosure_key, slot)
                 );
+                CREATE TABLE slot_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observed_at TEXT NOT NULL,
+                    system_id TEXT NOT NULL,
+                    system_label TEXT,
+                    enclosure_key TEXT NOT NULL,
+                    enclosure_id TEXT,
+                    enclosure_label TEXT,
+                    slot INTEGER NOT NULL,
+                    slot_label TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    previous_value TEXT,
+                    current_value TEXT,
+                    device_name TEXT,
+                    serial TEXT,
+                    details_json TEXT NOT NULL
+                );
+                CREATE TABLE metric_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observed_at TEXT NOT NULL,
+                    system_id TEXT NOT NULL,
+                    system_label TEXT,
+                    enclosure_key TEXT NOT NULL,
+                    enclosure_id TEXT,
+                    enclosure_label TEXT,
+                    slot INTEGER NOT NULL,
+                    slot_label TEXT NOT NULL,
+                    metric_name TEXT NOT NULL,
+                    value_integer INTEGER,
+                    value_real REAL,
+                    device_name TEXT,
+                    serial TEXT,
+                    model TEXT,
+                    state TEXT
+                );
                 """
             )
             connection.commit()
@@ -400,6 +1232,9 @@ class HistoryStoreTests(unittest.TestCase):
             pool_name="tank",
             vdev_name="raidz2-0",
             health="ONLINE",
+            persistent_id_label="GPTID",
+            logical_unit_id="0x5000cca27c7f0005",
+            sas_address="0x5000cca27c7f1005",
             topology_label="tank > raidz2-0 > data",
             multipath_device="multipath/disk5",
             multipath_mode="Active/Passive",
@@ -414,23 +1249,139 @@ class HistoryStoreTests(unittest.TestCase):
         )
 
         store.upsert_slot_state(record, "2026-04-16T22:05:00+00:00")
+        store.insert_events(
+            build_slot_events(record, replace(record, serial="SERIAL-5B"), "2026-04-16T22:06:00+00:00")
+        )
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-16T22:06:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name="temperature_c",
+                    value_integer=31,
+                    value_real=None,
+                    device_name="multipath/disk5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                    gptid="gptid/5",
+                    persistent_id_label="GPTID",
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
+                )
+            ]
+        )
 
         migrated = sqlite3.connect(db_path)
         try:
-            columns = {
+            state_columns = {
                 str(column_name)
                 for _, column_name, *_ in migrated.execute("PRAGMA table_info(slot_state_current)").fetchall()
+            }
+            event_columns = {
+                str(column_name)
+                for _, column_name, *_ in migrated.execute("PRAGMA table_info(slot_events)").fetchall()
+            }
+            metric_columns = {
+                str(column_name)
+                for _, column_name, *_ in migrated.execute("PRAGMA table_info(metric_samples)").fetchall()
             }
         finally:
             migrated.close()
 
         loaded = store.get_slot_state("archive-core", "enc-a", 5)
+        events = store.list_slot_events("archive-core", "enc-a", 5)
+        samples = store.list_metric_samples("archive-core", "enc-a", 5, metric_name="temperature_c")
 
-        self.assertIn("multipath_state", columns)
-        self.assertIn("multipath_active_paths", columns)
+        self.assertIn("persistent_id_label", state_columns)
+        self.assertIn("logical_unit_id", state_columns)
+        self.assertIn("sas_address", state_columns)
+        self.assertIn("gptid", event_columns)
+        self.assertIn("persistent_id_label", event_columns)
+        self.assertIn("logical_unit_id", event_columns)
+        self.assertIn("sas_address", event_columns)
+        self.assertIn("gptid", metric_columns)
+        self.assertIn("persistent_id_label", metric_columns)
+        self.assertIn("logical_unit_id", metric_columns)
+        self.assertIn("sas_address", metric_columns)
         self.assertIsNotNone(loaded)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(len(samples), 1)
         self.assertEqual(loaded.topology_label, "tank > raidz2-0 > data")
         self.assertEqual(loaded.multipath_passive_paths, "da44")
+        self.assertEqual(loaded.persistent_id_label, "GPTID")
+        self.assertEqual(events[0]["persistent_id_label"], "GPTID")
+        self.assertEqual(samples[0]["logical_unit_id"], "0x5000cca27c7f0005")
+
+    def test_backfill_disk_identity_keys_repairs_existing_metric_rows(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+
+        with sqlite3.connect(store.file_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO metric_samples (
+                    observed_at,
+                    system_id,
+                    system_label,
+                    enclosure_key,
+                    enclosure_id,
+                    enclosure_label,
+                    slot,
+                    slot_label,
+                    metric_name,
+                    value_integer,
+                    value_real,
+                    device_name,
+                    serial,
+                    model,
+                    state,
+                    gptid,
+                    persistent_id_label,
+                    disk_identity_key,
+                    logical_unit_id,
+                    sas_address
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "2026-04-16T22:06:00+00:00",
+                    "archive-core",
+                    "Archive CORE",
+                    "enc-a",
+                    "enc-a",
+                    "Front Shelf",
+                    5,
+                    "05",
+                    "bytes_written",
+                    123,
+                    None,
+                    "da5",
+                    "SERIAL-5",
+                    "Drive 5",
+                    "healthy",
+                    "eui.000000000000001000a075012b91c7cf",
+                    "EUI64",
+                    None,
+                    "0x5000cca27c7f0005",
+                    "0x5000cca27c7f1005",
+                ),
+            )
+            HistoryStore._backfill_disk_identity_keys(connection)
+            row = connection.execute(
+                "SELECT disk_identity_key FROM metric_samples WHERE system_id = 'archive-core' AND enclosure_key = 'enc-a' AND slot = 5"
+            ).fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(
+            row[0],
+            "serial-5|eui64|eui.000000000000001000a075012b91c7cf",
+        )
 
     def test_store_retries_write_after_readonly_database_error(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -620,6 +1571,9 @@ class HistoryCollectorTests(unittest.TestCase):
                             "serial": "SER-DOM-0",
                             "model": "SATADOM 0",
                             "gptid": "gptid/dom-a",
+                            "persistent_id_label": "GPTID",
+                            "logical_unit_id": "0x5000c500abcd0000",
+                            "sas_address": "0x5000c500abcd0001",
                             "pool_name": "freenas-boot",
                             "health": "ONLINE",
                             "placement_key": "device match: ada0",
@@ -653,6 +1607,9 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertNotIn("storage-view:primary-chassis", [scope.enclosure_id for scope in scopes])
         self.assertEqual(storage_scope.snapshot["slots"][0]["slot"], 0)
         self.assertEqual(storage_scope.snapshot["slots"][0]["device_name"], "ada0")
+        self.assertEqual(storage_scope.snapshot["slots"][0]["persistent_id_label"], "GPTID")
+        self.assertEqual(storage_scope.snapshot["slots"][0]["logical_unit_id"], "0x5000c500abcd0000")
+        self.assertEqual(storage_scope.snapshot["slots"][0]["sas_address"], "0x5000c500abcd0001")
         self.assertEqual(storage_scope.snapshot["storage_view_backing_enclosure_id"], "enc-a")
 
     def test_run_once_records_inventory_bound_storage_view_metrics(self) -> None:
@@ -694,6 +1651,9 @@ class HistoryCollectorTests(unittest.TestCase):
                     "serial": "SER-DOM-0",
                     "model": "SATADOM 0",
                     "gptid": "gptid/dom-a",
+                    "persistent_id_label": "GPTID",
+                    "logical_unit_id": "0x5000c500abcd0000",
+                    "sas_address": "0x5000c500abcd0001",
                     "pool_name": "freenas-boot",
                     "health": "ONLINE",
                     "topology_label": "device match: ada0",
@@ -738,12 +1698,179 @@ class HistoryCollectorTests(unittest.TestCase):
             0,
             metric_name="bytes_read",
         )
+        loaded = store.get_slot_state("archive-core", "storage-view:boot-doms", 0)
 
         self.assertEqual(len(temperature_samples), 1)
         self.assertEqual(len(read_samples), 1)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(temperature_samples[0]["persistent_id_label"], "GPTID")
+        self.assertEqual(temperature_samples[0]["logical_unit_id"], "0x5000c500abcd0000")
+        self.assertEqual(temperature_samples[0]["sas_address"], "0x5000c500abcd0001")
+        self.assertEqual(read_samples[0]["gptid"], "gptid/dom-a")
+        self.assertEqual(loaded.persistent_id_label, "GPTID")
+        self.assertEqual(loaded.logical_unit_id, "0x5000c500abcd0000")
+        self.assertEqual(loaded.sas_address, "0x5000c500abcd0001")
         self.assertEqual(
             collector._fetch_json.await_args_list[0].args[0],  # type: ignore[attr-defined]
             "/api/storage-views/boot-doms/slots/0/smart",
+        )
+        self.assertEqual(
+            collector._fetch_json.await_args_list[0].kwargs["params"],  # type: ignore[attr-defined]
+            {
+                "system_id": "archive-core",
+                "enclosure_id": "enc-a",
+                "fresh": "true",
+            },
+        )
+
+    def test_fetch_smart_summaries_uses_fresh_batch_params_for_live_slots(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        scope = ScopeSnapshot(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            snapshot={
+                "selected_system_id": "archive-core",
+                "selected_system_label": "Archive CORE",
+                "selected_enclosure_id": "enc-a",
+                "selected_enclosure_label": "Front Shelf",
+                "slots": [],
+            },
+        )
+        collector._fetch_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "summaries": [
+                    {"slot": 5, "summary": {"available": True, "bytes_written": 1234}},
+                    {"slot": 6, "summary": {"available": True, "bytes_written": 5678}},
+                ]
+            }
+        )
+
+        summaries = asyncio.run(collector._fetch_smart_summaries(scope, [5, 6], force_fresh=True))
+
+        self.assertEqual(sorted(summaries), [5, 6])
+        self.assertEqual(
+            collector._fetch_json.await_args.kwargs["params"],  # type: ignore[attr-defined]
+            {
+                "system_id": "archive-core",
+                "enclosure_id": "enc-a",
+                "fresh": "true",
+            },
+        )
+        self.assertEqual(
+            collector._fetch_json.await_args.kwargs["method"],  # type: ignore[attr-defined]
+            "POST",
+        )
+
+    def test_run_once_force_slow_recollects_even_when_slow_interval_not_due(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        collector.last_fast_metrics_at = collector.started_at
+        collector.last_slow_metrics_at = collector.started_at
+
+        storage_view_snapshot = {
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+            "selected_system_platform": "core",
+            "selected_enclosure_id": "storage-view:boot-doms",
+            "selected_enclosure_label": "Boot SATADOMs",
+            "storage_view_id": "boot-doms",
+            "storage_view_backing_enclosure_id": "enc-a",
+            "sources": {
+                "api": {
+                    "enabled": True,
+                    "ok": True,
+                    "message": "TrueNAS API reachable.",
+                }
+            },
+            "slots": [
+                {
+                    "slot": 0,
+                    "slot_label": "DOM-A",
+                    "enclosure_id": "storage-view:boot-doms",
+                    "enclosure_label": "Boot SATADOMs",
+                    "present": True,
+                    "state": "matched",
+                    "identify_active": False,
+                    "device_name": "ada0",
+                    "serial": "SER-DOM-0",
+                    "model": "SATADOM 0",
+                    "gptid": "gptid/dom-a",
+                    "persistent_id_label": "GPTID",
+                    "logical_unit_id": "0x5000c500abcd0000",
+                    "sas_address": "0x5000c500abcd0001",
+                    "pool_name": "freenas-boot",
+                    "health": "ONLINE",
+                    "topology_label": "device match: ada0",
+                }
+            ],
+        }
+
+        async def enumerate_scopes() -> list[ScopeSnapshot]:
+            return [
+                ScopeSnapshot(
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_id="storage-view:boot-doms",
+                    enclosure_label="Boot SATADOMs",
+                    snapshot=storage_view_snapshot,
+                )
+            ]
+
+        collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
+        collector._fetch_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "available": True,
+                "temperature_c": 31,
+                "bytes_read": 100,
+                "bytes_written": 200,
+                "annualized_bytes_written": 50,
+                "power_on_hours": 48,
+            }
+        )
+
+        asyncio.run(collector.run_once(force_slow=True))
+
+        temperature_samples = store.list_metric_samples(
+            "archive-core",
+            "storage-view:boot-doms",
+            0,
+            metric_name="temperature_c",
+        )
+        read_samples = store.list_metric_samples(
+            "archive-core",
+            "storage-view:boot-doms",
+            0,
+            metric_name="bytes_read",
+        )
+
+        self.assertEqual(len(temperature_samples), 0)
+        self.assertEqual(len(read_samples), 1)
+        self.assertEqual(
+            collector._fetch_json.await_args_list[0].kwargs["params"],  # type: ignore[attr-defined]
+            {
+                "system_id": "archive-core",
+                "enclosure_id": "enc-a",
+                "fresh": "true",
+            },
         )
 
     def test_run_once_skips_degraded_api_snapshot_without_event_noise(self) -> None:

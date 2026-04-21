@@ -92,6 +92,8 @@ class SmartSummaryView(BaseModel):
     last_test_age_hours: int | None = None
     power_on_hours: int | None = None
     power_on_days: int | None = None
+    power_cycle_count: int | None = None
+    power_on_resets: int | None = None
     logical_block_size: int | None = None
     physical_block_size: int | None = None
     available_spare_percent: int | None = None
@@ -103,12 +105,16 @@ class SmartSummaryView(BaseModel):
     annualized_bytes_written: int | None = None
     estimated_lifetime_bytes_written: int | None = None
     estimated_remaining_bytes_written: int | None = None
+    read_commands: int | None = None
+    write_commands: int | None = None
     media_errors: int | None = None
     predictive_errors: int | None = None
     non_medium_errors: int | None = None
     uncorrected_read_errors: int | None = None
     uncorrected_write_errors: int | None = None
     unsafe_shutdowns: int | None = None
+    hardware_resets: int | None = None
+    interface_crc_errors: int | None = None
     rotation_rate_rpm: int | None = None
     form_factor: str | None = None
     firmware_version: str | None = None
@@ -327,6 +333,11 @@ class SystemBackupExportRequest(BaseModel):
         return self
 
 
+class HistoryAdoptRequest(BaseModel):
+    source_system_id: str
+    target_system_id: str
+
+
 StorageViewKind = Literal["ses_enclosure", "nvme_carrier", "boot_devices", "manual"]
 StorageViewBindingMode = Literal["auto", "pool", "serial", "hybrid"]
 
@@ -339,11 +350,17 @@ class StorageViewRenderRequest(BaseModel):
 
 class StorageViewBindingRequest(BaseModel):
     mode: StorageViewBindingMode = "auto"
+    target_system_id: str | None = None
     enclosure_ids: list[str] = Field(default_factory=list)
     pool_names: list[str] = Field(default_factory=list)
     serials: list[str] = Field(default_factory=list)
     pcie_addresses: list[str] = Field(default_factory=list)
     device_names: list[str] = Field(default_factory=list)
+
+    @field_validator("target_system_id")
+    @classmethod
+    def sanitize_target_system_id(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=256)
 
     @field_validator("enclosure_ids", "pool_names", "serials", "pcie_addresses", "device_names")
     @classmethod
@@ -438,6 +455,9 @@ class StorageViewRequest(BaseModel):
 class StorageViewRuntimeSlot(BaseModel):
     slot_index: int
     slot_label: str
+    candidate_id: str | None = None
+    target_system_id: str | None = None
+    target_system_label: str | None = None
     occupied: bool = False
     state: str = "empty"
     source: Literal["snapshot_slot", "inventory_candidate", "placeholder"] = "placeholder"
@@ -454,6 +474,7 @@ class StorageViewRuntimeSlot(BaseModel):
     bus: str | None = None
     size_human: str | None = None
     gptid: str | None = None
+    persistent_id_label: str | None = None
     health: str | None = None
     temperature_c: int | None = None
     last_smart_test_type: str | None = None
@@ -498,6 +519,17 @@ class StorageViewRuntimePayload(BaseModel):
     views: list[StorageViewRuntimeView] = Field(default_factory=list)
 
 
+class HANodeRequest(BaseModel):
+    system_id: str | None = None
+    label: str | None = None
+    host: str | None = None
+
+    @field_validator("system_id", "label", "host")
+    @classmethod
+    def sanitize_text_fields(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=256)
+
+
 class SystemSetupRequest(BaseModel):
     system_id: str | None = None
     label: str
@@ -514,6 +546,8 @@ class SystemSetupRequest(BaseModel):
     ssh_enabled: bool = False
     ssh_host: str | None = None
     ssh_extra_hosts: list[str] = Field(default_factory=list)
+    ha_enabled: bool = False
+    ha_nodes: list[HANodeRequest] = Field(default_factory=list)
     ssh_port: int = 22
     ssh_user: str | None = None
     ssh_key_path: str | None = "/run/ssh/id_truenas"
@@ -561,6 +595,21 @@ class SystemSetupRequest(BaseModel):
             if cleaned:
                 cleaned_items.append(cleaned[:1024])
         return cleaned_items
+
+    @field_validator("ha_nodes", mode="after")
+    @classmethod
+    def sanitize_ha_nodes(cls, value: list[HANodeRequest]) -> list[HANodeRequest]:
+        cleaned: list[HANodeRequest] = []
+        seen: set[tuple[str | None, str | None]] = set()
+        for node in value[:3]:
+            if not (node.system_id or node.label or node.host):
+                continue
+            dedupe_key = (node.system_id, node.host)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            cleaned.append(node)
+        return cleaned
 
     @field_validator("timeout_seconds", "ssh_timeout_seconds")
     @classmethod
@@ -652,6 +701,46 @@ class TLSRemoteCertificateTrustRequest(BaseModel):
     def validate_host(self) -> "TLSRemoteCertificateTrustRequest":
         if not self.host:
             raise ValueError("A TLS host is required.")
+        return self
+
+
+class QuantastorNodeDiscoveryRequest(BaseModel):
+    truenas_host: str
+    api_user: str
+    api_password: str
+    verify_ssl: bool = True
+    tls_ca_bundle_path: str | None = None
+    tls_server_name: str | None = None
+    timeout_seconds: int = 15
+
+    @field_validator(
+        "truenas_host",
+        "api_user",
+        "tls_ca_bundle_path",
+        "tls_server_name",
+    )
+    @classmethod
+    def sanitize_text_fields(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=1024)
+
+    @field_validator("api_password")
+    @classmethod
+    def sanitize_secret_fields(cls, value: str | None) -> str | None:
+        return preserve_optional_secret(value, max_length=1024)
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def clamp_timeout(cls, value: int) -> int:
+        return max(1, min(int(value), 300))
+
+    @model_validator(mode="after")
+    def validate_required_fields(self) -> "QuantastorNodeDiscoveryRequest":
+        if not self.truenas_host:
+            raise ValueError("A host is required.")
+        if not self.api_user:
+            raise ValueError("An API user is required.")
+        if not self.api_password:
+            raise ValueError("An API password is required.")
         return self
 
 

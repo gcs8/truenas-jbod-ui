@@ -7,6 +7,7 @@ from typing import Any
 import yaml
 
 from app.config import (
+    HANodeConfig,
     SSHConfig,
     StorageViewBindingConfig,
     StorageViewConfig,
@@ -50,6 +51,44 @@ class SystemSetupService:
     def create_system(self, payload: SystemSetupRequest) -> SystemConfig:
         system, _ = self.save_system(payload)
         return system
+
+    def delete_system(self, system_id: str) -> tuple[str, str | None]:
+        normalized_system_id = _normalize_system_id(system_id, 1)
+        with _CONFIG_WRITE_LOCK:
+            config = self._load_config()
+            raw_systems = list(config.get("systems") or [])
+            existing_index = next(
+                (
+                    index
+                    for index, item in enumerate(raw_systems)
+                    if isinstance(item, dict)
+                    and _normalize_system_id(item.get("id"), index + 1) == normalized_system_id
+                ),
+                None,
+            )
+            if existing_index is None:
+                raise ValueError(f"System id '{normalized_system_id}' does not exist in the current config.")
+
+            removed_system = SystemConfig.model_validate(raw_systems.pop(existing_index))
+            config["systems"] = raw_systems
+
+            current_default = normalize_text(str(config.get("default_system_id") or ""))
+            next_default_id: str | None = current_default or None
+            if current_default == normalized_system_id:
+                if raw_systems:
+                    fallback_ids = [
+                        _normalize_system_id(item.get("id"), index + 1)
+                        for index, item in enumerate(raw_systems)
+                        if isinstance(item, dict)
+                    ]
+                    next_default_id = fallback_ids[0] if fallback_ids else None
+                    config["default_system_id"] = next_default_id
+                else:
+                    config.pop("default_system_id", None)
+                    next_default_id = None
+
+            self._write_config(config)
+            return removed_system.label or removed_system.id, next_default_id
 
     def save_system(self, payload: SystemSetupRequest) -> tuple[SystemConfig, bool]:
         with _CONFIG_WRITE_LOCK:
@@ -101,6 +140,7 @@ class SystemSetupService:
                         ),
                         binding=StorageViewBindingConfig(
                             mode=storage_view.binding.mode,
+                            target_system_id=storage_view.binding.target_system_id,
                             enclosure_ids=list(storage_view.binding.enclosure_ids),
                             pool_names=list(storage_view.binding.pool_names),
                             serials=list(storage_view.binding.serials),
@@ -156,6 +196,15 @@ class SystemSetupService:
                         if existing_system is not None
                         else list(payload.ssh_extra_hosts)
                     ),
+                    ha_enabled=bool(payload.ha_enabled),
+                    ha_nodes=[
+                        HANodeConfig(
+                            system_id=node.system_id,
+                            label=node.label,
+                            host=node.host or "",
+                        )
+                        for node in payload.ha_nodes
+                    ],
                     port=payload.ssh_port,
                     user=payload.ssh_user or "",
                     key_path=payload.ssh_key_path or "",

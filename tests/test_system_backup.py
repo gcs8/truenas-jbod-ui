@@ -704,6 +704,139 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(saved_view["layout_overrides"]["slot_labels"], {0: "M2-A", 1: "M2-B"})
         self.assertEqual(saved_view["layout_overrides"]["slot_sizes"], {0: "2280", 1: "22110"})
 
+    def test_save_system_persists_quantastor_ha_nodes_and_targeted_storage_view(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(config_path, {})
+
+        service = SystemSetupService(str(config_path))
+        created = service.create_system(
+            SystemSetupRequest(
+                label="QSOSN HA",
+                system_id="qsosn-ha",
+                platform="quantastor",
+                truenas_host="https://10.13.37.40",
+                api_user="jbodmap",
+                api_password="secret",
+                verify_ssl=False,
+                ssh_enabled=True,
+                ssh_host="10.13.37.30",
+                ssh_user="jbodmap",
+                ha_enabled=True,
+                ha_nodes=[
+                    {
+                        "system_id": "node-a",
+                        "label": "QSOSN Left",
+                        "host": "10.13.37.30",
+                    },
+                    {
+                        "system_id": "node-b",
+                        "label": "QSOSN Right",
+                        "host": "10.13.37.31",
+                    },
+                ],
+                storage_views=[
+                    {
+                        "id": "boot-doms-node-b",
+                        "label": "Boot SATADOMs B",
+                        "kind": "boot_devices",
+                        "template_id": "satadom-pair-2",
+                        "enabled": True,
+                        "order": 30,
+                        "render": {
+                            "show_in_main_ui": True,
+                            "show_in_admin_ui": True,
+                            "default_collapsed": False,
+                        },
+                        "binding": {
+                            "mode": "hybrid",
+                            "target_system_id": "node-b",
+                            "pool_names": ["QSOSN-BOOT-B"],
+                            "serials": ["SATADOM-B-1", "SATADOM-B-2"],
+                            "device_names": ["sda", "sdb"],
+                        },
+                    }
+                ],
+            )
+        )
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        saved_system = saved["systems"][0]
+        saved_view = saved_system["storage_views"][0]
+
+        self.assertEqual(created.id, "qsosn-ha")
+        self.assertTrue(saved_system["ssh"]["ha_enabled"])
+        self.assertEqual(
+            saved_system["ssh"]["ha_nodes"],
+            [
+                {"system_id": "node-a", "label": "QSOSN Left", "host": "10.13.37.30"},
+                {"system_id": "node-b", "label": "QSOSN Right", "host": "10.13.37.31"},
+            ],
+        )
+        self.assertEqual(saved_view["binding"]["target_system_id"], "node-b")
+        self.assertEqual(saved_view["binding"]["pool_names"], ["QSOSN-BOOT-B"])
+
+    def test_delete_system_removes_entry_and_rehomes_default(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(
+            config_path,
+            {
+                "default_system_id": "qs-cryostorage",
+                "systems": [
+                    {
+                        "id": "qs-cryostorage",
+                        "label": "QS CryoStorage",
+                        "truenas": {
+                            "host": "https://10.13.37.40",
+                            "platform": "quantastor",
+                        },
+                        "ssh": {
+                            "enabled": True,
+                            "host": "10.13.37.30",
+                            "extra_hosts": ["10.13.37.31"],
+                            "port": 22,
+                            "user": "jbodmap",
+                            "key_path": "/run/ssh/id_truenas",
+                            "known_hosts_path": "/app/data/known_hosts",
+                            "strict_host_key_checking": True,
+                            "timeout_seconds": 30,
+                            "commands": [],
+                        },
+                    },
+                    {
+                        "id": "archive-core",
+                        "label": "Archive CORE",
+                        "truenas": {
+                            "host": "https://archive-core.local",
+                            "platform": "core",
+                        },
+                        "ssh": {
+                            "enabled": True,
+                            "host": "archive-core.local",
+                            "port": 22,
+                            "user": "jbodmap",
+                            "key_path": "/run/ssh/id_truenas",
+                            "known_hosts_path": "/app/data/known_hosts",
+                            "strict_host_key_checking": True,
+                            "timeout_seconds": 30,
+                            "commands": [],
+                        },
+                    },
+                ],
+            },
+        )
+
+        service = SystemSetupService(str(config_path))
+        deleted_label, next_default = service.delete_system("qs-cryostorage")
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(deleted_label, "QS CryoStorage")
+        self.assertEqual(next_default, "archive-core")
+        self.assertEqual(saved["default_system_id"], "archive-core")
+        self.assertEqual([system["id"] for system in saved["systems"]], ["archive-core"])
+
 
 class SSHKeyManagerTests(unittest.TestCase):
     def test_generate_keypair_creates_reusable_runtime_paths(self) -> None:

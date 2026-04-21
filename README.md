@@ -23,8 +23,9 @@ The current tested hardware profiles are:
 - Generic Linux on a Supermicro `SYS-2029GP-TR` using a profile-driven `2`-bay
   right-side NVMe view backed by SSH `lsblk`, `mdadm`, and `nvme` discovery
 - OSNexus Quantastor on a Supermicro `SSG-2028R-DE2CR24L`, modeled as a
-  first-pass shared-front `24`-slot `1x24` profile with REST-first inventory,
-  SSH/`qs` enrichment, SES-aware LED control, and shared-face HA context
+  shared-front `24`-slot `1x24` profile with REST-first inventory,
+  SSH/`qs` enrichment, per-view HA-node targeting, SES-aware LED control, and
+  shared-face HA context
 - UniFi UNVR as a generic Linux / vendor-CLI appliance with a built-in `4`-bay
   front profile, direct ATA/SATA SMART detail, and validated vendor-local SSH
   LED control
@@ -59,31 +60,33 @@ different profile.
 
 ### Archive CORE
 
-![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/screenshots/core-overview-v0.10.0.png)
+![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/screenshots/core-overview-v0.11.0.png)
 
 ### Offsite SCALE
 
-![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/screenshots/scale-overview-v0.10.0.png)
+![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/screenshots/scale-overview-v0.11.0.png)
 
 ### Additional Validated Platforms
 
-- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.10.0.png](docs/images/screenshots/gpu-server-overview-v0.10.0.png)
-- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.10.0.png](docs/images/screenshots/unvr-overview-v0.10.0.png)
-- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.10.0.png](docs/images/screenshots/unvr-pro-overview-v0.10.0.png)
-- Quantastor: [docs/images/screenshots/quantastor-overview-v0.10.0.png](docs/images/screenshots/quantastor-overview-v0.10.0.png)
+- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.11.0.png](docs/images/screenshots/gpu-server-overview-v0.11.0.png)
+- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.11.0.png](docs/images/screenshots/unvr-overview-v0.11.0.png)
+- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.11.0.png](docs/images/screenshots/unvr-pro-overview-v0.11.0.png)
+- Quantastor: [docs/images/screenshots/quantastor-overview-v0.11.0.png](docs/images/screenshots/quantastor-overview-v0.11.0.png)
 
 ### History And Snapshot Walkthroughs
 
-- Live history drawer: [docs/images/screenshots/history-drawer-v0.10.0.png](docs/images/screenshots/history-drawer-v0.10.0.png)
-- Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.10.0.png](docs/images/screenshots/snapshot-export-dialog-v0.10.0.png)
-- Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.10.0.png](docs/images/screenshots/offline-snapshot-v0.10.0.png)
+- Live history drawer: [docs/images/screenshots/history-drawer-v0.11.0.png](docs/images/screenshots/history-drawer-v0.11.0.png)
+- Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.11.0.png](docs/images/screenshots/snapshot-export-dialog-v0.11.0.png)
+- Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.11.0.png](docs/images/screenshots/offline-snapshot-v0.11.0.png)
 
-### 0.10.0 Workflow Highlights
+### 0.11.0 Workflow Highlights
 
-- Grouped runtime selector on `archive-core`: [docs/images/screenshots/live-vs-storage-views-v0.10.0.png](docs/images/screenshots/live-vs-storage-views-v0.10.0.png)
-- Storage-view history on `Boot SATADOMs`: [docs/images/screenshots/storage-view-history-v0.10.0.png](docs/images/screenshots/storage-view-history-v0.10.0.png)
-- Separate CORE `Front 24 Bay` live enclosure: [docs/images/screenshots/archive-core-front-24-v0.10.0.png](docs/images/screenshots/archive-core-front-24-v0.10.0.png)
-- Admin sidecar grouped `Add Storage View` flow: [docs/images/screenshots/admin-setup-v0.10.0.png](docs/images/screenshots/admin-setup-v0.10.0.png)
+- Grouped runtime selector on `archive-core`: [docs/images/screenshots/live-vs-storage-views-v0.11.0.png](docs/images/screenshots/live-vs-storage-views-v0.11.0.png)
+- Storage-view history on `Boot SATADOMs`: [docs/images/screenshots/storage-view-history-v0.11.0.png](docs/images/screenshots/storage-view-history-v0.11.0.png)
+- Separate CORE `Front 24 Bay` live enclosure: [docs/images/screenshots/archive-core-front-24-v0.11.0.png](docs/images/screenshots/archive-core-front-24-v0.11.0.png)
+- Admin sidecar grouped `Add Storage View` flow: [docs/images/screenshots/admin-setup-v0.11.0.png](docs/images/screenshots/admin-setup-v0.11.0.png)
+- Quantastor HA SATADOM storage view on `QSOSN HA`: [docs/images/screenshots/quantastor-satadoms-right-v0.11.0.png](docs/images/screenshots/quantastor-satadoms-right-v0.11.0.png)
+- Admin backup, orphan cleanup, and history adoption tools: [docs/images/screenshots/admin-maintenance-v0.11.0.png](docs/images/screenshots/admin-maintenance-v0.11.0.png)
 
 `archive-core` currently does not ship with a saved chassis view enabled by
 default, so the runtime selector screenshot shows the live and virtual groups
@@ -119,9 +122,9 @@ chassis layout catalog that can be added when needed.
   when SSH works but the vendor API does not expose per-disk slot inventory,
   such as the shipped UniFi UNVR and first-pass UNVR Pro paths
 - First-pass Quantastor support for storage-system, disk, and pool inventory on
-  shared-slot hardware, with REST-first metadata plus optional SSH/`qs` CLI
-  enrichment for disk and enclosure detail, and master-node / IO-fencing
-  warnings
+  shared-slot hardware, with one cluster-style system entry, up to three HA
+  nodes, per-view target-node storage views, and REST-first metadata plus
+  optional SSH/`qs` CLI enrichment for disk and enclosure detail
 - UniFi appliance inventory through `ubntstorage disk inspect`, with built-in
   UniFi-specific tray styling and ATA/SATA SMART enrichment over SSH
 - Vendor-local UniFi SSH LED control for the regular UNVR and experimental
@@ -215,11 +218,11 @@ chassis layout catalog that can be added when needed.
 - Generic Linux slot mapping currently depends on explicit profile `slot_hints`
   and host inventory data such as `lsblk`, `mdadm`, and `nvme list-subsys`.
   It does not currently infer arbitrary Linux chassis geometry on its own.
-- Quantastor support is still intentionally first-pass in the current release. The current
-  implementation treats each storage system as a selectable system-scoped view,
-  supplements the REST path with SSH/`qs` CLI disk/enclosure rows when enabled,
-  and warns when HA groups are present instead of attempting full shared-face,
-  active-node, or IO-fencing visualization yet.
+- Quantastor support is still intentionally practical rather than claiming a
+  full appliance abstraction. The current implementation models one
+  cluster-style system entry plus up to three explicit HA nodes, lets virtual
+  storage views target a specific node, and relies on the appliance plus SSH
+  data instead of synthesizing a perfect universal controller model.
 - UniFi UNVR support is currently centered on SSH plus on-box vendor tooling,
   not on a rich documented Protect storage API.
 - UniFi UNVR Pro support is still first-pass and should be treated as
@@ -227,10 +230,10 @@ chassis layout catalog that can be added when needed.
   real hardware.
 - On the validated Quantastor cluster, the documented REST and `qs` identify
   operations are still being rejected by the LSI controller path, so the app
-  now prefers SSH `sg_ses` when one of the HA nodes exposes a usable enclosure
-  device. If the selected node does not expose the working SES path, add the
-  peer node to `ssh.extra_hosts` so the app can fall through to it for LED
-  control and live identify-state refresh.
+  prefers SSH `sg_ses` when one of the HA nodes exposes a usable enclosure
+  device. If the appliance only returns HA node ids and labels, operators may
+  still need to fill the per-node SSH host fields manually in admin when they
+  want node-targeted SES or SATADOM access.
 - Write-endurance and TBW-style estimates are only shown when the underlying
   SMART data actually exposes lifetime write counters. The current NVMe path is
   good here; generic HDD/SAS write-rate coverage is still best-effort.
@@ -657,8 +660,9 @@ Notes:
   through command-limited sudo
 - on the validated Quantastor HA cluster, the documented REST and `qs`
   identify methods are still failing, but the right-hand node exposes a usable
-  `sg_ses` controller path; the app can now use that through `ssh.extra_hosts`
-  even while the selected app view remains on the opposite node
+  `sg_ses` controller path; the app can now use that through the shared
+  cluster entry plus explicit HA-node targeting even while the selected app
+  view remains on the opposite node
 - the UI uses POST requests for LED-changing actions and surfaces errors instead
   of pretending the action succeeded
 

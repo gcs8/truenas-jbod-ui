@@ -36,7 +36,7 @@ UNVR_PRO_PARAMS = {
     "system_id": "unvr-pro",
 }
 QUANTASTOR_PARAMS = {
-    "system_id": "qs-cryostorage",
+    "system_id": "qsosn-ha",
 }
 
 

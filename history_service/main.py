@@ -13,6 +13,13 @@ from history_service.store import HistoryStore
 settings = get_history_settings()
 store = HistoryStore(settings.sqlite_path)
 collector = HistoryCollector(settings, store)
+SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
+    "temperature_c": 96,
+    "bytes_read": 60,
+    "bytes_written": 60,
+    "annualized_bytes_written": 60,
+    "power_on_hours": 60,
+}
 
 
 @asynccontextmanager
@@ -85,6 +92,24 @@ async def slot_metrics(
     }
 
 
+@app.get("/api/history/slots/{slot}/bundle")
+async def slot_history_bundle(
+    slot: int,
+    system_id: str = Query(...),
+    enclosure_id: str | None = Query(default=None),
+    since: str | None = Query(default=None),
+    event_limit: int = Query(default=12, ge=1, le=1000),
+) -> dict[str, object]:
+    return store.get_slot_history_bundle(
+        system_id,
+        enclosure_id,
+        slot,
+        event_limit=event_limit,
+        metric_limits=SLOT_HISTORY_METRIC_LIMITS,
+        since=since,
+    )
+
+
 @app.get("/api/history/scopes/slots")
 async def scope_slot_history(
     system_id: str = Query(...),
@@ -98,11 +123,7 @@ async def scope_slot_history(
         slots=slots,
         event_limit=event_limit,
         metric_limits={
-            "temperature_c": 96,
-            "bytes_read": 60,
-            "bytes_written": 60,
-            "annualized_bytes_written": 60,
-            "power_on_hours": 60,
+            **SLOT_HISTORY_METRIC_LIMITS,
         },
     )
     return {

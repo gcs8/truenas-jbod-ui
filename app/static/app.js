@@ -64,6 +64,7 @@
     timerId: null,
     refreshesInFlight: 0,
     latestRefreshToken: 0,
+    storageViewsRuntimeRequestToken: 0,
     smartSummaries: {},
     preloadedSmartSummariesBySlot,
     smartSummaryGeneration: 0,
@@ -238,6 +239,7 @@
   const historyCloseButton = document.getElementById("history-close-button");
   const historyTimeframeSelect = document.getElementById("history-timeframe-select");
   const detailHistorySummary = document.getElementById("detail-history-summary");
+  const detailHistoryNote = document.getElementById("detail-history-note");
   const detailHistoryEmpty = document.getElementById("detail-history-empty");
   const detailHistoryLoading = document.getElementById("detail-history-loading");
   const detailHistoryError = document.getElementById("detail-history-error");
@@ -496,15 +498,9 @@
   function bindStorageViewTileInteractions(tile, slot, selectedView) {
     tile.addEventListener("mouseenter", (event) => {
       state.hoveredSlot = slot.slot_index;
-      if (slotTooltipEl) {
-        slotTooltipEl.innerHTML = buildStorageViewRuntimeTooltip(slot, selectedView)
-          .split("\n")
-          .map((line, index) => `<div class="${index === 0 ? "slot-tooltip-title" : "slot-tooltip-line"}">${escapeHtml(line)}</div>`)
-          .join("");
-        slotTooltipEl.classList.remove("hidden");
-        slotTooltipEl.setAttribute("aria-hidden", "false");
-        positionSlotTooltip(event.clientX, event.clientY);
-      }
+      refreshHoveredTooltip(tile);
+      positionSlotTooltip(event.clientX, event.clientY);
+      void ensureStorageViewSmartSummary(selectedView, slot);
     });
     tile.addEventListener("mousemove", (event) => {
       if (state.hoveredSlot === slot.slot_index) {
@@ -519,15 +515,9 @@
     });
     tile.addEventListener("focus", () => {
       state.hoveredSlot = slot.slot_index;
-      if (slotTooltipEl) {
-        slotTooltipEl.innerHTML = buildStorageViewRuntimeTooltip(slot, selectedView)
-          .split("\n")
-          .map((line, index) => `<div class="${index === 0 ? "slot-tooltip-title" : "slot-tooltip-line"}">${escapeHtml(line)}</div>`)
-          .join("");
-        slotTooltipEl.classList.remove("hidden");
-        slotTooltipEl.setAttribute("aria-hidden", "false");
-        positionSlotTooltipFromElement(tile);
-      }
+      refreshHoveredTooltip(tile);
+      positionSlotTooltipFromElement(tile);
+      void ensureStorageViewSmartSummary(selectedView, slot);
     });
     tile.addEventListener("blur", () => {
       if (state.hoveredSlot === slot.slot_index) {
@@ -546,7 +536,7 @@
   }
 
   function storageViewRuntimeShortLabel(slot) {
-    if (!slot) {
+    if (!slot || !slot.occupied) {
       return "Empty";
     }
     return slot.serial || slot.device_name || slot.pool_name || "Matched disk";
@@ -594,16 +584,7 @@
     if (!slot) {
       return "";
     }
-    const lines = [
-      `${selectedView?.label || "Storage View"} • ${slot.slot_label}`,
-      slot.occupied ? (slot.serial || slot.device_name || "Matched disk") : "No live disk matched",
-      slot.device_name ? `Device ${slot.device_name}` : null,
-      slot.pool_name ? `Pool ${slot.pool_name}` : null,
-      slot.transport_address ? `PCIe ${slot.transport_address}` : null,
-      slot.slot_size ? `Size ${slot.slot_size}` : null,
-      slot.placement_key ? `Placement ${slot.placement_key}` : null,
-    ].filter(Boolean);
-    return lines.join("\n");
+    return buildStorageViewTooltipLines(slot, selectedView, getStorageViewSmartSummaryEntry(selectedView, slot)).join("\n");
   }
 
   function renderStorageViewGrid(selectedView) {
@@ -2273,7 +2254,8 @@
       state.snapshot.selected_enclosure_id ||
       state.selectedEnclosureId ||
       "all-enclosures";
-    return `${systemPart}|${enclosurePart}|${slot.slot}`;
+    const windowPart = currentHistoryWindowHours() === null ? "all" : String(currentHistoryWindowHours());
+    return `${systemPart}|${enclosurePart}|${slot.slot}|${windowPart}`;
   }
 
   function getStorageViewSmartCacheKey(view, slot) {
@@ -2306,9 +2288,13 @@
   function getSelectedHistoryTarget() {
     const selectedStorageView = getSelectedStorageViewRuntime();
     const storageViewSlot = selectedStorageView ? getSelectedStorageViewRuntimeSlot(state.selectedSlot) : null;
+    const windowHours = currentHistoryWindowHours();
     if (selectedStorageView && storageViewSlot) {
       const slot = buildStorageViewHistoryContextSlot(selectedStorageView, storageViewSlot);
       const params = buildSelectionParams();
+      if (Number.isInteger(windowHours)) {
+        params.set("window_hours", String(windowHours));
+      }
       const baseUrl = `/api/storage-views/${encodeURIComponent(selectedStorageView.id)}/slots/${storageViewSlot.slot_index}/history`;
       return {
         slot,
@@ -2321,10 +2307,15 @@
     if (!slot) {
       return null;
     }
+    const baseUrl = buildScopedUrl(`/api/slots/${slot.slot}/history`);
+    const url = new URL(baseUrl, window.location.origin);
+    if (Number.isInteger(windowHours)) {
+      url.searchParams.set("window_hours", String(windowHours));
+    }
     return {
       slot,
       cacheKey: getHistoryCacheKey(slot),
-      fetchUrl: buildScopedUrl(`/api/slots/${slot.slot}/history`),
+      fetchUrl: `${url.pathname}${url.search}`,
     };
   }
 
@@ -2645,6 +2636,14 @@
     return smartEntry?.data?.message ? "Unavailable" : "n/a";
   }
 
+  function formatPowerCycleValue(smartEntry) {
+    return formatOptionalCount(smartEntry?.data?.power_cycle_count, smartEntry);
+  }
+
+  function formatPowerOnResetsValue(smartEntry) {
+    return formatOptionalCount(smartEntry?.data?.power_on_resets, smartEntry);
+  }
+
   function formatSectorSizeValue(slot, smartEntry) {
     const logical = smartEntry?.data?.logical_block_size ?? slot?.logical_block_size;
     const physical = smartEntry?.data?.physical_block_size ?? slot?.physical_block_size;
@@ -2929,7 +2928,7 @@
 
   function formatOptionalCount(value, smartEntry) {
     if (Number.isInteger(value)) {
-      return String(value);
+      return value.toLocaleString();
     }
     if (smartEntry?.loading) {
       return "Loading...";
@@ -3004,6 +3003,14 @@
     return formatBytesValue(smartEntry?.data?.estimated_remaining_bytes_written, smartEntry);
   }
 
+  function formatReadCommandsValue(smartEntry) {
+    return formatOptionalCount(smartEntry?.data?.read_commands, smartEntry);
+  }
+
+  function formatWriteCommandsValue(smartEntry) {
+    return formatOptionalCount(smartEntry?.data?.write_commands, smartEntry);
+  }
+
   function formatMediaErrorsValue(smartEntry) {
     return formatOptionalCount(smartEntry?.data?.media_errors, smartEntry);
   }
@@ -3028,6 +3035,14 @@
     return formatOptionalCount(smartEntry?.data?.unsafe_shutdowns, smartEntry);
   }
 
+  function formatHardwareResetsValue(smartEntry) {
+    return formatOptionalCount(smartEntry?.data?.hardware_resets, smartEntry);
+  }
+
+  function formatInterfaceCrcErrorsValue(smartEntry) {
+    return formatOptionalCount(smartEntry?.data?.interface_crc_errors, smartEntry);
+  }
+
   function formatSmartHealthStatusValue(smartEntry) {
     const status = smartEntry?.data?.smart_health_status;
     if (status) {
@@ -3039,22 +3054,10 @@
     return "n/a";
   }
 
-  function buildTooltipLines(slot, smartEntry) {
-    const persistentIdText = slot.gptid ? `${persistentIdLabel(slot)}: ${slot.gptid}` : `${persistentIdLabel(slot)}: n/a`;
-    const poolLabel = currentPlatform() === "linux" ? "Mount" : "Pool";
-    const vdevLabel = currentPlatform() === "linux" ? "Array" : "Vdev";
-    const lines = [
-      `Slot ${slot.slot_label}${slot.device_name ? ` - ${slot.device_name}` : ""}`,
-      slot.serial ? `Serial: ${slot.serial}` : "Serial: n/a",
-      persistentIdText,
-      slot.pool_name ? `${poolLabel}: ${slot.pool_name}` : `${poolLabel}: n/a`,
-      slot.vdev_name ? `${vdevLabel}: ${slot.vdev_name}` : `${vdevLabel}: n/a`,
-      slot.health ? `Health: ${slot.health}` : "Health: n/a",
-    ];
-
+  function appendSmartTooltipMetrics(lines, slot, smartEntry) {
     if (smartEntry?.loading) {
       lines.push("SMART: loading...");
-      return lines;
+      return;
     }
 
     const temperature = formatTemperatureValue(slot, smartEntry);
@@ -3067,9 +3070,19 @@
       lines.push(`SMART: ${smartHealth}`);
     }
 
+    const powerOn = formatPowerOnValue(smartEntry);
+    if (powerOn !== "n/a" && powerOn !== "Unavailable") {
+      lines.push(`Power On: ${powerOn}`);
+    }
+
     const endurance = formatEnduranceValue(smartEntry);
     if (endurance !== "n/a") {
       lines.push(`Wear: ${endurance}`);
+    }
+
+    const availableSpare = formatAvailableSpareValue(smartEntry);
+    if (availableSpare !== "n/a") {
+      lines.push(`Spare: ${availableSpare}`);
     }
 
     const bytesRead = formatBytesReadValue(smartEntry);
@@ -3107,6 +3120,16 @@
       lines.push(`Transport: ${transport}`);
     }
 
+    const protocolVersion = formatProtocolVersionValue(smartEntry);
+    if (protocolVersion !== "n/a") {
+      lines.push(`Protocol: ${protocolVersion}`);
+    }
+
+    const firmware = formatFirmwareValue(smartEntry);
+    if (firmware !== "n/a") {
+      lines.push(`Firmware: ${firmware}`);
+    }
+
     const linkRate = formatLinkRateValue(smartEntry);
     if (linkRate !== "n/a") {
       lines.push(`Link Rate: ${linkRate}`);
@@ -3116,6 +3139,62 @@
     if (attachedSas !== "n/a") {
       lines.push(`Attached SAS: ${attachedSas}`);
     }
+  }
+
+  function buildStorageViewTooltipLines(slot, selectedView, smartEntry) {
+    if (!slot) {
+      return [];
+    }
+    const persistentIdText = slot.gptid ? `${persistentIdLabel(slot)}: ${slot.gptid}` : `${persistentIdLabel(slot)}: n/a`;
+    const lines = [
+      `${selectedView?.label || "Storage View"} • ${slot.slot_label}`,
+      slot.occupied ? (slot.serial || slot.device_name || "Matched disk") : "No live disk matched",
+      slot.device_name ? `Device: ${slot.device_name}` : null,
+      slot.serial ? `Serial: ${slot.serial}` : "Serial: n/a",
+      persistentIdText,
+      slot.pool_name ? `Pool: ${slot.pool_name}` : "Pool: n/a",
+      slot.health ? `Health: ${slot.health}` : null,
+      slot.target_system_label ? `Target: ${slot.target_system_label}` : null,
+      slot.placement_key ? `Placement: ${slot.placement_key}` : null,
+    ].filter(Boolean);
+
+    appendSmartTooltipMetrics(lines, slot, smartEntry);
+
+    const logicalUnitId = formatLogicalUnitIdValue(slot, smartEntry);
+    if (logicalUnitId !== "n/a") {
+      lines.push(`Logical Unit ID: ${logicalUnitId}`);
+    }
+
+    if (slot.transport_address) {
+      lines.push(`Address: ${slot.transport_address}`);
+    }
+
+    const matchReasons = Array.isArray(slot.match_reasons) ? slot.match_reasons.filter(Boolean) : [];
+    if (matchReasons.length) {
+      lines.push(`Matched By: ${matchReasons.join(", ")}`);
+    }
+
+    if (slot.source) {
+      lines.push(`Source: ${slot.source}`);
+    }
+
+    return lines;
+  }
+
+  function buildTooltipLines(slot, smartEntry) {
+    const persistentIdText = slot.gptid ? `${persistentIdLabel(slot)}: ${slot.gptid}` : `${persistentIdLabel(slot)}: n/a`;
+    const poolLabel = currentPlatform() === "linux" ? "Mount" : "Pool";
+    const vdevLabel = currentPlatform() === "linux" ? "Array" : "Vdev";
+    const lines = [
+      `Slot ${slot.slot_label}${slot.device_name ? ` - ${slot.device_name}` : ""}`,
+      slot.serial ? `Serial: ${slot.serial}` : "Serial: n/a",
+      persistentIdText,
+      slot.pool_name ? `${poolLabel}: ${slot.pool_name}` : `${poolLabel}: n/a`,
+      slot.vdev_name ? `${vdevLabel}: ${slot.vdev_name}` : `${vdevLabel}: n/a`,
+      slot.health ? `Health: ${slot.health}` : "Health: n/a",
+    ];
+
+    appendSmartTooltipMetrics(lines, slot, smartEntry);
 
     if (currentPlatform() === "quantastor") {
       const sesHost = formatSesHostValue(slot);
@@ -3175,14 +3254,28 @@
     if (state.hoveredSlot === null || !slotTooltipEl) {
       return;
     }
-    const slot = getSlotById(state.hoveredSlot);
-    if (!slot) {
-      state.hoveredSlot = null;
-      hideSlotTooltip();
-      return;
+    const selectedView = getSelectedStorageViewRuntime();
+    let lines = [];
+
+    if (selectedView) {
+      const storageViewSlot = getSelectedStorageViewRuntimeSlot(state.hoveredSlot);
+      if (!storageViewSlot) {
+        state.hoveredSlot = null;
+        hideSlotTooltip();
+        return;
+      }
+      const smartEntry = getStorageViewSmartSummaryEntry(selectedView, storageViewSlot);
+      lines = buildStorageViewTooltipLines(storageViewSlot, selectedView, smartEntry);
+    } else {
+      const slot = getSlotById(state.hoveredSlot);
+      if (!slot) {
+        state.hoveredSlot = null;
+        hideSlotTooltip();
+        return;
+      }
+      const smartEntry = getSmartSummaryEntry(slot);
+      lines = buildTooltipLines(slot, smartEntry);
     }
-    const smartEntry = getSmartSummaryEntry(slot);
-    const lines = buildTooltipLines(slot, smartEntry);
     const [headline, ...rest] = lines;
     slotTooltipEl.innerHTML = `
       <div class="slot-tooltip-title">${escapeHtml(headline)}</div>
@@ -3379,6 +3472,19 @@
       return "";
     }
     return kvRow(label, value, copyable);
+  }
+
+  function wireDetailCopyButtons() {
+    detailKvGrid.querySelectorAll("[data-copy]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(decodeURIComponent(button.dataset.copy));
+          setStatus("Copied to clipboard.");
+        } catch (error) {
+          setStatus(`Copy failed: ${error}`, "error");
+        }
+      });
+    });
   }
 
   function escapeHtml(value) {
@@ -3937,7 +4043,33 @@
     return timestamps;
   }
 
-  function computeHistoryCounterAverage(samples, windowHours = null, referenceTimestampMs = Date.now()) {
+  function isHistoryCounterScaleDiscontinuity(metricName, previousValue, currentValue) {
+    if (metricName !== "bytes_read" && metricName !== "bytes_written") {
+      return false;
+    }
+    if (!Number.isFinite(previousValue) || !Number.isFinite(currentValue) || previousValue <= 0 || currentValue < previousValue) {
+      return false;
+    }
+    return previousValue <= 1024 ** 3 && (currentValue / previousValue) >= 1024;
+  }
+
+  function hasHistoryCounterScaleDiscontinuity(metricName, samples, windowHours = null, referenceTimestampMs = Date.now()) {
+    const ordered = filterHistorySamplesToWindow(samples, windowHours, referenceTimestampMs);
+    if (ordered.length < 2) {
+      return false;
+    }
+
+    for (let index = 1; index < ordered.length; index += 1) {
+      const previousValue = Number(ordered[index - 1]?.value);
+      const currentValue = Number(ordered[index]?.value);
+      if (isHistoryCounterScaleDiscontinuity(metricName, previousValue, currentValue)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function summarizeHistoryCounterChanges(metricName, samples, windowHours = null, referenceTimestampMs = Date.now()) {
     const ordered = filterHistorySamplesToWindow(samples, windowHours, referenceTimestampMs);
     if (ordered.length < 2) {
       return null;
@@ -3945,6 +4077,7 @@
 
     let totalDelta = 0;
     let totalHours = 0;
+    let segmentCount = 0;
     for (let index = 1; index < ordered.length; index += 1) {
       const previous = ordered[index - 1];
       const current = ordered[index];
@@ -3956,6 +4089,7 @@
         !Number.isFinite(previousValue)
         || !Number.isFinite(currentValue)
         || currentValue < previousValue
+        || isHistoryCounterScaleDiscontinuity(metricName, previousValue, currentValue)
         || !Number.isFinite(previousTimestamp)
         || !Number.isFinite(currentTimestamp)
         || currentTimestamp <= previousTimestamp
@@ -3964,17 +4098,51 @@
       }
       totalDelta += currentValue - previousValue;
       totalHours += (currentTimestamp - previousTimestamp) / 3600000;
+      segmentCount += 1;
     }
 
-    if (!(totalHours > 0) || totalDelta <= 0) {
+    if (!segmentCount) {
       return null;
     }
 
-    return totalDelta / totalHours;
+    return {
+      totalDelta,
+      totalHours,
+      segmentCount,
+    };
   }
 
-  function formatHistoryAverage(metricName, samples, windowHours = null, prefix = "Avg", referenceTimestampMs = Date.now()) {
-    const ratePerHour = computeHistoryCounterAverage(samples, windowHours, referenceTimestampMs);
+  function computeHistoryCounterAverage(metricName, samples, windowHours = null, referenceTimestampMs = Date.now()) {
+    const summary = summarizeHistoryCounterChanges(metricName, samples, windowHours, referenceTimestampMs);
+    if (!summary || !(summary.totalHours > 0) || summary.totalDelta <= 0) {
+      return null;
+    }
+
+    return summary.totalDelta / summary.totalHours;
+  }
+
+  function formatHistoryWindowDelta(metricName, samples, windowHours = null, prefix = "Delta", referenceTimestampMs = Date.now()) {
+    const summary = summarizeHistoryCounterChanges(metricName, samples, windowHours, referenceTimestampMs);
+    if (!summary || summary.totalDelta < 0) {
+      return null;
+    }
+
+    const windowLabel = Number.isFinite(Number(windowHours)) && Number(windowHours) > 0
+      ? formatHistoryWindowLabel(windowHours)
+      : "";
+    const prefixLabel = `${prefix}${windowLabel ? ` ${windowLabel}` : ""}`;
+    if (metricName === "bytes_written" || metricName === "bytes_read") {
+      if (summary.totalDelta === 0) {
+        return `${prefixLabel} +0 B`;
+      }
+      const formatted = formatMetricBytes(summary.totalDelta);
+      return formatted ? `${prefixLabel} +${formatted}` : null;
+    }
+    return null;
+  }
+
+  function formatHistoryAverage(metricName, samples, windowHours = null, prefix = "Rate", referenceTimestampMs = Date.now()) {
+    const ratePerHour = computeHistoryCounterAverage(metricName, samples, windowHours, referenceTimestampMs);
     if (!Number.isFinite(ratePerHour) || ratePerHour <= 0) {
       return null;
     }
@@ -4024,7 +4192,11 @@
     if (windowHours !== null && totalCount > sampleCount) {
       noteParts.push(`${totalCount} total stored`);
     }
-    const averageLabel = formatHistoryAverage(metricName, allSamples, windowHours, "Avg", referenceTimestampMs);
+    const windowDeltaLabel = formatHistoryWindowDelta(metricName, allSamples, windowHours, "Delta", referenceTimestampMs);
+    if (windowDeltaLabel) {
+      noteParts.push(windowDeltaLabel);
+    }
+    const averageLabel = formatHistoryAverage(metricName, allSamples, windowHours, "Rate", referenceTimestampMs);
     if (averageLabel) {
       noteParts.push(averageLabel);
     }
@@ -4057,6 +4229,98 @@
 
     allTimestamps.sort((left, right) => new Date(right).getTime() - new Date(left).getTime());
     return `No history points in ${windowLabel}. Latest stored point ${formatTimestamp(allTimestamps[0])}`;
+  }
+
+  function getSelectedHistorySmartEntry() {
+    const selectedStorageView = getSelectedStorageViewRuntime();
+    const storageViewSlot = selectedStorageView ? getSelectedStorageViewRuntimeSlot(state.selectedSlot) : null;
+    if (selectedStorageView && storageViewSlot) {
+      return {
+        slotLike: storageViewSlot,
+        smartEntry: getStorageViewSmartSummaryEntry(selectedStorageView, storageViewSlot),
+      };
+    }
+
+    const liveSlot = getSlotById(state.selectedSlot);
+    return {
+      slotLike: liveSlot,
+      smartEntry: getSmartSummaryEntry(liveSlot),
+    };
+  }
+
+  function buildHistoryNoteText(payload, windowHours = null, referenceTimestampMs = Date.now()) {
+    const notes = [];
+    const { slotLike, smartEntry } = getSelectedHistorySmartEntry();
+    const smartMessage = smartEntry?.data?.message;
+    if (smartMessage) {
+      notes.push(smartMessage);
+    }
+
+    const ataHistoryCounterNote = (
+      smartEntry?.data?.transport_protocol === "ATA"
+      && ((payload?.metrics?.bytes_read || []).length || (payload?.metrics?.bytes_written || []).length)
+    )
+      ? "ATA read/write totals are lifetime SMART host counters. Lifetime shows the stored totals, while Rate converts them into per-hour movement between slower SMART samples."
+      : null;
+    if (ataHistoryCounterNote) {
+      notes.push(ataHistoryCounterNote);
+    }
+
+    const lowHourAnnualizedNote = (
+      Number.isInteger(smartEntry?.data?.power_on_hours)
+      && smartEntry.data.power_on_hours < (24 * 30)
+      && Number.isInteger(smartEntry?.data?.bytes_written)
+    )
+      ? "Annualized write stays hidden until the disk has at least about 30 days of power-on time."
+      : null;
+    if (lowHourAnnualizedNote) {
+      notes.push(lowHourAnnualizedNote);
+    }
+
+    const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
+      ? "Estimated write-endurance values extrapolate current writes against the NVMe percentage-used SMART field."
+      : null;
+    if (enduranceEstimateNote) {
+      notes.push(enduranceEstimateNote);
+    }
+
+    const temperatureSamples = Number(payload?.sample_counts?.temperature_c);
+    const slowMetricCounts = ["bytes_read", "bytes_written", "annualized_bytes_written", "power_on_hours"]
+      .map((metricName) => Number(payload?.sample_counts?.[metricName]))
+      .filter((count) => Number.isFinite(count) && count > 0);
+    if (
+      Number.isFinite(temperatureSamples)
+      && slowMetricCounts.length
+      && slowMetricCounts.some((count) => count < temperatureSamples)
+    ) {
+      notes.push("Read/write and power-on metrics are collected on the slower SMART cadence, so those samples can lag behind the latest temperature point.");
+    }
+
+    const hasCounterScaleBreak =
+      hasHistoryCounterScaleDiscontinuity("bytes_read", payload?.metrics?.bytes_read || [], windowHours, referenceTimestampMs)
+      || hasHistoryCounterScaleDiscontinuity("bytes_written", payload?.metrics?.bytes_written || [], windowHours, referenceTimestampMs);
+    if (hasCounterScaleBreak) {
+      notes.push("Read/write history includes an older low-scale sample, so Rate mode may need a few fresh slow samples to settle after the SMART counter-source correction.");
+    }
+
+    const diskHistory = payload?.disk_history;
+    const historyHomes = Array.isArray(diskHistory?.homes) ? diskHistory.homes : [];
+    if (diskHistory?.followed && historyHomes.length) {
+      const priorHomes = historyHomes
+        .filter((home) => home && home.sample_count)
+        .map((home) => {
+          const systemLabel = home.system_label || home.system_id || "unknown system";
+          const enclosureLabel = home.enclosure_label || home.enclosure_id || "unknown enclosure";
+          const slotLabel = home.slot_label || home.slot;
+          const lastSeenAt = home.last_seen_at ? formatTimestamp(home.last_seen_at) : null;
+          return `${systemLabel} / ${enclosureLabel} / slot ${slotLabel}${lastSeenAt ? ` through ${lastSeenAt}` : ""}`;
+        });
+      if (priorHomes.length) {
+        notes.push(`Disk metrics in this window follow the same disk across homes: ${priorHomes.join("; ")}. Slot-change events below still belong only to the currently selected slot.`);
+      }
+    }
+
+    return notes.join(" ");
   }
 
   function buildHistoryDrawerContext(slot) {
@@ -4110,7 +4374,7 @@
     };
   }
 
-  function buildHistoryRateSamples(samples) {
+  function buildHistoryRateSamples(metricName, samples) {
     const ordered = sortHistorySamplesAscending(samples);
     if (ordered.length < 2) {
       return [];
@@ -4128,6 +4392,7 @@
         !Number.isFinite(previousValue)
         || !Number.isFinite(currentValue)
         || currentValue < previousValue
+        || isHistoryCounterScaleDiscontinuity(metricName, previousValue, currentValue)
         || !Number.isFinite(previousTimestamp)
         || !Number.isFinite(currentTimestamp)
         || currentTimestamp <= previousTimestamp
@@ -4256,26 +4521,26 @@
     }
 
     const orderedRead = mode === "average"
-      ? filterHistorySamplesToWindow(buildHistoryRateSamples(readSamples), windowHours, referenceTimestampMs)
+      ? filterHistorySamplesToWindow(buildHistoryRateSamples("bytes_read", readSamples), windowHours, referenceTimestampMs)
       : filterHistorySamplesToWindow(readSamples, windowHours, referenceTimestampMs);
     const orderedWrite = mode === "average"
-      ? filterHistorySamplesToWindow(buildHistoryRateSamples(writeSamples), windowHours, referenceTimestampMs)
+      ? filterHistorySamplesToWindow(buildHistoryRateSamples("bytes_written", writeSamples), windowHours, referenceTimestampMs)
       : filterHistorySamplesToWindow(writeSamples, windowHours, referenceTimestampMs);
     if (labelTarget) {
       const labelParts = [];
       if (orderedRead.length) {
-        labelParts.push(`${orderedRead.length} ${mode === "average" ? "read rate" : "read"}`);
+        labelParts.push(`${orderedRead.length} ${mode === "average" ? "read rate samples" : "read counter samples"}`);
       }
       if (orderedWrite.length) {
-        labelParts.push(`${orderedWrite.length} ${mode === "average" ? "write rate" : "write"}`);
+        labelParts.push(`${orderedWrite.length} ${mode === "average" ? "write rate samples" : "write counter samples"}`);
       }
       labelParts.push(formatHistoryWindowDescription(windowHours));
       labelTarget.textContent = labelParts.join(" / ");
     }
     if (!orderedRead.length && !orderedWrite.length) {
       const emptyMessage = mode === "average"
-        ? `Average read and write rates need at least two slower samples inside ${formatHistoryWindowDescription(windowHours)}.`
-        : `No read or write samples in ${formatHistoryWindowDescription(windowHours)} yet.`;
+        ? `Read and write rate mode needs at least two slower SMART samples inside ${formatHistoryWindowDescription(windowHours)}.`
+        : `No read or write lifetime totals in ${formatHistoryWindowDescription(windowHours)} yet.`;
       target.innerHTML = `<div class="history-chart-empty">${escapeHtml(emptyMessage)}</div>`;
       return;
     }
@@ -4297,15 +4562,17 @@
       .sort((left, right) => new Date(right).getTime() - new Date(left).getTime())[0];
     const writeLatestValue = orderedWrite.length ? Number(orderedWrite[orderedWrite.length - 1].value) : null;
     const readLatestValue = orderedRead.length ? Number(orderedRead[orderedRead.length - 1].value) : null;
-    const writeAverage = formatHistoryAverage("bytes_written", writeSamples, windowHours, "Avg-W", referenceTimestampMs);
-    const readAverage = formatHistoryAverage("bytes_read", readSamples, windowHours, "Avg-R", referenceTimestampMs);
+    const writeAverage = formatHistoryAverage("bytes_written", writeSamples, windowHours, "Write Rate", referenceTimestampMs);
+    const readAverage = formatHistoryAverage("bytes_read", readSamples, windowHours, "Read Rate", referenceTimestampMs);
     const readPrimaryLabel = mode === "average"
       ? formatHistoryRateValue(readLatestValue)
       : formatHistoryMetricValue("bytes_read", readLatestValue);
     const writePrimaryLabel = mode === "average"
       ? formatHistoryRateValue(writeLatestValue)
       : formatHistoryMetricValue("bytes_written", writeLatestValue);
-    const chartAriaLabel = mode === "average" ? "Average read and write rate history" : "Read and write history";
+    const readWindowDelta = formatHistoryWindowDelta("bytes_read", readSamples, windowHours, "Read Delta", referenceTimestampMs);
+    const writeWindowDelta = formatHistoryWindowDelta("bytes_written", writeSamples, windowHours, "Write Delta", referenceTimestampMs);
+    const chartAriaLabel = mode === "average" ? "Read and write rate history" : "Read and write lifetime counter history";
     const readPointMarkup = buildHistoryPointHoverMarkup(
       readPoints,
       orderedRead,
@@ -4320,12 +4587,16 @@
     );
 
     target.innerHTML = `
-      <div class="history-chart-shell">
-        <div class="history-chart-meta">
-          ${readLatestValue !== null ? `<span class="history-legend-chip"><i class="history-legend-swatch read"></i>Read ${escapeHtml(readPrimaryLabel)}</span>` : ""}
-          ${readAverage ? `<span>${escapeHtml(readAverage)}</span>` : ""}
-          ${writeLatestValue !== null ? `<span class="history-legend-chip"><i class="history-legend-swatch write"></i>Write ${escapeHtml(writePrimaryLabel)}</span>` : ""}
-          ${writeAverage ? `<span>${escapeHtml(writeAverage)}</span>` : ""}
+        <div class="history-chart-shell">
+          <div class="history-chart-meta">
+          ${readLatestValue !== null ? `<span class="history-legend-chip"><i class="history-legend-swatch read"></i>${escapeHtml(mode === "average" ? `Read Rate ${readPrimaryLabel}` : `Read Lifetime ${readPrimaryLabel}`)}</span>` : ""}
+          ${mode === "average"
+            ? (readAverage ? `<span>${escapeHtml(readAverage)}</span>` : "")
+            : (readWindowDelta ? `<span>${escapeHtml(readWindowDelta)}</span>` : "")}
+          ${writeLatestValue !== null ? `<span class="history-legend-chip"><i class="history-legend-swatch write"></i>${escapeHtml(mode === "average" ? `Write Rate ${writePrimaryLabel}` : `Write Lifetime ${writePrimaryLabel}`)}</span>` : ""}
+          ${mode === "average"
+            ? (writeAverage ? `<span>${escapeHtml(writeAverage)}</span>` : "")
+            : (writeWindowDelta ? `<span>${escapeHtml(writeWindowDelta)}</span>` : "")}
         </div>
         <svg viewBox="0 0 ${width} ${height}" class="history-chart-svg" role="img" aria-label="${escapeHtml(chartAriaLabel)}">
           <line class="history-grid-line" x1="${padding}" y1="${padding}" x2="${width - padding}" y2="${padding}"></line>
@@ -4425,6 +4696,10 @@
     detailHistoryError.classList.add("hidden");
     detailHistoryContent.classList.add("hidden");
     detailHistoryError.textContent = "";
+    if (detailHistoryNote) {
+      detailHistoryNote.classList.add("hidden");
+      detailHistoryNote.textContent = "";
+    }
 
     const payload = historyTarget ? state.history.slotCache[historyTarget.cacheKey] : null;
     detailHistorySummary.textContent = payload?.available ? buildHistorySummary(payload, windowHours, referenceTimestampMs) : "";
@@ -4454,6 +4729,11 @@
     }
 
     detailHistoryContent.classList.remove("hidden");
+    const historyNote = buildHistoryNoteText(payload, windowHours, referenceTimestampMs);
+    if (detailHistoryNote) {
+      detailHistoryNote.textContent = historyNote;
+      detailHistoryNote.classList.toggle("hidden", !historyNote);
+    }
     historyMetricGrid.innerHTML = [
       historyMetricCard("Temperature", "temperature_c", payload, windowHours, referenceTimestampMs),
       historyMetricCard("Bytes Read", "bytes_read", payload, windowHours, referenceTimestampMs),
@@ -4656,6 +4936,16 @@
       detailStatePill.textContent = stateLabel(storageViewSlot);
       detailStatePill.className = `state-pill state-${storageViewSlot.state === "matched" ? "healthy" : (storageViewSlot.state || "unknown")}`;
       detailKvGrid.innerHTML = [
+        (() => {
+          const storageViewDetailSlot = {
+            ...storageViewSlot,
+            raw_status: {
+              attached_sas_address: storageViewSlot.attached_sas_address,
+            },
+          };
+          const showSasTransportFields = shouldShowSasTransportFields(storageViewDetailSlot, smartEntry);
+          const showLinkRate = showSasTransportFields || formatLinkRateValue(smartEntry) !== "n/a";
+          return [
         kvRow("Storage View", selectedStorageView.label),
         kvRow("Template", selectedStorageView.template_label || selectedStorageView.template_id),
         kvRow("Slot", storageViewSlot.slot_label),
@@ -4665,24 +4955,58 @@
         kvRow("Serial", storageViewSlot.serial, true),
         kvRowIfMeaningful("Model", storageViewSlot.model),
         kvRowIfMeaningful("Capacity", storageViewSlot.size_human),
+        kvRowIfMeaningful(persistentIdLabel(storageViewSlot), storageViewSlot.gptid, true),
+        kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(storageViewSlot, smartEntry), true),
+        kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
         kvRowIfMeaningful("Pool", storageViewSlot.pool_name),
         kvRowIfMeaningful("Health", storageViewSlot.health),
         kvRow("Temp", formatTemperatureValue(storageViewSlot, smartEntry)),
+        kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
+        kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
         kvRow("SMART Status", formatSmartHealthStatusValue(smartEntry)),
         kvRow("Last SMART Test", formatLastSmartTestValue(storageViewSlot, smartEntry)),
         kvRow("Power On", formatPowerOnValue(smartEntry)),
+        kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
+        kvRowIfMeaningful("Power-On Resets", formatPowerOnResetsValue(smartEntry)),
         kvRow("Sector Size", formatSectorSizeValue(storageViewSlot, smartEntry)),
+        kvRowIfMeaningful("Rotation", formatRotationValue(smartEntry)),
         kvRowIfMeaningful("SMART Form Factor", formatFormFactorValue(smartEntry)),
+        kvRowIfMeaningful("Firmware", formatFirmwareValue(smartEntry)),
+        kvRowIfMeaningful("Protocol Version", formatProtocolVersionValue(smartEntry)),
+        kvRowIfMeaningful("Endurance", formatEnduranceValue(smartEntry)),
+        kvRowIfMeaningful("Available Spare", formatAvailableSpareValue(smartEntry)),
+        kvRowIfMeaningful("TRIM", formatTrimSupportedValue(smartEntry)),
+        kvRowIfMeaningful("Bytes Read", formatBytesReadValue(smartEntry)),
+        kvRowIfMeaningful("Bytes Written", formatBytesWrittenValue(smartEntry)),
+        kvRowIfMeaningful("Annualized Write", formatAnnualizedWriteValue(smartEntry)),
+        kvRowIfMeaningful("Est. TBW Left", formatEstimatedRemainingWriteValue(smartEntry)),
+        kvRowIfMeaningful("Read Commands", formatReadCommandsValue(smartEntry)),
+        kvRowIfMeaningful("Write Commands", formatWriteCommandsValue(smartEntry)),
+        kvRowIfMeaningful("Media Errors", formatMediaErrorsValue(smartEntry)),
+        kvRowIfMeaningful("Predictive Errors", formatPredictiveErrorsValue(smartEntry)),
+        kvRowIfMeaningful("Non-Medium Errors", formatNonMediumErrorsValue(smartEntry)),
+        kvRowIfMeaningful("Uncorrected Read", formatUncorrectedReadErrorsValue(smartEntry)),
+        kvRowIfMeaningful("Uncorrected Write", formatUncorrectedWriteErrorsValue(smartEntry)),
+        kvRowIfMeaningful("Unsafe Shutdowns", formatUnsafeShutdownsValue(smartEntry)),
+        kvRowIfMeaningful("Hardware Resets", formatHardwareResetsValue(smartEntry)),
+        kvRowIfMeaningful("Interface CRC Errors", formatInterfaceCrcErrorsValue(smartEntry)),
+        kvRowIfMeaningful("Read Cache", formatReadCacheValue(smartEntry)),
+        kvRowIfMeaningful("Writeback Cache", formatWritebackCacheValue(smartEntry)),
         kvRowIfMeaningful("Transport", formatTransportValue(smartEntry)),
-        kvRowIfMeaningful("Logical Unit ID", formatLogicalUnitIdValue(storageViewSlot, smartEntry)),
-        kvRowIfMeaningful("SAS Address", formatSasAddressValue(storageViewSlot, smartEntry)),
+        showSasTransportFields ? kvRow("Logical Unit ID", formatLogicalUnitIdValue(storageViewDetailSlot, smartEntry)) : "",
+        showSasTransportFields ? kvRow("SAS Address", formatSasAddressValue(storageViewDetailSlot, smartEntry)) : "",
+        showSasTransportFields ? kvRow("Attached SAS", formatAttachedSasAddressValue(storageViewDetailSlot, smartEntry)) : "",
+        showLinkRate ? kvRow("Link Rate", formatLinkRateValue(smartEntry)) : "",
         kvRowIfMeaningful("Transport Address", storageViewSlot.transport_address),
         kvRowIfMeaningful("Placement", storageViewSlot.placement_key),
         kvRowIfMeaningful("Matched By", Array.isArray(storageViewSlot.match_reasons) ? storageViewSlot.match_reasons.join(", ") : null),
         kvRowIfMeaningful("Assignment Rank", storageViewSlot.assignment_rank),
         kvRowIfMeaningful("Source", storageViewSlot.source),
         kvRowIfMeaningful("Notes", storageViewRuntimeSecondaryLabel(storageViewSlot)),
+          ].filter(Boolean).join("");
+        })(),
       ].filter(Boolean).join("");
+      wireDetailCopyButtons();
       const smartNoteText = buildSmartNoteText(storageViewSlot, smartEntry);
       if (smartNoteText) {
         detailSmartNote.textContent = smartNoteText;
@@ -4776,6 +5100,8 @@
       kvRowIfMeaningful("SMART Status", formatSmartHealthStatusValue(smartEntry)),
       kvRow("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
       kvRow("Power On", formatPowerOnValue(smartEntry)),
+      kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
+      kvRowIfMeaningful("Power-On Resets", formatPowerOnResetsValue(smartEntry)),
       kvRow("Sector Size", formatSectorSizeValue(slot, smartEntry)),
       kvRow("Rotation", formatRotationValue(smartEntry)),
       kvRow("Form Factor", formatFormFactorValue(smartEntry)),
@@ -4788,12 +5114,16 @@
       kvRowIfMeaningful("Bytes Written", formatBytesWrittenValue(smartEntry)),
       kvRowIfMeaningful("Annualized Write", formatAnnualizedWriteValue(smartEntry)),
       kvRowIfMeaningful("Est. TBW Left", formatEstimatedRemainingWriteValue(smartEntry)),
+      kvRowIfMeaningful("Read Commands", formatReadCommandsValue(smartEntry)),
+      kvRowIfMeaningful("Write Commands", formatWriteCommandsValue(smartEntry)),
       kvRowIfMeaningful("Media Errors", formatMediaErrorsValue(smartEntry)),
       kvRowIfMeaningful("Predictive Errors", formatPredictiveErrorsValue(smartEntry)),
       kvRowIfMeaningful("Non-Medium Errors", formatNonMediumErrorsValue(smartEntry)),
       kvRowIfMeaningful("Uncorrected Read", formatUncorrectedReadErrorsValue(smartEntry)),
       kvRowIfMeaningful("Uncorrected Write", formatUncorrectedWriteErrorsValue(smartEntry)),
       kvRowIfMeaningful("Unsafe Shutdowns", formatUnsafeShutdownsValue(smartEntry)),
+      kvRowIfMeaningful("Hardware Resets", formatHardwareResetsValue(smartEntry)),
+      kvRowIfMeaningful("Interface CRC Errors", formatInterfaceCrcErrorsValue(smartEntry)),
       kvRow("Read Cache", formatReadCacheValue(smartEntry)),
       kvRow("Writeback Cache", formatWritebackCacheValue(smartEntry)),
       kvRow("Transport", formatTransportValue(smartEntry)),
@@ -4817,16 +5147,7 @@
       detailSmartNote.textContent = "";
     }
 
-    detailKvGrid.querySelectorAll("[data-copy]").forEach((button) => {
-      button.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(decodeURIComponent(button.dataset.copy));
-          setStatus("Copied to clipboard.");
-        } catch (error) {
-          setStatus(`Copy failed: ${error}`, "error");
-        }
-      });
-    });
+    wireDetailCopyButtons();
 
     renderTopologyContext(slot);
     renderMultipathContext(slot);
@@ -5381,24 +5702,34 @@
     if (state.snapshotMode) {
       return;
     }
+    const requestToken = ++state.storageViewsRuntimeRequestToken;
     try {
       state.storageViewsRuntimeLoading = true;
-      renderAll();
+      renderStorageViewsRuntime();
+      renderSelectors();
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
       const payload = await fetchJson(`/api/storage-views?${params.toString()}`);
+      if (requestToken !== state.storageViewsRuntimeRequestToken) {
+        return;
+      }
       applyStorageViewRuntime(payload);
       renderAll();
       if (!quiet) {
         setStatus(`Loaded ${Array.isArray(payload.views) ? payload.views.length : 0} storage view${Array.isArray(payload.views) && payload.views.length === 1 ? "" : "s"} for ${payload.system_label || payload.system_id || "the selected system"}.`);
       }
     } catch (error) {
+      if (requestToken !== state.storageViewsRuntimeRequestToken) {
+        return;
+      }
       if (!quiet) {
         setStatus(`Storage view refresh failed: ${error.message || error}`, "error");
       }
     } finally {
-      state.storageViewsRuntimeLoading = false;
-      renderAll();
+      if (requestToken === state.storageViewsRuntimeRequestToken) {
+        state.storageViewsRuntimeLoading = false;
+        renderAll();
+      }
     }
   }
 
@@ -5757,6 +6088,9 @@
       requestedAt: Date.now(),
       generation: state.smartSummaryGeneration,
     };
+    if (state.selectedStorageViewRuntimeId === view.id && state.hoveredSlot === slot.slot_index) {
+      refreshHoveredTooltip();
+    }
     try {
       const params = buildSelectionParams();
       const scopedUrl = params.toString()
@@ -5782,6 +6116,9 @@
 
     if (state.selectedStorageViewRuntimeId === view.id && state.selectedSlot === slot.slot_index) {
       renderDetail();
+    }
+    if (state.selectedStorageViewRuntimeId === view.id && state.hoveredSlot === slot.slot_index) {
+      refreshHoveredTooltip();
     }
   }
 
@@ -6099,6 +6436,9 @@
       state.history.timeframeHours = nextValue === "all" ? null : Number(nextValue) || DEFAULT_HISTORY_TIMEFRAME_HOURS;
       persistHistoryUiPreferences();
       renderHistoryPanel();
+      if (state.history.panelOpen && Number.isInteger(state.selectedSlot) && !state.snapshotMode && isHistoryAvailable()) {
+        void loadHistoryForSelectedSlot(true);
+      }
     });
   }
   historyIoModeButtons.forEach((button) => {

@@ -151,6 +151,34 @@
           <p id="backup-import-result" class="subtle action-note">
             Import replaces the mounted config/data/history state with the contents of the selected bundle.
           </p>
+          <p class="subtle action-note">
+            Maintenance: use orphan cleanup after deleting or renaming a saved system when you want to remove leftover history rows that no longer belong to anything in `config.yaml`.
+          </p>
+          <div class="button-row">
+            <button id="history-purge-orphaned-button" class="button secondary" type="button">Purge Orphaned Data</button>
+          </div>
+          <p id="history-purge-orphaned-result" class="subtle action-note">
+            This only removes history rows whose `system_id` no longer exists in the saved config.
+          </p>
+          <p class="subtle action-note">
+            Adoption is the rename/remap path: move saved history from a removed system id into a current saved system id without wiping the old samples first.
+          </p>
+          <div class="form-grid">
+            <label class="field">
+              <span>Adopt From Removed System</span>
+              <select id="history-adopt-source-select"></select>
+            </label>
+            <label class="field">
+              <span>Adopt Into Saved System</span>
+              <select id="history-adopt-target-select"></select>
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="history-adopt-button" class="button secondary" type="button">Adopt Removed System History</button>
+          </div>
+          <p id="history-adopt-result" class="subtle action-note">
+            This rewrites saved history ownership from one removed system id into a current saved system id. Disk metrics already auto-follow by disk identity on read; this tool is for system-id rename/remap cleanup.
+          </p>
         </div>
       </div>
     </section>
@@ -324,6 +352,11 @@
               <span>Enable SSH enrichment for this system</span>
             </label>
 
+            <label class="toggle">
+              <input id="setup-ha-enabled" type="checkbox">
+              <span>This Quantastor system is an HA cluster with shared SES access</span>
+            </label>
+
             <div class="form-grid">
               <label class="field">
                 <span>SSH Host</span>
@@ -365,6 +398,65 @@
                 <input id="setup-ssh-strict-host-key" data-ssh-field type="checkbox" checked>
                 <span>Strict host key checking</span>
               </label>
+            </div>
+
+            <div id="setup-ha-panel" class="key-mode-panel hidden">
+              <div class="setup-step-header">
+                <span class="badge">HA</span>
+                <div>
+                  <h3>Quantastor HA Nodes</h3>
+                  <p class="subtle">
+                    Reuse the shared SSH auth above, then point each Quantastor HA node at its own host so
+                    internal views like SATADOMs can target the correct node cleanly.
+                  </p>
+                </div>
+              </div>
+              <div class="button-row">
+                <button id="setup-discover-ha-nodes-button" class="button secondary small" type="button">Load Nodes From Quantastor API</button>
+              </div>
+              <div class="form-grid">
+                <label class="field">
+                  <span>Node 1 System ID</span>
+                  <input data-ha-node-system-id="0" type="text" placeholder="node-a">
+                </label>
+                <label class="field">
+                  <span>Node 1 Label</span>
+                  <input data-ha-node-label="0" type="text" placeholder="QSOSN Left">
+                </label>
+                <label class="field field-span">
+                  <span>Node 1 SSH Host</span>
+                  <input data-ha-node-host="0" type="text" placeholder="10.13.37.30">
+                </label>
+
+                <label class="field">
+                  <span>Node 2 System ID</span>
+                  <input data-ha-node-system-id="1" type="text" placeholder="node-b">
+                </label>
+                <label class="field">
+                  <span>Node 2 Label</span>
+                  <input data-ha-node-label="1" type="text" placeholder="QSOSN Right">
+                </label>
+                <label class="field field-span">
+                  <span>Node 2 SSH Host</span>
+                  <input data-ha-node-host="1" type="text" placeholder="10.13.37.31">
+                </label>
+
+                <label class="field">
+                  <span>Node 3 System ID</span>
+                  <input data-ha-node-system-id="2" type="text" placeholder="node-c">
+                </label>
+                <label class="field">
+                  <span>Node 3 Label</span>
+                  <input data-ha-node-label="2" type="text" placeholder="Optional tertiary node">
+                </label>
+                <label class="field field-span">
+                  <span>Node 3 SSH Host</span>
+                  <input data-ha-node-host="2" type="text" placeholder="Optional third HA node">
+                </label>
+              </div>
+              <p id="setup-ha-nodes-result" class="subtle action-note">
+                Use up to three HA node rows. Shared SSH auth settings above are reused for every listed node host.
+              </p>
             </div>
 
             <div class="key-manager">
@@ -542,6 +634,10 @@
                       </select>
                     </label>
                     <label class="field">
+                      <span>Target System</span>
+                      <select id="setup-storage-view-target-system"></select>
+                    </label>
+                    <label class="field">
                       <span>Display Order</span>
                       <input id="setup-storage-view-order" type="number" min="0" step="10" value="10">
                     </label>
@@ -551,7 +647,7 @@
                     </label>
                     <label class="toggle">
                       <input id="setup-storage-view-show-main" type="checkbox" checked>
-                      <span>Show in main read UI later</span>
+                      <span>Show in main read UI</span>
                     </label>
                     <label class="toggle">
                       <input id="setup-storage-view-show-admin" type="checkbox" checked>
@@ -671,7 +767,14 @@
                 <select id="existing-system-select"></select>
               </label>
               <button id="existing-system-load-button" class="button secondary small" type="button">Load Into Form</button>
+              <button id="existing-system-delete-button" class="button danger small" type="button">Delete System</button>
               <button id="existing-system-reset-button" class="button secondary small" type="button">Start Fresh</button>
+            </div>
+            <div class="toggle-group">
+              <label class="toggle">
+                <input id="existing-system-delete-history-toggle" type="checkbox">
+                <span>Delete + Purge History</span>
+              </label>
             </div>
             <p id="existing-system-help" class="subtle action-note"></p>
             <div id="existing-system-summary" class="profile-preview-meta"></div>

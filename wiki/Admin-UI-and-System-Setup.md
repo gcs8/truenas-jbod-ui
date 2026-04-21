@@ -48,7 +48,7 @@ If the admin sidecar is reachable, the main UI on `:8080` also shows a
 
 ## What The Page Looks Like
 
-![Admin sidecar grouped setup view](images/admin-setup-v0.10.0.png)
+![Admin sidecar grouped setup view](images/admin-setup-v0.11.0.png)
 
 The page is organized around one saved system at a time.
 
@@ -68,6 +68,11 @@ Use `Load Into Form` to pull one saved system into the editor.
 
 Use `Start Fresh` when you want to create a new system entry instead of
 editing an existing one.
+
+Use `Delete System` when you want to remove the saved config entry. Pair it
+with the `Delete + Purge History` checkbox when you really want a clean break
+instead of keeping the old sidecar rows around for later adoption or orphan
+cleanup.
 
 ### Profile Catalog and Preview
 
@@ -139,6 +144,23 @@ The admin sidecar is also the supported place for:
 
 This keeps write-capable maintenance actions out of the normal enclosure
 viewer.
+
+## History Maintenance And Recovery
+
+The same backup/restore area now also holds the safe cleanup tools for saved
+history:
+
+![Admin maintenance bundle and history tools](images/admin-maintenance-v0.11.0.png)
+
+Use that panel when you need to:
+
+- purge orphaned history after deleting or renaming a saved system
+- adopt removed-system history into a new saved `system_id`
+- export a bundle before destructive cleanup
+
+The detailed operator guidance lives on:
+
+- [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
 
 ## Good First-Time Pattern
 

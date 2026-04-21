@@ -15,6 +15,9 @@ FIELD_LABELS = {
     "serial": "Serial",
     "model": "Model",
     "gptid": "Persistent ID",
+    "persistent_id_label": "Persistent ID Type",
+    "logical_unit_id": "Logical Unit ID",
+    "sas_address": "SAS Address",
     "pool_name": "Pool",
     "vdev_name": "Vdev",
     "topology_label": "Topology",
@@ -35,7 +38,14 @@ FIELD_LABELS = {
 
 EVENT_GROUPS = {
     "slot_state_changed": ("present", "state", "identify_active", "health"),
-    "slot_identity_changed": ("device_name", "serial", "model", "gptid"),
+    "slot_identity_changed": (
+        "device_name",
+        "serial",
+        "model",
+        "gptid",
+        "logical_unit_id",
+        "sas_address",
+    ),
     "slot_topology_changed": ("pool_name", "vdev_name", "topology_label"),
     "slot_multipath_changed": (
         "multipath_device",
@@ -92,6 +102,23 @@ def unique_join(values: list[Any]) -> str | None:
     return ", ".join(parts) if parts else None
 
 
+def build_disk_identity_key(
+    serial: Any,
+    persistent_id_label: Any,
+    persistent_id_value: Any,
+) -> str | None:
+    normalized_serial = normalize_text(serial)
+    normalized_label = normalize_text(persistent_id_label)
+    normalized_value = normalize_text(persistent_id_value)
+    if not normalized_serial or not normalized_value:
+        return None
+    return (
+        f"{normalized_serial.casefold()}|"
+        f"{(normalized_label or 'unknown').casefold()}|"
+        f"{normalized_value.casefold()}"
+    )
+
+
 def classify_multipath_member_state(value: Any) -> str:
     state_name = normalize_text(value)
     if not state_name:
@@ -125,6 +152,10 @@ class SlotStateRecord:
     pool_name: str | None
     vdev_name: str | None
     health: str | None
+    persistent_id_label: str | None = None
+    disk_identity_key: str | None = None
+    logical_unit_id: str | None = None
+    sas_address: str | None = None
     topology_label: str | None = None
     multipath_device: str | None = None
     multipath_mode: str | None = None
@@ -139,6 +170,14 @@ class SlotStateRecord:
     multipath_active_controllers: str | None = None
     multipath_passive_controllers: str | None = None
     multipath_failed_controllers: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.disk_identity_key is None:
+            object.__setattr__(
+                self,
+                "disk_identity_key",
+                build_disk_identity_key(self.serial, self.persistent_id_label, self.gptid),
+            )
 
     @classmethod
     def from_snapshot_slot(
@@ -199,6 +238,17 @@ class SlotStateRecord:
             pool_name=normalize_text(slot_payload.get("pool_name")),
             vdev_name=normalize_text(slot_payload.get("vdev_name")),
             health=normalize_text(slot_payload.get("health")),
+            persistent_id_label=normalize_text(slot_payload.get("persistent_id_label")),
+            disk_identity_key=build_disk_identity_key(
+                slot_payload.get("serial"),
+                slot_payload.get("persistent_id_label"),
+                slot_payload.get("gptid"),
+            ),
+            logical_unit_id=normalize_text(slot_payload.get("logical_unit_id"))
+            or normalize_text(
+                multipath_payload.get("lunid") if isinstance(multipath_payload, dict) else None
+            ),
+            sas_address=normalize_text(slot_payload.get("sas_address")),
             topology_label=normalize_text(slot_payload.get("topology_label")),
             multipath_device=normalize_text(
                 multipath_payload.get("device_name") if isinstance(multipath_payload, dict) else None
@@ -248,6 +298,19 @@ class SlotEvent:
     device_name: str | None
     serial: str | None
     details_json: str
+    gptid: str | None = None
+    persistent_id_label: str | None = None
+    disk_identity_key: str | None = None
+    logical_unit_id: str | None = None
+    sas_address: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.disk_identity_key is None:
+            object.__setattr__(
+                self,
+                "disk_identity_key",
+                build_disk_identity_key(self.serial, self.persistent_id_label, self.gptid),
+            )
 
 
 @dataclass(slots=True, frozen=True)
@@ -267,6 +330,19 @@ class MetricSample:
     serial: str | None
     model: str | None
     state: str | None
+    gptid: str | None = None
+    persistent_id_label: str | None = None
+    disk_identity_key: str | None = None
+    logical_unit_id: str | None = None
+    sas_address: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.disk_identity_key is None:
+            object.__setattr__(
+                self,
+                "disk_identity_key",
+                build_disk_identity_key(self.serial, self.persistent_id_label, self.gptid),
+            )
 
 
 def summarize_record(record: SlotStateRecord | None, event_type: str) -> str | None:
@@ -343,6 +419,11 @@ def build_slot_events(
                 device_name=current.device_name,
                 serial=current.serial,
                 details_json=json.dumps(changes, sort_keys=True),
+                gptid=current.gptid,
+                persistent_id_label=current.persistent_id_label,
+                disk_identity_key=current.disk_identity_key,
+                logical_unit_id=current.logical_unit_id,
+                sas_address=current.sas_address,
             )
         )
     return events

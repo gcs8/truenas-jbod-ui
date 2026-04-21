@@ -32,6 +32,9 @@ SLOW_METRIC_FIELDS = (
     "power_on_hours",
 )
 EXTENDED_STATE_FIELDS = (
+    "persistent_id_label",
+    "logical_unit_id",
+    "sas_address",
     "topology_label",
     "multipath_device",
     "multipath_mode",
@@ -90,18 +93,23 @@ class HistoryCollector:
             pass
         self._task = None
 
-    async def run_once(self) -> None:
+    async def run_once(
+        self,
+        *,
+        force_fast: bool = False,
+        force_slow: bool = False,
+    ) -> None:
         run_started = utcnow()
         observed_at = isoformat_utc(run_started)
         scopes = await self._enumerate_scopes()
         self.last_scope_count = len(scopes)
         self.last_inventory_at = observed_at
-        collect_fast = self._interval_due(
+        collect_fast = force_fast or self._interval_due(
             self.last_fast_metrics_at,
             self.settings.fast_interval_seconds,
             run_started,
         )
-        collect_slow = self._interval_due(
+        collect_slow = force_slow or self._interval_due(
             self.last_slow_metrics_at,
             self.settings.slow_interval_seconds,
             run_started,
@@ -127,7 +135,7 @@ class HistoryCollector:
             present_slots = [record.slot for record in slot_records if record.present]
             if not present_slots:
                 continue
-            summaries = await self._fetch_smart_summaries(scope, present_slots)
+            summaries = await self._fetch_smart_summaries(scope, present_slots, force_fresh=collect_slow)
             metric_samples: list[MetricSample] = []
             for record in slot_records:
                 summary = summaries.get(record.slot)
@@ -185,13 +193,22 @@ class HistoryCollector:
         while not self._stopping.is_set():
             started = utcnow()
             try:
-                await self.run_once()
+                force_startup_collection = self.last_success_at is None
+                await self.run_once(
+                    force_fast=force_startup_collection,
+                    force_slow=force_startup_collection,
+                )
             except Exception as exc:  # noqa: BLE001 - keep the collector alive across transient appliance errors.
                 logger.exception("History collection pass failed")
                 self.last_error = str(exc)
 
             elapsed = (utcnow() - started).total_seconds()
-            sleep_for = max(1.0, self.settings.poll_interval_seconds - elapsed)
+            target_interval = (
+                min(self.settings.poll_interval_seconds, 30)
+                if self.last_success_at is None
+                else self.settings.poll_interval_seconds
+            )
+            sleep_for = max(1.0, target_interval - elapsed)
             try:
                 await asyncio.wait_for(self._stopping.wait(), timeout=sleep_for)
             except asyncio.TimeoutError:
@@ -286,6 +303,11 @@ class HistoryCollector:
                     serial=slot_record.serial,
                     model=slot_record.model,
                     state=slot_record.state,
+                    gptid=slot_record.gptid,
+                    persistent_id_label=slot_record.persistent_id_label,
+                    disk_identity_key=slot_record.disk_identity_key,
+                    logical_unit_id=slot_record.logical_unit_id,
+                    sas_address=slot_record.sas_address,
                 )
             )
         return samples
@@ -427,6 +449,9 @@ class HistoryCollector:
                         "serial": normalize_text(slot_payload.get("serial")),
                         "model": normalize_text(slot_payload.get("model")),
                         "gptid": normalize_text(slot_payload.get("gptid")),
+                        "persistent_id_label": normalize_text(slot_payload.get("persistent_id_label")),
+                        "logical_unit_id": normalize_text(slot_payload.get("logical_unit_id")),
+                        "sas_address": normalize_text(slot_payload.get("sas_address")),
                         "pool_name": normalize_text(slot_payload.get("pool_name")),
                         "vdev_name": None,
                         "health": normalize_text(slot_payload.get("health")),
@@ -461,18 +486,23 @@ class HistoryCollector:
         self,
         scope: ScopeSnapshot,
         slot_numbers: list[int],
+        *,
+        force_fresh: bool = False,
     ) -> dict[int, dict[str, Any]]:
         summaries: dict[int, dict[str, Any]] = {}
         storage_view_id = normalize_text(scope.snapshot.get("storage_view_id"))
         if storage_view_id:
             backing_enclosure_id = normalize_text(scope.snapshot.get("storage_view_backing_enclosure_id"))
             for slot_number in slot_numbers:
+                params: dict[str, Any] = {
+                    "system_id": scope.system_id,
+                    "enclosure_id": backing_enclosure_id,
+                }
+                if force_fresh:
+                    params["fresh"] = "true"
                 payload = await self._fetch_json(
                     f"/api/storage-views/{urllib.parse.quote(storage_view_id)}/slots/{slot_number}/smart",
-                    params={
-                        "system_id": scope.system_id,
-                        "enclosure_id": backing_enclosure_id,
-                    },
+                    params=params,
                 )
                 if isinstance(payload, dict):
                     summaries[slot_number] = payload
@@ -481,12 +511,15 @@ class HistoryCollector:
         batch_size = max(1, self.settings.smart_batch_size)
         for offset in range(0, len(slot_numbers), batch_size):
             chunk = slot_numbers[offset : offset + batch_size]
+            params: dict[str, Any] = {
+                "system_id": scope.system_id,
+                "enclosure_id": scope.enclosure_id,
+            }
+            if force_fresh:
+                params["fresh"] = "true"
             payload = await self._fetch_json(
                 "/api/slots/smart-batch",
-                params={
-                    "system_id": scope.system_id,
-                    "enclosure_id": scope.enclosure_id,
-                },
+                params=params,
                 method="POST",
                 body=json.dumps({"slots": chunk}).encode("utf-8"),
                 headers={"Content-Type": "application/json"},

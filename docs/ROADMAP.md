@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.9.0`.
+This file tracks the current intended release direction after `v0.11.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -12,6 +12,7 @@ Detailed execution plans live here:
 - [`docs/V0_5_QUANTASTOR_PLAN.md`](./V0_5_QUANTASTOR_PLAN.md)
 - [`docs/V0_8_HISTORY_PLAN.md`](./V0_8_HISTORY_PLAN.md)
 - [`docs/V0_9_0_PLAN.md`](./V0_9_0_PLAN.md)
+- [`docs/V0_11_0_PLAN.md`](./V0_11_0_PLAN.md)
 - [`docs/PROFILE_AUTHORING.md`](./PROFILE_AUTHORING.md)
 
 ## Guiding Principle
@@ -166,8 +167,9 @@ Primary outcomes:
 
 Current status:
 
-- prepared as the local `0.7.0` release candidate
-- focused on polish and clarity rather than adding another large new platform
+- shipped in `v0.7.0`
+- the layout polish, topology cleanup, and refreshed release-facing screenshots
+  all landed in the release
 
 ## v0.8.0 - Optional Slot History And Snapshot Export
 
@@ -193,9 +195,9 @@ Current notes:
 
 Current status:
 
-- prepared as the local `0.8.0` release candidate
-- history sidecar, offline snapshot export, screenshots, and wiki walkthroughs
-  are all in place for the cut
+- shipped in `v0.8.0`
+- the optional history sidecar, offline snapshot export flow, and the
+  screenshot/wiki walkthroughs all landed in the release
 
 ## v0.9.0 - Perf Harness And Reusable Profiles
 
@@ -229,11 +231,70 @@ Current notes:
 
 Current status:
 
-- release-closeout is underway on the local `v0.9.0` branch
+- shipped in `v0.9.0`
+- perf instrumentation, the HTTP perf harness, browser QA, and the reusable
+  generic profile batch all landed in the release
 - eBPF and other native profiler ideas remain optional investigation items, not
   the required center of the milestone
-- broader Linux appliance support, richer topology graphs, and auth workflows
-  remain explicitly deferred for now
+
+## v0.10.0 - Admin Sidecar, Storage Views, And Recovery
+
+Goal:
+
+- turn the app into a more complete operator workflow without abandoning the
+  simple read-only enclosure UI at its center
+
+Primary outcomes:
+
+- optional `admin` sidecar for setup, backup/restore, runtime control, SSH key
+  management, and TLS trust workflows
+- storage views promoted to first-class runtime targets instead of metadata-only
+  side paths
+- inventory-bound views such as `Boot SATADOMs` and the NVMe carrier wired into
+  the normal SMART and history flows
+- clearer operator wording between `Live Enclosures`, `Saved Chassis Views`,
+  and `Virtual Storage Views`
+- more resilient history-sidecar behavior on the validated Docker Desktop
+  bind-mount path
+
+Current status:
+
+- shipped in `v0.10.0`
+- the release tag, release notes, screenshots, and wiki refresh are complete
+- the remaining follow-up work is intentionally being carried into `v0.11.0`
+
+## v0.11.0 - Runtime Sanity, Bootstrap Clarity, And Cleanup
+
+Goal:
+
+- validate the new live-versus-saved runtime model on real systems, then close
+  the highest-value clarity and cleanup gaps before broadening scope again
+
+Primary outcomes:
+
+- live-host sanity pass for the grouped selector wording and grouped admin
+  `Add Storage View` flow
+- remaining storage-view first-class parity fixes plus a decision on legacy
+  saved `ses_enclosure` profile behavior
+- either backend/docs alignment or an explicit documentation correction for the
+  CORE `midclt call user.update` bootstrap story
+- follow-up decision on whether the Docker Desktop history-sidecar root-user
+  workaround can eventually relax
+- optional Quantastor and snapshot-export cleanup if those still look like the
+  best next low-risk wins afterward
+
+Current notes:
+
+- [`docs/V0_11_0_PLAN.md`](./V0_11_0_PLAN.md)
+
+Current status:
+
+- shipped in `v0.11.0`
+- release-facing docs, screenshots, Quantastor HA guidance, and the external
+  wiki refresh all landed with the cut
+- deferred follow-ups now live in `HANDOFF.md` / `TODO.md`, with
+  snapshot-export profiling and broader non-Quantastor runtime sanity at the
+  top of the carry-over list
 
 ## Longer-Term Ideas
 
