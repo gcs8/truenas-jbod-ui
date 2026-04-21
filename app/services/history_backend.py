@@ -252,7 +252,7 @@ class HistoryBackendClient:
         filtered_params = {
             key: value
             for key, value in (params or {}).items()
-            if value not in {None, ""}
+            if value is not None and (not isinstance(value, str) or value != "")
         }
         query = urllib.parse.urlencode(filtered_params, doseq=True)
         url = f"{self.config.service_url.rstrip('/')}{path}"

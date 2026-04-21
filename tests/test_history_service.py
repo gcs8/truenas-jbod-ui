@@ -90,6 +90,21 @@ class HistoryDomainTests(unittest.TestCase):
         self.assertEqual(identity_event.sas_address, "0x5000cca27c7f2229")
 
 
+class HistoryConfigTests(unittest.TestCase):
+    def test_history_settings_uses_sqlite_parent_for_backup_dirs_when_sqlite_path_changes(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        settings = HistorySettings(sqlite_path=str(temp_dir / "history.db"))
+
+        self.assertEqual(settings.backup_dir, str(temp_dir / "backups"))
+        self.assertEqual(settings.long_term_backup_dir, str(temp_dir / "backups" / "long-term"))
+
+    def test_history_settings_rebases_long_term_backup_dir_when_backup_dir_changes(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        settings = HistorySettings(backup_dir=str(temp_dir / "backups"))
+
+        self.assertEqual(settings.long_term_backup_dir, str(temp_dir / "backups" / "long-term"))
+
+
 class HistoryStoreTests(unittest.TestCase):
     def test_store_persists_scope_events_and_metrics(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -1421,6 +1436,58 @@ class HistoryStoreTests(unittest.TestCase):
         repair.assert_called_once()
         working_connection.execute.assert_called_once()
         working_connection.commit.assert_called_once()
+
+    def test_connect_applies_temp_store_and_cache_size_pragmas(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+
+        with store._connect() as connection:
+            temp_store = connection.execute("PRAGMA temp_store").fetchone()[0]
+            cache_size = connection.execute("PRAGMA cache_size").fetchone()[0]
+
+        self.assertEqual(temp_store, 2)
+        self.assertEqual(cache_size, -16384)
+
+    def test_connect_falls_back_when_wal_enablement_hits_disk_io_error(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        original_connect = sqlite3.connect
+
+        class FailingWalConnection:
+            def __init__(self, path: str) -> None:
+                self._connection = original_connect(path)
+
+            def __enter__(self) -> sqlite3.Connection:
+                return self._connection.__enter__()
+
+            def __exit__(self, exc_type, exc, tb) -> bool | None:
+                return self._connection.__exit__(exc_type, exc, tb)
+
+            def __getattr__(self, name: str):
+                return getattr(self._connection, name)
+
+            @property
+            def row_factory(self):
+                return self._connection.row_factory
+
+            @row_factory.setter
+            def row_factory(self, value) -> None:
+                self._connection.row_factory = value
+
+            def execute(self, sql: str, *args, **kwargs):
+                if sql == "PRAGMA journal_mode=WAL":
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._connection.execute(sql, *args, **kwargs)
+
+        with (
+            patch("history_service.store.sqlite3.connect", side_effect=lambda path: FailingWalConnection(path)),
+            self.assertLogs("history_service.store", level="WARNING") as logs,
+        ):
+            with store._connect() as connection:
+                result = connection.execute("SELECT 1").fetchone()[0]
+
+        self.assertEqual(result, 1)
+        self.assertTrue(any("could not enable WAL mode" in message for message in logs.output))
 
     def test_restore_backup_normalizes_database_permissions(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

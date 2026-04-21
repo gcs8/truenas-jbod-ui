@@ -8,6 +8,41 @@ from app.services.history_backend import HistoryBackendClient
 
 
 class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
+    def test_request_bytes_sync_preserves_list_query_params(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+
+        class FakeResponse:
+            def __init__(self) -> None:
+                self.headers: dict[str, str] = {}
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool | None:
+                return None
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        with patch("app.services.history_backend.urllib.request.urlopen", return_value=FakeResponse()) as urlopen:
+            payload, headers = client._request_bytes_sync(
+                "/api/history/scopes/slots",
+                params={
+                    "system_id": "archive-core",
+                    "slots": [5, 6],
+                    "enclosure_id": "",
+                },
+            )
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(payload, b"{}")
+        self.assertEqual(headers, {})
+        self.assertIn("system_id=archive-core", request.full_url)
+        self.assertIn("slots=5&slots=6", request.full_url)
+        self.assertNotIn("enclosure_id=", request.full_url)
+
     async def test_get_status_returns_unconfigured_shape_when_url_missing(self) -> None:
         client = HistoryBackendClient(HistoryConfig(service_url="", timeout_seconds=10))
 

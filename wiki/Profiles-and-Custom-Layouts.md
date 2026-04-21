@@ -46,6 +46,30 @@ On the Docker host, that is usually:
 ./config/profiles.yaml
 ```
 
+## Builder Mode
+
+You no longer have to start with hand-editing YAML.
+
+The optional admin sidecar now includes a dedicated
+`Enclosure / Profile Builder` workspace that can:
+
+- load a built-in profile from the catalog
+- clone it into a reusable custom profile
+- adjust the face style, latch edge, bay count, and row groups
+- generate common slot-ordering patterns
+- save an explicit custom row matrix into `slot_layout`
+
+![Builder workspace previewing a custom profile](images/builder-workspace-v0.12.0.png)
+
+This is the recommended first pass for normal operator changes.
+
+Hand-editing `profiles.yaml` is still useful when:
+
+- you want to keep the file under your own version control
+- you need fields the current builder does not expose yet
+- you are experimenting with sparse/gapped layouts or other later-work schema
+  details
+
 ## Example Custom Profile
 
 ```yaml
@@ -80,6 +104,38 @@ profiles:
 - `slot_layout`
 - `row_groups`
 - `slot_hints`
+
+## Slot Ordering In Builder Mode
+
+The builder can now generate common numbering patterns without editing YAML
+directly.
+
+Examples:
+
+- `Bottom-Up By Rows`
+- `Top-Down By Rows`
+- `Bottom-Up By Columns`
+- `Top-Down By Columns`
+
+If none of those match the real hardware, switch the builder to
+`Custom Matrix` and enter the rows yourself.
+
+Example:
+
+```text
+02 05
+01 04
+00 03
+```
+
+That saves as:
+
+```yaml
+slot_layout:
+  - [2, 5]
+  - [1, 4]
+  - [0, 3]
+```
 
 ## `latch_edge`
 

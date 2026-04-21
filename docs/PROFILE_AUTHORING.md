@@ -10,6 +10,11 @@ Use built-in profiles when they match validated hardware. Use a custom profile
 file when you need a different chassis layout or want to force a specific
 visual presentation for an enclosure.
 
+The optional admin sidecar now also exposes a dedicated
+`Enclosure / Profile Builder` workspace that can write safe first-pass custom
+profiles back into `profiles.yaml`. This guide remains the schema-level source
+of truth for the fields the builder is editing.
+
 ## Where Profiles Live
 
 The app loads custom profiles from:
@@ -107,6 +112,33 @@ That means:
 If `slot_layout` is omitted, the app builds a default top-to-bottom grid based
 on `rows * columns`.
 
+The builder workspace can now populate `slot_layout` in three different ways:
+
+- keep the source profile layout as-is
+- generate a common ordering preset such as bottom-up rows or bottom-up columns
+- save an explicit `Custom Matrix` row list
+
+Example custom matrix input in the builder:
+
+```text
+02 05
+01 04
+00 03
+```
+
+Saved YAML:
+
+```yaml
+slot_layout:
+  - [2, 5]
+  - [1, 4]
+  - [0, 3]
+```
+
+Explicit `slot_layout` payloads are now also validated against `slot_count`, so
+the visible slot count has to match the profile geometry instead of silently
+writing a broken layout.
+
 ## Tray Latch Orientation
 
 `latch_edge` is optional.
@@ -192,6 +224,8 @@ The selection order is:
 - Keep `id` stable once mappings exist
 - Treat `slot_layout` as physical truth, not storage topology
 - Use `row_groups` only for visual dividers
+- Prefer the builder workspace for common rectangular/profile-clone edits
+  instead of hand-editing YAML every time
 - Use `slot_hints` when a host is inventory-only and needs extra help matching
   physical slots to controller names, namespace devices, PCI addresses, or SES
   hints

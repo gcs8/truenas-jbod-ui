@@ -14,6 +14,10 @@
       <div class="hero-actions">
         <button id="refresh-state-button" class="button secondary" type="button">Refresh State</button>
         <a id="admin-origin-link" class="button ghost" href="#" target="_blank" rel="noopener">Open Another Admin Tab</a>
+        <div class="hero-view-switcher" role="group" aria-label="Admin sections">
+          <button class="button secondary small admin-view-button is-active" data-admin-view-button="operations" type="button">Setup + Maintenance</button>
+          <button class="button secondary small admin-view-button" data-admin-view-button="builder" type="button">Enclosure / Profile Builder</button>
+        </div>
       </div>
     </div>
     <div class="hero-meta">
@@ -44,8 +48,10 @@
     Admin sidecar ready.
   </div>
 
-  <main class="admin-layout">
-    <section class="panel runtime-panel">
+  <main class="admin-views">
+    <div class="admin-view is-active" data-admin-view-panel="operations">
+      <div class="admin-layout">
+        <section class="panel runtime-panel">
       <div class="panel-header">
         <div>
           <p class="eyebrow">Runtime Control</p>
@@ -60,7 +66,7 @@
       <div id="runtime-cards" class="runtime-cards"></div>
     </section>
 
-    <section class="panel backup-panel">
+        <section class="panel backup-panel">
       <div class="panel-header">
         <div>
           <p class="eyebrow">Full Backup Bundle</p>
@@ -183,7 +189,7 @@
       </div>
     </section>
 
-    <section class="panel setup-panel">
+        <section class="panel setup-panel">
       <div class="panel-header">
         <div>
           <p class="eyebrow">Guided Walkthrough</p>
@@ -747,10 +753,16 @@
 
           <section class="preview-card">
             <div class="preview-card-header">
-              <h3>Profile Catalog</h3>
-              <span id="profile-catalog-count" class="badge">0 profiles</span>
+              <h3>Builder Workspace</h3>
+              <span class="badge">Full Page</span>
             </div>
-            <div id="profile-catalog" class="profile-catalog"></div>
+            <p class="subtle action-note">
+              Need more room to tune a saved chassis profile? Switch to the dedicated
+              <strong>Enclosure / Profile Builder</strong> workspace to work against the shared profile catalog at a larger scale.
+            </p>
+            <div class="button-row compact-button-row">
+              <button class="button secondary small" data-admin-view-switch="builder" type="button">Open Builder Workspace</button>
+            </div>
           </section>
 
           <section class="preview-card">
@@ -782,6 +794,164 @@
           </section>
         </aside>
       </div>
+        </section>
+      </div>
+    </div>
+
+    <section class="panel builder-panel admin-view hidden" data-admin-view-panel="builder">
+      <div class="panel-header builder-panel-header">
+        <div class="builder-panel-copy">
+          <p class="eyebrow">Builder Mode</p>
+          <h2>Enclosure / Profile Builder</h2>
+          <p class="panel-copy">
+            Clone a source profile from the shared catalog, tune the draft geometry, and preview it at a larger scale before saving back into <code>profiles.yaml</code>.
+          </p>
+          <p class="subtle builder-panel-note">
+            This workspace stays preset-driven for now: rectangular bay grids, face style, latch edge, media size, and row grouping.
+            Sparse/manual geometry comes later.
+          </p>
+        </div>
+      </div>
+
+      <div class="builder-layout">
+        <aside class="builder-sidebar">
+          <section class="preview-card">
+            <div class="preview-card-header">
+              <h3>Profile Catalog</h3>
+              <span id="profile-catalog-count" class="badge">0 profiles</span>
+            </div>
+            <p class="subtle action-note">
+              Click a profile here to make it the current builder source and the pinned default-profile preview back in the setup form.
+            </p>
+            <div id="profile-catalog" class="profile-catalog"></div>
+          </section>
+        </aside>
+
+        <section class="preview-card builder-form-card">
+            <div class="preview-card-header">
+              <h3>Builder Controls</h3>
+              <span id="profile-builder-badge" class="badge">Preset / Lego</span>
+            </div>
+            <p class="subtle action-note">
+              First pass builder mode clones the selected profile into a reusable custom layout backed by <code>profiles.yaml</code>.
+              This pass stays preset-driven: rectangular bay grids, face style, latch edge, media size, and row grouping are editable here.
+              Sparse/manual/freeform geometry comes later.
+            </p>
+            <div class="button-row compact-button-row">
+              <button id="profile-builder-load-button" class="button secondary small" type="button">Load Selected Profile</button>
+              <button id="profile-builder-reset-button" class="button secondary small" type="button">Reset Builder</button>
+              <button id="profile-builder-save-button" class="button secondary small" type="button">Save Custom Profile</button>
+              <button id="profile-builder-delete-button" class="button danger small" type="button">Delete Custom Profile</button>
+            </div>
+            <div class="form-grid">
+              <label class="field">
+                <span>Custom Profile ID</span>
+                <input id="profile-builder-id" type="text" placeholder="custom-front-24">
+              </label>
+              <label class="field">
+                <span>Profile Label</span>
+                <input id="profile-builder-label" type="text" placeholder="Custom Front 24">
+              </label>
+              <label class="field field-span">
+                <span>Eyebrow</span>
+                <input id="profile-builder-eyebrow" type="text" placeholder="Custom / Front View">
+              </label>
+              <label class="field field-span">
+                <span>Summary</span>
+                <input id="profile-builder-summary" type="text" placeholder="Reusable saved chassis layout for this enclosure family.">
+              </label>
+              <label class="field">
+                <span>Panel Title</span>
+                <input id="profile-builder-panel-title" type="text" placeholder="Front 24 Bay">
+              </label>
+              <label class="field">
+                <span>Edge Label</span>
+                <input id="profile-builder-edge-label" type="text" placeholder="Front of chassis">
+              </label>
+              <label class="field">
+                <span>Face Style</span>
+                <select id="profile-builder-face-style">
+                  <option value="front-drive">front-drive</option>
+                  <option value="rear-drive">rear-drive</option>
+                  <option value="top-loader">top-loader</option>
+                  <option value="unifi-drive">unifi-drive</option>
+                  <option value="generic">generic</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Latch Edge</span>
+                <select id="profile-builder-latch-edge">
+                  <option value="top">top</option>
+                  <option value="right">right</option>
+                  <option value="bottom">bottom</option>
+                  <option value="left">left</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Media Size</span>
+                <select id="profile-builder-bay-size">
+                  <option value="">auto</option>
+                  <option value="3.5">3.5</option>
+                  <option value="2.5">2.5</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Rows</span>
+                <input id="profile-builder-rows" type="number" min="1" step="1" value="1">
+              </label>
+              <label class="field">
+                <span>Columns</span>
+                <input id="profile-builder-columns" type="number" min="1" step="1" value="1">
+              </label>
+              <label class="field">
+                <span>Visible Bays</span>
+                <input id="profile-builder-slot-count" type="number" min="1" step="1" value="1">
+              </label>
+              <label class="field">
+                <span>Slot Ordering</span>
+                <select id="profile-builder-ordering">
+                  <option value="source-layout">Keep Source Layout</option>
+                  <option value="row-major-bottom">Bottom-Up By Rows</option>
+                  <option value="row-major-top">Top-Down By Rows</option>
+                  <option value="column-major-bottom">Bottom-Up By Columns</option>
+                  <option value="column-major-top">Top-Down By Columns</option>
+                  <option value="custom-layout">Custom Matrix</option>
+                </select>
+              </label>
+              <label class="field field-span">
+                <span>Row Groups</span>
+                <input id="profile-builder-row-groups" type="text" placeholder="Optional, for example 12,12 or 6,6,3">
+              </label>
+              <label id="profile-builder-layout-editor" class="field field-span hidden">
+                <span>Custom Slot Matrix</span>
+                <textarea
+                  id="profile-builder-layout-text"
+                  rows="5"
+                  spellcheck="false"
+                  placeholder="02 05&#10;01 04&#10;00 03"
+                ></textarea>
+                <p class="subtle action-note builder-layout-note">
+                  Use one row per line, top row first. Separate slot numbers with spaces or commas. Use <code>--</code> for an empty cell when you need to preserve a gap.
+                </p>
+              </label>
+            </div>
+            <p id="profile-builder-result" class="subtle action-note">
+              Load a profile from the catalog, tune this first-pass builder form, then save it as a reusable custom profile.
+            </p>
+        </section>
+      </div>
+
+      <section class="preview-card builder-preview-card">
+        <div class="preview-card-header">
+          <h3>Builder Preview</h3>
+          <span id="profile-builder-preview-badge" class="badge">Draft</span>
+        </div>
+        <p id="profile-builder-preview-summary" class="subtle">
+          Load a source profile from the catalog to preview the custom geometry that will be saved.
+        </p>
+        <div id="profile-builder-preview-grid" class="profile-preview-grid" aria-label="Custom profile builder preview"></div>
+        <div id="profile-builder-preview-meta" class="profile-preview-meta"></div>
+      </section>
     </section>
   </main>
 </div>

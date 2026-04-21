@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.11.0`.
+This file tracks the current intended release direction after `v0.12.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -295,6 +295,36 @@ Current status:
 - deferred follow-ups now live in `HANDOFF.md` / `TODO.md`, with
   snapshot-export profiling and broader non-Quantastor runtime sanity at the
   top of the carry-over list
+
+## v0.12.0 - Builder Mode, Linux Host Parity, And Release Closeout
+
+Goal:
+
+- finish the profile-builder foundation and the highest-value shared-geometry
+  cleanup without opening a broader freeform-layout project yet
+
+Primary outcomes:
+
+- dedicated `Enclosure / Profile Builder` workspace in the optional admin
+  sidecar
+- custom profile save/update/delete backed by `profiles.yaml` and the existing
+  profile registry
+- slot-ordering presets plus an explicit `Custom Matrix` editor for
+  `slot_layout`
+- Linux host-side path cleanup so repo-local runs stop assuming a writable
+  `/app/{config,data,logs,history}` harness
+- saved live-backed chassis parity so the selected profile, not the runtime
+  view type, owns tray, latch, LED, and row geometry
+- snapshot-export estimate recovery after restoring the batched scope-history
+  read path and tightening history-sidecar SQLite settings
+
+Current status:
+
+- shipped in `v0.12.0`
+- the core product work and release-facing docs/screenshots/validation are
+  complete
+- a more visual tile-level builder editor is intentionally deferred to backlog
+  instead of being part of this release scope
 
 ## Longer-Term Ideas
 

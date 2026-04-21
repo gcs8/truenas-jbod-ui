@@ -111,6 +111,43 @@ async function findSystemWithMultipleEnclosures(page) {
   return fallback;
 }
 
+async function fetchStorageViewsForSystem(page, systemId) {
+  return page.evaluate(async (selectedSystemId) => {
+    const response = await fetch(`/api/storage-views?system_id=${encodeURIComponent(selectedSystemId)}`);
+    if (!response.ok) {
+      throw new Error(`storage view fetch failed for ${selectedSystemId}: ${response.status}`);
+    }
+    return response.json();
+  }, systemId);
+}
+
+async function findLiveBackedSavedChassisTarget(page) {
+  const systems = await getSelectValues(page, "#system-select");
+  for (const systemId of systems) {
+    const payload = await fetchStorageViewsForSystem(page, systemId);
+    const view = (payload.views || []).find((candidate) =>
+      candidate.kind === "ses_enclosure" &&
+      Array.isArray(candidate.slots) &&
+      candidate.slots.some((slot) => Number.isInteger(slot.snapshot_slot))
+    );
+    if (!view) {
+      continue;
+    }
+    const slot = view.slots.find((candidate) => Number.isInteger(candidate.snapshot_slot));
+    if (!slot) {
+      continue;
+    }
+    return {
+      systemId,
+      viewId: view.id,
+      slotIndex: slot.slot_index,
+      snapshotSlot: slot.snapshot_slot,
+      backingEnclosureId: view.backing_enclosure_id || null,
+    };
+  }
+  return null;
+}
+
 test.describe("browser qa smoke", () => {
   test("page loads and exposes the main switching chrome", async ({ page }) => {
     await gotoApp(page);
@@ -290,6 +327,75 @@ test.describe("browser qa smoke", () => {
       return Boolean(loading && loading.classList.contains("hidden"));
     }, { timeout: 20_000 });
     await expect(page.locator("#detail-history-error")).toBeHidden();
+  });
+
+  test("snapshot-backed saved chassis views reuse the live slot and detail chrome", async ({ page }) => {
+    await gotoApp(page);
+    await setAutoRefresh(page, false);
+
+    const target = await findLiveBackedSavedChassisTarget(page);
+    test.skip(!target, "Need one snapshot-backed saved chassis view for live-chrome coverage.");
+
+    await switchSystem(page, target.systemId);
+    const enclosureValues = await getSelectValues(page, "#enclosure-select");
+    const liveValue = target.backingEnclosureId && enclosureValues.includes(`enclosure:${target.backingEnclosureId}`)
+      ? `enclosure:${target.backingEnclosureId}`
+      : enclosureValues.find((value) => value.startsWith("enclosure:"));
+    test.skip(!liveValue, "Need a live enclosure option to compare saved-chassis selection behavior.");
+
+    await switchEnclosure(page, liveValue);
+    const liveTile = page.locator(`#slot-grid .slot-tile[data-slot="${target.snapshotSlot}"]`);
+    await expect(liveTile).toBeVisible();
+    const liveGeometry = await page.evaluate((slotIndex) => {
+      const tile = document.querySelector(`#slot-grid .slot-tile[data-slot="${slotIndex}"]`);
+      const rowSlots = document.querySelector("#slot-grid .row-slots");
+      return {
+        tileWidth: tile?.getBoundingClientRect().width || 0,
+        rowGroupCount: document.querySelectorAll("#slot-grid .row-group").length,
+        rowTemplate: rowSlots ? getComputedStyle(rowSlots).gridTemplateColumns : "",
+      };
+    }, target.snapshotSlot);
+    await liveTile.click();
+    await expect(liveTile).toHaveClass(/selected/);
+
+    await switchEnclosure(page, `view:${target.viewId}`);
+    await expect(page.locator("#slot-grid .slot-tile.selected")).toHaveCount(0);
+    await expect(page.locator("#detail-empty")).toBeVisible();
+    await expect(page.locator("#detail-empty")).toContainText("Select a slot tile");
+    await expect(page.locator("#detail-content")).toBeHidden();
+    await expect(page.locator("#detail-secondary")).toBeVisible();
+    await expect(page.locator("#history-toggle-button")).toBeHidden();
+    await expect(page.locator("#detail-led-controls")).toBeHidden();
+
+    const tile = page.locator(`#slot-grid .slot-tile[data-slot="${target.slotIndex}"]`);
+    await expect(tile).toBeVisible();
+    const savedGeometry = await page.evaluate((slotIndex) => {
+      const tile = document.querySelector(`#slot-grid .slot-tile[data-slot="${slotIndex}"]`);
+      const rowSlots = document.querySelector("#slot-grid .row-slots");
+      return {
+        tileWidth: tile?.getBoundingClientRect().width || 0,
+        rowGroupCount: document.querySelectorAll("#slot-grid .row-group").length,
+        rowTemplate: rowSlots ? getComputedStyle(rowSlots).gridTemplateColumns : "",
+      };
+    }, target.slotIndex);
+    expect(Math.abs(savedGeometry.tileWidth - liveGeometry.tileWidth)).toBeLessThan(1.5);
+    expect(savedGeometry.rowGroupCount).toBe(liveGeometry.rowGroupCount);
+    expect(savedGeometry.rowTemplate).toBe(liveGeometry.rowTemplate);
+    await tile.click();
+
+    await expect(tile).not.toHaveClass(/storage-view-slot/);
+    await expect(page.locator("#detail-secondary")).toBeVisible();
+    await expect(page.locator("#detail-led-controls")).toBeVisible();
+    await expect(page.locator("#history-toggle-button")).toBeVisible();
+
+    await page.locator(".enclosure-face").click({ position: { x: 40, y: 40 } });
+    await expect(page.locator("#slot-grid .slot-tile.selected")).toHaveCount(0);
+    await expect(page.locator("#detail-empty")).toBeVisible();
+    await expect(page.locator("#detail-empty")).toContainText("Select a slot tile");
+    await expect(page.locator("#detail-content")).toBeHidden();
+    await expect(page.locator("#detail-secondary")).toBeVisible();
+    await expect(page.locator("#history-toggle-button")).toBeHidden();
+    await expect(page.locator("#detail-led-controls")).toBeHidden();
   });
 
   test("export snapshot dialog renders estimate UI", async ({ page }) => {

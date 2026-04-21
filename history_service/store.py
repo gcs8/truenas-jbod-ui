@@ -16,6 +16,8 @@ from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
 logger = logging.getLogger(__name__)
 SQLITE_SHARED_DIR_MODE = 0o777
 SQLITE_SHARED_FILE_MODE = 0o666
+SQLITE_TEMP_STORE = "MEMORY"
+SQLITE_CACHE_SIZE_KIB = 16384
 
 SLOT_STATE_OPTIONAL_COLUMNS: dict[str, str] = {
     "persistent_id_label": "TEXT",
@@ -162,7 +164,18 @@ class HistoryStore:
         connection = sqlite3.connect(self.file_path)
         try:
             connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
+            connection.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_SIZE_KIB}")
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError as exc:
+                if not self._is_journal_mode_fallback_error(exc):
+                    raise
+                logger.warning(
+                    "History database %s could not enable WAL mode; continuing with the existing journal mode. Error: %s",
+                    self.file_path,
+                    exc,
+                )
         except sqlite3.Error:
             connection.close()
             raise
@@ -1520,6 +1533,11 @@ class HistoryStore:
     def _is_readonly_database_error(exc: sqlite3.Error) -> bool:
         message = str(exc).lower()
         return "readonly" in message or "read-only" in message
+
+    @staticmethod
+    def _is_journal_mode_fallback_error(exc: sqlite3.Error) -> bool:
+        message = str(exc).lower()
+        return "disk i/o" in message or "readonly" in message or "read-only" in message
 
     @staticmethod
     def _row_to_slot_state(row: sqlite3.Row) -> SlotStateRecord:

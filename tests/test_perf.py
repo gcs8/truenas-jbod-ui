@@ -20,6 +20,24 @@ from app.perf import (
 
 
 class PerfConfigTests(unittest.TestCase):
+    def test_get_settings_uses_config_relative_defaults_for_custom_app_config_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            config_path = temp_root / "config.yaml"
+            config_path.write_text("{}", encoding="utf-8")
+
+            with patch.dict("os.environ", {"APP_CONFIG_PATH": config_path.as_posix()}, clear=False):
+                get_settings.cache_clear()
+                settings = get_settings()
+                get_settings.cache_clear()
+
+            self.assertEqual(Path(settings.config_file), config_path)
+            self.assertEqual(Path(settings.paths.profile_file), temp_root / "profiles.yaml")
+            self.assertEqual(Path(settings.paths.mapping_file), temp_root / "slot_mappings.json")
+            self.assertEqual(Path(settings.paths.slot_detail_cache_file), temp_root / "slot_detail_cache.json")
+            self.assertEqual(Path(settings.paths.log_file), temp_root / "app.log")
+            self.assertEqual(Path(settings.ssh.known_hosts_path), temp_root / "known_hosts")
+
     def test_get_settings_reads_perf_env_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)

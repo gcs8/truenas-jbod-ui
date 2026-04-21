@@ -1,7 +1,7 @@
 {
   "name": "truenas-jbod-ui-browser-qa",
   "private": true,
-  "version": "0.11.0-dev",
+  "version": "0.12.0",
   "description": "Lightweight browser QA smoke tests for truenas-jbod-ui.",
   "scripts": {
     "qa:ui": "playwright test",

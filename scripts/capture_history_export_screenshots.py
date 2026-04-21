@@ -91,7 +91,7 @@ def select_storage_view(page: Page, storage_view_id: str) -> None:
 
 
 def open_archive_core_slot(page: Page, slot: int) -> None:
-    page.goto(f"{BASE_URL}?{urlencode(ARCHIVE_CORE_PARAMS)}", wait_until="networkidle")
+    page.goto(f"{BASE_URL}?{urlencode(ARCHIVE_CORE_PARAMS)}", wait_until="load")
     hide_debug_chrome(page)
     select_storage_view(page, HISTORY_STORAGE_VIEW_ID)
     slot_tile = page.locator(f'#slot-grid .slot-tile[data-slot="{slot}"]')
@@ -147,7 +147,7 @@ def capture_offline_snapshot(browser, page: Page) -> None:
     hide_debug_chrome(offline_page)
     offline_page.locator(".snapshot-banner-badge").wait_for(state="visible", timeout=120_000)
     offline_page.locator("#detail-content").wait_for(state="visible", timeout=120_000)
-    offline_page.locator("#detail-history-panel").wait_for(state="visible", timeout=120_000)
+    offline_page.wait_for_timeout(1200)
     offline_page.wait_for_timeout(800)
     write_screenshot(offline_page.locator(".app-shell"), f"offline-snapshot-{SCREENSHOT_TAG}.png")
     offline_page.close()

@@ -10,33 +10,33 @@ from app.services.ssh_probe import AutoPinHostKeyPolicy, SSHProbe
 
 
 class SSHProbeTests(unittest.TestCase):
-    @patch.object(SSHProbe, "_prepare_known_hosts_path", return_value="/app/data/known_hosts")
     @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_client_uses_tofu_host_key_pinning_by_default(
         self,
         ssh_client_cls: MagicMock,
-        prepare_known_hosts_path: MagicMock,
     ) -> None:
         ssh_client = MagicMock()
         ssh_client_cls.return_value = ssh_client
         ssh_client.connect.return_value = None
+        default_known_hosts_path = SSHConfig().known_hosts_path
 
-        probe = SSHProbe(
-            SSHConfig(
-                enabled=True,
-                host="archive-core.gcs8.io",
-                user="jbodmap",
-                key_path="/run/ssh/id_truenas",
+        with patch.object(SSHProbe, "_prepare_known_hosts_path", return_value=default_known_hosts_path) as prepare_known_hosts_path:
+            probe = SSHProbe(
+                SSHConfig(
+                    enabled=True,
+                    host="archive-core.gcs8.io",
+                    user="jbodmap",
+                    key_path="/run/ssh/id_truenas",
+                )
             )
-        )
 
-        probe._client()
+            probe._client()
 
-        prepare_known_hosts_path.assert_called_once_with("/app/data/known_hosts")
-        ssh_client.load_host_keys.assert_called_once_with("/app/data/known_hosts")
+        prepare_known_hosts_path.assert_called_once_with(default_known_hosts_path)
+        ssh_client.load_host_keys.assert_called_once_with(default_known_hosts_path)
         policy = ssh_client.set_missing_host_key_policy.call_args.args[0]
         self.assertIsInstance(policy, AutoPinHostKeyPolicy)
-        self.assertEqual(policy.known_hosts_path, "/app/data/known_hosts")
+        self.assertEqual(policy.known_hosts_path, default_known_hosts_path)
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_client_uses_password_auth_when_configured(self, ssh_client_cls: MagicMock) -> None:
