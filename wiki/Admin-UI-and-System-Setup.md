@@ -10,6 +10,7 @@ Use it when you want:
 - TLS certificate inspection and trust import
 - runtime restart control
 - config or history backup and restore
+- reusable custom profile authoring through the dedicated builder workspace
 - saved storage-view editing without changing YAML by hand
 
 The read-only enclosure UI on `:8080` still works without this sidecar. The
@@ -46,9 +47,14 @@ By default the admin sidecar:
 If the admin sidecar is reachable, the main UI on `:8080` also shows a
 `System Setup` button that opens the same page in a new tab.
 
+The top of the admin page now has two section targets:
+
+- `Setup + Maintenance`
+- `Enclosure / Profile Builder`
+
 ## What The Page Looks Like
 
-![Admin sidecar grouped setup view](images/admin-setup-v0.11.0.png)
+![Admin sidecar grouped setup view](images/admin-setup-v0.12.0.png)
 
 The page is organized around one saved system at a time.
 
@@ -82,6 +88,24 @@ The right side of the page shows:
 - the loaded profile catalog
 
 This is where you confirm the intended chassis shape before you save.
+
+### Enclosure / Profile Builder
+
+The admin sidecar now also has a dedicated builder workspace for reusable
+custom chassis profiles.
+
+![Builder workspace with full-width preview](images/builder-workspace-v0.12.0.png)
+
+Use it when you want to:
+
+- clone a built-in profile into a custom `profiles.yaml` entry
+- tweak the profile label, face style, latch edge, row groups, or bay count
+- generate common row-major or column-major slot-ordering patterns
+- save an explicit custom `slot_layout` without hand-editing YAML
+
+The current builder intentionally stays preset-driven. It can save rectangular
+grids, common slot-ordering presets, and explicit `Custom Matrix` layouts, but
+it does not yet try to be a full drag-and-drop freeform editor.
 
 ### Storage Views
 
@@ -150,7 +174,7 @@ viewer.
 The same backup/restore area now also holds the safe cleanup tools for saved
 history:
 
-![Admin maintenance bundle and history tools](images/admin-maintenance-v0.11.0.png)
+![Admin maintenance bundle and history tools](images/admin-maintenance-v0.12.0.png)
 
 Use that panel when you need to:
 
@@ -174,6 +198,10 @@ For a first-time setup on a new host:
 6. add only the storage views you actually need
 7. save
 8. go back to the main UI and verify the new live or saved runtime targets
+
+If you also need a custom chassis profile, do that in the builder workspace
+after the basic system entry is saved, then come back to the setup view and
+attach the new profile-backed saved chassis layout there.
 
 ## Related Pages
 

@@ -139,6 +139,17 @@ h3 {
   margin-top: 20px;
 }
 
+.hero-view-switcher {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 4px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(7, 15, 24, 0.62);
+}
+
 .button {
   appearance: none;
   border: 1px solid transparent;
@@ -186,6 +197,12 @@ h3 {
   min-height: 38px;
   padding: 0 14px;
   font-size: 0.92rem;
+}
+
+.admin-view-button.is-active {
+  background: linear-gradient(135deg, var(--accent-strong), var(--accent));
+  color: #03111c;
+  border-color: transparent;
 }
 
 .hero-meta {
@@ -236,15 +253,21 @@ h3 {
   color: #d7ffe8;
 }
 
-.admin-layout {
+.admin-views {
   display: grid;
   gap: 22px;
   margin-top: 22px;
 }
 
+.admin-layout {
+  display: grid;
+  gap: 22px;
+}
+
 .runtime-panel,
 .backup-panel,
-.setup-panel {
+.setup-panel,
+.builder-panel {
   padding: 24px;
 }
 
@@ -815,6 +838,88 @@ h3 {
   top: 22px;
 }
 
+.builder-panel {
+  display: grid;
+  gap: 22px;
+}
+
+.builder-panel-header {
+  margin-bottom: 0;
+}
+
+.builder-panel-copy {
+  display: grid;
+  gap: 12px;
+  max-width: 980px;
+}
+
+.builder-panel-copy .panel-copy,
+.builder-panel-note {
+  margin: 0;
+  max-width: 80ch;
+}
+
+.builder-layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.72fr) minmax(520px, 1.28fr);
+  gap: 22px;
+  align-items: start;
+}
+
+.builder-sidebar {
+  display: grid;
+  gap: 22px;
+}
+
+.builder-sidebar .profile-catalog {
+  max-height: 820px;
+}
+
+.builder-form-card,
+.builder-preview-card {
+  align-content: start;
+}
+
+.builder-form-card .compact-button-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.builder-form-card .compact-button-row .button {
+  width: 100%;
+}
+
+.builder-form-card .form-grid {
+  gap: 16px;
+}
+
+.builder-form-card .action-note {
+  max-width: 64ch;
+}
+
+.builder-form-card #profile-builder-layout-text {
+  min-height: 128px;
+  font-family: "Cascadia Code", "Consolas", "SFMono-Regular", monospace;
+  line-height: 1.45;
+}
+
+.builder-layout-note {
+  max-width: none;
+}
+
+.builder-preview-card .profile-preview-grid {
+  min-height: 480px;
+  gap: 12px;
+  padding: 18px;
+  align-content: start;
+}
+
+.builder-preview-card .profile-preview-cell {
+  min-height: 52px;
+  font-size: 0.92rem;
+}
+
 .preview-card {
   display: grid;
   gap: 14px;
@@ -1085,6 +1190,7 @@ h3 {
   .hero,
   .setup-layout,
   .backup-layout,
+  .builder-layout,
   .tls-cert-grid,
   .storage-view-layout {
     grid-template-columns: 1fr;
@@ -1103,7 +1209,8 @@ h3 {
   .hero,
   .runtime-panel,
   .backup-panel,
-  .setup-panel {
+  .setup-panel,
+  .builder-panel {
     padding: 18px;
   }
 
@@ -1111,6 +1218,14 @@ h3 {
   .form-grid,
   .compact-grid {
     grid-template-columns: 1fr;
+  }
+
+  .builder-form-card .compact-button-row {
+    grid-template-columns: 1fr;
+  }
+
+  .hero-view-switcher {
+    width: 100%;
   }
 
   .field-span {

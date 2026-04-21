@@ -60,33 +60,34 @@ different profile.
 
 ### Archive CORE
 
-![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/screenshots/core-overview-v0.11.0.png)
+![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/screenshots/core-overview-v0.12.0.png)
 
 ### Offsite SCALE
 
-![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/screenshots/scale-overview-v0.11.0.png)
+![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/screenshots/scale-overview-v0.12.0.png)
 
 ### Additional Validated Platforms
 
-- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.11.0.png](docs/images/screenshots/gpu-server-overview-v0.11.0.png)
-- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.11.0.png](docs/images/screenshots/unvr-overview-v0.11.0.png)
-- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.11.0.png](docs/images/screenshots/unvr-pro-overview-v0.11.0.png)
-- Quantastor: [docs/images/screenshots/quantastor-overview-v0.11.0.png](docs/images/screenshots/quantastor-overview-v0.11.0.png)
+- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.12.0.png](docs/images/screenshots/gpu-server-overview-v0.12.0.png)
+- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.12.0.png](docs/images/screenshots/unvr-overview-v0.12.0.png)
+- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.12.0.png](docs/images/screenshots/unvr-pro-overview-v0.12.0.png)
+- Quantastor: [docs/images/screenshots/quantastor-overview-v0.12.0.png](docs/images/screenshots/quantastor-overview-v0.12.0.png)
 
 ### History And Snapshot Walkthroughs
 
-- Live history drawer: [docs/images/screenshots/history-drawer-v0.11.0.png](docs/images/screenshots/history-drawer-v0.11.0.png)
-- Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.11.0.png](docs/images/screenshots/snapshot-export-dialog-v0.11.0.png)
-- Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.11.0.png](docs/images/screenshots/offline-snapshot-v0.11.0.png)
+- Live history drawer: [docs/images/screenshots/history-drawer-v0.12.0.png](docs/images/screenshots/history-drawer-v0.12.0.png)
+- Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.12.0.png](docs/images/screenshots/snapshot-export-dialog-v0.12.0.png)
+- Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.12.0.png](docs/images/screenshots/offline-snapshot-v0.12.0.png)
 
-### 0.11.0 Workflow Highlights
+### 0.12.0 Workflow Highlights
 
-- Grouped runtime selector on `archive-core`: [docs/images/screenshots/live-vs-storage-views-v0.11.0.png](docs/images/screenshots/live-vs-storage-views-v0.11.0.png)
-- Storage-view history on `Boot SATADOMs`: [docs/images/screenshots/storage-view-history-v0.11.0.png](docs/images/screenshots/storage-view-history-v0.11.0.png)
-- Separate CORE `Front 24 Bay` live enclosure: [docs/images/screenshots/archive-core-front-24-v0.11.0.png](docs/images/screenshots/archive-core-front-24-v0.11.0.png)
-- Admin sidecar grouped `Add Storage View` flow: [docs/images/screenshots/admin-setup-v0.11.0.png](docs/images/screenshots/admin-setup-v0.11.0.png)
-- Quantastor HA SATADOM storage view on `QSOSN HA`: [docs/images/screenshots/quantastor-satadoms-right-v0.11.0.png](docs/images/screenshots/quantastor-satadoms-right-v0.11.0.png)
-- Admin backup, orphan cleanup, and history adoption tools: [docs/images/screenshots/admin-maintenance-v0.11.0.png](docs/images/screenshots/admin-maintenance-v0.11.0.png)
+- Dedicated builder workspace with full-width preview: [docs/images/screenshots/builder-workspace-v0.12.0.png](docs/images/screenshots/builder-workspace-v0.12.0.png)
+- Grouped runtime selector on `archive-core`: [docs/images/screenshots/live-vs-storage-views-v0.12.0.png](docs/images/screenshots/live-vs-storage-views-v0.12.0.png)
+- Storage-view history on `Boot SATADOMs`: [docs/images/screenshots/storage-view-history-v0.12.0.png](docs/images/screenshots/storage-view-history-v0.12.0.png)
+- Separate CORE `Front 24 Bay` live enclosure: [docs/images/screenshots/archive-core-front-24-v0.12.0.png](docs/images/screenshots/archive-core-front-24-v0.12.0.png)
+- Admin sidecar grouped `Add Storage View` flow: [docs/images/screenshots/admin-setup-v0.12.0.png](docs/images/screenshots/admin-setup-v0.12.0.png)
+- Quantastor HA SATADOM storage view on `QSOSN HA`: [docs/images/screenshots/quantastor-satadoms-right-v0.12.0.png](docs/images/screenshots/quantastor-satadoms-right-v0.12.0.png)
+- Admin backup, orphan cleanup, and history adoption tools: [docs/images/screenshots/admin-maintenance-v0.12.0.png](docs/images/screenshots/admin-maintenance-v0.12.0.png)
 
 `archive-core` currently does not ship with a saved chassis view enabled by
 default, so the runtime selector screenshot shows the live and virtual groups
@@ -114,6 +115,9 @@ chassis layout catalog that can be added when needed.
   internal disk groups
 - Profile-driven enclosure rendering so validated hardware and custom layouts
   can share the same slot-map UI
+- Optional admin-side builder workspace for cloning built-in profiles into
+  reusable custom `profiles.yaml` entries, including slot-ordering presets and
+  explicit custom layout matrices
 - First-pass TrueNAS SCALE support with split front/rear enclosure pickers when
   Linux SES AES and enclosure-status data is available over SSH
 - First-pass generic Linux support for SSH-only `mdadm` / NVMe hosts where no

@@ -2,14 +2,66 @@
 
 ## Unreleased
 
-Working branch for the next feature set after `v0.11.0`.
+Follow-up work after `v0.12.0`.
 
 ### Carry-over notes
 
-- Snapshot-export estimate profiling/tuning after the accepted `v0.11.0` cut
-- Broader live-host sanity beyond the validated Quantastor SATADOM pass
-- CORE bootstrap backend/docs alignment plus the next cleanup slice chosen from
+- more visual builder editing stays explicitly deferred beyond the current
+  preset-plus-matrix first pass
+- encrypted backup/export support for SSH keys, imported TLS trust material,
+  and shared `known_hosts` is still later work
+- remaining CORE bootstrap/backend clarity cleanup still lives in
   `HANDOFF.md` / `TODO.md`
+
+## v0.12.0 - 2026-04-21
+
+### Added
+
+- Dedicated `Enclosure / Profile Builder` workspace in the optional admin
+  sidecar, including custom profile save/update/delete backed by the shared
+  profile registry and `profiles.yaml`
+- Slot-ordering presets plus an explicit `Custom Matrix` builder path so
+  common row-major and column-major numbering patterns can be saved without
+  hand-editing YAML
+- Checked-in `v0.12.0` screenshots for the refreshed README/wiki pages,
+  including the builder workspace, grouped runtime selector, updated admin
+  setup flow, maintenance tools, and snapshot/export walkthroughs
+
+### Changed
+
+- Saved live-backed `ses_enclosure` views now reuse the same profile-driven
+  geometry path as their live enclosure backing views, including row grouping,
+  tray width, latch placement, LED spacing, empty-detail state, and click-off
+  behavior
+- Linux host-side runs now resolve config/data/log/history defaults relative to
+  the checkout instead of requiring a writable `/app/...` harness, and startup
+  logging now degrades cleanly when a Docker-owned log file is not writable
+- Release-facing docs and wiki pages now describe the builder workspace,
+  slot-ordering workflow, and Linux-first validation/deploy shape instead of
+  the older sidebar-builder story
+
+### Fixed
+
+- Snapshot export estimate now uses the intended batched scope-history request
+  path again instead of silently falling back to one request per slot when
+  `slots=[...]` is present
+- History-sidecar SQLite connections now use in-memory temp-store and a larger
+  cache more safely, with WAL enablement treated as best-effort on filesystem
+  quirks instead of fatal
+- Host-side Linux path rebasing now keeps explicit legacy `/app/...` values
+  usable outside containers instead of forcing a fake writable harness for
+  repo-local runs
+
+### Validation
+
+- Local Windows Docker Desktop:
+  - `234` Python tests passing
+  - Playwright `9` passing / `1` skipped
+  - perf label `release-candidate-0.12.0-local-windows`
+- Linux dev target (`codex-dev-test-target`):
+  - `234` Python tests passing
+  - Playwright `10` passing
+  - perf label `release-candidate-0.12.0-linux-dev-target`
 
 ## v0.11.0 - 2026-04-21
 

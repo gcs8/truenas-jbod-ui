@@ -99,8 +99,9 @@ Use these pages when you are ready:
 
 ## 9. Optional: Turn On The Admin UI
 
-If you want the guided setup, runtime control, backup/restore, or storage-view
-editing flow, start the optional admin sidecar:
+If you want the guided setup, runtime control, backup/restore, storage-view
+editing flow, or the dedicated custom-profile builder workspace, start the
+optional admin sidecar:
 
 ```bash
 docker compose --profile admin up -d --build enclosure-admin

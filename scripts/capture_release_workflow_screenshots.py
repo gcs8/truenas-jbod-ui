@@ -25,6 +25,7 @@ ARCHIVE_CORE_FRONT_24 = "50030480090c4f7f"
 BOOT_DOMS_VIEW_ID = "boot-doms"
 QUANTASTOR_SYSTEM_ID = "qsosn-ha"
 QUANTASTOR_SATADOMS_RIGHT_VIEW_ID = "boot-satadoms-right"
+BUILDER_SOURCE_PROFILE_ID = "generic-front-24-1x24"
 
 
 def hide_debug_chrome(page: Page) -> None:
@@ -64,6 +65,14 @@ def wait_for_admin_ready(page: Page) -> None:
     page.wait_for_function(
         """() => Array.from(document.querySelectorAll('#existing-system-select option'))
             .some((option) => (option.value || '').trim().length > 0)""",
+        timeout=120_000,
+    )
+
+
+def wait_for_builder_ready(page: Page) -> None:
+    page.locator('[data-admin-view-panel="builder"]').wait_for(state="visible", timeout=120_000)
+    page.wait_for_function(
+        """() => document.querySelectorAll('#profile-catalog .profile-card').length > 0""",
         timeout=120_000,
     )
 
@@ -121,7 +130,7 @@ def show_select_as_listbox(page: Page, selector: str, max_rows: int = 8) -> None
 
 def capture_live_vs_storage_views(page: Page) -> None:
     page.set_viewport_size({"width": 1900, "height": 1180})
-    page.goto(f"{APP_URL}?{urlencode({'system_id': ARCHIVE_CORE_SYSTEM_ID})}", wait_until="networkidle")
+    page.goto(f"{APP_URL}?{urlencode({'system_id': ARCHIVE_CORE_SYSTEM_ID})}", wait_until="load")
     hide_debug_chrome(page)
     wait_for_runtime_ready(page)
     wait_for_storage_view_options(page)
@@ -160,7 +169,7 @@ def capture_archive_core_front_24(page: Page) -> None:
     page.set_viewport_size({"width": 1900, "height": 1750})
     page.goto(
         f"{APP_URL}?{urlencode({'system_id': ARCHIVE_CORE_SYSTEM_ID, 'enclosure_id': ARCHIVE_CORE_FRONT_24})}",
-        wait_until="networkidle",
+        wait_until="load",
     )
     hide_debug_chrome(page)
     wait_for_runtime_ready(page)
@@ -187,7 +196,7 @@ def select_storage_view(page: Page, storage_view_id: str) -> None:
 
 def capture_storage_view_history(page: Page) -> None:
     page.set_viewport_size({"width": 1900, "height": 2250})
-    page.goto(f"{APP_URL}?{urlencode({'system_id': ARCHIVE_CORE_SYSTEM_ID})}", wait_until="networkidle")
+    page.goto(f"{APP_URL}?{urlencode({'system_id': ARCHIVE_CORE_SYSTEM_ID})}", wait_until="load")
     hide_debug_chrome(page)
     wait_for_runtime_ready(page)
     select_storage_view(page, BOOT_DOMS_VIEW_ID)
@@ -205,7 +214,7 @@ def capture_storage_view_history(page: Page) -> None:
 
 def capture_quantastor_satadoms(page: Page) -> None:
     page.set_viewport_size({"width": 1900, "height": 1700})
-    page.goto(f"{APP_URL}?{urlencode({'system_id': QUANTASTOR_SYSTEM_ID})}", wait_until="networkidle")
+    page.goto(f"{APP_URL}?{urlencode({'system_id': QUANTASTOR_SYSTEM_ID})}", wait_until="load")
     hide_debug_chrome(page)
     wait_for_runtime_ready(page)
     select_storage_view(page, QUANTASTOR_SATADOMS_RIGHT_VIEW_ID)
@@ -218,7 +227,7 @@ def capture_quantastor_satadoms(page: Page) -> None:
 
 def capture_admin_setup(page: Page) -> None:
     page.set_viewport_size({"width": 1900, "height": 1500})
-    page.goto(ADMIN_URL, wait_until="networkidle")
+    page.goto(ADMIN_URL, wait_until="load")
     wait_for_admin_ready(page)
     page.locator("#existing-system-select").select_option(ARCHIVE_CORE_SYSTEM_ID)
     page.locator("#existing-system-load-button").click()
@@ -248,13 +257,39 @@ def capture_admin_setup(page: Page) -> None:
 
 def capture_admin_maintenance(page: Page) -> None:
     page.set_viewport_size({"width": 1900, "height": 1450})
-    page.goto(ADMIN_URL, wait_until="networkidle")
+    page.goto(ADMIN_URL, wait_until="load")
     wait_for_admin_ready(page)
     backup_panel = page.locator(".backup-panel")
     backup_panel.wait_for(state="visible", timeout=120_000)
     backup_panel.scroll_into_view_if_needed()
     page.wait_for_timeout(700)
     write_locator_screenshot(backup_panel, f"admin-maintenance-{SCREENSHOT_TAG}.png")
+
+
+def capture_builder_workspace(page: Page) -> None:
+    page.set_viewport_size({"width": 1900, "height": 1700})
+    page.goto(f"{ADMIN_URL}?view=builder", wait_until="load")
+    wait_for_builder_ready(page)
+    page.locator(f'#profile-catalog .profile-card[data-profile-id="{BUILDER_SOURCE_PROFILE_ID}"]').click()
+    page.locator("#profile-builder-load-button").click()
+    page.locator("#profile-builder-rows").fill("3")
+    page.locator("#profile-builder-columns").fill("2")
+    page.locator("#profile-builder-slot-count").fill("6")
+    page.locator("#profile-builder-ordering").select_option("column-major-bottom")
+    page.wait_for_function(
+        """() => {
+            const summary = document.getElementById('profile-builder-preview-summary');
+            const cells = Array.from(document.querySelectorAll('#profile-builder-preview-grid .profile-preview-cell'))
+              .map((node) => (node.textContent || '').trim())
+              .filter(Boolean);
+            return summary && /bottom-up by columns/i.test(summary.textContent || '') &&
+              cells.length === 6 &&
+              cells.join(',') === '02,05,01,04,00,03';
+        }""",
+        timeout=120_000,
+    )
+    page.wait_for_timeout(700)
+    write_locator_screenshot(page.locator('[data-admin-view-panel="builder"]'), f"builder-workspace-{SCREENSHOT_TAG}.png")
 
 
 def main() -> None:
@@ -269,6 +304,7 @@ def main() -> None:
         capture_quantastor_satadoms(page)
         capture_admin_setup(page)
         capture_admin_maintenance(page)
+        capture_builder_workspace(page)
         browser.close()
 
 

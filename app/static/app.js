@@ -288,6 +288,21 @@
   }
 
   function getSelectedProfile() {
+    const selectedStorageView = getSelectedStorageViewRuntime();
+    if (selectedStorageView?.kind === "ses_enclosure" && selectedStorageView.profile_id) {
+      return {
+        id: selectedStorageView.profile_id,
+        label: selectedStorageView.profile_label || selectedStorageView.label || selectedStorageView.id,
+        eyebrow: selectedStorageView.eyebrow || null,
+        summary: selectedStorageView.summary || null,
+        panel_title: selectedStorageView.panel_title || selectedStorageView.label || selectedStorageView.id,
+        edge_label: selectedStorageView.edge_label || null,
+        face_style: selectedStorageView.face_style || "generic",
+        latch_edge: selectedStorageView.latch_edge || "bottom",
+        bay_size: selectedStorageView.bay_size || null,
+        row_groups: Array.isArray(selectedStorageView.row_groups) ? selectedStorageView.row_groups : [],
+      };
+    }
     return state.snapshot.selected_profile || null;
   }
 
@@ -335,11 +350,18 @@
   }
 
   function getSelectedStorageViewRuntimeSlot(slotIndex) {
+    if (slotIndex === null || slotIndex === undefined || slotIndex === "") {
+      return null;
+    }
+    const normalizedSlotIndex = Number(slotIndex);
+    if (!Number.isInteger(normalizedSlotIndex)) {
+      return null;
+    }
     const selectedView = getSelectedStorageViewRuntime();
     if (!selectedView) {
       return null;
     }
-    return (selectedView.slots || []).find((slot) => Number(slot.slot_index) === Number(slotIndex)) || null;
+    return (selectedView.slots || []).find((slot) => Number(slot.slot_index) === normalizedSlotIndex) || null;
   }
 
   function activeLayoutRows() {
@@ -592,6 +614,10 @@
     grid.innerHTML = "";
     const slotLayout = Array.isArray(selectedView?.slot_layout) ? selectedView.slot_layout : [];
     const slotsByIndex = new Map((selectedView?.slots || []).map((slot) => [Number(slot.slot_index), slot]));
+    const peerContext = getSelectedPeerContext();
+    const profile = buildViewProfile();
+    const driveScale = inferDominantDriveScale(profile);
+    const layoutMode = inferChassisLayoutMode(profile, driveScale);
 
     if (selectedView.kind === "nvme_carrier") {
       const board = document.createElement("div");
@@ -655,14 +681,16 @@
       const rowSlots = document.createElement("div");
       rowSlots.className = "row-slots";
       rowSlots.dataset.slotCount = String(row.length);
-      rowSlots.style.gridTemplateColumns = `repeat(${row.length || 1}, minmax(0, 1fr))`;
+      const rowGroups = splitRowIntoGroups(row);
+      const isFlatTopLoaderGrouping = String(layoutMode || "").startsWith("top-loader") && rowGroups.length > 1;
+      const flatGroupBreakpoints = rowGroupBreakpoints(rowGroups);
 
-      row.forEach((slotValue) => {
+      const appendTile = (container, slotValue) => {
         if (!Number.isInteger(slotValue)) {
           const gapTile = document.createElement("div");
           gapTile.className = "slot-gap";
           gapTile.setAttribute("aria-hidden", "true");
-          rowSlots.appendChild(gapTile);
+          container.appendChild(gapTile);
           return;
         }
 
@@ -674,20 +702,27 @@
           slot_size: null,
         };
         const visualState = slot.state === "matched" ? "healthy" : slot.state;
+        const liveSlot = getLiveBackedStorageViewSlot(selectedView, slot);
         const tile = document.createElement("button");
         tile.type = "button";
-        tile.className = `slot-tile state-${visualState} storage-view-slot`;
+        tile.className = liveSlot
+          ? `slot-tile state-${liveSlot.state || "unknown"}`
+          : `slot-tile state-${visualState} storage-view-slot`;
         if (selectedView.kind === "nvme_carrier") {
           tile.classList.add("storage-view-slot-nvme");
         }
         if (selectedView.kind === "boot_devices") {
           tile.classList.add("storage-view-slot-boot");
         }
-        if (!storageViewRuntimeMatchesFilter(slot)) {
+        if (liveSlot ? !passesFilter(liveSlot) : !storageViewRuntimeMatchesFilter(slot)) {
           tile.classList.add("filtered-out");
         }
         if (state.selectedSlot === slot.slot_index) {
           tile.classList.add("selected");
+        } else if (liveSlot && peerContext.active && peerContext.peerSlots.has(slot.slot_index)) {
+          tile.classList.add("peer-highlight");
+        } else if (liveSlot && peerContext.active) {
+          tile.classList.add("peer-dimmed");
         }
         tile.dataset.slot = String(slot.slot_index);
         if (slot.slot_size) {
@@ -695,10 +730,17 @@
         } else {
           delete tile.dataset.slotSize;
         }
-        tile.setAttribute("aria-label", buildStorageViewRuntimeTooltip(slot, selectedView));
+        tile.setAttribute(
+          "aria-label",
+          liveSlot
+            ? slotTooltip(liveSlot, getStorageViewSmartSummaryEntry(selectedView, slot) || getSmartSummaryEntry(liveSlot))
+            : buildStorageViewRuntimeTooltip(slot, selectedView)
+        );
         tile.innerHTML =
           selectedView.kind === "nvme_carrier"
             ? buildNvmeRuntimeTileMarkup(slot, selectedView)
+            : liveSlot
+              ? buildLiveSlotTileMarkup(liveSlot)
             : `
               <span class="slot-status-led" aria-hidden="true"></span>
               <span class="slot-number">${escapeHtml(slot.slot_label)}</span>
@@ -708,11 +750,40 @@
               <span class="slot-latch" aria-hidden="true"></span>
             `;
         bindStorageViewTileInteractions(tile, slot, selectedView);
-        rowSlots.appendChild(tile);
-      });
+        container.appendChild(tile);
+      };
+
+      if (isFlatTopLoaderGrouping) {
+        rowSlots.classList.add("row-slots-flat-grouped");
+        row.forEach((slotValue, tileIndex) => {
+          appendTile(rowSlots, slotValue);
+          if (flatGroupBreakpoints.includes(tileIndex + 1)) {
+            const divider = document.createElement("span");
+            divider.className = "row-metal-divider";
+            divider.setAttribute("aria-hidden", "true");
+            rowSlots.appendChild(divider);
+          }
+        });
+      } else {
+        rowGroups.forEach((group) => {
+          const rowGroup = document.createElement("div");
+          rowGroup.className = "row-group";
+          rowGroup.dataset.slotCount = String(group.length);
+          rowGroup.style.setProperty("--group-columns", String(group.length));
+
+          group.forEach((slotValue) => {
+            appendTile(rowGroup, slotValue);
+          });
+
+          rowSlots.appendChild(rowGroup);
+        });
+      }
 
       rowWrapper.appendChild(rowSlots);
       grid.appendChild(rowWrapper);
+      rowSlots.style.gridTemplateColumns = isFlatTopLoaderGrouping
+        ? flatGroupedColumnTemplate(row.length, flatGroupBreakpoints)
+        : groupColumnTemplate(rowGroups, layoutMode);
     });
   }
 
@@ -855,17 +926,36 @@
               ? `Saved chassis view layered on top of the live enclosure ${selectedStorageView.backing_enclosure_label}.`
               : "Runtime storage-view map for the selected saved hardware view.";
       return {
-        eyebrow: `${systemLabel} / ${storageViewKindLabel(selectedStorageView)}`,
-        summary: selectedStorageView.notes?.[0] || baseSummary,
-        enclosureTitle: selectedStorageView.label || selectedStorageView.id,
-        edgeLabel: selectedStorageView.kind === "nvme_carrier" ? "PCIe edge / slot 1" : "Storage view",
+        eyebrow:
+          selectedStorageView.kind === "ses_enclosure"
+            ? (profile?.eyebrow || `${systemLabel} / ${storageViewKindLabel(selectedStorageView)}`)
+            : `${systemLabel} / ${storageViewKindLabel(selectedStorageView)}`,
+        summary:
+          selectedStorageView.kind === "ses_enclosure"
+            ? (selectedStorageView.notes?.[0] || profile?.summary || baseSummary)
+            : (selectedStorageView.notes?.[0] || baseSummary),
+        enclosureTitle:
+          selectedStorageView.kind === "ses_enclosure"
+            ? (profile?.panel_title || selectedStorageView.label || selectedStorageView.id)
+            : (selectedStorageView.label || selectedStorageView.id),
+        edgeLabel:
+          selectedStorageView.kind === "nvme_carrier"
+            ? "PCIe edge / slot 1"
+            : selectedStorageView.kind === "ses_enclosure"
+              ? (profile?.edge_label || "Front of chassis")
+              : "Storage view",
         faceStyle:
           selectedStorageView.kind === "nvme_carrier"
             ? "nvme-carrier"
             : selectedStorageView.kind === "boot_devices"
               ? "boot-devices"
-              : "generic",
-        latchEdge: "bottom",
+              : selectedStorageView.kind === "ses_enclosure"
+                ? (profile?.face_style || "generic")
+                : "generic",
+        latchEdge:
+          selectedStorageView.kind === "ses_enclosure"
+            ? (profile?.latch_edge || "bottom")
+            : "bottom",
         baySize: selectedStorageView.kind === "ses_enclosure" ? (profile?.bay_size || null) : "2.5",
       };
     }
@@ -2220,6 +2310,27 @@
     return "UNKNOWN";
   }
 
+  function buildLiveSlotTileMarkup(slot) {
+    return `
+      <span class="slot-status-led" aria-hidden="true"></span>
+      <span class="slot-number">${slot.slot_label}</span>
+      <span class="slot-device">${escapeHtml(slotPrimaryLabel(slot))}</span>
+      <span class="slot-pool">${escapeHtml(slot.pool_name || stateLabel(slot))}</span>
+      <span class="slot-latch" aria-hidden="true"></span>
+    `;
+  }
+
+  function isLiveStyledStorageView(view) {
+    return Boolean(view && view.kind === "ses_enclosure");
+  }
+
+  function getLiveBackedStorageViewSlot(view, slot) {
+    if (!isLiveStyledStorageView(view) || !slot || !Number.isInteger(slot.snapshot_slot)) {
+      return null;
+    }
+    return getSlotById(slot.snapshot_slot);
+  }
+
   function persistentIdLabel(slot) {
     return (
       slot?.persistent_id_label ||
@@ -3289,8 +3400,36 @@
   }
 
   function getSelectedPeerContext() {
-    if (getSelectedStorageViewRuntime()) {
-      return { active: false, peerSlots: new Set() };
+    const selectedStorageView = getSelectedStorageViewRuntime();
+    if (selectedStorageView) {
+      if (!isLiveStyledStorageView(selectedStorageView)) {
+        return { active: false, peerSlots: new Set() };
+      }
+      const selectedStorageViewSlot = getSelectedStorageViewRuntimeSlot(state.selectedSlot);
+      const selectedLiveSlot = getLiveBackedStorageViewSlot(selectedStorageView, selectedStorageViewSlot);
+      if (!selectedLiveSlot || !selectedLiveSlot.pool_name || !selectedLiveSlot.vdev_name) {
+        return { active: false, peerSlots: new Set() };
+      }
+
+      const peerSlots = new Set(
+        (selectedStorageView.slots || [])
+          .filter((candidate) => {
+            const candidateLiveSlot = getLiveBackedStorageViewSlot(selectedStorageView, candidate);
+            return Boolean(
+              candidateLiveSlot &&
+              candidateLiveSlot.pool_name === selectedLiveSlot.pool_name &&
+              candidateLiveSlot.vdev_name === selectedLiveSlot.vdev_name &&
+              candidateLiveSlot.vdev_class === selectedLiveSlot.vdev_class &&
+              candidateLiveSlot.device_name
+            );
+          })
+          .map((candidate) => candidate.slot_index)
+      );
+
+      return {
+        active: peerSlots.size > 1,
+        peerSlots,
+      };
     }
     const slot = getSlotById(state.selectedSlot);
     if (!slot || !slot.pool_name || !slot.vdev_name) {
@@ -3373,13 +3512,7 @@
         }
         tile.dataset.slot = String(slot.slot);
         tile.setAttribute("aria-label", slotTooltip(slot, getSmartSummaryEntry(slot)));
-        tile.innerHTML = `
-          <span class="slot-status-led" aria-hidden="true"></span>
-          <span class="slot-number">${slot.slot_label}</span>
-          <span class="slot-device">${escapeHtml(slotPrimaryLabel(slot))}</span>
-          <span class="slot-pool">${escapeHtml(slot.pool_name || stateLabel(slot))}</span>
-          <span class="slot-latch" aria-hidden="true"></span>
-        `;
+        tile.innerHTML = buildLiveSlotTileMarkup(slot);
         tile.addEventListener("mouseenter", (event) => {
           state.hoveredSlot = slot.slot;
           refreshHoveredTooltip(tile);
@@ -4893,33 +5026,168 @@
     return [smartMessage, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
   }
 
+  function renderEmptyDetailState(message, { showDetailSecondary = true } = {}) {
+    detailEmpty.textContent = message;
+    detailEmpty.classList.remove("hidden");
+    detailContent.classList.add("hidden");
+    detailKvGrid.innerHTML = "";
+    detailSmartNote.classList.add("hidden");
+    detailSmartNote.textContent = "";
+    detailSecondary.classList.toggle("hidden", !showDetailSecondary);
+    detailLedControls.classList.add("hidden");
+    renderTopologyContext(null);
+    renderMultipathContext(null);
+    resetMappingForm();
+    if (mappingEmpty) {
+      mappingEmpty.classList.remove("hidden");
+    }
+    mappingForm.classList.add("hidden");
+    setMappingFormEnabled(false);
+    ledButtons.forEach((button) => {
+      button.disabled = true;
+    });
+    if (historyToggleButton) {
+      historyToggleButton.classList.add("hidden");
+    }
+    if (detailHistoryPanel) {
+      detailHistoryPanel.classList.add("hidden");
+    }
+    renderHistoryPanel();
+  }
+
+  function renderLiveSlotDetail(slot, options = {}) {
+    const detailTitle = options.detailTitle || `Slot ${slot.slot_label}`;
+    const smartEntry = options.smartEntry || getSmartSummaryEntry(slot);
+    const showSasTransportFields = shouldShowSasTransportFields(slot, smartEntry);
+    const showLinkRate = showSasTransportFields || formatLinkRateValue(smartEntry) !== "n/a";
+    const showQuantastorContext = currentPlatform() === "quantastor";
+
+    detailEmpty.classList.add("hidden");
+    detailContent.classList.remove("hidden");
+    detailSecondary.classList.remove("hidden");
+    detailLedControls.classList.remove("hidden");
+    if (mappingEmpty) {
+      mappingEmpty.classList.add("hidden");
+    }
+    mappingForm.classList.remove("hidden");
+    detailSlotTitle.textContent = detailTitle;
+    detailStatePill.textContent = stateLabel(slot);
+    detailStatePill.className = `state-pill state-${slot.state}`;
+    detailKvGrid.innerHTML = [
+      kvRow("Device", slot.device_name),
+      kvRow("Serial", slot.serial, true),
+      kvRow("Model", slot.model),
+      kvRow("Size", slot.size_human),
+      kvRow(persistentIdLabel(slot), slot.gptid, true),
+      kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(slot, smartEntry), true),
+      kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
+      kvRow(currentPlatform() === "linux" ? "Mount" : "Pool", slot.pool_name),
+      kvRow(currentPlatform() === "linux" ? "Array" : "Vdev", slot.vdev_name),
+      kvRow(currentPlatform() === "linux" ? "Role" : "Class", slot.vdev_class),
+      kvRow("Topology", slot.topology_label),
+      showQuantastorContext ? kvRowIfMeaningful("Presented By", formatQuantastorContextValue(slot, "presented_by_label")) : "",
+      showQuantastorContext ? kvRowIfMeaningful("Pool Active On", formatQuantastorContextValue(slot, "pool_owner_label")) : "",
+      showQuantastorContext ? kvRowIfMeaningful("I/O Fence On", formatQuantastorContextValue(slot, "fence_owner_label")) : "",
+      showQuantastorContext ? kvRowIfMeaningful("Visible On", formatVisibleOnValue(slot)) : "",
+      showQuantastorContext ? kvRowIfMeaningful("SES Host", formatSesHostValue(slot)) : "",
+      kvRow("Health", slot.health),
+      kvRow("Temp", formatTemperatureValue(slot, smartEntry)),
+      kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
+      kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
+      kvRowIfMeaningful("SMART Status", formatSmartHealthStatusValue(smartEntry)),
+      kvRow("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
+      kvRow("Power On", formatPowerOnValue(smartEntry)),
+      kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
+      kvRowIfMeaningful("Power-On Resets", formatPowerOnResetsValue(smartEntry)),
+      kvRow("Sector Size", formatSectorSizeValue(slot, smartEntry)),
+      kvRow("Rotation", formatRotationValue(smartEntry)),
+      kvRow("Form Factor", formatFormFactorValue(smartEntry)),
+      kvRowIfMeaningful("Firmware", formatFirmwareValue(smartEntry)),
+      kvRowIfMeaningful("Protocol Version", formatProtocolVersionValue(smartEntry)),
+      kvRowIfMeaningful("Endurance", formatEnduranceValue(smartEntry)),
+      kvRowIfMeaningful("Available Spare", formatAvailableSpareValue(smartEntry)),
+      kvRowIfMeaningful("TRIM", formatTrimSupportedValue(smartEntry)),
+      kvRowIfMeaningful("Bytes Read", formatBytesReadValue(smartEntry)),
+      kvRowIfMeaningful("Bytes Written", formatBytesWrittenValue(smartEntry)),
+      kvRowIfMeaningful("Annualized Write", formatAnnualizedWriteValue(smartEntry)),
+      kvRowIfMeaningful("Est. TBW Left", formatEstimatedRemainingWriteValue(smartEntry)),
+      kvRowIfMeaningful("Read Commands", formatReadCommandsValue(smartEntry)),
+      kvRowIfMeaningful("Write Commands", formatWriteCommandsValue(smartEntry)),
+      kvRowIfMeaningful("Media Errors", formatMediaErrorsValue(smartEntry)),
+      kvRowIfMeaningful("Predictive Errors", formatPredictiveErrorsValue(smartEntry)),
+      kvRowIfMeaningful("Non-Medium Errors", formatNonMediumErrorsValue(smartEntry)),
+      kvRowIfMeaningful("Uncorrected Read", formatUncorrectedReadErrorsValue(smartEntry)),
+      kvRowIfMeaningful("Uncorrected Write", formatUncorrectedWriteErrorsValue(smartEntry)),
+      kvRowIfMeaningful("Unsafe Shutdowns", formatUnsafeShutdownsValue(smartEntry)),
+      kvRowIfMeaningful("Hardware Resets", formatHardwareResetsValue(smartEntry)),
+      kvRowIfMeaningful("Interface CRC Errors", formatInterfaceCrcErrorsValue(smartEntry)),
+      kvRow("Read Cache", formatReadCacheValue(smartEntry)),
+      kvRow("Writeback Cache", formatWritebackCacheValue(smartEntry)),
+      kvRow("Transport", formatTransportValue(smartEntry)),
+      showSasTransportFields ? kvRow("Logical Unit ID", formatLogicalUnitIdValue(slot, smartEntry)) : "",
+      showSasTransportFields ? kvRow("SAS Address", formatSasAddressValue(slot, smartEntry)) : "",
+      showSasTransportFields ? kvRow("Attached SAS", formatAttachedSasAddressValue(slot, smartEntry)) : "",
+      showLinkRate ? kvRow("Link Rate", formatLinkRateValue(smartEntry)) : "",
+      showQuantastorContext ? kvRowIfMeaningful("SES Flags", formatSesStateValue(slot)) : "",
+      kvRow("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
+      kvRow("LED", ledStatusLabel(slot)),
+      kvRow("Mapping", slot.mapping_source),
+      kvRow("Notes", slot.notes),
+    ].filter(Boolean).join("");
+
+    const smartNoteText = buildSmartNoteText(slot, smartEntry);
+    if (smartNoteText) {
+      detailSmartNote.textContent = smartNoteText;
+      detailSmartNote.classList.remove("hidden");
+    } else {
+      detailSmartNote.classList.add("hidden");
+      detailSmartNote.textContent = "";
+    }
+
+    wireDetailCopyButtons();
+    renderTopologyContext(slot);
+    renderMultipathContext(slot);
+
+    mappingForm.serial.value = slot.serial || "";
+    mappingForm.device_name.value = slot.device_name || "";
+    mappingForm.gptid.value = slot.gptid || "";
+    mappingForm.notes.value = slot.notes || "";
+    setMappingFormEnabled(!state.snapshotMode);
+    ledButtons.forEach((button) => {
+      button.disabled = state.snapshotMode || !slot.led_supported;
+    });
+    renderHistoryPanel();
+    if (state.history.panelOpen && isHistoryAvailable()) {
+      void loadHistoryForSelectedSlot(false);
+    }
+    if (typeof options.ensureSmart === "function") {
+      void options.ensureSmart();
+      return;
+    }
+    void ensureSmartSummary(slot);
+  }
+
   function renderDetail() {
     const selectedStorageView = getSelectedStorageViewRuntime();
     const storageViewSlot = selectedStorageView ? getSelectedStorageViewRuntimeSlot(state.selectedSlot) : null;
     if (selectedStorageView) {
       if (!storageViewSlot) {
-        detailEmpty.textContent = "Select a storage-view slot to inspect how a live disk landed in this saved layout.";
-        detailEmpty.classList.remove("hidden");
-        detailContent.classList.add("hidden");
-        detailSmartNote.classList.add("hidden");
-        detailSmartNote.textContent = "";
-        detailSecondary.classList.add("hidden");
-        detailLedControls.classList.add("hidden");
-        if (historyToggleButton) {
-          historyToggleButton.classList.add("hidden");
-        }
-        if (detailHistoryPanel) {
-          detailHistoryPanel.classList.add("hidden");
-        }
-        renderTopologyContext(null);
-        renderMultipathContext(null);
-        resetMappingForm();
-        if (mappingEmpty) {
-          mappingEmpty.classList.remove("hidden");
-        }
-        mappingForm.classList.add("hidden");
-        setMappingFormEnabled(false);
-        renderHistoryPanel();
+        renderEmptyDetailState(
+          isLiveStyledStorageView(selectedStorageView)
+            ? "Select a slot tile to view disk, pool, and mapping details."
+            : "Select a storage-view slot to inspect how a live disk landed in this saved layout.",
+          { showDetailSecondary: isLiveStyledStorageView(selectedStorageView) }
+        );
+        return;
+      }
+
+      const liveBackedSlot = getLiveBackedStorageViewSlot(selectedStorageView, storageViewSlot);
+      if (liveBackedSlot) {
+        renderLiveSlotDetail(liveBackedSlot, {
+          detailTitle: `Slot ${storageViewSlot.slot_label}`,
+          smartEntry: getStorageViewSmartSummaryEntry(selectedStorageView, storageViewSlot) || getSmartSummaryEntry(liveBackedSlot),
+          ensureSmart: () => ensureStorageViewSmartSummary(selectedStorageView, storageViewSlot),
+        });
         return;
       }
 
@@ -5032,139 +5300,11 @@
 
     const slot = getSlotById(state.selectedSlot);
     if (!slot) {
-      detailEmpty.textContent = "Select a slot tile to view disk, pool, and mapping details.";
-      detailEmpty.classList.remove("hidden");
-      detailContent.classList.add("hidden");
-      detailSmartNote.classList.add("hidden");
-      detailSmartNote.textContent = "";
-      detailSecondary.classList.remove("hidden");
-      detailLedControls.classList.add("hidden");
-      renderTopologyContext(null);
-      renderMultipathContext(null);
-      resetMappingForm();
-      if (mappingEmpty) {
-        mappingEmpty.classList.remove("hidden");
-      }
-      mappingForm.classList.add("hidden");
-      setMappingFormEnabled(false);
-      ledButtons.forEach((button) => {
-        button.disabled = true;
-      });
-      if (historyToggleButton) {
-        historyToggleButton.classList.add("hidden");
-      }
-      if (detailHistoryPanel) {
-        detailHistoryPanel.classList.add("hidden");
-      }
-      renderHistoryPanel();
+      renderEmptyDetailState("Select a slot tile to view disk, pool, and mapping details.");
       return;
     }
 
-    detailEmpty.classList.add("hidden");
-    detailContent.classList.remove("hidden");
-    detailSecondary.classList.remove("hidden");
-    detailLedControls.classList.remove("hidden");
-    if (mappingEmpty) {
-      mappingEmpty.classList.add("hidden");
-    }
-    mappingForm.classList.remove("hidden");
-    detailSlotTitle.textContent = `Slot ${slot.slot_label}`;
-    detailStatePill.textContent = stateLabel(slot);
-    detailStatePill.className = `state-pill state-${slot.state}`;
-    const smartEntry = getSmartSummaryEntry(slot);
-    const showSasTransportFields = shouldShowSasTransportFields(slot, smartEntry);
-    const showLinkRate = showSasTransportFields || formatLinkRateValue(smartEntry) !== "n/a";
-    const showQuantastorContext = currentPlatform() === "quantastor";
-
-    detailKvGrid.innerHTML = [
-      kvRow("Device", slot.device_name),
-      kvRow("Serial", slot.serial, true),
-      kvRow("Model", slot.model),
-      kvRow("Size", slot.size_human),
-      kvRow(persistentIdLabel(slot), slot.gptid, true),
-      kvRowIfMeaningful("Namespace EUI64", formatNamespaceEui64Value(slot, smartEntry), true),
-      kvRowIfMeaningful("Namespace NGUID", formatNamespaceNguidValue(smartEntry), true),
-      kvRow(currentPlatform() === "linux" ? "Mount" : "Pool", slot.pool_name),
-      kvRow(currentPlatform() === "linux" ? "Array" : "Vdev", slot.vdev_name),
-      kvRow(currentPlatform() === "linux" ? "Role" : "Class", slot.vdev_class),
-      kvRow("Topology", slot.topology_label),
-      showQuantastorContext ? kvRowIfMeaningful("Presented By", formatQuantastorContextValue(slot, "presented_by_label")) : "",
-      showQuantastorContext ? kvRowIfMeaningful("Pool Active On", formatQuantastorContextValue(slot, "pool_owner_label")) : "",
-      showQuantastorContext ? kvRowIfMeaningful("I/O Fence On", formatQuantastorContextValue(slot, "fence_owner_label")) : "",
-      showQuantastorContext ? kvRowIfMeaningful("Visible On", formatVisibleOnValue(slot)) : "",
-      showQuantastorContext ? kvRowIfMeaningful("SES Host", formatSesHostValue(slot)) : "",
-      kvRow("Health", slot.health),
-      kvRow("Temp", formatTemperatureValue(slot, smartEntry)),
-      kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
-      kvRowIfMeaningful("Critical Temp", formatCriticalTemperatureValue(smartEntry)),
-      kvRowIfMeaningful("SMART Status", formatSmartHealthStatusValue(smartEntry)),
-      kvRow("Last SMART Test", formatLastSmartTestValue(slot, smartEntry)),
-      kvRow("Power On", formatPowerOnValue(smartEntry)),
-      kvRowIfMeaningful("Power Cycles", formatPowerCycleValue(smartEntry)),
-      kvRowIfMeaningful("Power-On Resets", formatPowerOnResetsValue(smartEntry)),
-      kvRow("Sector Size", formatSectorSizeValue(slot, smartEntry)),
-      kvRow("Rotation", formatRotationValue(smartEntry)),
-      kvRow("Form Factor", formatFormFactorValue(smartEntry)),
-      kvRowIfMeaningful("Firmware", formatFirmwareValue(smartEntry)),
-      kvRowIfMeaningful("Protocol Version", formatProtocolVersionValue(smartEntry)),
-      kvRowIfMeaningful("Endurance", formatEnduranceValue(smartEntry)),
-      kvRowIfMeaningful("Available Spare", formatAvailableSpareValue(smartEntry)),
-      kvRowIfMeaningful("TRIM", formatTrimSupportedValue(smartEntry)),
-      kvRowIfMeaningful("Bytes Read", formatBytesReadValue(smartEntry)),
-      kvRowIfMeaningful("Bytes Written", formatBytesWrittenValue(smartEntry)),
-      kvRowIfMeaningful("Annualized Write", formatAnnualizedWriteValue(smartEntry)),
-      kvRowIfMeaningful("Est. TBW Left", formatEstimatedRemainingWriteValue(smartEntry)),
-      kvRowIfMeaningful("Read Commands", formatReadCommandsValue(smartEntry)),
-      kvRowIfMeaningful("Write Commands", formatWriteCommandsValue(smartEntry)),
-      kvRowIfMeaningful("Media Errors", formatMediaErrorsValue(smartEntry)),
-      kvRowIfMeaningful("Predictive Errors", formatPredictiveErrorsValue(smartEntry)),
-      kvRowIfMeaningful("Non-Medium Errors", formatNonMediumErrorsValue(smartEntry)),
-      kvRowIfMeaningful("Uncorrected Read", formatUncorrectedReadErrorsValue(smartEntry)),
-      kvRowIfMeaningful("Uncorrected Write", formatUncorrectedWriteErrorsValue(smartEntry)),
-      kvRowIfMeaningful("Unsafe Shutdowns", formatUnsafeShutdownsValue(smartEntry)),
-      kvRowIfMeaningful("Hardware Resets", formatHardwareResetsValue(smartEntry)),
-      kvRowIfMeaningful("Interface CRC Errors", formatInterfaceCrcErrorsValue(smartEntry)),
-      kvRow("Read Cache", formatReadCacheValue(smartEntry)),
-      kvRow("Writeback Cache", formatWritebackCacheValue(smartEntry)),
-      kvRow("Transport", formatTransportValue(smartEntry)),
-      showSasTransportFields ? kvRow("Logical Unit ID", formatLogicalUnitIdValue(slot, smartEntry)) : "",
-      showSasTransportFields ? kvRow("SAS Address", formatSasAddressValue(slot, smartEntry)) : "",
-      showSasTransportFields ? kvRow("Attached SAS", formatAttachedSasAddressValue(slot, smartEntry)) : "",
-      showLinkRate ? kvRow("Link Rate", formatLinkRateValue(smartEntry)) : "",
-      showQuantastorContext ? kvRowIfMeaningful("SES Flags", formatSesStateValue(slot)) : "",
-      kvRow("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
-      kvRow("LED", ledStatusLabel(slot)),
-      kvRow("Mapping", slot.mapping_source),
-      kvRow("Notes", slot.notes),
-    ].filter(Boolean).join("");
-
-    const smartNoteText = buildSmartNoteText(slot, smartEntry);
-    if (smartNoteText) {
-      detailSmartNote.textContent = smartNoteText;
-      detailSmartNote.classList.remove("hidden");
-    } else {
-      detailSmartNote.classList.add("hidden");
-      detailSmartNote.textContent = "";
-    }
-
-    wireDetailCopyButtons();
-
-    renderTopologyContext(slot);
-    renderMultipathContext(slot);
-
-    mappingForm.serial.value = slot.serial || "";
-    mappingForm.device_name.value = slot.device_name || "";
-    mappingForm.gptid.value = slot.gptid || "";
-    mappingForm.notes.value = slot.notes || "";
-    setMappingFormEnabled(!state.snapshotMode);
-    ledButtons.forEach((button) => {
-      button.disabled = state.snapshotMode || !slot.led_supported;
-    });
-    renderHistoryPanel();
-    if (state.history.panelOpen && isHistoryAvailable()) {
-      void loadHistoryForSelectedSlot(false);
-    }
-    void ensureSmartSummary(slot);
+    renderLiveSlotDetail(slot);
   }
 
   function renderTopologyContext(slot) {

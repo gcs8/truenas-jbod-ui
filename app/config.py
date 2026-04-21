@@ -11,6 +11,60 @@ import yaml
 from pydantic import BaseModel, Field, field_validator
 
 
+def _standard_runtime_config_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "config" / "config.yaml"
+
+
+def _derive_runtime_layout_paths(config_path: str | Path) -> dict[str, str]:
+    resolved_config_path = Path(config_path)
+    if resolved_config_path.parent.name.lower() == "config":
+        runtime_root = resolved_config_path.parent.parent
+        config_root = resolved_config_path.parent
+        data_root = runtime_root / "data"
+        log_root = runtime_root / "logs"
+    else:
+        runtime_root = resolved_config_path.parent
+        config_root = runtime_root
+        data_root = runtime_root
+        log_root = runtime_root
+    return {
+        "config_file": str(resolved_config_path),
+        "profile_file": str(config_root / "profiles.yaml"),
+        "mapping_file": str(data_root / "slot_mappings.json"),
+        "slot_detail_cache_file": str(data_root / "slot_detail_cache.json"),
+        "log_file": str(log_root / "app.log"),
+        "known_hosts_path": str(data_root / "known_hosts"),
+    }
+
+
+def _default_config_file() -> str:
+    return _derive_runtime_layout_paths(_standard_runtime_config_path())["config_file"]
+
+
+def _default_profile_file() -> str:
+    return _derive_runtime_layout_paths(_standard_runtime_config_path())["profile_file"]
+
+
+def _default_mapping_file() -> str:
+    return _derive_runtime_layout_paths(_standard_runtime_config_path())["mapping_file"]
+
+
+def _default_slot_detail_cache_file() -> str:
+    return _derive_runtime_layout_paths(_standard_runtime_config_path())["slot_detail_cache_file"]
+
+
+def _default_log_file() -> str:
+    return _derive_runtime_layout_paths(_standard_runtime_config_path())["log_file"]
+
+
+def _default_known_hosts_path() -> str:
+    return _derive_runtime_layout_paths(_standard_runtime_config_path())["known_hosts_path"]
+
+
+def _legacy_container_layout_paths() -> dict[str, str]:
+    return _derive_runtime_layout_paths(Path("/app/config/config.yaml"))
+
+
 class AppConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
@@ -75,7 +129,7 @@ class SSHConfig(BaseModel):
     key_path: str = "/run/ssh/id_truenas"
     password: str = ""
     sudo_password: str = ""
-    known_hosts_path: str | None = "/app/data/known_hosts"
+    known_hosts_path: str | None = Field(default_factory=_default_known_hosts_path)
     strict_host_key_checking: bool = True
     timeout_seconds: int = 15
     commands: list[str] = Field(
@@ -270,10 +324,10 @@ class LayoutConfig(BaseModel):
 
 
 class PathConfig(BaseModel):
-    mapping_file: str = "/app/data/slot_mappings.json"
-    log_file: str = "/app/logs/app.log"
-    profile_file: str = "/app/config/profiles.yaml"
-    slot_detail_cache_file: str = "/app/data/slot_detail_cache.json"
+    mapping_file: str = Field(default_factory=_default_mapping_file)
+    log_file: str = Field(default_factory=_default_log_file)
+    profile_file: str = Field(default_factory=_default_profile_file)
+    slot_detail_cache_file: str = Field(default_factory=_default_slot_detail_cache_file)
 
 
 class HistoryConfig(BaseModel):
@@ -310,7 +364,7 @@ class Settings(BaseModel):
     layout: LayoutConfig = Field(default_factory=LayoutConfig)
     paths: PathConfig = Field(default_factory=PathConfig)
     profiles: list[EnclosureProfileConfig] = Field(default_factory=list)
-    config_file: str = "/app/config/config.yaml"
+    config_file: str = Field(default_factory=_default_config_file)
 
 
 ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
@@ -443,6 +497,41 @@ def _load_profile_yaml(profile_path: Path) -> dict[str, Any]:
     )
 
 
+def _apply_config_path_relative_defaults(
+    merged: dict[str, Any],
+    *,
+    config_path: Path,
+    defaults: dict[str, Any],
+) -> dict[str, Any]:
+    derived = _derive_runtime_layout_paths(config_path)
+    legacy = _legacy_container_layout_paths()
+    merged["config_file"] = derived["config_file"]
+
+    merged_paths = merged.setdefault("paths", {})
+    for key in ("mapping_file", "log_file", "profile_file", "slot_detail_cache_file"):
+        if key not in merged_paths or merged_paths.get(key) in {defaults["paths"][key], legacy[key]}:
+            merged_paths[key] = derived[key]
+
+    merged_ssh = merged.setdefault("ssh", {})
+    if (
+        "known_hosts_path" not in merged_ssh
+        or merged_ssh.get("known_hosts_path") in {defaults["ssh"]["known_hosts_path"], legacy["known_hosts_path"]}
+    ):
+        merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
+
+    for system_payload in merged.get("systems") or []:
+        if not isinstance(system_payload, dict):
+            continue
+        ssh_payload = system_payload.setdefault("ssh", {})
+        if (
+            "known_hosts_path" not in ssh_payload
+            or ssh_payload.get("known_hosts_path") in {defaults["ssh"]["known_hosts_path"], legacy["known_hosts_path"]}
+        ):
+            ssh_payload["known_hosts_path"] = derived["known_hosts_path"]
+
+    return merged
+
+
 def _normalize_system_id(value: str | None, fallback_index: int) -> str:
     text = normalize_text(value)
     if not text:
@@ -573,6 +662,12 @@ def get_settings() -> Settings:
         if raw_value is None:
             continue
         _set_path_value(merged, target_path, _parse_scalar(raw_value))
+
+    merged = _apply_config_path_relative_defaults(
+        merged,
+        config_path=config_path,
+        defaults=defaults,
+    )
 
     profile_path = Path(merged.get("paths", {}).get("profile_file", defaults["paths"]["profile_file"]))
     if profile_path.exists():

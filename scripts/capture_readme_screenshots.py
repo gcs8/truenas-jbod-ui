@@ -84,7 +84,7 @@ def hide_debug_chrome(page: Page) -> None:
 
 
 def open_and_select_slot(page: Page, params: dict[str, str], slot: int) -> None:
-    page.goto(f"{BASE_URL}?{urlencode(params)}", wait_until="networkidle")
+    page.goto(f"{BASE_URL}?{urlencode(params)}", wait_until="load")
     hide_debug_chrome(page)
     tile = page.locator(f'#slot-grid .slot-tile[data-slot="{slot}"]')
     tile.wait_for(state="visible", timeout=120_000)

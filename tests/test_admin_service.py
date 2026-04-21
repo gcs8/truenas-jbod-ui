@@ -15,6 +15,7 @@ from admin_service.main import build_admin_state_payload
 from admin_service.main import decode_optional_secret_header
 from app.config import (
     AdminSurfaceConfig,
+    EnclosureProfileConfig,
     PathConfig,
     SSHConfig,
     Settings,
@@ -24,6 +25,7 @@ from app.config import (
 from app.main import app as main_app
 from app.main import resolve_admin_launch_url
 from app.models.domain import EnclosureOption
+from app.models.domain import EnclosureProfileRequest
 from app.models.domain import HistoryAdoptRequest
 from app.models.domain import QuantastorNodeDiscoveryRequest
 from app.models.domain import SystemSetupSudoPreviewRequest
@@ -56,6 +58,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("/api/admin/system-setup/bootstrap", paths)
         self.assertIn("/api/admin/system-setup/sudoers-preview", paths)
         self.assertIn("/api/admin/system-setup/{system_id}", paths)
+        self.assertIn("/api/admin/profiles", paths)
+        self.assertIn("/api/admin/profiles/{profile_id}", paths)
         self.assertIn("/api/admin/history/purge-orphaned", paths)
         self.assertIn("/api/admin/history/orphaned", paths)
         self.assertIn("/api/admin/history/adopt-removed-system", paths)
@@ -260,6 +264,8 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(payload["storage_view_templates"][0]["id"], "ses-auto")
         custom_profile = next(profile for profile in payload["profiles"] if profile["id"] == "lab-4x4")
         self.assertEqual(custom_profile["slot_count"], 16)
+        self.assertTrue(custom_profile["is_custom"])
+        self.assertEqual(custom_profile["reference_count"], 2)
         self.assertIn("core", payload["setup_platform_defaults"])
         self.assertEqual(payload["ssh_keys"][0]["name"], "id_truenas")
         self.assertEqual(payload["paths"]["history_db"], "/tmp/history/history.db")
@@ -860,6 +866,128 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["enclosures"][0]["profile_id"], "supermicro-ssg-6048r-front-24")
         self.assertEqual(payload["enclosures"][0]["profile_label"], "Supermicro SSG-6048R Front 24")
         service.get_snapshot.assert_awaited_once_with(force_refresh=False)
+
+    def test_save_profile_route_returns_updated_profile_list(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/profiles" and "POST" in getattr(route, "methods", set()))
+        initial_settings = Settings(
+            config_file="C:/tmp/config/config.yaml",
+            paths=PathConfig(
+                mapping_file="C:/tmp/data/slot_mappings.json",
+                log_file="C:/tmp/logs/app.log",
+                profile_file="C:/tmp/config/profiles.yaml",
+                slot_detail_cache_file="C:/tmp/data/slot_detail_cache.json",
+            ),
+        )
+        refreshed_settings = Settings(
+            config_file="C:/tmp/config/config.yaml",
+            paths=PathConfig(
+                mapping_file="C:/tmp/data/slot_mappings.json",
+                log_file="C:/tmp/logs/app.log",
+                profile_file="C:/tmp/config/profiles.yaml",
+                slot_detail_cache_file="C:/tmp/data/slot_detail_cache.json",
+            ),
+            profiles=[
+                EnclosureProfileConfig(
+                    id="custom-front-24",
+                    label="Custom Front 24",
+                    summary="Saved custom front-drive profile.",
+                    face_style="front-drive",
+                    latch_edge="top",
+                    bay_size="2.5",
+                    rows=1,
+                    columns=24,
+                    slot_layout=[list(range(24))],
+                )
+            ],
+        )
+        profile_service = MagicMock()
+        profile_service.save_profile.return_value = (refreshed_settings.profiles[0], False)
+        runtime_service = MagicMock()
+        runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
+
+        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.main.ProfileBuilderService", return_value=profile_service):
+                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+                    response = asyncio.run(
+                        route.endpoint(
+                            payload=EnclosureProfileRequest(
+                                source_profile_id="generic-front-24-1x24",
+                                id="custom-front-24",
+                                label="Custom Front 24",
+                                summary="Saved custom front-drive profile.",
+                                face_style="front-drive",
+                                latch_edge="top",
+                                bay_size="2.5",
+                                rows=1,
+                                columns=24,
+                                slot_count=24,
+                            )
+                        )
+                    )
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["profile"]["id"], "custom-front-24")
+        self.assertFalse(payload["updated_existing"])
+        self.assertIn("custom-front-24", [profile["id"] for profile in payload["profiles"]])
+        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+
+    def test_delete_profile_route_returns_updated_profile_list(self) -> None:
+        route = next(
+            route
+            for route in admin_app.routes
+            if route.path == "/api/admin/profiles/{profile_id}" and "DELETE" in getattr(route, "methods", set())
+        )
+        initial_settings = Settings(
+            config_file="C:/tmp/config/config.yaml",
+            paths=PathConfig(
+                mapping_file="C:/tmp/data/slot_mappings.json",
+                log_file="C:/tmp/logs/app.log",
+                profile_file="C:/tmp/config/profiles.yaml",
+                slot_detail_cache_file="C:/tmp/data/slot_detail_cache.json",
+            ),
+            profiles=[
+                EnclosureProfileConfig(
+                    id="custom-front-24",
+                    label="Custom Front 24",
+                    summary="Saved custom front-drive profile.",
+                    face_style="front-drive",
+                    latch_edge="top",
+                    bay_size="2.5",
+                    rows=1,
+                    columns=24,
+                    slot_layout=[list(range(24))],
+                )
+            ],
+        )
+        refreshed_settings = Settings(
+            config_file="C:/tmp/config/config.yaml",
+            paths=PathConfig(
+                mapping_file="C:/tmp/data/slot_mappings.json",
+                log_file="C:/tmp/logs/app.log",
+                profile_file="C:/tmp/config/profiles.yaml",
+                slot_detail_cache_file="C:/tmp/data/slot_detail_cache.json",
+            ),
+        )
+        profile_service = MagicMock()
+        profile_service.delete_profile.return_value = "Custom Front 24"
+        runtime_service = MagicMock()
+        runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
+
+        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.main.ProfileBuilderService", return_value=profile_service):
+                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+                    response = asyncio.run(route.endpoint(profile_id="custom-front-24"))
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["deleted_label"], "Custom Front 24")
+        self.assertNotIn("custom-front-24", [profile["id"] for profile in payload["profiles"]])
+        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
 
     def test_sudoers_preview_route_returns_exact_rendered_content(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")

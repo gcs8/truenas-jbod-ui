@@ -29,6 +29,7 @@ from app.config import (
     get_settings,
 )
 from app.models.domain import (
+    EnclosureProfileRequest,
     HistoryAdoptRequest,
     QuantastorNodeDiscoveryRequest,
     SSHKeyGenerateRequest,
@@ -40,6 +41,7 @@ from app.models.domain import (
     TLSCertificateInspectRequest,
     TLSRemoteCertificateTrustRequest,
 )
+from app.services.profile_builder import ProfileBuilderService, collect_profile_references
 from app.services.profile_registry import ProfileRegistry
 from app.services.inventory_registry import InventoryRegistry
 from app.services.quantastor_api import QuantastorRESTClient
@@ -676,6 +678,69 @@ def create_app() -> FastAPI:
             }
         )
 
+    @app.post("/api/admin/profiles")
+    async def save_profile(payload: EnclosureProfileRequest) -> JSONResponse:
+        settings = reload_app_settings()
+        profile_service = ProfileBuilderService(settings.config_file, settings.paths.profile_file)
+        try:
+            saved_profile, updated_existing = await asyncio.to_thread(
+                profile_service.save_profile,
+                payload,
+                settings,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        refreshed_settings = reload_app_settings()
+        runtime_service = get_runtime_service()
+        await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
+        serialized_profiles = serialize_profiles(refreshed_settings)
+        serialized_profile = next(
+            (profile for profile in serialized_profiles if profile["id"] == saved_profile.id),
+            None,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "profile": serialized_profile,
+                "profiles": serialized_profiles,
+                "detail": (
+                    "Custom enclosure profile updated. Restart the Read UI container to pick up the revised profile."
+                    if updated_existing
+                    else "Custom enclosure profile saved. Restart the Read UI container to pick up the new profile."
+                ),
+                "updated_existing": updated_existing,
+                "restart_required": ["ui"],
+                "runtime": runtime_service.status_payload(),
+            }
+        )
+
+    @app.delete("/api/admin/profiles/{profile_id}")
+    async def delete_profile(profile_id: str) -> JSONResponse:
+        settings = reload_app_settings()
+        profile_service = ProfileBuilderService(settings.config_file, settings.paths.profile_file)
+        try:
+            deleted_label = await asyncio.to_thread(profile_service.delete_profile, profile_id, settings)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        refreshed_settings = reload_app_settings()
+        runtime_service = get_runtime_service()
+        await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
+        return JSONResponse(
+            {
+                "ok": True,
+                "profile_id": profile_id,
+                "deleted_label": deleted_label,
+                "profiles": serialize_profiles(refreshed_settings),
+                "detail": (
+                    f"Deleted custom profile {deleted_label}. Restart the Read UI container when you are ready to drop it from the runtime profile list too."
+                ),
+                "restart_required": ["ui"],
+                "runtime": runtime_service.status_payload(),
+            }
+        )
+
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
         return JSONResponse(
@@ -859,6 +924,8 @@ def serialize_storage_view_templates() -> list[dict[str, Any]]:
 
 def serialize_profiles(settings: Settings) -> list[dict[str, Any]]:
     registry = ProfileRegistry(settings)
+    custom_profile_ids = {profile.id for profile in settings.profiles}
+    reference_map = collect_profile_references(settings)
     profiles = []
     for profile in registry.list_profiles():
         slot_count = sum(
@@ -867,10 +934,15 @@ def serialize_profiles(settings: Settings) -> list[dict[str, Any]]:
             for slot in row
             if isinstance(slot, int)
         )
+        references = reference_map.get(profile.id, {})
+        is_custom = profile.id in custom_profile_ids
         profiles.append(
             {
                 **profile.model_dump(mode="json"),
                 "slot_count": slot_count,
+                "is_custom": is_custom,
+                "source": "custom" if is_custom else "built-in",
+                "reference_count": int(references.get("count", 0) or 0),
             }
         )
     return profiles

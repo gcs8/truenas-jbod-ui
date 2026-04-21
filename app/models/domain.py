@@ -338,6 +338,133 @@ class HistoryAdoptRequest(BaseModel):
     target_system_id: str
 
 
+class EnclosureProfileRequest(BaseModel):
+    source_profile_id: str | None = None
+    id: str | None = None
+    label: str
+    eyebrow: str | None = None
+    summary: str | None = None
+    panel_title: str | None = None
+    edge_label: str | None = None
+    face_style: str = "front-drive"
+    latch_edge: Literal["top", "bottom", "left", "right"] = "bottom"
+    bay_size: Literal["3.5", "2.5"] | None = None
+    rows: int = 1
+    columns: int = 1
+    slot_count: int | None = None
+    row_groups: list[int] = Field(default_factory=list)
+    slot_layout: list[list[int | None]] | None = None
+    slot_hints: dict[int, list[str]] = Field(default_factory=dict)
+
+    @field_validator(
+        "source_profile_id",
+        "id",
+        "label",
+        "eyebrow",
+        "summary",
+        "panel_title",
+        "edge_label",
+        "face_style",
+    )
+    @classmethod
+    def sanitize_text_fields(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=256)
+
+    @field_validator("rows", "columns")
+    @classmethod
+    def sanitize_dimensions(cls, value: int) -> int:
+        return max(1, min(int(value), 256))
+
+    @field_validator("slot_count")
+    @classmethod
+    def sanitize_slot_count(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        return max(1, min(int(value), 4096))
+
+    @field_validator("row_groups")
+    @classmethod
+    def sanitize_row_groups(cls, value: list[int]) -> list[int]:
+        return [int(group) for group in value if int(group) > 0]
+
+    @field_validator("slot_layout", mode="before")
+    @classmethod
+    def sanitize_slot_layout(cls, value: Any) -> list[list[int | None]] | None:
+        if value is None or value == "":
+            return None
+        if not isinstance(value, list):
+            raise ValueError("slot_layout must be a list of rows.")
+        normalized_rows: list[list[int | None]] = []
+        seen_slots: set[int] = set()
+        for row in value:
+            if not isinstance(row, list):
+                raise ValueError("slot_layout rows must be lists.")
+            normalized_row: list[int | None] = []
+            for raw_slot in row:
+                if raw_slot is None or raw_slot == "":
+                    normalized_row.append(None)
+                    continue
+                slot_number = int(raw_slot)
+                if slot_number < 0:
+                    raise ValueError("slot_layout values must be non-negative integers or null.")
+                if slot_number in seen_slots:
+                    raise ValueError("slot_layout slot numbers must be unique.")
+                seen_slots.add(slot_number)
+                normalized_row.append(slot_number)
+            normalized_rows.append(normalized_row)
+        return normalized_rows
+
+    @field_validator("slot_hints", mode="before")
+    @classmethod
+    def sanitize_slot_hints(cls, value: Any) -> dict[int, list[str]]:
+        if value is None or value == "":
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("slot_hints must be a mapping of slot numbers to hint lists.")
+        cleaned: dict[int, list[str]] = {}
+        for raw_key, raw_values in value.items():
+            slot_number = int(raw_key)
+            if slot_number < 0:
+                continue
+            if not isinstance(raw_values, list):
+                raise ValueError("slot_hints values must be lists.")
+            hints: list[str] = []
+            seen: set[str] = set()
+            for raw_hint in raw_values:
+                normalized = trim_optional_text(str(raw_hint) if raw_hint is not None else None, max_length=256)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    hints.append(normalized)
+            if hints:
+                cleaned[slot_number] = hints
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_profile_builder_request(self) -> "EnclosureProfileRequest":
+        if not self.label:
+            raise ValueError("A profile label is required.")
+        if self.slot_layout is not None:
+            if len(self.slot_layout) != self.rows:
+                raise ValueError("slot_layout row count must match rows.")
+            widest_row = max((len(row) for row in self.slot_layout), default=0)
+            if widest_row > self.columns:
+                raise ValueError("slot_layout rows cannot be wider than columns.")
+            if self.slot_count is not None:
+                layout_slot_count = sum(
+                    1
+                    for row in self.slot_layout
+                    for slot in row
+                    if isinstance(slot, int)
+                )
+                if layout_slot_count != self.slot_count:
+                    raise ValueError("slot_layout must contain exactly slot_count visible slots.")
+        if self.slot_count is not None and self.slot_layout is None and self.slot_count > (self.rows * self.columns):
+            raise ValueError("slot_count cannot exceed rows x columns for the rectangular builder.")
+        if self.row_groups and sum(self.row_groups) != self.columns:
+            raise ValueError("row_groups must add up to the column count.")
+        return self
+
+
 StorageViewKind = Literal["ses_enclosure", "nvme_carrier", "boot_devices", "manual"]
 StorageViewBindingMode = Literal["auto", "pool", "serial", "hybrid"]
 
@@ -498,6 +625,14 @@ class StorageViewRuntimeView(BaseModel):
     template_id: str
     profile_id: str | None = None
     profile_label: str | None = None
+    eyebrow: str | None = None
+    summary: str | None = None
+    panel_title: str | None = None
+    edge_label: str | None = None
+    face_style: str = "generic"
+    latch_edge: str = "bottom"
+    bay_size: str | None = None
+    row_groups: list[int] = Field(default_factory=list)
     enabled: bool = True
     render: StorageViewRenderRequest = Field(default_factory=StorageViewRenderRequest)
     binding: StorageViewBindingRequest = Field(default_factory=StorageViewBindingRequest)

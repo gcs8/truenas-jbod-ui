@@ -30,6 +30,11 @@
     liveEnclosuresLoading: false,
     liveEnclosuresSystemId: null,
     liveEnclosuresError: null,
+    currentAdminView:
+      new URLSearchParams(window.location.search).get("view") === "builder"
+        ? "builder"
+        : "operations",
+    loadedBuilderProfileId: "",
     selectedStorageViewId: "",
     selectedProfileId: "",
     selectedExistingSystemId:
@@ -58,6 +63,9 @@
     banner: document.getElementById("admin-status-banner"),
     refreshStateButton: document.getElementById("refresh-state-button"),
     adminOriginLink: document.getElementById("admin-origin-link"),
+    adminViewButtons: Array.from(document.querySelectorAll("[data-admin-view-button]")),
+    adminViewPanels: Array.from(document.querySelectorAll("[data-admin-view-panel]")),
+    adminViewSwitches: Array.from(document.querySelectorAll("[data-admin-view-switch]")),
     countdown: document.getElementById("admin-countdown"),
     startedAt: document.getElementById("admin-started-at"),
     expiresAt: document.getElementById("admin-expires-at"),
@@ -208,6 +216,32 @@
     profilePreviewMeta: document.getElementById("profile-preview-meta"),
     profileCatalogCount: document.getElementById("profile-catalog-count"),
     profileCatalog: document.getElementById("profile-catalog"),
+    profileBuilderBadge: document.getElementById("profile-builder-badge"),
+    profileBuilderLoadButton: document.getElementById("profile-builder-load-button"),
+    profileBuilderResetButton: document.getElementById("profile-builder-reset-button"),
+    profileBuilderSaveButton: document.getElementById("profile-builder-save-button"),
+    profileBuilderDeleteButton: document.getElementById("profile-builder-delete-button"),
+    profileBuilderId: document.getElementById("profile-builder-id"),
+    profileBuilderLabel: document.getElementById("profile-builder-label"),
+    profileBuilderEyebrow: document.getElementById("profile-builder-eyebrow"),
+    profileBuilderSummary: document.getElementById("profile-builder-summary"),
+    profileBuilderPanelTitle: document.getElementById("profile-builder-panel-title"),
+    profileBuilderEdgeLabel: document.getElementById("profile-builder-edge-label"),
+    profileBuilderFaceStyle: document.getElementById("profile-builder-face-style"),
+    profileBuilderLatchEdge: document.getElementById("profile-builder-latch-edge"),
+    profileBuilderBaySize: document.getElementById("profile-builder-bay-size"),
+    profileBuilderRows: document.getElementById("profile-builder-rows"),
+    profileBuilderColumns: document.getElementById("profile-builder-columns"),
+    profileBuilderSlotCount: document.getElementById("profile-builder-slot-count"),
+    profileBuilderOrdering: document.getElementById("profile-builder-ordering"),
+    profileBuilderRowGroups: document.getElementById("profile-builder-row-groups"),
+    profileBuilderLayoutEditor: document.getElementById("profile-builder-layout-editor"),
+    profileBuilderLayoutText: document.getElementById("profile-builder-layout-text"),
+    profileBuilderResult: document.getElementById("profile-builder-result"),
+    profileBuilderPreviewBadge: document.getElementById("profile-builder-preview-badge"),
+    profileBuilderPreviewSummary: document.getElementById("profile-builder-preview-summary"),
+    profileBuilderPreviewGrid: document.getElementById("profile-builder-preview-grid"),
+    profileBuilderPreviewMeta: document.getElementById("profile-builder-preview-meta"),
     setupSshKeyHelp: document.getElementById("setup-ssh-key-help"),
   };
 
@@ -385,9 +419,50 @@
     }
     if (elements.adminOriginLink) {
       const origin = String(state.admin.public_origin || "").trim();
-      elements.adminOriginLink.href = origin || window.location.href;
+      const originUrl = new URL(origin || window.location.href, window.location.href);
+      if (state.currentAdminView === "builder") {
+        originUrl.searchParams.set("view", "builder");
+      } else {
+        originUrl.searchParams.delete("view");
+      }
+      elements.adminOriginLink.href = originUrl.toString();
       elements.adminOriginLink.classList.toggle("hidden", !origin);
     }
+  }
+
+  function normalizeAdminView(value) {
+    return value === "builder" ? "builder" : "operations";
+  }
+
+  function renderAdminView() {
+    const activeView = normalizeAdminView(state.currentAdminView);
+    elements.adminViewPanels.forEach((panel) => {
+      const isActive = panel.dataset.adminViewPanel === activeView;
+      panel.classList.toggle("hidden", !isActive);
+      panel.classList.toggle("is-active", isActive);
+    });
+    elements.adminViewButtons.forEach((button) => {
+      const isActive = button.dataset.adminViewButton === activeView;
+      button.classList.toggle("is-active", isActive);
+      button.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
+  }
+
+  function setAdminView(view, { updateUrl = true } = {}) {
+    const nextView = normalizeAdminView(view);
+    const changed = state.currentAdminView !== nextView;
+    state.currentAdminView = nextView;
+    renderAdminView();
+    if (updateUrl) {
+      const nextUrl = new URL(window.location.href);
+      if (nextView === "builder") {
+        nextUrl.searchParams.set("view", "builder");
+      } else {
+        nextUrl.searchParams.delete("view");
+      }
+      window.history[changed ? "pushState" : "replaceState"]({}, "", nextUrl);
+    }
+    updateAdminMeta();
   }
 
   function renderBackupPaths() {
@@ -987,16 +1062,516 @@
     return state.profiles[0] || null;
   }
 
+  const BUILDER_ORDERING_LABELS = {
+    "source-layout": "Source Layout",
+    "row-major-bottom": "Bottom-Up By Rows",
+    "row-major-top": "Top-Down By Rows",
+    "column-major-bottom": "Bottom-Up By Columns",
+    "column-major-top": "Top-Down By Columns",
+    "custom-layout": "Custom Matrix",
+  };
+
+  function builderOrderingLabel(ordering) {
+    return BUILDER_ORDERING_LABELS[ordering] || BUILDER_ORDERING_LABELS["row-major-bottom"];
+  }
+
+  function layoutSlotCount(layout) {
+    return (Array.isArray(layout) ? layout : [])
+      .flat()
+      .filter((value) => Number.isInteger(value))
+      .length;
+  }
+
+  function buildRectangularProfileLayout(rows, columns, slotCount, ordering = "row-major-bottom") {
+    const safeRows = Math.max(1, Number(rows) || 1);
+    const safeColumns = Math.max(1, Number(columns) || 1);
+    const maxSlots = safeRows * safeColumns;
+    const safeSlotCount = Math.max(1, Math.min(Number(slotCount) || maxSlots, maxSlots));
+    const layout = Array.from({ length: safeRows }, () => []);
+    const rowIndices = String(ordering || "").endsWith("-top")
+      ? Array.from({ length: safeRows }, (_, index) => index)
+      : Array.from({ length: safeRows }, (_, index) => safeRows - 1 - index);
+    let nextSlot = 0;
+
+    if (String(ordering || "").startsWith("column-major")) {
+      for (let columnIndex = 0; columnIndex < safeColumns; columnIndex += 1) {
+        rowIndices.forEach((rowIndex) => {
+          if (nextSlot >= safeSlotCount) {
+            return;
+          }
+          layout[rowIndex].push(nextSlot);
+          nextSlot += 1;
+        });
+      }
+      return layout;
+    }
+
+    rowIndices.forEach((rowIndex) => {
+      for (let columnIndex = 0; columnIndex < safeColumns; columnIndex += 1) {
+        if (nextSlot >= safeSlotCount) {
+          return;
+        }
+        layout[rowIndex].push(nextSlot);
+        nextSlot += 1;
+      }
+    });
+    return layout;
+  }
+
+  function serializeProfileLayoutText(layout) {
+    const previewRows = Array.isArray(layout) ? layout : [];
+    const widestSlot = previewRows
+      .flat()
+      .filter((value) => Number.isInteger(value))
+      .reduce((widest, value) => Math.max(widest, String(value).length), 2);
+    return previewRows
+      .map((row) => (Array.isArray(row) ? row : [])
+        .map((slotValue) => {
+          if (slotValue === null || slotValue === undefined) {
+            return "--";
+          }
+          return String(slotValue).padStart(widestSlot, "0");
+        })
+        .join(" "))
+      .join("\n");
+  }
+
+  function parseProfileLayoutText(value, rows, columns, slotCount) {
+    const safeRows = Math.max(1, Number(rows) || 1);
+    const safeColumns = Math.max(1, Number(columns) || 1);
+    const safeSlotCount = Math.max(1, Number(slotCount) || 1);
+    const rawLines = String(value || "").split(/\r?\n/);
+    while (rawLines.length > 1 && !rawLines[rawLines.length - 1].trim()) {
+      rawLines.pop();
+    }
+
+    if (rawLines.length > safeRows) {
+      return { layout: null, error: `Custom matrix expects ${safeRows} row${safeRows === 1 ? "" : "s"}.` };
+    }
+    while (rawLines.length < safeRows) {
+      rawLines.push("");
+    }
+
+    const seenSlots = new Set();
+    let populatedSlots = 0;
+    const normalizedRows = [];
+    for (let rowIndex = 0; rowIndex < rawLines.length; rowIndex += 1) {
+      const trimmedLine = rawLines[rowIndex].trim();
+      const tokens = trimmedLine ? trimmedLine.split(/[,\s]+/) : [];
+      if (tokens.length > safeColumns) {
+        return {
+          layout: null,
+          error: `Row ${rowIndex + 1} cannot be wider than ${safeColumns} column${safeColumns === 1 ? "" : "s"}.`,
+        };
+      }
+      const normalizedRow = [];
+      for (const token of tokens) {
+        if (/^(--|-|gap|empty|x|\.)$/i.test(token)) {
+          normalizedRow.push(null);
+          continue;
+        }
+        if (!/^\d+$/.test(token)) {
+          return { layout: null, error: `Custom matrix token "${token}" is not a slot number or "--".` };
+        }
+        const slotNumber = Number.parseInt(token, 10);
+        if (seenSlots.has(slotNumber)) {
+          return { layout: null, error: `Custom matrix repeats slot ${slotNumber}.` };
+        }
+        seenSlots.add(slotNumber);
+        normalizedRow.push(slotNumber);
+        populatedSlots += 1;
+      }
+      normalizedRows.push(normalizedRow);
+    }
+
+    if (populatedSlots !== safeSlotCount) {
+      return {
+        layout: null,
+        error: `Custom matrix must contain exactly ${safeSlotCount} visible slot number${safeSlotCount === 1 ? "" : "s"}.`,
+      };
+    }
+    return { layout: normalizedRows, error: null };
+  }
+
+  function layoutsEqual(leftRows, rightRows) {
+    return JSON.stringify(leftRows || []) === JSON.stringify(rightRows || []);
+  }
+
+  function detectGeneratedLayoutOrdering(layout, rows, columns, slotCount) {
+    const generatedOrderings = [
+      "row-major-bottom",
+      "row-major-top",
+      "column-major-bottom",
+      "column-major-top",
+    ];
+    for (const ordering of generatedOrderings) {
+      if (layoutsEqual(layout, buildRectangularProfileLayout(rows, columns, slotCount, ordering))) {
+        return ordering;
+      }
+    }
+    return null;
+  }
+
   function buildProfileRows(profile) {
     if (Array.isArray(profile.slot_layout) && profile.slot_layout.length) {
       return profile.slot_layout;
     }
-    const rows = Math.max(1, Number(profile.rows) || 1);
-    const columns = Math.max(1, Number(profile.columns) || 1);
-    let slotNumber = 0;
-    return Array.from({ length: rows }, () =>
-      Array.from({ length: columns }, () => slotNumber++)
+    const slotCount = Number(profile.slot_count) || (Number(profile.rows) || 1) * (Number(profile.columns) || 1);
+    return buildRectangularProfileLayout(profile.rows, profile.columns, slotCount, "row-major-bottom");
+  }
+
+  function renderProfilePreviewCells(previewRows, columnCount) {
+    return previewRows
+      .flatMap((row) => {
+        const paddedRow = Array.isArray(row) ? row.slice() : [];
+        while (paddedRow.length < columnCount) {
+          paddedRow.push(null);
+        }
+        return paddedRow;
+      })
+      .map((slotValue) => {
+        if (slotValue === null || slotValue === undefined) {
+          return '<div class="profile-preview-cell is-gap">Gap</div>';
+        }
+        return `<div class="profile-preview-cell">${escapeHtml(String(slotValue).padStart(2, "0"))}</div>`;
+      })
+      .join("");
+  }
+
+  function parseRowGroupsText(value) {
+    return String(value || "")
+      .split(/[,\s]+/)
+      .map((item) => Number.parseInt(item, 10))
+      .filter((item) => !Number.isNaN(item) && item > 0);
+  }
+
+  function profileRowGroupsText(profile) {
+    return Array.isArray(profile?.row_groups) ? profile.row_groups.filter(Boolean).join(",") : "";
+  }
+
+  function currentBuilderOrdering(sourceProfile, rows, columns, slotCount, { allowFallback = false } = {}) {
+    const rawOrdering = elements.profileBuilderOrdering?.value || "";
+    if (rawOrdering) {
+      return rawOrdering;
+    }
+    if (!allowFallback) {
+      return "source-layout";
+    }
+    const sourceLayout = sourceProfile ? buildProfileRows(sourceProfile) : [];
+    const detected = detectGeneratedLayoutOrdering(sourceLayout, rows, columns, slotCount);
+    return detected || "source-layout";
+  }
+
+  function resolveBuilderDraftLayout(draft, sourceProfile) {
+    const sourceLayout = sourceProfile ? buildProfileRows(sourceProfile) : [];
+    const ordering = String(draft?.ordering_preset || "source-layout");
+    const usesSourceLayout = ordering === "source-layout" && builderDraftUsesSourceLayout(draft, sourceProfile);
+
+    if (ordering === "custom-layout") {
+      const parsed = parseProfileLayoutText(draft.layout_text, draft.rows, draft.columns, draft.slot_count);
+      if (parsed.error) {
+        return {
+          previewRows: [],
+          slotLayoutForSave: null,
+          badge: "Custom Matrix",
+          summary: parsed.error,
+          error: parsed.error,
+          orderingLabel: builderOrderingLabel(ordering),
+        };
+      }
+      return {
+        previewRows: parsed.layout,
+        slotLayoutForSave: parsed.layout,
+        badge: "Custom Matrix",
+        summary: `Using the custom slot matrix for a ${draft.rows} x ${draft.columns} layout with ${draft.slot_count} visible bays.`,
+        error: null,
+        orderingLabel: builderOrderingLabel(ordering),
+      };
+    }
+
+    if (usesSourceLayout) {
+      return {
+        previewRows: sourceLayout,
+        slotLayoutForSave: null,
+        badge: "Source Layout",
+        summary: `Preserving the selected source profile geometry from ${sourceProfile.label}. Change rows, columns, or visible bays to generate a new layout order.`,
+        error: null,
+        orderingLabel: builderOrderingLabel(ordering),
+      };
+    }
+
+    const effectiveOrdering = ordering === "source-layout" ? "row-major-bottom" : ordering;
+    const generatedRows = buildRectangularProfileLayout(draft.rows, draft.columns, draft.slot_count, effectiveOrdering);
+    const orderingLabel = builderOrderingLabel(effectiveOrdering);
+    const summary = ordering === "source-layout"
+      ? `Geometry no longer matches ${sourceProfile?.label || "the selected source profile"}, so the builder is previewing the default bottom-up row order. Pick another ordering or switch to Custom Matrix if you want a different draft.`
+      : `Generating a ${orderingLabel.toLowerCase()} ${draft.rows} x ${draft.columns} profile with ${draft.slot_count} visible bays.`;
+    return {
+      previewRows: generatedRows,
+      slotLayoutForSave: generatedRows,
+      badge: ordering === "source-layout" ? "Rectangular Draft" : orderingLabel,
+      summary,
+      error: null,
+      orderingLabel,
+    };
+  }
+
+  function suggestedCustomProfileId(profile) {
+    const base = profile?.is_custom
+      ? slugify(profile.id || profile.label || "custom-profile", "custom-profile")
+      : slugify(`custom-${profile?.id || profile?.label || "profile"}`, "custom-profile");
+    let candidate = base;
+    let suffix = 2;
+    const reserved = new Set(state.profiles.map((item) => item.id).filter(Boolean));
+    if (profile?.is_custom) {
+      reserved.delete(profile.id);
+    }
+    while (reserved.has(candidate)) {
+      candidate = `${base}-${suffix}`;
+      suffix += 1;
+    }
+    return candidate;
+  }
+
+  function currentBuilderSourceProfile() {
+    const current = previewProfile();
+    return current || state.profiles[0] || null;
+  }
+
+  function readProfileBuilderDraft({ allowFallback = false } = {}) {
+    const sourceProfile = currentBuilderSourceProfile();
+    const rawLabel = elements.profileBuilderLabel?.value?.trim() || "";
+    const rawRows = Number(elements.profileBuilderRows?.value) || 0;
+    const rawColumns = Number(elements.profileBuilderColumns?.value) || 0;
+    const rawSlotCount = Number(elements.profileBuilderSlotCount?.value) || 0;
+    const resolvedRows = Math.max(1, rawRows || Number(sourceProfile?.rows) || 1);
+    const resolvedColumns = Math.max(1, rawColumns || Number(sourceProfile?.columns) || 1);
+    const resolvedSlotCount = Math.max(
+      1,
+      rawSlotCount || Number(sourceProfile?.slot_count) || (Number(sourceProfile?.rows) || 1) * (Number(sourceProfile?.columns) || 1)
     );
+    if (
+      !allowFallback
+      && !rawLabel
+      && !rawRows
+      && !rawColumns
+      && !rawSlotCount
+      && !elements.profileBuilderId?.value?.trim()
+    ) {
+      return null;
+    }
+
+    const fallbackLayoutText = allowFallback && sourceProfile
+      ? serializeProfileLayoutText(buildProfileRows(sourceProfile))
+      : "";
+
+    const draft = {
+      source_profile_id: sourceProfile?.id || null,
+      id: elements.profileBuilderId?.value?.trim() || (allowFallback ? suggestedCustomProfileId(sourceProfile) : ""),
+      label: rawLabel || (allowFallback ? (sourceProfile?.label || "Custom Profile") : ""),
+      eyebrow: elements.profileBuilderEyebrow?.value?.trim() || (allowFallback ? (sourceProfile?.eyebrow || "") : ""),
+      summary: elements.profileBuilderSummary?.value?.trim() || (allowFallback ? (sourceProfile?.summary || "") : ""),
+      panel_title: elements.profileBuilderPanelTitle?.value?.trim() || (allowFallback ? (sourceProfile?.panel_title || "") : ""),
+      edge_label: elements.profileBuilderEdgeLabel?.value?.trim() || (allowFallback ? (sourceProfile?.edge_label || "") : ""),
+      face_style: elements.profileBuilderFaceStyle?.value || (allowFallback ? (sourceProfile?.face_style || "front-drive") : "front-drive"),
+      latch_edge: elements.profileBuilderLatchEdge?.value || (allowFallback ? (sourceProfile?.latch_edge || "bottom") : "bottom"),
+      bay_size: elements.profileBuilderBaySize?.value || (allowFallback ? (sourceProfile?.bay_size || null) : null),
+      rows: resolvedRows,
+      columns: resolvedColumns,
+      slot_count: resolvedSlotCount,
+      ordering_preset: currentBuilderOrdering(sourceProfile, resolvedRows, resolvedColumns, resolvedSlotCount, { allowFallback }),
+      layout_text: elements.profileBuilderLayoutText?.value || fallbackLayoutText,
+      row_groups: parseRowGroupsText(elements.profileBuilderRowGroups?.value || (allowFallback ? profileRowGroupsText(sourceProfile) : "")),
+    };
+    return draft;
+  }
+
+  function builderDraftUsesSourceLayout(draft, sourceProfile) {
+    if (!draft || !sourceProfile) {
+      return false;
+    }
+    const sourceSlotCount = Number(sourceProfile.slot_count) || buildProfileRows(sourceProfile).flat().filter((value) => Number.isInteger(value)).length;
+    return Number(draft.rows) === Number(sourceProfile.rows)
+      && Number(draft.columns) === Number(sourceProfile.columns)
+      && Number(draft.slot_count) === Number(sourceSlotCount);
+  }
+
+  function resetProfileBuilder({ keepResult = false } = {}) {
+    state.loadedBuilderProfileId = "";
+    if (elements.profileBuilderId) {
+      elements.profileBuilderId.value = "";
+    }
+    if (elements.profileBuilderLabel) {
+      elements.profileBuilderLabel.value = "";
+    }
+    if (elements.profileBuilderEyebrow) {
+      elements.profileBuilderEyebrow.value = "";
+    }
+    if (elements.profileBuilderSummary) {
+      elements.profileBuilderSummary.value = "";
+    }
+    if (elements.profileBuilderPanelTitle) {
+      elements.profileBuilderPanelTitle.value = "";
+    }
+    if (elements.profileBuilderEdgeLabel) {
+      elements.profileBuilderEdgeLabel.value = "";
+    }
+    if (elements.profileBuilderFaceStyle) {
+      elements.profileBuilderFaceStyle.value = "front-drive";
+    }
+    if (elements.profileBuilderLatchEdge) {
+      elements.profileBuilderLatchEdge.value = "bottom";
+    }
+    if (elements.profileBuilderBaySize) {
+      elements.profileBuilderBaySize.value = "";
+    }
+    if (elements.profileBuilderRows) {
+      elements.profileBuilderRows.value = "1";
+    }
+    if (elements.profileBuilderColumns) {
+      elements.profileBuilderColumns.value = "1";
+    }
+    if (elements.profileBuilderSlotCount) {
+      elements.profileBuilderSlotCount.value = "1";
+    }
+    if (elements.profileBuilderOrdering) {
+      elements.profileBuilderOrdering.value = "source-layout";
+    }
+    if (elements.profileBuilderRowGroups) {
+      elements.profileBuilderRowGroups.value = "";
+    }
+    if (elements.profileBuilderLayoutText) {
+      elements.profileBuilderLayoutText.value = "";
+    }
+    if (elements.profileBuilderResult && !keepResult) {
+      elements.profileBuilderResult.textContent = "Load a profile from the catalog above, tune this first-pass builder form, then save it as a reusable custom profile.";
+    }
+    renderProfileBuilder();
+  }
+
+  function loadProfileIntoBuilder(profile = currentBuilderSourceProfile()) {
+    if (!profile) {
+      setBanner("Choose a profile first so the builder has a source to clone.", "error");
+      return;
+    }
+    state.loadedBuilderProfileId = profile.is_custom ? profile.id : "";
+    if (elements.profileBuilderId) {
+      elements.profileBuilderId.value = profile.is_custom ? profile.id : suggestedCustomProfileId(profile);
+    }
+    if (elements.profileBuilderLabel) {
+      elements.profileBuilderLabel.value = profile.label || "";
+    }
+    if (elements.profileBuilderEyebrow) {
+      elements.profileBuilderEyebrow.value = profile.eyebrow || "";
+    }
+    if (elements.profileBuilderSummary) {
+      elements.profileBuilderSummary.value = profile.summary || "";
+    }
+    if (elements.profileBuilderPanelTitle) {
+      elements.profileBuilderPanelTitle.value = profile.panel_title || "";
+    }
+    if (elements.profileBuilderEdgeLabel) {
+      elements.profileBuilderEdgeLabel.value = profile.edge_label || "";
+    }
+    if (elements.profileBuilderFaceStyle) {
+      elements.profileBuilderFaceStyle.value = profile.face_style || "front-drive";
+    }
+    if (elements.profileBuilderLatchEdge) {
+      elements.profileBuilderLatchEdge.value = profile.latch_edge || "bottom";
+    }
+    if (elements.profileBuilderBaySize) {
+      elements.profileBuilderBaySize.value = profile.bay_size || "";
+    }
+    if (elements.profileBuilderRows) {
+      elements.profileBuilderRows.value = String(Number(profile.rows) || 1);
+    }
+    if (elements.profileBuilderColumns) {
+      elements.profileBuilderColumns.value = String(Number(profile.columns) || 1);
+    }
+    if (elements.profileBuilderSlotCount) {
+      const slotCount = Number(profile.slot_count) || layoutSlotCount(buildProfileRows(profile));
+      elements.profileBuilderSlotCount.value = String(slotCount || 1);
+    }
+    const profileRows = buildProfileRows(profile);
+    const profileSlotCount = Number(profile.slot_count) || layoutSlotCount(profileRows);
+    const detectedOrdering = detectGeneratedLayoutOrdering(profileRows, Number(profile.rows) || 1, Number(profile.columns) || 1, profileSlotCount);
+    if (elements.profileBuilderOrdering) {
+      elements.profileBuilderOrdering.value = detectedOrdering || "source-layout";
+    }
+    if (elements.profileBuilderRowGroups) {
+      elements.profileBuilderRowGroups.value = profileRowGroupsText(profile);
+    }
+    if (elements.profileBuilderLayoutText) {
+      elements.profileBuilderLayoutText.value = serializeProfileLayoutText(profileRows);
+    }
+    if (elements.profileBuilderResult) {
+      elements.profileBuilderResult.textContent = profile.is_custom
+        ? `Loaded custom profile ${profile.label || profile.id}. Save with the same id to update it in place, or change the id to create a copy.`
+        : `Loaded built-in profile ${profile.label || profile.id}. Save this draft with a new custom profile id to reuse it across systems.`;
+    }
+    renderProfileBuilder();
+  }
+
+  function renderProfileBuilder() {
+    if (
+      !elements.profileBuilderPreviewSummary
+      || !elements.profileBuilderPreviewGrid
+      || !elements.profileBuilderPreviewMeta
+      || !elements.profileBuilderPreviewBadge
+      || !elements.profileBuilderDeleteButton
+      || !elements.profileBuilderBadge
+      || !elements.profileBuilderOrdering
+      || !elements.profileBuilderLayoutEditor
+    ) {
+      return;
+    }
+
+    const sourceProfile = currentBuilderSourceProfile();
+    const draft = readProfileBuilderDraft({ allowFallback: true });
+    if (!draft || !sourceProfile) {
+      elements.profileBuilderBadge.textContent = "Preset / Lego";
+      elements.profileBuilderPreviewBadge.textContent = "Draft";
+      elements.profileBuilderPreviewSummary.textContent = "Load a source profile above to preview the custom geometry that will be saved.";
+      elements.profileBuilderPreviewGrid.innerHTML = "";
+      elements.profileBuilderPreviewMeta.innerHTML = "";
+      elements.profileBuilderDeleteButton.disabled = true;
+      elements.profileBuilderOrdering.dataset.previousValue = "source-layout";
+      elements.profileBuilderLayoutEditor.classList.add("hidden");
+      return;
+    }
+
+    const layoutResolution = resolveBuilderDraftLayout(draft, sourceProfile);
+    const previewRows = Array.isArray(layoutResolution.previewRows) ? layoutResolution.previewRows : [];
+    const columnCount = previewRows.length
+      ? Math.max(1, ...previewRows.map((row) => (Array.isArray(row) ? row.length : 0)))
+      : Math.max(1, Number(draft.columns) || 1);
+    elements.profileBuilderBadge.textContent = state.loadedBuilderProfileId ? "Editing Custom" : "Clone To Custom";
+    elements.profileBuilderPreviewBadge.textContent = layoutResolution.badge;
+    elements.profileBuilderPreviewSummary.textContent = layoutResolution.summary;
+    elements.profileBuilderPreviewGrid.style.gridTemplateColumns = `repeat(${columnCount}, minmax(0, 1fr))`;
+    elements.profileBuilderPreviewGrid.innerHTML = renderProfilePreviewCells(previewRows, columnCount);
+    elements.profileBuilderOrdering.dataset.previousValue = draft.ordering_preset;
+    elements.profileBuilderLayoutEditor.classList.toggle("hidden", draft.ordering_preset !== "custom-layout");
+    const chips = [
+      `${draft.rows} rows`,
+      `${draft.columns} columns`,
+      `${draft.slot_count} visible bays`,
+      layoutResolution.orderingLabel ? `order: ${layoutResolution.orderingLabel}` : null,
+      draft.bay_size ? `${draft.bay_size}" media` : null,
+      draft.face_style || null,
+      draft.latch_edge ? `latch: ${draft.latch_edge}` : null,
+      draft.row_groups.length ? `groups: ${draft.row_groups.join("-")}` : null,
+      layoutResolution.error ? "fix custom matrix before save" : null,
+      sourceProfile?.source ? `source: ${sourceProfile.source}` : null,
+      Number(sourceProfile?.reference_count || 0) > 0 ? `${sourceProfile.reference_count} refs` : null,
+    ].filter(Boolean);
+    elements.profileBuilderPreviewMeta.innerHTML = chips
+      .map((item) => `<span class="meta-chip">${escapeHtml(item)}</span>`)
+      .join("");
+    const loadedProfile = state.loadedBuilderProfileId
+      ? getProfileById(state.loadedBuilderProfileId)
+      : null;
+    elements.profileBuilderDeleteButton.disabled = !(loadedProfile && loadedProfile.is_custom);
   }
 
   function renderProfilePreview() {
@@ -1021,15 +1596,7 @@
     elements.profilePreviewSummary.textContent = profile.summary
       || "Profile preview for the currently selected enclosure layout.";
     elements.profilePreviewGrid.style.gridTemplateColumns = `repeat(${columnCount}, minmax(0, 1fr))`;
-    elements.profilePreviewGrid.innerHTML = previewRows
-      .flat()
-      .map((slotValue) => {
-        if (slotValue === null || slotValue === undefined) {
-          return '<div class="profile-preview-cell is-gap">Gap</div>';
-        }
-        return `<div class="profile-preview-cell">${escapeHtml(String(slotValue).padStart(2, "0"))}</div>`;
-      })
-      .join("");
+    elements.profilePreviewGrid.innerHTML = renderProfilePreviewCells(previewRows, columnCount);
     const slotCount = Number(profile.slot_count) || previewRows.flat().filter((value) => Number.isInteger(value)).length;
     const chips = [
       `${profile.rows} rows`,
@@ -1037,6 +1604,8 @@
       `${slotCount} visible bays`,
       profile.bay_size ? `${profile.bay_size}" media` : null,
       profile.face_style ? profile.face_style : null,
+      profile.source ? profile.source : null,
+      Number(profile.reference_count || 0) > 0 ? `${profile.reference_count} refs` : null,
     ].filter(Boolean);
     elements.profilePreviewMeta.innerHTML = chips
       .map((item) => `<span class="meta-chip">${escapeHtml(item)}</span>`)
@@ -1059,6 +1628,8 @@
           `${profile.rows}x${profile.columns}`,
           `${profile.slot_count || 0} bays`,
           profile.bay_size ? `${profile.bay_size}"` : null,
+          profile.source || null,
+          Number(profile.reference_count || 0) > 0 ? `${profile.reference_count} refs` : null,
         ].filter(Boolean);
         return `
           <article class="${classes.join(" ")}" data-profile-id="${escapeHtml(profile.id)}">
@@ -3895,8 +4466,141 @@
     }
   }
 
+  async function saveCustomProfile() {
+    const sourceProfile = currentBuilderSourceProfile();
+    const draft = readProfileBuilderDraft();
+    if (!sourceProfile) {
+      setBanner("Choose a source profile first so the builder has something to clone.", "error");
+      return;
+    }
+    if (!draft?.label || !draft?.id) {
+      setBanner("Enter both a custom profile label and id before saving.", "error");
+      return;
+    }
+    if (Number(draft.slot_count) > Number(draft.rows) * Number(draft.columns)) {
+      setBanner("Visible bay count cannot exceed rows x columns in the first-pass rectangular builder.", "error");
+      return;
+    }
+    const layoutResolution = resolveBuilderDraftLayout(draft, sourceProfile);
+    if (layoutResolution.error) {
+      setBanner(`Builder layout needs fixes before save: ${layoutResolution.error}`, "error");
+      if (elements.profileBuilderResult) {
+        elements.profileBuilderResult.textContent = `Builder layout needs fixes before save: ${layoutResolution.error}`;
+      }
+      return;
+    }
+
+    const payloadBody = {
+      source_profile_id: draft.source_profile_id,
+      id: draft.id,
+      label: draft.label,
+      eyebrow: draft.eyebrow,
+      summary: draft.summary,
+      panel_title: draft.panel_title,
+      edge_label: draft.edge_label,
+      face_style: draft.face_style,
+      latch_edge: draft.latch_edge,
+      bay_size: draft.bay_size,
+      rows: draft.rows,
+      columns: draft.columns,
+      slot_count: draft.slot_count,
+      row_groups: draft.row_groups,
+      slot_layout: layoutResolution.slotLayoutForSave,
+    };
+
+    if (elements.profileBuilderSaveButton) {
+      elements.profileBuilderSaveButton.disabled = true;
+    }
+    if (elements.profileBuilderResult) {
+      elements.profileBuilderResult.textContent = `Saving custom profile ${draft.label}...`;
+    }
+
+    try {
+      const payload = await fetchJson("/api/admin/profiles", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payloadBody),
+      });
+      const savedProfileId = payload.profile?.id || draft.id;
+      state.loadedBuilderProfileId = savedProfileId;
+      state.selectedProfileId = savedProfileId;
+      if (elements.setupProfile) {
+        elements.setupProfile.value = savedProfileId;
+      }
+      await refreshState({ quiet: true });
+      const refreshedProfile = getProfileById(savedProfileId);
+      if (refreshedProfile) {
+        loadProfileIntoBuilder(refreshedProfile);
+      } else {
+        renderProfileBuilder();
+      }
+      if (elements.profileBuilderResult) {
+        elements.profileBuilderResult.textContent = payload.detail || `Saved custom profile ${savedProfileId}.`;
+      }
+      setBanner(
+        payload.updated_existing
+          ? `Updated custom profile ${payload.profile?.label || savedProfileId}.`
+          : `Saved custom profile ${payload.profile?.label || savedProfileId}.`,
+        "success"
+      );
+    } catch (error) {
+      if (elements.profileBuilderResult) {
+        elements.profileBuilderResult.textContent = `Custom profile save failed: ${error.message || error}`;
+      }
+      setBanner(`Custom profile save failed: ${error.message || error}`, "error");
+    } finally {
+      if (elements.profileBuilderSaveButton) {
+        elements.profileBuilderSaveButton.disabled = false;
+      }
+    }
+  }
+
+  async function deleteCustomProfile() {
+    const profileId = state.loadedBuilderProfileId || elements.profileBuilderId?.value?.trim() || "";
+    const profile = getProfileById(profileId);
+    if (!profile || !profile.is_custom) {
+      setBanner("Load a saved custom profile into the builder first if you want to delete it.", "error");
+      return;
+    }
+
+    const confirmation = window.confirm(
+      `Delete custom profile ${profile.label || profile.id}?\n\nThis removes it from profiles.yaml. Any saved systems or storage views still using it will block deletion until they are moved to another profile.`
+    );
+    if (!confirmation) {
+      return;
+    }
+
+    if (elements.profileBuilderDeleteButton) {
+      elements.profileBuilderDeleteButton.disabled = true;
+    }
+    if (elements.profileBuilderResult) {
+      elements.profileBuilderResult.textContent = `Deleting custom profile ${profile.label || profile.id}...`;
+    }
+
+    try {
+      const payload = await fetchJson(`/api/admin/profiles/${encodeURIComponent(profile.id)}`, {
+        method: "DELETE",
+      });
+      state.loadedBuilderProfileId = "";
+      await refreshState({ quiet: true });
+      resetProfileBuilder({ keepResult: true });
+      if (elements.profileBuilderResult) {
+        elements.profileBuilderResult.textContent = payload.detail || `Deleted custom profile ${profile.label || profile.id}.`;
+      }
+      setBanner(`Deleted custom profile ${profile.label || profile.id}.`, "success");
+    } catch (error) {
+      if (elements.profileBuilderResult) {
+        elements.profileBuilderResult.textContent = `Custom profile delete failed: ${error.message || error}`;
+      }
+      setBanner(`Custom profile delete failed: ${error.message || error}`, "error");
+    } finally {
+      renderProfileBuilder();
+    }
+  }
+
   function renderAll() {
     updateAdminMeta();
+    renderAdminView();
     renderBackupPaths();
     renderHistoryMaintenance();
     renderRuntimeCards();
@@ -3904,6 +4608,7 @@
     renderProfileOptions();
     renderProfilePreview();
     renderProfileCatalog();
+    renderProfileBuilder();
     renderQuantastorHaSection();
     renderStorageViews();
     syncPlatformHelp();
@@ -3919,6 +4624,19 @@
   }
 
   function bindEvents() {
+    elements.adminViewButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        setAdminView(button.dataset.adminViewButton || "operations");
+      });
+    });
+    elements.adminViewSwitches.forEach((button) => {
+      button.addEventListener("click", () => {
+        setAdminView(button.dataset.adminViewSwitch || "operations");
+      });
+    });
+    window.addEventListener("popstate", () => {
+      setAdminView(new URLSearchParams(window.location.search).get("view"), { updateUrl: false });
+    });
     elements.refreshStateButton?.addEventListener("click", () => {
       void refreshState();
     });
@@ -4022,6 +4740,7 @@
       state.selectedProfileId = elements.setupProfile?.value || "";
       renderProfilePreview();
       renderProfileCatalog();
+      renderProfileBuilder();
       renderStorageViews();
     });
     elements.setupHaEnabled?.addEventListener("change", () => {
@@ -4047,7 +4766,63 @@
       elements.setupProfile.value = state.selectedProfileId;
       renderProfilePreview();
       renderProfileCatalog();
+      renderProfileBuilder();
       renderStorageViews();
+    });
+    elements.profileBuilderLoadButton?.addEventListener("click", () => {
+      loadProfileIntoBuilder();
+    });
+    elements.profileBuilderResetButton?.addEventListener("click", () => {
+      resetProfileBuilder();
+    });
+    elements.profileBuilderSaveButton?.addEventListener("click", () => {
+      void saveCustomProfile();
+    });
+    elements.profileBuilderDeleteButton?.addEventListener("click", () => {
+      void deleteCustomProfile();
+    });
+    [
+      elements.profileBuilderId,
+      elements.profileBuilderLabel,
+      elements.profileBuilderEyebrow,
+      elements.profileBuilderSummary,
+      elements.profileBuilderPanelTitle,
+      elements.profileBuilderEdgeLabel,
+      elements.profileBuilderFaceStyle,
+      elements.profileBuilderLatchEdge,
+      elements.profileBuilderBaySize,
+      elements.profileBuilderRows,
+      elements.profileBuilderColumns,
+      elements.profileBuilderSlotCount,
+      elements.profileBuilderRowGroups,
+      elements.profileBuilderLayoutText,
+    ].forEach((field) => {
+      if (!field) {
+        return;
+      }
+      const eventName = field.matches("select") ? "change" : "input";
+      field.addEventListener(eventName, () => {
+        renderProfileBuilder();
+      });
+    });
+    elements.profileBuilderOrdering?.addEventListener("change", () => {
+      if (!elements.profileBuilderOrdering || !elements.profileBuilderLayoutText) {
+        renderProfileBuilder();
+        return;
+      }
+      if (elements.profileBuilderOrdering.value === "custom-layout" && !elements.profileBuilderLayoutText.value.trim()) {
+        const sourceProfile = currentBuilderSourceProfile();
+        const previousDraft = readProfileBuilderDraft({ allowFallback: true });
+        if (previousDraft) {
+          previousDraft.ordering_preset = elements.profileBuilderOrdering.dataset.previousValue || "source-layout";
+          const layoutResolution = resolveBuilderDraftLayout(previousDraft, sourceProfile);
+          const fallbackRows = sourceProfile ? buildProfileRows(sourceProfile) : buildRectangularProfileLayout(1, 1, 1, "row-major-bottom");
+          elements.profileBuilderLayoutText.value = serializeProfileLayoutText(
+            layoutResolution.previewRows?.length ? layoutResolution.previewRows : fallbackRows
+          );
+        }
+      }
+      renderProfileBuilder();
     });
     elements.setupStorageViewAddButton?.addEventListener("click", () => {
       addStorageView(elements.setupStorageViewTemplate?.value || state.storageViewTemplates[0]?.id || "");
@@ -4253,6 +5028,27 @@
   }
   if (elements.setupBootstrapEnabled) {
     elements.setupBootstrapEnabled.checked = false;
+  }
+  if (elements.profileBuilderFaceStyle) {
+    elements.profileBuilderFaceStyle.value = "front-drive";
+  }
+  if (elements.profileBuilderLatchEdge) {
+    elements.profileBuilderLatchEdge.value = "bottom";
+  }
+  if (elements.profileBuilderRows) {
+    elements.profileBuilderRows.value = "1";
+  }
+  if (elements.profileBuilderColumns) {
+    elements.profileBuilderColumns.value = "1";
+  }
+  if (elements.profileBuilderSlotCount) {
+    elements.profileBuilderSlotCount.value = "1";
+  }
+  if (elements.profileBuilderOrdering) {
+    elements.profileBuilderOrdering.value = "source-layout";
+  }
+  if (elements.profileBuilderLayoutText) {
+    elements.profileBuilderLayoutText.value = "";
   }
 
   bindEvents();

@@ -24,12 +24,19 @@ def configure_logging(settings: Settings) -> None:
     root.addHandler(stream_handler)
 
     log_file = Path(settings.paths.log_file)
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = RotatingFileHandler(log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    root.addHandler(file_handler)
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "File logging disabled for %s because the log file could not be opened: %s",
+            log_file,
+            exc,
+        )
+    else:
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
 
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("paramiko").setLevel(logging.WARNING)
     configure_logging._configured = True
-

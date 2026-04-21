@@ -5,7 +5,7 @@ deleted, renamed, or rebuilt under a new `system_id`.
 
 The admin maintenance area now exposes the safe paths directly:
 
-![Admin maintenance bundle and history tools](images/admin-maintenance-v0.11.0.png)
+![Admin maintenance bundle and history tools](images/admin-maintenance-v0.12.0.png)
 
 ## Export First If The History Matters
 

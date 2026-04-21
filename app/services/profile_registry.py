@@ -346,6 +346,10 @@ def _profile_to_view(profile: EnclosureProfileConfig) -> EnclosureProfileView:
     )
 
 
+def built_in_profile_ids() -> set[str]:
+    return {profile.id for profile in _built_in_profiles()}
+
+
 class ProfileRegistry:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
