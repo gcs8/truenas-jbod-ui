@@ -2,21 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import timedelta
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
 
 from app.config import HistoryConfig
-
-
-METRIC_LIMITS: dict[str, int] = {
-    "temperature_c": 96,
-    "bytes_read": 60,
-    "bytes_written": 60,
-    "annualized_bytes_written": 60,
-    "power_on_hours": 60,
-}
+from app.models.domain import utcnow
 
 
 class HistoryBackendClient:
@@ -64,6 +57,7 @@ class HistoryBackendClient:
         slot: int,
         system_id: str | None,
         enclosure_id: str | None,
+        window_hours: int | None = None,
     ) -> dict[str, Any]:
         if not self.configured:
             return {
@@ -83,24 +77,13 @@ class HistoryBackendClient:
             "system_id": system_id,
             "enclosure_id": enclosure_id,
         }
-        metric_names = tuple(METRIC_LIMITS.keys())
+        since = self._build_since_isoformat(window_hours)
+        if since:
+            params["since"] = since
         try:
-            events_payload, *metric_payloads = await asyncio.gather(
-                self._fetch_json(
-                    f"/api/history/slots/{slot}/events",
-                    params={**params, "limit": 12},
-                ),
-                *[
-                    self._fetch_json(
-                        f"/api/history/slots/{slot}/metrics",
-                        params={
-                            **params,
-                            "metric_name": metric_name,
-                            "limit": limit,
-                        },
-                    )
-                    for metric_name, limit in METRIC_LIMITS.items()
-                ],
+            payload = await self._fetch_json(
+                f"/api/history/slots/{slot}/bundle",
+                params={**params, "event_limit": 12},
             )
         except Exception as exc:  # noqa: BLE001 - optional backend should degrade gracefully.
             return {
@@ -116,16 +99,6 @@ class HistoryBackendClient:
                 "latest_values": {},
             }
 
-        metrics = {
-            metric_name: payload.get("samples", [])
-            for metric_name, payload in zip(metric_names, metric_payloads, strict=False)
-        }
-        latest_values = {}
-        sample_counts = {}
-        for metric_name, samples in metrics.items():
-            latest_values[metric_name] = samples[0].get("value") if samples else None
-            sample_counts[metric_name] = len(samples)
-
         return {
             "configured": True,
             "available": True,
@@ -133,10 +106,11 @@ class HistoryBackendClient:
             "slot": slot,
             "system_id": system_id,
             "enclosure_id": enclosure_id,
-            "metrics": metrics,
-            "events": events_payload.get("events", []),
-            "sample_counts": sample_counts,
-            "latest_values": latest_values,
+            "metrics": payload.get("metrics", {}),
+            "events": payload.get("events", []),
+            "sample_counts": payload.get("sample_counts", {}),
+            "latest_values": payload.get("latest_values", {}),
+            "disk_history": payload.get("disk_history", {}),
         }
 
     async def get_scope_history(
@@ -200,6 +174,7 @@ class HistoryBackendClient:
                     "events": history.get("events", []),
                     "sample_counts": history.get("sample_counts", {}),
                     "latest_values": history.get("latest_values", {}),
+                    "disk_history": history.get("disk_history", {}),
                 }
             else:
                 normalized[slot] = {
@@ -213,6 +188,7 @@ class HistoryBackendClient:
                     "events": [],
                     "sample_counts": {},
                     "latest_values": {},
+                    "disk_history": {},
                 }
         return normalized
 
@@ -233,6 +209,7 @@ class HistoryBackendClient:
             "events": [],
             "sample_counts": {},
             "latest_values": {},
+            "disk_history": {},
         }
 
     async def _fetch_json(
@@ -242,6 +219,12 @@ class HistoryBackendClient:
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(self._fetch_json_sync, path, params or {})
+
+    @staticmethod
+    def _build_since_isoformat(window_hours: int | None) -> str | None:
+        if not isinstance(window_hours, int) or window_hours < 1:
+            return None
+        return (utcnow() - timedelta(hours=window_hours)).isoformat()
 
     def _fetch_json_sync(
         self,

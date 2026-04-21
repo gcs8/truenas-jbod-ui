@@ -23,6 +23,8 @@ SCREENSHOT_TAG = os.environ.get("SCREENSHOT_TAG", f"v{__version__}")
 ARCHIVE_CORE_SYSTEM_ID = "archive-core"
 ARCHIVE_CORE_FRONT_24 = "50030480090c4f7f"
 BOOT_DOMS_VIEW_ID = "boot-doms"
+QUANTASTOR_SYSTEM_ID = "qsosn-ha"
+QUANTASTOR_SATADOMS_RIGHT_VIEW_ID = "boot-satadoms-right"
 
 
 def hide_debug_chrome(page: Page) -> None:
@@ -201,6 +203,19 @@ def capture_storage_view_history(page: Page) -> None:
     write_page_screenshot(page, f"storage-view-history-{SCREENSHOT_TAG}.png")
 
 
+def capture_quantastor_satadoms(page: Page) -> None:
+    page.set_viewport_size({"width": 1900, "height": 1700})
+    page.goto(f"{APP_URL}?{urlencode({'system_id': QUANTASTOR_SYSTEM_ID})}", wait_until="networkidle")
+    hide_debug_chrome(page)
+    wait_for_runtime_ready(page)
+    select_storage_view(page, QUANTASTOR_SATADOMS_RIGHT_VIEW_ID)
+    click_slot(page, 0)
+    for label in ("Power On", "Power Cycles", "Bytes Read"):
+        wait_for_detail_value(page, label)
+    page.wait_for_timeout(900)
+    write_page_screenshot(page, f"quantastor-satadoms-right-{SCREENSHOT_TAG}.png")
+
+
 def capture_admin_setup(page: Page) -> None:
     page.set_viewport_size({"width": 1900, "height": 1500})
     page.goto(ADMIN_URL, wait_until="networkidle")
@@ -231,6 +246,17 @@ def capture_admin_setup(page: Page) -> None:
     write_page_screenshot(page, f"admin-setup-{SCREENSHOT_TAG}.png")
 
 
+def capture_admin_maintenance(page: Page) -> None:
+    page.set_viewport_size({"width": 1900, "height": 1450})
+    page.goto(ADMIN_URL, wait_until="networkidle")
+    wait_for_admin_ready(page)
+    backup_panel = page.locator(".backup-panel")
+    backup_panel.wait_for(state="visible", timeout=120_000)
+    backup_panel.scroll_into_view_if_needed()
+    page.wait_for_timeout(700)
+    write_locator_screenshot(backup_panel, f"admin-maintenance-{SCREENSHOT_TAG}.png")
+
+
 def main() -> None:
     DOCS_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     WIKI_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
@@ -240,7 +266,9 @@ def main() -> None:
         capture_live_vs_storage_views(page)
         capture_storage_view_history(page)
         capture_archive_core_front_24(page)
+        capture_quantastor_satadoms(page)
         capture_admin_setup(page)
+        capture_admin_maintenance(page)
         browser.close()
 
 

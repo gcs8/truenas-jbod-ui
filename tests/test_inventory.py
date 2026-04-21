@@ -422,7 +422,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                         serial="SER-DOM-0",
                         model="SATADOM 0",
                         size_bytes=64_000_000_000,
-                        identifier=None,
+                        identifier="gptid/dom-a",
                         health="ONLINE",
                         pool_name="freenas-boot",
                         lunid=None,
@@ -481,6 +481,353 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         satadom_view = next(view for view in runtime.views if view.id == "boot-doms")
         self.assertEqual([slot.slot_label for slot in satadom_view.slots], ["DOM-A", "DOM-B"])
         self.assertEqual([slot.device_name for slot in satadom_view.slots], ["ada0", "ada1"])
+        self.assertEqual(satadom_view.slots[0].gptid, "gptid/dom-a")
+        self.assertEqual(satadom_view.slots[0].persistent_id_label, "GPTID")
+
+    def test_quantastor_storage_view_runtime_scopes_internal_view_to_target_system(self) -> None:
+        async def get_snapshot(
+            *,
+            selected_enclosure_id: str | None = None,
+            **_kwargs,
+        ) -> InventorySnapshot:
+            if selected_enclosure_id == "node-b":
+                return InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_system_id="qsosn-ha",
+                    selected_system_label="QSOSN HA",
+                    selected_enclosure_id="node-b",
+                    selected_enclosure_label="QSOSN Right",
+                )
+            return InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_id="qsosn-ha",
+                selected_system_label="QSOSN HA",
+                selected_enclosure_id="node-a",
+                selected_enclosure_label="QSOSN Left",
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="qsosn-ha",
+                label="QSOSN HA",
+                storage_views=[
+                    {
+                        "id": "boot-doms-node-b",
+                        "label": "Boot SATADOMs B",
+                        "kind": "boot_devices",
+                        "template_id": "satadom-pair-2",
+                        "enabled": True,
+                        "order": 30,
+                        "render": {
+                            "show_in_main_ui": True,
+                            "show_in_admin_ui": True,
+                            "default_collapsed": False,
+                        },
+                        "binding": {
+                            "mode": "serial",
+                            "target_system_id": "node-b",
+                            "enclosure_ids": [],
+                            "pool_names": [],
+                            "serials": [],
+                            "pcie_addresses": [],
+                            "device_names": ["sdb"],
+                        },
+                    }
+                ],
+                truenas=TrueNASConfig(
+                    host="https://10.13.37.40",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="10.13.37.30",
+                    user="jbodmap",
+                    ha_enabled=True,
+                    ha_nodes=[
+                        {
+                            "system_id": "node-a",
+                            "label": "QSOSN Left",
+                            "host": "10.13.37.30",
+                        },
+                        {
+                            "system_id": "node-b",
+                            "label": "QSOSN Right",
+                            "host": "10.13.37.31",
+                        },
+                    ],
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[],
+                        systems=[
+                            {"id": "node-a", "name": "QSOSN Left", "storageSystemClusterId": "cluster-a"},
+                            {"id": "node-b", "name": "QSOSN Right", "storageSystemClusterId": "cluster-a", "isMaster": True},
+                        ],
+                        disks=[
+                            {
+                                "id": "disk-a",
+                                "storageSystemId": "node-a",
+                                "devicePath": "/dev/sda",
+                                "serialNumber": "SER-A",
+                                "model": "SATADOM A",
+                                "size": 64_000_000_000,
+                                "protocol": "SATA",
+                            },
+                            {
+                                "id": "disk-b",
+                                "storageSystemId": "node-b",
+                                "devicePath": "/dev/sdb",
+                                "serialNumber": "SER-B",
+                                "model": "SATADOM B",
+                                "size": 64_000_000_000,
+                                "protocol": "SATA",
+                            },
+                        ],
+                        pools=[],
+                        pool_devices=[],
+                        ha_groups=[],
+                        hw_disks=[],
+                        hw_enclosures=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    ),
+                    ssh_outputs={},
+                    ssh_collected=False,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+
+            runtime = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="node-a"))
+
+        view = next(view for view in runtime.views if view.id == "boot-doms-node-b")
+        self.assertEqual(view.backing_enclosure_id, "node-b")
+        self.assertEqual(view.backing_enclosure_label, "QSOSN Right")
+        self.assertEqual(view.slots[0].device_name, "sdb")
+        self.assertEqual(view.slots[0].target_system_id, "node-b")
+        self.assertEqual(view.slots[0].target_system_label, "QSOSN Right")
+        self.assertEqual(view.slots[0].candidate_id, "SER-B")
+
+    def test_quantastor_storage_view_runtime_uses_stale_source_bundle_during_background_refresh(self) -> None:
+        async def get_snapshot(
+            *,
+            selected_enclosure_id: str | None = None,
+            **_kwargs,
+        ) -> InventorySnapshot:
+            if selected_enclosure_id == "node-b":
+                return InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_system_id="qsosn-ha",
+                    selected_system_label="QSOSN HA",
+                    selected_enclosure_id="node-b",
+                    selected_enclosure_label="QSOSN Right",
+                )
+            return InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_id="qsosn-ha",
+                selected_system_label="QSOSN HA",
+                selected_enclosure_id="node-a",
+                selected_enclosure_label="QSOSN Left",
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="qsosn-ha",
+                label="QSOSN HA",
+                storage_views=[
+                    {
+                        "id": "boot-doms-node-b",
+                        "label": "Boot SATADOMs B",
+                        "kind": "boot_devices",
+                        "template_id": "satadom-pair-2",
+                        "enabled": True,
+                        "order": 30,
+                        "render": {
+                            "show_in_main_ui": True,
+                            "show_in_admin_ui": True,
+                            "default_collapsed": False,
+                        },
+                        "binding": {
+                            "mode": "serial",
+                            "target_system_id": "node-b",
+                            "enclosure_ids": [],
+                            "pool_names": [],
+                            "serials": [],
+                            "pcie_addresses": [],
+                            "device_names": ["sdb"],
+                        },
+                    }
+                ],
+                truenas=TrueNASConfig(
+                    host="https://10.13.37.40",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="10.13.37.30",
+                    user="jbodmap",
+                    ha_enabled=True,
+                    ha_nodes=[
+                        {
+                            "system_id": "node-a",
+                            "label": "QSOSN Left",
+                            "host": "10.13.37.30",
+                        },
+                        {
+                            "system_id": "node-b",
+                            "label": "QSOSN Right",
+                            "host": "10.13.37.31",
+                        },
+                    ],
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            stale_bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    systems=[
+                        {"id": "node-a", "name": "QSOSN Left", "storageSystemClusterId": "cluster-a"},
+                        {"id": "node-b", "name": "QSOSN Right", "storageSystemClusterId": "cluster-a", "isMaster": True},
+                    ],
+                    disks=[
+                        {
+                            "id": "disk-b",
+                            "storageSystemId": "node-b",
+                            "devicePath": "/dev/sdb",
+                            "serialNumber": "SER-B",
+                            "model": "SATADOM B",
+                            "size": 64_000_000_000,
+                            "protocol": "SATA",
+                        },
+                    ],
+                    pools=[],
+                    pool_devices=[],
+                    ha_groups=[],
+                    hw_disks=[],
+                    hw_enclosures=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=False,
+                warnings=[],
+                sources={},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+            service._source_bundle = stale_bundle
+            service._source_bundle_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._collect_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[],
+                        systems=[],
+                        disks=[],
+                        pools=[],
+                        pool_devices=[],
+                        ha_groups=[],
+                        hw_disks=[],
+                        hw_enclosures=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    ),
+                    ssh_outputs={},
+                    ssh_collected=False,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+            service._schedule_background_source_bundle_refresh = MagicMock()
+
+            runtime = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="node-a"))
+
+        view = next(view for view in runtime.views if view.id == "boot-doms-node-b")
+        self.assertEqual(view.matched_count, 1)
+        self.assertEqual(view.slots[0].device_name, "sdb")
+        service._collect_inventory_source_bundle.assert_not_awaited()
+        service._schedule_background_source_bundle_refresh.assert_called_once_with()
+
+    def test_quantastor_preferred_hosts_use_explicit_ha_node_for_targeted_storage_view_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="qsosn-ha",
+                label="QSOSN HA",
+                truenas=TrueNASConfig(
+                    host="https://10.13.37.40",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="10.13.37.30",
+                    user="jbodmap",
+                    ha_enabled=True,
+                    ha_nodes=[
+                        {
+                            "system_id": "node-a",
+                            "label": "QSOSN Left",
+                            "host": "10.13.37.30",
+                        },
+                        {
+                            "system_id": "node-b",
+                            "label": "QSOSN Right",
+                            "host": "10.13.37.31",
+                        },
+                    ],
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            hosts = service._build_quantastor_preferred_hosts(
+                SlotView(
+                    slot=0,
+                    slot_label="DOM-B",
+                    row_index=0,
+                    column_index=0,
+                    raw_status={"target_system_id": "node-b"},
+                )
+            )
+
+        self.assertEqual(hosts, ["10.13.37.31", "10.13.37.30"])
 
     def test_get_storage_view_runtime_uses_saved_ses_profile_instead_of_live_selected_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -684,6 +1031,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                                     size_bytes=64_000_000_000,
                                     size_human="59.6 GiB",
                                     gptid="gptid/dom-a",
+                                    persistent_id_label="GPTID",
                                     health="ONLINE",
                                     temperature_c=31,
                                     logical_block_size=512,
@@ -715,6 +1063,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(synthetic_slot.smart_device_names, ["ada0"])
         self.assertEqual(synthetic_slot.pool_name, "freenas-boot")
         self.assertEqual(synthetic_slot.gptid, "gptid/dom-a")
+        self.assertEqual(synthetic_slot.persistent_id_label, "GPTID")
         self.assertEqual(synthetic_slot.logical_block_size, 512)
         self.assertEqual(synthetic_slot.physical_block_size, 4096)
 
@@ -3501,6 +3850,152 @@ Enclosure Status diagnostic page:
                     ("da91", ("-x",)),
                 ],
             )
+
+    async def test_core_ata_smart_summary_prefers_richer_ssh_json_when_available(self) -> None:
+        class DummyTrueNASClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+            async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None):
+                self.calls.append((disk_name, tuple(args or [])))
+                if args == ["-x"]:
+                    return (
+                        "SMART overall-health self-assessment test result: PASSED\n"
+                        "Logical Unit id:      515d93717d000810\n"
+                        "Read Cache is:        Enabled\n"
+                        "Writeback Cache is:   Enabled\n"
+                        "Current Drive Temperature:     44 C\n"
+                    )
+                return (
+                    '{'
+                    '"device":{"protocol":"ATA"},'
+                    '"smart_status":{"passed":true},'
+                    '"temperature":{"current":44},'
+                    '"power_on_time":{"hours":61405},'
+                    '"logical_block_size":512,'
+                    '"physical_block_size":512,'
+                    '"rotation_rate":0,'
+                    '"firmware_version":"SOB20R",'
+                    '"sata_version":{"string":"SATA 3.1"},'
+                    '"interface_speed":{"current":{"string":"6.0 Gb/s"}},'
+                    '"ata_smart_attributes":{"table":['
+                    '{"id":241,"name":"Host_Writes_32MiB","raw":{"value":6139}},'
+                    '{"id":242,"name":"Host_Reads_32MiB","raw":{"value":5882}}'
+                    "]}"
+                    "}"
+                )
+
+        class DummySSHProbe:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            async def run_command(self, command: str) -> SSHCommandResult:
+                self.commands.append(command)
+                if command.endswith("-x /dev/ada0"):
+                    return SSHCommandResult(
+                        command=command,
+                        ok=True,
+                        stdout=(
+                            "SMART overall-health self-assessment test result: PASSED\n"
+                            "Logical Unit id:      515d93717d000810\n"
+                            "Read Cache is:        Enabled\n"
+                            "Writeback Cache is:   Enabled\n"
+                            "SATA Version is:      SATA 3.1, 6.0 Gb/s (current: 6.0 Gb/s)\n"
+                        ),
+                        exit_code=0,
+                    )
+                return SSHCommandResult(
+                    command=command,
+                    ok=True,
+                    stdout=(
+                        '{'
+                        '"device":{"protocol":"ATA"},'
+                        '"smart_status":{"passed":true},'
+                        '"temperature":{"current":44},'
+                        '"power_on_time":{"hours":61405},'
+                        '"logical_block_size":512,'
+                        '"physical_block_size":512,'
+                        '"rotation_rate":0,'
+                        '"firmware_version":"SOB20R",'
+                        '"sata_version":{"string":"SATA 3.1"},'
+                        '"interface_speed":{"current":{"string":"6.0 Gb/s"}},'
+                        '"read_lookahead":{"enabled":true},'
+                        '"write_cache":{"enabled":true},'
+                        '"ata_smart_attributes":{"table":['
+                        '{"id":241,"name":"Host_Writes_32MiB","raw":{"value":6139}},'
+                        '{"id":242,"name":"Host_Reads_32MiB","raw":{"value":5882}}'
+                        ']},'
+                        '"ata_device_statistics":{"pages":[{'
+                        '"number":1,'
+                        '"name":"General Statistics",'
+                        '"revision":2,'
+                        '"table":['
+                        '{"offset":24,"name":"Logical Sectors Written","size":6,"value":4286460901},'
+                        '{"offset":40,"name":"Logical Sectors Read","size":6,"value":3747432196}'
+                        "]"
+                        "}]}"
+                        "}"
+                    ),
+                    exit_code=0,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True, user="jbodmap"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                DummySSHProbe(),
+                temp_dir,
+            )
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                device_name="ada0",
+                smart_device_names=["ada0"],
+                logical_block_size=512,
+                physical_block_size=512,
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[slot],
+                    refresh_interval_seconds=30,
+                )
+            )
+
+            summary = await service.get_slot_smart_summary(0)
+
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.smart_health_status, "PASSED")
+            self.assertEqual(summary.temperature_c, 44)
+            self.assertEqual(summary.power_on_hours, 61405)
+            self.assertEqual(summary.bytes_written, 2194667981312)
+            self.assertEqual(summary.bytes_read, 1918685284352)
+            self.assertEqual(summary.annualized_bytes_written, 313090001079)
+            self.assertEqual(summary.read_cache_enabled, True)
+            self.assertEqual(summary.writeback_cache_enabled, True)
+            self.assertEqual(summary.transport_protocol, "ATA")
+            self.assertIsNotNone(summary.logical_unit_id)
+            assert summary.logical_unit_id is not None
+            self.assertTrue(summary.logical_unit_id.lower().endswith("515d93717d000810"))
+            self.assertIsNone(summary.message)
+            self.assertEqual(
+                service.truenas_client.calls,
+                [
+                    ("ada0", ("-a", "-j")),
+                    ("ada0", ("-x",)),
+                ],
+            )
+            self.assertEqual(len(service.ssh_probe.commands), 2)
+            self.assertIn("/usr/local/sbin/smartctl -x -j /dev/ada0", service.ssh_probe.commands[0])
+            self.assertIn("/usr/local/sbin/smartctl -x /dev/ada0", service.ssh_probe.commands[1])
 
     async def test_core_smart_summary_falls_back_to_ssh_when_api_smartctl_fails(self) -> None:
         class DummyTrueNASClient:

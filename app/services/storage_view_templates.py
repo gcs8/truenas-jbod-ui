@@ -118,7 +118,7 @@ def list_storage_view_templates() -> list[StorageViewTemplate]:
             slot_count=2,
             slot_layout=[[0, 1]],
             default_render=StorageViewRenderConfig(
-                show_in_main_ui=False,
+                show_in_main_ui=True,
                 show_in_admin_ui=True,
                 default_collapsed=True,
             ),
@@ -129,7 +129,7 @@ def list_storage_view_templates() -> list[StorageViewTemplate]:
             },
             supports_led=False,
             supports_auto_discovery=False,
-            notes="Useful for mirrored boot pools that should stay visible for maintenance but not dominate the main read UI.",
+            notes="Useful for mirrored boot devices or SATADOM pairs. Hide it from the main read UI later if you only want it as a maintenance view.",
         ),
         StorageViewTemplate(
             id="manual-4",

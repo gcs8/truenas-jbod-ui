@@ -49,12 +49,17 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
             HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
         )
 
-        with patch.object(
-            client,
-            "_fetch_json",
-            AsyncMock(
-                side_effect=[
-                    {
+        with (
+            patch.object(
+                client,
+                "_build_since_isoformat",
+                return_value="2026-04-15T23:10:00+00:00",
+            ),
+            patch.object(
+                client,
+                "_fetch_json",
+                AsyncMock(
+                    return_value={
                         "events": [
                             {
                                 "observed_at": "2026-04-16T23:15:00+00:00",
@@ -62,45 +67,57 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
                                 "previous_value": "SERIAL-OLD",
                                 "current_value": "SERIAL-NEW",
                             }
-                        ]
-                    },
-                    {
-                        "samples": [
-                            {
-                                "observed_at": "2026-04-16T23:10:00+00:00",
-                                "value": 31,
-                            }
-                        ]
-                    },
-                    {
-                        "samples": [
-                            {
-                                "observed_at": "2026-04-16T23:10:00+00:00",
-                                "value": 549755813888,
-                            }
-                        ]
-                    },
-                    {
-                        "samples": [
-                            {
-                                "observed_at": "2026-04-16T23:10:00+00:00",
-                                "value": 1099511627776,
-                            }
-                        ]
-                    },
-                    {"samples": []},
-                    {
-                        "samples": [
-                            {
-                                "observed_at": "2026-04-16T23:10:00+00:00",
-                                "value": 10101,
-                            }
-                        ]
-                    },
-                ]
-            ),
+                        ],
+                        "metrics": {
+                            "temperature_c": [
+                                {
+                                    "observed_at": "2026-04-16T23:10:00+00:00",
+                                    "value": 31,
+                                }
+                            ],
+                            "bytes_read": [
+                                {
+                                    "observed_at": "2026-04-16T23:10:00+00:00",
+                                    "value": 549755813888,
+                                }
+                            ],
+                            "bytes_written": [
+                                {
+                                    "observed_at": "2026-04-16T23:10:00+00:00",
+                                    "value": 1099511627776,
+                                }
+                            ],
+                            "annualized_bytes_written": [],
+                            "power_on_hours": [
+                                {
+                                    "observed_at": "2026-04-16T23:10:00+00:00",
+                                    "value": 10101,
+                                }
+                            ],
+                        },
+                        "sample_counts": {
+                            "temperature_c": 1,
+                            "bytes_read": 1,
+                            "bytes_written": 1,
+                            "annualized_bytes_written": 0,
+                            "power_on_hours": 1,
+                        },
+                        "latest_values": {
+                            "temperature_c": 31,
+                            "bytes_read": 549755813888,
+                            "bytes_written": 1099511627776,
+                            "annualized_bytes_written": None,
+                            "power_on_hours": 10101,
+                        },
+                        "disk_history": {
+                            "followed": True,
+                            "prior_home_count": 1,
+                        },
+                    }
+                ),
+            ) as fetch_json,
         ):
-            payload = await client.get_slot_history(5, "archive-core", "front")
+            payload = await client.get_slot_history(5, "archive-core", "front", window_hours=24)
 
         self.assertTrue(payload["configured"])
         self.assertTrue(payload["available"])
@@ -116,6 +133,16 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(payload["latest_values"]["annualized_bytes_written"])
         self.assertEqual(payload["latest_values"]["power_on_hours"], 10101)
         self.assertEqual(len(payload["events"]), 1)
+        self.assertTrue(payload["disk_history"]["followed"])
+        fetch_json.assert_awaited_once_with(
+            "/api/history/slots/5/bundle",
+            params={
+                "system_id": "archive-core",
+                "enclosure_id": "front",
+                "since": "2026-04-15T23:10:00+00:00",
+                "event_limit": 12,
+            },
+        )
 
     async def test_get_scope_history_uses_scope_endpoint_when_available(self) -> None:
         client = HistoryBackendClient(

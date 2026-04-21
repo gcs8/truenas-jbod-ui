@@ -292,6 +292,7 @@ def create_app() -> FastAPI:
         slot: int,
         system_id: str | None = None,
         enclosure_id: str | None = None,
+        fresh: bool = False,
     ) -> SmartSummaryView:
         ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
@@ -301,7 +302,7 @@ def create_app() -> FastAPI:
             return await service.get_slot_smart_summary(
                 slot,
                 selected_enclosure_id=enclosure_id,
-                allow_stale_cache=True,
+                allow_stale_cache=not fresh,
             )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -312,6 +313,7 @@ def create_app() -> FastAPI:
         slot_index: int,
         system_id: str | None = None,
         enclosure_id: str | None = None,
+        fresh: bool = False,
     ) -> SmartSummaryView:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
@@ -327,7 +329,7 @@ def create_app() -> FastAPI:
                 view_id,
                 slot_index,
                 selected_enclosure_id=enclosure_id,
-                allow_stale_cache=True,
+                allow_stale_cache=not fresh,
             )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -338,6 +340,7 @@ def create_app() -> FastAPI:
         slot_index: int,
         system_id: str | None = None,
         enclosure_id: str | None = None,
+        window_hours: int | None = None,
     ) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
@@ -359,6 +362,7 @@ def create_app() -> FastAPI:
             history_slot,
             service.system.id,
             history_enclosure_id,
+            window_hours=window_hours,
         )
         return JSONResponse(payload)
 
@@ -367,6 +371,7 @@ def create_app() -> FastAPI:
         payload: SmartBatchRequest,
         system_id: str | None = None,
         enclosure_id: str | None = None,
+        fresh: bool = False,
     ) -> SmartBatchResponse:
         for slot in payload.slots:
             ensure_slot_bounds(get_settings(), slot)
@@ -384,7 +389,7 @@ def create_app() -> FastAPI:
                 payload.slots,
                 selected_enclosure_id=enclosure_id,
                 max_concurrency=payload.max_concurrency,
-                allow_stale_cache=True,
+                allow_stale_cache=not fresh,
             )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -400,10 +405,16 @@ def create_app() -> FastAPI:
         slot: int,
         system_id: str | None = None,
         enclosure_id: str | None = None,
+        window_hours: int | None = None,
     ) -> JSONResponse:
         ensure_slot_bounds(get_settings(), slot)
         history_backend = get_history_backend()
-        payload = await history_backend.get_slot_history(slot, system_id, enclosure_id)
+        payload = await history_backend.get_slot_history(
+            slot,
+            system_id,
+            enclosure_id,
+            window_hours=window_hours,
+        )
         return JSONResponse(payload)
 
     @app.post("/api/export/enclosure-snapshot")

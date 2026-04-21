@@ -285,6 +285,7 @@ class InventoryService:
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
         self._source_bundle_lock = asyncio.Lock()
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
+        self._source_bundle_refresh_task: asyncio.Task[None] | None = None
         self._smart_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._background_smart_refresh_semaphore = asyncio.Semaphore(
             max(1, self.settings.app.smart_batch_max_concurrency)
@@ -347,40 +348,23 @@ class InventoryService:
         *,
         force_refresh: bool = False,
         selected_enclosure_id: str | None = None,
+        target_system_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        source_bundle = await self._get_inventory_source_bundle(force_refresh=force_refresh)
-        snapshot = await self.get_snapshot(
+        source_bundle = await self._get_inventory_source_bundle(
             force_refresh=force_refresh,
-            selected_enclosure_id=selected_enclosure_id,
             allow_stale_cache=not force_refresh,
         )
-        ssh_data = parse_ssh_outputs(
-            source_bundle.ssh_outputs,
-            self.settings.layout.slot_count,
-            self.system.truenas.enclosure_filter,
-            selected_enclosure_id=snapshot.selected_enclosure_id,
+        candidate_enclosure_id = (
+            target_system_id
+            if self.system.truenas.platform == "quantastor" and target_system_id
+            else selected_enclosure_id
         )
-        disk_records = self._build_storage_view_candidate_records(
-            source_bundle.raw_data,
-            ssh_data,
-            snapshot.selected_enclosure_id,
+        snapshot = await self.get_snapshot(
+            force_refresh=force_refresh,
+            selected_enclosure_id=candidate_enclosure_id,
+            allow_stale_cache=not force_refresh,
         )
-        assigned_lookup_keys = self._collect_assigned_lookup_keys(snapshot.slots)
-
-        candidates: list[dict[str, Any]] = []
-        seen_candidate_ids: set[str] = set()
-        for disk in disk_records:
-            if self._disk_record_has_physical_slot_assignment(disk):
-                continue
-            if disk.lookup_keys & assigned_lookup_keys:
-                continue
-            serialized = self._serialize_storage_view_candidate(disk)
-            candidate_id = serialized.get("candidate_id")
-            if not candidate_id or candidate_id in seen_candidate_ids:
-                continue
-            seen_candidate_ids.add(candidate_id)
-            candidates.append(serialized)
-
+        candidates = self._build_storage_view_candidate_payloads(source_bundle, snapshot)
         candidates.sort(
             key=lambda item: (
                 item.get("pool_name") or "",
@@ -402,34 +386,37 @@ class InventoryService:
             selected_enclosure_id=selected_enclosure_id,
             allow_stale_cache=not force_refresh,
         )
-        source_bundle = await self._get_inventory_source_bundle(force_refresh=force_refresh)
-        ssh_data = parse_ssh_outputs(
-            source_bundle.ssh_outputs,
-            self.settings.layout.slot_count,
-            self.system.truenas.enclosure_filter,
-            selected_enclosure_id=active_snapshot.selected_enclosure_id,
+        source_bundle = await self._get_inventory_source_bundle(
+            force_refresh=force_refresh,
+            allow_stale_cache=not force_refresh,
         )
-        disk_records = self._build_storage_view_candidate_records(
-            source_bundle.raw_data,
-            ssh_data,
-            active_snapshot.selected_enclosure_id,
-        )
-        assigned_lookup_keys = self._collect_assigned_lookup_keys(active_snapshot.slots)
-        candidate_payloads = []
-        seen_candidate_ids: set[str] = set()
-        for disk in disk_records:
-            if self._disk_record_has_physical_slot_assignment(disk):
+        storage_views = resolve_system_storage_views(self.system, self.profile_registry)
+        target_snapshots: dict[str | None, InventorySnapshot] = {
+            active_snapshot.selected_enclosure_id: active_snapshot,
+        }
+        candidate_payloads_by_target: dict[str | None, list[dict[str, Any]]] = {}
+        for storage_view in storage_views:
+            if storage_view.kind == "ses_enclosure":
                 continue
-            if disk.lookup_keys & assigned_lookup_keys:
-                continue
-            serialized = self._serialize_storage_view_candidate(disk)
-            candidate_id = normalize_text(serialized.get("candidate_id"))
-            if not candidate_id or candidate_id in seen_candidate_ids:
-                continue
-            seen_candidate_ids.add(candidate_id)
-            candidate_payloads.append(serialized)
+            target_system_id = self._storage_view_target_system_id(storage_view, active_snapshot)
+            if target_system_id not in target_snapshots:
+                target_snapshots[target_system_id] = await self.get_snapshot(
+                    force_refresh=force_refresh,
+                    selected_enclosure_id=target_system_id,
+                    allow_stale_cache=not force_refresh,
+                )
+            if target_system_id not in candidate_payloads_by_target:
+                candidate_payloads_by_target[target_system_id] = self._build_storage_view_candidate_payloads(
+                    source_bundle,
+                    target_snapshots[target_system_id],
+                )
 
-        runtime_views = self._serialize_storage_views_runtime(active_snapshot, candidate_payloads)
+        runtime_views = self._serialize_storage_views_runtime(
+            active_snapshot,
+            storage_views,
+            target_snapshots,
+            candidate_payloads_by_target,
+        )
         return StorageViewRuntimePayload(
             system_id=self.system.id,
             system_label=self.system.label or self.system.id,
@@ -528,6 +515,7 @@ class InventoryService:
             size_bytes=runtime_slot.size_bytes,
             size_human=runtime_slot.size_human,
             gptid=runtime_slot.gptid,
+            persistent_id_label=runtime_slot.persistent_id_label,
             pool_name=runtime_slot.pool_name,
             topology_label=runtime_slot.description or runtime_slot.placement_key or runtime_view.label,
             health=runtime_slot.health,
@@ -544,15 +532,18 @@ class InventoryService:
             raw_status={
                 "attached_sas_address": runtime_slot.attached_sas_address,
                 "transport_address": runtime_slot.transport_address,
+                "target_system_id": runtime_slot.target_system_id,
+                "candidate_id": runtime_slot.candidate_id,
             },
         )
 
     def _serialize_storage_views_runtime(
         self,
         snapshot: InventorySnapshot,
-        candidate_payloads: list[dict[str, Any]],
+        storage_views: list[StorageViewConfig],
+        snapshots_by_target: dict[str | None, InventorySnapshot],
+        candidate_payloads_by_target: dict[str | None, list[dict[str, Any]]],
     ) -> list[StorageViewRuntimeView]:
-        storage_views = resolve_system_storage_views(self.system, self.profile_registry)
         claimed_candidate_ids: set[str] = set()
         runtime_views: list[StorageViewRuntimeView] = []
         for storage_view in storage_views:
@@ -560,11 +551,14 @@ class InventoryService:
                 runtime_views.append(self._build_ses_storage_view_runtime(storage_view, snapshot))
                 continue
 
+            target_system_id = self._storage_view_target_system_id(storage_view, snapshot)
+            target_snapshot = snapshots_by_target.get(target_system_id, snapshot)
             runtime_view = self._build_candidate_storage_view_runtime(
                 storage_view,
-                snapshot,
-                candidate_payloads,
+                target_snapshot,
+                candidate_payloads_by_target.get(target_system_id, []),
                 claimed_candidate_ids,
+                target_system_id=target_system_id,
             )
             runtime_views.append(runtime_view)
             for slot in runtime_view.slots:
@@ -618,6 +612,7 @@ class InventoryService:
                     bus=None,
                     size_human=slot.size_human if slot else None,
                     gptid=slot.gptid if slot else None,
+                    persistent_id_label=slot.persistent_id_label if slot else None,
                     health=slot.health if slot else None,
                     temperature_c=slot.temperature_c if slot else None,
                     last_smart_test_type=slot.last_smart_test_type if slot else None,
@@ -658,7 +653,7 @@ class InventoryService:
             profile_label=storage_view_profile.label if storage_view_profile else None,
             enabled=storage_view.enabled,
             render=storage_view.render.model_dump(mode="json"),
-            binding=storage_view.binding.model_dump(mode="json"),
+            binding=storage_view.binding.model_dump(mode="json", exclude_none=True),
             order=storage_view.order,
             template_label=template.label if template else storage_view.template_id,
             slot_layout=layout_rows,
@@ -677,6 +672,8 @@ class InventoryService:
         snapshot: InventorySnapshot,
         candidate_payloads: list[dict[str, Any]],
         claimed_candidate_ids: set[str],
+        *,
+        target_system_id: str | None = None,
     ) -> StorageViewRuntimeView:
         storage_view_profile = resolve_storage_view_profile(
             storage_view,
@@ -697,6 +694,8 @@ class InventoryService:
                     label,
                     assignment_rank,
                     candidate,
+                    target_system_id=target_system_id,
+                    target_system_label=snapshot.selected_enclosure_label,
                 )
             )
 
@@ -704,6 +703,10 @@ class InventoryService:
         notes = [
             "Placement follows your saved binding order first, then falls back to live inventory sort for any remaining matches.",
         ]
+        if target_system_id and self.system.truenas.platform == "quantastor":
+            notes.append(
+                f"Candidate matching is currently scoped to the Quantastor HA node {snapshot.selected_enclosure_label or target_system_id}."
+            )
         if storage_view.render.show_in_main_ui is False:
             notes.append("This view is marked maintenance-only in config, but is still shown here for runtime inspection.")
         return StorageViewRuntimeView(
@@ -715,7 +718,7 @@ class InventoryService:
             profile_label=storage_view_profile.label if storage_view_profile else None,
             enabled=storage_view.enabled,
             render=storage_view.render.model_dump(mode="json"),
-            binding=storage_view.binding.model_dump(mode="json"),
+            binding=storage_view.binding.model_dump(mode="json", exclude_none=True),
             order=storage_view.order,
             template_label=template.label if template else storage_view.template_id,
             slot_layout=layout_rows,
@@ -735,11 +738,16 @@ class InventoryService:
         slot_label: str,
         assignment_rank: int,
         candidate: dict[str, Any] | None,
+        *,
+        target_system_id: str | None = None,
+        target_system_label: str | None = None,
     ) -> StorageViewRuntimeSlot:
         if not candidate:
             return StorageViewRuntimeSlot(
                 slot_index=slot_value,
                 slot_label=slot_label,
+                target_system_id=target_system_id,
+                target_system_label=target_system_label,
                 occupied=False,
                 state="empty",
                 source="placeholder",
@@ -753,6 +761,9 @@ class InventoryService:
         return StorageViewRuntimeSlot(
             slot_index=slot_value,
             slot_label=slot_label,
+            candidate_id=normalize_text(candidate.get("candidate_id")),
+            target_system_id=target_system_id,
+            target_system_label=target_system_label or candidate.get("storage_system_label"),
             occupied=True,
             state="matched",
             source="inventory_candidate",
@@ -768,6 +779,7 @@ class InventoryService:
             bus=candidate.get("bus"),
             size_human=candidate.get("size_human"),
             gptid=candidate.get("gptid"),
+            persistent_id_label=candidate.get("persistent_id_label"),
             health=candidate.get("health"),
             temperature_c=candidate.get("temperature_c"),
             last_smart_test_type=candidate.get("last_smart_test_type"),
@@ -782,6 +794,15 @@ class InventoryService:
             description=candidate.get("description"),
             slot_size=storage_view_slot_size(storage_view, slot_value),
         )
+
+    def _storage_view_target_system_id(
+        self,
+        storage_view: StorageViewConfig,
+        snapshot: InventorySnapshot,
+    ) -> str | None:
+        if self.system.truenas.platform != "quantastor":
+            return snapshot.selected_enclosure_id
+        return normalize_text(storage_view.binding.target_system_id) or snapshot.selected_enclosure_id
 
     def _ordered_storage_view_candidates(
         self,
@@ -835,12 +856,18 @@ class InventoryService:
         return sequence
 
     def _candidate_identity_key(self, candidate: dict[str, Any]) -> str | None:
-        return (
+        base_key = (
             normalize_text(candidate.get("candidate_id"))
             or normalize_text(candidate.get("serial"))
             or normalize_text((candidate.get("device_names") or [None])[0])
             or normalize_text(candidate.get("transport_address"))
         )
+        if not base_key:
+            return None
+        storage_system_id = normalize_text(candidate.get("storage_system_id"))
+        if storage_system_id:
+            return f"{storage_system_id}|{base_key}"
+        return base_key
 
     def _candidate_sort_key(self, candidate: dict[str, Any]) -> tuple[str, str, str, str, str]:
         return (
@@ -944,10 +971,19 @@ class InventoryService:
                     selected_enclosure_id=enclosure_id,
                 )
 
-    async def _get_inventory_source_bundle(self, *, force_refresh: bool = False) -> InventorySourceBundle:
+    async def _get_inventory_source_bundle(
+        self,
+        *,
+        force_refresh: bool = False,
+        allow_stale_cache: bool = False,
+    ) -> InventorySourceBundle:
         now = utcnow()
         if not force_refresh and self._source_bundle is not None and now < self._source_bundle_until:
             add_perf_metadata(inventory_source_cache="hit", system_id=self.system.id)
+            return self._source_bundle
+        if not force_refresh and allow_stale_cache and self._source_bundle is not None:
+            add_perf_metadata(inventory_source_cache="stale-hit", system_id=self.system.id)
+            self._schedule_background_source_bundle_refresh()
             return self._source_bundle
 
         async with self._source_bundle_lock:
@@ -965,6 +1001,31 @@ class InventoryService:
             self._source_bundle = bundle
             self._source_bundle_until = utcnow() + timedelta(seconds=self.settings.app.cache_ttl_seconds)
             return bundle
+
+    def _schedule_background_source_bundle_refresh(self) -> None:
+        existing = self._source_bundle_refresh_task
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(self._background_source_bundle_refresh())
+        self._source_bundle_refresh_task = task
+
+        def _cleanup(completed: asyncio.Task[None]) -> None:
+            if self._source_bundle_refresh_task is completed:
+                self._source_bundle_refresh_task = None
+            if completed.cancelled():
+                return
+            exc = completed.exception()
+            if exc is not None:
+                logger.warning("Background inventory source refresh failed: %s", exc)
+
+        task.add_done_callback(_cleanup)
+
+    async def _background_source_bundle_refresh(self) -> None:
+        try:
+            await self._get_inventory_source_bundle(force_refresh=True)
+        except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
+            logger.exception("Background inventory source refresh failed")
 
     def _get_snapshot_lock(self, cache_key: str) -> asyncio.Lock:
         lock = self._snapshot_locks.get(cache_key)
@@ -1585,6 +1646,13 @@ class InventoryService:
                             parse_smartctl_text_enrichment(enrichment_payload)
                         ),
                     )
+            if self._summary_prefers_core_ssh_json(api_summary):
+                ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(candidates)
+                if ssh_summary is not None:
+                    api_summary = self._merge_missing_smart_fields(
+                        self._merge_smart_summary(slot_view, ssh_summary),
+                        api_summary,
+                    )
 
             self._smart_cache[cache_key] = api_summary
             self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
@@ -2134,6 +2202,40 @@ class InventoryService:
             parse_smart_test_results(raw_data.smart_test_results),
         )
 
+    def _build_storage_view_candidate_payloads(
+        self,
+        source_bundle: InventorySourceBundle,
+        snapshot: InventorySnapshot,
+    ) -> list[dict[str, Any]]:
+        ssh_data = parse_ssh_outputs(
+            source_bundle.ssh_outputs,
+            self.settings.layout.slot_count,
+            self.system.truenas.enclosure_filter,
+            selected_enclosure_id=snapshot.selected_enclosure_id,
+        )
+        disk_records = self._build_storage_view_candidate_records(
+            source_bundle.raw_data,
+            ssh_data,
+            snapshot.selected_enclosure_id,
+        )
+        assigned_lookup_keys = self._collect_assigned_lookup_keys(snapshot.slots)
+        candidates: list[dict[str, Any]] = []
+        seen_candidate_ids: set[str] = set()
+        for disk in disk_records:
+            if self._disk_record_has_physical_slot_assignment(disk):
+                continue
+            if disk.lookup_keys & assigned_lookup_keys:
+                continue
+            serialized = self._serialize_storage_view_candidate(disk)
+            if snapshot.selected_enclosure_label:
+                serialized["storage_system_label"] = snapshot.selected_enclosure_label
+            candidate_key = self._candidate_identity_key(serialized)
+            if not candidate_key or candidate_key in seen_candidate_ids:
+                continue
+            seen_candidate_ids.add(candidate_key)
+            candidates.append(serialized)
+        return candidates
+
     @staticmethod
     def _collect_assigned_lookup_keys(slots: list[SlotView]) -> set[str]:
         assigned_lookup_keys: set[str] = set()
@@ -2155,8 +2257,15 @@ class InventoryService:
                 assigned_lookup_keys.update(normalize_lookup_keys(value))
         return assigned_lookup_keys
 
-    @staticmethod
-    def _disk_record_has_physical_slot_assignment(disk: DiskRecord) -> bool:
+    def _disk_record_has_physical_slot_assignment(self, disk: DiskRecord) -> bool:
+        if self.system.truenas.platform == "quantastor":
+            # Quantastor internal disks can still be node-scoped without
+            # belonging to a real SES slot, so only treat them as "already
+            # assigned" when we have an actual slot/vendor-slot hint.
+            return bool(
+                disk.slot is not None
+                or isinstance(disk.raw.get("vendor_slot"), int)
+            )
         return bool(
             disk.enclosure_id is not None
             or disk.slot is not None
@@ -2190,6 +2299,7 @@ class InventoryService:
         ]
         transport_address = self._record_transport_address(disk)
         size_human = format_bytes(disk.size_bytes)
+        persistent_id, persistent_id_label = resolve_persistent_id(disk.identifier)
         candidate_id = (
             normalize_text(disk.serial)
             or normalize_text(disk.identifier)
@@ -2202,11 +2312,26 @@ class InventoryService:
             f"pool {disk.pool_name}" if disk.pool_name else None,
             transport_address,
         ]
+        storage_system_id = normalize_text(
+            str(
+                disk.raw.get("storageSystemId")
+                or disk.raw.get("systemId")
+                or disk.raw.get("controllerId")
+            )
+            if (
+                disk.raw.get("storageSystemId")
+                or disk.raw.get("systemId")
+                or disk.raw.get("controllerId")
+            ) is not None
+            else None
+        )
         return {
             "candidate_id": candidate_id,
             "label": normalize_text(disk.serial) or normalize_text(device_names[0] if device_names else None) or "Inventory candidate",
             "serial": disk.serial,
             "identifier": disk.identifier,
+            "storage_system_id": storage_system_id,
+            "storage_system_label": storage_system_id,
             "model": disk.model,
             "pool_name": disk.pool_name,
             "bus": disk.bus,
@@ -2214,7 +2339,8 @@ class InventoryService:
             "size_human": size_human,
             "device_names": device_names,
             "smart_device_names": list(disk.smart_devices),
-            "gptid": normalize_gptid(disk.identifier),
+            "gptid": persistent_id or normalize_gptid(disk.identifier),
+            "persistent_id_label": persistent_id_label,
             "health": disk.health,
             "temperature_c": disk.temperature_c,
             "last_smart_test_type": disk.last_smart_test_type,
@@ -3758,15 +3884,15 @@ class InventoryService:
         return hosts
 
     def _build_quantastor_ssh_hosts(self) -> list[str]:
-        hosts: list[str] = []
-        for value in [self._quantastor_preferred_ses_host, self.system.ssh.host, *(self.system.ssh.extra_hosts or [])]:
-            host = normalize_text(value)
-            if host and host not in hosts:
-                hosts.append(host)
-        return hosts
+        return self._build_configured_quantastor_hosts()
 
     def _build_quantastor_preferred_hosts(self, slot_view: SlotView | None = None) -> list[str]:
         hosts: list[str] = []
+        target_system_id = normalize_text(
+            slot_view.raw_status.get("target_system_id")
+            if slot_view and isinstance(slot_view.raw_status, dict)
+            else None
+        )
         if slot_view:
             for target in slot_view.ssh_ses_targets:
                 if not isinstance(target, dict):
@@ -3774,7 +3900,42 @@ class InventoryService:
                 host = normalize_text(target.get("ssh_host"))
                 if host and host not in hosts:
                     hosts.append(host)
-        for value in [self._quantastor_preferred_ses_host, self.system.ssh.host, *(self.system.ssh.extra_hosts or [])]:
+        for value in self._build_configured_quantastor_hosts(preferred_system_id=target_system_id):
+            host = normalize_text(value)
+            if host and host not in hosts:
+                hosts.append(host)
+        return hosts
+
+    def _configured_quantastor_host_for_system(self, system_id: str | None) -> str | None:
+        normalized_system_id = normalize_text(system_id)
+        if not normalized_system_id:
+            return None
+        for node in self.system.ssh.ha_nodes or []:
+            node_system_id = normalize_text(node.system_id)
+            node_host = normalize_text(node.host)
+            if node_system_id == normalized_system_id and node_host:
+                return node_host
+        return None
+
+    def _build_configured_quantastor_hosts(
+        self,
+        *,
+        preferred_system_id: str | None = None,
+    ) -> list[str]:
+        hosts: list[str] = []
+        preferred_host = self._configured_quantastor_host_for_system(preferred_system_id)
+        explicit_hosts = [
+            normalize_text(node.host)
+            for node in (self.system.ssh.ha_nodes or [])
+            if normalize_text(node.host)
+        ]
+        for value in [
+            self._quantastor_preferred_ses_host,
+            preferred_host,
+            self.system.ssh.host,
+            *explicit_hosts,
+            *(self.system.ssh.extra_hosts or []),
+        ]:
             host = normalize_text(value)
             if host and host not in hosts:
                 hosts.append(host)
@@ -5633,6 +5794,14 @@ class InventoryService:
             )
         )
 
+    def _summary_prefers_core_ssh_json(self, summary: SmartSummaryView) -> bool:
+        if self.system.truenas.platform != "core" or not self.system.ssh.enabled:
+            return False
+
+        transport = (summary.transport_protocol or "").strip().upper()
+        protocol_version = (summary.protocol_version or "").strip().upper()
+        return transport == "ATA" or protocol_version.startswith("SATA")
+
     @staticmethod
     def _merge_missing_smart_fields(
         primary: SmartSummaryView,
@@ -5647,6 +5816,8 @@ class InventoryService:
             "last_test_status",
             "last_test_lifetime_hours",
             "last_test_age_hours",
+            "power_cycle_count",
+            "power_on_resets",
             "power_on_hours",
             "power_on_days",
             "logical_block_size",
@@ -5660,12 +5831,16 @@ class InventoryService:
             "annualized_bytes_written",
             "estimated_lifetime_bytes_written",
             "estimated_remaining_bytes_written",
+            "read_commands",
+            "write_commands",
             "media_errors",
             "predictive_errors",
             "non_medium_errors",
             "uncorrected_read_errors",
             "uncorrected_write_errors",
             "unsafe_shutdowns",
+            "hardware_resets",
+            "interface_crc_errors",
             "rotation_rate_rpm",
             "form_factor",
             "firmware_version",

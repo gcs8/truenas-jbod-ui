@@ -52,10 +52,24 @@ class TrueNASConfig(BaseModel):
     enclosure_filter: str | None = None
 
 
+class HANodeConfig(BaseModel):
+    system_id: str | None = None
+    label: str | None = None
+    host: str | None = None
+
+    @field_validator("system_id", "label", "host", mode="before")
+    @classmethod
+    def _normalize_text_fields(cls, value: Any) -> str | None:
+        normalized = normalize_text(str(value) if value is not None else None)
+        return normalized or None
+
+
 class SSHConfig(BaseModel):
     enabled: bool = False
     host: str = ""
     extra_hosts: list[str] = Field(default_factory=list)
+    ha_enabled: bool = False
+    ha_nodes: list[HANodeConfig] = Field(default_factory=list)
     port: int = 22
     user: str = ""
     key_path: str = "/run/ssh/id_truenas"
@@ -74,6 +88,21 @@ class SSHConfig(BaseModel):
             "sesutil show",
         ]
     )
+
+    @field_validator("ha_nodes", mode="after")
+    @classmethod
+    def _normalize_ha_nodes(cls, value: list[HANodeConfig]) -> list[HANodeConfig]:
+        normalized: list[HANodeConfig] = []
+        seen: set[tuple[str | None, str | None]] = set()
+        for node in value[:3]:
+            if not (node.system_id or node.label or node.host):
+                continue
+            dedupe_key = (node.system_id, node.host)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            normalized.append(node)
+        return normalized
 
 
 class EnclosureProfileConfig(BaseModel):
@@ -118,6 +147,7 @@ class StorageViewRenderConfig(BaseModel):
 
 class StorageViewBindingConfig(BaseModel):
     mode: StorageViewBindingMode = "auto"
+    target_system_id: str | None = None
     enclosure_ids: list[str] = Field(default_factory=list)
     pool_names: list[str] = Field(default_factory=list)
     serials: list[str] = Field(default_factory=list)
@@ -221,6 +251,7 @@ class StorageViewConfig(BaseModel):
 
         return value.model_copy(
             update={
+                "target_system_id": normalize_text(value.target_system_id),
                 "enclosure_ids": _clean_list(value.enclosure_ids),
                 "pool_names": _clean_list(value.pool_names),
                 "serials": _clean_list(value.serials),

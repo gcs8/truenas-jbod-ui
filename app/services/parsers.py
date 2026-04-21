@@ -352,6 +352,97 @@ def _extract_ata_attribute_raw_value(payload: dict[str, Any], *attribute_ids: in
     return None
 
 
+def _extract_ata_attribute_entry(payload: dict[str, Any], *attribute_ids: int) -> dict[str, Any] | None:
+    table = (
+        payload.get("ata_smart_attributes", {}).get("table")
+        if isinstance(payload.get("ata_smart_attributes"), dict)
+        else None
+    )
+    if not isinstance(table, list):
+        return None
+
+    attribute_id_set = set(attribute_ids)
+    for entry in table:
+        if isinstance(entry, dict) and entry.get("id") in attribute_id_set:
+            return entry
+    return None
+
+
+def _ata_attribute_raw_value_to_bytes(entry: dict[str, Any], sector_size: int) -> int | None:
+    raw_value = entry.get("raw")
+    parsed_raw_value = None
+    if isinstance(raw_value, dict):
+        for candidate in (raw_value.get("value"), raw_value.get("string")):
+            parsed_raw_value = _coerce_int_like(candidate)
+            if parsed_raw_value is not None and parsed_raw_value >= 0:
+                break
+    else:
+        parsed_raw_value = _coerce_int_like(raw_value)
+
+    if parsed_raw_value is None or parsed_raw_value < 0:
+        return None
+
+    attribute_name = normalize_text(entry.get("name")) or ""
+    name_match = re.search(r"_(\d+)(KiB|MiB|GiB|TiB)$", attribute_name)
+    if name_match:
+        unit_value = int(name_match.group(1))
+        unit_name = name_match.group(2)
+        unit_scale = {
+            "KiB": 1024,
+            "MiB": 1024**2,
+            "GiB": 1024**3,
+            "TiB": 1024**4,
+        }.get(unit_name)
+        if unit_scale is not None:
+            return parsed_raw_value * unit_value * unit_scale
+
+    return parsed_raw_value * sector_size
+
+
+def _extract_ata_device_stat_bytes(payload: dict[str, Any], stat_name: str, sector_size: int) -> int | None:
+    ata_device_statistics = (
+        payload.get("ata_device_statistics")
+        if isinstance(payload.get("ata_device_statistics"), dict)
+        else {}
+    )
+    pages = ata_device_statistics.get("pages") if isinstance(ata_device_statistics.get("pages"), list) else []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        table = page.get("table") if isinstance(page.get("table"), list) else []
+        for entry in table:
+            if not isinstance(entry, dict):
+                continue
+            if normalize_text(entry.get("name")) != stat_name:
+                continue
+            value = _coerce_int_like(entry.get("value"))
+            if value is not None and value >= 0:
+                return value * sector_size
+    return None
+
+
+def _extract_ata_device_stat_int(payload: dict[str, Any], stat_name: str) -> int | None:
+    ata_device_statistics = (
+        payload.get("ata_device_statistics")
+        if isinstance(payload.get("ata_device_statistics"), dict)
+        else {}
+    )
+    pages = ata_device_statistics.get("pages") if isinstance(ata_device_statistics.get("pages"), list) else []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        table = page.get("table") if isinstance(page.get("table"), list) else []
+        for entry in table:
+            if not isinstance(entry, dict):
+                continue
+            if normalize_text(entry.get("name")) != stat_name:
+                continue
+            value = _coerce_int_like(entry.get("value"))
+            if value is not None and value >= 0:
+                return value
+    return None
+
+
 def parse_glabel_status(output: str) -> GlabelInfo:
     info = GlabelInfo()
     for line in output.splitlines():
@@ -1678,6 +1769,8 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         elif passed is False:
             smart_health_status = "FAILED"
     power_on_hours = power_on_time.get("hours") if isinstance(power_on_time.get("hours"), int) else None
+    power_cycle_count = _extract_ata_attribute_raw_value(payload, 12)
+    power_on_resets = _extract_ata_device_stat_int(payload, "Lifetime Power-On Resets")
     warning_temperature_c = None
     critical_temperature_c = None
     available_spare_percent = _coerce_non_negative_int(nvme_health.get("available_spare"))
@@ -1711,13 +1804,23 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         bytes_written = _scsi_gigabytes_processed_to_bytes(scsi_write_error_log.get("gigabytes_processed"))
     sector_size_for_ata = logical_block_size if isinstance(logical_block_size, int) and logical_block_size > 0 else 512
     if bytes_read is None:
-        ata_lbas_read = _extract_ata_attribute_raw_value(payload, 242)
-        if ata_lbas_read is not None:
-            bytes_read = ata_lbas_read * sector_size_for_ata
+        bytes_read = _extract_ata_device_stat_bytes(payload, "Logical Sectors Read", sector_size_for_ata)
     if bytes_written is None:
-        ata_lbas_written = _extract_ata_attribute_raw_value(payload, 241)
-        if ata_lbas_written is not None:
-            bytes_written = ata_lbas_written * sector_size_for_ata
+        bytes_written = _extract_ata_device_stat_bytes(payload, "Logical Sectors Written", sector_size_for_ata)
+    if bytes_read is None:
+        ata_read_entry = _extract_ata_attribute_entry(payload, 242)
+        if ata_read_entry is not None:
+            bytes_read = _ata_attribute_raw_value_to_bytes(ata_read_entry, sector_size_for_ata)
+    if bytes_written is None:
+        ata_write_entry = _extract_ata_attribute_entry(payload, 241)
+        if ata_write_entry is not None:
+            bytes_written = _ata_attribute_raw_value_to_bytes(ata_write_entry, sector_size_for_ata)
+    if available_spare_percent is None:
+        available_spare_percent = _extract_ata_attribute_raw_value(payload, 232, 169)
+    if endurance_used_percent is None:
+        endurance_used_percent = _extract_ata_device_stat_int(payload, "Percentage Used Endurance Indicator")
+    if endurance_remaining_percent is None and endurance_used_percent is not None:
+        endurance_remaining_percent = max(0, 100 - endurance_used_percent)
     annualized_bytes_written = _annualize_bytes_written(bytes_written, power_on_hours)
     estimated_lifetime_bytes_written = (
         int(bytes_written * 100 / endurance_used_percent)
@@ -1737,6 +1840,12 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
     sas_address: str | None = None
     attached_sas_address: str | None = None
     negotiated_link_rate: str | None = None
+    read_commands = _extract_ata_device_stat_int(payload, "Number of Read Commands")
+    write_commands = _extract_ata_device_stat_int(payload, "Number of Write Commands")
+    hardware_resets = _extract_ata_device_stat_int(payload, "Number of Hardware Resets")
+    interface_crc_errors = _extract_ata_device_stat_int(payload, "Number of Interface CRC Errors")
+    if interface_crc_errors is None:
+        interface_crc_errors = _extract_ata_attribute_raw_value(payload, 199)
     read_cache_enabled = (
         payload.get("read_lookahead", {}).get("enabled")
         if isinstance(payload.get("read_lookahead"), dict)
@@ -1834,6 +1943,8 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
                 latest_test_type,
                 latest_test_status,
                 latest_test_lifetime_hours,
+                power_cycle_count,
+                power_on_resets,
                 logical_block_size if isinstance(logical_block_size, int) else None,
                 physical_block_size if isinstance(physical_block_size, int) else None,
                 available_spare_percent,
@@ -1844,8 +1955,12 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
                 bytes_written,
                 annualized_bytes_written,
                 estimated_remaining_bytes_written,
+                read_commands,
+                write_commands,
                 media_errors,
                 unsafe_shutdowns,
+                hardware_resets,
+                interface_crc_errors,
                 rotation_rate,
                 form_factor,
                 firmware_version,
@@ -1866,6 +1981,8 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         "warning_temperature_c": warning_temperature_c,
         "critical_temperature_c": critical_temperature_c,
         "smart_health_status": smart_health_status,
+        "power_cycle_count": power_cycle_count,
+        "power_on_resets": power_on_resets,
         "power_on_hours": power_on_hours,
         "power_on_days": power_on_hours // 24 if isinstance(power_on_hours, int) else None,
         "last_test_type": latest_test_type,
@@ -1889,8 +2006,12 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         "annualized_bytes_written": annualized_bytes_written,
         "estimated_lifetime_bytes_written": estimated_lifetime_bytes_written,
         "estimated_remaining_bytes_written": estimated_remaining_bytes_written,
+        "read_commands": read_commands,
+        "write_commands": write_commands,
         "media_errors": media_errors,
         "unsafe_shutdowns": unsafe_shutdowns,
+        "hardware_resets": hardware_resets,
+        "interface_crc_errors": interface_crc_errors,
         "rotation_rate_rpm": rotation_rate,
         "form_factor": form_factor,
         "firmware_version": firmware_version,
@@ -2051,6 +2172,7 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
     sas_address: str | None = None
     attached_sas_address: str | None = None
     negotiated_link_rate: str | None = None
+    trim_supported: bool | None = None
 
     for raw_line in output.splitlines():
         line = raw_line.strip()
@@ -2108,6 +2230,14 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
             attached_sas_address = format_hex_identifier(line.split("=", 1)[1])
         elif line.startswith("negotiated logical link rate:"):
             negotiated_link_rate = normalize_text(line.split(":", 1)[1])
+        elif line.startswith("TRIM Command:"):
+            value = normalize_text(line.split(":", 1)[1])
+            if value:
+                lowered = value.lower()
+                if lowered.startswith("available"):
+                    trim_supported = True
+                elif lowered.startswith("unavailable") or lowered.startswith("not supported"):
+                    trim_supported = False
 
     return {
         "available": any(
@@ -2122,6 +2252,7 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
                 sas_address,
                 attached_sas_address,
                 negotiated_link_rate,
+                trim_supported,
             )
         ),
         "read_cache_enabled": read_cache_enabled,
@@ -2133,6 +2264,7 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
         "sas_address": sas_address,
         "attached_sas_address": attached_sas_address,
         "negotiated_link_rate": negotiated_link_rate,
+        "trim_supported": trim_supported,
     }
 
 

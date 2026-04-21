@@ -21,7 +21,7 @@ class HistorySettings(BaseModel):
     monthly_backup_retention_count: int = 3
     poll_interval_seconds: int = 300
     fast_interval_seconds: int = 300
-    slow_interval_seconds: int = 21600
+    slow_interval_seconds: int = 3600
     request_timeout_seconds: int = 20
     smart_batch_size: int = 24
     startup_grace_seconds: int = 20

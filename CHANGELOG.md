@@ -2,7 +2,78 @@
 
 ## Unreleased
 
-- Follow-up work after the `v0.10.0` cut lands here.
+Working branch for the next feature set after `v0.11.0`.
+
+### Carry-over notes
+
+- Snapshot-export estimate profiling/tuning after the accepted `v0.11.0` cut
+- Broader live-host sanity beyond the validated Quantastor SATADOM pass
+- CORE bootstrap backend/docs alignment plus the next cleanup slice chosen from
+  `HANDOFF.md` / `TODO.md`
+
+## v0.11.0 - 2026-04-21
+
+### Added
+
+- Cluster-style Quantastor HA modeling under one saved system entry, including
+  up to three explicit HA nodes, admin-side node discovery from the Quantastor
+  API, and per-storage-view target-node binding for internal groups such as
+  SATADOM pairs
+- Admin-side history maintenance tools for:
+  - deleting a saved system with optional history purge
+  - purging orphaned history rows whose `system_id` no longer exists in the
+    saved config
+  - adopting removed-system history into a new saved system id after a rename
+    or remap
+- Richer history-sidecar disk identity capture, including persistent-id type,
+  logical unit id, and SAS address fields that make later disk-follow or
+  system-adoption flows safer
+- Checked-in `v0.11.0` screenshots for the refreshed README/wiki pages,
+  including the Quantastor HA SATADOM view and the admin maintenance surface
+
+### Changed
+
+- Inventory-bound storage views now behave much more like first-class runtime
+  targets:
+  - storage-view history stays available for internal views such as SATADOMs
+  - disk-oriented metrics can auto-follow the same physical disk across homes
+    when the history sidecar has a strong identity match
+  - virtual storage views can pin a target Quantastor HA node instead of
+    always resolving against the currently selected appliance member
+- The admin setup flow now treats recommended SSH command lists as
+  platform-owned defaults until the operator edits them, so switching a fresh
+  form from CORE to Quantastor no longer saves inherited FreeBSD command lists
+  into a new Quantastor system
+- Quantastor storage-view SATADOM detail now surfaces richer ATA device
+  statistics such as TRIM support, power cycles, power-on resets,
+  command-count totals, interface resets, and endurance/spare values from the
+  Silicon Motion SMART data
+
+### Fixed
+
+- Quantastor storage-view auto-refresh no longer repaints SATADOM views with a
+  one-tick empty placeholder state before the matched runtime payload settles
+- Storage-view slot hover/detail now lazy-loads the same richer SMART surface
+  that live enclosure slots already had, instead of staying metadata-thin for
+  inventory-bound views
+- History reads no longer hide older local samples just because legacy rows
+  were missing the newer `disk_identity_key`; local slot history is merged back
+  in and eligible older rows are backfilled
+- The admin storage-view editor no longer snaps away from the selected view
+  while you edit the `View ID`, and view-label whitespace now survives normal
+  rerenders
+- Disabled admin buttons now use a normal blocked cursor instead of looking
+  like a busy spinner forever
+
+### Docs
+
+- Refreshed the README screenshots and release-facing operator copy to the
+  current `v0.11.0` behavior
+- Rewrote the repo/wiki Quantastor guide around the live HA-node model instead
+  of the old single-host `qs-cryostorage` shape
+- Added a dedicated wiki page for history maintenance and recovery, covering
+  `Delete + Purge History`, `Purge Orphaned Data`, and `Adopt Removed System
+  History`
 
 ## v0.10.0 - 2026-04-19
 

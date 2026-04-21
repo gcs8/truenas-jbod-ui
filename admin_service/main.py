@@ -25,9 +25,12 @@ from admin_service.services.tls_trust import TLSTrustStoreService
 from app import __version__
 from app.config import (
     Settings,
+    TrueNASConfig,
     get_settings,
 )
 from app.models.domain import (
+    HistoryAdoptRequest,
+    QuantastorNodeDiscoveryRequest,
     SSHKeyGenerateRequest,
     SystemBackupExportRequest,
     SystemSetupBootstrapRequest,
@@ -39,10 +42,12 @@ from app.models.domain import (
 )
 from app.services.profile_registry import ProfileRegistry
 from app.services.inventory_registry import InventoryRegistry
+from app.services.quantastor_api import QuantastorRESTClient
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.storage_view_templates import list_storage_view_templates
 from app.services.storage_views import resolve_system_storage_views
 from app.services.system_setup import SystemSetupService, default_ssh_commands_for_platform
+from app.services.parsers import normalize_text
 from history_service.config import get_history_settings
 from history_service.store import HistoryStore
 from history_service.system_backup import SystemBackupService
@@ -58,6 +63,12 @@ SERVICE_STARTED_AT = datetime.now(timezone.utc)
 def reload_app_settings() -> Settings:
     get_settings.cache_clear()
     return get_settings()
+
+
+@lru_cache
+def get_history_store() -> HistoryStore:
+    history_settings = get_history_settings()
+    return HistoryStore(history_settings.sqlite_path)
 
 
 def decode_optional_secret_header(value: str | None) -> str | None:
@@ -76,8 +87,7 @@ def decode_optional_secret_header(value: str | None) -> str | None:
 @lru_cache
 def get_backup_service() -> SystemBackupService:
     history_settings = get_history_settings()
-    store = HistoryStore(history_settings.sqlite_path)
-    return SystemBackupService(history_settings, store)
+    return SystemBackupService(history_settings, get_history_store())
 
 
 @lru_cache
@@ -92,6 +102,32 @@ def get_maintenance_service() -> AdminMaintenanceService:
         get_backup_service(),
         get_runtime_service(),
         clean_backup_targets=admin_settings.clean_backup_targets,
+    )
+
+
+def _format_count(value: int, singular: str, plural: str | None = None) -> str:
+    label = singular if value == 1 else (plural or f"{singular}s")
+    return f"{value} {label}"
+
+
+def format_history_cleanup_summary(summary: dict[str, Any]) -> str:
+    tracked_slots = int(summary.get("tracked_slots", 0) or 0)
+    event_count = int(summary.get("event_count", 0) or 0)
+    metric_sample_count = int(summary.get("metric_sample_count", 0) or 0)
+    return ", ".join(
+        (
+            _format_count(tracked_slots, "tracked slot"),
+            _format_count(event_count, "event"),
+            _format_count(metric_sample_count, "metric sample"),
+        )
+    )
+
+
+def format_history_system_summary(summary: dict[str, Any]) -> str:
+    total_rows = int(summary.get("total_rows", 0) or 0)
+    return (
+        f"{summary.get('system_label') or summary.get('system_id')} "
+        f"({_format_count(total_rows, 'saved history row')}; {format_history_cleanup_summary(summary)})"
     )
 
 
@@ -326,6 +362,29 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse({"ok": True, **trusted})
 
+    @app.post("/api/admin/system-setup/quantastor-nodes")
+    async def discover_quantastor_nodes(payload: QuantastorNodeDiscoveryRequest) -> JSONResponse:
+        client = QuantastorRESTClient(
+            TrueNASConfig(
+                host=payload.truenas_host,
+                api_user=payload.api_user,
+                api_password=payload.api_password,
+                platform="quantastor",
+                verify_ssl=payload.verify_ssl,
+                tls_ca_bundle_path=payload.tls_ca_bundle_path,
+                tls_server_name=payload.tls_server_name,
+                timeout_seconds=payload.timeout_seconds,
+            )
+        )
+        try:
+            raw_data = await client.fetch_all()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - surface discovery failures directly in setup.
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        nodes = serialize_quantastor_nodes(raw_data)
+        return JSONResponse({"ok": True, "nodes": nodes})
+
     @app.post("/api/admin/system-setup")
     async def create_system(payload: SystemSetupRequest) -> JSONResponse:
         settings = reload_app_settings()
@@ -359,6 +418,196 @@ def create_app() -> FastAPI:
             }
         )
 
+    @app.delete("/api/admin/system-setup/{system_id}")
+    async def delete_system(system_id: str, purge_history: bool = False) -> JSONResponse:
+        settings = reload_app_settings()
+        setup_service = SystemSetupService(settings.config_file)
+        try:
+            deleted_label, next_default_id = await asyncio.to_thread(setup_service.delete_system, system_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        history_purge: dict[str, Any] = {
+            "requested": purge_history,
+            "ok": True,
+            "summary": None,
+            "detail": "Saved history left in place.",
+        }
+        if purge_history:
+            history_store = get_history_store()
+            try:
+                purge_summary = await asyncio.to_thread(history_store.delete_system_history, system_id)
+                if purge_summary["total_rows"]:
+                    purge_detail = (
+                        f"Purged {_format_count(int(purge_summary['total_rows']), 'saved history row')} "
+                        f"({format_history_cleanup_summary(purge_summary)})."
+                    )
+                else:
+                    purge_detail = f"No saved history rows matched {system_id}."
+                history_purge = {
+                    "requested": True,
+                    "ok": True,
+                    "summary": purge_summary,
+                    "detail": purge_detail,
+                }
+            except Exception as exc:  # noqa: BLE001 - config delete already succeeded, so surface purge failure as warning payload.
+                logger.exception("History purge failed after deleting saved system %s", system_id)
+                history_purge = {
+                    "requested": True,
+                    "ok": False,
+                    "summary": None,
+                    "detail": f"Saved history purge failed: {exc}",
+                }
+
+        refreshed_settings = reload_app_settings()
+        runtime_service = get_runtime_service()
+        await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
+        detail = f"Removed {deleted_label}."
+        if purge_history:
+            detail = f"{detail} {history_purge['detail']}"
+        detail = f"{detail} Restart the Read UI container to drop the deleted system from the live runtime."
+        return JSONResponse(
+            {
+                "ok": True,
+                "system_id": system_id,
+                "deleted_label": deleted_label,
+                "systems": serialize_systems(refreshed_settings),
+                "default_system_id": next_default_id,
+                "detail": detail,
+                "history_purge": history_purge,
+                "restart_required": ["ui"],
+                "runtime": runtime_service.status_payload(),
+            }
+        )
+
+    @app.post("/api/admin/history/purge-orphaned")
+    async def purge_orphaned_history() -> JSONResponse:
+        settings = reload_app_settings()
+        valid_system_ids = [system.id for system in settings.systems]
+        history_store = get_history_store()
+        try:
+            summary = await asyncio.to_thread(history_store.purge_orphaned_history, valid_system_ids)
+        except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
+            raise HTTPException(status_code=500, detail=f"Unable to purge orphaned history: {exc}") from exc
+
+        removed_system_ids = list(summary.get("removed_system_ids") or [])
+        if summary["total_rows"]:
+            removed_text = ", ".join(removed_system_ids)
+            detail = (
+                f"Purged orphaned history for {removed_text}: "
+                f"{_format_count(int(summary['total_rows']), 'saved history row')} "
+                f"({format_history_cleanup_summary(summary)})."
+            )
+        else:
+            detail = "No orphaned history rows matched the current config."
+        return JSONResponse(
+            {
+                "ok": True,
+                "detail": detail,
+                "summary": summary,
+                "valid_system_ids": valid_system_ids,
+            }
+        )
+
+    @app.get("/api/admin/history/orphaned")
+    async def list_orphaned_history() -> JSONResponse:
+        settings = reload_app_settings()
+        valid_system_ids = [system.id for system in settings.systems]
+        history_store = get_history_store()
+        try:
+            orphaned_systems = await asyncio.to_thread(
+                history_store.list_history_system_summaries,
+                valid_system_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
+            raise HTTPException(status_code=500, detail=f"Unable to inspect orphaned history: {exc}") from exc
+
+        return JSONResponse(
+            {
+                "ok": True,
+                "orphaned_systems": orphaned_systems,
+                "valid_system_ids": valid_system_ids,
+            }
+        )
+
+    @app.post("/api/admin/history/adopt-removed-system")
+    async def adopt_removed_system_history(payload: HistoryAdoptRequest) -> JSONResponse:
+        settings = reload_app_settings()
+        valid_system_ids = [system.id for system in settings.systems]
+        source_system_id = normalize_text(payload.source_system_id)
+        target_system_id = normalize_text(payload.target_system_id)
+        if not source_system_id:
+            raise HTTPException(status_code=400, detail="Source system id is required.")
+        if not target_system_id:
+            raise HTTPException(status_code=400, detail="Target system id is required.")
+        if source_system_id == target_system_id:
+            raise HTTPException(status_code=400, detail="Source and target system ids must be different.")
+
+        target_system = next((system for system in settings.systems if system.id == target_system_id), None)
+        if target_system is None:
+            raise HTTPException(status_code=400, detail=f"Target system {target_system_id} is not in the saved config.")
+
+        history_store = get_history_store()
+        try:
+            orphaned_systems = await asyncio.to_thread(
+                history_store.list_history_system_summaries,
+                valid_system_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
+            raise HTTPException(status_code=500, detail=f"Unable to inspect orphaned history: {exc}") from exc
+
+        source_summary = next(
+            (summary for summary in orphaned_systems if summary.get("system_id") == source_system_id),
+            None,
+        )
+        if source_summary is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Source system {source_system_id} is not currently orphaned history.",
+            )
+
+        try:
+            summary = await asyncio.to_thread(
+                history_store.adopt_system_history,
+                source_system_id,
+                target_system_id,
+                target_system_label=target_system.label,
+            )
+            remaining_orphaned_systems = await asyncio.to_thread(
+                history_store.list_history_system_summaries,
+                valid_system_ids,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
+            raise HTTPException(status_code=500, detail=f"Unable to adopt removed system history: {exc}") from exc
+
+        if summary["total_rows"]:
+            detail = (
+                f"Adopted {format_history_system_summary(source_summary)} into "
+                f"{target_system.label}. Refresh an open History drawer to pull the updated rows."
+            )
+            if int(summary.get("slot_state_conflicts", 0) or 0) > 0:
+                detail = (
+                    f"{detail} Kept {_format_count(int(summary['slot_state_conflicts']), 'current-slot row')} "
+                    "already present on the target where scopes overlapped."
+                )
+        else:
+            detail = f"No saved history rows matched {source_system_id}."
+
+        return JSONResponse(
+            {
+                "ok": True,
+                "detail": detail,
+                "summary": summary,
+                "source": source_summary,
+                "target_system_id": target_system.id,
+                "target_system_label": target_system.label,
+                "orphaned_systems": remaining_orphaned_systems,
+                "valid_system_ids": valid_system_ids,
+            }
+        )
+
     @app.post("/api/admin/system-setup/bootstrap")
     async def bootstrap_service_account(payload: SystemSetupBootstrapRequest) -> JSONResponse:
         settings = reload_app_settings()
@@ -386,13 +635,17 @@ def create_app() -> FastAPI:
     @app.get("/api/admin/storage-views/candidates")
     async def list_storage_view_candidates(
         system_id: str | None = None,
+        target_system_id: str | None = None,
         force: bool = Query(default=False),
     ) -> JSONResponse:
         settings = reload_app_settings()
         registry = InventoryRegistry(settings)
         service = registry.get_service(system_id)
         try:
-            candidates = await service.get_storage_view_candidates(force_refresh=force)
+            candidates = await service.get_storage_view_candidates(
+                force_refresh=force,
+                target_system_id=target_system_id,
+            )
         except Exception as exc:  # noqa: BLE001 - surface inventory issues as an admin-side error.
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return JSONResponse(
@@ -513,6 +766,14 @@ def serialize_systems(settings: Settings) -> list[dict[str, Any]]:
             "ssh_enabled": bool(system.ssh.enabled),
             "ssh_host": system.ssh.host,
             "ssh_extra_hosts": list(system.ssh.extra_hosts),
+            "ha_enabled": bool(
+                system.ssh.ha_enabled
+                or (
+                    system.truenas.platform == "quantastor"
+                    and (system.ssh.ha_nodes or system.ssh.extra_hosts)
+                )
+            ),
+            "ha_nodes": serialize_system_ha_nodes(system),
             "ssh_port": system.ssh.port,
             "ssh_user": system.ssh.user,
             "ssh_key_path": system.ssh.key_path,
@@ -528,6 +789,41 @@ def serialize_systems(settings: Settings) -> list[dict[str, Any]]:
     ]
 
 
+def serialize_system_ha_nodes(system: Any) -> list[dict[str, Any]]:
+    explicit_nodes = list(getattr(system.ssh, "ha_nodes", []) or [])
+    if explicit_nodes:
+        return [
+            {
+                "system_id": node.system_id,
+                "label": node.label,
+                "host": node.host,
+            }
+            for node in explicit_nodes[:3]
+            if node.system_id or node.label or node.host
+        ]
+
+    if getattr(system.truenas, "platform", None) != "quantastor":
+        return []
+
+    legacy_hosts = [
+        normalize_text(system.ssh.host),
+        *[
+            normalize_text(value)
+            for value in (system.ssh.extra_hosts or [])
+        ],
+    ]
+    nodes: list[dict[str, Any]] = []
+    for index, host in enumerate(host for host in legacy_hosts if host):
+        nodes.append(
+            {
+                "system_id": None,
+                "label": f"Configured Node {index + 1}",
+                "host": host,
+            }
+        )
+    return nodes[:3]
+
+
 def serialize_storage_views(system: Any, profile_registry: ProfileRegistry) -> list[dict[str, Any]]:
     stored_views = resolve_system_storage_views(system, profile_registry)
     return [
@@ -540,7 +836,7 @@ def serialize_storage_views(system: Any, profile_registry: ProfileRegistry) -> l
             "enabled": bool(storage_view.enabled),
             "order": storage_view.order,
             "render": storage_view.render.model_dump(mode="json"),
-            "binding": storage_view.binding.model_dump(mode="json"),
+            "binding": storage_view.binding.model_dump(mode="json", exclude_none=True),
             "layout_overrides": (
                 storage_view.layout_overrides.model_dump(mode="json")
                 if storage_view.layout_overrides is not None
@@ -578,6 +874,46 @@ def serialize_profiles(settings: Settings) -> list[dict[str, Any]]:
             }
         )
     return profiles
+
+
+def serialize_quantastor_nodes(raw_data: Any) -> list[dict[str, Any]]:
+    if raw_data is None:
+        return []
+
+    hardware_system_ids = {
+        system_id
+        for system_id in (
+            normalize_text(str(item.get("storageSystemId")) if item.get("storageSystemId") is not None else None)
+            for item in [*(getattr(raw_data, "hw_disks", []) or []), *(getattr(raw_data, "hw_enclosures", []) or [])]
+        )
+        if system_id
+    }
+    nodes: list[dict[str, Any]] = []
+    for system_row in getattr(raw_data, "systems", []) or []:
+        system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+        if not system_id:
+            continue
+        if hardware_system_ids and system_id not in hardware_system_ids:
+            continue
+        nodes.append(
+            {
+                "system_id": system_id,
+                "label": (
+                    normalize_text(
+                        str(system_row.get("name") or system_row.get("hostname") or system_row.get("description") or system_id)
+                    )
+                    or system_id
+                ),
+                "host": normalize_text(system_row.get("hostname") or system_row.get("ipAddress")),
+                "cluster_id": normalize_text(
+                    str(system_row.get("storageSystemClusterId"))
+                    if system_row.get("storageSystemClusterId") is not None
+                    else None
+                ),
+                "is_master": bool(system_row.get("isMaster")),
+            }
+        )
+    return nodes
 
 
 def serialize_platform_defaults() -> dict[str, dict[str, object]]:
