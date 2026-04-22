@@ -44,6 +44,15 @@ Create or keep these paths beside the repo checkout:
 ./logs
 ```
 
+From the repo root on Linux, this one command creates the full directory tree
+the UI, history sidecar, and admin sidecar expect to find:
+
+```bash
+mkdir -p config config/ssh data history/backups/long-term logs
+```
+
+That is safe to run even if some of the directories already exist.
+
 Copy the usual example files first:
 
 ```bash
