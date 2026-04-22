@@ -83,9 +83,14 @@ UNIFI_GPIO_LED_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 }
+UNIFI_BOOT_MEDIA_PROFILE_IDS = {
+    UNIFI_UNVR_FRONT_4_PROFILE_ID,
+    UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+}
 STABLE_SLOT_DETAIL_FIELDS = (
     "device_name",
     "smart_device_names",
+    "smart_device_type",
     "serial",
     "model",
     "size_bytes",
@@ -510,6 +515,7 @@ class InventoryService:
             state=SlotState.healthy if runtime_slot.occupied else SlotState.empty,
             device_name=runtime_slot.device_name,
             smart_device_names=list(runtime_slot.smart_device_names),
+            smart_device_type=runtime_slot.smart_device_type,
             serial=runtime_slot.serial,
             model=runtime_slot.model,
             size_bytes=runtime_slot.size_bytes,
@@ -534,6 +540,7 @@ class InventoryService:
                 "transport_address": runtime_slot.transport_address,
                 "target_system_id": runtime_slot.target_system_id,
                 "candidate_id": runtime_slot.candidate_id,
+                "smartctl_device_type": runtime_slot.smart_device_type,
             },
         )
 
@@ -605,6 +612,7 @@ class InventoryService:
                     snapshot_slot=slot.slot if slot else slot_value,
                     device_name=slot.device_name if slot else None,
                     smart_device_names=list(slot.smart_device_names) if slot else [],
+                    smart_device_type=slot.smart_device_type if slot else None,
                     serial=slot.serial if slot else None,
                     pool_name=slot.pool_name if slot else None,
                     model=slot.model if slot else None,
@@ -788,6 +796,7 @@ class InventoryService:
             assignment_rank=assignment_rank,
             device_name=(candidate.get("device_names") or [None])[0],
             smart_device_names=list(candidate.get("smart_device_names") or []),
+            smart_device_type=normalize_text(candidate.get("smartctl_device_type")),
             serial=candidate.get("serial"),
             pool_name=candidate.get("pool_name"),
             model=candidate.get("model"),
@@ -1562,6 +1571,7 @@ class InventoryService:
         allow_stale_cache: bool = False,
     ) -> SmartSummaryView:
         slot = slot_view.slot
+        smartctl_device_type = self._smart_candidate_device_type(slot_view)
         if self.system.truenas.platform == "quantastor":
             summary = self._merge_smart_summary(slot_view, self._build_quantastor_smart_summary(slot_view))
             candidates = self._smart_candidate_devices(slot_view)
@@ -1569,6 +1579,7 @@ class InventoryService:
                 ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(
                     candidates,
                     hosts=self._build_quantastor_preferred_hosts(slot_view),
+                    device_type=smartctl_device_type,
                 )
                 if ssh_summary is not None:
                     summary = self._merge_missing_smart_fields(
@@ -1610,7 +1621,10 @@ class InventoryService:
 
         add_perf_metadata(smart_cache="miss", smart_candidate_count=len(candidates))
         if self.system.truenas.platform in {"scale", "linux"}:
-            summary, error_message = await self._fetch_smart_summary_over_ssh(candidates)
+            summary, error_message = await self._fetch_smart_summary_over_ssh(
+                candidates,
+                device_type=smartctl_device_type,
+            )
             if summary is not None:
                 summary = self._merge_smart_summary(slot_view, summary)
                 self._smart_cache[cache_key] = summary
@@ -1663,7 +1677,10 @@ class InventoryService:
                         ),
                     )
             if self._summary_prefers_core_ssh_json(api_summary):
-                ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(candidates)
+                ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(
+                    candidates,
+                    device_type=smartctl_device_type,
+                )
                 if ssh_summary is not None:
                     api_summary = self._merge_missing_smart_fields(
                         self._merge_smart_summary(slot_view, ssh_summary),
@@ -1676,7 +1693,10 @@ class InventoryService:
             return api_summary
 
         if self.system.ssh.enabled:
-            ssh_summary, ssh_error = await self._fetch_smart_summary_over_ssh(candidates)
+            ssh_summary, ssh_error = await self._fetch_smart_summary_over_ssh(
+                candidates,
+                device_type=smartctl_device_type,
+            )
             if ssh_summary is not None:
                 ssh_summary = self._merge_smart_summary(slot_view, ssh_summary)
                 self._smart_cache[cache_key] = ssh_summary
@@ -1738,6 +1758,7 @@ class InventoryService:
         self,
         candidates: list[str],
         hosts: list[str] | None = None,
+        device_type: str | None = None,
     ) -> tuple[SmartSummaryView | None, str | None]:
         if not self.system.ssh.enabled:
             return None, (
@@ -1755,16 +1776,11 @@ class InventoryService:
                 for candidate in candidates:
                     device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
                     for smartctl_binary in self._smartctl_binary_candidates():
-                        command = shlex.join(
-                            [
-                                "sudo",
-                                "-n",
-                                smartctl_binary,
-                                "-x",
-                                "-j",
-                                device_path,
-                            ]
-                        )
+                        command_parts = ["sudo", "-n", smartctl_binary]
+                        if device_type:
+                            command_parts.extend(["-d", device_type])
+                        command_parts.extend(["-x", "-j", device_path])
+                        command = shlex.join(command_parts)
                         result = await self._run_ssh_command(command, target_host)
                         summary = None
                         if result.stdout.strip():
@@ -1786,15 +1802,11 @@ class InventoryService:
                                 continue
                             break
 
-                        text_command = shlex.join(
-                            [
-                                "sudo",
-                                "-n",
-                                smartctl_binary,
-                                "-x",
-                                device_path,
-                            ]
-                        )
+                        text_command_parts = ["sudo", "-n", smartctl_binary]
+                        if device_type:
+                            text_command_parts.extend(["-d", device_type])
+                        text_command_parts.extend(["-x", device_path])
+                        text_command = shlex.join(text_command_parts)
                         text_result = await self._run_ssh_command(text_command, target_host)
                         if text_result.stdout.strip():
                             summary = self._merge_missing_smart_fields(
@@ -2322,6 +2334,7 @@ class InventoryService:
             or normalize_text(device_names[0] if device_names else None)
         )
         description_parts = [
+            "embedded boot media" if disk.raw.get("boot_media") else None,
             normalize_text(disk.bus),
             normalize_text(disk.model),
             size_human,
@@ -2369,6 +2382,7 @@ class InventoryService:
             "attached_sas_address": normalize_hex_identifier(disk.raw.get("attachedSasAddress") or disk.raw.get("attached_sas_address")),
             "transport_address": transport_address,
             "description": ", ".join(part for part in description_parts if part),
+            "smartctl_device_type": normalize_text(disk.raw.get("smartctl_device_type")),
             "recommended_binding": {
                 "serials": [disk.serial] if disk.serial else [],
                 "pcie_addresses": [transport_address] if transport_address else [],
@@ -4451,9 +4465,35 @@ class InventoryService:
             }
         return candidates
 
+    def _linux_profile_id(self) -> str | None:
+        return self.profile_registry.select_profile_id(self.system)
+
+    def _supports_linux_boot_media_inventory(self) -> bool:
+        return (
+            self.system.truenas.platform == "linux"
+            and self._linux_profile_id() in UNIFI_BOOT_MEDIA_PROFILE_IDS
+        )
+
+    @staticmethod
+    def _is_linux_boot_media_device_name(device_name: str | None) -> bool:
+        return normalize_device_name(device_name) == "boot"
+
+    @staticmethod
+    def _linux_boot_media_topology(blockdevice: dict[str, Any]) -> dict[str, Any]:
+        device_name = normalize_device_name(blockdevice.get("name")) or "boot"
+        return {
+            "top_array_name": None,
+            "top_array_path": normalize_text(blockdevice.get("path")) or f"/dev/{device_name}",
+            "top_mountpoint": None,
+            "top_role": "system",
+            "top_volume_type": normalize_text(blockdevice.get("type")) or "disk",
+            "pool_name": None,
+        }
+
     def _build_linux_disk_records(self, ssh_data: ParsedSSHData) -> list[DiskRecord]:
         controllers: dict[str, dict[str, Any]] = {}
         ubntstorage_by_node: dict[str, dict[str, Any]] = {}
+        supports_boot_media = self._supports_linux_boot_media_inventory()
         for entry in ssh_data.ubntstorage_disks:
             node = normalize_device_name(entry.get("node"))
             if node:
@@ -4560,14 +4600,19 @@ class InventoryService:
             device_name = normalize_device_name(blockdevice.get("name"))
             if not device_name or extract_nvme_controller_name(device_name):
                 continue
-            if not re.match(r"^(sd|hd|vd|xvd)[a-z]+$", device_name):
+            is_boot_media = supports_boot_media and self._is_linux_boot_media_device_name(device_name)
+            if not re.match(r"^(sd|hd|vd|xvd)[a-z]+$", device_name) and not is_boot_media:
                 continue
             device_type = normalize_text(blockdevice.get("type"))
             if device_type and device_type.lower() != "disk":
                 continue
             vendor_entry = ubntstorage_by_node.get(device_name.lower())
 
-            topology = self._describe_linux_storage_topology(blockdevice)
+            topology = (
+                self._linux_boot_media_topology(blockdevice)
+                if is_boot_media
+                else self._describe_linux_storage_topology(blockdevice)
+            )
             top_array_name = topology["top_array_name"]
             top_array_path = topology["top_array_path"]
             top_mountpoint = topology["top_mountpoint"]
@@ -4605,6 +4650,8 @@ class InventoryService:
                         "transport": normalize_text(blockdevice.get("tran")),
                         "vendor_slot": vendor_slot,
                         "vendor_raw": vendor_entry,
+                        "boot_media": is_boot_media,
+                        "smartctl_device_type": "scsi" if is_boot_media else None,
                     },
                     device_name=device_name,
                     path_device_name=device_name,
@@ -4617,7 +4664,7 @@ class InventoryService:
                     health=normalize_text(vendor_entry.get("healthy") if vendor_entry else None) or "ONLINE",
                     pool_name=pool_name,
                     lunid=None,
-                    bus=(normalize_text(blockdevice.get("tran")) or "disk").upper(),
+                    bus=(normalize_text(blockdevice.get("tran")) or ("scsi" if is_boot_media else "disk")).upper(),
                     temperature_c=None,
                     last_smart_test_type=None,
                     last_smart_test_status=None,
@@ -5292,6 +5339,10 @@ class InventoryService:
             identify_active=identify_active,
             device_name=device_name,
             smart_device_names=list(disk.smart_devices) if disk else [],
+            smart_device_type=(
+                normalize_text(raw_slot_status.get("smartctl_device_type"))
+                or (normalize_text(disk.raw.get("smartctl_device_type")) if disk else None)
+            ),
             serial=serial,
             model=model,
             size_bytes=size_bytes,
@@ -5700,6 +5751,17 @@ class InventoryService:
             candidates.append(normalized_device)
 
         return candidates
+
+    @staticmethod
+    def _smart_candidate_device_type(slot_view: SlotView) -> str | None:
+        return (
+            normalize_text(slot_view.smart_device_type)
+            or normalize_text(
+                str(slot_view.raw_status.get("smartctl_device_type"))
+                if slot_view.raw_status.get("smartctl_device_type") is not None
+                else None
+            )
+        )
 
     @staticmethod
     def _fallback_smart_summary(slot_view: SlotView, message: str) -> SmartSummaryView:

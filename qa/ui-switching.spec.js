@@ -329,6 +329,24 @@ test.describe("browser qa smoke", () => {
     await expect(page.locator("#detail-history-error")).toBeHidden();
   });
 
+  test("boot-device storage views render SATADOM-style cards", async ({ page }) => {
+    await gotoApp(page);
+    await setAutoRefresh(page, false);
+
+    const enclosureValues = await getSelectValues(page, "#enclosure-select");
+    const bootViewValue = enclosureValues.find((value) => value === "view:boot-doms");
+    test.skip(!bootViewValue, "Need the Boot SATADOMs storage view for SATADOM-card coverage.");
+
+    await switchEnclosure(page, bootViewValue);
+
+    const satadomTiles = page.locator("#slot-grid .slot-tile.storage-view-slot-boot");
+    test.skip((await satadomTiles.count()) === 0, "Need at least one SATADOM slot tile.");
+
+    await expect(satadomTiles.first()).toBeVisible();
+    await expect(page.locator(".storage-view-runtime-card--satadom").first()).toBeVisible();
+    await expect(page.locator(".storage-view-runtime-card-photo").first()).toBeVisible();
+  });
+
   test("snapshot-backed saved chassis views reuse the live slot and detail chrome", async ({ page }) => {
     await gotoApp(page);
     await setAutoRefresh(page, false);

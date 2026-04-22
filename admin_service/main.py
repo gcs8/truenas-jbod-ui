@@ -29,6 +29,8 @@ from app.config import (
     get_settings,
 )
 from app.models.domain import (
+    DebugBundleExportRequest,
+    DemoSystemRequest,
     EnclosureProfileRequest,
     HistoryAdoptRequest,
     QuantastorNodeDiscoveryRequest,
@@ -42,6 +44,7 @@ from app.models.domain import (
     TLSRemoteCertificateTrustRequest,
 )
 from app.services.profile_builder import ProfileBuilderService, collect_profile_references
+from app.services.demo_system_factory import DemoSystemFactory
 from app.services.profile_registry import ProfileRegistry
 from app.services.inventory_registry import InventoryRegistry
 from app.services.quantastor_api import QuantastorRESTClient
@@ -52,7 +55,12 @@ from app.services.system_setup import SystemSetupService, default_ssh_commands_f
 from app.services.parsers import normalize_text
 from history_service.config import get_history_settings
 from history_service.store import HistoryStore
-from history_service.system_backup import SystemBackupService
+from history_service.system_backup import (
+    SystemBackupService,
+    default_backup_included_paths,
+    default_debug_included_paths,
+    describe_bundle_groups,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -239,6 +247,39 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.post("/api/admin/debug/export")
+    async def export_debug_bundle(
+        payload: DebugBundleExportRequest,
+        stop_services: bool = Query(default=True),
+        restart_services: bool = Query(default=True),
+    ) -> Response:
+        maintenance_service = get_maintenance_service()
+        try:
+            artifact, maintenance = await asyncio.to_thread(
+                maintenance_service.export_debug_bundle,
+                payload,
+                stop_services=stop_services,
+                restart_services=restart_services,
+            )
+        except (ValueError, DockerRuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return Response(
+            content=artifact.content,
+            media_type=artifact.media_type or "application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{artifact.filename}"',
+                "X-Debug-Encrypted": "true" if payload.encrypt else "false",
+                "X-Debug-Packaging": str(artifact.manifest.get("packaging") or payload.packaging),
+                "X-Debug-Schema-Version": str(artifact.manifest.get("schema_version") or 1),
+                "X-Debug-Scrubbed": "true" if (payload.scrub_secrets or payload.scrub_disk_identifiers) else "false",
+                "X-Debug-Scrub-Secrets": "true" if payload.scrub_secrets else "false",
+                "X-Debug-Scrub-Disk-Identifiers": "true" if payload.scrub_disk_identifiers else "false",
+                "X-Admin-Stopped-Containers": ",".join(maintenance.stopped_containers),
+                "X-Admin-Restarted-Containers": ",".join(maintenance.restarted_containers),
+            },
+        )
+
     @app.post("/api/admin/backup/import")
     async def import_backup(
         request: Request,
@@ -415,6 +456,49 @@ def create_app() -> FastAPI:
                     else "Config saved. Restart the Read UI container to pick up the new system."
                 ),
                 "updated_existing": updated_existing,
+                "restart_required": ["ui"],
+                "runtime": runtime_service.status_payload(),
+            }
+        )
+
+    @app.post("/api/admin/system-setup/demo")
+    async def create_demo_system(payload: DemoSystemRequest | None = None) -> JSONResponse:
+        settings = reload_app_settings()
+        demo_factory = DemoSystemFactory(settings.config_file, settings.paths.profile_file)
+        try:
+            result = await asyncio.to_thread(
+                demo_factory.create_demo_system,
+                payload or DemoSystemRequest(),
+                settings,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        refreshed_settings = reload_app_settings()
+        saved_system = result["system"]
+        saved_profile = result["profile"]
+        runtime_service = get_runtime_service()
+        await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
+        return JSONResponse(
+            {
+                "ok": True,
+                "system": {
+                    "id": saved_system.id,
+                    "label": saved_system.label,
+                    "platform": saved_system.truenas.platform,
+                },
+                "profile": {
+                    "id": saved_profile.id,
+                    "label": saved_profile.label,
+                },
+                "systems": serialize_systems(refreshed_settings),
+                "profiles": serialize_profiles(refreshed_settings),
+                "default_system_id": refreshed_settings.default_system_id,
+                "updated_existing": bool(result.get("updated_existing")),
+                "updated_profile": bool(result.get("updated_profile")),
+                "detail": (
+                    f"Demo builder system {saved_system.label} saved. Restart the Read UI container to pick the synthetic chassis and views up cleanly."
+                ),
                 "restart_required": ["ui"],
                 "runtime": runtime_service.status_payload(),
             }
@@ -797,6 +881,15 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
             "restart_services": True,
             "import_stop_services": True,
             "import_restart_services": True,
+            "included_paths": default_backup_included_paths(),
+            "debug_packaging": "tar.zst",
+            "debug_stop_services": True,
+            "debug_restart_services": True,
+            "debug_included_paths": default_debug_included_paths(),
+            "debug_scrub_secrets": True,
+            "debug_scrub_disk_identifiers": True,
+            "debug_scrub_sensitive": True,
+            "path_groups": describe_bundle_groups(settings, history_settings),
             "clean_backup_targets": list(admin_settings.clean_backup_targets),
         },
         "paths": {

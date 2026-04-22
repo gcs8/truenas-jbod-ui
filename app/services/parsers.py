@@ -21,6 +21,7 @@ GPTID_REGEX = re.compile(r"(?P<gptid>(?:/dev/)?gptid/[A-Za-z0-9\-_.]+)", re.IGNO
 GUID_REGEX = re.compile(r"^[0-9]{16,}$")
 SLOT_REGEX = re.compile(r"(?:slot|bay|element)\D{0,4}(?P<slot>\d{1,3})", re.IGNORECASE)
 HEX_VALUE_REGEX = re.compile(r"^(?:0x)?(?P<value>[0-9a-fA-F]+)$")
+HEX_IDENTIFIER_ERROR_SPLIT_REGEX = re.compile(r"(?i)error:")
 
 
 @dataclass(slots=True)
@@ -188,7 +189,10 @@ def extract_nvme_controller_name(value: str | None) -> str | None:
 def normalize_hex_identifier(value: str | None) -> str | None:
     if not value:
         return None
-    match = HEX_VALUE_REGEX.match(value.strip())
+    cleaned = HEX_IDENTIFIER_ERROR_SPLIT_REGEX.split(value.strip(), maxsplit=1)[0].strip()
+    if not cleaned:
+        return None
+    match = HEX_VALUE_REGEX.match(cleaned)
     if not match:
         return None
     normalized = match.group("value").lower().lstrip("0")
@@ -209,7 +213,7 @@ def format_hex_identifier(value: str | None) -> str | None:
     normalized = normalize_hex_identifier(value)
     if normalized is not None:
         return f"0x{normalized}"
-    return normalize_text(value)
+    return None
 
 
 def format_bytes(size_bytes: int | None) -> str | None:

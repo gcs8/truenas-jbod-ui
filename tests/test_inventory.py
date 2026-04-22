@@ -484,6 +484,99 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(satadom_view.slots[0].gptid, "gptid/dom-a")
         self.assertEqual(satadom_view.slots[0].persistent_id_label, "GPTID")
 
+    def test_get_storage_view_runtime_infers_unifi_embedded_boot_media_view(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="unvr",
+                label="UniFi UNVR",
+                default_profile_id=UNIFI_UNVR_FRONT_4_PROFILE_ID,
+                truenas=TrueNASConfig(
+                    host="https://unvr.local",
+                    platform="linux",
+                ),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_system_id="unvr",
+                    selected_system_label="UniFi UNVR",
+                    selected_enclosure_id="unvr-front",
+                    selected_enclosure_label="UNVR Front",
+                )
+            )
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[],
+                        disks=[],
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    ),
+                    ssh_outputs={},
+                    ssh_collected=True,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+            service._build_storage_view_candidate_records = MagicMock(
+                return_value=[
+                    DiskRecord(
+                        raw={
+                            "boot_media": True,
+                            "smartctl_device_type": "scsi",
+                        },
+                        device_name="boot",
+                        path_device_name="boot",
+                        multipath_name=None,
+                        multipath_member=None,
+                        serial=None,
+                        model="Generic- SD/MMC/MS/MSPRO",
+                        size_bytes=31_268_536_320,
+                        identifier=None,
+                        health="ONLINE",
+                        pool_name=None,
+                        lunid=None,
+                        bus="SCSI",
+                        temperature_c=None,
+                        last_smart_test_type=None,
+                        last_smart_test_status=None,
+                        last_smart_test_lifetime_hours=None,
+                        logical_block_size=512,
+                        physical_block_size=None,
+                        enclosure_id=None,
+                        slot=None,
+                        smart_devices=["boot"],
+                        lookup_keys={"boot"},
+                    )
+                ]
+            )
+
+            runtime = asyncio.run(service.get_storage_view_runtime())
+
+        self.assertEqual(runtime.system_id, "unvr")
+        self.assertEqual([view.id for view in runtime.views], ["primary-chassis", "embedded-boot-media"])
+        boot_view = next(view for view in runtime.views if view.id == "embedded-boot-media")
+        self.assertEqual(boot_view.template_id, "embedded-boot-media-1")
+        self.assertEqual(boot_view.slot_layout, [[0]])
+        self.assertEqual(boot_view.slots[0].slot_label, "Boot")
+        self.assertEqual(boot_view.slots[0].device_name, "boot")
+        self.assertEqual(boot_view.slots[0].smart_device_type, "scsi")
+        self.assertEqual(boot_view.slots[0].placement_key, "device match: boot")
+
     def test_quantastor_storage_view_runtime_scopes_internal_view_to_target_system(self) -> None:
         async def get_snapshot(
             *,
@@ -1468,6 +1561,65 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0].raw["vendor_slot"], 1)
             self.assertEqual(records[0].health, "optimal")
+
+    def test_build_linux_disk_records_includes_unifi_boot_media_as_scsi_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="unvr",
+                default_profile_id=UNIFI_UNVR_FRONT_4_PROFILE_ID,
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {
+                        "name": "boot",
+                        "type": "disk",
+                        "size": "29.1G",
+                        "children": [
+                            {
+                                "name": "boot2",
+                                "type": "part",
+                                "mountpoint": "/boot/firmware",
+                            },
+                            {
+                                "name": "boot3",
+                                "type": "part",
+                                "mountpoint": "/data",
+                            },
+                            {
+                                "name": "boot4",
+                                "type": "part",
+                                "mountpoint": "/var/log",
+                            },
+                            {
+                                "name": "boot5",
+                                "type": "part",
+                                "mountpoint": "/mnt/.rwfs",
+                            },
+                        ],
+                    }
+                ],
+            )
+
+            records = service._build_linux_disk_records(ssh_data)
+
+            self.assertEqual(len(records), 1)
+            record = records[0]
+            self.assertEqual(record.device_name, "boot")
+            self.assertEqual(record.smart_devices, ["boot"])
+            self.assertEqual(record.bus, "SCSI")
+            self.assertTrue(record.raw["boot_media"])
+            self.assertEqual(record.raw["smartctl_device_type"], "scsi")
+            self.assertEqual(record.raw["top_role"], "system")
 
     def test_correlate_linux_host_uses_ubntstorage_slots_and_marks_nodisk_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4260,6 +4412,85 @@ Enclosure Status diagnostic page:
             self.assertIsNone(summary.message)
             self.assertIn("/usr/sbin/smartctl -x -j /dev/sdc", service.ssh_probe.commands[0])
             self.assertIn("/usr/sbin/smartctl -x /dev/sdc", service.ssh_probe.commands[1])
+
+    async def test_linux_boot_media_smart_summary_uses_scsi_device_type_hint(self) -> None:
+        class DummyTrueNASClient:
+            async def fetch_disk_smartctl(self, *_args, **_kwargs):
+                raise AssertionError("Linux boot media SMART should use SSH smartctl fallback in this test.")
+
+        class DummySSHProbe:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            async def run_command(self, command: str) -> SSHCommandResult:
+                self.commands.append(command)
+                if "-d scsi -x /dev/boot" in command:
+                    return SSHCommandResult(
+                        command=command,
+                        ok=True,
+                        stdout=(
+                            "Read Cache is:        Enabled\n"
+                            "Writeback Cache is:   Disabled\n"
+                        ),
+                        exit_code=0,
+                    )
+                return SSHCommandResult(
+                    command=command,
+                    ok=True,
+                    stdout=(
+                        "{"
+                        '"device":{"type":"scsi","protocol":"SCSI"},'
+                        '"model_name":"Generic- SD/MMC/MS/MSPRO",'
+                        '"user_capacity":{"bytes":31268536320},'
+                        '"logical_block_size":512,'
+                        '"serial_number":"2012090114345300",'
+                        '"smart_status":{"passed":true},'
+                        '"temperature":{"current":0,"drive_trip":0}'
+                        "}"
+                    ),
+                    exit_code=4,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="unvr",
+                default_profile_id=UNIFI_UNVR_FRONT_4_PROFILE_ID,
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                DummySSHProbe(),
+                temp_dir,
+            )
+            slot = SlotView(
+                slot=0,
+                slot_label="Boot",
+                row_index=0,
+                column_index=0,
+                device_name="boot",
+                smart_device_names=["boot"],
+                smart_device_type="scsi",
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[slot],
+                    refresh_interval_seconds=30,
+                )
+            )
+
+            summary = await service.get_slot_smart_summary(0)
+
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.smart_health_status, "PASSED")
+            self.assertEqual(summary.logical_block_size, 512)
+            self.assertEqual(summary.read_cache_enabled, True)
+            self.assertEqual(summary.writeback_cache_enabled, False)
+            self.assertIn("/usr/sbin/smartctl -d scsi -x -j /dev/boot", service.ssh_probe.commands[0])
+            self.assertIn("/usr/sbin/smartctl -d scsi -x /dev/boot", service.ssh_probe.commands[1])
 
     async def test_scale_smart_summary_accepts_smartctl_advisory_exit_with_valid_json(self) -> None:
         class DummyTrueNASClient:

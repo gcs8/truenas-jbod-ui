@@ -29,6 +29,7 @@ from app.models.domain import EnclosureProfileRequest
 from app.models.domain import HistoryAdoptRequest
 from app.models.domain import QuantastorNodeDiscoveryRequest
 from app.models.domain import SystemSetupSudoPreviewRequest
+from app.services.profile_registry import UNIFI_UNVR_FRONT_4_PROFILE_ID
 from history_service.config import HistorySettings
 from history_service.main import app as history_app
 from app.services.truenas_ws import TrueNASRawData
@@ -58,11 +59,13 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("/api/admin/system-setup/bootstrap", paths)
         self.assertIn("/api/admin/system-setup/sudoers-preview", paths)
         self.assertIn("/api/admin/system-setup/{system_id}", paths)
+        self.assertIn("/api/admin/system-setup/demo", paths)
         self.assertIn("/api/admin/profiles", paths)
         self.assertIn("/api/admin/profiles/{profile_id}", paths)
         self.assertIn("/api/admin/history/purge-orphaned", paths)
         self.assertIn("/api/admin/history/orphaned", paths)
         self.assertIn("/api/admin/history/adopt-removed-system", paths)
+        self.assertIn("/api/admin/debug/export", paths)
 
     def test_main_app_does_not_expose_embedded_admin_routes(self) -> None:
         paths = {route.path for route in main_app.routes}
@@ -270,6 +273,11 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(payload["ssh_keys"][0]["name"], "id_truenas")
         self.assertEqual(payload["paths"]["history_db"], "/tmp/history/history.db")
         self.assertEqual(payload["paths"]["tls_dir"], str(Path("C:/tmp/config") / "tls"))
+        self.assertIn("included_paths", payload["backup_defaults"])
+        self.assertIn("debug_included_paths", payload["backup_defaults"])
+        self.assertTrue(payload["backup_defaults"]["debug_scrub_secrets"])
+        self.assertTrue(payload["backup_defaults"]["debug_scrub_disk_identifiers"])
+        self.assertTrue(any(group["key"] == "ssh_keys" for group in payload["backup_defaults"]["path_groups"]))
 
     def test_build_admin_state_payload_includes_quantastor_ha_nodes(self) -> None:
         settings = Settings(
@@ -392,6 +400,49 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(inferred_view["profile_id"], "supermicro-cse-946-top-60")
         self.assertTrue(inferred_view["render"]["show_in_main_ui"])
 
+    def test_build_admin_state_payload_infers_unifi_embedded_boot_media_view(self) -> None:
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="unvr",
+                    label="UniFi UNVR",
+                    default_profile_id=UNIFI_UNVR_FRONT_4_PROFILE_ID,
+                    truenas=TrueNASConfig(
+                        host="https://unvr.local",
+                        platform="linux",
+                    ),
+                    ssh=SSHConfig(
+                        enabled=True,
+                        host="unvr.local",
+                        user="root",
+                    ),
+                )
+            ],
+            default_system_id="unvr",
+        )
+
+        runtime_service = MagicMock()
+        runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
+        key_manager = MagicMock()
+        key_manager.list_keys.return_value = []
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+                        with patch(
+                            "admin_service.main.get_history_settings",
+                            return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
+                        ):
+                            payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
+
+        views = payload["systems"][0]["storage_views"]
+        self.assertEqual([view["id"] for view in views], ["primary-chassis", "embedded-boot-media"])
+        boot_view = next(view for view in views if view["id"] == "embedded-boot-media")
+        self.assertEqual(boot_view["template_id"], "embedded-boot-media-1")
+        self.assertEqual(boot_view["binding"]["device_names"], ["boot"])
+        self.assertTrue(any(template["id"] == "embedded-boot-media-1" for template in payload["storage_view_templates"]))
+
     def test_build_admin_state_payload_prefers_saved_storage_views_over_seeded_chassis(self) -> None:
         settings = Settings(
             systems=[
@@ -452,6 +503,73 @@ class AdminStatePayloadTests(unittest.TestCase):
 
 
 class AdminSudoPreviewRouteTests(unittest.TestCase):
+    def test_create_demo_system_route_accepts_missing_payload_and_marks_ui_restart(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/demo")
+        initial_settings = Settings(
+            config_file="C:/tmp/config/config.yaml",
+            paths=PathConfig(
+                mapping_file="C:/tmp/data/slot_mappings.json",
+                log_file="C:/tmp/logs/app.log",
+                profile_file="C:/tmp/config/profiles.yaml",
+                slot_detail_cache_file="C:/tmp/data/slot_detail_cache.json",
+            ),
+        )
+        refreshed_settings = Settings(
+            config_file="C:/tmp/config/config.yaml",
+            paths=PathConfig(
+                mapping_file="C:/tmp/data/slot_mappings.json",
+                log_file="C:/tmp/logs/app.log",
+                profile_file="C:/tmp/config/profiles.yaml",
+                slot_detail_cache_file="C:/tmp/data/slot_detail_cache.json",
+            ),
+            systems=[
+                SystemConfig(
+                    id="demo-builder-lab",
+                    label="Demo Builder Lab",
+                    default_profile_id="demo-builder-lab-chassis",
+                    truenas=TrueNASConfig(
+                        host="https://demo-builder.invalid",
+                        platform="linux",
+                    ),
+                )
+            ],
+            profiles=[
+                EnclosureProfileConfig(
+                    id="demo-builder-lab-chassis",
+                    label="Demo Builder Lab Chassis",
+                    summary="Synthetic demo profile.",
+                    face_style="front-drive",
+                    latch_edge="top",
+                    bay_size="2.5",
+                    rows=3,
+                    columns=4,
+                    slot_layout=[[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]],
+                )
+            ],
+        )
+        demo_factory = MagicMock()
+        demo_factory.create_demo_system.return_value = {
+            "system": refreshed_settings.systems[0],
+            "profile": refreshed_settings.profiles[0],
+            "updated_existing": False,
+            "updated_profile": False,
+        }
+        runtime_service = MagicMock()
+        runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
+
+        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.main.DemoSystemFactory", return_value=demo_factory):
+                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+                    response = asyncio.run(route.endpoint())
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["system"]["id"], "demo-builder-lab")
+        self.assertEqual(payload["profile"]["id"], "demo-builder-lab-chassis")
+        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+
     def test_delete_system_route_returns_updated_system_list(self) -> None:
         route = next(
             route for route in admin_app.routes

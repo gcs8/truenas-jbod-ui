@@ -43,7 +43,7 @@ place.
 Once the sidecar is healthy, pick a populated slot and use the `History`
 button in Slot Details.
 
-![Live slot history drawer](images/history-drawer-v0.12.0.png)
+![Live slot history drawer](images/history-drawer-v0.13.0.png)
 
 Things to notice:
 
@@ -55,7 +55,7 @@ Things to notice:
 The same history drawer is also available for inventory-bound
 storage views such as `Boot SATADOMs` and the internal NVMe carrier:
 
-![Storage-view history on Boot SATADOMs](images/storage-view-history-v0.12.0.png)
+![Storage-view history on Boot SATADOMs](images/storage-view-history-v0.13.0.png)
 
 Things to notice:
 
@@ -71,7 +71,7 @@ Things to notice:
 
 Use `Export Snapshot` from the main toolbar.
 
-![Snapshot export dialog with live estimate](images/snapshot-export-dialog-v0.12.0.png)
+![Snapshot export dialog with live estimate](images/snapshot-export-dialog-v0.13.0.png)
 
 Things to notice:
 
@@ -88,7 +88,7 @@ History drawer first, then open the export dialog.
 The export produces a self-contained HTML file that opens locally without
 access to the live app.
 
-![Frozen offline enclosure snapshot](images/offline-snapshot-v0.12.0.png)
+![Frozen offline enclosure snapshot](images/offline-snapshot-v0.13.0.png)
 
 Things to notice:
 
@@ -96,6 +96,24 @@ Things to notice:
 - the selected slot can stay selected in the snapshot
 - the history drawer can stay open if it was open when exported
 - live actions stay disabled, but slot inspection and navigation still work
+
+## Snapshot Export Versus Admin Debug Bundle
+
+These are intentionally different tools:
+
+- `Export Snapshot` in the main UI creates one self-contained offline HTML
+  artifact for the currently selected enclosure or storage view
+- `Debug Bundle` in the admin sidecar on `:8082` creates a normal archive with
+  selected config/history/support files for offline troubleshooting
+- `Full Backup` in the admin sidecar creates the restore-grade bundle you use
+  for import or cross-host recovery
+
+Use the debug bundle when you want to hand someone a frozen stack state to
+inspect. Use full backup when you actually need to restore the app later.
+
+The debug bundle is not a standalone HTML viewer and it is not an import path
+today. It does, however, support separate `Scrub obvious secrets` and `Scrub
+disk identifiers` toggles so you can choose how much local detail to share.
 
 ## If History Is Unavailable
 

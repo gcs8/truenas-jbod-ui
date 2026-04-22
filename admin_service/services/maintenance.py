@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from app.models.domain import SystemBackupExportRequest
+from app.models.domain import DebugBundleExportRequest, SystemBackupExportRequest
 
 
 @dataclass(slots=True)
@@ -42,6 +42,47 @@ class AdminMaintenanceService:
                 encrypt=payload.encrypt,
                 passphrase=payload.passphrase,
                 packaging=payload.packaging,
+                included_paths=payload.included_paths,
+            )
+        finally:
+            if stop_services and restart_services:
+                for key in stopped_containers:
+                    self.runtime_service.start_container(key)
+                    restarted_containers.append(key)
+        return artifact, MaintenanceOutcome(stopped_containers, restarted_containers)
+
+    def export_debug_bundle(
+        self,
+        payload: DebugBundleExportRequest,
+        *,
+        stop_services: bool = True,
+        restart_services: bool = True,
+    ) -> tuple[Any, MaintenanceOutcome]:
+        stopped_containers: list[str] = []
+        restarted_containers: list[str] = []
+        runtime_before = self.runtime_service.status_payload()
+        if stop_services:
+            stopped_containers = self.runtime_service.running_container_keys(self.clean_backup_targets)
+            for key in stopped_containers:
+                self.runtime_service.stop_container(key)
+        try:
+            runtime_after_stop = self.runtime_service.status_payload()
+            artifact = self.backup_service.export_debug_bundle(
+                encrypt=payload.encrypt,
+                passphrase=payload.passphrase,
+                packaging=payload.packaging,
+                included_paths=payload.included_paths,
+                scrub_secrets=payload.scrub_secrets,
+                scrub_disk_identifiers=payload.scrub_disk_identifiers,
+                runtime_payload={
+                    "before_stop": runtime_before,
+                    "after_stop": runtime_after_stop,
+                },
+                maintenance_payload={
+                    "stop_services": stop_services,
+                    "restart_services": restart_services,
+                    "stopped_containers": list(stopped_containers),
+                },
             )
         finally:
             if stop_services and restart_services:

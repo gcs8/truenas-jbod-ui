@@ -10,11 +10,24 @@
     sshKeys: Array.isArray(bootstrap.ssh_keys) ? bootstrap.ssh_keys : [],
     runtime: bootstrap.runtime || { available: false, detail: null, containers: [] },
     backupDefaults: bootstrap.backup_defaults || {},
+    selectedBackupPaths: Array.isArray(bootstrap.backup_defaults?.included_paths)
+      ? [...bootstrap.backup_defaults.included_paths]
+      : [],
+    selectedDebugPaths: Array.isArray(bootstrap.backup_defaults?.debug_included_paths)
+      ? [...bootstrap.backup_defaults.debug_included_paths]
+      : [],
+    backupManualEncrypt: false,
     backupLastPlainPackaging:
       bootstrap.backup_defaults && bootstrap.backup_defaults.packaging !== "7z"
         ? bootstrap.backup_defaults.packaging
         : "tar.zst",
     backupForced7z: false,
+    debugManualEncrypt: false,
+    debugLastPlainPackaging:
+      bootstrap.backup_defaults && bootstrap.backup_defaults.debug_packaging !== "7z"
+        ? bootstrap.backup_defaults.debug_packaging
+        : "tar.zst",
+    debugForced7z: false,
     paths: bootstrap.paths || {},
     tlsInspection: null,
     tlsTrustStatus: {
@@ -74,6 +87,9 @@
     runtimeDetail: document.getElementById("runtime-detail"),
     runtimeCards: document.getElementById("runtime-cards"),
     backupPathList: document.getElementById("backup-path-list"),
+    backupPathSummary: document.getElementById("backup-path-summary"),
+    debugPathList: document.getElementById("debug-path-list"),
+    debugPathSummary: document.getElementById("debug-path-summary"),
     backupPackaging: document.getElementById("backup-packaging"),
     backupEncryptToggle: document.getElementById("backup-encrypt-toggle"),
     backupExportPassphrase: document.getElementById("backup-export-passphrase"),
@@ -81,6 +97,15 @@
     backupExportRestartToggle: document.getElementById("backup-export-restart-toggle"),
     backupExportButton: document.getElementById("backup-export-button"),
     backupExportResult: document.getElementById("backup-export-result"),
+    debugPackaging: document.getElementById("debug-packaging"),
+    debugScrubSecretsToggle: document.getElementById("debug-scrub-secrets-toggle"),
+    debugScrubIdentifiersToggle: document.getElementById("debug-scrub-identifiers-toggle"),
+    debugEncryptToggle: document.getElementById("debug-encrypt-toggle"),
+    debugExportPassphrase: document.getElementById("debug-export-passphrase"),
+    debugExportStopToggle: document.getElementById("debug-export-stop-toggle"),
+    debugExportRestartToggle: document.getElementById("debug-export-restart-toggle"),
+    debugExportButton: document.getElementById("debug-export-button"),
+    debugExportResult: document.getElementById("debug-export-result"),
     backupImportFile: document.getElementById("backup-import-file"),
     backupImportPickButton: document.getElementById("backup-import-pick-button"),
     backupImportFileLabel: document.getElementById("backup-import-file-label"),
@@ -200,6 +225,7 @@
     setupStorageViewPreviewGrid: document.getElementById("setup-storage-view-preview-grid"),
     setupStorageViewPreviewMeta: document.getElementById("setup-storage-view-preview-meta"),
     setupCreateButton: document.getElementById("setup-create-button"),
+    setupCreateDemoButton: document.getElementById("setup-create-demo-button"),
     setupResult: document.getElementById("setup-result"),
     existingSystemSelect: document.getElementById("existing-system-select"),
     existingSystemLoadButton: document.getElementById("existing-system-load-button"),
@@ -465,20 +491,90 @@
     updateAdminMeta();
   }
 
-  function renderBackupPaths() {
-    if (!elements.backupPathList) {
+  function bundlePathGroups(bundleType) {
+    const groups = Array.isArray(state.backupDefaults?.path_groups) ? state.backupDefaults.path_groups : [];
+    return groups.filter((group) => Array.isArray(group.bundle_types) && group.bundle_types.includes(bundleType));
+  }
+
+  function bundlePathGroupByKey(key) {
+    return bundlePathGroups("backup").concat(bundlePathGroups("debug")).find((group) => group.key === key) || null;
+  }
+
+  function selectedBundlePathKeys(bundleType) {
+    return bundleType === "debug" ? state.selectedDebugPaths : state.selectedBackupPaths;
+  }
+
+  function setSelectedBundlePathKeys(bundleType, nextKeys) {
+    if (bundleType === "debug") {
+      state.selectedDebugPaths = nextKeys;
       return;
     }
-    const items = [
-      ["Config", state.paths.config_file],
-      ["Profiles", state.paths.profile_file],
-      ["Mappings", state.paths.mapping_file],
-      ["Slot Cache", state.paths.slot_detail_cache_file],
-      ["History DB", state.paths.history_db],
-    ].filter(([, value]) => Boolean(value));
-    elements.backupPathList.innerHTML = items
-      .map(([label, value]) => `<li><strong>${escapeHtml(label)}:</strong> ${escapeHtml(value)}</li>`)
+    state.selectedBackupPaths = nextKeys;
+  }
+
+  function bundleHasLockedSelection(bundleType) {
+    return selectedBundlePathKeys(bundleType).some((key) => Boolean(bundlePathGroupByKey(key)?.sensitive));
+  }
+
+  function renderBundlePathList(listElement, bundleType, options = {}) {
+    if (!listElement) {
+      return;
+    }
+    const disableSensitive = Boolean(options.disableSensitive);
+    const selectedKeys = selectedBundlePathKeys(bundleType);
+    const groups = bundlePathGroups(bundleType);
+    listElement.innerHTML = groups
+      .map((group) => {
+        const selected = selectedKeys.includes(group.key);
+        const locked = Boolean(group.sensitive);
+        const disabled = disableSensitive && locked;
+        const detail = group.path || group.archive_root || "";
+        return `
+          <li>
+            <button
+              class="path-pill${selected ? " is-selected" : ""}${locked ? " is-locked" : ""}${disabled ? " is-disabled" : ""}"
+              type="button"
+              data-bundle-type="${escapeHtml(bundleType)}"
+              data-path-key="${escapeHtml(group.key)}"
+              title="${escapeHtml(detail)}"
+              aria-pressed="${selected ? "true" : "false"}"
+              ${disabled ? "disabled" : ""}
+            >
+              <span class="path-pill-state" aria-hidden="true">${selected ? "[x]" : "[ ]"}</span>
+              <span class="path-pill-label">${escapeHtml(group.label || group.key)}</span>
+              <span class="path-pill-path">${escapeHtml(detail)}</span>
+              ${locked ? '<span class="path-pill-lock" aria-hidden="true">&#128274;</span>' : ""}
+            </button>
+          </li>
+        `;
+      })
       .join("");
+  }
+
+  function renderBundlePathSummary(summaryElement, bundleType, options = {}) {
+    if (!summaryElement) {
+      return;
+    }
+    const totalCount = bundlePathGroups(bundleType).length;
+    const selectedCount = selectedBundlePathKeys(bundleType).length;
+    const disableSensitive = Boolean(options.disableSensitive);
+    const lockedCount = bundlePathGroups(bundleType).filter((group) => Boolean(group.sensitive)).length;
+    const parts = [`${selectedCount} of ${totalCount} selected.`];
+    if (disableSensitive && lockedCount) {
+      parts.push(`${lockedCount} locked secret path${lockedCount === 1 ? " is" : "s are"} disabled while secrets scrub is on.`);
+    }
+    summaryElement.textContent = parts.join(" ");
+  }
+
+  function renderBackupPaths() {
+    renderBundlePathList(elements.backupPathList, "backup");
+    renderBundlePathSummary(elements.backupPathSummary, "backup");
+    renderBundlePathList(elements.debugPathList, "debug", {
+      disableSensitive: Boolean(elements.debugScrubSecretsToggle?.checked),
+    });
+    renderBundlePathSummary(elements.debugPathSummary, "debug", {
+      disableSensitive: Boolean(elements.debugScrubSecretsToggle?.checked),
+    });
   }
 
   function runtimeStatusClass(container) {
@@ -2196,6 +2292,10 @@
     ].filter(Boolean);
   }
 
+  function isSatadomBootTemplate(storageView) {
+    return storageView?.kind === "boot_devices" && storageView?.template_id === "satadom-pair-2";
+  }
+
   function buildStorageViewPreviewCell(storageView, slotValue) {
     const slotLabel = storageViewSlotLabel(storageView, slotValue);
     const slotSize = storageViewSlotSize(storageView, slotValue);
@@ -2207,6 +2307,42 @@
             <div class="storage-view-device-content">
               <span class="storage-view-preview-slot-label">${escapeHtml(slotLabel)}</span>
               <span class="storage-view-preview-slot-index">${escapeHtml(slotSize)}</span>
+              <span class="storage-view-binding-summary">${escapeHtml(bindingValue || "Unbound preview slot")}</span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+    if (storageView?.kind === "boot_devices") {
+      if (!isSatadomBootTemplate(storageView)) {
+        return `
+          <div class="profile-preview-cell">
+            <div class="storage-view-device storage-view-device--boot-media">
+              <span class="storage-view-device-boot-chip storage-view-device-boot-chip--large" aria-hidden="true"></span>
+              <span class="storage-view-device-boot-chip storage-view-device-boot-chip--small" aria-hidden="true"></span>
+              <span class="storage-view-device-boot-connector" aria-hidden="true"></span>
+              <div class="storage-view-device-content storage-view-device-content--boot-media">
+                <div class="storage-view-device-label-plate storage-view-device-label-plate--boot-media">
+                  <span class="storage-view-preview-slot-label">${escapeHtml(slotLabel)}</span>
+                  <span class="storage-view-preview-slot-index">slot ${escapeHtml(String(slotValue))}</span>
+                </div>
+                <span class="storage-view-binding-summary">${escapeHtml(bindingValue || "/dev/boot")}</span>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+      return `
+        <div class="profile-preview-cell">
+          <div class="storage-view-device storage-view-device--satadom">
+            <div class="storage-view-device-photo-wrap" aria-hidden="true">
+              <img class="storage-view-device-photo" src="/static/images/satadom-ml-3ie3-v2.png" alt="" loading="lazy" decoding="async">
+            </div>
+            <div class="storage-view-device-content storage-view-device-content--satadom">
+              <div class="storage-view-device-label-plate">
+                <span class="storage-view-preview-slot-label">${escapeHtml(slotLabel)}</span>
+                <span class="storage-view-preview-slot-index">slot ${escapeHtml(String(slotValue))}</span>
+              </div>
               <span class="storage-view-binding-summary">${escapeHtml(bindingValue || "Unbound preview slot")}</span>
             </div>
           </div>
@@ -2399,6 +2535,8 @@
         : template?.summary || "Storage view preview for the selected template.";
     elements.setupStorageViewPreviewGrid.style.gridTemplateColumns = `repeat(${columnCount}, minmax(0, 1fr))`;
     elements.setupStorageViewPreviewGrid.classList.toggle("is-nvme-carrier", storageView.kind === "nvme_carrier");
+    elements.setupStorageViewPreviewGrid.classList.toggle("is-boot-device", storageView.kind === "boot_devices");
+    elements.setupStorageViewPreviewGrid.classList.toggle("is-satadom", isSatadomBootTemplate(storageView));
     elements.setupStorageViewPreviewGrid.innerHTML = previewRows
       .flat()
       .map((slotValue) => {
@@ -3186,27 +3324,95 @@
     }
   }
 
-  function syncBackupControls() {
-    if (elements.backupPackaging) {
-      const encryptEnabled = Boolean(elements.backupEncryptToggle?.checked);
-      const currentPackaging = elements.backupPackaging.value || state.backupDefaults.packaging || "tar.zst";
+  function toggleBundlePathSelection(bundleType, pathKey) {
+    const group = bundlePathGroupByKey(pathKey);
+    if (!group) {
+      return;
+    }
+    if (bundleType === "debug" && Boolean(elements.debugScrubSecretsToggle?.checked) && group.sensitive) {
+      setBanner("Turn off secrets scrubbing before including locked secret paths in a debug bundle.", "info");
+      return;
+    }
+    const selectedKeys = selectedBundlePathKeys(bundleType);
+    if (selectedKeys.includes(pathKey)) {
+      if (selectedKeys.length === 1) {
+        setBanner("Keep at least one included path selected for this bundle.", "info");
+        return;
+      }
+      setSelectedBundlePathKeys(bundleType, selectedKeys.filter((key) => key !== pathKey));
+    } else {
+      setSelectedBundlePathKeys(bundleType, [...selectedKeys, pathKey]);
+    }
+    renderBackupPaths();
+    syncBackupControls();
+  }
+
+  function syncSingleBundleControls(bundleType, config) {
+    const lockedSelection = bundleHasLockedSelection(bundleType);
+    const manualEncrypt = Boolean(state[config.manualEncryptKey]);
+    const encryptEnabled = lockedSelection || manualEncrypt;
+    if (config.encryptToggle) {
+      config.encryptToggle.checked = encryptEnabled;
+      config.encryptToggle.disabled = lockedSelection;
+    }
+    if (config.packagingSelect) {
+      const currentPackaging = config.packagingSelect.value || config.defaultPackaging || "tar.zst";
       if (encryptEnabled) {
-        if (!state.backupForced7z && currentPackaging && currentPackaging !== "7z") {
-          state.backupLastPlainPackaging = currentPackaging;
+        if (!state[config.forced7zKey] && currentPackaging && currentPackaging !== "7z") {
+          state[config.lastPlainPackagingKey] = currentPackaging;
         }
-        elements.backupPackaging.value = "7z";
-        elements.backupPackaging.disabled = true;
-        state.backupForced7z = true;
+        config.packagingSelect.value = "7z";
+        config.packagingSelect.disabled = true;
+        state[config.forced7zKey] = true;
       } else {
-        elements.backupPackaging.disabled = false;
-        if (state.backupForced7z && state.backupLastPlainPackaging && state.backupLastPlainPackaging !== "7z") {
-          elements.backupPackaging.value = state.backupLastPlainPackaging;
+        config.packagingSelect.disabled = false;
+        if (
+          state[config.forced7zKey]
+          && state[config.lastPlainPackagingKey]
+          && state[config.lastPlainPackagingKey] !== "7z"
+        ) {
+          config.packagingSelect.value = state[config.lastPlainPackagingKey];
         }
-        state.backupForced7z = false;
+        state[config.forced7zKey] = false;
       }
     }
-    if (elements.backupExportPassphrase) {
-      elements.backupExportPassphrase.disabled = !Boolean(elements.backupEncryptToggle?.checked);
+    if (config.passphraseField) {
+      config.passphraseField.disabled = !encryptEnabled;
+    }
+  }
+
+  function syncBackupControls() {
+    let rerenderPaths = false;
+    if (elements.debugScrubSecretsToggle?.checked) {
+      const filteredKeys = state.selectedDebugPaths.filter((key) => !Boolean(bundlePathGroupByKey(key)?.sensitive));
+      if (filteredKeys.length !== state.selectedDebugPaths.length) {
+        state.selectedDebugPaths = filteredKeys;
+        rerenderPaths = true;
+      }
+    }
+    if (rerenderPaths) {
+      renderBackupPaths();
+    }
+    syncSingleBundleControls("backup", {
+      encryptToggle: elements.backupEncryptToggle,
+      packagingSelect: elements.backupPackaging,
+      passphraseField: elements.backupExportPassphrase,
+      defaultPackaging: state.backupDefaults.packaging || "tar.zst",
+      lastPlainPackagingKey: "backupLastPlainPackaging",
+      forced7zKey: "backupForced7z",
+      manualEncryptKey: "backupManualEncrypt",
+    });
+    syncSingleBundleControls("debug", {
+      encryptToggle: elements.debugEncryptToggle,
+      packagingSelect: elements.debugPackaging,
+      passphraseField: elements.debugExportPassphrase,
+      defaultPackaging: state.backupDefaults.debug_packaging || "tar.zst",
+      lastPlainPackagingKey: "debugLastPlainPackaging",
+      forced7zKey: "debugForced7z",
+      manualEncryptKey: "debugManualEncrypt",
+    });
+    if (elements.backupExportButton) {
+      elements.backupExportButton.disabled = !state.selectedBackupPaths.length;
     }
     if (elements.backupExportRestartToggle) {
       const stopEnabled = Boolean(elements.backupExportStopToggle?.checked);
@@ -3220,6 +3426,16 @@
       elements.backupImportRestartToggle.disabled = !stopEnabled;
       if (!stopEnabled) {
         elements.backupImportRestartToggle.checked = false;
+      }
+    }
+    if (elements.debugExportButton) {
+      elements.debugExportButton.disabled = !state.selectedDebugPaths.length;
+    }
+    if (elements.debugExportRestartToggle) {
+      const stopEnabled = Boolean(elements.debugExportStopToggle?.checked);
+      elements.debugExportRestartToggle.disabled = !stopEnabled;
+      if (!stopEnabled) {
+        elements.debugExportRestartToggle.checked = false;
       }
     }
   }
@@ -3691,11 +3907,36 @@
     }
   }
 
+  function describeApiError(detail) {
+    if (detail === undefined || detail === null || detail === "") {
+      return "";
+    }
+    if (Array.isArray(detail)) {
+      return detail
+        .map((item) => {
+          if (item && typeof item === "object") {
+            const location = Array.isArray(item.loc) ? item.loc.join(".") : "";
+            const message = item.msg ? String(item.msg) : JSON.stringify(item);
+            return location ? `${location}: ${message}` : message;
+          }
+          return String(item);
+        })
+        .join("; ");
+    }
+    if (detail && typeof detail === "object") {
+      if (detail.msg) {
+        return String(detail.msg);
+      }
+      return JSON.stringify(detail);
+    }
+    return String(detail);
+  }
+
   async function fetchJson(url, options = {}) {
     const response = await fetch(url, options);
     const payload = await readJsonResponse(response);
     if (!response.ok || (payload && payload.ok === false)) {
-      throw new Error(payload?.detail || `Request failed with ${response.status}`);
+      throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
     }
     return payload || {};
   }
@@ -3915,6 +4156,12 @@
       state.sshKeys = Array.isArray(payload.ssh_keys) ? payload.ssh_keys : [];
       state.runtime = payload.runtime || { available: false, detail: null, containers: [] };
       state.backupDefaults = payload.backup_defaults || state.backupDefaults;
+      if (!state.selectedBackupPaths.length && Array.isArray(state.backupDefaults?.included_paths)) {
+        state.selectedBackupPaths = [...state.backupDefaults.included_paths];
+      }
+      if (!state.selectedDebugPaths.length && Array.isArray(state.backupDefaults?.debug_included_paths)) {
+        state.selectedDebugPaths = [...state.backupDefaults.debug_included_paths];
+      }
       state.paths = payload.paths || state.paths;
       await loadOrphanedHistory({ quiet: true, render: false });
       renderAll();
@@ -3981,6 +4228,7 @@
             encrypt,
             passphrase,
             packaging,
+            included_paths: state.selectedBackupPaths,
           }),
         }
       );
@@ -4016,6 +4264,84 @@
     } finally {
       if (elements.backupExportButton) {
         elements.backupExportButton.disabled = false;
+      }
+    }
+  }
+
+  async function exportDebugBundle() {
+    const encrypt = Boolean(elements.debugEncryptToggle?.checked);
+    const passphrase = readOptionalSecretValue(elements.debugExportPassphrase);
+    const packaging = elements.debugPackaging?.value || "tar.zst";
+    const scrubSecrets = Boolean(elements.debugScrubSecretsToggle?.checked);
+    const scrubDiskIdentifiers = Boolean(elements.debugScrubIdentifiersToggle?.checked);
+    if (encrypt && !passphrase) {
+      setBanner("Enter a passphrase before exporting an encrypted debug bundle.", "error");
+      return;
+    }
+    if (elements.debugExportButton) {
+      elements.debugExportButton.disabled = true;
+    }
+    if (elements.debugExportResult) {
+      elements.debugExportResult.textContent = "Preparing debug bundle...";
+    }
+    try {
+      const stopServices = Boolean(elements.debugExportStopToggle?.checked);
+      const restartServices = Boolean(elements.debugExportRestartToggle?.checked);
+      const response = await fetch(
+        `/api/admin/debug/export?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            encrypt,
+            passphrase,
+            packaging,
+            included_paths: state.selectedDebugPaths,
+            scrub_secrets: scrubSecrets,
+            scrub_disk_identifiers: scrubDiskIdentifiers,
+          }),
+        }
+      );
+      if (!response.ok) {
+        const payload = await readJsonResponse(response);
+        throw new Error(payload?.detail || `Request failed with ${response.status}`);
+      }
+      const blob = await response.blob();
+      const objectUrl = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      const actualPackaging = response.headers.get("X-Debug-Packaging") || packaging;
+      anchor.download = resolveDownloadFilename(
+        response,
+        `jbod-debug-bundle${actualPackaging === "tar.zst" ? ".tar.zst" : actualPackaging === "tar.gz" ? ".tar.gz" : `.${actualPackaging}`}`
+      );
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(objectUrl);
+      const stopped = response.headers.get("X-Admin-Stopped-Containers") || "none";
+      const restarted = response.headers.get("X-Admin-Restarted-Containers") || "none";
+      const scrubbed = [];
+      if (response.headers.get("X-Debug-Scrub-Secrets") === "true") {
+        scrubbed.push("secrets");
+      }
+      if (response.headers.get("X-Debug-Scrub-Disk-Identifiers") === "true") {
+        scrubbed.push("disk identifiers");
+      }
+      const scrubLabel = scrubbed.length ? `Scrubbed ${scrubbed.join(" + ")}` : "Raw";
+      if (elements.debugExportResult) {
+        elements.debugExportResult.textContent = `${scrubLabel} ${actualPackaging} debug bundle exported. Stopped: ${stopped}. Restarted: ${restarted}.`;
+      }
+      setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}.`, "success");
+      await refreshState({ quiet: true });
+    } catch (error) {
+      if (elements.debugExportResult) {
+        elements.debugExportResult.textContent = `Debug export failed: ${error.message || error}`;
+      }
+      setBanner(`Debug bundle export failed: ${error.message || error}`, "error");
+    } finally {
+      if (elements.debugExportButton) {
+        elements.debugExportButton.disabled = false;
       }
     }
   }
@@ -4070,6 +4396,50 @@
     } finally {
       if (elements.backupImportButton) {
         elements.backupImportButton.disabled = false;
+      }
+    }
+  }
+
+  async function createDemoSystem() {
+    if (elements.setupCreateDemoButton) {
+      elements.setupCreateDemoButton.disabled = true;
+    }
+    if (elements.setupResult) {
+      elements.setupResult.textContent = "Creating demo builder system...";
+    }
+    try {
+      const systemId = elements.setupSystemId?.value?.trim() || "";
+      const label = elements.setupSystemLabel?.value?.trim() || "";
+      const payload = await fetchJson("/api/admin/system-setup/demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(systemId ? { system_id: systemId } : {}),
+          ...(label ? { label } : {}),
+          make_default: Boolean(elements.setupMakeDefault?.checked),
+          replace_existing: true,
+        }),
+      });
+      await refreshState({ quiet: true });
+      state.selectedExistingSystemId = payload.system?.id || state.selectedExistingSystemId;
+      const createdSystem = getSystemById(payload.system?.id || "");
+      if (createdSystem) {
+        loadSystemIntoForm(createdSystem);
+      } else {
+        renderAll();
+      }
+      if (elements.setupResult) {
+        elements.setupResult.textContent = payload.detail || "Demo builder system created.";
+      }
+      setBanner(`Demo builder system ${payload.system?.label || "saved"}.`, "success");
+    } catch (error) {
+      if (elements.setupResult) {
+        elements.setupResult.textContent = `Demo builder system creation failed: ${error.message || error}`;
+      }
+      setBanner(`Demo builder system creation failed: ${error.message || error}`, "error");
+    } finally {
+      if (elements.setupCreateDemoButton) {
+        elements.setupCreateDemoButton.disabled = false;
       }
     }
   }
@@ -4649,16 +5019,54 @@
       void runRuntimeAction(button.dataset.containerKey, button.dataset.runtimeAction);
     });
 
-    elements.backupEncryptToggle?.addEventListener("change", syncBackupControls);
+    elements.backupPathList?.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-path-key][data-bundle-type='backup']");
+      if (!button) {
+        return;
+      }
+      toggleBundlePathSelection("backup", button.dataset.pathKey || "");
+    });
+    elements.debugPathList?.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-path-key][data-bundle-type='debug']");
+      if (!button) {
+        return;
+      }
+      toggleBundlePathSelection("debug", button.dataset.pathKey || "");
+    });
+    elements.backupEncryptToggle?.addEventListener("change", () => {
+      state.backupManualEncrypt = Boolean(elements.backupEncryptToggle?.checked);
+      syncBackupControls();
+    });
     elements.backupPackaging?.addEventListener("change", () => {
-      if (!elements.backupEncryptToggle?.checked && elements.backupPackaging?.value && elements.backupPackaging.value !== "7z") {
+      if (!bundleHasLockedSelection("backup") && elements.backupPackaging?.value && elements.backupPackaging.value !== "7z") {
         state.backupLastPlainPackaging = elements.backupPackaging.value;
+      }
+    });
+    elements.debugScrubSecretsToggle?.addEventListener("change", () => {
+      syncBackupControls();
+      renderBackupPaths();
+    });
+    elements.debugScrubIdentifiersToggle?.addEventListener("change", () => {
+      syncBackupControls();
+      renderBackupPaths();
+    });
+    elements.debugEncryptToggle?.addEventListener("change", () => {
+      state.debugManualEncrypt = Boolean(elements.debugEncryptToggle?.checked);
+      syncBackupControls();
+    });
+    elements.debugPackaging?.addEventListener("change", () => {
+      if (!bundleHasLockedSelection("debug") && elements.debugPackaging?.value && elements.debugPackaging.value !== "7z") {
+        state.debugLastPlainPackaging = elements.debugPackaging.value;
       }
     });
     elements.backupExportStopToggle?.addEventListener("change", syncBackupControls);
     elements.backupImportStopToggle?.addEventListener("change", syncBackupControls);
+    elements.debugExportStopToggle?.addEventListener("change", syncBackupControls);
     elements.backupExportButton?.addEventListener("click", () => {
       void exportBackup();
+    });
+    elements.debugExportButton?.addEventListener("click", () => {
+      void exportDebugBundle();
     });
     elements.backupImportPickButton?.addEventListener("click", () => {
       elements.backupImportFile?.click();
@@ -4991,6 +5399,9 @@
     elements.setupCreateButton?.addEventListener("click", () => {
       void createSystem();
     });
+    elements.setupCreateDemoButton?.addEventListener("click", () => {
+      void createDemoSystem();
+    });
   }
 
   if (elements.backupExportStopToggle) {
@@ -5010,6 +5421,24 @@
     if (elements.backupPackaging.value !== "7z") {
       state.backupLastPlainPackaging = elements.backupPackaging.value;
     }
+  }
+  if (elements.debugPackaging) {
+    elements.debugPackaging.value = state.backupDefaults.debug_packaging || "tar.zst";
+    if (elements.debugPackaging.value !== "7z") {
+      state.debugLastPlainPackaging = elements.debugPackaging.value;
+    }
+  }
+  if (elements.debugScrubSecretsToggle) {
+    elements.debugScrubSecretsToggle.checked = state.backupDefaults.debug_scrub_secrets !== false;
+  }
+  if (elements.debugScrubIdentifiersToggle) {
+    elements.debugScrubIdentifiersToggle.checked = state.backupDefaults.debug_scrub_disk_identifiers !== false;
+  }
+  if (elements.debugExportStopToggle) {
+    elements.debugExportStopToggle.checked = state.backupDefaults.debug_stop_services !== false;
+  }
+  if (elements.debugExportRestartToggle) {
+    elements.debugExportRestartToggle.checked = Boolean(state.backupDefaults.debug_restart_services);
   }
   if (elements.setupPlatform) {
     elements.setupPlatform.value = "core";

@@ -83,6 +83,10 @@
         <div class="backup-column">
           <h3>Included Paths</h3>
           <ul id="backup-path-list" class="path-list"></ul>
+          <p id="backup-path-summary" class="subtle action-note"></p>
+          <p class="subtle action-note">
+            Click the pills to choose what lands in the restore bundle. Locked pills add secret material and force encrypted <code>.7z</code> export.
+          </p>
 
           <div class="form-grid compact-grid">
             <label class="field">
@@ -122,6 +126,67 @@
           <p id="backup-export-result" class="subtle action-note">
             Exports can stay live, or you can pause the read surfaces first for a cleaner point-in-time bundle.
           </p>
+
+          <div class="preview-card debug-bundle-card">
+            <div class="preview-card-header">
+              <h3>Debug Bundle</h3>
+              <span class="badge">Frozen Support Snapshot</span>
+            </div>
+            <p class="subtle action-note">
+              Builds a temp-space support bundle from the current local stack. This exports a normal archive for offline inspection, not a standalone HTML and not an importable restore path.
+            </p>
+            <ul id="debug-path-list" class="path-list"></ul>
+            <p id="debug-path-summary" class="subtle action-note"></p>
+
+            <div class="form-grid compact-grid">
+              <label class="field">
+                <span>Bundle Format</span>
+                <select id="debug-packaging">
+                  <option value="tar.zst">tar.zst / ZSTD-9 (Recommended)</option>
+                  <option value="zip">.zip / Deflate</option>
+                  <option value="tar.gz">.tar.gz / Gzip-9</option>
+                  <option value="7z">.7z / 7-Zip</option>
+                </select>
+              </label>
+              <label class="toggle">
+                <input id="debug-scrub-secrets-toggle" type="checkbox" checked>
+                <span>Scrub obvious secrets</span>
+              </label>
+              <label class="toggle">
+                <input id="debug-scrub-identifiers-toggle" type="checkbox" checked>
+                <span>Scrub disk identifiers</span>
+              </label>
+              <label class="toggle field-span">
+                <input id="debug-encrypt-toggle" type="checkbox">
+                <span>Encrypt exported debug bundle with a passphrase</span>
+              </label>
+              <label class="field field-span">
+                <span>Debug Export Passphrase</span>
+                <input id="debug-export-passphrase" type="password" placeholder="Required when debug export encryption is enabled">
+              </label>
+              <p class="subtle action-note field-span">
+                Secret scrubbing disables locked secret-path pills. Disk-identifier scrubbing keeps the bundle share-friendlier without changing the fact that this is still just an offline archive.
+              </p>
+            </div>
+
+            <div class="toggle-group">
+              <label class="toggle">
+                <input id="debug-export-stop-toggle" type="checkbox" checked>
+                <span>Stop read UI and history before debug export</span>
+              </label>
+              <label class="toggle">
+                <input id="debug-export-restart-toggle" type="checkbox" checked>
+                <span>Restart anything stopped after debug export</span>
+              </label>
+            </div>
+
+            <div class="button-row">
+              <button id="debug-export-button" class="button secondary" type="button">Export Debug Bundle</button>
+            </div>
+            <p id="debug-export-result" class="subtle action-note">
+              Use this when you want a frozen local support snapshot without pretending it is the same thing as a restore-grade full backup.
+            </p>
+          </div>
         </div>
 
         <div class="backup-column">
@@ -732,6 +797,7 @@
 
           <div class="button-row">
             <button id="setup-create-button" class="button" type="button">Create System Entry</button>
+            <button id="setup-create-demo-button" class="button secondary" type="button">Add Demo Builder System</button>
           </div>
           <p id="setup-result" class="subtle action-note">
             Saving here updates the mounted config file; restart the read UI after a new system is added so it picks the new list up cleanly.

@@ -1,17 +1,47 @@
 # Changelog
 
-## Unreleased
+## v0.13.0 - 2026-04-21
 
-Follow-up work after `v0.12.0`.
+### Added
 
-### Carry-over notes
+- Selectable `Included Paths` pills in the admin full-backup flow, with locked
+  secret paths (`config/ssh`, imported TLS trust material, and shared
+  `known_hosts`) that force encrypted portable `.7z` export and restore
+  together with the selected bundle
+- Separate admin-side `Debug Bundle` export for frozen support snapshots, with
+  distinct `Scrub obvious secrets` and `Scrub disk identifiers` toggles plus
+  extra local stack-state capture
+- `Add Demo Builder System` in the admin setup flow so enclosure/profile/view
+  work can be tested against a seeded synthetic system without a real appliance
+- Optional `Embedded Boot Media` virtual storage view for UniFi UNVR / UNVR
+  Pro systems, including limited `/dev/boot` SMART collection through
+  `smartctl -d scsi`
+- Focused admin Playwright smoke coverage for bundle-path pills, locked-path
+  forced encryption, and the split debug scrub controls
 
-- more visual builder editing stays explicitly deferred beyond the current
-  preset-plus-matrix first pass
-- encrypted backup/export support for SSH keys, imported TLS trust material,
-  and shared `known_hosts` is still later work
-- remaining CORE bootstrap/backend clarity cleanup still lives in
-  `HANDOFF.md` / `TODO.md`
+### Changed
+
+- Checked-in operator docs now distinguish restore-grade full backup bundles,
+  engineer-facing debug bundles, and the main UI's self-contained offline
+  snapshot export
+- The admin operations UI now makes bundle-path selection more obvious with
+  explicit `[x]` / `[ ]` state, selected-count summaries, and clearer
+  demo-builder save feedback
+- `Boot SATADOMs` now render with photo-backed SATADOM tiles instead of the
+  older generic boot-media cards, and the surrounding boot-device shelf/overlay
+  spacing has been tuned to fit those cards more cleanly in the live UI
+- UniFi UNVR / UNVR Pro inventory now keeps the internal `boot` disk as a
+  limited boot-media candidate instead of dropping it from Linux inventory just
+  because it is not named like a normal `sdX` / `vdX` data disk
+
+### Fixed
+
+- Demo-builder saves now tolerate missing request bodies, use optional system
+  label/id overrides, and return readable success/error messages instead of the
+  earlier opaque `[object Object]` failure path
+- UniFi embedded-boot detail now strips inline smartctl parser noise such as
+  `error: designator length` from hex-only SCSI identifier fields before they
+  reach the hover text or the detail drawer
 
 ## v0.12.0 - 2026-04-21
 

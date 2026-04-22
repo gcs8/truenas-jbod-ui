@@ -43,7 +43,7 @@ set before you copy `wiki/images/` into the GitHub wiki repo.
 From the repo root in PowerShell:
 
 ```powershell
-$env:SCREENSHOT_TAG='v0.12.0'
+$env:SCREENSHOT_TAG='v0.13.0'
 .\.venv\Scripts\python.exe scripts\capture_readme_screenshots.py
 .\.venv\Scripts\python.exe scripts\capture_history_export_screenshots.py
 .\.venv\Scripts\python.exe scripts\capture_release_workflow_screenshots.py

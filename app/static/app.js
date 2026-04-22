@@ -470,6 +470,77 @@
     `;
   }
 
+  function buildSatadomRuntimeTileMarkup(slot, selectedView) {
+    const slotLabel = slot?.slot_label || `Slot ${Number(slot?.slot_index ?? 0) + 1}`;
+    const primary = storageViewRuntimeTilePrimary(slot, selectedView);
+    const summary = storageViewRuntimeTileSummary(slot, selectedView);
+    const tertiary = storageViewRuntimeTertiaryLabel(slot);
+    return `
+      <span class="slot-status-led" aria-hidden="true"></span>
+      <div class="storage-view-runtime-card storage-view-runtime-card--satadom">
+        <div class="storage-view-runtime-card-photo-wrap" aria-hidden="true">
+          <img class="storage-view-runtime-card-photo" src="/static/images/satadom-ml-3ie3-v2.png" alt="" loading="lazy" decoding="async">
+        </div>
+        <div class="storage-view-runtime-card-overlay">
+          <div class="storage-view-runtime-card-label-plate">
+            <div class="storage-view-runtime-card-head">
+              <span class="storage-view-runtime-card-slot">${escapeHtml(slotLabel)}</span>
+            </div>
+            <span class="storage-view-runtime-card-device">${escapeHtml(primary)}</span>
+          </div>
+          <div class="storage-view-runtime-card-content storage-view-runtime-card-content--satadom">
+            <span class="storage-view-runtime-card-summary">${escapeHtml(summary || stateLabel(slot))}</span>
+            ${tertiary ? `<span class="storage-view-runtime-card-tertiary">${escapeHtml(tertiary)}</span>` : ""}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function isSatadomBootTemplate(selectedView) {
+    return selectedView?.kind === "boot_devices" && selectedView?.template_id === "satadom-pair-2";
+  }
+
+  function buildEmbeddedBootMediaRuntimeTileMarkup(slot) {
+    const slotLabel = slot?.slot_label || `Slot ${Number(slot?.slot_index ?? 0) + 1}`;
+    const primary = slot?.occupied
+      ? (slot.device_name ? `/dev/${slot.device_name}` : slot.serial || "Embedded boot media")
+      : "Embedded boot media";
+    const summary = slot?.occupied
+      ? [
+          slot.model || null,
+          slot.size_human || null,
+          slot.smart_device_type ? `smartctl -d ${slot.smart_device_type}` : null,
+        ].filter(Boolean).join(" • ") || "Matched from live inventory."
+      : "No live boot device is currently landing in this storage-view slot.";
+    const tertiary = slot?.occupied
+      ? [
+          slot.serial || null,
+          slot.bus || null,
+        ].filter(Boolean).join(" • ")
+      : (slot?.smart_device_type ? `smartctl -d ${slot.smart_device_type}` : "");
+    return `
+      <span class="slot-status-led" aria-hidden="true"></span>
+      <div class="storage-view-runtime-card storage-view-runtime-card--boot-media">
+        <span class="storage-view-runtime-card-boot-chip storage-view-runtime-card-boot-chip--large" aria-hidden="true"></span>
+        <span class="storage-view-runtime-card-boot-chip storage-view-runtime-card-boot-chip--small" aria-hidden="true"></span>
+        <span class="storage-view-runtime-card-boot-connector" aria-hidden="true"></span>
+        <div class="storage-view-runtime-card-overlay storage-view-runtime-card-overlay--boot-media">
+          <div class="storage-view-runtime-card-label-plate storage-view-runtime-card-label-plate--boot-media">
+            <div class="storage-view-runtime-card-head">
+              <span class="storage-view-runtime-card-slot">${escapeHtml(slotLabel)}</span>
+            </div>
+            <span class="storage-view-runtime-card-device">${escapeHtml(primary)}</span>
+          </div>
+          <div class="storage-view-runtime-card-content storage-view-runtime-card-content--boot-media">
+            <span class="storage-view-runtime-card-summary">${escapeHtml(summary || stateLabel(slot))}</span>
+            ${tertiary ? `<span class="storage-view-runtime-card-tertiary storage-view-runtime-card-tertiary--boot-media">${escapeHtml(tertiary)}</span>` : ""}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   function formatNvmeFormFactorTag(slotSize) {
     const text = String(slotSize || "").trim();
     if (!text) {
@@ -739,6 +810,10 @@
         tile.innerHTML =
           selectedView.kind === "nvme_carrier"
             ? buildNvmeRuntimeTileMarkup(slot, selectedView)
+            : selectedView.kind === "boot_devices"
+              ? (isSatadomBootTemplate(selectedView)
+                ? buildSatadomRuntimeTileMarkup(slot, selectedView)
+                : buildEmbeddedBootMediaRuntimeTileMarkup(slot))
             : liveSlot
               ? buildLiveSlotTileMarkup(liveSlot)
             : `
@@ -2825,7 +2900,7 @@
     if (value === null || value === undefined || value === "") {
       return null;
     }
-    const text = String(value).trim();
+    const text = String(value).trim().split(/error:/i, 1)[0].trim();
     if (!text) {
       return null;
     }
@@ -2835,7 +2910,7 @@
     if (/^[0-9a-f]+$/i.test(text)) {
       return `0x${text.toLowerCase()}`;
     }
-    return text;
+    return null;
   }
 
   function formatTransportValue(smartEntry) {

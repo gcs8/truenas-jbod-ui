@@ -392,12 +392,87 @@ h3 {
 
 .path-list li,
 .pill-list .pill {
+  list-style: none;
+}
+
+.pill-list .pill {
   border-radius: 999px;
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.03);
   color: var(--muted);
   font-size: 0.88rem;
   padding: 8px 12px;
+}
+
+.path-list li {
+  margin: 0;
+}
+
+.path-pill {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 100%;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  cursor: pointer;
+  padding: 8px 12px;
+  text-align: left;
+  transition: border-color 140ms ease, background 140ms ease, transform 140ms ease, color 140ms ease;
+}
+
+.path-pill:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: rgba(113, 210, 255, 0.28);
+}
+
+.path-pill.is-selected {
+  border-color: rgba(113, 210, 255, 0.55);
+  background: rgba(50, 152, 255, 0.14);
+  color: var(--text);
+}
+
+.path-pill.is-locked {
+  box-shadow: inset 0 0 0 1px rgba(255, 209, 102, 0.16);
+}
+
+.path-pill.is-disabled,
+.path-pill:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.path-pill-state {
+  font-family: "Consolas", "SFMono-Regular", "Liberation Mono", monospace;
+  font-size: 0.82rem;
+  color: rgba(232, 240, 255, 0.75);
+}
+
+.path-pill-label {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.path-pill-path {
+  max-width: 22rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+}
+
+.path-pill-lock {
+  margin-left: auto;
+  font-size: 0.92rem;
+}
+
+.debug-bundle-card {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
 }
 
 .pill-list .pill strong {
@@ -675,8 +750,20 @@ h3 {
   gap: 10px;
 }
 
+.storage-view-preview-grid.is-boot-device {
+  gap: 14px;
+}
+
 .storage-view-preview-grid.is-nvme-carrier .profile-preview-cell {
   min-height: 72px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  justify-content: center;
+}
+
+.storage-view-preview-grid.is-boot-device .profile-preview-cell {
+  min-height: 104px;
   padding: 0;
   border: 0;
   background: transparent;
@@ -810,6 +897,199 @@ h3 {
   align-items: center;
   text-align: left;
   min-width: 0;
+}
+
+.storage-view-device-content--satadom {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px;
+}
+
+.storage-view-device-content--boot-media {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px;
+}
+
+.storage-view-device-label-plate {
+  display: grid;
+  gap: 2px;
+  width: fit-content;
+  max-width: min(78%, 160px);
+  padding: 10px 12px 8px;
+  border-radius: 12px;
+  border: 1px solid rgba(226, 236, 244, 0.16);
+  background: rgba(9, 15, 21, 0.56);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.1),
+    0 10px 18px rgba(0, 0, 0, 0.16);
+  backdrop-filter: blur(8px);
+}
+
+.storage-view-device-label-plate--boot-media {
+  border-color: rgba(186, 242, 214, 0.16);
+  background: rgba(6, 12, 14, 0.56);
+}
+
+.storage-view-device--satadom {
+  position: relative;
+  width: min(100%, 240px);
+  aspect-ratio: 268 / 210;
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(8, 13, 18, 0.18), rgba(8, 13, 18, 0.04));
+  box-shadow: 0 14px 24px rgba(0, 0, 0, 0.16);
+  overflow: visible;
+}
+
+.storage-view-device--boot-media {
+  position: relative;
+  width: min(100%, 240px);
+  aspect-ratio: 268 / 210;
+  border-radius: 16px;
+  border: 1px solid rgba(89, 208, 156, 0.18);
+  background:
+    radial-gradient(circle at 18% 22%, rgba(76, 216, 164, 0.12), transparent 28%),
+    linear-gradient(180deg, rgba(12, 36, 30, 0.96), rgba(9, 21, 19, 0.96));
+  box-shadow:
+    inset 0 1px 0 rgba(207, 246, 228, 0.08),
+    inset 0 0 0 1px rgba(7, 18, 15, 0.28),
+    0 14px 24px rgba(0, 0, 0, 0.16);
+  overflow: hidden;
+}
+
+.storage-view-device--boot-media::before {
+  content: "";
+  position: absolute;
+  inset: 14px 16px 38px;
+  border-radius: 14px;
+  border: 1px solid rgba(109, 232, 180, 0.16);
+  background:
+    linear-gradient(90deg, rgba(61, 180, 128, 0.16) 0 14%, transparent 14% 20%, rgba(61, 180, 128, 0.14) 20% 54%, transparent 54% 60%, rgba(61, 180, 128, 0.14) 60% 100%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0));
+}
+
+.storage-view-device-photo-wrap {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 8px 10px 6px;
+  border-radius: 16px;
+  pointer-events: none;
+}
+
+.storage-view-device-photo {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: center bottom;
+  user-select: none;
+  pointer-events: none;
+  filter: drop-shadow(0 10px 18px rgba(0, 0, 0, 0.28));
+}
+
+.storage-view-device--satadom .storage-view-preview-slot-label,
+.storage-view-device--satadom .storage-view-preview-slot-index {
+  color: #f3f7fb;
+}
+
+.storage-view-device--boot-media .storage-view-preview-slot-label,
+.storage-view-device--boot-media .storage-view-preview-slot-index,
+.storage-view-device--boot-media .storage-view-binding-summary {
+  color: #effaf4;
+}
+
+.storage-view-device--satadom .storage-view-preview-slot-label {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.storage-view-device--boot-media .storage-view-preview-slot-label {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.storage-view-device--satadom .storage-view-binding-summary {
+  width: fit-content;
+  max-width: 88%;
+  padding: 9px 11px;
+  border-radius: 12px;
+  border: 1px solid rgba(226, 236, 244, 0.15);
+  background: rgba(9, 15, 21, 0.52);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.08),
+    0 10px 18px rgba(0, 0, 0, 0.14);
+  color: rgba(230, 237, 243, 0.94);
+  font-size: 0.78rem;
+  backdrop-filter: blur(8px);
+}
+
+.storage-view-device--boot-media .storage-view-binding-summary {
+  width: fit-content;
+  max-width: 88%;
+  padding: 9px 11px;
+  border-radius: 12px;
+  border: 1px solid rgba(186, 242, 214, 0.16);
+  background: rgba(6, 12, 14, 0.56);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.08),
+    0 10px 18px rgba(0, 0, 0, 0.14);
+  font-size: 0.78rem;
+  backdrop-filter: blur(8px);
+}
+
+.storage-view-device-boot-chip {
+  position: absolute;
+  z-index: 0;
+  border-radius: 10px;
+  border: 1px solid rgba(8, 16, 19, 0.34);
+  background: linear-gradient(180deg, rgba(18, 27, 34, 0.96), rgba(9, 15, 19, 0.96));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 10px 16px rgba(0, 0, 0, 0.14);
+}
+
+.storage-view-device-boot-chip--large {
+  top: 60px;
+  left: 30px;
+  width: 34%;
+  height: 24%;
+}
+
+.storage-view-device-boot-chip--small {
+  top: 52px;
+  right: 34px;
+  width: 18%;
+  height: 16%;
+}
+
+.storage-view-device-boot-connector {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  width: 92px;
+  height: 24px;
+  transform: translateX(-50%);
+  border-radius: 8px 8px 12px 12px;
+  border: 1px solid rgba(212, 180, 88, 0.32);
+  background:
+    linear-gradient(180deg, rgba(59, 68, 73, 0.96), rgba(28, 33, 38, 0.96)),
+    repeating-linear-gradient(90deg, rgba(214, 177, 76, 0.98) 0 6px, rgba(83, 62, 16, 0.96) 6px 8px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 8px 14px rgba(0, 0, 0, 0.18);
 }
 
 .storage-view-preview-slot-label {

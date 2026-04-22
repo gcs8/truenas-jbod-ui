@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.12.0`.
+This file tracks the current intended release direction after `v0.13.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -325,6 +325,36 @@ Current status:
   complete
 - a more visual tile-level builder editor is intentionally deferred to backlog
   instead of being part of this release scope
+
+## v0.13.0 - Support Bundles, Embedded Boot Media, And Storage View Polish
+
+Goal:
+
+- round out the operator-support workflows around admin-side bundles and polish
+  the first-pass internal-device views that now sit alongside the larger
+  enclosure workflows
+
+Primary outcomes:
+
+- selectable admin full-backup scope with locked secret-path pills that force
+  encrypted `.7z` export when SSH keys, TLS trust material, or shared
+  `known_hosts` are included
+- separate scrub-capable debug bundles for frozen support snapshots without
+  pretending that flow is a restore path
+- seeded `demo-builder-lab` system/profile/view fixtures so profile and storage
+  view work can be exercised locally without a real appliance first
+- optional UniFi UNVR / UNVR Pro `Embedded Boot Media` view backed by limited
+  `smartctl -d scsi` detail from `/dev/boot`
+- photo-backed SATADOM rendering and the small follow-up visual/detail polish
+  needed to make those internal views read cleanly in the live UI
+
+Current status:
+
+- shipped in `v0.13.0`
+- the current release-facing work centers on backup/debug/demo workflows,
+  internal boot-media visibility, and tighter storage-view presentation polish
+- deeper debug-bundle replay/viewer ideas and broader builder-mode editing
+  remain intentionally deferred to backlog
 
 ## Longer-Term Ideas
 

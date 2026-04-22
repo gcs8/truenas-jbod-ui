@@ -132,6 +132,35 @@ def list_storage_view_templates() -> list[StorageViewTemplate]:
             notes="Useful for mirrored boot devices or SATADOM pairs. Hide it from the main read UI later if you only want it as a maintenance view.",
         ),
         StorageViewTemplate(
+            id="embedded-boot-media-1",
+            label="Embedded Boot Media",
+            default_id="embedded-boot-media",
+            default_label="Embedded Boot Media",
+            kind="boot_devices",
+            summary=(
+                "Single-slot internal boot-media view for embedded flash, eMMC, or other fixed appliance boot storage."
+            ),
+            rows=1,
+            columns=1,
+            slot_count=1,
+            slot_layout=[[0]],
+            default_render=StorageViewRenderConfig(
+                show_in_main_ui=True,
+                show_in_admin_ui=True,
+                default_collapsed=True,
+            ),
+            default_binding=StorageViewBindingConfig(mode="auto"),
+            default_slot_labels={
+                0: "Boot",
+            },
+            supports_led=False,
+            supports_auto_discovery=False,
+            notes=(
+                "Useful for appliance boot media that is exposed as a single fixed disk, "
+                "such as the UniFi UNVR and UNVR Pro internal boot device."
+            ),
+        ),
+        StorageViewTemplate(
             id="manual-4",
             label="Manual 4-Slot Group",
             default_id="manual-group",

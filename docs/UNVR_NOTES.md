@@ -120,6 +120,41 @@ The local app now uses that command as the primary UniFi slot source and keeps
 - read lookahead / write cache state
 - ATA lifetime read/write counters when SMART attributes `241/242` are present
 
+### Embedded Boot Media
+
+Both the regular UNVR and the tested UNVR Pro also expose their internal boot
+flash as a separate `/dev/boot` disk with partitions for `/boot/firmware`,
+`/data`, `/var/log`, and `/mnt/.rwfs`.
+
+Observed behavior on both appliances:
+
+- `readlink -f /sys/class/block/boot` resolves through a PCI-attached USB
+  mass-storage path, not a native `/dev/mmcblk*` eMMC device node
+- `lsusb` reports the backing reader as `Realtek USB3.0 Card Reader`
+  (`0bda:0315`)
+- `smartctl -x /dev/boot` does **not** autodetect the device type, but
+  `smartctl -d scsi -x -j /dev/boot` returns useful limited identity / health
+  data
+
+What the SCSI-style SMART path exposes today:
+
+- model / product family (`Generic- SD/MMC/MS/MSPRO`)
+- capacity
+- serial number
+- SMART pass/fail state
+- read-cache / writeback-cache flags
+- logical block size
+
+What it does **not** expose through the current UniFi OS device path:
+
+- native eMMC `EXT_CSD` lifetime buckets
+- `PRE_EOL_INFO`
+- other MMC-only wear counters
+
+The local app now treats this as an optional single-slot `Embedded Boot Media`
+storage view for both UNVR models and uses the limited `smartctl -d scsi`
+path when that boot view is selected.
+
 ## SES / LED Status
 
 `sg_ses` is installed, but the available `/dev/sg*` nodes on this host appear to

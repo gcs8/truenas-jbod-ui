@@ -171,6 +171,7 @@ class SlotView(BaseModel):
     identify_active: bool = False
     device_name: str | None = None
     smart_device_names: list[str] = Field(default_factory=list)
+    smart_device_type: str | None = None
     serial: str | None = None
     model: str | None = None
     size_bytes: int | None = None
@@ -320,17 +321,82 @@ class SystemBackupExportRequest(BaseModel):
     encrypt: bool = False
     passphrase: str | None = None
     packaging: Literal["tar.zst", "zip", "tar.gz", "7z"] = "tar.zst"
+    included_paths: list[str] = Field(default_factory=list)
 
     @field_validator("passphrase")
     @classmethod
     def sanitize_passphrase(cls, value: str | None) -> str | None:
         return preserve_optional_secret(value, max_length=512)
 
+    @field_validator("included_paths")
+    @classmethod
+    def sanitize_included_paths(cls, value: list[str]) -> list[str]:
+        cleaned_items: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            cleaned = trim_optional_text(item, max_length=128)
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            cleaned_items.append(cleaned)
+        return cleaned_items
+
     @model_validator(mode="after")
     def validate_encryption_requirements(self) -> "SystemBackupExportRequest":
         if self.encrypt and not self.passphrase:
             raise ValueError("A passphrase is required when encryption is enabled.")
         return self
+
+
+class DebugBundleExportRequest(BaseModel):
+    encrypt: bool = False
+    passphrase: str | None = None
+    packaging: Literal["tar.zst", "zip", "tar.gz", "7z"] = "tar.zst"
+    included_paths: list[str] = Field(default_factory=list)
+    scrub_secrets: bool = True
+    scrub_disk_identifiers: bool = True
+    scrub_sensitive: bool | None = None
+
+    @field_validator("passphrase")
+    @classmethod
+    def sanitize_passphrase(cls, value: str | None) -> str | None:
+        return preserve_optional_secret(value, max_length=512)
+
+    @field_validator("included_paths")
+    @classmethod
+    def sanitize_included_paths(cls, value: list[str]) -> list[str]:
+        cleaned_items: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            cleaned = trim_optional_text(item, max_length=128)
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            cleaned_items.append(cleaned)
+        return cleaned_items
+
+    @model_validator(mode="after")
+    def validate_encryption_requirements(self) -> "DebugBundleExportRequest":
+        if self.scrub_sensitive is not None:
+            if "scrub_secrets" not in self.model_fields_set:
+                self.scrub_secrets = self.scrub_sensitive
+            if "scrub_disk_identifiers" not in self.model_fields_set:
+                self.scrub_disk_identifiers = self.scrub_sensitive
+        if self.encrypt and not self.passphrase:
+            raise ValueError("A passphrase is required when encryption is enabled.")
+        return self
+
+
+class DemoSystemRequest(BaseModel):
+    system_id: str | None = None
+    label: str = "Demo Builder Lab"
+    make_default: bool = False
+    replace_existing: bool = False
+
+    @field_validator("system_id", "label")
+    @classmethod
+    def sanitize_text_fields(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=256)
 
 
 class HistoryAdoptRequest(BaseModel):
@@ -594,6 +660,7 @@ class StorageViewRuntimeSlot(BaseModel):
     snapshot_slot: int | None = None
     device_name: str | None = None
     smart_device_names: list[str] = Field(default_factory=list)
+    smart_device_type: str | None = None
     serial: str | None = None
     pool_name: str | None = None
     model: str | None = None

@@ -3,11 +3,41 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from app.config import StorageViewBindingConfig, StorageViewConfig, StorageViewRenderConfig, SystemConfig
+from app.services.profile_registry import (
+    UNIFI_UNVR_FRONT_4_PROFILE_ID,
+    UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+)
 from app.services.storage_view_templates import build_sequential_layout, get_storage_view_template
 
 if TYPE_CHECKING:
     from app.models.domain import EnclosureProfileView
     from app.services.profile_registry import ProfileRegistry
+
+
+UNIFI_EMBEDDED_BOOT_MEDIA_PROFILE_IDS = {
+    UNIFI_UNVR_FRONT_4_PROFILE_ID,
+    UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+}
+
+
+def _build_inferred_unifi_boot_media_view() -> StorageViewConfig:
+    return StorageViewConfig(
+        id="embedded-boot-media",
+        label="Embedded Boot Media",
+        kind="boot_devices",
+        template_id="embedded-boot-media-1",
+        enabled=True,
+        order=30,
+        render=StorageViewRenderConfig(
+            show_in_main_ui=True,
+            show_in_admin_ui=True,
+            default_collapsed=True,
+        ),
+        binding=StorageViewBindingConfig(
+            mode="auto",
+            device_names=["boot"],
+        ),
+    )
 
 
 def resolve_system_storage_views(
@@ -34,6 +64,8 @@ def resolve_system_storage_views(
                 binding=StorageViewBindingConfig(mode="auto"),
             )
         ]
+        if inferred_profile_id in UNIFI_EMBEDDED_BOOT_MEDIA_PROFILE_IDS:
+            stored_views.append(_build_inferred_unifi_boot_media_view())
 
     return sorted(
         stored_views,

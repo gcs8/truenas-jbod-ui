@@ -899,9 +899,10 @@ textarea {
 }
 
 .chassis-shell[data-face-style="boot-devices"] {
-  --chassis-min-height: 260px;
+  --chassis-min-height: 390px;
   --slot-grid-gap: 12px;
-  padding: 18px;
+  margin-top: 10px;
+  padding: 22px 18px 20px;
   background:
     linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0) 18%),
     linear-gradient(180deg, #6e7277 0%, #484d53 12%, #1b2026 12.2%, #12171c 100%);
@@ -918,10 +919,25 @@ textarea {
   justify-content: center;
 }
 
+.chassis-shell[data-face-style="boot-devices"] .slot-grid {
+  position: relative;
+  z-index: 2;
+  min-height: clamp(340px, 42vh, 420px);
+  padding: 24px;
+  margin-bottom: 24px;
+}
+
 .chassis-shell[data-face-style="nvme-carrier"] .slot-grid,
 .chassis-shell[data-face-style="nvme-carrier"] .front-edge {
   position: relative;
   z-index: 1;
+}
+
+.chassis-shell[data-face-style="boot-devices"] .front-edge {
+  position: relative;
+  z-index: 1;
+  margin-top: 0;
+  padding-top: 20px;
 }
 
 .chassis-shell[data-face-style="nvme-carrier"] .slot-grid {
@@ -936,9 +952,19 @@ textarea {
   justify-content: center;
 }
 
+.chassis-shell[data-face-style="boot-devices"] .slot-row {
+  margin-top: 18px;
+}
+
 .chassis-shell[data-face-style="nvme-carrier"] .row-slots,
 .chassis-shell[data-face-style="boot-devices"] .row-slots {
   justify-items: center;
+}
+
+.chassis-shell[data-face-style="boot-devices"] .row-slots {
+  min-height: 288px;
+  align-items: center;
+  align-content: center;
 }
 
 .chassis-shell[data-drive-scale="3.5"]:not([data-face-style="unifi-drive"]) {
@@ -1722,6 +1748,308 @@ textarea {
   height: auto;
   min-height: 106px;
   aspect-ratio: auto;
+}
+
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot {
+  width: clamp(240px, 28vw, 300px);
+  min-width: 240px;
+  max-width: 300px;
+  min-height: 0;
+  height: auto;
+  aspect-ratio: auto;
+  padding: 0;
+  gap: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
+  align-items: stretch;
+}
+
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot::before,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot::after,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot .slot-number,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot .slot-device,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot .slot-pool,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot .slot-tertiary,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot .slot-latch {
+  display: none;
+}
+
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot:hover,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.selected {
+  box-shadow: none;
+}
+
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot .slot-status-led {
+  top: 10px;
+  right: 14px;
+  width: 9px;
+  height: 9px;
+  box-shadow: 0 0 0 2px rgba(10, 18, 27, 0.86);
+}
+
+.storage-view-runtime-card--boot-media,
+.storage-view-runtime-card--satadom {
+  position: relative;
+  z-index: 2;
+  display: block;
+  width: 100%;
+  min-height: 0;
+  aspect-ratio: 268 / 255;
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(8, 13, 18, 0.18), rgba(8, 13, 18, 0.04));
+  box-shadow: 0 16px 24px rgba(0, 0, 0, 0.16);
+  transition: transform 0.16s ease, box-shadow 0.16s ease, filter 0.16s ease;
+  overflow: visible;
+}
+
+.storage-view-runtime-card--boot-media {
+  aspect-ratio: 268 / 220;
+  border: 1px solid rgba(89, 208, 156, 0.18);
+  background:
+    radial-gradient(circle at 18% 22%, rgba(76, 216, 164, 0.12), transparent 28%),
+    linear-gradient(180deg, rgba(12, 36, 30, 0.96), rgba(9, 21, 19, 0.96));
+  box-shadow:
+    inset 0 1px 0 rgba(207, 246, 228, 0.08),
+    inset 0 0 0 1px rgba(7, 18, 15, 0.28),
+    0 16px 24px rgba(0, 0, 0, 0.16);
+  overflow: hidden;
+}
+
+.storage-view-runtime-card--boot-media::before {
+  content: "";
+  position: absolute;
+  inset: 14px 16px 40px;
+  border-radius: 14px;
+  border: 1px solid rgba(109, 232, 180, 0.16);
+  background:
+    linear-gradient(90deg, rgba(61, 180, 128, 0.16) 0 14%, transparent 14% 20%, rgba(61, 180, 128, 0.14) 20% 54%, transparent 54% 60%, rgba(61, 180, 128, 0.14) 60% 100%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.storage-view-runtime-card-overlay--boot-media {
+  inset: 0;
+  z-index: 1;
+  padding: 14px;
+}
+
+.storage-view-runtime-card-label-plate--boot-media,
+.storage-view-runtime-card-content--boot-media {
+  border-color: rgba(186, 242, 214, 0.16);
+  background: rgba(6, 12, 14, 0.56);
+}
+
+.storage-view-runtime-card-content--boot-media {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 6px;
+  align-self: end;
+  max-width: calc(100% - 18px);
+  padding: 12px 14px;
+  border-radius: 12px;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.08),
+    0 10px 18px rgba(0, 0, 0, 0.16);
+  backdrop-filter: blur(8px);
+}
+
+.storage-view-runtime-card--boot-media .storage-view-runtime-card-slot,
+.storage-view-runtime-card--boot-media .storage-view-runtime-card-device,
+.storage-view-runtime-card--boot-media .storage-view-runtime-card-summary {
+  color: #effaf4;
+}
+
+.storage-view-runtime-card--boot-media .storage-view-runtime-card-slot {
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.storage-view-runtime-card--boot-media .storage-view-runtime-card-device {
+  font-size: 0.86rem;
+  line-height: 1.15;
+}
+
+.storage-view-runtime-card--boot-media .storage-view-runtime-card-summary {
+  font-size: 0.79rem;
+}
+
+.storage-view-runtime-card-tertiary--boot-media {
+  border-color: rgba(121, 231, 187, 0.22);
+  background: rgba(16, 36, 29, 0.56);
+}
+
+.storage-view-runtime-card-boot-chip {
+  position: absolute;
+  z-index: 0;
+  border-radius: 10px;
+  border: 1px solid rgba(8, 16, 19, 0.34);
+  background: linear-gradient(180deg, rgba(18, 27, 34, 0.96), rgba(9, 15, 19, 0.96));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 12px 18px rgba(0, 0, 0, 0.14);
+}
+
+.storage-view-runtime-card-boot-chip--large {
+  top: 64px;
+  left: 32px;
+  width: 34%;
+  height: 24%;
+}
+
+.storage-view-runtime-card-boot-chip--small {
+  top: 54px;
+  right: 36px;
+  width: 18%;
+  height: 16%;
+}
+
+.storage-view-runtime-card-boot-connector {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  width: 96px;
+  height: 24px;
+  transform: translateX(-50%);
+  border-radius: 8px 8px 12px 12px;
+  border: 1px solid rgba(212, 180, 88, 0.32);
+  background:
+    linear-gradient(180deg, rgba(59, 68, 73, 0.96), rgba(28, 33, 38, 0.96)),
+    repeating-linear-gradient(90deg, rgba(214, 177, 76, 0.98) 0 6px, rgba(83, 62, 16, 0.96) 6px 8px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 8px 14px rgba(0, 0, 0, 0.18);
+}
+
+.storage-view-runtime-card-photo-wrap {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 68px 24px 84px;
+  border-radius: 18px;
+  pointer-events: none;
+}
+
+.storage-view-runtime-card-photo {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: center bottom;
+  user-select: none;
+  pointer-events: none;
+  filter: drop-shadow(0 12px 20px rgba(0, 0, 0, 0.28));
+}
+
+.storage-view-runtime-card-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  padding: 14px;
+}
+
+.storage-view-runtime-card-label-plate {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 3px;
+  width: fit-content;
+  max-width: min(78%, 188px);
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(226, 236, 244, 0.18);
+  background: rgba(9, 15, 21, 0.58);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.12),
+    0 10px 18px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(8px);
+}
+
+.storage-view-runtime-card--satadom .storage-view-runtime-card-slot,
+.storage-view-runtime-card--satadom .storage-view-runtime-card-device {
+  color: #f3f7fb;
+}
+
+.storage-view-runtime-card--satadom .storage-view-runtime-card-slot {
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.storage-view-runtime-card--satadom .storage-view-runtime-card-device {
+  font-size: 0.86rem;
+  line-height: 1.15;
+}
+
+.storage-view-runtime-card-content--satadom {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 6px;
+  align-self: end;
+  max-width: calc(100% - 18px);
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(226, 236, 244, 0.16);
+  background: rgba(9, 15, 21, 0.54);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.1),
+    0 10px 18px rgba(0, 0, 0, 0.16);
+  backdrop-filter: blur(8px);
+}
+
+.storage-view-runtime-card--satadom .storage-view-runtime-card-summary {
+  color: rgba(230, 237, 243, 0.94);
+  font-size: 0.79rem;
+}
+
+.storage-view-runtime-card-tertiary {
+  width: fit-content;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(137, 220, 179, 0.24);
+  background: rgba(18, 40, 33, 0.48);
+  color: rgba(156, 235, 195, 0.92);
+  font-size: 0.66rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot:hover .storage-view-runtime-card--satadom,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot:hover .storage-view-runtime-card--boot-media {
+  transform: translateY(-3px) scale(1.01);
+  box-shadow: 0 18px 30px rgba(0, 0, 0, 0.22);
+}
+
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.selected .storage-view-runtime-card--satadom,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.selected .storage-view-runtime-card--boot-media {
+  box-shadow:
+    0 0 0 2px rgba(91, 183, 255, 0.36),
+    0 0 24px rgba(91, 183, 255, 0.16),
+    0 18px 30px rgba(0, 0, 0, 0.22);
+}
+
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.peer-highlight .storage-view-runtime-card--satadom,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.peer-highlight .storage-view-runtime-card--boot-media {
+  box-shadow:
+    0 0 0 1px rgba(76, 216, 164, 0.26),
+    0 0 16px rgba(76, 216, 164, 0.1),
+    0 18px 30px rgba(0, 0, 0, 0.2);
+}
+
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.peer-dimmed {
+  filter: none;
+}
+
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.peer-dimmed .storage-view-runtime-card--satadom,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.peer-dimmed .storage-view-runtime-card--boot-media {
+  filter: saturate(0.42) brightness(0.76);
+  opacity: 0.56;
 }
 
 .slot-latch {

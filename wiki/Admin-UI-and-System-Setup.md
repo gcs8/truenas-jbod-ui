@@ -9,7 +9,8 @@ Use it when you want:
 - SSH key reuse or generation
 - TLS certificate inspection and trust import
 - runtime restart control
-- config or history backup and restore
+- config/history restore bundles or frozen debug bundles
+- one-click demo builder data for enclosure or storage-view testing
 - reusable custom profile authoring through the dedicated builder workspace
 - saved storage-view editing without changing YAML by hand
 
@@ -54,7 +55,7 @@ The top of the admin page now has two section targets:
 
 ## What The Page Looks Like
 
-![Admin sidecar grouped setup view](images/admin-setup-v0.12.0.png)
+![Admin sidecar grouped setup view](images/admin-setup-v0.13.0.png)
 
 The page is organized around one saved system at a time.
 
@@ -94,7 +95,7 @@ This is where you confirm the intended chassis shape before you save.
 The admin sidecar now also has a dedicated builder workspace for reusable
 custom chassis profiles.
 
-![Builder workspace with full-width preview](images/builder-workspace-v0.12.0.png)
+![Builder workspace with full-width preview](images/builder-workspace-v0.13.0.png)
 
 Use it when you want to:
 
@@ -162,19 +163,70 @@ The pills on the page can show whether each service is:
 
 The admin sidecar is also the supported place for:
 
-- full config export
-- history DB export
-- backup bundle import or restore
+- restore-grade full backup export
+- full backup bundle import or restore
+- frozen debug bundle export for support review
 
 This keeps write-capable maintenance actions out of the normal enclosure
 viewer.
+
+### Full Backup Bundles
+
+The `Included Paths` pills are now selectable instead of just descriptive.
+
+Use the default plaintext scope when you only need the core app state:
+
+- `config/config.yaml`
+- `config/profiles.yaml`
+- slot mappings and slot-detail cache JSON
+- the history SQLite database
+
+The locked pills are the secret-material path:
+
+- `config/ssh`
+- imported TLS trust bundles
+- shared `known_hosts`
+
+Selecting any locked pill forces encrypted portable `.7z` export. That keeps
+secret material out of plaintext bundles while still letting the admin import
+path restore those same selected files later.
+
+### Debug Bundles
+
+The `Debug Bundle` card is a different tool from the restore bundle.
+
+Use it when you want a frozen support snapshot of the local stack for offline
+inspection. It:
+
+- exports a normal archive, not a self-contained HTML file
+- is not an importable restore path
+- can stop/restart the UI and history sidecar around capture
+- has separate `Scrub obvious secrets` and `Scrub disk identifiers` toggles
+
+If `Scrub obvious secrets` stays on, the locked secret-path pills remain
+disabled in the debug bundle so private keys and trust material do not
+accidentally ride along.
+
+### Demo Builder Seed
+
+The setup form now also exposes `Add Demo Builder System`.
+
+Use it when you want a safe local fixture for custom enclosure/profile work
+without pointing at a real host first. The action seeds:
+
+- a synthetic `demo-builder-lab` system
+- a matching custom demo chassis profile
+- sample saved/virtual storage views for builder and layout checks
+
+After saving a new system into the mounted config, restart the read UI so the
+runtime selector picks the updated system list up cleanly.
 
 ## History Maintenance And Recovery
 
 The same backup/restore area now also holds the safe cleanup tools for saved
 history:
 
-![Admin maintenance bundle and history tools](images/admin-maintenance-v0.12.0.png)
+![Admin maintenance bundle and history tools](images/admin-maintenance-v0.13.0.png)
 
 Use that panel when you need to:
 

@@ -1,28 +1,40 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 import yaml
 
-from app.config import get_settings
+from app.config import PathConfig, Settings, get_settings
 from app.models.domain import (
+    DebugBundleExportRequest,
+    DemoSystemRequest,
     SystemBackupExportRequest,
     SystemSetupBootstrapRequest,
     SystemSetupRequest,
 )
+from app.services.demo_system_factory import DemoSystemFactory
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.system_setup import SystemSetupService
 from history_service.config import HistorySettings
 from history_service.domain import MetricSample, SlotStateRecord
 from history_service.store import HistoryStore
-from history_service.system_backup import SEVEN_ZIP_SIGNATURE, SystemBackupService
+from history_service.system_backup import (
+    DEBUG_BUNDLE_FORMAT,
+    SEVEN_ZIP_SIGNATURE,
+    SSH_KEYS_KEY,
+    TLS_TRUST_KEY,
+    KNOWN_HOSTS_KEY,
+    SystemBackupService,
+)
 
 
 def write_yaml(path: Path, payload: dict[str, object]) -> None:
@@ -39,6 +51,9 @@ class SystemBackupServiceTests(unittest.TestCase):
         self.log_path = self.temp_dir / "app.log"
         self.history_db_path = self.temp_dir / "history.db"
         self.history_backup_dir = self.temp_dir / "history-backups"
+        self.ssh_dir = self.temp_dir / "ssh"
+        self.tls_dir = self.temp_dir / "tls"
+        self.known_hosts_path = self.temp_dir / "known_hosts"
 
         write_yaml(
             self.config_path,
@@ -152,6 +167,15 @@ class SystemBackupServiceTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.ssh_dir.mkdir(parents=True, exist_ok=True)
+        (self.ssh_dir / "id_truenas").write_text("PRIVATE-KEY\n", encoding="utf-8")
+        (self.ssh_dir / "id_truenas.pub").write_text("ssh-ed25519 PUBLIC-KEY demo\n", encoding="utf-8")
+        self.tls_dir.mkdir(parents=True, exist_ok=True)
+        (self.tls_dir / "archive-core.pem").write_text(
+            "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n",
+            encoding="utf-8",
+        )
+        self.known_hosts_path.write_text("archive-core.local ssh-ed25519 AAAATEST\n", encoding="utf-8")
 
         self.store = HistoryStore(str(self.history_db_path))
         self.store.upsert_slot_state(
@@ -426,6 +450,126 @@ class SystemBackupServiceTests(unittest.TestCase):
                 self.assertTrue(result["encrypted"])
                 self.assertEqual(result["packaging"], "7z")
 
+    def test_locked_secret_paths_require_encryption(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "Encrypted export is required"):
+                self.backup_service.export_bundle(
+                    included_paths=[
+                        "config_file",
+                        "profile_file",
+                        "mapping_file",
+                        "slot_detail_file",
+                        "history_db",
+                        SSH_KEYS_KEY,
+                    ],
+                )
+
+    def test_encrypted_backup_round_trip_restores_locked_secret_paths(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with patch.object(self.backup_service, "_run_7z_command", side_effect=self._fake_7z_command):
+                artifact = self.backup_service.export_bundle(
+                    encrypt=True,
+                    passphrase="topsecret",
+                    packaging="tar.zst",
+                    included_paths=[
+                        "config_file",
+                        "profile_file",
+                        "mapping_file",
+                        "slot_detail_file",
+                        "history_db",
+                        SSH_KEYS_KEY,
+                        TLS_TRUST_KEY,
+                        KNOWN_HOSTS_KEY,
+                    ],
+                )
+
+                group_entries = {entry["key"]: entry for entry in artifact.manifest.get("groups", [])}
+                self.assertTrue(group_entries[SSH_KEYS_KEY]["selected"])
+                self.assertTrue(group_entries[TLS_TRUST_KEY]["selected"])
+                self.assertTrue(group_entries[KNOWN_HOSTS_KEY]["selected"])
+
+                for file_path in self.ssh_dir.rglob("*"):
+                    if file_path.is_file():
+                        file_path.unlink()
+                self.ssh_dir.rmdir()
+                for file_path in self.tls_dir.rglob("*"):
+                    if file_path.is_file():
+                        file_path.unlink()
+                self.tls_dir.rmdir()
+                self.known_hosts_path.unlink()
+
+                self.backup_service.import_bundle(artifact.content, passphrase="topsecret")
+
+                self.assertEqual((self.ssh_dir / "id_truenas").read_text(encoding="utf-8"), "PRIVATE-KEY\n")
+                self.assertEqual(
+                    (self.tls_dir / "archive-core.pem").read_text(encoding="utf-8"),
+                    "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n",
+                )
+                self.assertEqual(
+                    self.known_hosts_path.read_text(encoding="utf-8"),
+                    "archive-core.local ssh-ed25519 AAAATEST\n",
+                )
+
+    def test_debug_bundle_scrubs_config_and_identifier_fields(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_debug_bundle(
+                packaging="zip",
+                scrub_secrets=True,
+                scrub_disk_identifiers=True,
+            )
+
+            self.assertEqual(artifact.manifest["format"], DEBUG_BUNDLE_FORMAT)
+            self.assertTrue(artifact.filename.endswith(".zip"))
+
+            with zipfile.ZipFile(io.BytesIO(artifact.content), mode="r") as archive:
+                scrubbed_config = archive.read("config/config.yaml").decode("utf-8")
+                scrubbed_mapping = archive.read("data/slot_mappings.json").decode("utf-8")
+                debug_state = archive.read("debug/state.json").decode("utf-8")
+
+            self.assertNotIn("API-KEY-1", scrubbed_config)
+            self.assertNotIn("archive-core.local", scrubbed_config)
+            self.assertNotIn("SERIAL-0", scrubbed_mapping)
+            self.assertIn("REDACTED-API_KEY", scrubbed_config)
+            self.assertIn("redacted-host-01.invalid", scrubbed_config)
+            self.assertIn("selected_groups", debug_state)
+
+    def test_debug_bundle_can_scrub_only_secrets(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_debug_bundle(
+                packaging="zip",
+                scrub_secrets=True,
+                scrub_disk_identifiers=False,
+            )
+
+            with zipfile.ZipFile(io.BytesIO(artifact.content), mode="r") as archive:
+                scrubbed_config = archive.read("config/config.yaml").decode("utf-8")
+                scrubbed_mapping = archive.read("data/slot_mappings.json").decode("utf-8")
+
+            self.assertNotIn("API-KEY-1", scrubbed_config)
+            self.assertIn("REDACTED-API_KEY", scrubbed_config)
+            self.assertIn("SERIAL-0", scrubbed_mapping)
+
+    def test_debug_bundle_can_scrub_only_disk_identifiers(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_debug_bundle(
+                packaging="zip",
+                scrub_secrets=False,
+                scrub_disk_identifiers=True,
+            )
+
+            with zipfile.ZipFile(io.BytesIO(artifact.content), mode="r") as archive:
+                scrubbed_config = archive.read("config/config.yaml").decode("utf-8")
+                scrubbed_mapping = archive.read("data/slot_mappings.json").decode("utf-8")
+
+            self.assertIn("API-KEY-1", scrubbed_config)
+            self.assertNotIn("SERIAL-0", scrubbed_mapping)
+            self.assertIn("serial-", scrubbed_mapping)
+
 class SecretWhitespaceModelTests(unittest.TestCase):
     def test_backup_export_request_preserves_padded_passphrase(self) -> None:
         payload = SystemBackupExportRequest(encrypt=True, passphrase="padded secret   ")
@@ -436,6 +580,28 @@ class SecretWhitespaceModelTests(unittest.TestCase):
         payload = SystemBackupExportRequest(packaging="7z")
 
         self.assertEqual(payload.packaging, "7z")
+
+    def test_backup_export_request_preserves_included_paths(self) -> None:
+        payload = SystemBackupExportRequest(included_paths=["config_file", "config_file", "history_db"])
+
+        self.assertEqual(payload.included_paths, ["config_file", "history_db"])
+
+    def test_debug_bundle_export_request_preserves_scrub_toggle(self) -> None:
+        payload = DebugBundleExportRequest(
+            scrub_secrets=False,
+            scrub_disk_identifiers=True,
+            included_paths=["config_file", "debug_state"],
+        )
+
+        self.assertFalse(payload.scrub_secrets)
+        self.assertTrue(payload.scrub_disk_identifiers)
+        self.assertEqual(payload.included_paths, ["config_file", "debug_state"])
+
+    def test_debug_bundle_export_request_aliases_legacy_scrub_toggle(self) -> None:
+        payload = DebugBundleExportRequest(scrub_sensitive=False)
+
+        self.assertFalse(payload.scrub_secrets)
+        self.assertFalse(payload.scrub_disk_identifiers)
 
     def test_system_setup_request_preserves_secret_whitespace(self) -> None:
         payload = SystemSetupRequest(
@@ -611,7 +777,6 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(saved_system["enclosure_profiles"], {"enc-a": "lab-4x4"})
         self.assertEqual(saved_system["storage_views"][0]["id"], "front-bays")
         self.assertEqual(saved_system["storage_views"][0]["binding"]["enclosure_ids"], ["enc-a"])
-
     def test_save_system_persists_explicit_storage_views(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         config_path = temp_dir / "config.yaml"
@@ -836,6 +1001,53 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(next_default, "archive-core")
         self.assertEqual(saved["default_system_id"], "archive-core")
         self.assertEqual([system["id"] for system in saved["systems"]], ["archive-core"])
+
+
+class DemoSystemFactoryTests(unittest.TestCase):
+    def test_create_demo_system_adds_profile_and_sample_views(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        profile_path = temp_dir / "profiles.yaml"
+        write_yaml(
+            config_path,
+            {
+                "paths": {
+                    "mapping_file": str(temp_dir / "slot_mappings.json"),
+                    "log_file": str(temp_dir / "app.log"),
+                    "profile_file": str(profile_path),
+                    "slot_detail_cache_file": str(temp_dir / "slot_detail_cache.json"),
+                }
+            },
+        )
+        write_yaml(profile_path, {"profiles": []})
+
+        settings = Settings(
+            config_file=str(config_path),
+            paths=PathConfig(
+                mapping_file=str(temp_dir / "slot_mappings.json"),
+                log_file=str(temp_dir / "app.log"),
+                profile_file=str(profile_path),
+                slot_detail_cache_file=str(temp_dir / "slot_detail_cache.json"),
+            ),
+            systems=[],
+            profiles=[],
+        )
+        factory = DemoSystemFactory(str(config_path), str(profile_path))
+
+        result = factory.create_demo_system(
+            DemoSystemRequest(replace_existing=True),
+            settings,
+        )
+
+        saved_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        saved_profiles = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["system"].id, "demo-builder-lab")
+        self.assertEqual(result["profile"].id, "demo-builder-lab-chassis")
+        self.assertEqual(saved_config["systems"][0]["default_profile_id"], "demo-builder-lab-chassis")
+        self.assertEqual(len(saved_config["systems"][0]["storage_views"]), 4)
+        self.assertEqual(saved_profiles["profiles"][0]["id"], "demo-builder-lab-chassis")
+        self.assertEqual(saved_profiles["profiles"][0]["slot_layout"][0], [2, 5, 8, 11])
 
 
 class SSHKeyManagerTests(unittest.TestCase):

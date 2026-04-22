@@ -645,6 +645,27 @@ Enclosure status diagnostic page:
         self.assertEqual(parsed["bytes_written"], 111254503000000)
         self.assertEqual(parsed["annualized_bytes_written"], 19831300795214)
 
+    def test_parse_smartctl_summary_strips_scsi_identifier_error_suffixes(self) -> None:
+        output = """
+{
+  "device": {"protocol": "SCSI"},
+  "logical_unit_id": "0x00e04c2020202000error: designator length",
+  "scsi_sas_port_0": {
+    "phy_0": {
+      "sas_address": "0x5000cca264d473d5error: designator length",
+      "attached_sas_address": "0x5003048001c1043ferror: designator length"
+    }
+  }
+}
+""".strip()
+
+        parsed = parse_smartctl_summary(output)
+
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["logical_unit_id"], "0xe04c2020202000")
+        self.assertEqual(parsed["sas_address"], "0x5000cca264d473d5")
+        self.assertEqual(parsed["attached_sas_address"], "0x5003048001c1043f")
+
     def test_parse_smartctl_text_enrichment_extracts_ata_cache_health_and_link_metadata(self) -> None:
         output = """
 === START OF INFORMATION SECTION ===
@@ -782,6 +803,21 @@ Writeback Cache is:   Disabled
         self.assertEqual(parsed["sas_address"], "0x5000cca23b713c81")
         self.assertEqual(parsed["attached_sas_address"], "0x500304801f715f3f")
         self.assertEqual(parsed["negotiated_link_rate"], "phy enabled; 12 Gbps")
+
+    def test_parse_smartctl_text_enrichment_strips_scsi_identifier_error_suffixes(self) -> None:
+        output = """
+Transport protocol:   SCSI
+Logical Unit id:      0x00e04c2020202000error: designator length
+    SAS address = 0x5000cca23b713c81error: designator length
+    attached SAS address = 0x500304801f715f3ferror: designator length
+""".strip()
+
+        parsed = parse_smartctl_text_enrichment(output)
+
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["logical_unit_id"], "0xe04c2020202000")
+        self.assertEqual(parsed["sas_address"], "0x5000cca23b713c81")
+        self.assertEqual(parsed["attached_sas_address"], "0x500304801f715f3f")
 
     def test_parse_linux_inventory_helpers_extract_useful_structures(self) -> None:
         lsblk_payload = """
