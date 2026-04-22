@@ -3,6 +3,7 @@
 Getting Started
 
 - [[Quick Start|Quick-Start]]
+- [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]]
 - [[Troubleshooting]]
 
 Platform Guides

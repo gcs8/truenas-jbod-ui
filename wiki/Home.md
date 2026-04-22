@@ -11,6 +11,8 @@ The goal is simple:
 If you are new here, start with:
 
 - [[Quick Start|Quick-Start]]
+- [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]] if you want the
+  published-image path instead of local builds
 
 If you already know what kind of host you are targeting, jump to:
 
@@ -27,6 +29,7 @@ If you want to control what the enclosure looks like, use:
 If you want to really tune things, use:
 
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
+- [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]]
 - [[Advanced Configuration|Advanced-Configuration]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
 - [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
@@ -61,6 +64,7 @@ It gives you:
 - manual slot calibration
 - multi-system selection
 - profile-driven enclosure layouts
+- both local-build and published-GHCR deployment paths
 
 ## Current Validated Hardware
 

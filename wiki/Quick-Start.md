@@ -79,6 +79,11 @@ in `.env` before you start:
 JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.13.0
 ```
 
+If you want the fuller published-image walkthrough, including update commands,
+stable-vs-dev tag guidance, and running all sidecars from GHCR, use:
+
+- [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]]
+
 ## 6. Open It
 
 ```text

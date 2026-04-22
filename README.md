@@ -285,6 +285,9 @@ the repo now ships a release-oriented Compose file that points at:
 
 - `ghcr.io/gcs8/truenas-jbod-ui`
 
+For the fuller pull-from-GHCR walkthrough, including update commands and tag
+guidance, see [wiki/Docker-and-GHCR-Deployment.md](wiki/Docker-and-GHCR-Deployment.md).
+
 Quick start:
 
 1. Copy the environment example:
@@ -434,6 +437,7 @@ The repo now includes a GitHub-wiki-ready page set under:
 
 - [`wiki/Home.md`](wiki/Home.md)
 - [`wiki/Quick-Start.md`](wiki/Quick-Start.md)
+- [`wiki/Docker-and-GHCR-Deployment.md`](wiki/Docker-and-GHCR-Deployment.md)
 - [`wiki/TrueNAS-CORE-Setup.md`](wiki/TrueNAS-CORE-Setup.md)
 - [`wiki/TrueNAS-SCALE-Setup.md`](wiki/TrueNAS-SCALE-Setup.md)
 - [`wiki/Quantastor-Setup.md`](wiki/Quantastor-Setup.md)
