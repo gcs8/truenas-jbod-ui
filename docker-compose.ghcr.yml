@@ -1,0 +1,101 @@
+services:
+  enclosure-ui:
+    image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
+    container_name: truenas-jbod-ui
+    user: "0:0"
+    env_file:
+      - .env
+    environment:
+      HISTORY_BACKEND_URL: http://enclosure-history:8001
+      HISTORY_BACKEND_TIMEOUT: ${HISTORY_BACKEND_TIMEOUT:-10}
+      ADMIN_SERVICE_URL: http://enclosure-admin:8002
+      ADMIN_PORT: ${ADMIN_PORT:-8082}
+      ADMIN_BIND_ADDRESS: ${ADMIN_BIND_ADDRESS:-0.0.0.0}
+      ADMIN_TIMEOUT_SECONDS: ${ADMIN_TIMEOUT_SECONDS:-0.75}
+    ports:
+      - "${APP_PORT:-8080}:8000"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config/ssh:/run/ssh:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  enclosure-history:
+    profiles:
+      - history
+    image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
+    container_name: truenas-jbod-history
+    user: "0:0"
+    command: ["uvicorn", "history_service.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      HISTORY_SOURCE_BASE_URL: http://enclosure-ui:8000
+      HISTORY_SQLITE_PATH: /app/history/history.db
+      HISTORY_BACKUP_DIR: ${HISTORY_BACKUP_DIR:-/app/history/backups}
+      HISTORY_BACKUP_RETENTION_COUNT: ${HISTORY_BACKUP_RETENTION_COUNT:-28}
+      HISTORY_LONG_TERM_BACKUP_DIR: ${HISTORY_LONG_TERM_BACKUP_DIR:-/app/history/backups/long-term}
+      HISTORY_WEEKLY_BACKUP_RETENTION_COUNT: ${HISTORY_WEEKLY_BACKUP_RETENTION_COUNT:-4}
+      HISTORY_MONTHLY_BACKUP_RETENTION_COUNT: ${HISTORY_MONTHLY_BACKUP_RETENTION_COUNT:-3}
+      HISTORY_POLL_INTERVAL_SECONDS: ${HISTORY_POLL_INTERVAL_SECONDS:-300}
+      HISTORY_FAST_INTERVAL_SECONDS: ${HISTORY_FAST_INTERVAL_SECONDS:-300}
+      HISTORY_SLOW_INTERVAL_SECONDS: ${HISTORY_SLOW_INTERVAL_SECONDS:-3600}
+      HISTORY_REQUEST_TIMEOUT_SECONDS: ${HISTORY_REQUEST_TIMEOUT_SECONDS:-20}
+      HISTORY_SMART_BATCH_SIZE: ${HISTORY_SMART_BATCH_SIZE:-24}
+      HISTORY_STARTUP_GRACE_SECONDS: ${HISTORY_STARTUP_GRACE_SECONDS:-20}
+    ports:
+      - "127.0.0.1:${HISTORY_PORT:-8081}:8001"
+    volumes:
+      - ./history:/app/history
+    depends_on:
+      enclosure-ui:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  enclosure-admin:
+    profiles:
+      - admin
+    image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
+    container_name: truenas-jbod-admin
+    user: "0:0"
+    command: ["uvicorn", "admin_service.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    env_file:
+      - .env
+    environment:
+      HISTORY_SQLITE_PATH: /app/history/history.db
+      HISTORY_BACKUP_DIR: ${HISTORY_BACKUP_DIR:-/app/history/backups}
+      HISTORY_LONG_TERM_BACKUP_DIR: ${HISTORY_LONG_TERM_BACKUP_DIR:-/app/history/backups/long-term}
+      ADMIN_PORT: 8002
+      ADMIN_BIND_ADDRESS: ${ADMIN_BIND_ADDRESS:-0.0.0.0}
+      ADMIN_AUTO_STOP_SECONDS: ${ADMIN_AUTO_STOP_SECONDS:-3600}
+      ADMIN_CONTAINER_UI_NAME: truenas-jbod-ui
+      ADMIN_CONTAINER_HISTORY_NAME: truenas-jbod-history
+      ADMIN_CONTAINER_ADMIN_NAME: truenas-jbod-admin
+      ADMIN_CLEAN_BACKUP_TARGETS_JSON: '${ADMIN_CLEAN_BACKUP_TARGETS_JSON:-["ui","history"]}'
+    ports:
+      - "${ADMIN_BIND_ADDRESS:-0.0.0.0}:${ADMIN_PORT:-8082}:8002"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./history:/app/history
+      - ./logs:/app/logs
+      - ./config/ssh:/run/ssh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

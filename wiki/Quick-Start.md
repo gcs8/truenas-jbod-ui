@@ -58,8 +58,25 @@ SSH_ENABLED=false
 
 ## 5. Start The App
 
-```bash
-docker compose up -d --build
+Choose one path:
+
+- published GHCR image, no local build:
+
+  ```bash
+  docker compose -f docker-compose.ghcr.yml up -d
+  ```
+
+- local source build:
+
+  ```bash
+  docker compose up -d --build
+  ```
+
+If you want to pin a specific published image tag instead of `latest`, set this
+in `.env` before you start:
+
+```dotenv
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.13.0
 ```
 
 ## 6. Open It
@@ -104,6 +121,12 @@ editing flow, or the dedicated custom-profile builder workspace, start the
 optional admin sidecar:
 
 ```bash
+docker compose -f docker-compose.ghcr.yml --profile admin up -d enclosure-admin
+```
+
+Or from source:
+
+```bash
 docker compose --profile admin up -d --build enclosure-admin
 ```
 
@@ -121,6 +144,12 @@ Use this page for the walkthrough:
 
 If you want historical slot lookback and the offline HTML snapshot export flow,
 start the optional history sidecar:
+
+```bash
+docker compose -f docker-compose.ghcr.yml --profile history up -d
+```
+
+Or from source:
 
 ```bash
 docker compose --profile history up -d --build

@@ -131,6 +131,12 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - push the release tag
 - publish the repo `wiki/` pages if they changed
 - create the GitHub release notes from the final changelog section
+- publish the GitHub release page so the `Publish GHCR Image` workflow runs
+- wait for the `Publish GHCR Image` Actions run to finish successfully
+- confirm GHCR has the expected release tags:
+  - `ghcr.io/gcs8/truenas-jbod-ui:vX.Y.Z`
+  - `ghcr.io/gcs8/truenas-jbod-ui:X.Y.Z`
+  - `ghcr.io/gcs8/truenas-jbod-ui:latest`
 - if the GitHub plugin is available in Codex, prefer it for GitHub-side actions
   like PRs, issues, or release-page prep
 

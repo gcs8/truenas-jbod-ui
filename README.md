@@ -269,13 +269,63 @@ truenas-jbod-ui/
 |- tests/
 |- .dockerignore
 |- .env.example
+|- .github/
+|  \- workflows/
 |- Dockerfile
+|- docker-compose.ghcr.yml
 |- docker-compose.yml
 |- README.md
 \- requirements.txt
 ```
 
-## Setup
+## Run The Published GHCR Image
+
+If you want to run a published container image instead of building locally,
+the repo now ships a release-oriented Compose file that points at:
+
+- `ghcr.io/gcs8/truenas-jbod-ui`
+
+Quick start:
+
+1. Copy the environment example:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Copy the sample config:
+
+   ```bash
+   cp config/config.example.yaml config/config.yaml
+   ```
+
+3. Optional if you want custom chassis layouts:
+
+   ```bash
+   cp config/profiles.example.yaml config/profiles.yaml
+   ```
+
+4. Optional if you want to pin a specific published tag instead of `latest`,
+   set this in `.env`:
+
+   ```dotenv
+   JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.13.0
+   ```
+
+5. Start the main UI:
+
+   ```bash
+   docker compose -f docker-compose.ghcr.yml up -d
+   ```
+
+6. Optional sidecars from the published image:
+
+   ```bash
+   docker compose -f docker-compose.ghcr.yml --profile history up -d
+   docker compose -f docker-compose.ghcr.yml --profile admin up -d enclosure-admin
+   ```
+
+## Build From Source
 
 1. Copy the environment example:
 
@@ -359,6 +409,8 @@ Typical host-side layout:
 Useful commands:
 
 ```bash
+docker compose -f docker-compose.ghcr.yml up -d
+docker compose -f docker-compose.ghcr.yml --profile history up -d
 docker compose up -d --build
 docker compose --profile history up -d --build
 docker compose logs -f
