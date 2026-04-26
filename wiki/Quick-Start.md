@@ -76,7 +76,7 @@ If you want to pin a specific published image tag instead of `latest`, set this
 in `.env` before you start:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.14.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.14.1
 ```
 
 If you want the fuller published-image walkthrough, including update commands,

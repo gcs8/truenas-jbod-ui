@@ -323,7 +323,7 @@ Quick start:
    set this in `.env`:
 
    ```dotenv
-   JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.14.0
+   JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.14.1
    ```
 
 5. Start the main UI:

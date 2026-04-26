@@ -88,6 +88,9 @@ It gives you:
   ESXi support on the validated `AOC-SLG4-2H8M2` path, better admin guardrails
   around non-Linux hosts, and a more responsive stale-cache-first runtime
   switching path for the already validated systems
+- `0.14.1` is the narrow SSH-only setup hotfix: the admin save path now lets
+  `esxi`, generic Linux, and UniFi-family systems persist cleanly when SSH is
+  the real source of truth and no API host should be required first
 
 ## Visual Walkthrough
 

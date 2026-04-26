@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.14.1 - 2026-04-26
+
+### Fixed
+
+- The admin sidecar now allows SSH-only `linux` and `esxi` system entries to
+  save without forcing the API host box to be filled first, reusing `ssh_host`
+  as the saved primary host when that API field is intentionally blank
+- Generic Linux and UniFi-family setups no longer trip the same save-path bug
+  when they are being configured as SSH-first systems with no appliance API
+  dependency
+
 ## v0.14.0 - 2026-04-26
 
 ### Added
