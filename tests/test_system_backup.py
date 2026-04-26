@@ -618,6 +618,29 @@ class SecretWhitespaceModelTests(unittest.TestCase):
         self.assertEqual(payload.ssh_password, "ssh secret   ")
         self.assertEqual(payload.ssh_sudo_password, "sudo secret   ")
 
+    def test_system_setup_request_uses_ssh_host_for_ssh_only_platforms(self) -> None:
+        esxi_payload = SystemSetupRequest(
+            label="CryoStorage ESXi",
+            platform="esxi",
+            truenas_host="",
+            ssh_enabled=True,
+            ssh_host="10.88.88.20",
+            ssh_user="root",
+        )
+        linux_payload = SystemSetupRequest(
+            label="GPU Server Linux",
+            platform="linux",
+            truenas_host="",
+            ssh_enabled=True,
+            ssh_host="gpu-server.local",
+            ssh_user="jbodmap",
+        )
+
+        self.assertEqual(esxi_payload.truenas_host, "10.88.88.20")
+        self.assertEqual(esxi_payload.ssh_host, "10.88.88.20")
+        self.assertEqual(linux_payload.truenas_host, "gpu-server.local")
+        self.assertEqual(linux_payload.ssh_host, "gpu-server.local")
+
     def test_bootstrap_request_preserves_secret_whitespace(self) -> None:
         payload = SystemSetupBootstrapRequest(
             host="archive-core.local",
@@ -668,6 +691,30 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(saved["systems"][0]["truenas"]["platform"], "scale")
         self.assertTrue(saved["systems"][0]["ssh"]["enabled"])
         self.assertIn("/usr/bin/lsscsi -g", saved["systems"][0]["ssh"]["commands"])
+
+    def test_create_system_uses_ssh_host_as_primary_host_for_esxi(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(config_path, {})
+
+        service = SystemSetupService(str(config_path))
+        created = service.create_system(
+            SystemSetupRequest(
+                label="CryoStorage ESXi",
+                platform="esxi",
+                truenas_host="",
+                ssh_enabled=True,
+                ssh_host="10.88.88.20",
+                ssh_user="root",
+            )
+        )
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(created.truenas.host, "10.88.88.20")
+        self.assertEqual(created.ssh.host, "10.88.88.20")
+        self.assertEqual(saved["systems"][0]["truenas"]["host"], "10.88.88.20")
+        self.assertEqual(saved["systems"][0]["ssh"]["host"], "10.88.88.20")
 
     def test_save_system_updates_existing_entry_when_replace_existing_is_true(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

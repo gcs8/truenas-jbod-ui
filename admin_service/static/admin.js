@@ -718,6 +718,11 @@
     return String(platform || "").toLowerCase() !== "esxi";
   }
 
+  function setupPlatformUsesSshOnlyHost(platform = currentSetupPlatform()) {
+    const normalized = String(platform || "").toLowerCase();
+    return normalized === "linux" || normalized === "esxi";
+  }
+
   function normalizeHaNode(rawNode) {
     const systemId = String(rawNode?.system_id || "").trim();
     const label = String(rawNode?.label || "").trim();
@@ -3838,15 +3843,18 @@
   }
 
   function collectSetupPayload() {
+    const platform = elements.setupPlatform?.value || "core";
     const sshEnabled = Boolean(elements.setupSshEnabled?.checked);
     const sshHost = normalizeConnectionHost(elements.setupSshHost?.value) || null;
     const sshUser = elements.setupSshUser?.value?.trim() || (sshEnabled ? recommendedSshUserForPlatform() : null);
     const normalizedSystemId = elements.setupSystemId?.value?.trim() || null;
+    const apiHost = elements.setupTruenasHost?.value?.trim() || "";
+    const primaryHost = apiHost || (setupPlatformUsesSshOnlyHost(platform) ? (sshHost || "") : "");
     return {
       system_id: normalizedSystemId,
       label: elements.setupSystemLabel?.value?.trim() || "",
-      platform: elements.setupPlatform?.value || "core",
-      truenas_host: elements.setupTruenasHost?.value?.trim() || "",
+      platform,
+      truenas_host: primaryHost,
       api_key: elements.setupApiKey?.value?.trim() || null,
       api_user: elements.setupApiUser?.value?.trim() || null,
       api_password: elements.setupApiPassword?.value || null,

@@ -825,12 +825,16 @@ class SystemSetupRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_required_fields(self) -> "SystemSetupRequest":
+        ssh_only_host_platform = self.platform in {"linux", "esxi"}
+        primary_host = self.truenas_host or (self.ssh_host if ssh_only_host_platform else None)
         if not self.label:
             raise ValueError("A system label is required.")
-        if not self.truenas_host:
+        if not primary_host:
             raise ValueError("A host is required.")
+        if ssh_only_host_platform and not self.truenas_host:
+            self.truenas_host = primary_host
         if self.ssh_enabled and not self.ssh_host:
-            self.ssh_host = self.truenas_host
+            self.ssh_host = primary_host
         if self.ssh_enabled and not self.ssh_user:
             raise ValueError("An SSH user is required when SSH enrichment is enabled.")
         return self

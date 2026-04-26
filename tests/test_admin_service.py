@@ -130,6 +130,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         script_text = script_path.read_text(encoding="utf-8")
 
         self.assertIn("platformSupportsBootstrap", script_text)
+        self.assertIn("setupPlatformUsesSshOnlyHost", script_text)
+        self.assertIn("truenas_host: primaryHost", script_text)
         self.assertIn('setupSshSudoPasswordField.classList.toggle("hidden", !savedSudoSupported)', script_text)
         self.assertIn("VMware ESXi does not use the one-time Linux service-account bootstrap.", script_text)
         self.assertIn("VMware ESXi does not use the Linux sudoers/bootstrap path.", script_text)
