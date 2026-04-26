@@ -32,6 +32,7 @@ from app.models.domain import (
 from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
 from app.services.history_backend import HistoryBackendClient
 from app.services.inventory_registry import InventoryRegistry
+from app.services.release_status import ReleaseStatusService
 from app.services.snapshot_export import SnapshotExportService, SnapshotExportTooLargeError
 from app.services.truenas_ws import TrueNASAPIError
 
@@ -62,6 +63,19 @@ def get_snapshot_export_service() -> SnapshotExportService:
     return SnapshotExportService(settings, get_history_backend(), templates)
 
 
+@lru_cache
+def get_release_status_service() -> ReleaseStatusService:
+    settings = get_settings()
+    configure_logging(settings)
+    return ReleaseStatusService(
+        current_version=__version__,
+        enabled=settings.app.release_check_enabled,
+        repo_full_name=settings.app.release_check_repo,
+        interval_seconds=settings.app.release_check_interval_seconds,
+        timeout_seconds=settings.app.release_check_timeout_seconds,
+    )
+
+
 def create_app() -> FastAPI:
     startup_settings = get_settings()
     configure_logging(startup_settings)
@@ -69,14 +83,22 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         warm_task: asyncio.Task[None] | None = None
+        release_task: asyncio.Task[None] | None = None
         if startup_settings.app.startup_warm_cache_enabled:
             registry = get_inventory_registry()
             warm_task = asyncio.create_task(
                 registry.prewarm_all(warm_smart=startup_settings.app.startup_warm_smart_enabled)
             )
+        release_task = asyncio.create_task(get_release_status_service().run_periodic_refresh())
         try:
             yield
         finally:
+            if release_task is not None and not release_task.done():
+                release_task.cancel()
+                try:
+                    await release_task
+                except asyncio.CancelledError:
+                    pass
             if warm_task is not None and not warm_task.done():
                 warm_task.cancel()
                 try:
@@ -123,6 +145,8 @@ def create_app() -> FastAPI:
                 settings=current_settings,
                 history_configured=bool(current_settings.history.service_url),
                 admin_launch_url=admin_launch_url,
+                app_version=__version__,
+                release_status=get_release_status_service().snapshot(),
             ),
         )
 
@@ -565,6 +589,8 @@ def build_index_context(
     settings: Settings,
     history_configured: bool,
     admin_launch_url: str | None = None,
+    app_version: str = __version__,
+    release_status: dict[str, object] | None = None,
     snapshot_mode: bool = False,
     snapshot_export_meta: dict[str, object] | None = None,
     snapshot_export_meta_json: str = "null",
@@ -584,6 +610,8 @@ def build_index_context(
         "initial_snapshot_json": json.dumps(snapshot.model_dump(mode="json")),
         "initial_storage_view_runtime_json": json.dumps(storage_view_runtime.model_dump(mode="json")),
         "history_configured": history_configured,
+        "app_version": app_version,
+        "release_status": release_status or {},
         "snapshot_mode": snapshot_mode,
         "snapshot_export_meta": snapshot_export_meta or {},
         "snapshot_export_meta_json": snapshot_export_meta_json,

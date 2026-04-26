@@ -29,6 +29,10 @@ class HistorySettings(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8001
     source_base_url: str = "http://enclosure-ui:8000"
+    release_check_enabled: bool = True
+    release_check_repo: str = "gcs8/truenas-jbod-ui"
+    release_check_interval_seconds: int = 86400
+    release_check_timeout_seconds: float = 5.0
     sqlite_path: str = Field(default_factory=_default_history_sqlite_path)
     backup_dir: str = Field(default_factory=_default_history_backup_dir)
     backup_retention_count: int = 28
@@ -64,6 +68,10 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_HOST": "host",
     "HISTORY_PORT": "port",
     "HISTORY_SOURCE_BASE_URL": "source_base_url",
+    "RELEASE_CHECK_ENABLED": "release_check_enabled",
+    "RELEASE_CHECK_REPO": "release_check_repo",
+    "RELEASE_CHECK_INTERVAL_SECONDS": "release_check_interval_seconds",
+    "RELEASE_CHECK_TIMEOUT_SECONDS": "release_check_timeout_seconds",
     "HISTORY_SQLITE_PATH": "sqlite_path",
     "HISTORY_BACKUP_DIR": "backup_dir",
     "HISTORY_BACKUP_RETENTION_COUNT": "backup_retention_count",

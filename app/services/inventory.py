@@ -2085,6 +2085,9 @@ class InventoryService:
             with perf_stage("inventory.quantastor.build_platform_context"):
                 platform_context = self._build_quantastor_platform_context(raw_data, selected_system_id)
                 self._annotate_quantastor_slot_context(slots, raw_data, selected_system_id, platform_context)
+        elif self.system.truenas.platform == "esxi":
+            with perf_stage("inventory.esxi.build_platform_context"):
+                platform_context = self._build_esxi_platform_context(ssh_data)
 
         with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
             self._apply_persisted_slot_details(slots)
@@ -3829,6 +3832,291 @@ class InventoryService:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return False
+
+    @staticmethod
+    def _platform_details_entry(label: str, value: Any, *, copyable: bool = False) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            text = "Yes" if value else "No"
+        else:
+            text = normalize_text(str(value))
+        if not text or text.lower() in {"n/a", "na", "-"}:
+            return None
+        return {
+            "label": label,
+            "value": text,
+            "copyable": copyable,
+        }
+
+    @staticmethod
+    def _platform_details_group(
+        title: str,
+        *,
+        summary: str | None = None,
+        entries: Iterable[dict[str, Any] | None] = (),
+    ) -> dict[str, Any] | None:
+        normalized_entries = [entry for entry in entries if entry]
+        if not normalized_entries:
+            return None
+        return {
+            "title": title,
+            "summary": normalize_text(summary),
+            "entries": normalized_entries,
+        }
+
+    @staticmethod
+    def _platform_details_section(
+        section_id: str,
+        title: str,
+        *,
+        summary: str | None = None,
+        entries: Iterable[dict[str, Any] | None] = (),
+        groups: Iterable[dict[str, Any] | None] = (),
+    ) -> dict[str, Any] | None:
+        normalized_entries = [entry for entry in entries if entry]
+        normalized_groups = [group for group in groups if group]
+        if not normalized_entries and not normalized_groups:
+            return None
+        return {
+            "id": section_id,
+            "title": title,
+            "summary": normalize_text(summary),
+            "entries": normalized_entries,
+            "groups": normalized_groups,
+        }
+
+    @staticmethod
+    def _platform_details_summary(*parts: str | None) -> str | None:
+        normalized = [normalize_text(part) for part in parts]
+        values = [part for part in normalized if part]
+        return " · ".join(values) if values else None
+
+    @staticmethod
+    def _storcli_display_state(value: Any) -> str | None:
+        text = normalize_text(str(value) if value is not None else None)
+        if not text:
+            return None
+        lowered = text.lower()
+        if lowered == "optl":
+            return "Optimal"
+        if lowered == "onln":
+            return "Online"
+        if lowered == "dgrd":
+            return "Degraded"
+        return text
+
+    def _build_esxi_platform_context(self, ssh_data: ParsedSSHData) -> dict[str, Any]:
+        sections: list[dict[str, Any]] = []
+        controller = ssh_data.esxi_storcli_controller if isinstance(ssh_data.esxi_storcli_controller, dict) else {}
+        basics = controller.get("Basics") if isinstance(controller.get("Basics"), dict) else {}
+        version = controller.get("Version") if isinstance(controller.get("Version"), dict) else {}
+        bus = controller.get("Bus") if isinstance(controller.get("Bus"), dict) else {}
+        status = controller.get("Status") if isinstance(controller.get("Status"), dict) else {}
+
+        overview = self._platform_details_section(
+            "overview",
+            "Overview",
+            summary=self._platform_details_summary(
+                normalize_text(basics.get("Model")),
+                (
+                    f"FW {normalize_text(version.get('Firmware Package Build'))}"
+                    if normalize_text(version.get("Firmware Package Build"))
+                    else None
+                ),
+                normalize_text(version.get("Driver Name")),
+            ),
+            entries=[
+                self._platform_details_entry("Controller Status", status.get("Controller Status")),
+                self._platform_details_entry("Model", basics.get("Model")),
+                self._platform_details_entry("Firmware Package", version.get("Firmware Package Build")),
+                self._platform_details_entry("Firmware Version", version.get("Firmware Version")),
+                self._platform_details_entry(
+                    "Driver",
+                    self._platform_details_summary(
+                        normalize_text(version.get("Driver Name")),
+                        normalize_text(version.get("Driver Version")),
+                    ),
+                ),
+                self._platform_details_entry("Serial Number", basics.get("Serial Number"), copyable=True),
+                self._platform_details_entry("PCI Address", basics.get("PCI Address"), copyable=True),
+                self._platform_details_entry("SAS Address", basics.get("SAS Address"), copyable=True),
+                self._platform_details_entry("Host Interface", bus.get("Host Interface")),
+                self._platform_details_entry("Device Interface", bus.get("Device Interface")),
+            ],
+        )
+        if overview:
+            sections.append(overview)
+
+        virtual_drive_groups: list[dict[str, Any]] = []
+        virtual_drive_names: list[str] = []
+        for virtual_drive in ssh_data.esxi_storcli_virtual_drives:
+            name = normalize_text(virtual_drive.get("name")) or (
+                f"VD{virtual_drive.get('vd_id')}" if virtual_drive.get("vd_id") is not None else "Virtual Drive"
+            )
+            if name:
+                virtual_drive_names.append(name)
+            detail = virtual_drive.get("detail") if isinstance(virtual_drive.get("detail"), dict) else {}
+            physical_count = len([drive for drive in virtual_drive.get("physical_drives") or [] if isinstance(drive, dict)])
+            virtual_drive_groups.append(
+                self._platform_details_group(
+                    name or "Virtual Drive",
+                    summary=self._platform_details_summary(
+                        normalize_text(virtual_drive.get("raid")),
+                        self._storcli_display_state(virtual_drive.get("state")),
+                        normalize_text(virtual_drive.get("size")),
+                        f"{physical_count} members" if physical_count else None,
+                    ),
+                    entries=[
+                        self._platform_details_entry("State", self._storcli_display_state(virtual_drive.get("state"))),
+                        self._platform_details_entry("Size", virtual_drive.get("size")),
+                        self._platform_details_entry("Strip Size", detail.get("Strip Size")),
+                        self._platform_details_entry("Write Policy", detail.get("Write Cache(initial setting)")),
+                        self._platform_details_entry("Disk Cache Policy", detail.get("Disk Cache Policy")),
+                        self._platform_details_entry("SCSI NAA", virtual_drive.get("scsi_naa"), copyable=True),
+                        self._platform_details_entry("Unmap Enabled", detail.get("Unmap Enabled")),
+                        self._platform_details_entry(
+                            "Created",
+                            self._platform_details_summary(
+                                normalize_text(detail.get("Creation Date")),
+                                normalize_text(detail.get("Creation Time")),
+                            ),
+                        ),
+                    ],
+                )
+            )
+        virtual_drives = self._platform_details_section(
+            "virtual-drives",
+            "Virtual Drives",
+            summary=self._platform_details_summary(
+                f"{len(virtual_drive_names)}" if virtual_drive_names else None,
+                " / ".join(virtual_drive_names[:3]) if virtual_drive_names else None,
+            ),
+            groups=virtual_drive_groups,
+        )
+        if virtual_drives:
+            sections.append(virtual_drives)
+
+        filesystems_by_volume = {
+            normalize_text(filesystem.get("volume_name")): filesystem
+            for filesystem in ssh_data.esxi_filesystems
+            if isinstance(filesystem, dict) and normalize_text(filesystem.get("volume_name"))
+        }
+        datastore_groups: list[dict[str, Any]] = []
+        datastore_names: list[str] = []
+        for extent in ssh_data.esxi_vmfs_extents:
+            if not isinstance(extent, dict):
+                continue
+            volume_name = normalize_text(extent.get("volume_name"))
+            if not volume_name:
+                continue
+            datastore_names.append(volume_name)
+            filesystem = filesystems_by_volume.get(volume_name) or {}
+            size_value = format_bytes(parse_size_to_bytes(filesystem.get("size")))
+            datastore_groups.append(
+                self._platform_details_group(
+                    volume_name,
+                    summary=self._platform_details_summary(
+                        normalize_text(filesystem.get("type")),
+                        size_value,
+                    ),
+                    entries=[
+                        self._platform_details_entry("Mounted", filesystem.get("mounted")),
+                        self._platform_details_entry("Device", extent.get("device_name"), copyable=True),
+                        self._platform_details_entry("Partition", extent.get("partition")),
+                        self._platform_details_entry("Mount Point", filesystem.get("mount_point")),
+                        self._platform_details_entry("Free", format_bytes(parse_size_to_bytes(filesystem.get("free")))),
+                    ],
+                )
+            )
+        datastores = self._platform_details_section(
+            "datastores",
+            "Datastore Context",
+            summary=self._platform_details_summary(
+                f"{len(datastore_names)}" if datastore_names else None,
+                " / ".join(datastore_names[:3]) if datastore_names else None,
+            ),
+            groups=datastore_groups,
+        )
+        if datastores:
+            sections.append(datastores)
+
+        member_groups: list[dict[str, Any]] = []
+        sed_capable_count = 0
+        opal_like_count = 0
+        for drive in sorted(
+            ssh_data.esxi_storcli_physical_drives,
+            key=lambda item: (
+                normalize_text(item.get("enclosure_id")) or "",
+                item.get("slot") if isinstance(item.get("slot"), int) else 999,
+            ),
+        ):
+            detail = drive.get("detail") if isinstance(drive.get("detail"), dict) else {}
+            slot = drive.get("slot") if isinstance(drive.get("slot"), int) else None
+            slot_key = normalize_text(drive.get("slot_key"))
+            title = (
+                f"Slot {slot:02d} ({slot_key})"
+                if slot is not None and slot_key
+                else f"Slot {slot:02d}" if slot is not None else slot_key or "Physical Member"
+            )
+            sed_capable = normalize_text(detail.get("SED Capable") or detail.get("SED"))
+            fde_type = normalize_text(detail.get("FDE Type"))
+            if self._storcli_bool(sed_capable):
+                sed_capable_count += 1
+            if fde_type and "opal" in fde_type.lower():
+                opal_like_count += 1
+            member_groups.append(
+                self._platform_details_group(
+                    title,
+                    summary=self._platform_details_summary(
+                        normalize_text(drive.get("model")),
+                        normalize_text(drive.get("firmware")),
+                    ),
+                    entries=[
+                        self._platform_details_entry("WWN", detail.get("WWN"), copyable=True),
+                        self._platform_details_entry("Firmware", drive.get("firmware") or detail.get("Firmware Revision")),
+                        self._platform_details_entry("Drive Position", detail.get("Drive position")),
+                        self._platform_details_entry("Connector", drive.get("connector_name") or detail.get("Connector Name")),
+                        self._platform_details_entry("Connected Port", drive.get("connected_port") or detail.get("Connected Port Number")),
+                        self._platform_details_entry("Link Speed", drive.get("link_speed") or detail.get("Link Speed")),
+                        self._platform_details_entry("Write Cache", detail.get("Write Cache")),
+                        self._platform_details_entry("Max Lane Width", detail.get("Max lane width")),
+                        self._platform_details_entry("FDE Type", fde_type),
+                        self._platform_details_entry("SED Capable", sed_capable),
+                        self._platform_details_entry("SED Enabled", detail.get("SED Enabled")),
+                        self._platform_details_entry("Secured", detail.get("Secured")),
+                        self._platform_details_entry("Cryptographic Erase", detail.get("Cryptographic Erase Capable")),
+                        self._platform_details_entry("Sanitize Support", detail.get("Sanitize Support")),
+                        self._platform_details_entry("PD Unmap", detail.get("Unmap Capable") or drive.get("unmap_capable")),
+                        self._platform_details_entry("LD Unmap", detail.get("Unmap Capable for LDs")),
+                    ],
+                )
+            )
+        member_capabilities = self._platform_details_section(
+            "member-capabilities",
+            "Member Capabilities",
+            summary=self._platform_details_summary(
+                f"{len(member_groups)}" if member_groups else None,
+                "Opal capable" if opal_like_count else None,
+                "SED capable" if sed_capable_count else None,
+            ),
+            groups=member_groups,
+        )
+        if member_capabilities:
+            sections.append(member_capabilities)
+
+        if not sections:
+            return {}
+        return {
+            "details": {
+                "title": "Platform Details",
+                "summary": (
+                    "Read-only controller, datastore, and member capability context surfaced from the "
+                    "existing ESXi SSH plus StorCLI inventory path."
+                ),
+                "sections": sections,
+            }
+        }
 
     def _build_esxi_smart_summary(self, slot_view: SlotView) -> SmartSummaryView:
         raw_drive = slot_view.raw_status.get("storcli_physical_drive") if isinstance(slot_view.raw_status, dict) else None

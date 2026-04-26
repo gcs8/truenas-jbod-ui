@@ -119,6 +119,10 @@
       currentRun: null,
       recentRuns: [],
     },
+    platformDetails: {
+      open: false,
+      expandedSections: {},
+    },
   };
 
   const grid = document.getElementById("slot-grid");
@@ -127,6 +131,11 @@
   const headerSummary = document.getElementById("header-summary");
   const enclosurePanelTitle = document.getElementById("enclosure-panel-title");
   const enclosureEdgeLabel = document.getElementById("enclosure-edge-label");
+  const platformDetailsToggleButton = document.getElementById("platform-details-toggle-button");
+  const platformDetailsPanel = document.getElementById("platform-details-panel");
+  const platformDetailsTitle = document.getElementById("platform-details-title");
+  const platformDetailsSummary = document.getElementById("platform-details-summary");
+  const platformDetailsSections = document.getElementById("platform-details-sections");
   const chassisShell = document.getElementById("chassis-shell");
   const slotTooltipEl = document.getElementById("slot-tooltip");
   const detailEmpty = document.getElementById("detail-empty");
@@ -321,6 +330,28 @@
 
   function currentPlatformContext() {
     return state.snapshot.platform_context || {};
+  }
+
+  function currentPlatformDetails() {
+    const details = currentPlatformContext()?.details;
+    if (!details || !Array.isArray(details.sections)) {
+      return null;
+    }
+    const sections = details.sections.filter((section) => {
+      if (!section || typeof section !== "object") {
+        return false;
+      }
+      const entries = Array.isArray(section.entries) ? section.entries.filter(Boolean) : [];
+      const groups = Array.isArray(section.groups) ? section.groups.filter(Boolean) : [];
+      return entries.length || groups.length;
+    });
+    if (!sections.length) {
+      return null;
+    }
+    return {
+      ...details,
+      sections,
+    };
   }
 
   function storageViewRuntimeViews() {
@@ -3880,8 +3911,11 @@
     return kvRow(label, value, copyable);
   }
 
-  function wireDetailCopyButtons() {
-    detailKvGrid.querySelectorAll("[data-copy]").forEach((button) => {
+  function wireCopyButtons(root) {
+    if (!root) {
+      return;
+    }
+    root.querySelectorAll("[data-copy]").forEach((button) => {
       button.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(decodeURIComponent(button.dataset.copy));
@@ -3891,6 +3925,10 @@
         }
       });
     });
+  }
+
+  function wireDetailCopyButtons() {
+    wireCopyButtons(detailKvGrid);
   }
 
   function escapeHtml(value) {
@@ -6010,6 +6048,113 @@
     }
   }
 
+  function renderPlatformDetailsEntryGrid(entries) {
+    if (!Array.isArray(entries) || !entries.length) {
+      return "";
+    }
+    return `
+      <div class="platform-details-entry-grid">
+        ${entries.map((entry) => kvRow(entry.label, entry.value, Boolean(entry.copyable))).join("")}
+      </div>
+    `;
+  }
+
+  function renderPlatformDetailsGroup(group) {
+    const entries = Array.isArray(group?.entries) ? group.entries.filter(Boolean) : [];
+    if (!entries.length) {
+      return "";
+    }
+    return `
+      <article class="platform-details-group-card">
+        <div class="platform-details-group-head">
+          <div class="platform-details-group-title">${escapeHtml(group.title || "Details")}</div>
+          ${group.summary ? `<div class="platform-details-group-summary">${escapeHtml(group.summary)}</div>` : ""}
+        </div>
+        ${renderPlatformDetailsEntryGrid(entries)}
+      </article>
+    `;
+  }
+
+  function renderPlatformDetailsSection(section) {
+    const entries = Array.isArray(section?.entries) ? section.entries.filter(Boolean) : [];
+    const groups = Array.isArray(section?.groups) ? section.groups.filter(Boolean) : [];
+    if (!entries.length && !groups.length) {
+      return "";
+    }
+    const isOpen = Boolean(state.platformDetails.expandedSections[section.id]);
+    return `
+      <section class="platform-details-section${isOpen ? " is-open" : ""}">
+        <button
+          class="platform-details-toggle"
+          type="button"
+          data-platform-details-section-toggle="${escapeHtml(section.id)}"
+          aria-expanded="${isOpen ? "true" : "false"}"
+        >
+          <span class="platform-details-chevron">▸</span>
+          <span class="platform-details-toggle-text">
+            <span class="platform-details-section-title">${escapeHtml(section.title || "Section")}</span>
+            ${section.summary ? `<span class="platform-details-section-summary">(${escapeHtml(section.summary)})</span>` : ""}
+          </span>
+        </button>
+        <div class="platform-details-body${isOpen ? "" : " hidden"}">
+          ${renderPlatformDetailsEntryGrid(entries)}
+          ${groups.length ? `<div class="platform-details-group-grid">${groups.map((group) => renderPlatformDetailsGroup(group)).join("")}</div>` : ""}
+        </div>
+      </section>
+    `;
+  }
+
+  function renderPlatformDetails() {
+    if (!platformDetailsToggleButton || !platformDetailsPanel || !platformDetailsSections) {
+      return;
+    }
+
+    const details = currentPlatformDetails();
+    if (!details) {
+      state.platformDetails.open = false;
+      state.platformDetails.expandedSections = {};
+      platformDetailsToggleButton.classList.add("hidden");
+      platformDetailsToggleButton.setAttribute("aria-expanded", "false");
+      platformDetailsToggleButton.textContent = "Platform Details";
+      platformDetailsPanel.classList.add("hidden");
+      platformDetailsSections.innerHTML = "";
+      return;
+    }
+
+    const validSectionIds = new Set(details.sections.map((section) => section.id).filter(Boolean));
+    Object.keys(state.platformDetails.expandedSections).forEach((sectionId) => {
+      if (!validSectionIds.has(sectionId)) {
+        delete state.platformDetails.expandedSections[sectionId];
+      }
+    });
+
+    platformDetailsToggleButton.classList.remove("hidden");
+    platformDetailsToggleButton.textContent = state.platformDetails.open ? "Hide Platform Details" : "Platform Details";
+    platformDetailsToggleButton.setAttribute("aria-expanded", state.platformDetails.open ? "true" : "false");
+    platformDetailsTitle.textContent = details.title || "Platform Details";
+    platformDetailsSummary.textContent = details.summary || "Read-only platform context.";
+
+    if (!state.platformDetails.open) {
+      platformDetailsPanel.classList.add("hidden");
+      platformDetailsSections.innerHTML = "";
+      return;
+    }
+
+    platformDetailsPanel.classList.remove("hidden");
+    platformDetailsSections.innerHTML = details.sections.map((section) => renderPlatformDetailsSection(section)).join("");
+    platformDetailsSections.querySelectorAll("[data-platform-details-section-toggle]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const sectionId = button.dataset.platformDetailsSectionToggle;
+        if (!sectionId) {
+          return;
+        }
+        state.platformDetails.expandedSections[sectionId] = !state.platformDetails.expandedSections[sectionId];
+        renderPlatformDetails();
+      });
+    });
+    wireCopyButtons(platformDetailsSections);
+  }
+
   function renderRefreshControls() {
     autoRefreshToggle.checked = state.autoRefresh;
     refreshIntervalSelect.value = String(state.refreshIntervalSeconds);
@@ -6071,6 +6216,7 @@
 
   function renderAll() {
     renderViewChrome();
+    renderPlatformDetails();
     renderGrid();
     renderDetail();
     renderStorageViewsRuntime();
@@ -6829,6 +6975,18 @@
   if (setupCreateButton) {
     setupCreateButton.addEventListener("click", () => {
       void createSystemFromWalkthrough();
+    });
+  }
+  if (platformDetailsToggleButton) {
+    platformDetailsToggleButton.addEventListener("click", () => {
+      if (!currentPlatformDetails()) {
+        return;
+      }
+      state.platformDetails.open = !state.platformDetails.open;
+      renderPlatformDetails();
+      if (state.platformDetails.open && platformDetailsPanel) {
+        platformDetailsPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
     });
   }
   if (historyCloseButton) {

@@ -11,8 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import HTTPException
 from fastapi import Request
 
+from app import __version__
 from admin_service.config import AdminSettings
 from admin_service.main import app as admin_app
+from admin_service.main import annotate_runtime_versions
 from admin_service.main import build_admin_state_payload
 from admin_service.main import decode_optional_secret_header
 from app.config import (
@@ -98,12 +100,33 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("/livez", paths)
         self.assertIn("/healthz", paths)
 
+    def test_admin_and_history_services_expose_livez(self) -> None:
+        admin_paths = {route.path for route in admin_app.routes}
+        history_paths = {route.path for route in history_app.routes}
+
+        self.assertIn("/livez", admin_paths)
+        self.assertIn("/livez", history_paths)
+
     def test_main_ui_template_omits_storage_view_runtime_panel(self) -> None:
         template_path = Path(__file__).resolve().parents[1] / "app" / "templates" / "index.html"
         template_text = template_path.read_text(encoding="utf-8")
 
         self.assertNotIn('id="storage-views-panel"', template_text)
         self.assertNotIn("Selected Storage View", template_text)
+
+    def test_main_ui_template_includes_version_meta(self) -> None:
+        template_path = Path(__file__).resolve().parents[1] / "app" / "templates" / "index.html"
+        template_text = template_path.read_text(encoding="utf-8")
+
+        self.assertIn('id="app-version-value"', template_text)
+        self.assertIn('id="app-version-note"', template_text)
+
+    def test_admin_ui_template_includes_version_stat(self) -> None:
+        template_path = Path(__file__).resolve().parents[1] / "admin_service" / "templates" / "index.html"
+        template_text = template_path.read_text(encoding="utf-8")
+
+        self.assertIn('id="admin-app-version"', template_text)
+        self.assertIn('id="admin-release-note"', template_text)
 
     def test_main_ui_script_filters_admin_only_storage_views_from_selector(self) -> None:
         script_path = Path(__file__).resolve().parents[1] / "app" / "static" / "app.js"
@@ -141,6 +164,20 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body)["status"], "ok")
+        self.assertEqual(json.loads(response.body)["version"], __version__)
+
+    def test_admin_and_history_livez_report_shared_version(self) -> None:
+        admin_route = next(route for route in admin_app.routes if route.path == "/livez")
+        history_route = next(route for route in history_app.routes if route.path == "/livez")
+
+        admin_response = asyncio.run(admin_route.endpoint())
+        history_response = asyncio.run(history_route.endpoint())
+
+        self.assertEqual(json.loads(admin_response.body)["version"], __version__)
+        self.assertEqual(json.loads(history_response.body)["version"], __version__)
+
+    def test_history_service_uses_shared_app_version(self) -> None:
+        self.assertEqual(history_app.version, __version__)
 
     def test_main_app_healthz_uses_cached_snapshot_only(self) -> None:
         fake_service = MagicMock()
@@ -341,6 +378,7 @@ class AdminStatePayloadTests(unittest.TestCase):
                             payload = asyncio.run(build_admin_state_payload(request))
 
         self.assertTrue(payload["ok"])
+        self.assertEqual(payload["app_version"], __version__)
         self.assertEqual(payload["admin"]["public_origin"], "http://localhost:8082")
         self.assertEqual(payload["default_system_id"], "archive-core")
         self.assertEqual(payload["systems"][0]["truenas_host"], "https://archive-core.local")
@@ -368,6 +406,91 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertTrue(payload["backup_defaults"]["debug_scrub_secrets"])
         self.assertTrue(payload["backup_defaults"]["debug_scrub_disk_identifiers"])
         self.assertTrue(any(group["key"] == "ssh_keys" for group in payload["backup_defaults"]["path_groups"]))
+
+    def test_build_admin_state_payload_includes_release_status(self) -> None:
+        request = make_request(port=8082)
+        runtime_service = MagicMock()
+        runtime_service.status_payload.return_value = {"available": False, "detail": None, "containers": []}
+        key_manager = MagicMock()
+        key_manager.list_keys.return_value = []
+        release_service = MagicMock()
+        release_service.snapshot.return_value = {
+            "current_version": __version__,
+            "status": "dev-build",
+            "summary": "Dev build · latest stable v0.14.1",
+            "latest_tag": "v0.14.1",
+            "latest_url": "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.14.1",
+        }
+
+        with patch("admin_service.main.reload_app_settings", return_value=Settings()):
+            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.main.get_release_status_service", return_value=release_service):
+                        with patch(
+                            "admin_service.main.get_admin_settings",
+                            return_value=AdminSettings(auto_stop_seconds=3600),
+                        ):
+                            with patch(
+                                "admin_service.main.get_history_settings",
+                                return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
+                            ):
+                                payload = asyncio.run(build_admin_state_payload(request))
+
+        self.assertEqual(payload["release_status"]["status"], "dev-build")
+        self.assertEqual(payload["release_status"]["latest_tag"], "v0.14.1")
+
+    def test_annotate_runtime_versions_marks_out_of_sync_services(self) -> None:
+        runtime_payload = {
+            "available": True,
+            "detail": None,
+            "containers": [
+                {"key": "ui", "running": True, "running_version": "0.14.1"},
+                {"key": "history", "running": True, "running_version": "0.15.0-dev"},
+                {"key": "admin", "running": True, "running_version": "0.15.0-dev"},
+            ],
+        }
+        release_status = {
+            "status": "dev-build",
+            "summary": "Dev build · latest stable v0.14.1",
+            "latest_tag": "v0.14.1",
+        }
+
+        annotated = annotate_runtime_versions(runtime_payload, release_status)
+
+        ui_container = next(item for item in annotated["containers"] if item["key"] == "ui")
+        history_container = next(item for item in annotated["containers"] if item["key"] == "history")
+        self.assertEqual(ui_container["latest_version"], "v0.14.1")
+        self.assertEqual(ui_container["release_status"]["status"], "current")
+        self.assertEqual(ui_container["version_sync_state"], "out_of_sync")
+        self.assertIn("0.15.0-dev", ui_container["version_sync_summary"])
+        self.assertEqual(history_container["release_status"]["status"], "dev-build")
+        self.assertEqual(history_container["version_sync_state"], "out_of_sync")
+
+    def test_annotate_runtime_versions_handles_probe_failures(self) -> None:
+        runtime_payload = {
+            "available": True,
+            "detail": None,
+            "containers": [
+                {
+                    "key": "history",
+                    "running": True,
+                    "running_version": None,
+                    "version_probe_error": "Version probe failed for http://enclosure-history:8001/livez: timed out.",
+                }
+            ],
+        }
+        release_status = {
+            "status": "current",
+            "summary": "Latest tagged release",
+            "latest_tag": "v0.14.1",
+        }
+
+        annotated = annotate_runtime_versions(runtime_payload, release_status)
+
+        history_container = annotated["containers"][0]
+        self.assertEqual(history_container["release_status"]["status"], "known")
+        self.assertEqual(history_container["version_sync_state"], "unknown")
+        self.assertIn("Version probe failed", history_container["version_sync_summary"])
 
     def test_build_admin_state_payload_includes_quantastor_ha_nodes(self) -> None:
         settings = Settings(

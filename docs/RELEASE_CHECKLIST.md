@@ -13,7 +13,7 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 ## Code And Runtime
 
 - run the targeted test suite:
-  - `.\.venv\Scripts\python -m unittest tests.test_profiles tests.test_inventory tests.test_history_service tests.test_perf tests.test_perf_harness tests.test_snapshot_export`
+  - `.\.venv\Scripts\python -m unittest tests.test_profiles tests.test_inventory tests.test_history_service tests.test_perf tests.test_perf_harness tests.test_snapshot_export tests.test_admin_service tests.test_release_status`
 - run the browser smoke suite against the live app:
   - `npx playwright test`
 - if the release includes recent Quantastor topology or cache work, sanity-check:
@@ -35,6 +35,9 @@ The goal is to make releases boring, repeatable, and easy to audit later.
     `enclosure-ui` still works as a standalone deployment
   - bring `enclosure-history` back while keeping `enclosure-admin` stopped, and
     confirm the UI still works normally with history-enhanced paths available
+  - with the admin sidecar up, confirm the `Runtime Control` cards show
+    `Running` plus `Latest` versions and settle back to a clean aligned state
+    after startup or sidecar restarts
 - sanity-check the validated platform views in the live UI:
   - CORE
   - SCALE
@@ -52,7 +55,13 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 
 ## Screenshots
 
-- regenerate tracked screenshots:
+- decide first whether the release actually needs a screenshot refresh:
+  - if operator-facing layout or workflow visuals changed materially, regenerate
+    the tracked screenshot set
+  - if the release is mostly runtime, guardrail, or metadata polish, it is okay
+    to keep the current screenshot set intentionally and only verify the
+    existing image references still match the shipped workflow story
+- when a refresh is needed, regenerate tracked screenshots:
   - `python scripts/capture_readme_screenshots.py`
   - `python scripts/capture_history_export_screenshots.py`
 - verify output in `docs/images/screenshots/`
@@ -86,15 +95,15 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   - export snapshot dialog with live size estimate visible if that workflow is
     still featured in the README/wiki
 - use release-style filenames for those manual captures, for example:
-  - `builder-workspace-v0.14.0.png`
-  - `admin-setup-v0.14.0.png`
-  - `admin-maintenance-v0.14.0.png`
-  - `live-vs-storage-views-v0.14.0.png`
-  - `storage-view-history-v0.14.0.png`
-  - `archive-core-front-24-v0.14.0.png`
-  - `quantastor-satadoms-right-v0.14.0.png`
-  - `esxi-overview-v0.14.0.png`
-  - `snapshot-export-dialog-v0.14.0.png`
+  - `builder-workspace-v0.14.2.png`
+  - `admin-setup-v0.14.2.png`
+  - `admin-maintenance-v0.14.2.png`
+  - `live-vs-storage-views-v0.14.2.png`
+  - `storage-view-history-v0.14.2.png`
+  - `archive-core-front-24-v0.14.2.png`
+  - `quantastor-satadoms-right-v0.14.2.png`
+  - `esxi-overview-v0.14.2.png`
+  - `snapshot-export-dialog-v0.14.2.png`
 - decide whether each new screenshot is:
   - README-facing and should replace or extend repo image references
   - wiki-facing only and should still be staged in-repo before wiki publish
@@ -106,7 +115,8 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - bump `app/__init__.py` to the release version
 - add the release section to `CHANGELOG.md`
 - refresh any checked-in draft release-notes file if the repo is using one
-- refresh `docs/RELEASE_NOTES_0.14.0.md`
+- refresh the checked-in release notes file for the target tag, for example
+  `docs/RELEASE_NOTES_0.14.2.md`
 - review `README.md` for stale version or milestone wording
 - review `docs/ROADMAP.md` for stale "current direction" text
 - review profile/config docs for dead or outdated comments, especially builder

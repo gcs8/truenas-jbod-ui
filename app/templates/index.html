@@ -2,6 +2,8 @@
 {% block title %}TrueNAS JBOD Enclosure UI{% endblock %}
 {% block body %}
 {% set profile = snapshot.selected_profile %}
+{% set release_status_payload = release_status if release_status is defined and release_status else {} %}
+{% set release_note = release_status_payload.summary if release_status_payload and release_status_payload.summary else "Checking releases..." %}
 <div class="app-shell">
   <header class="topbar">
     <div>
@@ -42,6 +44,15 @@
         <span class="meta-label">Last Updated</span>
         <span class="meta-value" id="last-updated">{{ snapshot.last_updated }}</span>
         <span class="meta-note" id="timezone-label">Browser local time</span>
+      </div>
+      <div class="meta-card">
+        <span class="meta-label">Version</span>
+        <span class="meta-value" id="app-version-value">{% if snapshot_mode and snapshot_export_meta.app_version %}{{ snapshot_export_meta.app_version }}{% else %}{{ app_version }}{% endif %}</span>
+        {% if not snapshot_mode and release_status_payload and release_status_payload.latest_url %}
+          <a class="meta-note version-note version-note-{{ release_status_payload.status or 'unknown' }}" id="app-version-note" href="{{ release_status_payload.latest_url }}" target="_blank" rel="noopener">{{ release_note }}</a>
+        {% else %}
+          <span class="meta-note version-note version-note-{{ release_status_payload.status or 'unknown' }}" id="app-version-note">{% if snapshot_mode %}Snapshot artifact{% else %}{{ release_note }}{% endif %}</span>
+        {% endif %}
       </div>
     </div>
   </header>
@@ -211,40 +222,57 @@
   </section>
 
   <main class="content-grid">
-    <section class="panel enclosure-panel">
-      <div class="panel-header">
-        <div>
-          <h2 id="enclosure-panel-title">
-            {{ profile.panel_title if profile and profile.panel_title else (snapshot.selected_enclosure_label or "Enclosure") }}
-          </h2>
-        </div>
-        <div class="legend">
-          <span class="legend-item"><i class="swatch healthy"></i> Healthy</span>
-          <span class="legend-item"><i class="swatch empty"></i> Empty</span>
-          <span class="legend-item"><i class="swatch identify"></i> Identify</span>
-          <span class="legend-item"><i class="swatch fault"></i> Fault</span>
-          <span class="legend-item"><i class="swatch unknown"></i> Unknown</span>
-          <span class="legend-item"><i class="swatch unmapped"></i> Unmapped</span>
-        </div>
-      </div>
-      <div class="enclosure-face">
-        <div class="chassis-shell" id="chassis-shell" data-face-style="{{ profile.face_style if profile else 'generic' }}" data-latch-edge="{{ profile.latch_edge if profile else 'bottom' }}">
-          <div class="service-zone" aria-hidden="true">
-            <div class="service-panel service-panel-wide"></div>
-            <div class="service-cavity"></div>
-            <div class="service-panel service-panel-short"></div>
+    <div class="primary-column">
+      <section class="panel enclosure-panel">
+        <div class="panel-header">
+          <div>
+            <h2 id="enclosure-panel-title">
+              {{ profile.panel_title if profile and profile.panel_title else (snapshot.selected_enclosure_label or "Enclosure") }}
+            </h2>
           </div>
-          <div class="slot-grid" id="slot-grid"></div>
-          <div class="front-edge" aria-hidden="true">
-            <span class="front-handle"></span>
-            <span class="front-label" id="enclosure-edge-label">
-              {{ profile.edge_label if profile and profile.edge_label else "System front" }}
-            </span>
-            <span class="front-handle"></span>
+          <div class="panel-header-actions">
+            <button class="button secondary small hidden" id="platform-details-toggle-button" type="button" aria-expanded="false">
+              Platform Details
+            </button>
+            <div class="legend">
+              <span class="legend-item"><i class="swatch healthy"></i> Healthy</span>
+              <span class="legend-item"><i class="swatch empty"></i> Empty</span>
+              <span class="legend-item"><i class="swatch identify"></i> Identify</span>
+              <span class="legend-item"><i class="swatch fault"></i> Fault</span>
+              <span class="legend-item"><i class="swatch unknown"></i> Unknown</span>
+              <span class="legend-item"><i class="swatch unmapped"></i> Unmapped</span>
+            </div>
           </div>
         </div>
-      </div>
-    </section>
+        <div class="enclosure-face">
+          <div class="chassis-shell" id="chassis-shell" data-face-style="{{ profile.face_style if profile else 'generic' }}" data-latch-edge="{{ profile.latch_edge if profile else 'bottom' }}">
+            <div class="service-zone" aria-hidden="true">
+              <div class="service-panel service-panel-wide"></div>
+              <div class="service-cavity"></div>
+              <div class="service-panel service-panel-short"></div>
+            </div>
+            <div class="slot-grid" id="slot-grid"></div>
+            <div class="front-edge" aria-hidden="true">
+              <span class="front-handle"></span>
+              <span class="front-label" id="enclosure-edge-label">
+                {{ profile.edge_label if profile and profile.edge_label else "System front" }}
+              </span>
+              <span class="front-handle"></span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="platform-details-panel" class="panel platform-details-panel hidden">
+        <div class="panel-header compact">
+          <div>
+            <h2 id="platform-details-title">Platform Details</h2>
+            <p id="platform-details-summary" class="subtle">Read-only platform context.</p>
+          </div>
+        </div>
+        <div id="platform-details-sections" class="platform-details-sections"></div>
+      </section>
+    </div>
 
     <aside class="panel detail-panel">
       <div class="panel-header detail-panel-top">

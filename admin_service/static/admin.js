@@ -2,6 +2,8 @@
   const bootstrap = window.ADMIN_BOOTSTRAP || {};
   const state = {
     admin: bootstrap.admin || {},
+    appVersion: bootstrap.app_version || "",
+    releaseStatus: bootstrap.release_status || {},
     systems: Array.isArray(bootstrap.systems) ? bootstrap.systems : [],
     defaultSystemId: bootstrap.default_system_id || null,
     profiles: Array.isArray(bootstrap.profiles) ? bootstrap.profiles : [],
@@ -85,6 +87,8 @@
     expiresAt: document.getElementById("admin-expires-at"),
     systemCount: document.getElementById("admin-system-count"),
     profileCount: document.getElementById("admin-profile-count"),
+    appVersion: document.getElementById("admin-app-version"),
+    releaseNote: document.getElementById("admin-release-note"),
     runtimeDetail: document.getElementById("runtime-detail"),
     runtimeCards: document.getElementById("runtime-cards"),
     backupPathList: document.getElementById("backup-path-list"),
@@ -448,6 +452,25 @@
     if (elements.profileCount) {
       elements.profileCount.textContent = String(state.profiles.length);
     }
+    if (elements.appVersion) {
+      elements.appVersion.textContent = state.appVersion || "unknown";
+    }
+    if (elements.releaseNote) {
+      const releaseStatus = state.releaseStatus || {};
+      const summary = String(releaseStatus.summary || "Checking releases...");
+      const latestUrl = String(releaseStatus.latest_url || "").trim();
+      elements.releaseNote.textContent = summary;
+      elements.releaseNote.className = `hero-stat-note is-${releaseStatus.status || "unknown"}`;
+      if (latestUrl) {
+        elements.releaseNote.innerHTML = "";
+        const link = document.createElement("a");
+        link.href = latestUrl;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.textContent = summary;
+        elements.releaseNote.appendChild(link);
+      }
+    }
     if (elements.adminOriginLink) {
       const origin = String(state.admin.public_origin || "").trim();
       const originUrl = new URL(origin || window.location.href, window.location.href);
@@ -600,13 +623,30 @@
     return "is-error";
   }
 
+  function runtimeVersionNoteClass(container) {
+    const releaseState = String(container.release_status?.status || "").toLowerCase();
+    if (releaseState) {
+      return `is-${releaseState}`;
+    }
+    const syncState = String(container.version_sync_state || "").toLowerCase();
+    if (syncState === "out_of_sync") {
+      return "is-out-of-sync";
+    }
+    return "";
+  }
+
+  function formatRuntimeMetaValue(value, fallback = "Unavailable") {
+    const text = String(value || "").trim();
+    return text || fallback;
+  }
+
   function renderRuntimeCards() {
     if (!elements.runtimeCards || !elements.runtimeDetail) {
       return;
     }
     const runtime = state.runtime || {};
     elements.runtimeDetail.textContent = runtime.available
-      ? "Runtime control is available through the mounted Docker socket."
+      ? `Runtime control is available through the mounted Docker socket.${runtime.version_detail ? ` ${runtime.version_detail}` : ""}`
       : String(runtime.detail || "Runtime control is unavailable in this session.");
     const containers = Array.isArray(runtime.containers) ? runtime.containers : [];
     elements.runtimeCards.innerHTML = containers
@@ -629,6 +669,7 @@
         }
         const health = container.health ? ` / ${escapeHtml(container.health)}` : "";
         const lifecycleLabel = String(container.lifecycle_label || container.status_text || container.status || "unknown");
+        const versionNote = String(container.release_status?.summary || container.version_sync_summary || "").trim();
         return `
           <article class="runtime-card">
             <div class="runtime-card-header">
@@ -642,6 +683,18 @@
             </div>
             <div class="runtime-card-copy"><code>${escapeHtml(container.name || container.key)}</code></div>
             <div class="subtle">${escapeHtml(container.status_text || "No additional runtime detail is available.")}</div>
+            <div class="runtime-version-grid">
+              <div class="runtime-version-row">
+                <span class="runtime-version-label">Running</span>
+                <span class="runtime-version-value">${escapeHtml(formatRuntimeMetaValue(container.running_version, container.running ? "Unavailable" : "Stopped"))}</span>
+              </div>
+              <div class="runtime-version-row">
+                <span class="runtime-version-label">Latest</span>
+                <span class="runtime-version-value">${escapeHtml(formatRuntimeMetaValue(container.latest_version))}</span>
+              </div>
+            </div>
+            <div class="runtime-version-note ${runtimeVersionNoteClass(container)}">${escapeHtml(versionNote)}</div>
+            <div class="runtime-sync-note ${String(container.version_sync_state || "").toLowerCase() === "out_of_sync" ? "is-out-of-sync" : ""}">${escapeHtml(container.version_sync_summary || "")}</div>
             <div class="button-row">${actions.join("") || '<span class="subtle">No action available from this state.</span>'}</div>
           </article>
         `;
@@ -4263,6 +4316,8 @@
     try {
       const payload = await fetchJson("/api/admin/state");
       state.admin = payload.admin || {};
+      state.appVersion = payload.app_version || state.appVersion;
+      state.releaseStatus = payload.release_status || state.releaseStatus;
       state.systems = Array.isArray(payload.systems) ? payload.systems : [];
       state.defaultSystemId = payload.default_system_id || null;
       state.profiles = Array.isArray(payload.profiles) ? payload.profiles : [];

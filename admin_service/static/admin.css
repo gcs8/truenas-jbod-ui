@@ -234,6 +234,37 @@ h3 {
   font-weight: 700;
 }
 
+.hero-stat-note {
+  display: block;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.hero-stat-note a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.hero-stat-note a:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+.hero-stat-note.is-update-available {
+  color: var(--warning);
+}
+
+.hero-stat-note.is-error {
+  color: var(--danger);
+}
+
+.hero-stat-note.is-dev-build,
+.hero-stat-note.is-ahead {
+  color: #9ed5ff;
+}
+
 .status-banner {
   margin: 18px 4px 0;
   padding: 14px 18px;
@@ -299,6 +330,57 @@ h3 {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.runtime-version-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.runtime-version-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(10, 18, 28, 0.54);
+}
+
+.runtime-version-label {
+  color: var(--muted);
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.runtime-version-value {
+  color: var(--text);
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.92rem;
+}
+
+.runtime-version-note,
+.runtime-sync-note {
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.runtime-version-note.is-update-available,
+.runtime-version-note.is-out-of-sync,
+.runtime-sync-note.is-out-of-sync {
+  color: var(--warning);
+}
+
+.runtime-version-note.is-error {
+  color: var(--danger);
+}
+
+.runtime-version-note.is-dev-build,
+.runtime-version-note.is-ahead {
+  color: #9ed5ff;
 }
 
 .runtime-card-header,
