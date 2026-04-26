@@ -143,6 +143,7 @@ def summarize(results: list[RunResult]) -> list[dict[str, Any]]:
                 "stage_summary": stage_summary,
             }
         )
+    summary.sort(key=lambda item: (item["avg_ms"], item["name"]))
     return summary
 
 
@@ -514,6 +515,11 @@ def main() -> int:
     parser.add_argument("--output", default=None, help="Optional file to write instead of stdout.")
     parser.add_argument("--label", default=None, help="Optional label for the saved run.")
     parser.add_argument(
+        "--skip-snapshot-export-estimate",
+        action="store_true",
+        help="Skip the snapshot export estimate workflow when focusing on live read-path timings.",
+    )
+    parser.add_argument(
         "--record-dir",
         default=str(REPO_ROOT / "data" / "perf"),
         help="Directory for latest/history perf artifacts.",
@@ -530,7 +536,15 @@ def main() -> int:
     results: list[RunResult] = []
 
     inventory = client.get_json("/api/inventory", params={"force": "true"})
+    client.get_json("/api/storage-views")
     mapping_bundle = client.get_json("/api/mappings/export")
+    history_status_available = False
+    try:
+        client.get_json("/api/history/status")
+    except Exception:
+        history_status_available = False
+    else:
+        history_status_available = True
     slots = inventory.get("slots") or []
     mappings = mapping_bundle.get("mappings") or []
     probe_slots = [slot.get("slot") for slot in slots[: max(1, args.smart_slot_count)] if isinstance(slot, dict) and slot.get("slot") is not None]
@@ -541,6 +555,15 @@ def main() -> int:
 
     def inventory_cached() -> RequestMetrics:
         return build_request_metrics(client.get_json_with_headers("/api/inventory"))
+
+    def storage_views_cached() -> RequestMetrics:
+        return build_request_metrics(client.get_json_with_headers("/api/storage-views"))
+
+    def history_status() -> RequestMetrics:
+        return build_request_metrics(client.get_json_with_headers("/api/history/status"))
+
+    def health_cached() -> RequestMetrics:
+        return build_request_metrics(client.get_json_with_headers("/healthz"))
 
     def request_smart_batch(slots_to_fetch: list[int]) -> RequestMetrics:
         response = client.post_json_with_headers(
@@ -594,14 +617,19 @@ def main() -> int:
     workflows: list[tuple[str, Any]] = [
         ("inventory_force", inventory_force),
         ("inventory_cached", inventory_cached),
+        ("storage_views_cached", storage_views_cached),
+        ("health_cached", health_cached),
     ]
+    if history_status_available:
+        workflows.append(("history_status", history_status))
     if probe_slots:
         workflows.append(("smart_batch", smart_batch))
         if len(probe_slots) > 1:
             workflows.append(("smart_prefetch_chunked", smart_prefetch_chunked))
     if not mappings:
         workflows.append(("mappings_import_roundtrip", mappings_import_roundtrip))
-    workflows.append(("snapshot_export_estimate", snapshot_estimate))
+    if not args.skip_snapshot_export_estimate:
+        workflows.append(("snapshot_export_estimate", snapshot_estimate))
 
     for _ in range(max(1, args.iterations)):
         for name, fn in workflows:

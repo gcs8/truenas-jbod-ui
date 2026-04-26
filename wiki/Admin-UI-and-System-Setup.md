@@ -55,7 +55,7 @@ The top of the admin page now has two section targets:
 
 ## What The Page Looks Like
 
-![Admin sidecar grouped setup view](images/admin-setup-v0.13.0.png)
+![Admin sidecar grouped setup view](images/admin-setup-v0.14.0.png)
 
 The page is organized around one saved system at a time.
 
@@ -95,7 +95,7 @@ This is where you confirm the intended chassis shape before you save.
 The admin sidecar now also has a dedicated builder workspace for reusable
 custom chassis profiles.
 
-![Builder workspace with full-width preview](images/builder-workspace-v0.13.0.png)
+![Builder workspace with full-width preview](images/builder-workspace-v0.14.0.png)
 
 Use it when you want to:
 
@@ -135,6 +135,13 @@ Use the SSH section when you want to:
 
 This is especially useful on CORE and SCALE systems where the app can stay
 read-only in the main UI but still use richer SSH detail and LED control.
+
+For VMware ESXi, the admin sidecar now keeps the setup intentionally narrower:
+
+- the recommended saved SSH user stays `root`
+- the path stays read-only and SSH-only
+- the Linux one-time bootstrap and sudoers preview flow stay disabled because
+  ESXi is not using Linux sudo
 
 ### TLS Trust
 
@@ -226,7 +233,7 @@ runtime selector picks the updated system list up cleanly.
 The same backup/restore area now also holds the safe cleanup tools for saved
 history:
 
-![Admin maintenance bundle and history tools](images/admin-maintenance-v0.13.0.png)
+![Admin maintenance bundle and history tools](images/admin-maintenance-v0.14.0.png)
 
 Use that panel when you need to:
 

@@ -38,6 +38,9 @@ UNVR_PRO_PARAMS = {
 QUANTASTOR_PARAMS = {
     "system_id": "qsosn-ha",
 }
+ESXI_PARAMS = {
+    "system_id": "cryostorage-esxi",
+}
 
 
 def kv_value(page: Page, label: str) -> str:
@@ -134,6 +137,14 @@ def capture_quantastor(page: Page) -> None:
     capture_app_shell(page, f"quantastor-overview-{SCREENSHOT_TAG}.png")
 
 
+def capture_esxi(page: Page) -> None:
+    open_and_select_slot(page, ESXI_PARAMS, 1)
+    page.locator(".nvme-carrier-board-image").wait_for(state="visible", timeout=120_000)
+    for label in ("Pool", "Transport", "Link Rate"):
+        wait_for_kv_value(page, label)
+    capture_app_shell(page, f"esxi-overview-{SCREENSHOT_TAG}.png")
+
+
 def main() -> None:
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as playwright:
@@ -145,6 +156,7 @@ def main() -> None:
         capture_unvr(page)
         capture_unvr_pro(page)
         capture_quantastor(page)
+        capture_esxi(page)
         browser.close()
 
 

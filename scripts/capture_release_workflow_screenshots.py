@@ -263,7 +263,6 @@ def capture_admin_setup(page: Page) -> None:
     )
     page.locator("#setup-storage-view-template").scroll_into_view_if_needed()
     page.evaluate("window.scrollBy(0, -180)")
-    show_select_as_listbox(page, "#setup-storage-view-template", max_rows=10)
     page.wait_for_timeout(700)
     write_page_screenshot(page, f"admin-setup-{SCREENSHOT_TAG}.png")
 

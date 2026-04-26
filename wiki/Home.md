@@ -72,6 +72,8 @@ It gives you:
 - TrueNAS SCALE on a Supermicro `SSG-6048R-E1CR36L` with front `24` and rear `12`
 - OSNexus Quantastor on a Supermicro `SSG-2028R-DE2CR24L` shared front `24`
 - Generic Linux on a Supermicro `SYS-2029GP-TR` with a right-side `2`-bay NVMe profile
+- VMware ESXi `7.0.3` on a Supermicro `AOC-SLG4-2H8M2`, using SSH `esxcli`
+  plus StorCLI for a read-only `2`-slot M.2 RAID-member view
 - UniFi UNVR as generic Linux over SSH with a built-in `4`-bay profile and
   validated vendor-local LED control
 - UniFi UNVR Pro as generic Linux over SSH with a built-in `7`-bay `3-over-4`
@@ -79,12 +81,13 @@ It gives you:
 
 ## Current Direction
 
-- `0.10.0` shipped the admin sidecar, the grouped storage-view setup flow,
-  broader in-repo/wiki release documentation, and the first public
-  storage-view history/export walkthrough
-- `0.11.0` ships Quantastor HA-node modeling, inventory-bound storage-view
-  parity for history and SMART detail, and the admin maintenance actions for
-  purging or adopting saved history after system deletes or renames
+- `0.13.0` shipped the selectable backup/debug-bundle scope work, the demo
+  builder seed path, the first embedded boot-media view for UniFi, and the
+  current internal-view visual polish
+- `0.14.0` rounds out the current carry-over cycle with first-pass read-only
+  ESXi support on the validated `AOC-SLG4-2H8M2` path, better admin guardrails
+  around non-Linux hosts, and a more responsive stale-cache-first runtime
+  switching path for the already validated systems
 
 ## Visual Walkthrough
 

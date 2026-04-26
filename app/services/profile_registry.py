@@ -10,6 +10,7 @@ SCALE_SSG_FRONT_24_PROFILE_ID = "supermicro-ssg-6048r-front-24"
 SCALE_SSG_REAR_12_PROFILE_ID = "supermicro-ssg-6048r-rear-12"
 LINUX_GPU_SERVER_NVME_PROFILE_ID = "supermicro-sys-2029gp-tr-right-nvme-2"
 QUANTASTOR_SSG_SHARED_24_PROFILE_ID = "supermicro-ssg-2028r-shared-front-24"
+ESXI_AOC_SLG4_2H8M2_PROFILE_ID = "supermicro-aoc-slg4-2h8m2"
 UNIFI_UNVR_FRONT_4_PROFILE_ID = "ubiquiti-unvr-front-4"
 UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID = "ubiquiti-unvr-pro-front-7"
 GENERIC_FRONT_24_1X24_PROFILE_ID = "generic-front-24-1x24"
@@ -202,6 +203,27 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             slot_layout=[
                 list(range(24)),
             ],
+        ),
+        EnclosureProfileConfig(
+            id=ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
+            label="Supermicro AOC-SLG4-2H8M2",
+            eyebrow="VMware ESXi / Supermicro AOC-SLG4-2H8M2",
+            summary="Read-only ESXi StorCLI profile for the two M.2 members behind the SAS3808 hardware RAID adapter.",
+            panel_title="AOC-SLG4-2H8M2",
+            edge_label="PCIe edge / M.2 RAID card",
+            face_style="nvme-carrier",
+            latch_edge="bottom",
+            bay_size="2.5",
+            rows=2,
+            columns=1,
+            slot_layout=[
+                [1],
+                [0],
+            ],
+            slot_hints={
+                0: ["13:0", "C0 x4", "0(path0)"],
+                1: ["13:1", "C1 x4", "1(path0)"],
+            },
         ),
         EnclosureProfileConfig(
             id=GENERIC_FRONT_24_1X24_PROFILE_ID,
@@ -430,6 +452,8 @@ class ProfileRegistry:
             return LINUX_GPU_SERVER_NVME_PROFILE_ID
         if system.truenas.platform == "quantastor":
             return QUANTASTOR_SSG_SHARED_24_PROFILE_ID
+        if system.truenas.platform == "esxi":
+            return ESXI_AOC_SLG4_2H8M2_PROFILE_ID
 
         return None
 

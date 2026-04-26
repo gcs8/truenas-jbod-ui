@@ -76,7 +76,7 @@ If you want to pin a specific published image tag instead of `latest`, set this
 in `.env` before you start:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.13.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.14.0
 ```
 
 If you want the fuller published-image walkthrough, including update commands,
@@ -93,13 +93,19 @@ http://your-docker-host:8080
 ## 7. Check Health
 
 ```bash
-curl http://your-docker-host:8080/healthz
+curl http://your-docker-host:8080/livez
 ```
 
-Expected:
+Expected for the lightweight container health path:
 
 ```json
-{"status":"ok","dependency_status":"ok", ...}
+{"status":"ok", ...}
+```
+
+If you want the cached dependency/readiness view too:
+
+```bash
+curl http://your-docker-host:8080/healthz
 ```
 
 ## 8. Add SSH Later If You Want Better Data

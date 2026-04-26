@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.13.0`.
+This file tracks the current intended release direction after `v0.14.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -355,6 +355,33 @@ Current status:
   internal boot-media visibility, and tighter storage-view presentation polish
 - deeper debug-bundle replay/viewer ideas and broader builder-mode editing
   remain intentionally deferred to backlog
+
+## v0.14.0 - ESXi Read-Only Support And Read-Path Cleanup
+
+Goal:
+
+- add a narrow, operator-honest ESXi adapter while also reducing switch and
+  refresh friction on the already validated platforms
+
+Primary outcomes:
+
+- first-pass read-only VMware ESXi support on the validated Supermicro
+  `AOC-SLG4-2H8M2` path using SSH `esxcli` plus StorCLI JSON
+- a built-in photo-backed `2`-slot AOC carrier profile/template that renders
+  physical RAID members `13:0` and `13:1` directly on the board image
+- admin-side setup guardrails that keep ESXi out of the Linux
+  bootstrap/sudoers flow and recommend the narrower saved SSH shape instead
+- stale-cache-first system/enclosure switching, lightweight `/livez`, cached
+  `/healthz`, scoped cache invalidation, and a non-blocking Quantastor LED
+  verify follow-up instead of forcing full blocking refreshes on page load
+
+Current status:
+
+- shipped in `v0.14.0`
+- the current release-facing work centers on ESXi operator clarity,
+  responsiveness, and refreshed README/wiki screenshots
+- the later ESXi credential model question, shared `ses_enclosure` geometry
+  cleanup, and Windows `history_status` tuning remain intentionally deferred
 
 ## Longer-Term Ideas
 

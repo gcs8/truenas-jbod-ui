@@ -71,4 +71,29 @@ test.describe("admin sidecar smoke", () => {
     await expect(page.locator("#debug-encrypt-toggle")).toBeDisabled();
     await expect(page.locator("#debug-packaging")).toHaveValue("7z");
   });
+
+  test("ESXi setup guidance disables the Linux bootstrap path", async ({ page }) => {
+    await gotoAdmin(page);
+
+    const resetButton = page.locator("#existing-system-reset-button");
+    if (await resetButton.isEnabled()) {
+      await resetButton.click();
+    }
+    await page.locator("#setup-platform").selectOption("esxi");
+    await page.locator("#setup-ssh-enabled").check();
+
+    await expect(page.locator("#setup-platform-help")).toContainText("SSH-only");
+    await expect(page.locator("#setup-platform-help")).toContainText("bootstrap");
+    await expect(page.locator("#setup-ssh-user")).toHaveValue("root");
+    await expect(page.locator("#setup-ssh-sudo-password-field")).toBeHidden();
+    await expect(page.locator("#setup-bootstrap-enabled")).toBeDisabled();
+    await expect(page.locator("#setup-bootstrap-result")).toContainText(
+      "does not use the one-time Linux service-account bootstrap"
+    );
+    await expect(page.locator("#setup-bootstrap-sudoers-preview")).toContainText(
+      "does not use the Linux sudoers/bootstrap flow"
+    );
+    await page.locator("#setup-load-recommended-button").click();
+    await expect(page.locator("#setup-ssh-commands")).toHaveValue(/\/opt\/lsi\/storcli64\/storcli64 \/c0\/eall\/sall show all J/);
+  });
 });

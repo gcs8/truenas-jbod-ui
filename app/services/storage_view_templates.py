@@ -107,6 +107,42 @@ def list_storage_view_templates() -> list[StorageViewTemplate]:
             notes="Good for internal all-flash groups that should stay attached to the same host. Slot 1 is nearest the PCIe edge.",
         ),
         StorageViewTemplate(
+            id="aoc-slg4-2h8m2-2",
+            label="Supermicro AOC-SLG4-2H8M2",
+            default_id="aoc-slg4-2h8m2",
+            default_label="AOC-SLG4-2H8M2",
+            kind="nvme_carrier",
+            summary=(
+                "Two-slot Supermicro M.2 RAID carrier card. The ESXi first pass binds StorCLI physical "
+                "members 13:0 and 13:1 to M2-1 and M2-2."
+            ),
+            rows=2,
+            columns=1,
+            slot_count=2,
+            # The supplied card photo labels M2-2 above M2-1, so render slot 1 above slot 0.
+            slot_layout=[[1], [0]],
+            default_render=StorageViewRenderConfig(
+                show_in_main_ui=False,
+                show_in_admin_ui=True,
+                default_collapsed=False,
+            ),
+            default_binding=StorageViewBindingConfig(
+                mode="hybrid",
+                pcie_addresses=["C0 x4", "C1 x4"],
+                device_names=["13:0", "13:1"],
+            ),
+            default_slot_labels={
+                0: "M2-1",
+                1: "M2-2",
+            },
+            supports_led=False,
+            supports_auto_discovery=False,
+            notes=(
+                "Read-only carrier view for the AOC-SLG4-2H8M2. LED/identify and RAID-management "
+                "actions intentionally stay disabled."
+            ),
+        ),
+        StorageViewTemplate(
             id="satadom-pair-2",
             label="SATADOM Pair",
             default_id="boot-doms",

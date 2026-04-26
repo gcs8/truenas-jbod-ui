@@ -28,6 +28,7 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - rebuild the Docker image from the current branch tip:
   - `docker compose up -d --build`
 - confirm the app is healthy:
+  - `curl http://localhost:8080/livez`
   - `curl http://localhost:8080/healthz`
 - validate the optional-sidecar runtime modes:
   - stop `enclosure-admin` and `enclosure-history`, then confirm
@@ -38,9 +39,16 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   - CORE
   - SCALE
   - GPU Server Linux
+  - VMware ESXi
   - UniFi UNVR
   - UniFi UNVR Pro
   - Quantastor
+- if the release includes recent ESXi work, sanity-check:
+  - the saved ESXi system renders the `AOC-SLG4-2H8M2` board image with two
+    matched member slots
+  - the ESXi detail pane stays read-only with LED/write actions hidden
+  - the admin setup form recommends `root` and keeps the Linux bootstrap /
+    sudoers path disabled for the ESXi platform
 
 ## Screenshots
 
@@ -52,7 +60,7 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - if the release changes operator-facing workflows beyond the README overview,
   capture and stage manual screenshots in `docs/images/screenshots/` before the
   tag is cut
-- for `0.13.0`, capture at least:
+- for `0.14.0`, capture at least:
   - admin sidecar `Enclosure / Profile Builder` workspace showing:
     - the profile catalog
     - the builder controls
@@ -71,19 +79,22 @@ The goal is to make releases boring, repeatable, and easy to audit later.
     Linux/runtime sanity work is still featured
   - the Quantastor HA SATADOM runtime view on `QSOSN HA` if the current docs
     still call out the HA-node model
+  - the ESXi `AOC-SLG4-2H8M2` live carrier view if the current docs call out
+    the first-pass read-only ESXi path
   - the admin maintenance panel showing orphan purge and history adoption if
     those maintenance tools remain part of the README/wiki operator story
   - export snapshot dialog with live size estimate visible if that workflow is
     still featured in the README/wiki
 - use release-style filenames for those manual captures, for example:
-  - `builder-workspace-v0.13.0.png`
-  - `admin-setup-v0.13.0.png`
-  - `admin-maintenance-v0.13.0.png`
-  - `live-vs-storage-views-v0.13.0.png`
-  - `storage-view-history-v0.13.0.png`
-  - `archive-core-front-24-v0.13.0.png`
-  - `quantastor-satadoms-right-v0.13.0.png`
-  - `snapshot-export-dialog-v0.13.0.png`
+  - `builder-workspace-v0.14.0.png`
+  - `admin-setup-v0.14.0.png`
+  - `admin-maintenance-v0.14.0.png`
+  - `live-vs-storage-views-v0.14.0.png`
+  - `storage-view-history-v0.14.0.png`
+  - `archive-core-front-24-v0.14.0.png`
+  - `quantastor-satadoms-right-v0.14.0.png`
+  - `esxi-overview-v0.14.0.png`
+  - `snapshot-export-dialog-v0.14.0.png`
 - decide whether each new screenshot is:
   - README-facing and should replace or extend repo image references
   - wiki-facing only and should still be staged in-repo before wiki publish
@@ -95,7 +106,7 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - bump `app/__init__.py` to the release version
 - add the release section to `CHANGELOG.md`
 - refresh any checked-in draft release-notes file if the repo is using one
-- refresh `docs/RELEASE_NOTES_0.13.0.md`
+- refresh `docs/RELEASE_NOTES_0.14.0.md`
 - review `README.md` for stale version or milestone wording
 - review `docs/ROADMAP.md` for stale "current direction" text
 - review profile/config docs for dead or outdated comments, especially builder

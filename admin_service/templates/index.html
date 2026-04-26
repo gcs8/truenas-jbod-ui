@@ -293,6 +293,7 @@
                   <option value="scale">TrueNAS SCALE</option>
                   <option value="linux">Generic Linux</option>
                   <option value="quantastor">Quantastor</option>
+                  <option value="esxi">VMware ESXi</option>
                 </select>
               </label>
               <label class="field">
@@ -457,7 +458,7 @@
                 <span>Saved SSH Password</span>
                 <input id="setup-ssh-password" data-ssh-field type="password" placeholder="Persist only if the final service account still uses password auth">
               </label>
-              <label class="field">
+              <label id="setup-ssh-sudo-password-field" class="field">
                 <span>Saved SSH Sudo Password</span>
                 <input id="setup-ssh-sudo-password" data-ssh-field type="password" placeholder="Persist only if the final service account needs a sudo password">
               </label>
@@ -560,12 +561,12 @@
 
             <p id="setup-ssh-key-help" class="subtle action-note"></p>
 
-            <div class="key-mode-panel">
+            <div id="setup-bootstrap-panel" class="key-mode-panel">
               <div class="setup-step-header">
                 <span class="badge">Optional</span>
                 <div>
                   <h3>One-Time Bootstrap</h3>
-                  <p class="subtle">
+                  <p id="setup-bootstrap-copy" class="subtle">
                     Use temporary root or installer credentials once to create the final service account,
                     install the selected public key, and optionally write limited sudo rules.
                   </p>
@@ -629,7 +630,7 @@
               <span>SSH Runtime Commands</span>
               <textarea id="setup-ssh-commands" data-ssh-field rows="7" placeholder="One command per line"></textarea>
             </label>
-            <p class="subtle action-note">
+            <p id="setup-ssh-commands-note" class="subtle action-note">
               These are the exact SSH commands the app runs. When you use the one-time bootstrap, any
               <code>sudo -n ...</code> lines here are also converted into <code>NOPASSWD</code> sudo rules
               for the final service account, with the platform's on-demand smartctl and LED-control

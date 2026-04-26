@@ -60,6 +60,109 @@ scbus13 on mpr1 bus 0:
         self.assertEqual(canonicalize_ssh_command("/usr/sbin/ubntstorage space inspect"), "ubntstorage space inspect")
         self.assertEqual(canonicalize_ssh_command("cat /sys/kernel/debug/gpio"), "gpio debug")
 
+    def test_canonicalize_esxi_inventory_commands(self) -> None:
+        self.assertEqual(canonicalize_ssh_command("esxcli storage core device list"), "esxcli storage core device list")
+        self.assertEqual(canonicalize_ssh_command("esxcli storage vmfs extent list"), "esxcli storage vmfs extent list")
+        self.assertEqual(
+            canonicalize_ssh_command("/opt/lsi/storcli64/storcli64 /c0/eall/sall show all J"),
+            "storcli /c0/eall/sall show all J",
+        )
+
+    def test_parse_esxi_storcli_json_maps_physical_members(self) -> None:
+        virtual_drives = """
+{
+  "Controllers": [
+    {
+      "Command Status": {"Status": "Success"},
+      "Response Data": {
+        "/c0/v0": [
+          {"DG/VD": "0/0", "TYPE": "RAID1", "State": "Optl", "Size": "100.000 GB", "Name": "ESXi"}
+        ],
+        "PDs for VD 0": [
+          {"EID:Slt": "13:0", "State": "Onln"},
+          {"EID:Slt": "13:1", "State": "Onln"}
+        ],
+        "VD0 Properties": {
+          "SCSI NAA Id": "naa.60030480208ba599ffa8f1"
+        }
+      }
+    }
+  ]
+}
+""".strip()
+        physical_drives = """
+{
+  "Controllers": [
+    {
+      "Command Status": {"Status": "Success"},
+      "Response Data": {
+        "Drive /c0/e13/s0": [
+          {
+            "EID:Slt": "13:0", "DID": 11, "State": "Onln", "DG": "0", "Size": "1.818 TB", "Intf": "NVMe", "Med": "SSD", "SeSz": "512B", "Model": "Samsung SSD 970 EVO 2TB"
+          }
+        ],
+        "Drive /c0/e13/s0 - Detailed Information": {
+          "Drive /c0/e13/s0 State": {
+            "Media Error Count": "60",
+            "Other Error Count": "2",
+            "Predictive Failure Count": "0",
+            "S.M.A.R.T alert flagged by drive": "No",
+            "Drive Temperature": "34C"
+          },
+          "Drive /c0/e13/s0 Device attributes": {
+            "SN": "SERIAL0",
+            "Firmware Revision": "2B2QEXE7"
+          },
+          "Drive /c0/e13/s0 Port Information": {
+            "Connector Name": "C0 x4",
+            "Connected Port Number(path)": "0(path0)",
+            "Link Speed": "8.0GT/s"
+          }
+        },
+        "Drive /c0/e13/s1": [
+          {
+            "EID:Slt": "13:1", "DID": 12, "State": "Onln", "DG": "0", "Size": "1.818 TB", "Intf": "NVMe", "Med": "SSD", "SeSz": "512B", "Model": "Samsung SSD 970 EVO 2TB"
+          }
+        ],
+        "Drive /c0/e13/s1 - Detailed Information": {
+          "Drive /c0/e13/s1 State": {
+            "Media Error Count": "262",
+            "Predictive Failure Count": "0",
+            "S.M.A.R.T alert flagged by drive": "No",
+            "Drive Temperature": "35C"
+          },
+          "Drive /c0/e13/s1 Device attributes": {
+            "SN": "SERIAL1",
+            "Firmware Revision": "2B2QEXE7"
+          },
+          "Drive /c0/e13/s1 Port Information": {
+            "Connector Name": "C1 x4",
+            "Connected Port Number(path)": "1(path0)",
+            "Link Speed": "8.0GT/s"
+          }
+        }
+      }
+    }
+  ]
+}
+""".strip()
+
+        parsed = parse_ssh_outputs(
+            {
+                "/opt/lsi/storcli64/storcli64 /c0/vall show all J": virtual_drives,
+                "/opt/lsi/storcli64/storcli64 /c0/eall/sall show all J": physical_drives,
+            },
+            slot_count=2,
+            enclosure_filter=None,
+        )
+
+        self.assertEqual(parsed.esxi_storcli_virtual_drives[0]["name"], "ESXi")
+        self.assertEqual(parsed.esxi_storcli_virtual_drives[0]["physical_drives"][0]["slot_key"], "13:0")
+        self.assertEqual(parsed.esxi_storcli_physical_drives[0]["slot_key"], "13:0")
+        self.assertEqual(parsed.esxi_storcli_physical_drives[0]["connector_name"], "C0 x4")
+        self.assertEqual(parsed.esxi_storcli_physical_drives[0]["temperature_c"], 34)
+        self.assertEqual(parsed.esxi_storcli_physical_drives[1]["media_errors"], 262)
+
     def test_parse_unifi_gpio_debug_uses_last_output_line_per_slot(self) -> None:
         output = """
 gpiochip1: GPIOs 480-495, parent: i2c/0-0021, pca9575, can sleep:

@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.14.0 - 2026-04-26
+
+### Added
+
+- First-pass read-only VMware ESXi inventory for the validated Supermicro
+  `AOC-SLG4-2H8M2` host path, including SSH `esxcli` plus StorCLI JSON
+  parsing, a built-in `2`-slot AOC profile/template, a photo-backed live
+  carrier view, and focused Playwright smoke coverage for the ESXi read path
+
+### Changed
+
+- The admin setup flow now treats VMware ESXi as explicitly outside the Linux
+  one-time bootstrap / sudoers path: the recommended saved SSH user stays
+  `root`, saved sudo-password fields are hidden, bootstrap is disabled, and
+  the UI explains that the ESXi path stays read-only and SSH-only
+- Read-path switching is back to stale-cache-first behavior for normal page
+  load and system/enclosure changes, with lightweight `/livez` container
+  health, cached `/healthz` dependency status, and perf-harness coverage for
+  the cached read routes alongside the heavier inventory and export workflows
+- Release-facing README, GHCR deployment docs, and the checked-in wiki pages
+  now point at the refreshed `v0.14.0` screenshot set, current `0.14.0` image
+  tags, and the operator-facing ESXi guidance
+
+### Fixed
+
+- Quantastor identify-state verification no longer forces blocking fresh
+  inventory reads on every page load or system/enclosure switch; the current
+  identify check now runs as a narrower non-blocking follow-up refresh
+- Slot LED and mapping mutations now invalidate only the active enclosure plus
+  default snapshot scope instead of clearing every cached enclosure snapshot
+- The browser no longer carries a stale `selected_enclosure_id` into the next
+  system switch before a matching snapshot exists, and container health probes
+  no longer trigger fresh inventory builds behind normal operator reads
+- Unsupported ESXi LED actions now stay hidden in the live detail pane while
+  surfacing the read-only limitation directly in the detail note instead of
+  leaving dead identify buttons visible
 ## v0.13.0 - 2026-04-21
 
 ### Added

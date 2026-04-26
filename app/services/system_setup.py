@@ -40,6 +40,21 @@ def default_ssh_commands_for_platform(platform: str) -> list[str]:
         ]
     if normalized == "quantastor":
         return []
+    if normalized == "esxi":
+        return [
+            "vmware -v",
+            "esxcli system version get",
+            "esxcli software vib list",
+            "esxcli storage core adapter list",
+            "esxcli storage core device list",
+            "esxcli storage core path list",
+            "esxcli storage filesystem list",
+            "esxcli storage vmfs extent list",
+            "esxcli storage san sas list",
+            "/opt/lsi/storcli64/storcli64 /c0 show all J",
+            "/opt/lsi/storcli64/storcli64 /c0/vall show all J",
+            "/opt/lsi/storcli64/storcli64 /c0/eall/sall show all J",
+        ]
     return list(SSHConfig().commands)
 
 

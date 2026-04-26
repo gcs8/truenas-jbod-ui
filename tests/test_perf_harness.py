@@ -65,6 +65,16 @@ class PerfHarnessTests(unittest.TestCase):
         self.assertEqual(summary[0]["stage_summary"][0]["label"], "smart.batch.total")
         self.assertEqual(summary[0]["stage_summary"][0]["avg_ms"], 102.5)
 
+    def test_summarize_orders_workflows_from_fastest_to_slowest(self) -> None:
+        results = [
+            run_perf_harness.RunResult(name="slower", duration_ms=200.0),
+            run_perf_harness.RunResult(name="faster", duration_ms=50.0),
+        ]
+
+        summary = run_perf_harness.summarize(results)
+
+        self.assertEqual([item["name"] for item in summary], ["faster", "slower"])
+
     def test_write_history_files_creates_latest_and_csv_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             record_dir = Path(temp_dir)

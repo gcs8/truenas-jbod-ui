@@ -185,8 +185,8 @@ def create_app() -> FastAPI:
             )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        service.invalidate_snapshot_cache(reason="route.set_slot_led", invalidate_source_bundle=True)
-        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+        service.invalidate_snapshot_cache(reason="route.set_slot_led", cache_keys=[enclosure_id, None])
+        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": True, "snapshot": snapshot.model_dump(mode="json")})
 
     @app.post("/api/slots/{slot}/mapping")
@@ -227,9 +227,9 @@ def create_app() -> FastAPI:
 
         service.invalidate_snapshot_cache(
             reason="route.save_mapping",
-            invalidate_source_bundle=payload.clear_identify_after_save,
+            cache_keys=[mapping.enclosure_id, None],
         )
-        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
         return JSONResponse(
             {
                 "ok": True,
@@ -251,8 +251,8 @@ def create_app() -> FastAPI:
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         cleared = await service.clear_mapping(slot, selected_enclosure_id=enclosure_id, invalidate_snapshot=False)
         if cleared:
-            service.invalidate_snapshot_cache(reason="route.clear_mapping")
-        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+            service.invalidate_snapshot_cache(reason="route.clear_mapping", cache_keys=[enclosure_id, None])
+        snapshot = await service.get_snapshot(force_refresh=cleared, selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": cleared, "snapshot": snapshot.model_dump(mode="json")})
 
     @app.get("/api/mappings/export", response_model=MappingBundle)
@@ -505,11 +505,33 @@ def create_app() -> FastAPI:
             )
         return JSONResponse(estimate)
 
+    @app.get("/livez")
+    async def livez() -> JSONResponse:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "version": __version__,
+            },
+            status_code=200,
+        )
+
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(None)
-        snapshot = await service.get_snapshot()
+        snapshot = service.peek_cached_snapshot()
+        if snapshot is None:
+            return JSONResponse(
+                {
+                    "status": "ok",
+                    "dependency_status": "unknown",
+                    "last_updated": None,
+                    "sources": {},
+                    "warnings": [],
+                    "cache_state": "empty",
+                },
+                status_code=200,
+            )
         api_status = snapshot.sources.get("api")
         return JSONResponse(
             {
@@ -518,6 +540,7 @@ def create_app() -> FastAPI:
                 "last_updated": snapshot.last_updated.isoformat(),
                 "sources": snapshot.model_dump(mode="json").get("sources", {}),
                 "warnings": snapshot.warnings,
+                "cache_state": "cached",
             },
             status_code=200,
         )

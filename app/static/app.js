@@ -62,6 +62,7 @@
     autoRefresh: snapshotMode ? false : true,
     refreshIntervalSeconds: supportedRefreshIntervals.includes(bootstrapRefreshInterval) ? bootstrapRefreshInterval : 30,
     timerId: null,
+    identifyVerifyTimerId: null,
     refreshesInFlight: 0,
     latestRefreshToken: 0,
     storageViewsRuntimeRequestToken: 0,
@@ -161,6 +162,7 @@
   const summaryMappedSlotCount = document.getElementById("summary-mapped-slot-count");
   const summaryManualMappingCount = document.getElementById("summary-manual-mapping-count");
   const summarySshSlotHintCount = document.getElementById("summary-ssh-slot-hint-count");
+  const storageViewsPanel = document.getElementById("storage-views-panel");
   const storageViewsSummary = document.getElementById("storage-views-summary");
   const storageViewList = document.getElementById("storage-view-list");
   const storageViewEmpty = document.getElementById("storage-view-empty");
@@ -279,12 +281,19 @@
     return (state.snapshot.enclosures || []).find((enclosure) => enclosure.id === state.selectedEnclosureId) || null;
   }
 
+  function snapshotMatchesSelectedSystem() {
+    return (state.snapshot?.selected_system_id || null) === (state.selectedSystemId || null);
+  }
+
   function currentLiveEnclosureId() {
-    return state.selectedEnclosureId || state.snapshot.selected_enclosure_id || null;
+    if (state.selectedEnclosureId) {
+      return state.selectedEnclosureId;
+    }
+    return snapshotMatchesSelectedSystem() ? (state.snapshot.selected_enclosure_id || null) : null;
   }
 
   function currentLiveEnclosureLabel() {
-    return getSelectedEnclosureOption()?.label || state.snapshot.selected_enclosure_label || null;
+    return getSelectedEnclosureOption()?.label || (snapshotMatchesSelectedSystem() ? (state.snapshot.selected_enclosure_label || null) : null);
   }
 
   function getSelectedProfile() {
@@ -320,7 +329,7 @@
   }
 
   function getMainUiStorageViewRuntimeOptions() {
-    return storageViewRuntimeViews().filter((view) => view.enabled !== false);
+    return storageViewRuntimeViews().filter((view) => view.enabled !== false && view.render?.show_in_main_ui !== false);
   }
 
   function getStorageViewRuntimeById(viewId) {
@@ -329,15 +338,16 @@
 
   function ensureStorageViewRuntimeSelection(preferVisible = false) {
     const views = storageViewRuntimeViews();
+    const mainUiViews = getMainUiStorageViewRuntimeOptions();
     if (!views.length) {
       state.selectedStorageViewRuntimeId = "";
       return null;
     }
-    if (state.selectedStorageViewRuntimeId && views.some((view) => view.id === state.selectedStorageViewRuntimeId)) {
+    if (state.selectedStorageViewRuntimeId && mainUiViews.some((view) => view.id === state.selectedStorageViewRuntimeId)) {
       return getStorageViewRuntimeById(state.selectedStorageViewRuntimeId);
     }
     if (preferVisible) {
-      const preferredVisible = getMainUiStorageViewRuntimeOptions()[0] || views[0];
+      const preferredVisible = mainUiViews[0] || null;
       state.selectedStorageViewRuntimeId = preferredVisible?.id || "";
       return preferredVisible || null;
     }
@@ -555,9 +565,13 @@
   const NVME_CARRIER_BOARD_LAYOUT = {
     width: 902,
     height: 526,
+    imageSrc: "/static/images/hyper-m2-gen3-card.png",
+    className: "",
+    edgeNote: "PCIe edge / slot 1",
     connectorRight: 638,
     cardHeight: 56,
     holeInset: 8,
+    defaultSlotSize: "2280",
     rowCenters: [55, 151, 247, 342],
     screwCenters: {
       "2242": 458,
@@ -569,22 +583,51 @@
     },
   };
 
-  function nvmeCarrierSlotMetrics(slot, orderIndex) {
+  const AOC_SLG4_2H8M2_BOARD_LAYOUT = {
+    width: 800,
+    height: 800,
+    imageSrc: "/static/images/aoc-slg4-2h8m2.jpg",
+    className: "is-aoc-slg4-2h8m2",
+    edgeNote: "PCIe edge / M2-1 lower slot",
+    connectorRight: 730,
+    cardHeight: 58,
+    holeInset: 8,
+    defaultSlotSize: "2280",
+    // Keep the overlays centered on the printed M.2 connector lanes.
+    rowCenters: [278, 403],
+    screwCenters: {
+      "2230": 554,
+      "2242": 554,
+      "2260": 554,
+      "2280": 374,
+      "22110": 236,
+      default: 374,
+    },
+  };
+
+  function nvmeCarrierBoardLayout(surface) {
+    if (surface?.template_id === "aoc-slg4-2h8m2-2" || surface?.id === "supermicro-aoc-slg4-2h8m2") {
+      return AOC_SLG4_2H8M2_BOARD_LAYOUT;
+    }
+    return NVME_CARRIER_BOARD_LAYOUT;
+  }
+
+  function nvmeCarrierSlotMetrics(slot, orderIndex, boardLayout = NVME_CARRIER_BOARD_LAYOUT) {
     const slotSize = String(slot?.slot_size || "").trim();
     const screwCenterPx =
-      NVME_CARRIER_BOARD_LAYOUT.screwCenters[slotSize]
-      || NVME_CARRIER_BOARD_LAYOUT.screwCenters.default;
-    const widthPx = NVME_CARRIER_BOARD_LAYOUT.connectorRight - screwCenterPx + NVME_CARRIER_BOARD_LAYOUT.holeInset;
+      boardLayout.screwCenters[slotSize]
+      || boardLayout.screwCenters.default;
+    const widthPx = boardLayout.connectorRight - screwCenterPx + boardLayout.holeInset;
     const centerPx =
-      NVME_CARRIER_BOARD_LAYOUT.rowCenters[orderIndex]
-      ?? NVME_CARRIER_BOARD_LAYOUT.rowCenters[NVME_CARRIER_BOARD_LAYOUT.rowCenters.length - 1];
-    const topPx = centerPx - (NVME_CARRIER_BOARD_LAYOUT.cardHeight / 2);
-    const leftPx = NVME_CARRIER_BOARD_LAYOUT.connectorRight - widthPx;
+      boardLayout.rowCenters[orderIndex]
+      ?? boardLayout.rowCenters[boardLayout.rowCenters.length - 1];
+    const topPx = centerPx - (boardLayout.cardHeight / 2);
+    const leftPx = boardLayout.connectorRight - widthPx;
     return {
-      left: `${(leftPx / NVME_CARRIER_BOARD_LAYOUT.width) * 100}%`,
-      top: `${(topPx / NVME_CARRIER_BOARD_LAYOUT.height) * 100}%`,
-      width: `${(widthPx / NVME_CARRIER_BOARD_LAYOUT.width) * 100}%`,
-      minHeight: `${(NVME_CARRIER_BOARD_LAYOUT.cardHeight / NVME_CARRIER_BOARD_LAYOUT.height) * 100}%`,
+      left: `${(leftPx / boardLayout.width) * 100}%`,
+      top: `${(topPx / boardLayout.height) * 100}%`,
+      width: `${(widthPx / boardLayout.width) * 100}%`,
+      minHeight: `${(boardLayout.cardHeight / boardLayout.height) * 100}%`,
     };
   }
 
@@ -691,11 +734,12 @@
     const layoutMode = inferChassisLayoutMode(profile, driveScale);
 
     if (selectedView.kind === "nvme_carrier") {
+      const boardLayout = nvmeCarrierBoardLayout(selectedView);
       const board = document.createElement("div");
-      board.className = "nvme-carrier-canvas";
+      board.className = ["nvme-carrier-canvas", boardLayout.className].filter(Boolean).join(" ");
       const boardImage = document.createElement("img");
       boardImage.className = "nvme-carrier-board-image";
-      boardImage.src = "/static/images/hyper-m2-gen3-card.png";
+      boardImage.src = boardLayout.imageSrc;
       boardImage.alt = "";
       boardImage.setAttribute("aria-hidden", "true");
       board.appendChild(boardImage);
@@ -720,7 +764,7 @@
         } else {
           delete tile.dataset.slotSize;
         }
-        const metrics = nvmeCarrierSlotMetrics(slot, orderIndex);
+        const metrics = nvmeCarrierSlotMetrics(slot, orderIndex, boardLayout);
         tile.style.left = metrics.left;
         tile.style.top = metrics.top;
         tile.style.width = metrics.width;
@@ -739,7 +783,7 @@
 
       const edgeNote = document.createElement("div");
       edgeNote.className = "nvme-carrier-edge-note";
-      edgeNote.textContent = "PCIe edge / slot 1";
+      edgeNote.textContent = boardLayout.edgeNote;
       board.appendChild(edgeNote);
 
       grid.appendChild(board);
@@ -862,6 +906,113 @@
     });
   }
 
+  function renderLiveNvmeCarrierGrid(selectedProfile) {
+    hideSlotTooltip();
+    grid.innerHTML = "";
+    const slotLayout = activeLayoutRows();
+    const slotsByNumber = new Map(state.snapshot.slots.map((slot) => [slot.slot, slot]));
+    const peerContext = getSelectedPeerContext();
+    const boardLayout = nvmeCarrierBoardLayout(selectedProfile);
+    const board = document.createElement("div");
+    board.className = ["nvme-carrier-canvas", boardLayout.className].filter(Boolean).join(" ");
+    const boardImage = document.createElement("img");
+    boardImage.className = "nvme-carrier-board-image";
+    boardImage.src = boardLayout.imageSrc;
+    boardImage.alt = "";
+    boardImage.setAttribute("aria-hidden", "true");
+    board.appendChild(boardImage);
+
+    slotLayout.flat().filter((slotValue) => Number.isInteger(slotValue)).forEach((slotValue, orderIndex) => {
+      const slotNumber = Number(slotValue);
+      const liveSlot = slotsByNumber.get(slotNumber) || {
+        slot: slotNumber,
+        slot_label: formatSlotLabel(slotNumber),
+        state: "unknown",
+      };
+      const slotSize = boardLayout.defaultSlotSize || "";
+      const displaySlot = {
+        slot_index: liveSlot.slot,
+        slot_label: liveSlot.slot_label || formatSlotLabel(slotNumber),
+        occupied: Boolean(liveSlot.device_name || liveSlot.serial || liveSlot.pool_name),
+        state: liveSlot.state || "unknown",
+        slot_size: slotSize,
+        device_name: liveSlot.device_name || null,
+        pool_name: liveSlot.pool_name || null,
+        transport_address: liveSlot.operator_context?.transport_address || liveSlot.operator_context?.pcie_address || null,
+        placement_key: liveSlot.operator_context?.placement_key || null,
+        serial: liveSlot.serial || null,
+        model: liveSlot.model || null,
+      };
+      const tile = document.createElement("button");
+      tile.type = "button";
+      tile.className = `slot-tile state-${liveSlot.state || "unknown"} storage-view-slot storage-view-slot-nvme storage-view-slot-nvme-absolute`;
+      if (!passesFilter(liveSlot)) {
+        tile.classList.add("filtered-out");
+      }
+      if (state.selectedSlot === liveSlot.slot) {
+        tile.classList.add("selected");
+      } else if (peerContext.active && peerContext.peerSlots.has(liveSlot.slot)) {
+        tile.classList.add("peer-highlight");
+      } else if (peerContext.active) {
+        tile.classList.add("peer-dimmed");
+      }
+      tile.dataset.slot = String(liveSlot.slot);
+      tile.dataset.slotSize = slotSize;
+      const metrics = nvmeCarrierSlotMetrics(displaySlot, orderIndex, boardLayout);
+      tile.style.left = metrics.left;
+      tile.style.top = metrics.top;
+      tile.style.width = metrics.width;
+      tile.style.minHeight = metrics.minHeight;
+      tile.setAttribute("aria-label", slotTooltip(liveSlot, getSmartSummaryEntry(liveSlot)));
+      tile.innerHTML = buildNvmeRuntimeTileMarkup(displaySlot, { kind: "nvme_carrier" });
+      tile.addEventListener("mouseenter", (event) => {
+        state.hoveredSlot = liveSlot.slot;
+        refreshHoveredTooltip(tile);
+        positionSlotTooltip(event.clientX, event.clientY);
+        void ensureSmartSummary(liveSlot);
+      });
+      tile.addEventListener("mousemove", (event) => {
+        if (state.hoveredSlot === liveSlot.slot) {
+          positionSlotTooltip(event.clientX, event.clientY);
+        }
+      });
+      tile.addEventListener("mouseleave", () => {
+        if (state.hoveredSlot === liveSlot.slot) {
+          state.hoveredSlot = null;
+        }
+        hideSlotTooltip();
+      });
+      tile.addEventListener("focus", () => {
+        state.hoveredSlot = liveSlot.slot;
+        refreshHoveredTooltip(tile);
+        positionSlotTooltipFromElement(tile);
+        void ensureSmartSummary(liveSlot);
+      });
+      tile.addEventListener("blur", () => {
+        if (state.hoveredSlot === liveSlot.slot) {
+          state.hoveredSlot = null;
+        }
+        hideSlotTooltip();
+      });
+      tile.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (state.selectedSlot === liveSlot.slot) {
+          clearSelectedSlot();
+          return;
+        }
+        selectSlot(liveSlot.slot);
+      });
+      board.appendChild(tile);
+    });
+
+    const edgeNote = document.createElement("div");
+    edgeNote.className = "nvme-carrier-edge-note";
+    edgeNote.textContent = boardLayout.edgeNote;
+    board.appendChild(edgeNote);
+
+    grid.appendChild(board);
+  }
+
   function renderStorageViewsRuntime() {
     if (!storageViewList || !storageViewEmpty || !storageViewContent || !storageViewTitle || !storageViewNote || !storageViewMeta || !storageViewGrid || !storageViewMappingList) {
       return;
@@ -869,6 +1020,9 @@
 
     const views = storageViewRuntimeViews();
     const selectedView = ensureStorageViewRuntimeSelection();
+    if (storageViewsPanel) {
+      storageViewsPanel.classList.toggle("hidden", !views.length);
+    }
     if (storageViewsSummary) {
       if (state.storageViewsRuntimeLoading) {
         storageViewsSummary.textContent = `Inspecting runtime storage-view matches on ${state.selectedSystemId || state.snapshot.selected_system_id || "the selected system"}...`;
@@ -981,7 +1135,7 @@
   }
 
   function usesGenericPersistentIdLabel() {
-    return ["scale", "linux"].includes(currentPlatform());
+    return ["scale", "linux", "esxi"].includes(currentPlatform());
   }
 
   function buildViewProfile() {
@@ -1015,7 +1169,7 @@
             : (selectedStorageView.label || selectedStorageView.id),
         edgeLabel:
           selectedStorageView.kind === "nvme_carrier"
-            ? "PCIe edge / slot 1"
+            ? (selectedStorageView.template_id === "aoc-slg4-2h8m2-2" ? "PCIe edge / M2-1 lower slot" : "PCIe edge / slot 1")
             : selectedStorageView.kind === "ses_enclosure"
               ? (profile?.edge_label || "Front of chassis")
               : "Storage view",
@@ -1259,6 +1413,8 @@
         return "Generic Linux can run inventory-only over SSH, or you can pair it with a light API endpoint if you have one.";
       case "quantastor":
         return "Quantastor usually authenticates with API user/password, then optionally adds SSH for qs and SES detail.";
+      case "esxi":
+        return "VMware ESXi is read-only and SSH-only in this first pass; StorCLI supplies physical RAID-member detail and LED/write actions stay disabled.";
       default:
         return "TrueNAS CORE usually wants an API key, with SSH as the optional fallback for enclosure mapping and LED control.";
     }
@@ -1270,8 +1426,8 @@
     return Array.isArray(commands) ? commands : [];
   }
 
-  function recommendedSetupSshUser() {
-    return "jbodmap";
+  function recommendedSetupSshUser(platform = setupPlatformSelect?.value || "core") {
+    return String(platform || "").toLowerCase() === "esxi" ? "root" : "jbodmap";
   }
 
   function renderSetupProfileOptions() {
@@ -2056,6 +2212,12 @@
         return "System Switch";
       case "enclosure-switch":
         return "Enclosure Switch";
+      case "startup-led-verify":
+        return "Startup LED Verify";
+      case "system-switch-led-verify":
+        return "System LED Verify";
+      case "enclosure-switch-led-verify":
+        return "Enclosure LED Verify";
       case "manual-refresh":
         return "Manual Refresh";
       case "auto-refresh":
@@ -2072,7 +2234,38 @@
     if (reason === "enclosure-switch") {
       return "Loading enclosure view...";
     }
+    if (reason === "startup-led-verify" || reason === "system-switch-led-verify" || reason === "enclosure-switch-led-verify") {
+      return "Checking current identify LED state...";
+    }
     return force ? "Refreshing inventory..." : "Auto-refreshing inventory...";
+  }
+
+  function shouldQueueIdentifyVerify() {
+    if (state.snapshotMode || !state.snapshot) {
+      return false;
+    }
+    if (currentPlatform() !== "quantastor") {
+      return false;
+    }
+    return Array.isArray(state.snapshot.slots) && state.snapshot.slots.some((slot) => (
+      slot && (slot.led_supported || slot.identify_active || slot.led_backend === "quantastor_sg_ses")
+    ));
+  }
+
+  function queueIdentifyVerify(reason) {
+    if (!shouldQueueIdentifyVerify()) {
+      return;
+    }
+    if (state.identifyVerifyTimerId) {
+      window.clearTimeout(state.identifyVerifyTimerId);
+    }
+    state.identifyVerifyTimerId = window.setTimeout(() => {
+      state.identifyVerifyTimerId = null;
+      if (!shouldQueueIdentifyVerify() || state.refreshesInFlight > 0) {
+        return;
+      }
+      void refreshSnapshot(true, `${reason}-led-verify`);
+    }, 0);
   }
 
   function uiPerfScopeLabel(summary) {
@@ -3532,6 +3725,11 @@
     const selectedStorageView = getSelectedStorageViewRuntime();
     if (selectedStorageView) {
       renderStorageViewGrid(selectedStorageView);
+      return;
+    }
+    const selectedProfile = getSelectedProfile();
+    if (selectedProfile?.face_style === "nvme-carrier") {
+      renderLiveNvmeCarrierGrid(selectedProfile);
       return;
     }
     hideSlotTooltip();
@@ -5082,6 +5280,12 @@
 
   function buildSmartNoteText(slotLike, smartEntry) {
     const smartMessage = smartEntry?.data?.message;
+    const ledControlNote = (
+      !slotLike?.led_supported
+      && String(slotLike?.led_reason || "").trim()
+    )
+      ? String(slotLike.led_reason).trim()
+      : null;
     const ataVolumeCounterNote = (
       smartEntry?.data?.transport_protocol === "ATA"
       && (Number.isInteger(smartEntry?.data?.bytes_read) || Number.isInteger(smartEntry?.data?.bytes_written))
@@ -5098,7 +5302,7 @@
     const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
       ? "Estimated write-endurance values extrapolate current writes against the NVMe percentage-used SMART field."
       : null;
-    return [smartMessage, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
+    return [smartMessage, ledControlNote, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
   }
 
   function renderEmptyDetailState(message, { showDetailSecondary = true } = {}) {
@@ -5136,11 +5340,12 @@
     const showSasTransportFields = shouldShowSasTransportFields(slot, smartEntry);
     const showLinkRate = showSasTransportFields || formatLinkRateValue(smartEntry) !== "n/a";
     const showQuantastorContext = currentPlatform() === "quantastor";
+    const showLedControls = !state.snapshotMode && (slot.led_supported || slot.identify_active);
 
     detailEmpty.classList.add("hidden");
     detailContent.classList.remove("hidden");
     detailSecondary.classList.remove("hidden");
-    detailLedControls.classList.remove("hidden");
+    detailLedControls.classList.toggle("hidden", !showLedControls);
     if (mappingEmpty) {
       mappingEmpty.classList.add("hidden");
     }
@@ -6399,6 +6604,7 @@
       clearSelectedSlot();
       applyReusableSnapshot(state.selectedSystemId, null);
       await refreshSnapshot(false, "system-switch");
+      queueIdentifyVerify("system-switch");
     });
   }
   if (enclosureSelect) {
@@ -6417,6 +6623,7 @@
       state.storageViewsRuntimeLoading = true;
       applyReusableSnapshot(state.selectedSystemId, state.selectedEnclosureId);
       await refreshSnapshot(false, "enclosure-switch");
+      queueIdentifyVerify("enclosure-switch");
     });
   }
   if (enclosureFace) {
@@ -6684,4 +6891,5 @@
   void refreshHistoryStatus(true);
   scheduleSmartPrefetch();
   resetTimer();
+  queueIdentifyVerify("startup");
 })();

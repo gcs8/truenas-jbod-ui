@@ -98,7 +98,7 @@ class TrueNASConfig(BaseModel):
     api_key: str = ""
     api_user: str = ""
     api_password: str = ""
-    platform: Literal["core", "scale", "linux", "quantastor"] = "core"
+    platform: Literal["core", "scale", "linux", "quantastor", "esxi"] = "core"
     verify_ssl: bool = True
     tls_ca_bundle_path: str | None = None
     tls_server_name: str | None = None

@@ -59,6 +59,14 @@ class ParsedSSHData:
     ubntstorage_disks: list[dict[str, Any]] = field(default_factory=list)
     ubntstorage_spaces: list[dict[str, Any]] = field(default_factory=list)
     unifi_led_states: dict[int, bool] = field(default_factory=dict)
+    esxi_storage_adapters: list[dict[str, Any]] = field(default_factory=list)
+    esxi_storage_devices: list[dict[str, Any]] = field(default_factory=list)
+    esxi_filesystems: list[dict[str, Any]] = field(default_factory=list)
+    esxi_vmfs_extents: list[dict[str, Any]] = field(default_factory=list)
+    esxi_sas_adapters: list[dict[str, Any]] = field(default_factory=list)
+    esxi_storcli_controller: dict[str, Any] = field(default_factory=dict)
+    esxi_storcli_virtual_drives: list[dict[str, Any]] = field(default_factory=list)
+    esxi_storcli_physical_drives: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -2393,6 +2401,28 @@ def canonicalize_ssh_command(command: str) -> str:
         return "ubntstorage disk inspect"
     if executable == "ubntstorage" and args[:2] == ["space", "inspect"]:
         return "ubntstorage space inspect"
+    lowered_args = [arg.lower() for arg in args]
+    if executable == "esxcli":
+        if lowered_args[:4] == ["storage", "core", "adapter", "list"]:
+            return "esxcli storage core adapter list"
+        if lowered_args[:4] == ["storage", "core", "device", "list"]:
+            return "esxcli storage core device list"
+        if lowered_args[:4] == ["storage", "core", "path", "list"]:
+            return "esxcli storage core path list"
+        if lowered_args[:3] == ["storage", "filesystem", "list"]:
+            return "esxcli storage filesystem list"
+        if lowered_args[:4] == ["storage", "vmfs", "extent", "list"]:
+            return "esxcli storage vmfs extent list"
+        if lowered_args[:4] == ["storage", "san", "sas", "list"]:
+            return "esxcli storage san sas list"
+    if executable in {"storcli", "storcli64"}:
+        normalized_args = [arg for arg in args if arg]
+        has_json = any(arg.lower() == "j" for arg in normalized_args)
+        lowered_storcli_args = [arg.lower() for arg in normalized_args]
+        if has_json and len(lowered_storcli_args) >= 4 and lowered_storcli_args[1:3] == ["show", "all"]:
+            target = lowered_storcli_args[0]
+            if target in {"/c0", "/call", "/c0/vall", "/c0/eall/sall"}:
+                return f"storcli {target} show all J"
     if "/sys/kernel/debug/gpio" in command:
         return "gpio debug"
 
@@ -2448,6 +2478,355 @@ def parse_unifi_gpio_debug(output: str) -> dict[int, bool]:
         # The last writable output line is the one that toggles during fault/locate.
         slot_states[slot] = state == "hi"
     return slot_states
+
+
+def _normalize_table_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def parse_esxcli_key_value_sections(output: str) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for raw_line in output.splitlines():
+        if not raw_line.strip():
+            continue
+        if not raw_line[:1].isspace():
+            current = {"id": raw_line.strip()}
+            sections.append(current)
+            continue
+        if current is None or ":" not in raw_line:
+            continue
+        key, value = raw_line.split(":", 1)
+        normalized_key = _normalize_table_key(key)
+        if normalized_key:
+            current[normalized_key] = value.strip()
+    return sections
+
+
+def parse_esxcli_table(output: str) -> list[dict[str, Any]]:
+    lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return []
+
+    header_index = next(
+        (
+            index
+            for index, line in enumerate(lines[:-1])
+            if re.search(r"\s{2,}", line)
+            and set(lines[index + 1].strip()) <= {"-", " "}
+        ),
+        None,
+    )
+    if header_index is None:
+        return []
+
+    headers = [_normalize_table_key(item) for item in re.split(r"\s{2,}", lines[header_index].strip())]
+    rows: list[dict[str, Any]] = []
+    for line in lines[header_index + 2:]:
+        values = re.split(r"\s{2,}", line.strip(), maxsplit=max(0, len(headers) - 1))
+        if len(values) < len(headers):
+            continue
+        rows.append({header: values[index].strip() for index, header in enumerate(headers) if header})
+    return rows
+
+
+def _parse_storcli_json(output: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    controllers = payload.get("Controllers")
+    if not isinstance(controllers, list) or not controllers:
+        return {}
+    controller = controllers[0]
+    if not isinstance(controller, dict):
+        return {}
+    response_data = controller.get("Response Data")
+    if not isinstance(response_data, dict):
+        response_data = {}
+    return {
+        "command_status": controller.get("Command Status") if isinstance(controller.get("Command Status"), dict) else {},
+        "response_data": response_data,
+    }
+
+
+def _storcli_response_data(output: str) -> dict[str, Any]:
+    parsed = _parse_storcli_json(output)
+    response_data = parsed.get("response_data")
+    return response_data if isinstance(response_data, dict) else {}
+
+
+def parse_storcli_controller_info(output: str) -> dict[str, Any]:
+    parsed = _parse_storcli_json(output)
+    response_data = parsed.get("response_data")
+    return response_data if isinstance(response_data, dict) else {}
+
+
+def _storcli_slot_key(enclosure_id: Any, slot: Any) -> str | None:
+    enclosure_text = normalize_text(str(enclosure_id) if enclosure_id is not None else None)
+    slot_text = normalize_text(str(slot) if slot is not None else None)
+    if not enclosure_text or not slot_text:
+        return None
+    return f"{enclosure_text}:{slot_text}"
+
+
+def _parse_storcli_eid_slot(value: Any) -> tuple[str | None, int | None, str | None]:
+    text = normalize_text(str(value) if value is not None else None)
+    if not text or ":" not in text:
+        return None, None, None
+    enclosure_text, slot_text = text.split(":", 1)
+    slot = _coerce_int_like(slot_text)
+    if slot is None:
+        return normalize_text(enclosure_text), None, None
+    return normalize_text(enclosure_text), slot, f"{normalize_text(enclosure_text)}:{slot}"
+
+
+def _extract_storcli_drive_path(value: str) -> tuple[str | None, str | None, int | None, str | None]:
+    match = re.search(r"/(?P<controller>c\d+)/e(?P<enclosure>\d+)/s(?P<slot>\d+)", value, re.IGNORECASE)
+    if not match:
+        return None, None, None, None
+    enclosure_id = match.group("enclosure")
+    slot = int(match.group("slot"))
+    return match.group("controller").lower(), enclosure_id, slot, f"{enclosure_id}:{slot}"
+
+
+def _flatten_storcli_detail(value: Any) -> dict[str, Any]:
+    flattened: dict[str, Any] = {}
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if isinstance(child, (dict, list)):
+                    visit(child)
+                else:
+                    flattened[str(key)] = child
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return flattened
+
+
+def _first_detail_value(payload: dict[str, Any], *keys: str) -> Any:
+    lowered = {key.lower(): value for key, value in payload.items()}
+    for key in keys:
+        if key in payload:
+            return payload[key]
+        lowered_value = lowered.get(key.lower())
+        if lowered_value is not None:
+            return lowered_value
+    return None
+
+
+def _storcli_int(value: Any) -> int | None:
+    return _coerce_int_like(value)
+
+
+def _storcli_temperature_c(value: Any) -> int | None:
+    return _coerce_int_like(value)
+
+
+def _collect_storcli_drive_details(response_data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    details: dict[str, dict[str, Any]] = {}
+    for key, value in response_data.items():
+        if not isinstance(key, str) or not key.lower().startswith("drive /c"):
+            continue
+        controller_id, enclosure_id, slot, slot_key = _extract_storcli_drive_path(key)
+        if not slot_key:
+            continue
+        flattened = _flatten_storcli_detail(value)
+        if controller_id:
+            flattened["controller_id"] = controller_id
+        if enclosure_id:
+            flattened["enclosure_id"] = enclosure_id
+        if slot is not None:
+            flattened["slot"] = slot
+        details.setdefault(slot_key, {}).update(flattened)
+    return details
+
+
+def _collect_storcli_physical_drive_rows(response_data: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = response_data.get("Drive Information") or response_data.get("PD LIST") or []
+    if isinstance(rows, list) and rows:
+        return [row for row in rows if isinstance(row, dict)]
+
+    fallback_rows: list[dict[str, Any]] = []
+    for key, value in response_data.items():
+        if not isinstance(key, str) or not re.match(r"^Drive\s+/c\d+/e\d+/s\d+$", key, re.IGNORECASE):
+            continue
+        if isinstance(value, list):
+            fallback_rows.extend(item for item in value if isinstance(item, dict))
+        elif isinstance(value, dict):
+            fallback_rows.append(value)
+    return fallback_rows
+
+
+def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
+    response_data = _storcli_response_data(output)
+    rows = _collect_storcli_physical_drive_rows(response_data)
+    details_by_slot = _collect_storcli_drive_details(response_data)
+    drives: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        enclosure_id, slot, slot_key = _parse_storcli_eid_slot(row.get("EID:Slt") or row.get("EID:Slt "))
+        if slot_key is None:
+            continue
+        detail = details_by_slot.get(slot_key, {})
+        serial = normalize_text(
+            str(
+                _first_detail_value(detail, "SN", "Serial Number", "Inquiry Data")
+                or row.get("SN")
+                or ""
+            )
+        )
+        connector_name = normalize_text(
+            str(_first_detail_value(detail, "Connector Name", "Connector") or row.get("Cntrl") or "")
+        )
+        connected_port = normalize_text(
+            str(_first_detail_value(detail, "Connected Port Number(path)", "Connected Port Number", "Port") or "")
+        )
+        media_error_count = _storcli_int(
+            _first_detail_value(detail, "Media Error Count", "Media Errors", "Media_Error_Count")
+        )
+        other_error_count = _storcli_int(
+            _first_detail_value(detail, "Other Error Count", "Other Errors", "Other_Error_Count")
+        )
+        predictive_failure_count = _storcli_int(
+            _first_detail_value(detail, "Predictive Failure Count", "Predictive Failure", "Predictive_Failure_Count")
+        )
+        smart_alert = normalize_text(
+            str(
+                _first_detail_value(
+                    detail,
+                    "S.M.A.R.T alert flagged by drive",
+                    "SMART alert flagged by drive",
+                    "SMART Alert",
+                )
+                or ""
+            )
+        )
+        firmware = normalize_text(
+            str(_first_detail_value(detail, "Firmware Revision", "Firmware", "F/W") or row.get("F/W") or "")
+        )
+        link_speed = normalize_text(
+            str(_first_detail_value(detail, "Link Speed", "Negotiated Link Speed", "Drive Speed") or row.get("Sp") or "")
+        )
+        drives.append(
+            {
+                "slot_key": slot_key,
+                "enclosure_id": enclosure_id,
+                "slot": slot,
+                "controller_id": normalize_text(str(detail.get("controller_id") or row.get("Ctl") or "c0")),
+                "device_id": normalize_text(str(row.get("DID") if row.get("DID") is not None else "")),
+                "state": normalize_text(str(row.get("State") or "")),
+                "drive_group": normalize_text(str(row.get("DG") if row.get("DG") is not None else "")),
+                "size": normalize_text(str(row.get("Size") or "")),
+                "interface": normalize_text(str(row.get("Intf") or "")),
+                "media": normalize_text(str(row.get("Med") or "")),
+                "sector_size": normalize_text(str(row.get("SeSz") or row.get("SeSz ") or "")),
+                "model": normalize_text(str(row.get("Model") or _first_detail_value(detail, "Model Number") or "")),
+                "serial": serial,
+                "firmware": firmware,
+                "temperature_c": _storcli_temperature_c(
+                    _first_detail_value(detail, "Drive Temperature", "Temperature", "Drive Temperature(C)")
+                ),
+                "media_errors": media_error_count,
+                "other_errors": other_error_count,
+                "predictive_errors": predictive_failure_count,
+                "smart_alert": smart_alert,
+                "connector_name": connector_name,
+                "connected_port": connected_port,
+                "link_speed": link_speed,
+                "raw_size": normalize_text(str(_first_detail_value(detail, "Raw Size") or "")),
+                "unmap_capable": normalize_text(str(_first_detail_value(detail, "Unmap Capable") or "")),
+                "raw": row,
+                "detail": detail,
+            }
+        )
+    return drives
+
+
+def _collect_storcli_virtual_drive_details(response_data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    details: dict[str, dict[str, Any]] = {}
+    for key, value in response_data.items():
+        if not isinstance(key, str):
+            continue
+        match = re.search(r"/c\d+/v(?P<vd>\d+)", key, re.IGNORECASE)
+        if not match:
+            match = re.search(r"^VD(?P<vd>\d+)\s+Properties$", key, re.IGNORECASE)
+        if not match:
+            continue
+        flattened = _flatten_storcli_detail(value)
+        details.setdefault(match.group("vd"), {}).update(flattened)
+    return details
+
+
+def _collect_storcli_virtual_drive_rows(response_data: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = response_data.get("VD LIST") or response_data.get("Virtual Drives") or []
+    if isinstance(rows, list) and rows:
+        return [row for row in rows if isinstance(row, dict)]
+
+    fallback_rows: list[dict[str, Any]] = []
+    for key, value in response_data.items():
+        if not isinstance(key, str) or not re.match(r"^/c\d+/v\d+$", key, re.IGNORECASE):
+            continue
+        if isinstance(value, list):
+            fallback_rows.extend(item for item in value if isinstance(item, dict))
+        elif isinstance(value, dict):
+            fallback_rows.append(value)
+    return fallback_rows
+
+
+def parse_storcli_virtual_drives(output: str) -> list[dict[str, Any]]:
+    response_data = _storcli_response_data(output)
+    rows = _collect_storcli_virtual_drive_rows(response_data)
+    details_by_vd = _collect_storcli_virtual_drive_details(response_data)
+    virtual_drives: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_dg_vd = normalize_text(str(row.get("DG/VD") or row.get("DG VD") or ""))
+        vd_id = None
+        if raw_dg_vd and "/" in raw_dg_vd:
+            vd_id = raw_dg_vd.split("/", 1)[1]
+        if vd_id is None:
+            vd_id = normalize_text(str(row.get("VD") if row.get("VD") is not None else ""))
+        detail = details_by_vd.get(vd_id or "", {})
+        pd_rows = []
+        for key, value in response_data.items():
+            if isinstance(key, str) and re.search(rf"\bPDs\s+for\s+VD\s+{re.escape(vd_id or '')}\b", key, re.IGNORECASE):
+                if isinstance(value, list):
+                    pd_rows.extend(item for item in value if isinstance(item, dict))
+        physical_drives = []
+        for pd_row in pd_rows:
+            enclosure_id, slot, slot_key = _parse_storcli_eid_slot(pd_row.get("EID:Slt") or pd_row.get("EID:Slt "))
+            if slot_key:
+                physical_drives.append(
+                    {
+                        "slot_key": slot_key,
+                        "enclosure_id": enclosure_id,
+                        "slot": slot,
+                        "raw": pd_row,
+                    }
+                )
+        virtual_drives.append(
+            {
+                "vd_id": vd_id,
+                "name": normalize_text(str(row.get("Name") or _first_detail_value(detail, "Name") or "")),
+                "raid": normalize_text(str(row.get("TYPE") or row.get("Type") or "")),
+                "state": normalize_text(str(row.get("State") or "")),
+                "size": normalize_text(str(row.get("Size") or "")),
+                "scsi_naa": normalize_text(str(_first_detail_value(detail, "SCSI NAA Id", "SCSI NAA ID") or "")),
+                "physical_drives": physical_drives,
+                "raw": row,
+                "detail": detail,
+            }
+        )
+    return virtual_drives
 
 
 def parse_mdadm_detail_scan(output: str) -> dict[str, LinuxMdArray]:
@@ -2536,6 +2915,22 @@ def parse_ssh_outputs(
         parsed.ubntstorage_spaces = parse_ubntstorage_json(normalized_outputs["ubntstorage space inspect"])
     if normalized_outputs.get("gpio debug"):
         parsed.unifi_led_states = parse_unifi_gpio_debug(normalized_outputs["gpio debug"])
+    if normalized_outputs.get("esxcli storage core adapter list"):
+        parsed.esxi_storage_adapters = parse_esxcli_table(normalized_outputs["esxcli storage core adapter list"])
+    if normalized_outputs.get("esxcli storage core device list"):
+        parsed.esxi_storage_devices = parse_esxcli_key_value_sections(normalized_outputs["esxcli storage core device list"])
+    if normalized_outputs.get("esxcli storage filesystem list"):
+        parsed.esxi_filesystems = parse_esxcli_table(normalized_outputs["esxcli storage filesystem list"])
+    if normalized_outputs.get("esxcli storage vmfs extent list"):
+        parsed.esxi_vmfs_extents = parse_esxcli_table(normalized_outputs["esxcli storage vmfs extent list"])
+    if normalized_outputs.get("esxcli storage san sas list"):
+        parsed.esxi_sas_adapters = parse_esxcli_key_value_sections(normalized_outputs["esxcli storage san sas list"])
+    if normalized_outputs.get("storcli /c0 show all J"):
+        parsed.esxi_storcli_controller = parse_storcli_controller_info(normalized_outputs["storcli /c0 show all J"])
+    if normalized_outputs.get("storcli /c0/vall show all J"):
+        parsed.esxi_storcli_virtual_drives = parse_storcli_virtual_drives(normalized_outputs["storcli /c0/vall show all J"])
+    if normalized_outputs.get("storcli /c0/eall/sall show all J"):
+        parsed.esxi_storcli_physical_drives = parse_storcli_physical_drives(normalized_outputs["storcli /c0/eall/sall show all J"])
     if normalized_outputs.get("gmultipath list"):
         parsed.multipath_info = parse_gmultipath_list(normalized_outputs["gmultipath list"])
     if normalized_outputs.get("camcontrol devlist"):

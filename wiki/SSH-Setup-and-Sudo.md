@@ -9,6 +9,11 @@ The short version:
 - allow only the exact commands you need
 - start narrow and widen only when a real feature needs it
 
+Current ESXi support is the exception to that pattern: it is SSH-only,
+read-only, and intentionally skips the Linux bootstrap/sudo flow. On the
+validated ESXi host the saved SSH user stays `root`, and the app uses direct
+read-only runtime commands instead of trying to synthesize Linux sudo rules.
+
 ## Recommended SSH User Pattern
 
 - username: `jbodmap`
@@ -75,6 +80,23 @@ sudo -n /usr/sbin/mdadm --detail --scan
 /usr/sbin/nvme list-subsys -o json
 ```
 
+## ESXi Command Ideas
+
+```text
+vmware -v
+esxcli system version get
+esxcli software vib list
+esxcli storage core adapter list
+esxcli storage core device list
+esxcli storage core path list
+esxcli storage filesystem list
+esxcli storage vmfs extent list
+esxcli storage san sas list
+/opt/lsi/storcli64/storcli64 /c0 show all J
+/opt/lsi/storcli64/storcli64 /c0/vall show all J
+/opt/lsi/storcli64/storcli64 /c0/eall/sall show all J
+```
+
 ## On-Demand Commands The App Runs Separately
 
 These do not have to live in the standing command list:
@@ -87,6 +109,9 @@ These do not have to live in the standing command list:
 - LED identify actions such as `sesutil locate` or `sg_ses --set=ident`
 
 But the SSH user still needs sudo permission for them if the host requires root.
+
+ESXi does not use Linux sudo. Keep that path as direct read-only root or
+key-based SSH instead of trying to reuse the CORE/SCALE/Linux sudoers model.
 
 ## Example Narrow Sudoers Entries
 

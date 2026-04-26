@@ -1086,7 +1086,7 @@ def serialize_platform_defaults() -> dict[str, dict[str, object]]:
         platform: {
             "ssh_commands": default_ssh_commands_for_platform(platform),
         }
-        for platform in ("core", "scale", "linux", "quantastor")
+        for platform in ("core", "scale", "linux", "quantastor", "esxi")
     }
 
 

@@ -56,6 +56,7 @@
       || "",
     loadedSystemId: null,
     sshCommandsAutoPlatform: null,
+    sshUserAutoPlatform: null,
     sshKeysLoading: false,
     refreshInFlight: false,
     countdownTimerId: null,
@@ -167,9 +168,12 @@
     setupGenerateKeyPanel: document.getElementById("setup-generate-key-panel"),
     setupManualKeyPanel: document.getElementById("setup-manual-key-panel"),
     setupSshPassword: document.getElementById("setup-ssh-password"),
+    setupSshSudoPasswordField: document.getElementById("setup-ssh-sudo-password-field"),
     setupSshSudoPassword: document.getElementById("setup-ssh-sudo-password"),
     setupSshKnownHosts: document.getElementById("setup-ssh-known-hosts"),
     setupSshStrictHostKey: document.getElementById("setup-ssh-strict-host-key"),
+    setupBootstrapPanel: document.getElementById("setup-bootstrap-panel"),
+    setupBootstrapCopy: document.getElementById("setup-bootstrap-copy"),
     setupBootstrapEnabled: document.getElementById("setup-bootstrap-enabled"),
     setupBootstrapFields: document.getElementById("setup-bootstrap-fields"),
     setupBootstrapHost: document.getElementById("setup-bootstrap-host"),
@@ -184,6 +188,7 @@
     setupBootstrapSudoersDetail: document.getElementById("setup-bootstrap-sudoers-detail"),
     setupBootstrapSudoersPreview: document.getElementById("setup-bootstrap-sudoers-preview"),
     setupSshCommands: document.getElementById("setup-ssh-commands"),
+    setupSshCommandsNote: document.getElementById("setup-ssh-commands-note"),
     setupLoadRecommendedButton: document.getElementById("setup-load-recommended-button"),
     setupStorageViewTemplate: document.getElementById("setup-storage-view-template"),
     setupStorageViewAddButton: document.getElementById("setup-storage-view-add-button"),
@@ -703,6 +708,14 @@
 
   function currentSetupPlatform() {
     return String(elements.setupPlatform?.value || "core").toLowerCase();
+  }
+
+  function platformSupportsBootstrap(platform = currentSetupPlatform()) {
+    return String(platform || "").toLowerCase() !== "esxi";
+  }
+
+  function platformSupportsSavedSudo(platform = currentSetupPlatform()) {
+    return String(platform || "").toLowerCase() !== "esxi";
   }
 
   function normalizeHaNode(rawNode) {
@@ -2286,7 +2299,9 @@
       storageView?.binding?.mode ? `binding: ${storageView.binding.mode}` : null,
       targetNode ? `target: ${targetNode}` : null,
       profileChip,
-      storageView?.kind === "nvme_carrier" ? "slot 1 nearest PCIe edge" : null,
+      storageView?.kind === "nvme_carrier"
+        ? (storageView?.template_id === "aoc-slg4-2h8m2-2" ? "M2-1 lower / M2-2 upper" : "slot 1 nearest PCIe edge")
+        : null,
       template?.supports_auto_discovery ? "auto-discovery" : null,
       template?.supports_led ? "LED capable" : null,
     ].filter(Boolean);
@@ -2952,9 +2967,15 @@
         return "Generic Linux setups are usually SSH-heavy, so pinning a trusted profile and SSH command set matters more than API auth here.";
       case "quantastor":
         return "Quantastor normally uses API user/password auth, with SSH reserved for the richer shared-slot and SES details.";
+      case "esxi":
+        return "VMware ESXi is read-only and SSH-only in this first pass; StorCLI provides the physical RAID-member truth, the saved SSH user normally stays root, and the Linux bootstrap/sudo flow is intentionally disabled.";
       default:
         return "TrueNAS CORE usually wants an API key, with SSH as the optional fallback for enclosure mapping and LED control.";
     }
+  }
+
+  function recommendedSshUserForPlatform(platform = currentSetupPlatform()) {
+    return String(platform || "").toLowerCase() === "esxi" ? "root" : "jbodmap";
   }
 
   function defaultCommands(platform) {
@@ -2984,11 +3005,44 @@
     scheduleSudoersPreviewRefresh(0);
   }
 
+  function setRecommendedSshUser(platform) {
+    if (!elements.setupSshUser) {
+      return;
+    }
+    elements.setupSshUser.value = recommendedSshUserForPlatform(platform);
+    state.sshUserAutoPlatform = String(platform || "core").toLowerCase();
+  }
+
   function syncPlatformHelp() {
     if (!elements.setupPlatformHelp || !elements.setupPlatform) {
       return;
     }
     elements.setupPlatformHelp.textContent = platformSetupCopy(elements.setupPlatform.value);
+  }
+
+  function syncPlatformSpecificSetupFields() {
+    const platform = currentSetupPlatform();
+    const bootstrapSupported = platformSupportsBootstrap(platform);
+    const savedSudoSupported = platformSupportsSavedSudo(platform);
+    if (elements.setupSshSudoPasswordField) {
+      elements.setupSshSudoPasswordField.classList.toggle("hidden", !savedSudoSupported);
+    }
+    if (!savedSudoSupported && elements.setupSshSudoPassword) {
+      elements.setupSshSudoPassword.value = "";
+    }
+    if (elements.setupBootstrapPanel) {
+      elements.setupBootstrapPanel.classList.toggle("is-disabled", !bootstrapSupported);
+    }
+    if (elements.setupBootstrapCopy) {
+      elements.setupBootstrapCopy.textContent = bootstrapSupported
+        ? "Use temporary root or installer credentials once to create the final service account, install the selected public key, and optionally write limited sudo rules."
+        : "VMware ESXi stays on the saved SSH credentials or key directly. The Linux-style one-time service-account bootstrap and sudoers flow are intentionally disabled here.";
+    }
+    if (elements.setupSshCommandsNote) {
+      elements.setupSshCommandsNote.innerHTML = bootstrapSupported
+        ? "These are the exact SSH commands the app runs. When you use the one-time bootstrap, any <code>sudo -n ...</code> lines here are also converted into <code>NOPASSWD</code> sudo rules for the final service account, with the platform's on-demand smartctl and LED-control extras kept in place."
+        : "These are the exact SSH commands the app runs on the ESXi host. This path stays read-only and SSH-only, so no Linux sudoers/bootstrap conversion is used.";
+    }
   }
 
   function maybeLoadRecommendedCommands(force = false) {
@@ -3010,6 +3064,25 @@
     setRecommendedCommands(platform);
   }
 
+  function maybeLoadRecommendedSshUser(force = false) {
+    if (!elements.setupSshUser || !elements.setupPlatform) {
+      return;
+    }
+    const platform = elements.setupPlatform.value || "core";
+    const currentValue = String(elements.setupSshUser.value || "").trim();
+    if (!force && currentValue) {
+      const previousPlatform = state.sshUserAutoPlatform;
+      if (!previousPlatform || previousPlatform === String(platform).toLowerCase()) {
+        return;
+      }
+      const previousRecommended = recommendedSshUserForPlatform(previousPlatform);
+      if (currentValue !== previousRecommended) {
+        return;
+      }
+    }
+    setRecommendedSshUser(platform);
+  }
+
   function collectSetupCommands() {
     return String(elements.setupSshCommands?.value || "")
       .split(/\r?\n/)
@@ -3025,7 +3098,7 @@
     const bootstrapEnabled = bootstrapEnabledForSession();
     return {
       platform: elements.setupPlatform?.value || "core",
-      service_user: elements.setupSshUser?.value?.trim() || "jbodmap",
+      service_user: elements.setupSshUser?.value?.trim() || recommendedSshUserForPlatform(elements.setupPlatform?.value || "core"),
       install_sudo_rules: bootstrapEnabled && Boolean(elements.setupBootstrapInstallSudo?.checked),
       sudo_commands: bootstrapEnabled ? collectBootstrapSudoCommands() : [],
     };
@@ -3071,6 +3144,15 @@
       return;
     }
     const payload = collectSudoersPreviewPayload();
+    if (!platformSupportsBootstrap(payload.platform)) {
+      renderSudoersPreview({
+        service_user: payload.service_user,
+        enabled: false,
+        detail: "VMware ESXi does not use the Linux sudoers/bootstrap path. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.",
+        content: "# VMware ESXi does not use the Linux sudoers/bootstrap flow.\n# Keep the saved SSH credentials or key directly on the system entry instead.\n",
+      });
+      return;
+    }
     if (!bootstrapEnabledForSession()) {
       renderSudoersPreview({
         service_user: payload.service_user,
@@ -3291,24 +3373,39 @@
     if (enabled && elements.setupSshHost && !elements.setupSshHost.value.trim()) {
       elements.setupSshHost.value = suggestedConnectionHost();
     }
-    if (enabled && elements.setupSshUser && !elements.setupSshUser.value.trim()) {
-      elements.setupSshUser.value = "jbodmap";
+    if (enabled) {
+      maybeLoadRecommendedSshUser();
     }
     if (enabled && elements.setupBootstrapHost && !elements.setupBootstrapHost.value.trim()) {
       elements.setupBootstrapHost.value = suggestedConnectionHost();
     }
+    syncPlatformSpecificSetupFields();
     syncBootstrapFields();
     syncKeyMode();
     syncKeyHelp();
   }
 
   function bootstrapEnabledForSession() {
-    return Boolean(elements.setupSshEnabled?.checked && elements.setupBootstrapEnabled?.checked);
+    return Boolean(
+      elements.setupSshEnabled?.checked
+      && platformSupportsBootstrap()
+      && elements.setupBootstrapEnabled?.checked
+    );
   }
 
   function syncBootstrapFields() {
     const sshEnabled = Boolean(elements.setupSshEnabled?.checked);
+    const bootstrapSupported = platformSupportsBootstrap();
+    if (!bootstrapSupported && elements.setupBootstrapEnabled) {
+      elements.setupBootstrapEnabled.checked = false;
+    }
+    if (!bootstrapSupported && elements.setupBootstrapInstallSudo) {
+      elements.setupBootstrapInstallSudo.checked = false;
+    }
     const bootstrapEnabled = bootstrapEnabledForSession();
+    if (elements.setupBootstrapEnabled) {
+      elements.setupBootstrapEnabled.disabled = !sshEnabled || !bootstrapSupported;
+    }
     document.querySelectorAll("[data-bootstrap-field]").forEach((field) => {
       field.disabled = !bootstrapEnabled;
     });
@@ -3318,6 +3415,8 @@
     if (elements.setupBootstrapResult) {
       if (!sshEnabled) {
         elements.setupBootstrapResult.textContent = "Enable SSH enrichment first if you want to use one-time bootstrap.";
+      } else if (!bootstrapSupported) {
+        elements.setupBootstrapResult.textContent = "VMware ESXi does not use the one-time Linux service-account bootstrap. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.";
       } else if (!bootstrapEnabled) {
         elements.setupBootstrapResult.textContent = "Bootstrap is off by default for saved systems. Enable it only when you intend to run one-time service-account setup.";
       }
@@ -3450,6 +3549,7 @@
     state.tlsInspection = null;
     state.haNodes = [];
     state.haNodesLoading = false;
+    state.sshUserAutoPlatform = null;
     state.storageViews = [];
     state.storageViewCandidates = [];
     state.storageViewCandidatesSystemId = null;
@@ -3645,6 +3745,10 @@
     }
     if (elements.setupSshUser) {
       elements.setupSshUser.value = system.ssh_user || "";
+      state.sshUserAutoPlatform =
+        String(system.ssh_user || "").trim() === recommendedSshUserForPlatform(system.platform || "core")
+          ? String(system.platform || "core").toLowerCase()
+          : null;
     }
     if (elements.setupSshPort) {
       elements.setupSshPort.value = String(system.ssh_port || 22);
@@ -3736,7 +3840,7 @@
   function collectSetupPayload() {
     const sshEnabled = Boolean(elements.setupSshEnabled?.checked);
     const sshHost = normalizeConnectionHost(elements.setupSshHost?.value) || null;
-    const sshUser = elements.setupSshUser?.value?.trim() || (sshEnabled ? "jbodmap" : null);
+    const sshUser = elements.setupSshUser?.value?.trim() || (sshEnabled ? recommendedSshUserForPlatform() : null);
     const normalizedSystemId = elements.setupSystemId?.value?.trim() || null;
     return {
       system_id: normalizedSystemId,
@@ -3760,7 +3864,7 @@
       ssh_user: sshUser,
       ssh_key_path: elements.setupSshKeyPath?.value?.trim() || null,
       ssh_password: elements.setupSshPassword?.value || null,
-      ssh_sudo_password: elements.setupSshSudoPassword?.value || null,
+      ssh_sudo_password: platformSupportsSavedSudo() ? (elements.setupSshSudoPassword?.value || null) : null,
       ssh_known_hosts_path: elements.setupSshKnownHosts?.value?.trim() || null,
       ssh_strict_host_key_checking: Boolean(elements.setupSshStrictHostKey?.checked),
       ssh_commands: collectSetupCommands(),
@@ -3872,6 +3976,9 @@
       throw new Error("Enable One-Time Bootstrap before running bootstrap on this host.");
     }
     const setupPayload = collectSetupPayload();
+    if (!platformSupportsBootstrap(setupPayload.platform)) {
+      throw new Error("VMware ESXi does not use the one-time Linux service-account bootstrap path.");
+    }
     if (!setupPayload.ssh_enabled) {
       throw new Error("Enable SSH enrichment first so the final service-account details are defined.");
     }
@@ -5095,7 +5202,9 @@
 
     elements.setupPlatform?.addEventListener("change", () => {
       syncPlatformHelp();
+      maybeLoadRecommendedSshUser();
       maybeLoadRecommendedCommands();
+      syncSshFields();
       renderQuantastorHaSection();
       renderStorageViews();
       updateCreateButton();

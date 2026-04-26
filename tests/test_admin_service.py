@@ -4,9 +4,11 @@ import asyncio
 import json
 import urllib.error
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from fastapi import HTTPException
 from fastapi import Request
 
 from admin_service.config import AdminSettings
@@ -28,6 +30,7 @@ from app.models.domain import EnclosureOption
 from app.models.domain import EnclosureProfileRequest
 from app.models.domain import HistoryAdoptRequest
 from app.models.domain import QuantastorNodeDiscoveryRequest
+from app.models.domain import SystemSetupBootstrapRequest
 from app.models.domain import SystemSetupSudoPreviewRequest
 from app.services.profile_registry import UNIFI_UNVR_FRONT_4_PROFILE_ID
 from history_service.config import HistorySettings
@@ -53,6 +56,11 @@ def make_request(host: str = "localhost", port: int = 8082) -> Request:
 
 
 class MainAppBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def _call_main_route(path: str) -> object:
+        route = next(route for route in main_app.routes if route.path == path)
+        return asyncio.run(route.endpoint())
+
     def test_admin_sidecar_exposes_one_time_bootstrap_route(self) -> None:
         paths = {route.path for route in admin_app.routes}
 
@@ -87,6 +95,84 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertIn("/api/storage-views", paths)
         self.assertIn("/api/storage-views/{view_id}/slots/{slot_index}/history", paths)
+        self.assertIn("/livez", paths)
+        self.assertIn("/healthz", paths)
+
+    def test_main_ui_template_omits_storage_view_runtime_panel(self) -> None:
+        template_path = Path(__file__).resolve().parents[1] / "app" / "templates" / "index.html"
+        template_text = template_path.read_text(encoding="utf-8")
+
+        self.assertNotIn('id="storage-views-panel"', template_text)
+        self.assertNotIn("Selected Storage View", template_text)
+
+    def test_main_ui_script_filters_admin_only_storage_views_from_selector(self) -> None:
+        script_path = Path(__file__).resolve().parents[1] / "app" / "static" / "app.js"
+        script_text = script_path.read_text(encoding="utf-8")
+
+        self.assertIn('view.render?.show_in_main_ui !== false', script_text)
+        self.assertIn('get("storage_view_id")', script_text)
+        self.assertIn('rawValue.startsWith("view:")', script_text)
+
+    def test_main_ui_script_keeps_navigation_stale_first_with_background_led_verify(self) -> None:
+        script_path = Path(__file__).resolve().parents[1] / "app" / "static" / "app.js"
+        script_text = script_path.read_text(encoding="utf-8")
+
+        self.assertIn('await refreshSnapshot(false, "system-switch");', script_text)
+        self.assertIn('await refreshSnapshot(false, "enclosure-switch");', script_text)
+        self.assertIn('queueIdentifyVerify("startup");', script_text)
+        self.assertIn('queueIdentifyVerify("system-switch");', script_text)
+        self.assertIn('queueIdentifyVerify("enclosure-switch");', script_text)
+        self.assertIn('void refreshSnapshot(true, `${reason}-led-verify`);', script_text)
+        self.assertIn("snapshotMatchesSelectedSystem()", script_text)
+
+    def test_admin_script_disables_linux_bootstrap_flow_for_esxi(self) -> None:
+        script_path = Path(__file__).resolve().parents[1] / "admin_service" / "static" / "admin.js"
+        script_text = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("platformSupportsBootstrap", script_text)
+        self.assertIn('setupSshSudoPasswordField.classList.toggle("hidden", !savedSudoSupported)', script_text)
+        self.assertIn("VMware ESXi does not use the one-time Linux service-account bootstrap.", script_text)
+        self.assertIn("VMware ESXi does not use the Linux sudoers/bootstrap path.", script_text)
+
+    def test_main_app_livez_is_lightweight(self) -> None:
+        response = self._call_main_route("/livez")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body)["status"], "ok")
+
+    def test_main_app_healthz_uses_cached_snapshot_only(self) -> None:
+        fake_service = MagicMock()
+        fake_snapshot = MagicMock()
+        fake_snapshot.sources = {"api": MagicMock(ok=True)}
+        fake_snapshot.last_updated = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
+        fake_snapshot.warnings = ["cached warning"]
+        fake_snapshot.model_dump.return_value = {"sources": {"api": {"enabled": True, "ok": True, "message": "reachable"}}}
+        fake_service.peek_cached_snapshot.return_value = fake_snapshot
+        fake_registry = MagicMock()
+        fake_registry.get_service.return_value = fake_service
+
+        with patch("app.main.get_inventory_registry", return_value=fake_registry):
+            response = self._call_main_route("/healthz")
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["dependency_status"], "ok")
+        self.assertEqual(payload["cache_state"], "cached")
+        fake_service.peek_cached_snapshot.assert_called_once_with()
+
+    def test_main_app_healthz_reports_unknown_when_cache_is_empty(self) -> None:
+        fake_service = MagicMock()
+        fake_service.peek_cached_snapshot.return_value = None
+        fake_registry = MagicMock()
+        fake_registry.get_service.return_value = fake_service
+
+        with patch("app.main.get_inventory_registry", return_value=fake_registry):
+            response = self._call_main_route("/healthz")
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["dependency_status"], "unknown")
+        self.assertEqual(payload["cache_state"], "empty")
 
     def test_resolve_admin_launch_url_returns_public_url_when_sidecar_is_healthy(self) -> None:
         request = make_request(port=8080)
@@ -265,11 +351,13 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(payload["systems"][0]["storage_views"][0]["template_id"], "ses-auto")
         self.assertEqual(payload["systems"][0]["storage_views"][0]["profile_id"], "lab-4x4")
         self.assertEqual(payload["storage_view_templates"][0]["id"], "ses-auto")
+        self.assertTrue(any(template["id"] == "aoc-slg4-2h8m2-2" for template in payload["storage_view_templates"]))
         custom_profile = next(profile for profile in payload["profiles"] if profile["id"] == "lab-4x4")
         self.assertEqual(custom_profile["slot_count"], 16)
         self.assertTrue(custom_profile["is_custom"])
         self.assertEqual(custom_profile["reference_count"], 2)
         self.assertIn("core", payload["setup_platform_defaults"])
+        self.assertIn("esxi", payload["setup_platform_defaults"])
         self.assertEqual(payload["ssh_keys"][0]["name"], "id_truenas")
         self.assertEqual(payload["paths"]["history_db"], "/tmp/history/history.db")
         self.assertEqual(payload["paths"]["tls_dir"], str(Path("C:/tmp/config") / "tls"))
@@ -1157,3 +1245,48 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["filename"], "truenas-jbod-ui-readonly")
         self.assertIn("skip writing a sudoers file", payload["detail"])
         self.assertIn("# Sudo rules disabled", payload["content"])
+
+    def test_sudoers_preview_route_disables_esxi_bootstrap_flow(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
+
+        response = asyncio.run(
+            route.endpoint(
+                SystemSetupSudoPreviewRequest(
+                    platform="esxi",
+                    service_user="root",
+                    install_sudo_rules=True,
+                    sudo_commands=[],
+                )
+            )
+        )
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["enabled"])
+        self.assertEqual(payload["filename"], "truenas-jbod-ui-root")
+        self.assertIn("does not use the Linux one-time bootstrap or sudoers flow", payload["detail"])
+        self.assertIn("# VMware ESXi does not use the Linux sudoers/bootstrap flow.", payload["content"])
+
+    def test_bootstrap_route_rejects_esxi_platform(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/bootstrap")
+        settings = Settings(config_file="C:/tmp/config/config.yaml")
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with self.assertRaises(HTTPException) as context:
+                asyncio.run(
+                    route.endpoint(
+                        SystemSetupBootstrapRequest(
+                            platform="esxi",
+                            host="10.88.88.20",
+                            bootstrap_user="root",
+                            bootstrap_password="secret",
+                            service_user="root",
+                            service_public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyOnly esxi-test",
+                            install_sudo_rules=False,
+                        )
+                    )
+                )
+
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertIn("does not use the Linux one-time bootstrap or sudoers flow", str(context.exception.detail))

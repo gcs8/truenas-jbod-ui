@@ -9,6 +9,7 @@ from app.config import SystemConfig, TrueNASConfig, _load_profile_yaml, get_sett
 from app.models.domain import EnclosureOption
 from app.services.profile_registry import (
     CORE_CSE_946_PROFILE_ID,
+    ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
     GENERIC_FRONT_12_3X4_PROFILE_ID,
     GENERIC_FRONT_24_1X24_PROFILE_ID,
     GENERIC_FRONT_60_5X12_PROFILE_ID,
@@ -137,6 +138,26 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.rows, 1)
         self.assertEqual(profile.columns, 24)
         self.assertEqual(profile.slot_layout, [list(range(24))])
+
+    def test_builtin_esxi_aoc_profile_exposes_two_m2_slots(self) -> None:
+        system = SystemConfig(id="cryo-esxi", label="CryoStorage ESXi", truenas=TrueNASConfig(platform="esxi"))
+        registry = ProfileRegistry(get_settings())
+
+        profile = registry.resolve_for_enclosure(
+            system,
+            None,
+            fallback_label="AOC-SLG4-2H8M2",
+            fallback_rows=2,
+            fallback_columns=1,
+            fallback_slot_count=2,
+        )
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.id, ESXI_AOC_SLG4_2H8M2_PROFILE_ID)
+        self.assertEqual(profile.face_style, "nvme-carrier")
+        self.assertEqual(profile.slot_layout, [[1], [0]])
+        self.assertEqual(profile.slot_hints[0], ["13:0", "C0 x4", "0(path0)"])
+        self.assertEqual(profile.slot_hints[1], ["13:1", "C1 x4", "1(path0)"])
 
     def test_builtin_generic_profiles_expose_reusable_reference_geometries(self) -> None:
         registry = ProfileRegistry(get_settings())

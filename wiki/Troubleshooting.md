@@ -7,11 +7,14 @@ This page is the short list of the failures you are most likely to hit.
 Check:
 
 ```bash
+curl http://localhost:8080/livez
 curl http://localhost:8080/healthz
 docker compose logs -f
 ```
 
-If `healthz` is not `ok`, fix that first.
+If `livez` is not `ok`, fix that first. If `livez` is healthy but `healthz`
+shows degraded dependency state, inspect the returned warning/error payload
+before chasing layout or mapping bugs.
 
 ## The App Is Up But Slot Mapping Looks Wrong
 

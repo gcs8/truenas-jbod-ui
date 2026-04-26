@@ -735,7 +735,7 @@ class HANodeRequest(BaseModel):
 class SystemSetupRequest(BaseModel):
     system_id: str | None = None
     label: str
-    platform: Literal["core", "scale", "linux", "quantastor"] = "core"
+    platform: Literal["core", "scale", "linux", "quantastor", "esxi"] = "core"
     truenas_host: str
     api_key: str | None = None
     api_user: str | None = None
@@ -963,7 +963,7 @@ class SSHKeyGenerateRequest(BaseModel):
 
 
 class SystemSetupBootstrapRequest(BaseModel):
-    platform: Literal["core", "scale", "linux", "quantastor"] = "core"
+    platform: Literal["core", "scale", "linux", "quantastor", "esxi"] = "core"
     host: str
     port: int = 22
     bootstrap_user: str
@@ -1037,7 +1037,7 @@ class SystemSetupBootstrapRequest(BaseModel):
 
 
 class SystemSetupSudoPreviewRequest(BaseModel):
-    platform: Literal["core", "scale", "linux", "quantastor"] = "core"
+    platform: Literal["core", "scale", "linux", "quantastor", "esxi"] = "core"
     service_user: str = "jbodmap"
     install_sudo_rules: bool = True
     sudo_commands: list[str] = Field(default_factory=list)

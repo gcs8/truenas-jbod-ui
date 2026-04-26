@@ -22,6 +22,9 @@ The current tested hardware profiles are:
   and rear `12`-bay enclosure views
 - Generic Linux on a Supermicro `SYS-2029GP-TR` using a profile-driven `2`-bay
   right-side NVMe view backed by SSH `lsblk`, `mdadm`, and `nvme` discovery
+- VMware ESXi `7.0.3` on a Supermicro `AOC-SLG4-2H8M2`, using SSH `esxcli`
+  plus StorCLI JSON for a read-only `2`-slot M.2 RAID-member view behind the
+  Broadcom / SAS3808 controller
 - OSNexus Quantastor on a Supermicro `SSG-2028R-DE2CR24L`, modeled as a
   shared-front `24`-slot `1x24` profile with REST-first inventory,
   SSH/`qs` enrichment, per-view HA-node targeting, SES-aware LED control, and
@@ -60,34 +63,36 @@ different profile.
 
 ### Archive CORE
 
-![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/screenshots/core-overview-v0.13.0.png)
+![TrueNAS JBOD Enclosure UI on Archive CORE](docs/images/screenshots/core-overview-v0.14.0.png)
 
 ### Offsite SCALE
 
-![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/screenshots/scale-overview-v0.13.0.png)
+![TrueNAS JBOD Enclosure UI on Offsite SCALE](docs/images/screenshots/scale-overview-v0.14.0.png)
 
 ### Additional Validated Platforms
 
-- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.13.0.png](docs/images/screenshots/gpu-server-overview-v0.13.0.png)
-- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.13.0.png](docs/images/screenshots/unvr-overview-v0.13.0.png)
-- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.13.0.png](docs/images/screenshots/unvr-pro-overview-v0.13.0.png)
-- Quantastor: [docs/images/screenshots/quantastor-overview-v0.13.0.png](docs/images/screenshots/quantastor-overview-v0.13.0.png)
+- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.14.0.png](docs/images/screenshots/gpu-server-overview-v0.14.0.png)
+- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.14.0.png](docs/images/screenshots/unvr-overview-v0.14.0.png)
+- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.14.0.png](docs/images/screenshots/unvr-pro-overview-v0.14.0.png)
+- Quantastor: [docs/images/screenshots/quantastor-overview-v0.14.0.png](docs/images/screenshots/quantastor-overview-v0.14.0.png)
+- VMware ESXi: [docs/images/screenshots/esxi-overview-v0.14.0.png](docs/images/screenshots/esxi-overview-v0.14.0.png)
 
 ### History And Snapshot Walkthroughs
 
-- Live history drawer: [docs/images/screenshots/history-drawer-v0.13.0.png](docs/images/screenshots/history-drawer-v0.13.0.png)
-- Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.13.0.png](docs/images/screenshots/snapshot-export-dialog-v0.13.0.png)
-- Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.13.0.png](docs/images/screenshots/offline-snapshot-v0.13.0.png)
+- Live history drawer: [docs/images/screenshots/history-drawer-v0.14.0.png](docs/images/screenshots/history-drawer-v0.14.0.png)
+- Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.14.0.png](docs/images/screenshots/snapshot-export-dialog-v0.14.0.png)
+- Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.14.0.png](docs/images/screenshots/offline-snapshot-v0.14.0.png)
 
-### 0.13.0 Workflow Highlights
+### 0.14.0 Workflow Highlights
 
-- Dedicated builder workspace with full-width preview: [docs/images/screenshots/builder-workspace-v0.13.0.png](docs/images/screenshots/builder-workspace-v0.13.0.png)
-- Grouped runtime selector on `archive-core`: [docs/images/screenshots/live-vs-storage-views-v0.13.0.png](docs/images/screenshots/live-vs-storage-views-v0.13.0.png)
-- Storage-view history on `Boot SATADOMs`: [docs/images/screenshots/storage-view-history-v0.13.0.png](docs/images/screenshots/storage-view-history-v0.13.0.png)
-- Separate CORE `Front 24 Bay` live enclosure: [docs/images/screenshots/archive-core-front-24-v0.13.0.png](docs/images/screenshots/archive-core-front-24-v0.13.0.png)
-- Admin sidecar grouped `Add Storage View` flow: [docs/images/screenshots/admin-setup-v0.13.0.png](docs/images/screenshots/admin-setup-v0.13.0.png)
-- Quantastor HA SATADOM storage view on `QSOSN HA`: [docs/images/screenshots/quantastor-satadoms-right-v0.13.0.png](docs/images/screenshots/quantastor-satadoms-right-v0.13.0.png)
-- Admin backup, orphan cleanup, and history adoption tools: [docs/images/screenshots/admin-maintenance-v0.13.0.png](docs/images/screenshots/admin-maintenance-v0.13.0.png)
+- Dedicated builder workspace with full-width preview: [docs/images/screenshots/builder-workspace-v0.14.0.png](docs/images/screenshots/builder-workspace-v0.14.0.png)
+- Grouped runtime selector on `archive-core`: [docs/images/screenshots/live-vs-storage-views-v0.14.0.png](docs/images/screenshots/live-vs-storage-views-v0.14.0.png)
+- Storage-view history on `Boot SATADOMs`: [docs/images/screenshots/storage-view-history-v0.14.0.png](docs/images/screenshots/storage-view-history-v0.14.0.png)
+- Separate CORE `Front 24 Bay` live enclosure: [docs/images/screenshots/archive-core-front-24-v0.14.0.png](docs/images/screenshots/archive-core-front-24-v0.14.0.png)
+- Admin sidecar grouped `Add Storage View` flow: [docs/images/screenshots/admin-setup-v0.14.0.png](docs/images/screenshots/admin-setup-v0.14.0.png)
+- Quantastor HA SATADOM storage view on `QSOSN HA`: [docs/images/screenshots/quantastor-satadoms-right-v0.14.0.png](docs/images/screenshots/quantastor-satadoms-right-v0.14.0.png)
+- Admin backup, orphan cleanup, and history adoption tools: [docs/images/screenshots/admin-maintenance-v0.14.0.png](docs/images/screenshots/admin-maintenance-v0.14.0.png)
+- ESXi `AOC-SLG4-2H8M2` live carrier view with read-only StorCLI-backed detail: [docs/images/screenshots/esxi-overview-v0.14.0.png](docs/images/screenshots/esxi-overview-v0.14.0.png)
 
 `archive-core` currently does not ship with a saved chassis view enabled by
 default, so the runtime selector screenshot shows the live and virtual groups
@@ -122,6 +127,8 @@ chassis layout catalog that can be added when needed.
   Linux SES AES and enclosure-status data is available over SSH
 - First-pass generic Linux support for SSH-only `mdadm` / NVMe hosts where no
   TrueNAS API is available
+- First-pass read-only VMware ESXi support for SSH-only `esxcli` plus StorCLI
+  inventory on the validated Supermicro `AOC-SLG4-2H8M2` path
 - Generic Linux support can also cover password-only appliance-style hosts
   when SSH works but the vendor API does not expose per-disk slot inventory,
   such as the shipped UniFi UNVR and first-pass UNVR Pro paths
@@ -197,7 +204,8 @@ chassis layout catalog that can be added when needed.
 - Persistent JSON slot calibration storage on a bind mount
 - Manual calibration workflow for imperfect slot mapping
 - Graceful partial-data behavior when API or SSH is incomplete
-- `/healthz` endpoint for Docker health checks
+- lightweight `/livez` endpoint for container health checks plus cached
+  `/healthz` dependency status for operator troubleshooting
 
 ## Limitations
 
@@ -218,6 +226,9 @@ chassis layout catalog that can be added when needed.
   profile for a SYS-2029GP-TR right-side dual-bay layout.
 - SCALE slot mapping and LED control currently depend on Linux SES access over
   SSH because the tested SCALE host does not expose usable enclosure rows
+- ESXi support is intentionally narrow in this first pass: SSH-only, read-only,
+  and validated against the `AOC-SLG4-2H8M2` host path without LED, RAID-write,
+  or Linux bootstrap/sudo flows
   through the middleware API.
 - Generic Linux slot mapping currently depends on explicit profile `slot_hints`
   and host inventory data such as `lsblk`, `mdadm`, and `nvme list-subsys`.
@@ -312,7 +323,7 @@ Quick start:
    set this in `.env`:
 
    ```dotenv
-   JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.13.0
+   JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.14.0
    ```
 
 5. Start the main UI:

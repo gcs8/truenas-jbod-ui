@@ -29,7 +29,7 @@ Validated target so far:
 
 Here is the current QSOSN HA SATADOM view in the main UI:
 
-![Quantastor HA SATADOM storage view](images/quantastor-satadoms-right-v0.13.0.png)
+![Quantastor HA SATADOM storage view](images/quantastor-satadoms-right-v0.14.0.png)
 
 ## Recommended Admin Flow
 

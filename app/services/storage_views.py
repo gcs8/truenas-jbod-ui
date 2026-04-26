@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from app.config import StorageViewBindingConfig, StorageViewConfig, StorageViewRenderConfig, SystemConfig
+from app.config import (
+    StorageViewBindingConfig,
+    StorageViewConfig,
+    StorageViewLayoutOverridesConfig,
+    StorageViewRenderConfig,
+    SystemConfig,
+)
 from app.services.profile_registry import (
+    ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 )
@@ -18,6 +25,30 @@ UNIFI_EMBEDDED_BOOT_MEDIA_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 }
+
+
+def _build_inferred_esxi_aoc_view() -> StorageViewConfig:
+    return StorageViewConfig(
+        id="aoc-slg4-2h8m2",
+        label="AOC-SLG4-2H8M2",
+        kind="nvme_carrier",
+        template_id="aoc-slg4-2h8m2-2",
+        enabled=True,
+        order=20,
+        render=StorageViewRenderConfig(
+            show_in_main_ui=False,
+            show_in_admin_ui=True,
+            default_collapsed=False,
+        ),
+        binding=StorageViewBindingConfig(
+            mode="hybrid",
+            pcie_addresses=["C0 x4", "C1 x4"],
+            device_names=["13:0", "13:1"],
+        ),
+        layout_overrides=StorageViewLayoutOverridesConfig(
+            slot_sizes={0: "2280", 1: "2280"},
+        ),
+    )
 
 
 def _build_inferred_unifi_boot_media_view() -> StorageViewConfig:
@@ -66,6 +97,8 @@ def resolve_system_storage_views(
         ]
         if inferred_profile_id in UNIFI_EMBEDDED_BOOT_MEDIA_PROFILE_IDS:
             stored_views.append(_build_inferred_unifi_boot_media_view())
+        if inferred_profile_id == ESXI_AOC_SLG4_2H8M2_PROFILE_ID:
+            stored_views.append(_build_inferred_esxi_aoc_view())
 
     return sorted(
         stored_views,

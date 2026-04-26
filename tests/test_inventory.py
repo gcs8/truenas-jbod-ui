@@ -35,12 +35,14 @@ from app.services.parsers import (
 from app.services.profile_registry import ProfileRegistry
 from app.services.profile_registry import (
     CORE_CSE_946_PROFILE_ID,
+    ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
     SCALE_SSG_FRONT_24_PROFILE_ID,
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 )
 from app.services.ssh_probe import SSHCommandResult
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
+from app.services.storage_views import resolve_system_storage_views
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
 
 
@@ -142,6 +144,159 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(summary.physical_block_size, 4096)
         self.assertEqual(summary.logical_unit_id, "5000cca264d473d4")
         self.assertEqual(summary.sas_address, "5000cca264d473d5")
+
+    def test_correlate_esxi_host_maps_storcli_physical_members(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="cryo-esxi",
+                label="CryoStorage ESXi",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="10.88.88.20", user="root"),
+            )
+            settings = Settings(systems=[system])
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            ssh_data = ParsedSSHData(
+                esxi_storcli_virtual_drives=[
+                    {
+                        "vd_id": "0",
+                        "name": "ESXi",
+                        "raid": "RAID1",
+                        "state": "Optl",
+                        "physical_drives": [
+                            {"slot_key": "13:0", "slot": 0, "enclosure_id": "13"},
+                            {"slot_key": "13:1", "slot": 1, "enclosure_id": "13"},
+                        ],
+                    },
+                    {
+                        "vd_id": "1",
+                        "name": "VMs",
+                        "raid": "RAID1",
+                        "state": "Optl",
+                        "physical_drives": [
+                            {"slot_key": "13:0", "slot": 0, "enclosure_id": "13"},
+                            {"slot_key": "13:1", "slot": 1, "enclosure_id": "13"},
+                        ],
+                    },
+                ],
+                esxi_storcli_physical_drives=[
+                    {
+                        "slot_key": "13:0",
+                        "enclosure_id": "13",
+                        "slot": 0,
+                        "controller_id": "c0",
+                        "state": "Onln",
+                        "size": "1.818 TB",
+                        "interface": "NVMe",
+                        "sector_size": "512B",
+                        "model": "Samsung SSD 970 EVO 2TB",
+                        "serial": "SERIAL0",
+                        "firmware": "2B2QEXE7",
+                        "temperature_c": 34,
+                        "media_errors": 60,
+                        "predictive_errors": 0,
+                        "smart_alert": "No",
+                        "connector_name": "C0 x4",
+                        "connected_port": "0(path0)",
+                        "link_speed": "8.0GT/s",
+                    },
+                    {
+                        "slot_key": "13:1",
+                        "enclosure_id": "13",
+                        "slot": 1,
+                        "controller_id": "c0",
+                        "state": "Onln",
+                        "size": "1.818 TB",
+                        "interface": "NVMe",
+                        "sector_size": "512B",
+                        "model": "Samsung SSD 970 EVO 2TB",
+                        "serial": "SERIAL1",
+                        "firmware": "2B2QEXE7",
+                        "temperature_c": 35,
+                        "media_errors": 262,
+                        "predictive_errors": 0,
+                        "smart_alert": "No",
+                        "connector_name": "C1 x4",
+                        "connected_port": "1(path0)",
+                        "link_speed": "8.0GT/s",
+                    },
+                ],
+            )
+
+            slots, enclosures, selected_meta, layout_rows, slot_count, columns = service._correlate_esxi_host(
+                ssh_data,
+                [],
+                None,
+            )
+
+            self.assertEqual(enclosures[0].profile_id, ESXI_AOC_SLG4_2H8M2_PROFILE_ID)
+            self.assertEqual(selected_meta["id"], ESXI_AOC_SLG4_2H8M2_PROFILE_ID)
+            self.assertEqual(layout_rows, [[1], [0]])
+            self.assertEqual(slot_count, 2)
+            self.assertEqual(columns, 1)
+            self.assertEqual(slots[0].device_name, "13:0")
+            self.assertEqual(slots[0].pool_name, "ESXi + VMs")
+            self.assertEqual(slots[0].temperature_c, 34)
+            self.assertFalse(slots[0].led_supported)
+            self.assertIn("LED control is not enabled for ESXi", slots[0].led_reason or "")
+
+            smart = service._build_esxi_smart_summary(slots[0])
+            self.assertTrue(smart.available)
+            self.assertEqual(smart.media_errors, 60)
+            self.assertEqual(smart.firmware_version, "2B2QEXE7")
+            self.assertEqual(smart.negotiated_link_rate, "8.0GT/s")
+            self.assertEqual(smart.transport_protocol, "NVMe")
+
+    def test_esxi_inferred_aoc_storage_view_reuses_storcli_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="cryo-esxi", label="CryoStorage ESXi", truenas=TrueNASConfig(platform="esxi"))
+            settings = Settings(systems=[system])
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            profile = service.profile_registry.get(ESXI_AOC_SLG4_2H8M2_PROFILE_ID)
+            storage_views = resolve_system_storage_views(system, service.profile_registry)
+            snapshot = InventorySnapshot(
+                slots=[],
+                layout_rows=[[1], [0]],
+                layout_slot_count=2,
+                layout_columns=1,
+                refresh_interval_seconds=30,
+                selected_system_id=system.id,
+                selected_system_label=system.label,
+                selected_system_platform="esxi",
+                selected_enclosure_id=ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
+                selected_enclosure_label="AOC-SLG4-2H8M2",
+                selected_profile=profile,
+            )
+            candidates = [
+                {
+                    "candidate_id": "SERIAL0",
+                    "serial": "SERIAL0",
+                    "device_names": ["13:0"],
+                    "transport_address": "C0 x4",
+                    "snapshot_slot": 0,
+                },
+                {
+                    "candidate_id": "SERIAL1",
+                    "serial": "SERIAL1",
+                    "device_names": ["13:1"],
+                    "transport_address": "C1 x4",
+                    "snapshot_slot": 1,
+                },
+            ]
+
+            runtime_views = service._serialize_storage_views_runtime(
+                snapshot,
+                storage_views,
+                {snapshot.selected_enclosure_id: snapshot},
+                {snapshot.selected_enclosure_id: candidates},
+            )
+            aoc_view = next(view for view in runtime_views if view.id == "aoc-slg4-2h8m2")
+
+            self.assertEqual(aoc_view.template_id, "aoc-slg4-2h8m2-2")
+            self.assertFalse(aoc_view.render.show_in_main_ui)
+            self.assertEqual(aoc_view.slot_layout, [[1], [0]])
+            self.assertEqual(aoc_view.matched_count, 2)
+            self.assertEqual([slot.slot_label for slot in aoc_view.slots], ["M2-1", "M2-2"])
+            self.assertEqual([slot.snapshot_slot for slot in aoc_view.slots], [0, 1])
 
 
 class InventoryStorageViewCandidateTests(unittest.TestCase):
@@ -4980,6 +5135,72 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(truenas_client.fetch_all_calls, 2)
 
+    async def test_scoped_snapshot_invalidation_keeps_unrelated_enclosure_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            default_snapshot = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+            enclosure_a_snapshot = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+            enclosure_b_snapshot = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+            cache_until = datetime.now(timezone.utc) + timedelta(seconds=30)
+            service._cache["__default__"] = default_snapshot
+            service._cache["enc-a"] = enclosure_a_snapshot
+            service._cache["enc-b"] = enclosure_b_snapshot
+            service._cache_until["__default__"] = cache_until
+            service._cache_until["enc-a"] = cache_until
+            service._cache_until["enc-b"] = cache_until
+
+            service.invalidate_snapshot_cache(reason="test.invalidate.scope", cache_keys=["enc-a", None])
+
+            self.assertNotIn("__default__", service._cache)
+            self.assertNotIn("enc-a", service._cache)
+            self.assertIn("enc-b", service._cache)
+
+    async def test_peek_cached_snapshot_prefers_requested_scope_then_default_then_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            default_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                last_updated=datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc),
+            )
+            enclosure_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                last_updated=datetime(2026, 4, 25, 12, 5, tzinfo=timezone.utc),
+            )
+            newest_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                last_updated=datetime(2026, 4, 25, 12, 10, tzinfo=timezone.utc),
+            )
+            service._cache["__default__"] = default_snapshot
+            service._cache["enc-a"] = enclosure_snapshot
+            service._cache["enc-b"] = newest_snapshot
+
+            self.assertIs(service.peek_cached_snapshot(selected_enclosure_id="enc-a"), enclosure_snapshot)
+
+            service._cache.pop("enc-a")
+            self.assertIs(service.peek_cached_snapshot(selected_enclosure_id="enc-a"), default_snapshot)
+
+            service._cache.pop("__default__")
+            self.assertIs(service.peek_cached_snapshot(selected_enclosure_id="enc-a"), newest_snapshot)
+
     async def test_get_slot_smart_summary_can_use_persisted_stable_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -5099,6 +5320,11 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             service.get_snapshot = AsyncMock(return_value=snapshot)
             service._cache["__default__"] = snapshot
             service._cache_until["__default__"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+            service._cache["enc-2"] = InventorySnapshot(
+                slots=[SlotView(slot=1, slot_label="01", row_index=0, column_index=1, enclosure_id="enc-2")],
+                refresh_interval_seconds=30,
+            )
+            service._cache_until["enc-2"] = datetime.now(timezone.utc) + timedelta(seconds=30)
             service._source_bundle = object()  # type: ignore[assignment]
             service._source_bundle_until = datetime.now(timezone.utc) + timedelta(seconds=30)
 
@@ -5106,6 +5332,9 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(truenas_client.calls, [("enc-1", 1, LedAction.identify.value)])
             self.assertIsNone(service._source_bundle)
+            self.assertNotIn("__default__", service._cache)
+            self.assertNotIn("enc-1", service._cache)
+            self.assertIn("enc-2", service._cache)
 
     async def test_save_mapping_invalidates_cache_without_second_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5129,6 +5358,11 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             service.get_snapshot = AsyncMock(return_value=snapshot)
             service._cache["__default__"] = snapshot
             service._cache_until["__default__"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+            service._cache["enc-2"] = InventorySnapshot(
+                slots=[SlotView(slot=1, slot_label="01", row_index=0, column_index=1, enclosure_id="enc-2")],
+                refresh_interval_seconds=30,
+            )
+            service._cache_until["enc-2"] = datetime.now(timezone.utc) + timedelta(seconds=30)
 
             saved = await service.save_mapping(0, {"serial": "SER123"})
 
@@ -5138,7 +5372,9 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 service.mapping_store.get_mapping(system.id, "enc-1", 0).serial,
                 "SER123",
             )
-            self.assertEqual(service._cache, {})
+            self.assertNotIn("__default__", service._cache)
+            self.assertNotIn("enc-1", service._cache)
+            self.assertIn("enc-2", service._cache)
 
     async def test_clear_mapping_can_defer_invalidation_without_second_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5203,6 +5439,75 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
 
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_quantastor_ses_overlay_keeps_authoritative_host_truth_and_merges_redundant_targets(self) -> None:
+        class DummyTrueNASClient:
+            pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.20", extra_hosts=["10.0.0.30"], user="jbodmap"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                AsyncMock(),
+                temp_dir,
+            )
+            discovery_command = service._build_sg_ses_discovery_command()
+            aes_output = """  SMCDRS2U  SAS3x40           0701
+Array device slot element:
+  Element type: Array device slot, subenclosure id: 0 [ti=0]
+    Element 0 descriptor:
+      device slot number: 0
+      sas address: 0x5002538b496a5512
+      attached sas address: 0x5003048026b2ff7f
+"""
+            ec_off_output = """  SMCDRS2U  SAS3x40           0701
+Enclosure Status diagnostic page:
+  status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element 0 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+"""
+            ec_on_output = ec_off_output.replace("Ident=0", "Ident=1")
+
+            async def run_command(command: str, host: str | None = None) -> SSHCommandResult:
+                if command == discovery_command:
+                    device = "/dev/sg11" if host == "10.0.0.20" else "/dev/sg27"
+                    return SSHCommandResult(command=command, ok=True, stdout=f"{device}\n", stderr="", exit_code=0)
+                if "sg_ses -p aes /dev/sg11" in command or "sg_ses -p aes /dev/sg27" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout=aes_output, stderr="", exit_code=0)
+                if "sg_ses -p ec /dev/sg11" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout=ec_off_output, stderr="", exit_code=0)
+                if "sg_ses -p ec /dev/sg27" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout=ec_on_output, stderr="", exit_code=0)
+                raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
+
+            service._run_ssh_command = AsyncMock(side_effect=run_command)
+
+            overlay, failures = await service._fetch_quantastor_ses_overlay()
+
+            self.assertEqual(failures, [])
+            self.assertEqual(service._quantastor_preferred_ses_host, "10.0.0.20")
+            slot0 = overlay.ses_slot_candidates[0]
+            self.assertEqual(slot0["ses_device"], "/dev/sg11")
+            self.assertTrue(slot0["identify_active"])
+            self.assertCountEqual(
+                [
+                    (target["ssh_host"], target["ses_device"])
+                    for target in slot0["ses_targets"]
+                ],
+                [
+                    ("10.0.0.20", "/dev/sg11"),
+                    ("10.0.0.30", "/dev/sg27"),
+                ],
+            )
+
     async def test_unifi_led_control_uses_sata_led_sm_set_fault(self) -> None:
         class DummyTrueNASClient:
             pass

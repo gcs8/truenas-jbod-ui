@@ -15,6 +15,10 @@ from app.services.ssh_probe import SSHProbe
 
 PUBLIC_KEY_PREFIXES = ("ssh-ed25519 ", "ssh-rsa ", "ecdsa-", "sk-ssh-")
 SUDOERS_DIR_CANDIDATES = ("/usr/local/etc/sudoers.d", "/etc/sudoers.d")
+ESXI_BOOTSTRAP_UNSUPPORTED_DETAIL = (
+    "VMware ESXi does not use the Linux one-time bootstrap or sudoers flow. "
+    "Save the SSH host, root or key-based auth, and the read-only runtime commands directly instead."
+)
 SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     "core": (
         "/usr/sbin/sesutil map",
@@ -55,6 +59,7 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/local/sbin/smartctl -x *",
         "/usr/bin/qs *",
     ),
+    "esxi": (),
 }
 SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     "core": (
@@ -88,6 +93,7 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/local/sbin/smartctl -x *",
         "/usr/bin/qs *",
     ),
+    "esxi": (),
 }
 
 
@@ -103,6 +109,8 @@ class ServiceAccountBootstrapService:
         self.probe_factory = probe_factory
 
     def bootstrap_service_account(self, payload: SystemSetupBootstrapRequest) -> dict[str, object]:
+        if payload.platform == "esxi":
+            raise ValueError(ESXI_BOOTSTRAP_UNSUPPORTED_DETAIL)
         public_key, key_source = self._resolve_public_key(payload)
         ssh_config = SSHConfig(
             enabled=True,
@@ -285,6 +293,17 @@ class ServiceAccountBootstrapService:
     ) -> dict[str, object]:
         filename = cls._sudoers_filename(service_user)
         path_candidates = [f"{directory}/{filename}" for directory in SUDOERS_DIR_CANDIDATES]
+        if platform == "esxi":
+            return {
+                "enabled": False,
+                "filename": filename,
+                "path_candidates": path_candidates,
+                "detail": ESXI_BOOTSTRAP_UNSUPPORTED_DETAIL,
+                "content": (
+                    "# VMware ESXi does not use the Linux sudoers/bootstrap flow.\n"
+                    "# Keep the saved SSH credentials or key directly on the system entry instead.\n"
+                ),
+            }
         if not install_sudo_rules:
             return {
                 "enabled": False,
@@ -314,6 +333,8 @@ class ServiceAccountBootstrapService:
         platform: str,
         requested_commands: list[str] | tuple[str, ...] | None = None,
     ) -> str:
+        if platform == "esxi":
+            raise ValueError(ESXI_BOOTSTRAP_UNSUPPORTED_DETAIL)
         commands = cls._resolve_sudo_commands(platform, requested_commands)
         alias_name = f"JBODMAP_{re.sub(r'[^A-Z0-9]+', '_', platform.upper())}_CMDS"
         lines = [

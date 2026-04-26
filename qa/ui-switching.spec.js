@@ -375,6 +375,8 @@ test.describe("browser qa smoke", () => {
     }, target.snapshotSlot);
     await liveTile.click();
     await expect(liveTile).toHaveClass(/selected/);
+    const liveLedControlsVisible = await page.locator("#detail-led-controls").isVisible();
+    const liveHistoryButtonVisible = await page.locator("#history-toggle-button").isVisible();
 
     await switchEnclosure(page, `view:${target.viewId}`);
     await expect(page.locator("#slot-grid .slot-tile.selected")).toHaveCount(0);
@@ -403,8 +405,16 @@ test.describe("browser qa smoke", () => {
 
     await expect(tile).not.toHaveClass(/storage-view-slot/);
     await expect(page.locator("#detail-secondary")).toBeVisible();
-    await expect(page.locator("#detail-led-controls")).toBeVisible();
-    await expect(page.locator("#history-toggle-button")).toBeVisible();
+    if (liveLedControlsVisible) {
+      await expect(page.locator("#detail-led-controls")).toBeVisible();
+    } else {
+      await expect(page.locator("#detail-led-controls")).toBeHidden();
+    }
+    if (liveHistoryButtonVisible) {
+      await expect(page.locator("#history-toggle-button")).toBeVisible();
+    } else {
+      await expect(page.locator("#history-toggle-button")).toBeHidden();
+    }
 
     await page.locator(".enclosure-face").click({ position: { x: 40, y: 40 } });
     await expect(page.locator("#slot-grid .slot-tile.selected")).toHaveCount(0);
