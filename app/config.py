@@ -70,6 +70,10 @@ class AppConfig(BaseModel):
     port: int = 8080
     refresh_interval_seconds: int = 30
     cache_ttl_seconds: int = 10
+    release_check_enabled: bool = True
+    release_check_repo: str = "gcs8/truenas-jbod-ui"
+    release_check_interval_seconds: int = 86400
+    release_check_timeout_seconds: float = 5.0
     startup_warm_cache_enabled: bool = False
     startup_warm_smart_enabled: bool = False
     smart_batch_max_concurrency: int = 12
@@ -372,6 +376,10 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "APP_PORT": ("app", "port"),
     "APP_REFRESH_INTERVAL": ("app", "refresh_interval_seconds"),
     "APP_CACHE_TTL": ("app", "cache_ttl_seconds"),
+    "RELEASE_CHECK_ENABLED": ("app", "release_check_enabled"),
+    "RELEASE_CHECK_REPO": ("app", "release_check_repo"),
+    "RELEASE_CHECK_INTERVAL_SECONDS": ("app", "release_check_interval_seconds"),
+    "RELEASE_CHECK_TIMEOUT_SECONDS": ("app", "release_check_timeout_seconds"),
     "APP_STARTUP_WARM_CACHE_ENABLED": ("app", "startup_warm_cache_enabled"),
     "APP_STARTUP_WARM_SMART_ENABLED": ("app", "startup_warm_smart_enabled"),
     "APP_SMART_BATCH_MAX_CONCURRENCY": ("app", "smart_batch_max_concurrency"),

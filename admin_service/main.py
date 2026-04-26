@@ -48,6 +48,7 @@ from app.services.demo_system_factory import DemoSystemFactory
 from app.services.profile_registry import ProfileRegistry
 from app.services.inventory_registry import InventoryRegistry
 from app.services.quantastor_api import QuantastorRESTClient
+from app.services.release_status import ReleaseStatusService, describe_release_status
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.storage_view_templates import list_storage_view_templates
 from app.services.storage_views import resolve_system_storage_views
@@ -115,6 +116,18 @@ def get_maintenance_service() -> AdminMaintenanceService:
     )
 
 
+@lru_cache
+def get_release_status_service() -> ReleaseStatusService:
+    settings = reload_app_settings()
+    return ReleaseStatusService(
+        current_version=__version__,
+        enabled=settings.app.release_check_enabled,
+        repo_full_name=settings.app.release_check_repo,
+        interval_seconds=settings.app.release_check_interval_seconds,
+        timeout_seconds=settings.app.release_check_timeout_seconds,
+    )
+
+
 def _format_count(value: int, singular: str, plural: str | None = None) -> str:
     label = singular if value == 1 else (plural or f"{singular}s")
     return f"{value} {label}"
@@ -147,11 +160,19 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         shutdown_task: asyncio.Task[None] | None = None
+        release_task: asyncio.Task[None] | None = None
         if admin_settings.auto_stop_seconds > 0:
             shutdown_task = asyncio.create_task(_shutdown_after_ttl(admin_settings.auto_stop_seconds))
+        release_task = asyncio.create_task(get_release_status_service().run_periodic_refresh())
         try:
             yield
         finally:
+            if release_task is not None and not release_task.done():
+                release_task.cancel()
+                try:
+                    await release_task
+                except asyncio.CancelledError:
+                    pass
             if shutdown_task is not None and not shutdown_task.done():
                 shutdown_task.cancel()
                 try:
@@ -193,7 +214,7 @@ def create_app() -> FastAPI:
             await asyncio.to_thread(runtime_service.stop_container, container_key)
         except DockerRuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        return JSONResponse({"ok": True, "runtime": runtime_service.status_payload()})
+        return JSONResponse({"ok": True, "runtime": await build_runtime_payload(runtime_service)})
 
     @app.post("/api/admin/runtime/containers/{container_key}/start")
     async def start_container(container_key: str) -> JSONResponse:
@@ -204,7 +225,7 @@ def create_app() -> FastAPI:
             await asyncio.to_thread(runtime_service.start_container, container_key)
         except DockerRuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        return JSONResponse({"ok": True, "runtime": runtime_service.status_payload()})
+        return JSONResponse({"ok": True, "runtime": await build_runtime_payload(runtime_service)})
 
     @app.post("/api/admin/runtime/containers/{container_key}/restart")
     async def restart_container(container_key: str) -> JSONResponse:
@@ -215,7 +236,7 @@ def create_app() -> FastAPI:
             await asyncio.to_thread(runtime_service.restart_container, container_key)
         except DockerRuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        return JSONResponse({"ok": True, "runtime": runtime_service.status_payload()})
+        return JSONResponse({"ok": True, "runtime": await build_runtime_payload(runtime_service)})
 
     @app.post("/api/admin/backup/export")
     async def export_backup(
@@ -327,7 +348,7 @@ def create_app() -> FastAPI:
                 "default_system_id": settings.default_system_id,
                 "stopped_containers": maintenance.stopped_containers,
                 "restarted_containers": maintenance.restarted_containers,
-                "runtime": runtime_service.status_payload(),
+                "runtime": await build_runtime_payload(runtime_service),
             }
         )
 
@@ -457,7 +478,7 @@ def create_app() -> FastAPI:
                 ),
                 "updated_existing": updated_existing,
                 "restart_required": ["ui"],
-                "runtime": runtime_service.status_payload(),
+                "runtime": await build_runtime_payload(runtime_service),
             }
         )
 
@@ -500,7 +521,7 @@ def create_app() -> FastAPI:
                     f"Demo builder system {saved_system.label} saved. Restart the Read UI container to pick the synthetic chassis and views up cleanly."
                 ),
                 "restart_required": ["ui"],
-                "runtime": runtime_service.status_payload(),
+                "runtime": await build_runtime_payload(runtime_service),
             }
         )
 
@@ -562,7 +583,7 @@ def create_app() -> FastAPI:
                 "detail": detail,
                 "history_purge": history_purge,
                 "restart_required": ["ui"],
-                "runtime": runtime_service.status_payload(),
+                "runtime": await build_runtime_payload(runtime_service),
             }
         )
 
@@ -795,7 +816,7 @@ def create_app() -> FastAPI:
                 ),
                 "updated_existing": updated_existing,
                 "restart_required": ["ui"],
-                "runtime": runtime_service.status_payload(),
+                "runtime": await build_runtime_payload(runtime_service),
             }
         )
 
@@ -821,7 +842,7 @@ def create_app() -> FastAPI:
                     f"Deleted custom profile {deleted_label}. Restart the Read UI container when you are ready to drop it from the runtime profile list too."
                 ),
                 "restart_required": ["ui"],
-                "runtime": runtime_service.status_payload(),
+                "runtime": await build_runtime_payload(runtime_service),
             }
         )
 
@@ -835,6 +856,16 @@ def create_app() -> FastAPI:
                 if compute_expires_at(get_admin_settings())
                 else None,
             }
+        )
+
+    @app.get("/livez")
+    async def livez() -> JSONResponse:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "version": __version__,
+            },
+            status_code=200,
         )
 
     @app.exception_handler(HTTPException)
@@ -852,15 +883,17 @@ def create_app() -> FastAPI:
 async def build_admin_state_payload(request: Request) -> dict[str, Any]:
     settings = reload_app_settings()
     runtime_service = get_runtime_service()
-    runtime_payload = await asyncio.to_thread(runtime_service.status_payload)
+    runtime_payload = await build_runtime_payload(runtime_service)
     key_manager = SSHKeyManager(settings.config_file)
     ssh_keys = await asyncio.to_thread(key_manager.list_keys)
     admin_settings = get_admin_settings()
     history_settings = get_history_settings()
     expires_at = compute_expires_at(admin_settings)
+    release_status = get_release_status_service().snapshot()
     return {
         "ok": True,
         "app_version": __version__,
+        "release_status": release_status,
         "admin": {
             "title": admin_settings.app_name,
             "started_at": SERVICE_STARTED_AT.isoformat(),
@@ -901,6 +934,70 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
             "tls_dir": str(Path(settings.config_file).parent / "tls"),
         },
     }
+
+
+async def build_runtime_payload(runtime_service: DockerRuntimeService | None = None) -> dict[str, Any]:
+    service = runtime_service or get_runtime_service()
+    runtime_payload = await asyncio.to_thread(service.status_payload)
+    return annotate_runtime_versions(runtime_payload, get_release_status_service().snapshot())
+
+
+def annotate_runtime_versions(
+    runtime_payload: dict[str, Any] | None,
+    release_status: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload = dict(runtime_payload or {})
+    containers = [dict(item) for item in payload.get("containers", [])]
+    release_payload = dict(release_status or {})
+    latest_tag = str(release_payload.get("latest_tag") or "").strip() or None
+    running_versions = sorted(
+        {
+            str(item.get("running_version") or "").strip()
+            for item in containers
+            if item.get("running") and str(item.get("running_version") or "").strip()
+        }
+    )
+    probe_errors_present = any(item.get("running") and item.get("version_probe_error") for item in containers)
+    for item in containers:
+        running_version = str(item.get("running_version") or "").strip() or None
+        if running_version:
+            release_state, release_summary = describe_release_status(running_version, latest_tag)
+        elif latest_tag:
+            release_state, release_summary = "known", f"Latest stable {latest_tag}"
+        else:
+            release_state = str(release_payload.get("status") or "unknown")
+            release_summary = str(release_payload.get("summary") or "Checking releases...")
+
+        if not item.get("running"):
+            sync_state = "stopped"
+            sync_summary = "Container is not running."
+        elif item.get("version_probe_error"):
+            sync_state = "unknown"
+            sync_summary = f"Version probe failed: {item['version_probe_error']}"
+        elif len(running_versions) > 1 and running_version:
+            peer_versions = [version for version in running_versions if version != running_version]
+            sync_state = "out_of_sync"
+            sync_summary = f"Differs from {', '.join(peer_versions)}."
+        elif probe_errors_present and running_version:
+            sync_state = "partial"
+            sync_summary = "Other running containers could not report a version."
+        elif running_version:
+            sync_state = "aligned"
+            sync_summary = "Matches other running containers."
+        else:
+            sync_state = "unknown"
+            sync_summary = "Running container did not report a version."
+
+        item["latest_version"] = latest_tag
+        item["release_status"] = {
+            "status": release_state,
+            "summary": release_summary,
+        }
+        item["version_sync_state"] = sync_state
+        item["version_sync_summary"] = sync_summary
+
+    payload["containers"] = containers
+    return payload
 
 
 def serialize_systems(settings: Settings) -> list[dict[str, Any]]:

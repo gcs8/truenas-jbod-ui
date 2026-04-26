@@ -166,6 +166,10 @@ The pills on the page can show whether each service is:
 - needs restart
 - down
 
+Each runtime card also shows the live running app version it probed from that
+container plus the latest tagged stable release, so you can spot a stale or
+partially updated sidecar without jumping across three separate pages.
+
 ## Backup and Restore
 
 The admin sidecar is also the supported place for:

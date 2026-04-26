@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import html
 from contextlib import asynccontextmanager
+from functools import lru_cache
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from app import __version__
+from app.services.release_status import ReleaseStatusService
 from history_service.collector import HistoryCollector
 from history_service.config import get_history_settings
 from history_service.store import HistoryStore
@@ -22,14 +26,34 @@ SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
 }
 
 
+@lru_cache
+def get_release_status_service() -> ReleaseStatusService:
+    return ReleaseStatusService(
+        current_version=__version__,
+        enabled=settings.release_check_enabled,
+        repo_full_name=settings.release_check_repo,
+        interval_seconds=settings.release_check_interval_seconds,
+        timeout_seconds=settings.release_check_timeout_seconds,
+    )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    release_task = asyncio.create_task(get_release_status_service().run_periodic_refresh())
     await collector.start()
-    yield
-    await collector.stop()
+    try:
+        yield
+    finally:
+        if release_task is not None and not release_task.done():
+            release_task.cancel()
+            try:
+                await release_task
+            except asyncio.CancelledError:
+                pass
+        await collector.stop()
 
 
-app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+app = FastAPI(title=settings.app_name, version=__version__, lifespan=lifespan)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -37,7 +61,7 @@ async def index() -> HTMLResponse:
     status = collector.status()
     counts = store.counts()
     scopes = store.list_scopes()
-    return HTMLResponse(render_dashboard(status, counts, scopes))
+    return HTMLResponse(render_dashboard(status, counts, scopes, app_version=__version__, release_status=get_release_status_service().snapshot()))
 
 
 @app.get("/healthz")
@@ -48,6 +72,17 @@ async def healthz() -> JSONResponse:
         **store.counts(),
     }
     return JSONResponse(payload, status_code=200)
+
+
+@app.get("/livez")
+async def livez() -> JSONResponse:
+    return JSONResponse(
+        {
+            "status": "ok",
+            "version": __version__,
+        },
+        status_code=200,
+    )
 
 
 @app.get("/api/history/overview")
@@ -146,7 +181,18 @@ def render_dashboard(
     status: dict[str, object],
     counts: dict[str, int],
     scopes: list[dict[str, object]],
+    *,
+    app_version: str,
+    release_status: dict[str, object] | None = None,
 ) -> str:
+    release_payload = release_status or {}
+    release_summary = html.escape(str(release_payload.get("summary") or "Checking releases..."))
+    latest_url = str(release_payload.get("latest_url") or "").strip()
+    release_note_markup = (
+        f"<a class='note-link' href='{html.escape(latest_url)}' target='_blank' rel='noopener'>{release_summary}</a>"
+        if latest_url
+        else f"<span class='note-text'>{release_summary}</span>"
+    )
     rows = []
     for scope in scopes:
         rows.append(
@@ -217,6 +263,21 @@ def render_dashboard(
         font-size: 1.35rem;
         font-weight: 700;
       }}
+      .note-text,
+      .note-link {{
+        display: block;
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 0.82rem;
+        line-height: 1.4;
+      }}
+      .note-link {{
+        text-decoration: none;
+      }}
+      .note-link:hover {{
+        color: var(--text);
+        text-decoration: underline;
+      }}
       table {{
         width: 100%;
         border-collapse: collapse;
@@ -269,6 +330,11 @@ def render_dashboard(
         <div class="card">
           <div class="label">Metric Samples</div>
           <div class="value">{counts.get('metric_sample_count', 0)}</div>
+        </div>
+        <div class="card">
+          <div class="label">Version</div>
+          <div class="value">{html.escape(app_version)}</div>
+          {release_note_markup}
         </div>
       </section>
 

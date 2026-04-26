@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+## v0.14.2 - 2026-04-26
+
+### Added
+
+- A collapsed `Platform Details` panel now appears under the enclosure canvas
+  when a runtime payload exposes useful non-standard controller or
+  platform-specific context, starting with first-pass ESXi sections for
+  `overview`, `virtual-drives`, `datastores`, and `member-capabilities`
+- The main UI, history dashboard, and admin sidecar now surface the current
+  running app version plus the latest tagged GitHub release status directly on
+  the live page instead of limiting that information to export artifacts
+- Admin `Runtime Control` cards now probe each managed container's live
+  version endpoint and show per-card `Running` plus `Latest` versions, making
+  cross-container drift visible from one maintenance surface
+
+### Changed
+
+- Release checks now run once at startup and then daily from a shared cached
+  GitHub latest-release service instead of requiring page-by-page lookups
+- The admin runtime view now reports startup-time version-probe warnings
+  honestly when a sibling container has not finished binding yet, then settles
+  back to a clean aligned state on the next refresh once that sidecar is live
+
 ## v0.14.1 - 2026-04-26
 
 ### Fixed

@@ -98,13 +98,14 @@ textarea {
 
 .topbar-meta {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
   align-items: stretch;
   min-width: 300px;
 }
 
 .meta-card {
-  flex: 1;
+  flex: 1 1 180px;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -135,6 +136,28 @@ textarea {
   color: var(--muted);
   font-size: 0.78rem;
   line-height: 1.35;
+}
+
+.meta-note.version-note {
+  text-decoration: none;
+}
+
+.meta-note.version-note:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+.version-note-update-available {
+  color: #ffe49b;
+}
+
+.version-note-error {
+  color: #ffadad;
+}
+
+.version-note-dev-build,
+.version-note-ahead {
+  color: #9fcaf5;
 }
 
 .snapshot-banner {
@@ -734,6 +757,13 @@ textarea {
   margin-bottom: 18px;
 }
 
+.primary-column {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
+}
+
 .panel {
   padding: 18px;
 }
@@ -741,7 +771,8 @@ textarea {
 .enclosure-panel {
   display: flex;
   flex-direction: column;
-  align-self: start;
+  align-self: stretch;
+  min-width: 0;
 }
 
 .panel-header {
@@ -749,6 +780,14 @@ textarea {
   justify-content: space-between;
   gap: 14px;
   margin-bottom: 16px;
+}
+
+.panel-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: flex-start;
+  gap: 12px;
 }
 
 .panel-header.compact {
@@ -1749,6 +1788,128 @@ textarea {
 
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .storage-view-runtime-card--nvme {
   width: 100%;
+}
+
+.platform-details-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.platform-details-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.platform-details-section {
+  border: 1px solid var(--panel-border);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+}
+
+.platform-details-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.platform-details-toggle:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.platform-details-toggle:focus-visible {
+  outline: 2px solid rgba(91, 183, 255, 0.45);
+  outline-offset: -2px;
+}
+
+.platform-details-chevron {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.82rem;
+  transition: transform 0.15s ease;
+}
+
+.platform-details-section.is-open .platform-details-chevron {
+  transform: rotate(90deg);
+}
+
+.platform-details-toggle-text {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.platform-details-section-title {
+  font-size: 0.96rem;
+  font-weight: 700;
+}
+
+.platform-details-section-summary {
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.4;
+}
+
+.platform-details-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 16px 16px;
+}
+
+.platform-details-body.hidden {
+  display: none;
+}
+
+.platform-details-entry-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.platform-details-group-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.platform-details-group-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.platform-details-group-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.platform-details-group-title {
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.platform-details-group-summary {
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.35;
 }
 
 .chassis-shell[data-face-style="nvme-carrier"] .front-edge {

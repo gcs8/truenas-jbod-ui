@@ -18,6 +18,10 @@ class AdminSettings(BaseModel):
     container_history_name: str = "truenas-jbod-history"
     container_admin_name: str = "truenas-jbod-admin"
     container_control_timeout_seconds: int = 30
+    container_ui_livez_url: str = "http://enclosure-ui:8000/livez"
+    container_history_livez_url: str = "http://enclosure-history:8001/livez"
+    container_admin_livez_url: str = "http://127.0.0.1:8002/livez"
+    container_version_probe_timeout_seconds: float = 1.5
     public_origin: str | None = None
     clean_backup_targets: list[str] = Field(default_factory=lambda: ["ui", "history"])
 
@@ -32,6 +36,10 @@ ENV_OVERRIDES: dict[str, str] = {
     "ADMIN_CONTAINER_HISTORY_NAME": "container_history_name",
     "ADMIN_CONTAINER_ADMIN_NAME": "container_admin_name",
     "ADMIN_CONTAINER_CONTROL_TIMEOUT_SECONDS": "container_control_timeout_seconds",
+    "ADMIN_CONTAINER_UI_LIVEZ_URL": "container_ui_livez_url",
+    "ADMIN_CONTAINER_HISTORY_LIVEZ_URL": "container_history_livez_url",
+    "ADMIN_CONTAINER_ADMIN_LIVEZ_URL": "container_admin_livez_url",
+    "ADMIN_CONTAINER_VERSION_PROBE_TIMEOUT_SECONDS": "container_version_probe_timeout_seconds",
     "ADMIN_PUBLIC_ORIGIN": "public_origin",
     "ADMIN_CLEAN_BACKUP_TARGETS_JSON": "clean_backup_targets",
 }

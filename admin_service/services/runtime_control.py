@@ -4,6 +4,7 @@ import http.client
 import json
 import socket
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -35,16 +36,19 @@ class DockerRuntimeService:
                 "name": settings.container_ui_name,
                 "label": "Read UI",
                 "description": "Primary read-mostly enclosure UI.",
+                "livez_url": settings.container_ui_livez_url,
             },
             "history": {
                 "name": settings.container_history_name,
                 "label": "History Sidecar",
                 "description": "Optional SQLite history collector.",
+                "livez_url": settings.container_history_livez_url,
             },
             "admin": {
                 "name": settings.container_admin_name,
                 "label": "Admin Sidecar",
                 "description": "Optional maintenance surface.",
+                "livez_url": settings.container_admin_livez_url,
             },
         }
 
@@ -73,13 +77,18 @@ class DockerRuntimeService:
             for name in container.get("Names") or []:
                 by_name[str(name).lstrip("/")] = container
 
+        container_payloads = [
+            self._build_status_payload(key, by_name.get(meta["name"]))
+            for key, meta in self.managed_containers.items()
+        ]
+        self._annotate_versions(container_payloads)
+        version_state, version_detail = self._summarize_version_alignment(container_payloads)
         return {
             "available": True,
             "detail": None,
-            "containers": [
-                self._build_status_payload(key, by_name.get(meta["name"]))
-                for key, meta in self.managed_containers.items()
-            ],
+            "version_state": version_state,
+            "version_detail": version_detail,
+            "containers": container_payloads,
         }
 
     def running_container_keys(self, keys: list[str] | tuple[str, ...] | None = None) -> list[str]:
@@ -199,6 +208,8 @@ class DockerRuntimeService:
             "can_stop": False,
             "can_start": False,
             "can_restart": False,
+            "running_version": None,
+            "version_probe_error": None,
         }
 
     @staticmethod
@@ -211,3 +222,56 @@ class DockerRuntimeService:
         if "(health: starting)" in lowered:
             return "starting"
         return None
+
+    def _annotate_versions(self, container_payloads: list[dict[str, Any]]) -> None:
+        for payload in container_payloads:
+            payload["running_version"] = None
+            payload["version_probe_error"] = None
+            if not payload.get("running"):
+                continue
+            livez_url = str(self.managed_containers.get(payload["key"], {}).get("livez_url") or "").strip()
+            if not livez_url:
+                payload["version_probe_error"] = "No live version endpoint configured."
+                continue
+            try:
+                payload["running_version"] = self._probe_running_version(livez_url)
+            except DockerRuntimeError as exc:
+                payload["version_probe_error"] = str(exc)
+
+    def _probe_running_version(self, livez_url: str) -> str:
+        request = urllib.request.Request(
+            livez_url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "truenas-jbod-admin/runtime-version-probe",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.settings.container_version_probe_timeout_seconds) as response:
+                payload = json.load(response)
+        except OSError as exc:
+            raise DockerRuntimeError(f"Version probe failed for {livez_url}: {exc}.") from exc
+        if not isinstance(payload, dict):
+            raise DockerRuntimeError(f"Version probe returned an invalid JSON payload for {livez_url}.")
+        version = str(payload.get("version") or "").strip()
+        if not version:
+            raise DockerRuntimeError(f"Version probe returned no version for {livez_url}.")
+        return version
+
+    @staticmethod
+    def _summarize_version_alignment(container_payloads: list[dict[str, Any]]) -> tuple[str, str]:
+        running_payloads = [payload for payload in container_payloads if payload.get("running")]
+        running_versions = sorted(
+            {
+                str(payload.get("running_version") or "").strip()
+                for payload in running_payloads
+                if str(payload.get("running_version") or "").strip()
+            }
+        )
+        if any(payload.get("version_probe_error") for payload in running_payloads):
+            return "partial", "One or more running containers could not report a live version."
+        if len(running_versions) > 1:
+            return "out_of_sync", f"Running containers disagree on version: {', '.join(running_versions)}."
+        if running_versions:
+            return "aligned", f"Running containers agree on {running_versions[0]}."
+        return "unknown", "No running container version data is available yet."

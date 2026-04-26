@@ -246,6 +246,128 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertEqual(smart.negotiated_link_rate, "8.0GT/s")
             self.assertEqual(smart.transport_protocol, "NVMe")
 
+    def test_build_esxi_platform_context_surfaces_useful_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="cryo-esxi",
+                label="CryoStorage ESXi",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="10.88.88.20", user="root"),
+            )
+            settings = Settings(systems=[system])
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            ssh_data = ParsedSSHData(
+                esxi_filesystems=[
+                    {
+                        "mount_point": "/vmfs/volumes/663fea18-16bffe1c-3a8c-ac1f6b406486",
+                        "volume_name": "CryoStore-Local",
+                        "uuid": "663fea18-16bffe1c-3a8c-ac1f6b406486",
+                        "mounted": "true",
+                        "type": "VMFS-6",
+                        "size": "1892201529344",
+                        "free": "415834832896",
+                    }
+                ],
+                esxi_vmfs_extents=[
+                    {
+                        "volume_name": "CryoStore-Local",
+                        "vmfs_uuid": "663fea18-16bffe1c-3a8c-ac1f6b406486",
+                        "extent_number": "0",
+                        "device_name": "naa.60030480208ba5992dd29c62f9ffa8f1",
+                        "partition": "1",
+                    }
+                ],
+                esxi_storcli_controller={
+                    "Basics": {
+                        "Model": "SAS 3808",
+                        "Serial Number": "HA243S005874",
+                        "SAS Address": "50030480208ba599",
+                        "PCI Address": "00:03:00:00",
+                    },
+                    "Version": {
+                        "Firmware Package Build": "52.28.0-5308",
+                        "Firmware Version": "5.280.01-3972",
+                        "Driver Name": "lsi_mr3",
+                        "Driver Version": "7.727.02.00",
+                    },
+                    "Bus": {
+                        "Host Interface": "PCI-E",
+                        "Device Interface": "SAS-12G",
+                    },
+                    "Status": {
+                        "Controller Status": "Optimal",
+                    },
+                },
+                esxi_storcli_virtual_drives=[
+                    {
+                        "vd_id": "0",
+                        "name": "ESXi",
+                        "raid": "RAID1",
+                        "state": "Optl",
+                        "size": "100.000 GB",
+                        "scsi_naa": "60030480208ba5992dd29badeb9f9403",
+                        "physical_drives": [
+                            {"slot_key": "13:0", "slot": 0, "enclosure_id": "13"},
+                            {"slot_key": "13:1", "slot": 1, "enclosure_id": "13"},
+                        ],
+                        "detail": {
+                            "Strip Size": "64 KB",
+                            "Write Cache(initial setting)": "WriteThrough",
+                            "Disk Cache Policy": "Disk's Default",
+                            "Creation Date": "11-05-2024",
+                            "Creation Time": "09:12:13 PM",
+                            "Unmap Enabled": "No",
+                        },
+                    }
+                ],
+                esxi_storcli_physical_drives=[
+                    {
+                        "slot_key": "13:0",
+                        "enclosure_id": "13",
+                        "slot": 0,
+                        "model": "Samsung SSD 970 EVO 2TB",
+                        "firmware": "2B2QEXE7",
+                        "connector_name": "C0 x4",
+                        "connected_port": "0(path0)",
+                        "link_speed": "8.0GT/s",
+                        "unmap_capable": "Yes",
+                        "detail": {
+                            "WWN": "3025385981B2633B",
+                            "Drive position": "DriveGroup:0, Span:0, Row:0",
+                            "Write Cache": "Disabled",
+                            "Max lane width": "4",
+                            "FDE Type": "TCG Opal",
+                            "SED Capable": "Yes",
+                            "SED Enabled": "No",
+                            "Secured": "No",
+                            "Cryptographic Erase Capable": "Yes",
+                            "Sanitize Support": "Not supported",
+                            "Unmap Capable for LDs": "No",
+                        },
+                    }
+                ],
+            )
+
+            context = service._build_esxi_platform_context(ssh_data)
+
+            self.assertEqual(context["details"]["title"], "Platform Details")
+            section_ids = [section["id"] for section in context["details"]["sections"]]
+            self.assertEqual(
+                section_ids,
+                ["overview", "virtual-drives", "datastores", "member-capabilities"],
+            )
+            overview_entries = {entry["label"]: entry["value"] for entry in context["details"]["sections"][0]["entries"]}
+            self.assertEqual(overview_entries["Controller Status"], "Optimal")
+            self.assertEqual(overview_entries["Firmware Package"], "52.28.0-5308")
+            virtual_drive_group = context["details"]["sections"][1]["groups"][0]
+            self.assertEqual(virtual_drive_group["title"], "ESXi")
+            self.assertIn("RAID1", virtual_drive_group["summary"])
+            member_group = context["details"]["sections"][3]["groups"][0]
+            self.assertEqual(member_group["title"], "Slot 00 (13:0)")
+            member_entries = {entry["label"]: entry["value"] for entry in member_group["entries"]}
+            self.assertEqual(member_entries["WWN"], "3025385981B2633B")
+            self.assertEqual(member_entries["FDE Type"], "TCG Opal")
+
     def test_esxi_inferred_aoc_storage_view_reuses_storcli_slots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             system = SystemConfig(id="cryo-esxi", label="CryoStorage ESXi", truenas=TrueNASConfig(platform="esxi"))

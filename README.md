@@ -83,7 +83,7 @@ different profile.
 - Snapshot export dialog: [docs/images/screenshots/snapshot-export-dialog-v0.14.0.png](docs/images/screenshots/snapshot-export-dialog-v0.14.0.png)
 - Frozen offline snapshot: [docs/images/screenshots/offline-snapshot-v0.14.0.png](docs/images/screenshots/offline-snapshot-v0.14.0.png)
 
-### 0.14.0 Workflow Highlights
+### 0.14.x Workflow Highlights
 
 - Dedicated builder workspace with full-width preview: [docs/images/screenshots/builder-workspace-v0.14.0.png](docs/images/screenshots/builder-workspace-v0.14.0.png)
 - Grouped runtime selector on `archive-core`: [docs/images/screenshots/live-vs-storage-views-v0.14.0.png](docs/images/screenshots/live-vs-storage-views-v0.14.0.png)
@@ -323,7 +323,7 @@ Quick start:
    set this in `.env`:
 
    ```dotenv
-   JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.14.1
+   JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.14.2
    ```
 
 5. Start the main UI:
