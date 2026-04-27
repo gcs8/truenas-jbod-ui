@@ -36,6 +36,10 @@ services:
     command: ["uvicorn", "history_service.main:app", "--host", "0.0.0.0", "--port", "8001"]
     environment:
       HISTORY_SOURCE_BASE_URL: http://enclosure-ui:8000
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      METRICS_PATH: ${METRICS_PATH:-/metrics}
       HISTORY_SQLITE_PATH: /app/history/history.db
       HISTORY_BACKUP_DIR: ${HISTORY_BACKUP_DIR:-/app/history/backups}
       HISTORY_BACKUP_RETENTION_COUNT: ${HISTORY_BACKUP_RETENTION_COUNT:-28}
@@ -49,7 +53,7 @@ services:
       HISTORY_SMART_BATCH_SIZE: ${HISTORY_SMART_BATCH_SIZE:-24}
       HISTORY_STARTUP_GRACE_SECONDS: ${HISTORY_STARTUP_GRACE_SECONDS:-20}
     ports:
-      - "127.0.0.1:${HISTORY_PORT:-8081}:8001"
+      - "${HISTORY_BIND_ADDRESS:-127.0.0.1}:${HISTORY_PORT:-8081}:8001"
     volumes:
       - ./history:/app/history
     depends_on:

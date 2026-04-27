@@ -19,6 +19,7 @@ history/backups/*
 !history/.gitkeep
 !history/backups/.gitkeep
 logs/*.log*
+docker-compose.override.yml
 node_modules/
 playwright-report/
 test-results/

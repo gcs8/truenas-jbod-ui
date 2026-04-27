@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import shlex
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,14 @@ from app.models.domain import (
     SourceStatus,
     SystemOption,
     SystemLocatorStatusView,
+)
+from app.metrics import (
+    observe_inventory_cache_sizes,
+    observe_inventory_snapshot_build,
+    observe_inventory_snapshot_request,
+    observe_inventory_source_bundle_build,
+    observe_inventory_source_bundle_request,
+    observe_smart_summary_request,
 )
 from app.perf import add_perf_metadata, perf_stage
 from app.services.mapping_store import MappingStore
@@ -83,6 +92,7 @@ from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebsocketClient
 
 logger = logging.getLogger(__name__)
+METRICS_SERVICE_NAME = "enclosure-ui"
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
 BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
 UNIFI_GPIO_LED_PROFILE_IDS = {
@@ -307,6 +317,77 @@ class InventoryService:
         self._scale_preferred_ses_host: str | None = None
         self._quantastor_preferred_ses_host: str | None = None
 
+    def _metrics_labels(self) -> dict[str, str | None]:
+        return {
+            "service_name": METRICS_SERVICE_NAME,
+            "system_id": self.system.id,
+            "platform": self.system.truenas.platform,
+        }
+
+    def _observe_inventory_cache_metrics(self) -> None:
+        labels = self._metrics_labels()
+        observe_inventory_cache_sizes(
+            service_name=str(labels["service_name"]),
+            system_id=str(labels["system_id"]),
+            platform=str(labels["platform"]),
+            snapshot_entries=len(self._cache),
+            smart_entries=len(self._smart_cache),
+        )
+
+    def _observe_inventory_snapshot_request(self, cache_state: str) -> None:
+        labels = self._metrics_labels()
+        observe_inventory_snapshot_request(
+            service_name=str(labels["service_name"]),
+            system_id=str(labels["system_id"]),
+            platform=str(labels["platform"]),
+            cache_state=cache_state,
+        )
+
+    def _observe_inventory_snapshot_build(
+        self,
+        *,
+        trigger: str,
+        snapshot: InventorySnapshot,
+        duration_seconds: float,
+    ) -> None:
+        labels = self._metrics_labels()
+        observe_inventory_snapshot_build(
+            service_name=str(labels["service_name"]),
+            system_id=str(labels["system_id"]),
+            platform=str(labels["platform"]),
+            trigger=trigger,
+            topology="trusted" if self._snapshot_has_trusted_topology(snapshot) else "untrusted",
+            duration_seconds=duration_seconds,
+        )
+
+    def _observe_inventory_source_bundle_request(self, cache_state: str) -> None:
+        labels = self._metrics_labels()
+        observe_inventory_source_bundle_request(
+            service_name=str(labels["service_name"]),
+            system_id=str(labels["system_id"]),
+            platform=str(labels["platform"]),
+            cache_state=cache_state,
+        )
+
+    def _observe_inventory_source_bundle_build(self, *, trigger: str, duration_seconds: float) -> None:
+        labels = self._metrics_labels()
+        observe_inventory_source_bundle_build(
+            service_name=str(labels["service_name"]),
+            system_id=str(labels["system_id"]),
+            platform=str(labels["platform"]),
+            trigger=trigger,
+            duration_seconds=duration_seconds,
+        )
+
+    def _observe_smart_summary_request(self, cache_state: str) -> None:
+        labels = self._metrics_labels()
+        observe_smart_summary_request(
+            service_name=str(labels["service_name"]),
+            system_id=str(labels["system_id"]),
+            platform=str(labels["platform"]),
+            cache_state=cache_state,
+        )
+
     async def get_snapshot(
         self,
         force_refresh: bool = False,
@@ -319,9 +400,11 @@ class InventoryService:
         now = utcnow()
         if not force_refresh and cached and now < cache_until:
             add_perf_metadata(snapshot_cache="hit", snapshot_cache_key=cache_key)
+            self._observe_inventory_snapshot_request("hit")
             return cached
         if not force_refresh and allow_stale_cache and cached:
             add_perf_metadata(snapshot_cache="stale-hit", snapshot_cache_key=cache_key)
+            self._observe_inventory_snapshot_request("stale-hit")
             self._schedule_background_snapshot_refresh(cache_key, selected_enclosure_id)
             return cached
 
@@ -331,30 +414,42 @@ class InventoryService:
             now = utcnow()
             if not force_refresh and cached and now < cache_until:
                 add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
+                self._observe_inventory_snapshot_request("hit-after-wait")
                 return cached
 
+            refresh_trigger = "forced-refresh" if force_refresh else "miss"
             add_perf_metadata(
-                snapshot_cache="forced-refresh" if force_refresh else "miss",
+                snapshot_cache=refresh_trigger,
                 snapshot_cache_key=cache_key,
                 system_id=self.system.id,
                 platform=self.system.truenas.platform,
             )
+            build_started = time.perf_counter()
             with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=selected_enclosure_id):
                 snapshot = await self._build_snapshot(
                     selected_enclosure_id=selected_enclosure_id,
                     force_source_refresh=force_refresh,
                 )
+            self._observe_inventory_snapshot_build(
+                trigger=refresh_trigger,
+                snapshot=snapshot,
+                duration_seconds=time.perf_counter() - build_started,
+            )
             if not self._snapshot_has_trusted_topology(snapshot):
                 add_perf_metadata(snapshot_topology="untrusted", snapshot_cache_key=cache_key)
                 if cached and self._snapshot_has_trusted_topology(cached):
+                    self._observe_inventory_snapshot_request("trusted-fallback")
                     logger.warning(
                         "Preserving previously trusted snapshot for %s because the refreshed topology is incomplete.",
                         cache_key,
                     )
                     return cached
+                self._observe_inventory_snapshot_request(refresh_trigger)
                 return snapshot
             self._cache[cache_key] = snapshot
             self._cache_until[cache_key] = utcnow() + timedelta(seconds=self.settings.app.cache_ttl_seconds)
+            self._observe_inventory_cache_metrics()
+            self._observe_inventory_snapshot_request(refresh_trigger)
             return snapshot
 
     async def get_storage_view_candidates(
@@ -1002,6 +1097,7 @@ class InventoryService:
             self._source_bundle = None
             self._source_bundle_until = datetime.min.replace(tzinfo=timezone.utc)
         add_perf_metadata(snapshot_cache_invalidated=reason)
+        self._observe_inventory_cache_metrics()
 
     def peek_cached_snapshot(self, *, selected_enclosure_id: str | None = None) -> InventorySnapshot | None:
         preferred_keys: list[str] = []
@@ -1045,9 +1141,11 @@ class InventoryService:
         now = utcnow()
         if not force_refresh and self._source_bundle is not None and now < self._source_bundle_until:
             add_perf_metadata(inventory_source_cache="hit", system_id=self.system.id)
+            self._observe_inventory_source_bundle_request("hit")
             return self._source_bundle
         if not force_refresh and allow_stale_cache and self._source_bundle is not None:
             add_perf_metadata(inventory_source_cache="stale-hit", system_id=self.system.id)
+            self._observe_inventory_source_bundle_request("stale-hit")
             self._schedule_background_source_bundle_refresh()
             return self._source_bundle
 
@@ -1055,16 +1153,24 @@ class InventoryService:
             now = utcnow()
             if not force_refresh and self._source_bundle is not None and now < self._source_bundle_until:
                 add_perf_metadata(inventory_source_cache="hit-after-wait", system_id=self.system.id)
+                self._observe_inventory_source_bundle_request("hit-after-wait")
                 return self._source_bundle
 
+            refresh_trigger = "forced-refresh" if force_refresh else "miss"
             add_perf_metadata(
-                inventory_source_cache="forced-refresh" if force_refresh else "miss",
+                inventory_source_cache=refresh_trigger,
                 system_id=self.system.id,
                 platform=self.system.truenas.platform,
             )
+            build_started = time.perf_counter()
             bundle = await self._collect_inventory_source_bundle()
             self._source_bundle = bundle
             self._source_bundle_until = utcnow() + timedelta(seconds=self.settings.app.cache_ttl_seconds)
+            self._observe_inventory_source_bundle_build(
+                trigger=refresh_trigger,
+                duration_seconds=time.perf_counter() - build_started,
+            )
+            self._observe_inventory_source_bundle_request(refresh_trigger)
             return bundle
 
     def _schedule_background_source_bundle_refresh(self) -> None:
@@ -1930,6 +2036,8 @@ class InventoryService:
             self._smart_cache[f"{self.system.id}|esxi|{slot}"] = summary
             self._smart_cache_until[f"{self.system.id}|esxi|{slot}"] = utcnow() + timedelta(minutes=5)
             self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+            self._observe_inventory_cache_metrics()
+            self._observe_smart_summary_request("esxi-live")
             return summary
         if self.system.truenas.platform == "quantastor":
             summary = self._merge_smart_summary(slot_view, self._build_quantastor_smart_summary(slot_view))
@@ -1948,6 +2056,8 @@ class InventoryService:
             self._smart_cache[f"{self.system.id}|quantastor|{slot}"] = summary
             self._smart_cache_until[f"{self.system.id}|quantastor|{slot}"] = utcnow() + timedelta(minutes=5)
             self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+            self._observe_inventory_cache_metrics()
+            self._observe_smart_summary_request("quantastor-live")
             return summary
 
         candidates = self._smart_candidate_devices(slot_view)
@@ -1957,6 +2067,7 @@ class InventoryService:
                 "No SMART-capable device path is available for this slot.",
             )
             cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+            self._observe_smart_summary_request("no-device-fallback")
             return cached_fallback or fallback
 
         cache_key = f"{self.system.id}|{'|'.join(candidates)}"
@@ -1964,9 +2075,11 @@ class InventoryService:
         cached = self._smart_cache.get(cache_key)
         if cached and utcnow() < cache_until:
             add_perf_metadata(smart_cache="hit")
+            self._observe_smart_summary_request("hit")
             return cached
         if cached and allow_stale_cache:
             add_perf_metadata(smart_cache="stale-hit")
+            self._observe_smart_summary_request("stale-hit")
             self._schedule_background_smart_refresh(cache_key, slot_view)
             return cached
 
@@ -1976,6 +2089,8 @@ class InventoryService:
             self._smart_cache[cache_key] = persisted
             self._smart_cache_until[cache_key] = utcnow()
             self._schedule_background_smart_refresh(cache_key, slot_view)
+            self._observe_inventory_cache_metrics()
+            self._observe_smart_summary_request("persistent-hit")
             return persisted
 
         add_perf_metadata(smart_cache="miss", smart_candidate_count=len(candidates))
@@ -1989,6 +2104,8 @@ class InventoryService:
                 self._smart_cache[cache_key] = summary
                 self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
                 self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+                self._observe_inventory_cache_metrics()
+                self._observe_smart_summary_request("ssh-live")
                 return summary
 
             fallback = self._fallback_smart_summary(
@@ -2001,6 +2118,7 @@ class InventoryService:
                 ),
             )
             cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+            self._observe_smart_summary_request("fallback")
             return cached_fallback or fallback
 
         last_error: str | None = None
@@ -2049,6 +2167,8 @@ class InventoryService:
             self._smart_cache[cache_key] = api_summary
             self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
             self._persist_slot_detail_cache(slot_view, smart_summary=api_summary)
+            self._observe_inventory_cache_metrics()
+            self._observe_smart_summary_request("api-live")
             return api_summary
 
         if self.system.ssh.enabled:
@@ -2061,6 +2181,8 @@ class InventoryService:
                 self._smart_cache[cache_key] = ssh_summary
                 self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
                 self._persist_slot_detail_cache(slot_view, smart_summary=ssh_summary)
+                self._observe_inventory_cache_metrics()
+                self._observe_smart_summary_request("ssh-live")
                 return ssh_summary
             if ssh_error:
                 last_error = ssh_error
@@ -2070,6 +2192,7 @@ class InventoryService:
             last_error or "SMART summary is unavailable for this slot.",
         )
         cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+        self._observe_smart_summary_request("fallback")
         return cached_fallback or fallback
 
     async def get_slot_smart_summaries(

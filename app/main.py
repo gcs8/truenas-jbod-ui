@@ -31,6 +31,7 @@ from app.models.domain import (
     SystemLocatorRequest,
     SystemLocatorStatusView,
 )
+from app.metrics import install_metrics
 from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
 from app.services.history_backend import HistoryBackendClient
 from app.services.inventory_registry import InventoryRegistry
@@ -116,6 +117,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+    install_metrics(app, service_name="enclosure-ui", version=__version__)
     install_perf_timing_middleware(app, startup_settings)
 
     @app.get("/", response_class=HTMLResponse)

@@ -1,0 +1,15 @@
+services:
+  enclosure-ui:
+    logging: &syslog-logging
+      driver: syslog
+      options:
+        syslog-address: "${LOG_SYSLOG_ADDRESS}"
+        syslog-format: "${LOG_SYSLOG_FORMAT:-rfc5424micro}"
+        syslog-facility: "${LOG_SYSLOG_FACILITY:-local0}"
+        tag: "truenas-jbod-ui/{{.Name}}"
+
+  enclosure-history:
+    logging: *syslog-logging
+
+  enclosure-admin:
+    logging: *syslog-logging

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
@@ -9,11 +10,18 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app import __version__
+from app.logging_config import configure_service_logging
+from app.metrics import install_metrics
 from app.services.release_status import ReleaseStatusService
 from history_service.collector import HistoryCollector
 from history_service.config import get_history_settings
 from history_service.store import HistoryStore
 
+configure_service_logging(
+    log_level=os.getenv("APP_LOG_LEVEL", "INFO"),
+    log_format=os.getenv("LOG_FORMAT", "text"),
+    service_name="enclosure-history",
+)
 settings = get_history_settings()
 store = HistoryStore(settings.sqlite_path)
 collector = HistoryCollector(settings, store)
@@ -54,6 +62,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, version=__version__, lifespan=lifespan)
+install_metrics(app, service_name="enclosure-history", version=__version__)
 
 
 @app.get("/", response_class=HTMLResponse)
