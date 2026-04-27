@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.15.0`.
+This file tracks the current intended release direction after `v0.16.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -17,22 +17,25 @@ Detailed execution plans live here:
 
 ## Current Snapshot
 
-`v0.15.0` just shipped the Supermicro BMC / IPMI-first FatTwin slice:
+`v0.16.0` just shipped the first observability/runtime-operations slice:
 
-- first-class `ipmi` platform support
-- validated FatTwin front-six plus inferred rear-two profiles
-- BMC-backed slot truth and identify
-- ESXi host prep for operator-supplied StorCLI bundles
-- much tighter published-image and optional-sidecar docs
+- optional generic syslog shipping
+- shared JSON log output across UI/history/admin
+- scrape-based Prometheus/OpenMetrics endpoints on all three services
+- first-pass inventory/cache metrics plus checked-in Grafana dashboards
+- live Windows-vs-Linux comparison strong enough to keep Linux as the primary
+  perf truth and local Windows Docker Desktop as the slower tuning target
 
 The next cycle should stay narrower than that release:
 
-- confirm the remaining sibling FatTwin ESXi node behavior
-- live-confirm rear-bay numbering later
-- decide whether chassis locator/UID graduates from backend-only to a visible
-  UI affordance
 - keep Linux Docker as the primary perf truth while chasing the still-slow
-  local Windows history/export path
+  local Windows `history_status` and snapshot-export path
+- decide whether the observability slice grows alert rules, richer structured
+  perf-event logging, or optional host-level `node_exporter` coverage
+- investigate the intermittent `unvr-pro` SSH slow path without widening the
+  app's normal request path around one slow UniFi box
+- confirm the remaining sibling FatTwin ESXi node behavior and live-confirm
+  rear-bay numbering later once hardware is available
 
 ## Guiding Principle
 
