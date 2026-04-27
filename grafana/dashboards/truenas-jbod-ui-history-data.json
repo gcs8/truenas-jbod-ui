@@ -1,0 +1,801 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "id": 101,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "truenas_jbod_ui_history_collector_running{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "instant": true,
+          "legendFormat": "{{deployment}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Collector Running",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 900
+              },
+              {
+                "color": "red",
+                "value": 3600
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "id": 102,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "time() - truenas_jbod_ui_history_last_success_timestamp_seconds{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "legendFormat": "{{deployment}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Last Success Age",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "id": 103,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "truenas_jbod_ui_history_last_error{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "instant": true,
+          "legendFormat": "{{deployment}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Last Error Flag",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "id": 104,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "truenas_jbod_ui_history_last_scope_count{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "instant": true,
+          "legendFormat": "{{deployment}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Last Scope Count",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "id": 105,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "truenas_jbod_ui_history_tracked_slots{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "instant": true,
+          "legendFormat": "{{deployment}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Tracked Slots",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "id": 106,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "truenas_jbod_ui_history_metric_sample_count{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "instant": true,
+          "legendFormat": "{{deployment}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Metric Samples",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 107,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "min",
+            "max"
+          ],
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (deployment) (rate(truenas_jbod_ui_history_collection_duration_seconds_sum{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}[1h])) / sum by (deployment) (rate(truenas_jbod_ui_history_collection_duration_seconds_count{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}[1h]))",
+          "legendFormat": "{{deployment}} avg pass duration",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Average Collection Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 108,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "min",
+            "max"
+          ],
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (deployment, result) (rate(truenas_jbod_ui_history_collection_runs_total{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}[1h])) * 3600",
+          "legendFormat": "{{deployment}} {{result}} runs/hour",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Collection Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "id": 109,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "min",
+            "max"
+          ],
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "time() - truenas_jbod_ui_history_last_inventory_timestamp_seconds{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "legendFormat": "{{deployment}} inventory age",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "time() - truenas_jbod_ui_history_last_fast_metrics_timestamp_seconds{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "legendFormat": "{{deployment}} fast metrics age",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "time() - truenas_jbod_ui_history_last_slow_metrics_timestamp_seconds{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "legendFormat": "{{deployment}} slow metrics age",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "time() - truenas_jbod_ui_history_last_backup_timestamp_seconds{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "legendFormat": "{{deployment}} backup age",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Freshness Ages",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "id": 110,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "min",
+            "max"
+          ],
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "truenas_jbod_ui_history_last_scope_count{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "legendFormat": "{{deployment}} scope count",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "truenas_jbod_ui_history_tracked_slots{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "legendFormat": "{{deployment}} tracked slots",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "truenas_jbod_ui_history_event_count{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "legendFormat": "{{deployment}} event rows",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Inventory & Event Counts",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 111,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "min",
+            "max"
+          ],
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "truenas_jbod_ui_history_metric_sample_count{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}",
+          "legendFormat": "{{deployment}} metric samples",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Stored Metric Samples",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "id": 112,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "min",
+            "max"
+          ],
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (deployment, route) (rate(truenas_jbod_ui_http_requests_total{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}[5m]))",
+          "legendFormat": "{{deployment}} {{route}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "History Service HTTP Request Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 3,
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "id": 113,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "topk(10, histogram_quantile(0.95, sum by (deployment, le, route) (rate(truenas_jbod_ui_http_request_duration_seconds_bucket{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}[5m]))))",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{deployment}} {{route}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Slowest History Routes (P95)",
+      "type": "table"
+    },
+    {
+      "datasource": "Prometheus Lab",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "id": 114,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "min",
+            "max"
+          ],
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "13.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (deployment, le, route) (rate(truenas_jbod_ui_http_request_duration_seconds_bucket{job=\"truenas-jbod-ui\",deployment=~\"$deployment\",service=\"enclosure-history\"}[5m])))",
+          "legendFormat": "{{deployment}} {{route}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "History Route Latency",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "style": "dark",
+  "tags": [
+    "truenas-jbod-ui",
+    "history",
+    "metrics"
+  ],
+  "templating": {
+    "list": [
+      {
+        "allValue": ".+",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": "Prometheus Lab",
+        "definition": "label_values(truenas_jbod_ui_service_up{job=\"truenas-jbod-ui\",deployment=~\".+\"}, deployment)",
+        "includeAll": true,
+        "label": "Deployment",
+        "multi": true,
+        "name": "deployment",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(truenas_jbod_ui_service_up{job=\"truenas-jbod-ui\",deployment=~\".+\"}, deployment)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "TrueNAS JBOD UI - History & Data",
+  "uid": "truenas-jbod-ui-history-data",
+  "version": 4,
+  "weekStart": ""
+}

@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+## v0.16.0 - 2026-04-27
+
+### Added
+
+- optional Docker syslog shipping through a tracked
+  `docker-compose.override.yml.example`, generic RFC5424-style transport
+  settings, and a default `docker compose up -d` operator path that does not
+  require extra `-f` flags
+- optional structured JSON stdout/syslog logging with stable `ts`, `level`,
+  `logger`, `message`, and `service` fields across the main UI, history
+  sidecar, and admin sidecar
+- scrape-based Prometheus/OpenMetrics endpoints on the main UI, history
+  sidecar, and admin sidecar, including shared HTTP metrics plus
+  history-collector state/counter visibility
+- low-cardinality inventory/cache metrics for snapshot rebuilds, source-bundle
+  rebuilds, SMART summary cache outcomes, and current cache entry counts
+- checked-in starter Grafana dashboards under `grafana/dashboards/` for
+  backend/runtime health and history/data freshness
+
+### Changed
+
+- history-sidecar port binding can now be intentionally opened with
+  `HISTORY_BIND_ADDRESS` for external scraping, while the default repo/runtime
+  shape stays localhost-only
+- README, GHCR deployment docs, and the checked-in wiki pages now document the
+  syslog, metrics, and Grafana import path as part of the normal supported
+  deployment story
+
+### Fixed
+
+- the Linux dev-target collector false-positive path is now easier to reason
+  about because the history service exports explicit collector-running,
+  last-success, and last-error metrics instead of leaving that state buried in
+  logs alone
+
 ## v0.15.0 - 2026-04-27
 
 ### Added

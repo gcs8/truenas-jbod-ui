@@ -20,7 +20,7 @@ This package is public, so normal pulls do not require `docker login`.
 
 Choose the GHCR path if you want to:
 
-- pull a tagged release image such as `v0.15.0`
+- pull a tagged release image such as `v0.16.0`
 - keep a server on a pinned known-good image
 - update with `docker compose pull` instead of rebuilding locally
 
@@ -128,6 +128,72 @@ Docker `syslog` logging driver. Backend-specific parsing belongs on the
 receiver side, whether that is Splunk, ELK/Logstash, Graylog, rsyslog, or
 syslog-ng.
 
+## Optional Metrics Endpoints
+
+All three services now expose a scrape-based Prometheus/OpenMetrics endpoint
+over HTTP by default:
+
+- main UI: `http://your-docker-host:8080/metrics`
+- history sidecar: `http://your-docker-host:8081/metrics` after setting
+  `HISTORY_BIND_ADDRESS=0.0.0.0` in `.env`
+- admin sidecar: `http://your-docker-host:8082/metrics`
+
+This first pass is intentionally collector-agnostic. It is just a normal
+scrape endpoint, so Prometheus, Grafana Alloy, VictoriaMetrics, Telegraf, or
+an Influx scraper can all sit outside the stack and pull from it.
+
+What you get in the first pass:
+
+- standard Python/process metrics from `prometheus_client`
+- shared HTTP request count, in-flight, and latency metrics for all services
+- build/version info for the running service
+- history-sidecar collector gauges and counters such as last-success
+  timestamps, tracked-slot counts, and collection-pass duration
+
+Starter Grafana dashboards are checked in under `grafana/dashboards/` too:
+
+- `TrueNAS JBOD UI - Backend Overview`
+- `TrueNAS JBOD UI - History & Data`
+
+They were built around the current first-pass metrics slice, so they focus on
+request/perf health plus collector/data freshness rather than pretending the
+app already exports deep per-system business metrics.
+
+If you do not want to expose the scrape endpoint, set this in `.env`:
+
+```dotenv
+METRICS_ENABLED=false
+```
+
+You can also move the endpoint off `/metrics` if needed:
+
+```dotenv
+METRICS_PATH=/metrics
+```
+
+The history sidecar stays localhost-only by default, matching the older
+compose behavior. If you want another host to scrape it directly, open that
+bind address intentionally:
+
+```dotenv
+HISTORY_BIND_ADDRESS=0.0.0.0
+```
+
+Small Prometheus example:
+
+```yaml
+scrape_configs:
+  - job_name: truenas-jbod-ui
+    static_configs:
+      - targets:
+          - your-docker-host:8080
+          - your-docker-host:8082
+  - job_name: truenas-jbod-history
+    static_configs:
+      - targets:
+          - your-docker-host:8081
+```
+
 ## Pick A Tag
 
 If you do not set anything, the default `docker-compose.yml` defaults to:
@@ -139,14 +205,14 @@ JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:latest
 You can pin a specific image in `.env`:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.15.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.16.0
 ```
 
 Useful tag shapes:
 
 - `latest`
   Best for people who want the newest published stable image
-- `v0.15.0`
+- `v0.16.0`
   Best when you want the exact release-tag name from the repo
 - `0.14.1`
   Equivalent stable version tag without the `v`
@@ -240,7 +306,7 @@ If you pin a specific tag:
 Example:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.15.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.16.0
 ```
 
 ```bash

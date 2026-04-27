@@ -30,6 +30,7 @@ from app.config import (
     get_settings,
 )
 from app.logging_config import configure_service_logging
+from app.metrics import install_metrics
 from app.models.domain import (
     DebugBundleExportRequest,
     DemoSystemRequest,
@@ -202,6 +203,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+    install_metrics(app, service_name="enclosure-admin", version=__version__)
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:

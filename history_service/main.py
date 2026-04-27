@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from app import __version__
 from app.logging_config import configure_service_logging
+from app.metrics import install_metrics
 from app.services.release_status import ReleaseStatusService
 from history_service.collector import HistoryCollector
 from history_service.config import get_history_settings
@@ -61,6 +62,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, version=__version__, lifespan=lifespan)
+install_metrics(app, service_name="enclosure-history", version=__version__)
 
 
 @app.get("/", response_class=HTMLResponse)

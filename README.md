@@ -93,6 +93,45 @@ override explicitly:
 docker compose -f docker-compose.dev.yml -f docker-compose.override.yml up -d --build
 ```
 
+Optional metrics endpoints:
+
+- main UI: `http://your-docker-host:8080/metrics`
+- history sidecar: `http://your-docker-host:8081/metrics` after setting
+  `HISTORY_BIND_ADDRESS=0.0.0.0` in `.env`
+- admin sidecar: `http://your-docker-host:8082/metrics`
+
+The first pass is scrape-based Prometheus/OpenMetrics over HTTP. It includes
+the usual Python/process metrics from `prometheus_client` plus shared app
+metrics such as HTTP request count/latency and history-collector state. To
+disable the endpoints entirely, set `METRICS_ENABLED=false` in `.env`.
+
+Starter Grafana dashboards now live under `grafana/dashboards/`:
+
+- `TrueNAS JBOD UI - Backend Overview`
+- `TrueNAS JBOD UI - History & Data`
+
+They assume a Prometheus datasource named `Prometheus Lab` in the current dev
+sandbox. If your Grafana instance uses a different datasource, remap it during
+dashboard import.
+
+Small Prometheus example:
+
+```yaml
+scrape_configs:
+  - job_name: truenas-jbod-ui
+    static_configs:
+      - targets:
+          - your-docker-host:8080
+          - your-docker-host:8082
+  - job_name: truenas-jbod-history
+    static_configs:
+      - targets:
+          - your-docker-host:8081
+```
+
+Keep `HISTORY_BIND_ADDRESS=127.0.0.1` if you only want the history sidecar
+reachable from the Docker host itself.
+
 Open:
 
 - `http://your-docker-host:8080`

@@ -104,6 +104,11 @@ It gives you:
   and identify, optional ESXi host-prep for operator-supplied StorCLI bundles,
   and direct JBOD SMART enrichment when the host exposes both StorCLI and
   `esxcli storage core device smart get`
+- `0.16.0` turns the new runtime story into a first observability slice:
+  optional generic syslog shipping, shared JSON log output, scrape-based
+  Prometheus metrics on all three services, low-cardinality inventory/cache
+  counters, and checked-in Grafana dashboards for backend/runtime plus
+  history/data visibility
 
 ## Visual Walkthrough
 

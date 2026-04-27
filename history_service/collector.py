@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from history_service.config import HistorySettings
+from app.metrics import observe_history_collection_run, set_history_collector_running
 from history_service.domain import (
     MetricSample,
     SlotStateRecord,
@@ -23,6 +25,7 @@ from history_service.store import HistoryStore
 
 logger = logging.getLogger(__name__)
 STORAGE_VIEW_SCOPE_PREFIX = "storage-view:"
+HISTORY_METRICS_SERVICE_NAME = "enclosure-history"
 
 FAST_METRIC_FIELDS = ("temperature_c",)
 SLOW_METRIC_FIELDS = (
@@ -75,12 +78,14 @@ class HistoryCollector:
         self.last_backup_at: str | None = None
         self.last_error: str | None = None
         self.last_scope_count: int = 0
+        set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, False)
 
     async def start(self) -> None:
         if self._task and not self._task.done():
             return
         self._stopping.clear()
         self._task = asyncio.create_task(self._run_loop(), name="history-collector")
+        set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, True)
 
     async def stop(self) -> None:
         if not self._task:
@@ -92,6 +97,7 @@ class HistoryCollector:
         except asyncio.CancelledError:
             pass
         self._task = None
+        set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, False)
 
     async def run_once(
         self,
@@ -192,15 +198,30 @@ class HistoryCollector:
 
         while not self._stopping.is_set():
             started = utcnow()
+            started_monotonic = time.perf_counter()
             try:
                 force_startup_collection = self.last_success_at is None
                 await self.run_once(
                     force_fast=force_startup_collection,
                     force_slow=force_startup_collection,
                 )
+                observe_history_collection_run(
+                    service_name=HISTORY_METRICS_SERVICE_NAME,
+                    result="success",
+                    duration_seconds=time.perf_counter() - started_monotonic,
+                    status=self.status(),
+                    counts=self.store.counts(),
+                )
             except Exception as exc:  # noqa: BLE001 - keep the collector alive across transient appliance errors.
                 logger.exception("History collection pass failed")
                 self.last_error = str(exc)
+                observe_history_collection_run(
+                    service_name=HISTORY_METRICS_SERVICE_NAME,
+                    result="error",
+                    duration_seconds=time.perf_counter() - started_monotonic,
+                    status=self.status(),
+                    counts=None,
+                )
 
             elapsed = (utcnow() - started).total_seconds()
             target_interval = (
