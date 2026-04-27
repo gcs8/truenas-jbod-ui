@@ -29,6 +29,7 @@ from app.config import (
     TrueNASConfig,
     get_settings,
 )
+from app.logging_config import configure_service_logging
 from app.models.domain import (
     DebugBundleExportRequest,
     DemoSystemRequest,
@@ -68,6 +69,11 @@ from history_service.system_backup import (
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+configure_service_logging(
+    log_level=os.getenv("APP_LOG_LEVEL", "INFO"),
+    log_format=os.getenv("LOG_FORMAT", "text"),
+    service_name="enclosure-admin",
+)
 logger = logging.getLogger(__name__)
 
 SERVICE_STARTED_AT = datetime.now(timezone.utc)

@@ -36,6 +36,8 @@ services:
     command: ["uvicorn", "history_service.main:app", "--host", "0.0.0.0", "--port", "8001"]
     environment:
       HISTORY_SOURCE_BASE_URL: http://enclosure-ui:8000
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
       HISTORY_SQLITE_PATH: /app/history/history.db
       HISTORY_BACKUP_DIR: ${HISTORY_BACKUP_DIR:-/app/history/backups}
       HISTORY_BACKUP_RETENTION_COUNT: ${HISTORY_BACKUP_RETENTION_COUNT:-28}

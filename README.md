@@ -76,6 +76,23 @@ docker compose --profile admin up -d enclosure-admin
 docker compose --profile history --profile admin up -d
 ```
 
+Optional syslog shipping with the same plain `docker compose up -d` path:
+
+```bash
+cp docker-compose.override.yml.example docker-compose.override.yml
+# set LOG_SYSLOG_* in .env
+# optional: set LOG_FORMAT=json in .env for structured stdout/syslog logs
+docker compose up -d
+```
+
+Docker auto-loads `docker-compose.override.yml` for the default published-image
+path. If you are intentionally using `docker-compose.dev.yml`, include the
+override explicitly:
+
+```bash
+docker compose -f docker-compose.dev.yml -f docker-compose.override.yml up -d --build
+```
+
 Open:
 
 - `http://your-docker-host:8080`

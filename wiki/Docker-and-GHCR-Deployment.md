@@ -83,6 +83,51 @@ same image. The history and admin sidecars are optional services, not dev-only
 ones, so the default `docker-compose.yml` is the first-class path for all three
 runtime roles.
 
+## Optional Syslog Shipping
+
+If you want the same plain `docker compose up -d` command to also ship
+container logs to a remote syslog receiver, use a local override file:
+
+```bash
+cp docker-compose.override.yml.example docker-compose.override.yml
+```
+
+Then set the matching keys in `.env`:
+
+```dotenv
+LOG_SYSLOG_ADDRESS=udp://syslog.example.local:514
+LOG_SYSLOG_FORMAT=rfc5424micro
+LOG_SYSLOG_FACILITY=local0
+```
+
+Optional structured stdout/syslog logs:
+
+```dotenv
+LOG_FORMAT=json
+```
+
+After that, the normal default path stays the same:
+
+```bash
+docker compose up -d
+```
+
+`docker compose` auto-loads `docker-compose.override.yml` beside the default
+`docker-compose.yml`, so no extra `-f` arguments are needed for the normal
+published-image workflow.
+
+If you are intentionally running the source-build path with an explicit compose
+file, include the override explicitly too:
+
+```bash
+docker compose -f docker-compose.dev.yml -f docker-compose.override.yml up -d --build
+```
+
+The first pass keeps the transport generic: RFC5424-style syslog over the
+Docker `syslog` logging driver. Backend-specific parsing belongs on the
+receiver side, whether that is Splunk, ELK/Logstash, Graylog, rsyslog, or
+syslog-ng.
+
 ## Pick A Tag
 
 If you do not set anything, the default `docker-compose.yml` defaults to:
