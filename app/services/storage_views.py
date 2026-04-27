@@ -11,6 +11,7 @@ from app.config import (
 )
 from app.services.profile_registry import (
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
+    SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 )
@@ -71,20 +72,41 @@ def _build_inferred_unifi_boot_media_view() -> StorageViewConfig:
     )
 
 
+def _build_inferred_fattwin_rear_view() -> StorageViewConfig:
+    return StorageViewConfig(
+        id="fat-twin-rear",
+        label="Rear 2 Bay",
+        kind="manual",
+        template_id="fat-twin-rear-2",
+        enabled=True,
+        order=30,
+        render=StorageViewRenderConfig(
+            show_in_main_ui=True,
+            show_in_admin_ui=True,
+            default_collapsed=True,
+        ),
+        binding=StorageViewBindingConfig(
+            mode="hybrid",
+            device_names=["bmc-slot:6", "bmc-slot:7"],
+        ),
+    )
+
+
 def resolve_system_storage_views(
     system: SystemConfig,
     profile_registry: "ProfileRegistry | None" = None,
+    inferred_profile_id: str | None = None,
 ) -> list[StorageViewConfig]:
     stored_views = list(system.storage_views)
-    inferred_profile_id = profile_registry.select_profile_id(system) if profile_registry else None
-    if not stored_views and inferred_profile_id:
+    selected_profile_id = inferred_profile_id or (profile_registry.select_profile_id(system) if profile_registry else None)
+    if not stored_views and selected_profile_id:
         stored_views = [
             StorageViewConfig(
                 id="primary-chassis",
                 label="Primary Chassis",
                 kind="ses_enclosure",
                 template_id="ses-auto",
-                profile_id=inferred_profile_id,
+                profile_id=selected_profile_id,
                 enabled=True,
                 order=10,
                 render=StorageViewRenderConfig(
@@ -95,10 +117,12 @@ def resolve_system_storage_views(
                 binding=StorageViewBindingConfig(mode="auto"),
             )
         ]
-        if inferred_profile_id in UNIFI_EMBEDDED_BOOT_MEDIA_PROFILE_IDS:
+        if selected_profile_id in UNIFI_EMBEDDED_BOOT_MEDIA_PROFILE_IDS:
             stored_views.append(_build_inferred_unifi_boot_media_view())
-        if inferred_profile_id == ESXI_AOC_SLG4_2H8M2_PROFILE_ID:
+        if selected_profile_id == ESXI_AOC_SLG4_2H8M2_PROFILE_ID:
             stored_views.append(_build_inferred_esxi_aoc_view())
+        if selected_profile_id == SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID:
+            stored_views.append(_build_inferred_fattwin_rear_view())
 
     return sorted(
         stored_views,

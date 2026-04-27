@@ -33,12 +33,19 @@ Here is the current QSOSN HA SATADOM view in the main UI:
 
 ## Recommended Admin Flow
 
-The admin sidecar is the easiest path now.
+The admin sidecar is the easiest path now, and it is a normal supported
+runtime service rather than a dev-only helper.
 
 1. Start the admin sidecar:
 
    ```bash
-   docker compose --profile admin up -d --build enclosure-admin
+   docker compose --profile admin up -d enclosure-admin
+   ```
+
+   Or, if you are intentionally building from source:
+
+   ```bash
+   docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin
    ```
 
 2. Create one Quantastor system entry:

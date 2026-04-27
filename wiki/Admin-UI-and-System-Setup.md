@@ -15,20 +15,35 @@ Use it when you want:
 - saved storage-view editing without changing YAML by hand
 
 The read-only enclosure UI on `:8080` still works without this sidecar. The
-admin page is optional and separate on purpose.
+admin page is optional and separate on purpose, but it is a normal supported
+runtime service rather than a dev-only helper.
 
 ## How To Launch It
 
-From the repo root, start the admin sidecar profile:
+From the repo root, start the admin sidecar profile from the default published
+image path:
 
 ```bash
-docker compose --profile admin up -d --build enclosure-admin
+docker compose --profile admin up -d enclosure-admin
 ```
 
-If you also want the optional history sidecar at the same time:
+If you are intentionally building from source instead:
 
 ```bash
-docker compose --profile admin --profile history up -d --build
+docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin
+```
+
+If you also want the history sidecar at the same time from the published-image
+path:
+
+```bash
+docker compose --profile admin --profile history up -d
+```
+
+If you want the source-build variant instead:
+
+```bash
+docker compose -f docker-compose.dev.yml --profile admin --profile history up -d --build
 ```
 
 Then open:
@@ -55,7 +70,7 @@ The top of the admin page now has two section targets:
 
 ## What The Page Looks Like
 
-![Admin sidecar grouped setup view](images/admin-setup-v0.14.0.png)
+![Admin sidecar grouped setup view](images/admin-setup-v0.15.0.png)
 
 The page is organized around one saved system at a time.
 
@@ -95,7 +110,7 @@ This is where you confirm the intended chassis shape before you save.
 The admin sidecar now also has a dedicated builder workspace for reusable
 custom chassis profiles.
 
-![Builder workspace with full-width preview](images/builder-workspace-v0.14.0.png)
+![Builder workspace with full-width preview](images/builder-workspace-v0.15.0.png)
 
 Use it when you want to:
 
@@ -139,9 +154,40 @@ read-only in the main UI but still use richer SSH detail and LED control.
 For VMware ESXi, the admin sidecar now keeps the setup intentionally narrower:
 
 - the recommended saved SSH user stays `root`
+- `Password Only / No Key` is a first-class option when the host is using
+  direct root password auth instead of a mounted key
 - the path stays read-only and SSH-only
 - the Linux one-time bootstrap and sudoers preview flow stay disabled because
   ESXi is not using Linux sudo
+
+### ESXi Host Prep / Vendor Tool Upload
+
+The setup form now also includes an ESXi-only `Host Prep / Vendor Tool Upload`
+panel for operator-supplied vendor packages.
+
+![Admin ESXi host prep panel](images/admin-esxi-host-prep-v0.15.0.png)
+
+Use it when the host needs something like Broadcom StorCLI before the main UI
+can enrich controller-backed disks properly.
+
+The current workflow is intentionally conservative:
+
+- choose a `.zip` offline bundle or `.vib` from your machine
+- stage it in the admin sidecar temp area under
+  `/tmp/truenas-jbod-ui-host-prep`
+- reuse the current saved ESXi SSH host, user, and password-or-key settings
+  from the form
+- upload it to the host and run the matching `esxcli software component apply`
+  or `esxcli software vib install` command
+- get back a short verification summary instead of only a blind success/fail
+
+Important guardrails:
+
+- the project does **not** bundle Broadcom or other vendor binaries
+- the temp area is just staging space, not long-term package management
+- this path is for one-time host prep / remediation, not ongoing RAID control
+- if a host only needs BMC-backed inventory, you can still use the `ipmi`
+  platform and skip ESXi SSH entirely
 
 ### TLS Trust
 
@@ -237,7 +283,7 @@ runtime selector picks the updated system list up cleanly.
 The same backup/restore area now also holds the safe cleanup tools for saved
 history:
 
-![Admin maintenance bundle and history tools](images/admin-maintenance-v0.14.0.png)
+![Admin maintenance bundle and history tools](images/admin-maintenance-v0.15.0.png)
 
 Use that panel when you need to:
 
@@ -257,10 +303,12 @@ For a first-time setup on a new host:
 2. start the admin sidecar on `:8082`
 3. load or create the target system entry
 4. configure SSH if you want richer mapping, SMART, or LED support
-5. inspect TLS trust if the host uses private certs
-6. add only the storage views you actually need
-7. save
-8. go back to the main UI and verify the new live or saved runtime targets
+5. for ESXi, use `Host Prep / Vendor Tool Upload` only if the validated read
+   path still needs a vendor package such as StorCLI
+6. inspect TLS trust if the host uses private certs
+7. add only the storage views you actually need
+8. save
+9. go back to the main UI and verify the new live or saved runtime targets
 
 If you also need a custom chassis profile, do that in the builder workspace
 after the basic system entry is saved, then come back to the setup view and

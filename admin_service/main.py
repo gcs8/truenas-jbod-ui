@@ -19,6 +19,7 @@ from fastapi.templating import Jinja2Templates
 
 from admin_service.config import AdminSettings, get_admin_settings
 from admin_service.services.account_bootstrap import ServiceAccountBootstrapService
+from admin_service.services.esxi_host_prep import ESXiHostPrepService
 from admin_service.services.maintenance import AdminMaintenanceService
 from admin_service.services.runtime_control import DockerRuntimeError, DockerRuntimeService
 from admin_service.services.tls_trust import TLSTrustStoreService
@@ -31,6 +32,7 @@ from app.config import (
 from app.models.domain import (
     DebugBundleExportRequest,
     DemoSystemRequest,
+    ESXiHostPrepInstallRequest,
     EnclosureProfileRequest,
     HistoryAdoptRequest,
     QuantastorNodeDiscoveryRequest,
@@ -114,6 +116,12 @@ def get_maintenance_service() -> AdminMaintenanceService:
         get_runtime_service(),
         clean_backup_targets=admin_settings.clean_backup_targets,
     )
+
+
+@lru_cache
+def get_esxi_host_prep_service() -> ESXiHostPrepService:
+    admin_settings = get_admin_settings()
+    return ESXiHostPrepService(admin_settings.host_prep_temp_dir)
 
 
 @lru_cache
@@ -349,6 +357,43 @@ def create_app() -> FastAPI:
                 "stopped_containers": maintenance.stopped_containers,
                 "restarted_containers": maintenance.restarted_containers,
                 "runtime": await build_runtime_payload(runtime_service),
+            }
+        )
+
+    @app.post("/api/admin/esxi-host-prep/upload")
+    async def upload_esxi_host_prep_package(
+        request: Request,
+        filename: str = Query(..., min_length=1),
+    ) -> JSONResponse:
+        content = await request.body()
+        if not content:
+            raise HTTPException(status_code=400, detail="ESXi host-prep upload request body was empty.")
+        service = get_esxi_host_prep_service()
+        try:
+            package = await asyncio.to_thread(service.stage_package, filename, content)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(
+            {
+                "ok": True,
+                "package": package,
+                "packages": await asyncio.to_thread(service.list_staged_packages),
+            }
+        )
+
+    @app.post("/api/admin/esxi-host-prep/install")
+    async def install_esxi_host_prep_package(payload: ESXiHostPrepInstallRequest) -> JSONResponse:
+        service = get_esxi_host_prep_service()
+        try:
+            result = await asyncio.to_thread(service.install_package, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(
+            {
+                "ok": True,
+                "install_ok": bool(result.get("ok")),
+                **{key: value for key, value in result.items() if key != "ok"},
+                "packages": await asyncio.to_thread(service.list_staged_packages),
             }
         )
 
@@ -907,6 +952,10 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
         "storage_view_templates": serialize_storage_view_templates(),
         "setup_platform_defaults": serialize_platform_defaults(),
         "ssh_keys": ssh_keys,
+        "esxi_host_prep": {
+            "temp_dir": admin_settings.host_prep_temp_dir,
+            "staged_packages": await asyncio.to_thread(get_esxi_host_prep_service().list_staged_packages),
+        },
         "runtime": runtime_payload,
         "backup_defaults": {
             "packaging": "tar.zst",
@@ -1038,6 +1087,12 @@ def serialize_systems(settings: Settings) -> list[dict[str, Any]]:
             "ssh_strict_host_key_checking": bool(system.ssh.strict_host_key_checking),
             "ssh_timeout_seconds": system.ssh.timeout_seconds,
             "ssh_commands": list(system.ssh.commands),
+            "bmc_enabled": bool(system.bmc.enabled),
+            "bmc_host": system.bmc.host,
+            "bmc_username": system.bmc.username,
+            "bmc_password": system.bmc.password,
+            "bmc_verify_ssl": bool(system.bmc.verify_ssl),
+            "bmc_timeout_seconds": system.bmc.timeout_seconds,
             "storage_views": serialize_storage_views(system, profile_registry),
         }
         for system in settings.systems
@@ -1183,7 +1238,7 @@ def serialize_platform_defaults() -> dict[str, dict[str, object]]:
         platform: {
             "ssh_commands": default_ssh_commands_for_platform(platform),
         }
-        for platform in ("core", "scale", "linux", "quantastor", "esxi")
+        for platform in ("core", "scale", "linux", "quantastor", "esxi", "ipmi")
     }
 
 

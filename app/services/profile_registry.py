@@ -11,6 +11,8 @@ SCALE_SSG_REAR_12_PROFILE_ID = "supermicro-ssg-6048r-rear-12"
 LINUX_GPU_SERVER_NVME_PROFILE_ID = "supermicro-sys-2029gp-tr-right-nvme-2"
 QUANTASTOR_SSG_SHARED_24_PROFILE_ID = "supermicro-ssg-2028r-shared-front-24"
 ESXI_AOC_SLG4_2H8M2_PROFILE_ID = "supermicro-aoc-slg4-2h8m2"
+SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID = "supermicro-fat-twin-front-6"
+SUPERMICRO_FATTWIN_REAR_2_PROFILE_ID = "supermicro-fat-twin-rear-2"
 UNIFI_UNVR_FRONT_4_PROFILE_ID = "ubiquiti-unvr-front-4"
 UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID = "ubiquiti-unvr-pro-front-7"
 GENERIC_FRONT_24_1X24_PROFILE_ID = "generic-front-24-1x24"
@@ -223,6 +225,66 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             slot_hints={
                 0: ["13:0", "C0 x4", "0(path0)"],
                 1: ["13:1", "C1 x4", "1(path0)"],
+            },
+        ),
+        EnclosureProfileConfig(
+            id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+            label="Supermicro FatTwin Front 6",
+            eyebrow="Supermicro FatTwin / Front 6 Bay",
+            summary=(
+                "First-pass front six-bay profile for Supermicro FatTwin nodes, using the usual "
+                "Supermicro bottom-up then left-to-right front-bay numbering with validated BMC "
+                "slot-hint bindings for the onboard Broadcom 3108 storage path."
+            ),
+            panel_title="Front 6 Bay",
+            edge_label="Front of node",
+            face_style="front-drive",
+            latch_edge="right",
+            bay_size="3.5",
+            rows=3,
+            columns=2,
+            # Supermicro front-drive chassis have consistently matched a
+            # bottom-up, then left-to-right column ordering in the hardware
+            # we have validated so far, so future first-pass Supermicro faces
+            # should start from that assumption unless live discovery proves
+            # otherwise.
+            slot_layout=[
+                [2, 5],
+                [1, 4],
+                [0, 3],
+            ],
+            slot_hints={
+                0: ["bmc-slot:0"],
+                1: ["bmc-slot:1"],
+                2: ["bmc-slot:2"],
+                3: ["bmc-slot:3"],
+                4: ["bmc-slot:4"],
+                5: ["bmc-slot:5"],
+            },
+        ),
+        EnclosureProfileConfig(
+            id=SUPERMICRO_FATTWIN_REAR_2_PROFILE_ID,
+            label="Supermicro FatTwin Rear 2",
+            eyebrow="Supermicro FatTwin / Rear 2 Bay",
+            summary=(
+                "First-pass rear two-bay profile for Supermicro FatTwin nodes, using the validated "
+                "stacked rear-carrier orientation with independent BMC slot numbers outside the "
+                "front six-bay range."
+            ),
+            panel_title="Rear 2 Bay",
+            edge_label="Rear of node",
+            face_style="rear-drive",
+            latch_edge="right",
+            bay_size="3.5",
+            rows=2,
+            columns=1,
+            slot_layout=[
+                [1],
+                [0],
+            ],
+            slot_hints={
+                0: ["bmc-slot:6"],
+                1: ["bmc-slot:7"],
             },
         ),
         EnclosureProfileConfig(
@@ -454,6 +516,8 @@ class ProfileRegistry:
             return QUANTASTOR_SSG_SHARED_24_PROFILE_ID
         if system.truenas.platform == "esxi":
             return ESXI_AOC_SLG4_2H8M2_PROFILE_ID
+        if system.truenas.platform == "ipmi":
+            return None
 
         return None
 

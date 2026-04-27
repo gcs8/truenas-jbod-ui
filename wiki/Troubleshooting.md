@@ -96,7 +96,7 @@ Try:
 - rebuild and restart the container
 
 ```bash
-docker compose up -d --build
+docker compose -f docker-compose.dev.yml up -d --build
 ```
 
 ## Multipath Or Pool Grouping Looks Wrong On CORE

@@ -63,13 +63,13 @@ Choose one path:
 - published GHCR image, no local build:
 
   ```bash
-  docker compose -f docker-compose.ghcr.yml up -d
+  docker compose up -d
   ```
 
 - local source build:
 
   ```bash
-  docker compose up -d --build
+  docker compose -f docker-compose.dev.yml up -d --build
   ```
 
 If you want to pin a specific published image tag instead of `latest`, set this
@@ -127,18 +127,21 @@ Use these pages when you are ready:
 
 ## 9. Optional: Turn On The Admin UI
 
+The admin UI is optional, but it is a normal supported runtime service rather
+than a dev-only extra.
+
 If you want the guided setup, runtime control, backup/restore, storage-view
 editing flow, or the dedicated custom-profile builder workspace, start the
-optional admin sidecar:
+admin sidecar:
 
 ```bash
-docker compose -f docker-compose.ghcr.yml --profile admin up -d enclosure-admin
+docker compose --profile admin up -d enclosure-admin
 ```
 
 Or from source:
 
 ```bash
-docker compose --profile admin up -d --build enclosure-admin
+docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin
 ```
 
 Then open:
@@ -153,17 +156,19 @@ Use this page for the walkthrough:
 
 ## 10. Optional: Turn On History And Snapshot Export
 
+The history sidecar is also a normal supported runtime service.
+
 If you want historical slot lookback and the offline HTML snapshot export flow,
-start the optional history sidecar:
+start the history sidecar:
 
 ```bash
-docker compose -f docker-compose.ghcr.yml --profile history up -d
+docker compose --profile history up -d
 ```
 
 Or from source:
 
 ```bash
-docker compose --profile history up -d --build
+docker compose -f docker-compose.dev.yml --profile history up -d --build
 ```
 
 By default that stores the live history DB under `./history/history.db`, keeps

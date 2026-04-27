@@ -8,6 +8,7 @@ Use this path when you want:
 - a faster first deploy
 - a simpler update flow
 - the same image shape for the main UI, history sidecar, and admin sidecar
+- the normal runtime path for the main UI alone or the optional sidecars
 
 The published image lives at:
 
@@ -68,7 +69,7 @@ If you do not need custom profiles yet, `config/profiles.yaml` can stay absent.
 Use the release-oriented Compose file:
 
 ```bash
-docker compose -f docker-compose.ghcr.yml up -d
+docker compose up -d
 ```
 
 That file uses the same published image for:
@@ -78,11 +79,13 @@ That file uses the same published image for:
 - `enclosure-admin`
 
 The services still split by command and environment, but they all come from the
-same image.
+same image. The history and admin sidecars are optional services, not dev-only
+ones, so the default `docker-compose.yml` is the first-class path for all three
+runtime roles.
 
 ## Pick A Tag
 
-If you do not set anything, `docker-compose.ghcr.yml` defaults to:
+If you do not set anything, the default `docker-compose.yml` defaults to:
 
 ```dotenv
 JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:latest
@@ -109,7 +112,7 @@ Useful tag shapes:
 ## Start The Main UI
 
 ```bash
-docker compose -f docker-compose.ghcr.yml up -d
+docker compose up -d
 ```
 
 Open:
@@ -133,7 +136,7 @@ curl http://your-docker-host:8080/healthz
 ## Optional History Sidecar
 
 ```bash
-docker compose -f docker-compose.ghcr.yml --profile history up -d
+docker compose --profile history up -d
 ```
 
 By default this keeps:
@@ -142,12 +145,12 @@ By default this keeps:
 - rotating backups under `./history/backups`
 - promoted weekly/monthly copies under `./history/backups/long-term`
 
-The main UI will surface the `History` view when this sidecar is healthy.
+The main UI will surface the `History` view when this service is healthy.
 
 ## Optional Admin Sidecar
 
 ```bash
-docker compose -f docker-compose.ghcr.yml --profile admin up -d enclosure-admin
+docker compose --profile admin up -d enclosure-admin
 ```
 
 Open:
@@ -163,12 +166,15 @@ Use this when you want:
 - backup and restore tools
 - the enclosure/profile builder workspace
 
+This is the normal published-image path for the admin service. You only need
+`docker-compose.dev.yml` if you are intentionally building from source.
+
 ## Start Everything Together
 
 If you want the main UI plus both optional sidecars:
 
 ```bash
-docker compose -f docker-compose.ghcr.yml --profile history --profile admin up -d
+docker compose --profile history --profile admin up -d
 ```
 
 ## Update To A New Published Image
@@ -176,8 +182,8 @@ docker compose -f docker-compose.ghcr.yml --profile history --profile admin up -
 If you keep `latest`:
 
 ```bash
-docker compose -f docker-compose.ghcr.yml pull
-docker compose -f docker-compose.ghcr.yml up -d
+docker compose pull
+docker compose up -d
 ```
 
 If you pin a specific tag:
@@ -193,24 +199,23 @@ JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.14.2
 ```
 
 ```bash
-docker compose -f docker-compose.ghcr.yml pull
-docker compose -f docker-compose.ghcr.yml up -d
+docker compose pull
+docker compose up -d
 ```
 
 ## Switch Back To Source Builds
 
-If you want to go back to local builds later, just use the original Compose
-commands:
+If you want to go back to local builds later, use the dev Compose file:
 
 ```bash
-docker compose up -d --build
-docker compose --profile history up -d --build
-docker compose --profile admin up -d --build enclosure-admin
+docker compose -f docker-compose.dev.yml up -d --build
+docker compose -f docker-compose.dev.yml --profile history up -d --build
+docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin
 ```
 
 ## Troubleshooting Notes
 
-- If `docker compose -f docker-compose.ghcr.yml up -d` complains about missing
+- If `docker compose up -d` complains about missing
   `.env` values, you still need the same local `.env` and `config/config.yaml`
   setup as the source-build path.
 - If the app starts but cannot talk to your appliance, the likely issue is
@@ -218,14 +223,14 @@ docker compose --profile admin up -d --build enclosure-admin
 - If you want the exact image currently on the host, use:
 
   ```bash
-  docker compose -f docker-compose.ghcr.yml images
+  docker compose images
   ```
 
 - If you want to refresh only after a new image exists upstream, use:
 
   ```bash
-  docker compose -f docker-compose.ghcr.yml pull
-  docker compose -f docker-compose.ghcr.yml up -d
+  docker compose pull
+  docker compose up -d
   ```
 
 ## Related Pages

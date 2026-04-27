@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
+from app.config import BMCConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
     InventorySnapshot,
     LedAction,
@@ -21,6 +21,7 @@ from app.models.domain import (
     StorageViewRuntimePayload,
     StorageViewRuntimeSlot,
     StorageViewRuntimeView,
+    SystemLocatorStatusView,
 )
 from app.services.inventory import DiskRecord, InventoryService, InventorySourceBundle, build_lunid_aliases, infer_slot_count_from_layout, resolve_persistent_id
 from app.services.mapping_store import MappingStore
@@ -37,12 +38,15 @@ from app.services.profile_registry import (
     CORE_CSE_946_PROFILE_ID,
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
     SCALE_SSG_FRONT_24_PROFILE_ID,
+    SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 )
 from app.services.ssh_probe import SSHCommandResult
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.storage_views import resolve_system_storage_views
+from app.services.storage_view_templates import get_storage_view_template
+from app.services.supermicro_bmc import BMCInventory, BMCControllerRecord, BMCDriveRecord
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
 
 
@@ -52,12 +56,14 @@ def build_inventory_service(
     truenas_client,
     ssh_probe,
     temp_dir: str,
+    bmc_service=None,
 ) -> InventoryService:
     return InventoryService(
         settings,
         system,
         truenas_client,
         ssh_probe,
+        bmc_service,
         MappingStore(f"{temp_dir}\\slot_mappings.json"),
         ProfileRegistry(settings),
         SlotDetailStore(f"{temp_dir}\\slot_detail_cache.json"),
@@ -114,6 +120,213 @@ class InventoryHelpersTests(unittest.TestCase):
         )
 
         self.assertEqual(InventoryService._smart_candidate_devices(slot), [])
+
+    def test_smart_candidate_devices_ignores_bmc_slot_placeholders(self) -> None:
+        slot = SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            smart_device_names=["bmc-slot:2"],
+            device_name="bmc-slot:2",
+        )
+
+        self.assertEqual(InventoryService._smart_candidate_devices(slot), [])
+
+    def test_resolve_system_storage_views_can_use_runtime_inferred_fattwin_profile(self) -> None:
+        settings = Settings()
+        system = SystemConfig(
+            id="f629-node",
+            truenas=TrueNASConfig(platform="ipmi"),
+        )
+
+        views = resolve_system_storage_views(
+            system,
+            ProfileRegistry(settings),
+            inferred_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+        )
+
+        self.assertEqual([view.id for view in views], ["primary-chassis", "fat-twin-rear"])
+        self.assertEqual(views[1].binding.device_names, ["bmc-slot:6", "bmc-slot:7"])
+
+    def test_fattwin_rear_template_uses_stacked_slot_order(self) -> None:
+        template = get_storage_view_template("fat-twin-rear-2")
+
+        self.assertIsNotNone(template)
+        assert template is not None
+        self.assertEqual(template.rows, 2)
+        self.assertEqual(template.columns, 1)
+        self.assertEqual(template.slot_layout, [[1], [0]])
+
+    def test_summarize_ssh_failures_collapses_transport_level_batch_failure(self) -> None:
+        command_results = [
+            SSHCommandResult(command="esxcli storage core adapter list", ok=False, stderr="Authentication failed.", exit_code=255),
+            SSHCommandResult(command="esxcli storage core device list", ok=False, stderr="Authentication failed.", exit_code=255),
+            SSHCommandResult(command="/opt/lsi/storcli64/storcli64 /c0 show all J", ok=False, stderr="Authentication failed.", exit_code=255),
+        ]
+
+        warnings, status_message = InventoryService._summarize_ssh_failures(command_results, {})
+
+        self.assertEqual(
+            warnings,
+            [
+                "SSH connection or authentication failed before inventory commands could run: "
+                "Authentication failed. Host-side inventory enrichment is unavailable for this refresh."
+            ],
+        )
+        self.assertEqual(status_message, "SSH connection or authentication failed.")
+
+    def test_summarize_ssh_failures_collapses_missing_storcli_batch(self) -> None:
+        command_results = [
+            SSHCommandResult(
+                command="/opt/lsi/storcli64/storcli64 /c0 show all J",
+                ok=False,
+                stderr="sh: /opt/lsi/storcli64/storcli64: not found",
+                exit_code=127,
+            ),
+            SSHCommandResult(
+                command="/opt/lsi/storcli64/storcli64 /c0/vall show all J",
+                ok=False,
+                stderr="sh: /opt/lsi/storcli64/storcli64: not found",
+                exit_code=127,
+            ),
+            SSHCommandResult(
+                command="/opt/lsi/storcli64/storcli64 /c0/eall/sall show all J",
+                ok=False,
+                stderr="sh: /opt/lsi/storcli64/storcli64: not found",
+                exit_code=127,
+            ),
+        ]
+
+        warnings, status_message = InventoryService._summarize_ssh_failures(
+            command_results,
+            {"esxcli storage core adapter list": "vmhba64 iscsi_vmk"},
+        )
+
+        self.assertEqual(
+            warnings,
+            [
+                "StorCLI commands are unavailable on this ESXi host, so physical-drive enrichment "
+                "is unavailable for this refresh. Detail: sh: /opt/lsi/storcli64/storcli64: not found."
+            ],
+        )
+        self.assertEqual(status_message, "StorCLI commands unavailable.")
+
+    def test_summarize_ssh_failures_mentions_broadcom_lsi_stack_when_storcli_missing(self) -> None:
+        command_results = [
+            SSHCommandResult(
+                command="/opt/lsi/storcli64/storcli64 /c0 show all J",
+                ok=False,
+                stderr="sh: /opt/lsi/storcli64/storcli64: not found",
+                exit_code=127,
+            ),
+            SSHCommandResult(
+                command="/opt/lsi/storcli64/storcli64 /c0/vall show all J",
+                ok=False,
+                stderr="sh: /opt/lsi/storcli64/storcli64: not found",
+                exit_code=127,
+            ),
+            SSHCommandResult(
+                command="/opt/lsi/storcli64/storcli64 /c0/eall/sall show all J",
+                ok=False,
+                stderr="sh: /opt/lsi/storcli64/storcli64: not found",
+                exit_code=127,
+            ),
+        ]
+
+        warnings, status_message = InventoryService._summarize_ssh_failures(
+            command_results,
+            {
+                "esxcli software vib list": (
+                    "lsi-mr3 7.727.02.00-1OEM.700.1.0.15843807 BCM VMwareCertified\n"
+                    "lsuv2-lsiv2-drivers-plugin 1.0.0-12vmw.703.0.50.20036589 VMware VMwareCertified\n"
+                ),
+            },
+        )
+
+        self.assertEqual(
+            warnings,
+            [
+                "StorCLI commands are unavailable on this ESXi host. Broadcom/LSI driver packages "
+                "such as lsi-mr3 or lsuv2-lsiv2-drivers-plugin do not expose the MegaRAID member "
+                "detail this app needs; install a compatible StorCLI ESXi VIB for physical-drive "
+                "enrichment. Detail: sh: /opt/lsi/storcli64/storcli64: not found."
+            ],
+        )
+        self.assertEqual(status_message, "StorCLI commands unavailable.")
+
+    def test_esxi_storcli_runtime_warning_reports_zero_visible_controllers(self) -> None:
+        warning = InventoryService._esxi_storcli_runtime_warning(
+            {
+                "esxcli software vib list": (
+                    "lsi-mr3 7.727.02.00-1OEM.700.1.0.15843807 BCM VMwareCertified\n"
+                    "lsuv2-lsiv2-drivers-plugin 1.0.0-12vmw.703.0.50.20036589 VMware VMwareCertified\n"
+                    "vmware-storcli64 007.2705.0000.0000-01 BCM PartnerSupported\n"
+                ),
+                "/opt/lsi/storcli64/storcli64 /c0 show all J": (
+                    "{\n"
+                    "\"Controllers\":[{\n"
+                    "\"Command Status\":{\"Status\":\"Failure\",\"Description\":\"Controller 0 not found\"}\n"
+                    "}]\n"
+                    "}\n"
+                ),
+                "/opt/lsi/storcli64/storcli64 show J": (
+                    "{\n"
+                    "\"Controllers\":[{\n"
+                    "\"Response Data\":{\"Number of Controllers\" : 0}\n"
+                    "}]\n"
+                    "}\n"
+                ),
+            }
+        )
+
+        self.assertEqual(
+            warning,
+            "StorCLI is installed on this ESXi host, but it currently reports no visible "
+            "MegaRAID controllers. Broadcom/LSI packages such as lsi-mr3, lsuv2-lsiv2-drivers-plugin, "
+            "and vmware-storcli64 are present, but no compatible controller is being surfaced to StorCLI, "
+            "so physical-drive enrichment is unavailable for this refresh.",
+        )
+
+    def test_esxi_storcli_runtime_warning_reports_pci_passthrough_when_detected(self) -> None:
+        warning = InventoryService._esxi_storcli_runtime_warning(
+            {
+                "esxcli software vib list": (
+                    "lsi-mr3 7.727.02.00-1OEM.700.1.0.15843807 BCM VMwareCertified\n"
+                    "vmware-storcli64 007.2705.0000.0000-01 BCM PartnerSupported\n"
+                ),
+                "/opt/lsi/storcli64/storcli64 /c0 show all J": (
+                    "{\n"
+                    "\"Controllers\":[{\n"
+                    "\"Command Status\":{\"Status\":\"Failure\",\"Description\":\"Controller 0 not found\"}\n"
+                    "}]\n"
+                    "}\n"
+                ),
+                "/opt/lsi/storcli64/storcli64 show J": (
+                    "{\n"
+                    "\"Controllers\":[{\n"
+                    "\"Response Data\":{\"Number of Controllers\" : 0}\n"
+                    "}]\n"
+                    "}\n"
+                ),
+                "esxcli hardware pci pcipassthru list 2>&1 || true": (
+                    "Device ID     Enabled\n"
+                    "------------  -------\n"
+                    "0000:3b:00.0     true\n"
+                ),
+                "lspci 2>&1 || true": (
+                    "0000:3b:00.0 RAID bus controller: Broadcom MegaRAID SAS Invader Controller [vmhba2]\n"
+                ),
+            }
+        )
+
+        self.assertEqual(
+            warning,
+            "StorCLI is installed on this ESXi host, but the Broadcom MegaRAID controller is "
+            "currently configured for PCI passthrough (0000:3b:00.0). ESXi will not bind that "
+            "device to lsi_mr3 or expose it to StorCLI until passthrough is disabled and the host "
+            "is rebooted, so physical-drive enrichment is unavailable for this refresh.",
+        )
 
     def test_extract_block_sizes_from_scale_disk_metadata(self) -> None:
         disk = {
@@ -245,6 +458,310 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertEqual(smart.firmware_version, "2B2QEXE7")
             self.assertEqual(smart.negotiated_link_rate, "8.0GT/s")
             self.assertEqual(smart.transport_protocol, "NVMe")
+            self.assertEqual(smart.form_factor, "M.2")
+            self.assertIn("host-level SMART", smart.message or "")
+
+    def test_build_esxi_smart_summary_does_not_force_nvme_wording_for_sas_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="esxi-ft-node-2",
+                label="esxi-ft-node-2",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="10.13.37.121", user="root"),
+            )
+            settings = Settings(systems=[system])
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            slot = SlotView(
+                slot=2,
+                slot_label="02",
+                row_index=0,
+                column_index=0,
+                health="JBOD",
+                temperature_c=34,
+                logical_block_size=512,
+                physical_block_size=512,
+                raw_status={
+                    "storcli_physical_drive": {
+                        "interface": "SAS",
+                        "firmware": "A3A0",
+                        "link_speed": "6.0Gb/s",
+                        "media_errors": 0,
+                        "predictive_errors": 0,
+                        "other_errors": 0,
+                        "smart_alert": "No",
+                    }
+                },
+            )
+
+            smart = service._build_esxi_smart_summary(slot)
+
+            self.assertTrue(smart.available)
+            self.assertEqual(smart.transport_protocol, "SAS")
+            self.assertIsNone(smart.form_factor)
+            self.assertNotIn("NVMe SMART", smart.message or "")
+            self.assertIn("host-level SMART", smart.message or "")
+
+    def test_build_esxi_smart_summary_does_not_assume_m2_for_generic_nvme_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="generic-esxi-nvme",
+                label="generic-esxi-nvme",
+                truenas=TrueNASConfig(platform="esxi"),
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                ssh=SSHConfig(enabled=True, host="10.13.37.122", user="root"),
+            )
+            settings = Settings(systems=[system])
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                health="ONLINE",
+                temperature_c=31,
+                logical_block_size=4096,
+                physical_block_size=4096,
+                raw_status={
+                    "storcli_physical_drive": {
+                        "interface": "NVMe",
+                        "firmware": "1.0",
+                        "link_speed": "8.0GT/s",
+                        "media_errors": 0,
+                        "predictive_errors": 0,
+                        "other_errors": 0,
+                        "smart_alert": "No",
+                    }
+                },
+            )
+
+            smart = service._build_esxi_smart_summary(slot)
+
+            self.assertEqual(smart.transport_protocol, "NVMe")
+            self.assertEqual(smart.rotation_rate_rpm, 0)
+            self.assertIsNone(smart.form_factor)
+
+    def test_build_esxi_disk_records_links_local_sas_jbod_member_to_host_device(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="esxi-ft-node-2",
+                label="esxi-ft-node-2",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="10.13.37.121", user="root"),
+            )
+            settings = Settings(systems=[system])
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            ssh_data = ParsedSSHData(
+                esxi_storage_devices=[
+                    {
+                        "id": "naa.5000cca07316765c",
+                        "display_name": "Local HGST Disk (naa.5000cca07316765c)",
+                        "devfs_path": "/vmfs/devices/disks/naa.5000cca07316765c",
+                        "other_uids": "vml.02000000005000cca07316765c483732343041",
+                        "is_local": "true",
+                        "drive_type": "physical",
+                        "raid_level": "NA",
+                    }
+                ],
+                esxi_storage_paths=[
+                    {
+                        "id": "sas.50030480252d8100-sas.5000cca07316765d-naa.5000cca07316765c",
+                        "runtime_name": "vmhba2:C0:T27:L0",
+                        "device": "naa.5000cca07316765c",
+                        "target": "27",
+                        "transport": "sas",
+                        "target_identifier": "sas.5000cca07316765d",
+                        "state": "active",
+                    }
+                ],
+                esxi_storcli_physical_drives=[
+                    {
+                        "slot_key": "252:2",
+                        "enclosure_id": "252",
+                        "slot": 2,
+                        "controller_id": "c0",
+                        "device_id": "27",
+                        "state": "JBOD",
+                        "size": "3.638 TB",
+                        "interface": "SAS",
+                        "sector_size": "512B",
+                        "model": "H7240AS60SUN4.0T",
+                        "serial": "001518EDAYRX        PEGDAYRX",
+                        "firmware": "A3A0",
+                        "temperature_c": 34,
+                        "media_errors": 0,
+                        "predictive_errors": 0,
+                        "other_errors": 0,
+                        "smart_alert": "No",
+                        "connector_name": "Port 0 - 3 x1",
+                        "connected_port": "0(path0)",
+                        "link_speed": "6.0Gb/s",
+                    }
+                ],
+            )
+
+            records = service._build_esxi_disk_records(ssh_data)
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].pool_name, "ESXi local JBOD")
+            self.assertEqual(records[0].health, "ONLINE")
+            self.assertEqual(records[0].lunid, "naa.5000cca07316765c")
+            self.assertEqual(records[0].smart_devices, ["naa.5000cca07316765c", "vml.02000000005000cca07316765c483732343041"])
+            self.assertEqual(records[0].raw.get("esxi_runtime_name"), "vmhba2:C0:T27:L0")
+            self.assertEqual(records[0].raw.get("esxi_drive_type"), "physical")
+            self.assertEqual(records[0].raw.get("esxi_raid_level"), "NA")
+
+    def test_build_esxi_slot_smart_summary_merges_host_smart_for_local_jbod(self) -> None:
+        class DummySSHProbe:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            async def run_command(self, command: str) -> SSHCommandResult:
+                self.commands.append(command)
+                if command == "esxcli storage core device smart get -d naa.5000cca07316765c":
+                    return SSHCommandResult(
+                        command=command,
+                        ok=True,
+                        stdout=(
+                            "Parameter                 Value         Threshold  Worst  Raw\n"
+                            "------------------------  ------------  ---------  -----  ---\n"
+                            "Health Status             OK            N/A        N/A    N/A\n"
+                            "Write Error Count         0             N/A        N/A    N/A\n"
+                            "Read Error Count          444578        N/A        N/A    N/A\n"
+                            "Power Cycle Count         29            N/A        N/A    N/A\n"
+                            "Reallocated Sector Count  0             N/A        N/A    N/A\n"
+                            "Drive Temperature         34            N/A        N/A    N/A\n"
+                            "Write Sectors TOT Count   224246729061  N/A        N/A    N/A\n"
+                            "Read Sectors TOT Count    49378996762   N/A        N/A    N/A\n"
+                            "Program Fail Count        0             N/A        N/A    N/A\n"
+                            "Erase Fail Count          0             N/A        N/A    N/A\n"
+                        ),
+                        exit_code=0,
+                    )
+                return SSHCommandResult(command=command, ok=False, stderr="unexpected command", exit_code=1)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="esxi-ft-node-2",
+                label="esxi-ft-node-2",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="10.13.37.121", user="root"),
+            )
+            settings = Settings(systems=[system])
+            probe = DummySSHProbe()
+            service = build_inventory_service(settings, system, MagicMock(), probe, temp_dir)
+            slot = SlotView(
+                slot=2,
+                slot_label="02",
+                row_index=0,
+                column_index=0,
+                health="JBOD",
+                temperature_c=34,
+                logical_block_size=512,
+                physical_block_size=512,
+                smart_device_names=["naa.5000cca07316765c"],
+                raw_status={
+                    "storcli_physical_drive": {
+                        "interface": "SAS",
+                        "firmware": "A3A0",
+                        "link_speed": "6.0Gb/s",
+                        "media_errors": 0,
+                        "predictive_errors": 0,
+                        "other_errors": 0,
+                        "smart_alert": "No",
+                        "esxi_device_id": "naa.5000cca07316765c",
+                        "esxi_other_uids": "vml.02000000005000cca07316765c483732343041",
+                        "esxi_drive_type": "physical",
+                        "esxi_raid_level": "NA",
+                        "logical_block_size": 512,
+                    }
+                },
+            )
+
+            smart = asyncio.run(service._build_esxi_slot_smart_summary(slot))
+
+            self.assertTrue(smart.available)
+            self.assertEqual(smart.transport_protocol, "SAS")
+            self.assertEqual(smart.smart_health_status, "PASSED")
+            self.assertEqual(smart.power_cycle_count, 29)
+            self.assertEqual(smart.read_error_count, 444578)
+            self.assertEqual(smart.write_error_count, 0)
+            self.assertIsNone(smart.uncorrected_read_errors)
+            self.assertIsNone(smart.uncorrected_write_errors)
+            self.assertEqual(smart.bytes_written, 114814325279232)
+            self.assertEqual(smart.bytes_read, 25282046342144)
+            self.assertIn("local physical device", smart.message or "")
+            self.assertEqual(
+                probe.commands,
+                ["esxcli storage core device smart get -d naa.5000cca07316765c"],
+            )
+
+    def test_build_esxi_topology_members_uses_jbod_class_for_direct_member(self) -> None:
+        member = InventoryService._build_esxi_topology_members(
+            [
+                DiskRecord(
+                    raw={
+                        "storcli_slot": "252:2",
+                        "storcli_state": "JBOD",
+                        "virtual_drive_names": [],
+                    },
+                    device_name="252:2",
+                    path_device_name=None,
+                    multipath_name=None,
+                    multipath_member=None,
+                    serial="SERIAL0",
+                    model="H7240AS60SUN4.0T",
+                    size_bytes=3638000000000,
+                    identifier="SERIAL0",
+                    health="ONLINE",
+                    pool_name="ESXi local JBOD",
+                    lunid="naa.5000cca07316765c",
+                    bus="SAS",
+                    temperature_c=34,
+                    last_smart_test_type=None,
+                    last_smart_test_status=None,
+                    last_smart_test_lifetime_hours=None,
+                    logical_block_size=512,
+                    physical_block_size=512,
+                    enclosure_id="supermicro-fat-twin-front-6",
+                    slot=2,
+                    smart_devices=["naa.5000cca07316765c"],
+                    lookup_keys={"252:2", "serial0"},
+                )
+            ]
+        )
+
+        resolved = member["252:2"]
+        self.assertEqual(resolved.pool_name, "ESXi local JBOD")
+        self.assertEqual(resolved.vdev_class, "JBOD")
+        self.assertEqual(resolved.topology_label, "ESXi local Enc > slot 252:2 > direct disk")
+        self.assertEqual(resolved.health, "ONLINE")
+
+    def test_correlate_esxi_host_keeps_aoc_specific_storcli_warning_on_aoc_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="cryo-esxi",
+                label="CryoStorage ESXi",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="10.88.88.20", user="root"),
+            )
+            settings = Settings(systems=[system])
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            warnings: list[str] = []
+
+            _slots, _enclosures, _selected_meta, _layout_rows, _slot_count, _columns = service._correlate_esxi_host(
+                ParsedSSHData(),
+                warnings,
+                None,
+            )
+
+            self.assertTrue(
+                any(
+                    "The AOC carrier-card view needs StorCLI to map physical M.2 slots behind the RAID LUNs."
+                    in warning
+                    for warning in warnings
+                )
+            )
 
     def test_build_esxi_platform_context_surfaces_useful_sections(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -367,6 +884,120 @@ class InventoryHelpersTests(unittest.TestCase):
             member_entries = {entry["label"]: entry["value"] for entry in member_group["entries"]}
             self.assertEqual(member_entries["WWN"], "3025385981B2633B")
             self.assertEqual(member_entries["FDE Type"], "TCG Opal")
+
+    def test_build_esxi_platform_context_hides_remote_san_and_falls_back_to_local_devices(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="esxi-ft-node-2",
+                label="esxi-ft-node-2",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="10.13.37.121", user="root"),
+            )
+            settings = Settings(systems=[system])
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            ssh_data = ParsedSSHData(
+                esxi_storage_devices=[
+                    {
+                        "id": "t10.ATA_____SATADOM_LOCAL",
+                        "display_name": "Local ATA Disk (t10.ATA_____SATADOM_LOCAL)",
+                        "is_local": "true",
+                        "is_ssd": "true",
+                        "is_boot_device": "false",
+                        "devfs_path": "/vmfs/devices/disks/t10.ATA_____SATADOM_LOCAL",
+                        "vendor": "ATA",
+                        "model": "SATADOM-SL 3TE7",
+                        "revision": "04B",
+                        "size": "114473",
+                        "device_type": "Direct-Access",
+                        "multipath_plugin": "HPP",
+                        "status": "on",
+                    },
+                    {
+                        "id": "naa.6589cfc000000c31f0073f88a08ea329",
+                        "display_name": "TrueNAS iSCSI Disk (naa.6589cfc000000c31f0073f88a08ea329)",
+                        "is_local": "false",
+                        "is_ssd": "false",
+                        "devfs_path": "/vmfs/devices/disks/naa.6589cfc000000c31f0073f88a08ea329",
+                        "vendor": "TrueNAS",
+                        "model": "iSCSI Disk",
+                        "size": "8388608",
+                        "device_type": "Direct-Access",
+                        "multipath_plugin": "NMP",
+                    },
+                    {
+                        "id": "naa.5006016844602c9d",
+                        "display_name": "DGC Fibre Channel Disk (naa.5006016844602c9d)",
+                        "is_local": "false",
+                        "devfs_path": "/vmfs/devices/disks/naa.5006016844602c9d",
+                        "vendor": "DGC",
+                        "model": "VRAID",
+                        "size": "4194304",
+                        "device_type": "Direct-Access",
+                        "multipath_plugin": "NMP",
+                    },
+                ],
+                esxi_filesystems=[
+                    {
+                        "mount_point": "/vmfs/volumes/local-store",
+                        "volume_name": "Local-Store",
+                        "mounted": "true",
+                        "type": "VMFS-6",
+                        "size": "104857600",
+                        "free": "52428800",
+                    },
+                    {
+                        "mount_point": "/vmfs/volumes/san-store",
+                        "volume_name": "SAN-Store",
+                        "mounted": "true",
+                        "type": "VMFS-6",
+                        "size": "209715200",
+                        "free": "104857600",
+                    },
+                    {
+                        "mount_point": "/vmfs/volumes/fc-store",
+                        "volume_name": "FC-Store",
+                        "mounted": "true",
+                        "type": "VMFS-6",
+                        "size": "209715200",
+                        "free": "104857600",
+                    },
+                ],
+                esxi_vmfs_extents=[
+                    {
+                        "volume_name": "Local-Store",
+                        "device_name": "t10.ATA_____SATADOM_LOCAL",
+                        "partition": "1",
+                    },
+                    {
+                        "volume_name": "SAN-Store",
+                        "device_name": "naa.6589cfc000000c31f0073f88a08ea329",
+                        "partition": "1",
+                    },
+                    {
+                        "volume_name": "FC-Store",
+                        "device_name": "naa.5006016844602c9d",
+                        "partition": "1",
+                    },
+                ],
+            )
+
+            context = service._build_esxi_platform_context(ssh_data)
+
+            self.assertEqual(context["details"]["title"], "Platform Details")
+            self.assertIn("StorCLI physical-member detail is unavailable", context["details"]["summary"])
+            self.assertIn("Remote iSCSI / FC presentations are hidden.", context["details"]["summary"])
+            section_ids = [section["id"] for section in context["details"]["sections"]]
+            self.assertEqual(section_ids, ["datastores", "local-devices"])
+            datastore_section = context["details"]["sections"][0]
+            self.assertEqual(datastore_section["summary"], "1 local shown · 2 remote SAN omitted · Local-Store")
+            self.assertEqual([group["title"] for group in datastore_section["groups"]], ["Local-Store"])
+            local_devices_section = context["details"]["sections"][1]
+            self.assertEqual(local_devices_section["summary"], "1 local shown · 2 remote SAN omitted")
+            self.assertEqual(len(local_devices_section["groups"]), 1)
+            self.assertEqual(
+                local_devices_section["groups"][0]["title"],
+                "Local ATA Disk (t10.ATA_____SATADOM_LOCAL)",
+            )
 
     def test_esxi_inferred_aoc_storage_view_reuses_storcli_slots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2231,6 +2862,214 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(slot_view.vdev_class, "special")
 
 
+class InventoryBmcCorrelationTests(unittest.TestCase):
+    def test_correlate_ipmi_host_uses_bmc_slot_hints_for_fattwin_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="ft-node-1",
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                truenas=TrueNASConfig(platform="ipmi"),
+                bmc=BMCConfig(enabled=True, host="10.13.0.20", username="ADMIN", password="secret"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+                bmc_service=MagicMock(),
+            )
+            warnings: list[str] = []
+            bmc_inventory = BMCInventory(
+                system_model="SuperServer SYS-F629P3-RC1B",
+                controllers=[BMCControllerRecord(controller_id=0, product_name="AVAGO 3108 MegaRAID")],
+                drives=[
+                    BMCDriveRecord(
+                        controller_id=0,
+                        physical_index=0,
+                        slot_number=2,
+                        enclosure_id="252",
+                        model="H7240AS60SUN4.0T",
+                        serial="SERIAL-1",
+                        size_bytes=4_000_000_000_000,
+                        health="ONLINE",
+                        identify_active=True,
+                    )
+                ],
+            )
+
+            slot_views, enclosures, selected_meta, _layout_rows, layout_slot_count, _layout_columns = service._correlate_bmc_host(
+                warnings,
+                None,
+                bmc_inventory,
+            )
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(enclosures[0].id, SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
+            self.assertEqual(selected_meta["id"], SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
+            self.assertEqual(layout_slot_count, 6)
+            self.assertFalse(slot_views[0].present)
+            self.assertTrue(slot_views[2].present)
+            self.assertEqual(slot_views[2].serial, "SERIAL-1")
+            self.assertEqual(slot_views[2].led_backend, "supermicro_bmc")
+            self.assertEqual(slot_views[2].raw_status["bmc_slot_number"], 2)
+
+    def test_correlate_esxi_host_uses_bmc_slot_hints_for_fattwin_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="ft-node-1",
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="esxi-ft-node-1.gcs8.io", user="root"),
+                bmc=BMCConfig(enabled=True, host="10.13.0.20", username="ADMIN", password="secret"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+                bmc_service=MagicMock(),
+            )
+            ssh_data = ParsedSSHData(
+                esxi_storcli_physical_drives=[
+                    {
+                        "controller_id": "c0",
+                        "enclosure_id": "252",
+                        "slot": 2,
+                        "slot_key": "252:2",
+                        "serial": "SERIAL-1",
+                        "model": "H7240AS60SUN4.0T",
+                        "size": "4 TB",
+                        "interface": "SAS",
+                        "state": "Onln",
+                    }
+                ],
+                esxi_storcli_virtual_drives=[],
+            )
+            bmc_inventory = BMCInventory(
+                system_model="SuperServer SYS-F629P3-RC1B",
+                drives=[
+                    BMCDriveRecord(
+                        controller_id=0,
+                        physical_index=0,
+                        slot_number=2,
+                        enclosure_id="252",
+                        model="H7240AS60SUN4.0T",
+                        serial="SERIAL-1",
+                        size_bytes=4_000_000_000_000,
+                        health="ONLINE",
+                    )
+                ],
+            )
+
+            slot_views, _enclosures, _selected_meta, _layout_rows, _layout_slot_count, _layout_columns = service._correlate_esxi_host(
+                ssh_data,
+                [],
+                None,
+                bmc_inventory,
+            )
+
+            self.assertFalse(slot_views[0].present)
+            self.assertTrue(slot_views[2].present)
+            self.assertEqual(slot_views[2].serial, "SERIAL-1")
+            self.assertEqual(slot_views[2].led_backend, "supermicro_bmc")
+            self.assertEqual(slot_views[2].raw_status["bmc_slot_number"], 2)
+
+    def test_correlate_esxi_host_does_not_emit_aoc_warning_for_fattwin_bmc_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="ft-node-1",
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="esxi-ft-node-1.gcs8.io", user="root"),
+                bmc=BMCConfig(enabled=True, host="10.13.0.20", username="ADMIN", password="secret"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+                bmc_service=MagicMock(),
+            )
+            warnings: list[str] = []
+            bmc_inventory = BMCInventory(
+                system_model="SuperServer SYS-F629P3-RC1B",
+                drives=[
+                    BMCDriveRecord(
+                        controller_id=0,
+                        physical_index=0,
+                        slot_number=2,
+                        enclosure_id="252",
+                        model="H7240AS60SUN4.0T",
+                        serial="SERIAL-1",
+                        size_bytes=4_000_000_000_000,
+                        health="ONLINE",
+                    )
+                ],
+            )
+
+            slot_views, _enclosures, _selected_meta, _layout_rows, _layout_slot_count, _layout_columns = service._correlate_esxi_host(
+                ParsedSSHData(),
+                warnings,
+                None,
+                bmc_inventory,
+            )
+
+            self.assertEqual(warnings, [])
+            self.assertTrue(slot_views[2].present)
+            self.assertEqual(slot_views[2].serial, "SERIAL-1")
+
+    def test_correlate_esxi_host_marks_bmc_present_slot_healthy_without_storcli_members(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="ft-node-1",
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="esxi-ft-node-1.gcs8.io", user="root"),
+                bmc=BMCConfig(enabled=True, host="10.13.0.20", username="ADMIN", password="secret"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+                bmc_service=MagicMock(),
+            )
+            bmc_inventory = BMCInventory(
+                system_model="SuperServer SYS-F629P3-RC1B",
+                drives=[
+                    BMCDriveRecord(
+                        controller_id=0,
+                        physical_index=0,
+                        slot_number=2,
+                        enclosure_id="252",
+                        model="H7240AS60SUN4.0T",
+                        serial="SERIAL-1",
+                        size_bytes=4_000_000_000_000,
+                        health="ONLINE",
+                    )
+                ],
+            )
+
+            slot_views, _enclosures, _selected_meta, _layout_rows, _layout_slot_count, _layout_columns = service._correlate_esxi_host(
+                ParsedSSHData(),
+                [],
+                None,
+                bmc_inventory,
+            )
+
+            self.assertTrue(slot_views[2].present)
+            self.assertEqual(slot_views[2].health, "ONLINE")
+            self.assertEqual(slot_views[2].state, SlotState.healthy)
+
+
 class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _build_core_ses_enclosures() -> list[SESMapEnclosure]:
@@ -3861,6 +4700,7 @@ Enclosure Status diagnostic page:
             system=system,
             truenas_client=AsyncMock(),
             ssh_probe=AsyncMock(),
+            bmc_service=None,
             mapping_store=MappingStore(Path(tempfile.mkdtemp()) / "mappings.json"),
             profile_registry=ProfileRegistry(settings),
         )
@@ -3918,6 +4758,7 @@ Enclosure Status diagnostic page:
             system=system,
             truenas_client=AsyncMock(),
             ssh_probe=AsyncMock(),
+            bmc_service=None,
             mapping_store=MappingStore(Path(tempfile.mkdtemp()) / "mappings.json"),
             profile_registry=ProfileRegistry(settings),
         )
@@ -5787,6 +6628,88 @@ Enclosure Status diagnostic page:
                 ("sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg11", "10.0.0.20"),
                 awaited,
             )
+
+    async def test_set_slot_led_uses_supermicro_bmc_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="ft-node-1",
+                truenas=TrueNASConfig(platform="ipmi"),
+                bmc=BMCConfig(enabled=True, host="10.13.0.20", username="ADMIN", password="secret"),
+            )
+            bmc_service = MagicMock()
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+                bmc_service=bmc_service,
+            )
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                led_supported=True,
+                led_backend="supermicro_bmc",
+                raw_status={
+                    "bmc_controller_id": 0,
+                    "bmc_physical_index": 4,
+                },
+            )
+            snapshot = InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
+            service.get_snapshot = AsyncMock(return_value=snapshot)
+
+            await service.set_slot_led(0, LedAction.identify, invalidate_snapshot=False)
+            await service.set_slot_led(0, LedAction.clear, invalidate_snapshot=False)
+
+            self.assertEqual(
+                bmc_service.set_drive_identify.call_args_list,
+                [
+                    unittest.mock.call(0, 4, True),
+                    unittest.mock.call(0, 4, False),
+                ],
+            )
+
+    async def test_system_locator_status_reads_bmc_uid_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="ft-node-1",
+                truenas=TrueNASConfig(platform="ipmi"),
+                bmc=BMCConfig(enabled=True, host="10.13.0.20", username="ADMIN", password="secret"),
+            )
+            bmc_service = MagicMock()
+            bmc_service.get_uid_status.return_value = True
+            bmc_service.set_uid_active.return_value = False
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+                bmc_service=bmc_service,
+            )
+            service._cache["__default__"] = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+            service._cache_until["__default__"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+
+            status = await service.get_system_locator_status()
+            cleared = await service.set_system_locator(False)
+
+            self.assertEqual(
+                status,
+                SystemLocatorStatusView(
+                    supported=True,
+                    active=True,
+                    backend="supermicro_bmc",
+                    reason=None,
+                ),
+            )
+            self.assertEqual(cleared.backend, "supermicro_bmc")
+            self.assertFalse(cleared.active)
+            self.assertNotIn("__default__", service._cache)
 
 
 if __name__ == "__main__":

@@ -107,6 +107,8 @@ class SmartSummaryView(BaseModel):
     estimated_remaining_bytes_written: int | None = None
     read_commands: int | None = None
     write_commands: int | None = None
+    read_error_count: int | None = None
+    write_error_count: int | None = None
     media_errors: int | None = None
     predictive_errors: int | None = None
     non_medium_errors: int | None = None
@@ -280,6 +282,17 @@ class InventorySnapshot(BaseModel):
 
 class LedRequest(BaseModel):
     action: LedAction
+
+
+class SystemLocatorRequest(BaseModel):
+    active: bool
+
+
+class SystemLocatorStatusView(BaseModel):
+    supported: bool = False
+    active: bool = False
+    backend: str | None = None
+    reason: str | None = None
 
 
 class MappingRequest(BaseModel):
@@ -735,7 +748,7 @@ class HANodeRequest(BaseModel):
 class SystemSetupRequest(BaseModel):
     system_id: str | None = None
     label: str
-    platform: Literal["core", "scale", "linux", "quantastor", "esxi"] = "core"
+    platform: Literal["core", "scale", "linux", "quantastor", "esxi", "ipmi"] = "core"
     truenas_host: str
     api_key: str | None = None
     api_user: str | None = None
@@ -759,6 +772,12 @@ class SystemSetupRequest(BaseModel):
     ssh_strict_host_key_checking: bool = True
     ssh_timeout_seconds: int = 15
     ssh_commands: list[str] = Field(default_factory=list)
+    bmc_enabled: bool = False
+    bmc_host: str | None = None
+    bmc_username: str | None = None
+    bmc_password: str | None = None
+    bmc_verify_ssl: bool = True
+    bmc_timeout_seconds: int = 15
     default_profile_id: str | None = None
     storage_views: list[StorageViewRequest] | None = None
     replace_existing: bool = False
@@ -777,13 +796,15 @@ class SystemSetupRequest(BaseModel):
         "ssh_user",
         "ssh_key_path",
         "ssh_known_hosts_path",
+        "bmc_host",
+        "bmc_username",
         "default_profile_id",
     )
     @classmethod
     def sanitize_text_fields(cls, value: str | None) -> str | None:
         return trim_optional_text(value, max_length=1024)
 
-    @field_validator("api_password", "ssh_password", "ssh_sudo_password")
+    @field_validator("api_password", "ssh_password", "ssh_sudo_password", "bmc_password")
     @classmethod
     def sanitize_secret_fields(cls, value: str | None) -> str | None:
         return preserve_optional_secret(value, max_length=1024)
@@ -813,7 +834,7 @@ class SystemSetupRequest(BaseModel):
             cleaned.append(node)
         return cleaned
 
-    @field_validator("timeout_seconds", "ssh_timeout_seconds")
+    @field_validator("timeout_seconds", "ssh_timeout_seconds", "bmc_timeout_seconds")
     @classmethod
     def clamp_timeout(cls, value: int) -> int:
         return max(1, min(int(value), 300))
@@ -826,17 +847,32 @@ class SystemSetupRequest(BaseModel):
     @model_validator(mode="after")
     def validate_required_fields(self) -> "SystemSetupRequest":
         ssh_only_host_platform = self.platform in {"linux", "esxi"}
-        primary_host = self.truenas_host or (self.ssh_host if ssh_only_host_platform else None)
+        bmc_only_host_platform = self.platform == "ipmi"
+        primary_host = (
+            self.truenas_host
+            or (self.ssh_host if ssh_only_host_platform else None)
+            or (self.bmc_host if bmc_only_host_platform else None)
+        )
         if not self.label:
             raise ValueError("A system label is required.")
         if not primary_host:
             raise ValueError("A host is required.")
+        if bmc_only_host_platform and not self.bmc_enabled:
+            raise ValueError("Enable BMC access for IPMI / BMC Only systems.")
         if ssh_only_host_platform and not self.truenas_host:
+            self.truenas_host = primary_host
+        if bmc_only_host_platform and not self.truenas_host:
             self.truenas_host = primary_host
         if self.ssh_enabled and not self.ssh_host:
             self.ssh_host = primary_host
         if self.ssh_enabled and not self.ssh_user:
             raise ValueError("An SSH user is required when SSH enrichment is enabled.")
+        if self.bmc_enabled and not self.bmc_host:
+            self.bmc_host = primary_host
+        if self.bmc_enabled and not self.bmc_username:
+            raise ValueError("A BMC username is required when BMC access is enabled.")
+        if self.bmc_enabled and not self.bmc_password:
+            raise ValueError("A BMC password is required when BMC access is enabled.")
         return self
 
 
@@ -967,7 +1003,7 @@ class SSHKeyGenerateRequest(BaseModel):
 
 
 class SystemSetupBootstrapRequest(BaseModel):
-    platform: Literal["core", "scale", "linux", "quantastor", "esxi"] = "core"
+    platform: Literal["core", "scale", "linux", "quantastor", "esxi", "ipmi"] = "core"
     host: str
     port: int = 22
     bootstrap_user: str
@@ -1040,8 +1076,52 @@ class SystemSetupBootstrapRequest(BaseModel):
         return self
 
 
+class ESXiHostPrepInstallRequest(BaseModel):
+    host: str
+    port: int = 22
+    user: str
+    key_path: str | None = None
+    password: str | None = None
+    known_hosts_path: str | None = "/app/data/known_hosts"
+    strict_host_key_checking: bool = True
+    timeout_seconds: int = 15
+    upload_token: str
+
+    @field_validator("host", "user", "key_path", "known_hosts_path", "upload_token")
+    @classmethod
+    def sanitize_text_fields(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=4096)
+
+    @field_validator("password")
+    @classmethod
+    def sanitize_secret_field(cls, value: str | None) -> str | None:
+        return preserve_optional_secret(value, max_length=4096)
+
+    @field_validator("port")
+    @classmethod
+    def clamp_port(cls, value: int) -> int:
+        return max(1, min(int(value), 65535))
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def clamp_timeout(cls, value: int) -> int:
+        return max(1, min(int(value), 300))
+
+    @model_validator(mode="after")
+    def validate_requirements(self) -> "ESXiHostPrepInstallRequest":
+        if not self.host:
+            raise ValueError("An ESXi SSH host is required.")
+        if not self.user:
+            raise ValueError("An ESXi SSH user is required.")
+        if not self.password and not self.key_path:
+            raise ValueError("Provide either an ESXi SSH password or key path.")
+        if not self.upload_token:
+            raise ValueError("Choose a staged ESXi package before installing it.")
+        return self
+
+
 class SystemSetupSudoPreviewRequest(BaseModel):
-    platform: Literal["core", "scale", "linux", "quantastor", "esxi"] = "core"
+    platform: Literal["core", "scale", "linux", "quantastor", "esxi", "ipmi"] = "core"
     service_user: str = "jbodmap"
     install_sudo_rules: bool = True
     sudo_commands: list[str] = Field(default_factory=list)

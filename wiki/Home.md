@@ -65,6 +65,8 @@ It gives you:
 - multi-system selection
 - profile-driven enclosure layouts
 - both local-build and published-GHCR deployment paths
+- a main UI that can run alone plus optional history/admin services that share
+  the same supported deployment model
 
 ## Current Validated Hardware
 
@@ -72,6 +74,12 @@ It gives you:
 - TrueNAS SCALE on a Supermicro `SSG-6048R-E1CR36L` with front `24` and rear `12`
 - OSNexus Quantastor on a Supermicro `SSG-2028R-DE2CR24L` shared front `24`
 - Generic Linux on a Supermicro `SYS-2029GP-TR` with a right-side `2`-bay NVMe profile
+- Supermicro FatTwin `SYS-F629P3-RC1B` nodes through the built-in `ipmi`
+  platform with a validated front `6`-bay view, inferred rear `2`-bay view,
+  Broadcom storage monitoring, and BMC-backed slot identify
+- VMware ESXi `7.0.3` on that same FatTwin / Broadcom 3108 path, using BMC
+  slot truth plus SSH `esxcli` / StorCLI enrichment for a read-only front
+  `6`-bay JBOD-member view
 - VMware ESXi `7.0.3` on a Supermicro `AOC-SLG4-2H8M2`, using SSH `esxcli`
   plus StorCLI for a read-only `2`-slot M.2 RAID-member view
 - UniFi UNVR as generic Linux over SSH with a built-in `4`-bay profile and
@@ -84,17 +92,18 @@ It gives you:
 - `0.13.0` shipped the selectable backup/debug-bundle scope work, the demo
   builder seed path, the first embedded boot-media view for UniFi, and the
   current internal-view visual polish
-- `0.14.0` rounds out the current carry-over cycle with first-pass read-only
-  ESXi support on the validated `AOC-SLG4-2H8M2` path, better admin guardrails
-  around non-Linux hosts, and a more responsive stale-cache-first runtime
-  switching path for the already validated systems
-- `0.14.1` locked in the narrow SSH-only setup hotfix: `esxi`, generic Linux,
-  and UniFi-family systems now persist cleanly when SSH is the real source of
-  truth and no API host should be required first
-- `0.14.2` adds the first `Platform Details` follow-up under the enclosure
-  canvas for ESXi-backed oddball hardware, and it makes the live app surfaces
-  more self-describing with running-version badges plus admin-side
-  cross-container version checks
+- `0.14.0` added the first read-only ESXi path on the validated
+  `AOC-SLG4-2H8M2` carrier view, plus tighter admin guardrails around
+  SSH-first non-Linux hosts
+- `0.14.1` locked in the SSH-only setup hotfix so `esxi`, generic Linux, and
+  UniFi-family systems persist cleanly when no API host should be required
+- `0.14.2` added the first ESXi `Platform Details` panel plus live version
+  visibility across the main UI, history sidecar, and admin runtime cards
+- the current `0.15.0-dev` carry-over slice is broadening that ESXi work into
+  a Supermicro BMC / IPMI-first inventory path: validated FatTwin front/rear
+  profiles, BMC-backed slot truth and identify, optional ESXi host-prep for
+  operator-supplied StorCLI bundles, and direct JBOD SMART enrichment when the
+  host exposes both StorCLI and `esxcli storage core device smart get`
 
 ## Visual Walkthrough
 

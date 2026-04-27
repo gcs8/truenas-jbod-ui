@@ -30,12 +30,14 @@ from app.models.domain import (
     StorageViewRuntimeView,
     SourceStatus,
     SystemOption,
+    SystemLocatorStatusView,
 )
 from app.perf import add_perf_metadata, perf_stage
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import (
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
     ProfileRegistry,
+    SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 )
@@ -64,6 +66,7 @@ from app.services.parsers import (
     normalize_hex_identifier,
     normalize_lookup_keys,
     normalize_text,
+    parse_esxcli_smart_get,
     parse_pool_query_topology,
     parse_nvme_id_ctrl_summary,
     parse_nvme_id_ns_summary,
@@ -76,10 +79,12 @@ from app.services.parsers import (
 )
 from app.services.ssh_probe import SSHProbe
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
+from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebsocketClient
 
 logger = logging.getLogger(__name__)
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
+BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
 UNIFI_GPIO_LED_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
@@ -262,6 +267,7 @@ class InventorySourceBundle:
     sources: dict[str, SourceStatus]
     scale_ses_data: ParsedSSHData
     quantastor_ses_data: ParsedSSHData
+    bmc_inventory: BMCInventory | None = None
 
 
 class InventoryService:
@@ -271,6 +277,7 @@ class InventoryService:
         system: SystemConfig,
         truenas_client: TrueNASWebsocketClient | QuantastorRESTClient,
         ssh_probe: SSHProbe,
+        bmc_service: SupermicroBMCService | None,
         mapping_store: MappingStore,
         profile_registry: ProfileRegistry,
         slot_detail_store: SlotDetailStore | None = None,
@@ -279,6 +286,7 @@ class InventoryService:
         self.system = system
         self.truenas_client = truenas_client
         self.ssh_probe = ssh_probe
+        self.bmc_service = bmc_service
         self.mapping_store = mapping_store
         self.profile_registry = profile_registry
         self.slot_detail_store = slot_detail_store
@@ -396,7 +404,12 @@ class InventoryService:
             force_refresh=force_refresh,
             allow_stale_cache=not force_refresh,
         )
-        storage_views = resolve_system_storage_views(self.system, self.profile_registry)
+        inferred_profile_id = active_snapshot.selected_profile.id if active_snapshot.selected_profile else None
+        storage_views = resolve_system_storage_views(
+            self.system,
+            self.profile_registry,
+            inferred_profile_id=inferred_profile_id,
+        )
         target_snapshots: dict[str | None, InventorySnapshot] = {
             active_snapshot.selected_enclosure_id: active_snapshot,
         }
@@ -1086,17 +1099,226 @@ class InventoryService:
             self._snapshot_locks[cache_key] = lock
         return lock
 
+    @staticmethod
+    def _summarize_ssh_failures(
+        command_results: list[SSHCommandResult],
+        outputs: dict[str, str],
+    ) -> tuple[list[str], str]:
+        failures = [item for item in command_results if not item.ok]
+        if not failures:
+            return [], "SSH probe completed."
+
+        # When the SSH session fails before any command can start, Paramiko
+        # produces the same synthetic startup failure for every configured
+        # command. Collapse that fan-out into one user-facing warning.
+        unique_stderr = {
+            normalize_text(failure.stderr) or normalize_text(failure.stdout)
+            for failure in failures
+            if normalize_text(failure.stderr) or normalize_text(failure.stdout)
+        }
+        unique_exit_codes = {failure.exit_code for failure in failures}
+        transport_level_failure = (
+            not outputs
+            and len(failures) == len(command_results)
+            and unique_exit_codes == {255}
+            and len(unique_stderr) == 1
+        )
+        if transport_level_failure:
+            detail = next(iter(unique_stderr)).rstrip(".")
+            return (
+                [
+                    "SSH connection or authentication failed before inventory commands could run: "
+                    f"{detail}. Host-side inventory enrichment is unavailable for this refresh."
+                ],
+                "SSH connection or authentication failed.",
+            )
+
+        normalized_outputs = {
+            canonicalize_ssh_command(command): output
+            for command, output in outputs.items()
+        }
+        failed_canonical_commands = [canonicalize_ssh_command(failure.command) for failure in failures]
+        storcli_command_failures = [
+            command
+            for command in failed_canonical_commands
+            if command.startswith("storcli ")
+        ]
+        storcli_commands_missing = (
+            storcli_command_failures
+            and len(storcli_command_failures) == len(failures)
+            and unique_exit_codes == {127}
+        )
+        if storcli_commands_missing:
+            detail = next(iter(unique_stderr)).rstrip(".") if len(unique_stderr) == 1 else None
+            vib_output = (normalized_outputs.get("esxcli software vib list") or "").lower()
+            broadcom_stack_detected = any(
+                token in vib_output
+                for token in (
+                    "lsi-mr3",
+                    "megaraid",
+                    "lsuv2-lsiv2-drivers-plugin",
+                    "avago_bootbank_lsi-mr3",
+                    "bcm_bootbank_vmware-storcli64",
+                )
+            )
+            if broadcom_stack_detected:
+                warning = (
+                    "StorCLI commands are unavailable on this ESXi host. Broadcom/LSI driver packages "
+                    "such as lsi-mr3 or lsuv2-lsiv2-drivers-plugin do not expose the MegaRAID "
+                    "member detail this app needs; install a compatible StorCLI ESXi VIB for "
+                    "physical-drive enrichment."
+                )
+            else:
+                warning = (
+                    "StorCLI commands are unavailable on this ESXi host, so physical-drive "
+                    "enrichment is unavailable for this refresh."
+                )
+            if detail:
+                warning = f"{warning} Detail: {detail}."
+            return ([warning], "StorCLI commands unavailable.")
+
+        return (
+            [
+                f"SSH command failed: {failure.command} (exit {failure.exit_code})"
+                for failure in failures
+            ],
+            "Some SSH commands failed.",
+        )
+
+    @staticmethod
+    def _esxi_storcli_runtime_warning(outputs: dict[str, str]) -> str | None:
+        normalized_outputs = {
+            canonicalize_ssh_command(command): output
+            for command, output in outputs.items()
+        }
+        storcli_outputs = [
+            output
+            for command, output in normalized_outputs.items()
+            if command.startswith("storcli ")
+        ]
+        if not storcli_outputs:
+            return None
+
+        storcli_text = "\n".join(storcli_outputs).lower()
+        no_controller_visible = any(
+            needle in storcli_text
+            for needle in (
+                '"number of controllers" : 0',
+                "number of controllers = 0",
+                "controller 0 not found",
+                "no controller found",
+            )
+        )
+        if not no_controller_visible:
+            return None
+
+        passthrough_enabled = InventoryService._extract_enabled_passthrough_addresses(
+            normalized_outputs.get("esxcli hardware pci pcipassthru list") or ""
+        )
+        megaraid_pci_addresses = InventoryService._extract_megaraid_pci_addresses(
+            normalized_outputs.get("lspci") or ""
+        )
+        megaraid_passthrough = [
+            address
+            for address in megaraid_pci_addresses
+            if address in passthrough_enabled
+        ]
+        if megaraid_passthrough:
+            address_list = ", ".join(megaraid_passthrough)
+            return (
+                "StorCLI is installed on this ESXi host, but the Broadcom MegaRAID controller is "
+                f"currently configured for PCI passthrough ({address_list}). ESXi will not bind that "
+                "device to lsi_mr3 or expose it to StorCLI until passthrough is disabled and the host "
+                "is rebooted, so physical-drive enrichment is unavailable for this refresh."
+            )
+
+        vib_output = (normalized_outputs.get("esxcli software vib list") or "").lower()
+        broadcom_stack_detected = any(
+            token in vib_output
+            for token in (
+                "lsi-mr3",
+                "megaraid",
+                "lsuv2-lsiv2-drivers-plugin",
+                "avago_bootbank_lsi-mr3",
+                "bcm_bootbank_vmware-storcli64",
+                "vmware-storcli64",
+            )
+        )
+        if broadcom_stack_detected:
+            return (
+                "StorCLI is installed on this ESXi host, but it currently reports no visible "
+                "MegaRAID controllers. Broadcom/LSI packages such as lsi-mr3, lsuv2-lsiv2-drivers-plugin, "
+                "and vmware-storcli64 are present, but no compatible controller is being surfaced to StorCLI, "
+                "so physical-drive enrichment is unavailable for this refresh."
+            )
+        return (
+            "StorCLI is installed on this ESXi host, but it currently reports no visible storage "
+            "controllers, so physical-drive enrichment is unavailable for this refresh."
+        )
+
+    @staticmethod
+    def _extract_enabled_passthrough_addresses(output: str) -> list[str]:
+        addresses: list[str] = []
+        for raw_line in output.splitlines():
+            match = re.search(
+                r"(?im)^\s*([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])\s+true\b",
+                raw_line,
+            )
+            if not match:
+                continue
+            address = match.group(1).lower()
+            if address not in addresses:
+                addresses.append(address)
+        return addresses
+
+    @staticmethod
+    def _extract_megaraid_pci_addresses(output: str) -> list[str]:
+        addresses: list[str] = []
+        for raw_line in output.splitlines():
+            if "megaraid" not in raw_line.lower():
+                continue
+            match = re.search(r"(?im)^\s*([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])\b", raw_line)
+            if not match:
+                continue
+            address = match.group(1).lower()
+            if address not in addresses:
+                addresses.append(address)
+        return addresses
+
+    def _esxi_controller_diagnostic_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
+        if self.system.truenas.platform != "esxi":
+            return []
+        outputs = {item.command: item.stdout for item in command_results if item.ok}
+        if not self._esxi_storcli_runtime_warning(outputs):
+            return []
+        seen_commands = {canonicalize_ssh_command(item.command) for item in command_results}
+        missing_commands: list[str] = []
+        if "esxcli hardware pci pcipassthru list" not in seen_commands:
+            missing_commands.append("esxcli hardware pci pcipassthru list 2>&1 || true")
+        if "lspci" not in seen_commands:
+            missing_commands.append("lspci 2>&1 || true")
+        return missing_commands
+
     async def _collect_inventory_source_bundle(self) -> InventorySourceBundle:
         warnings: list[str] = []
-        api_enabled = self.system.truenas.platform not in {"linux", "esxi"}
+        api_enabled = self.system.truenas.platform not in {"linux", "esxi", "ipmi"}
+        bmc_enabled = bool(self.system.bmc.enabled and self.bmc_service is not None)
         api_label = (
             "Quantastor API"
             if self.system.truenas.platform == "quantastor"
             else "ESXi API"
             if self.system.truenas.platform == "esxi"
+            else "BMC / IPMI"
+            if self.system.truenas.platform == "ipmi"
             else "TrueNAS API"
         )
-        ssh_only_platform_label = "ESXi" if self.system.truenas.platform == "esxi" else "Linux"
+        ssh_only_platform_label = (
+            "ESXi"
+            if self.system.truenas.platform == "esxi"
+            else "IPMI / BMC"
+            if self.system.truenas.platform == "ipmi"
+            else "Linux"
+        )
         sources = {
             "api": SourceStatus(
                 enabled=api_enabled,
@@ -1104,6 +1326,15 @@ class InventoryService:
                 message=f"{api_label} disabled for this SSH-only {ssh_only_platform_label} system." if not api_enabled else None,
             ),
             "ssh": SourceStatus(enabled=self.system.ssh.enabled, ok=not self.system.ssh.enabled, message=None),
+            "bmc": SourceStatus(
+                enabled=bmc_enabled,
+                ok=not bmc_enabled,
+                message=(
+                    "BMC / IPMI enrichment is disabled for this system."
+                    if not bmc_enabled
+                    else None
+                ),
+            ),
         }
 
         raw_data = TrueNASRawData(
@@ -1124,6 +1355,7 @@ class InventoryService:
         quantastor_ses_loaded = False
         quantastor_ses_data = ParsedSSHData()
         quantastor_ses_failures: list[str] = []
+        bmc_inventory: BMCInventory | None = None
 
         async def load_api_data() -> TrueNASRawData | None:
             if not api_enabled:
@@ -1136,25 +1368,30 @@ class InventoryService:
                 command_results = await self.ssh_probe.run_commands()
                 if self._should_probe_unifi_gpio_debug(command_results):
                     command_results.append(await self.ssh_probe.run_command("cat /sys/kernel/debug/gpio"))
+                for command in self._esxi_controller_diagnostic_commands(command_results):
+                    command_results.append(await self.ssh_probe.run_command(command))
             outputs = {item.command: item.stdout for item in command_results if item.ok}
-            failures = [item for item in command_results if not item.ok]
-            failure_messages = [
-                f"SSH command failed: {failure.command} (exit {failure.exit_code})"
-                for failure in failures
-            ]
+            failure_messages, status_message = self._summarize_ssh_failures(command_results, outputs)
             return (
                 outputs,
                 True,
                 failure_messages,
                 SourceStatus(
                     enabled=True,
-                    ok=not failures,
-                    message="SSH probe completed." if not failures else "Some SSH commands failed.",
+                    ok=not failure_messages,
+                    message=status_message,
                 ),
             )
 
+        async def load_bmc_inventory() -> BMCInventory:
+            if self.bmc_service is None:
+                raise TrueNASAPIError("BMC / IPMI access is not configured for this system.")
+            with perf_stage("inventory.bmc.fetch"):
+                return await asyncio.to_thread(self.bmc_service.fetch_inventory)
+
         api_task = asyncio.create_task(load_api_data()) if api_enabled else None
         ssh_task = asyncio.create_task(load_ssh_payload()) if self.system.ssh.enabled else None
+        bmc_task = asyncio.create_task(load_bmc_inventory()) if bmc_enabled else None
 
         if api_task is not None:
             try:
@@ -1178,6 +1415,17 @@ class InventoryService:
             else:
                 sources["ssh"] = ssh_status
                 warnings.extend(ssh_failures)
+
+        if bmc_task is not None:
+            try:
+                bmc_inventory = await bmc_task
+            except Exception as exc:
+                logger.exception("Failed to collect BMC / IPMI diagnostics")
+                sources["bmc"] = SourceStatus(enabled=True, ok=False, message=str(exc))
+                warnings.append("BMC / IPMI enrichment is enabled but could not collect out-of-band inventory.")
+            else:
+                sources["bmc"] = SourceStatus(enabled=True, ok=True, message="BMC / IPMI inventory reachable.")
+                warnings.extend(bmc_inventory.warnings)
 
         if self.system.truenas.platform == "scale" and ssh_collected:
             try:
@@ -1268,6 +1516,7 @@ class InventoryService:
             sources=sources,
             scale_ses_data=scale_ses_data,
             quantastor_ses_data=quantastor_ses_data,
+            bmc_inventory=bmc_inventory,
         )
 
     def _schedule_background_snapshot_refresh(self, cache_key: str, selected_enclosure_id: str | None) -> None:
@@ -1533,6 +1782,25 @@ class InventoryService:
             await self._set_slot_led_over_ssh(slot_view, action)
         elif slot_view.led_backend == "unifi_fault":
             await self._set_unifi_slot_led_over_ssh(slot_view, action)
+        elif slot_view.led_backend == "supermicro_bmc":
+            if self.bmc_service is None:
+                raise TrueNASAPIError("BMC / IPMI access is not configured for this system.")
+            controller_id = slot_view.raw_status.get("bmc_controller_id")
+            physical_index = slot_view.raw_status.get("bmc_physical_index")
+            if not isinstance(controller_id, int) or not isinstance(physical_index, int):
+                raise TrueNASAPIError(
+                    slot_view.led_reason
+                    or f"Slot {slot:02d} is missing the BMC controller metadata required for identify LED control."
+                )
+            if action == LedAction.identify:
+                active = True
+            elif action == LedAction.clear:
+                active = False
+            else:
+                raise TrueNASAPIError(
+                    "Supermicro BMC LED control currently supports identify on and clear/off only."
+                )
+            await asyncio.to_thread(self.bmc_service.set_drive_identify, controller_id, physical_index, active)
         else:
             raise TrueNASAPIError(
                 slot_view.led_reason
@@ -1544,6 +1812,53 @@ class InventoryService:
                 cache_keys=[slot_view.enclosure_id, None],
                 invalidate_source_bundle=True,
             )
+
+    async def get_system_locator_status(self) -> SystemLocatorStatusView:
+        if not self.system.bmc.enabled or self.bmc_service is None:
+            return SystemLocatorStatusView(
+                supported=False,
+                active=False,
+                backend="supermicro_bmc",
+                reason="BMC / IPMI access is not configured for this system.",
+            )
+
+        try:
+            active = await asyncio.to_thread(self.bmc_service.get_uid_status)
+        except Exception as exc:  # noqa: BLE001 - surface operational failure in-band.
+            return SystemLocatorStatusView(
+                supported=True,
+                active=False,
+                backend="supermicro_bmc",
+                reason=str(exc),
+            )
+
+        return SystemLocatorStatusView(
+            supported=True,
+            active=active,
+            backend="supermicro_bmc",
+            reason=None,
+        )
+
+    async def set_system_locator(self, active: bool) -> SystemLocatorStatusView:
+        if not self.system.bmc.enabled or self.bmc_service is None:
+            raise TrueNASAPIError("System locator control requires configured BMC / IPMI access.")
+
+        try:
+            resolved_active = await asyncio.to_thread(self.bmc_service.set_uid_active, bool(active))
+        except Exception as exc:  # noqa: BLE001 - normalize backend failures.
+            raise TrueNASAPIError(str(exc)) from exc
+
+        self.invalidate_snapshot_cache(
+            reason="set_system_locator",
+            cache_keys=[None],
+            invalidate_source_bundle=True,
+        )
+        return SystemLocatorStatusView(
+            supported=True,
+            active=resolved_active,
+            backend="supermicro_bmc",
+            reason=None,
+        )
 
     async def save_mapping(
         self,
@@ -1611,7 +1926,7 @@ class InventoryService:
         slot = slot_view.slot
         smartctl_device_type = self._smart_candidate_device_type(slot_view)
         if self.system.truenas.platform == "esxi":
-            summary = self._merge_smart_summary(slot_view, self._build_esxi_smart_summary(slot_view))
+            summary = await self._build_esxi_slot_smart_summary(slot_view)
             self._smart_cache[f"{self.system.id}|esxi|{slot}"] = summary
             self._smart_cache_until[f"{self.system.id}|esxi|{slot}"] = utcnow() + timedelta(minutes=5)
             self._persist_slot_detail_cache(slot_view, smart_summary=summary)
@@ -1987,6 +2302,7 @@ class InventoryService:
         raw_data = source_bundle.raw_data
         scale_ses_data = source_bundle.scale_ses_data
         quantastor_ses_data = source_bundle.quantastor_ses_data
+        bmc_inventory = source_bundle.bmc_inventory
         ssh_data = ParsedSSHData()
         if source_bundle.ssh_collected:
             with perf_stage("inventory.ssh.parse_outputs", command_count=len(source_bundle.ssh_outputs)):
@@ -1996,11 +2312,15 @@ class InventoryService:
                     self.system.truenas.enclosure_filter,
                     selected_enclosure_id,
                 )
+            if self.system.truenas.platform == "esxi":
+                storcli_runtime_warning = self._esxi_storcli_runtime_warning(source_bundle.ssh_outputs)
+                if storcli_runtime_warning and storcli_runtime_warning not in warnings:
+                    warnings.append(storcli_runtime_warning)
         if self.system.truenas.platform == "scale" and scale_ses_data.ses_enclosures:
             ssh_data = self._merge_ses_overlay_data(ssh_data, scale_ses_data)
 
         has_scale_linux_ses = self._has_scale_linux_ses(ssh_data)
-        if self.system.truenas.platform not in {"linux", "esxi"} and not raw_data.enclosures:
+        if self.system.truenas.platform not in {"linux", "esxi", "ipmi"} and not raw_data.enclosures:
             if self.system.truenas.platform == "scale" and has_scale_linux_ses:
                 warnings.append(
                     "TrueNAS SCALE did not return enclosure rows, so this view is using Linux SES AES page parsing "
@@ -2030,6 +2350,7 @@ class InventoryService:
                 warnings,
                 selected_enclosure_id=selected_enclosure_id,
                 quantastor_ses_data=quantastor_ses_data,
+                bmc_inventory=bmc_inventory,
             )
         option_by_id = {item.id: item for item in available_enclosures}
         resolved_enclosure_id = None
@@ -2065,6 +2386,11 @@ class InventoryService:
                 len((selected_profile.slot_hints if selected_profile else {}) or {}),
                 sum(1 for slot in slots if slot.smart_device_names),
             )
+        elif self.system.truenas.platform == "ipmi":
+            disk_count = sum(1 for slot in slots if slot.device_name)
+            pool_count = 0
+            enclosure_count = len(available_enclosures)
+            ssh_slot_hint_count = len((selected_profile.slot_hints if selected_profile else {}) or {})
         elif self.system.truenas.platform == "quantastor":
             disk_count = len(raw_data.disks)
             pool_count = len(raw_data.pools)
@@ -2088,6 +2414,13 @@ class InventoryService:
         elif self.system.truenas.platform == "esxi":
             with perf_stage("inventory.esxi.build_platform_context"):
                 platform_context = self._build_esxi_platform_context(ssh_data)
+        if bmc_inventory is not None:
+            with perf_stage("inventory.bmc.build_platform_context"):
+                bmc_context = self._build_bmc_platform_context(bmc_inventory)
+            if self.system.truenas.platform == "ipmi":
+                platform_context = bmc_context
+            else:
+                platform_context["bmc"] = bmc_context
 
         with perf_stage("inventory.slot_detail_cache.apply", slot_count=len(slots)):
             self._apply_persisted_slot_details(slots)
@@ -2139,11 +2472,14 @@ class InventoryService:
         warnings: list[str],
         selected_enclosure_id: str | None = None,
         quantastor_ses_data: ParsedSSHData | None = None,
+        bmc_inventory: BMCInventory | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         if self.system.truenas.platform == "linux":
             return self._correlate_linux_host(ssh_data, warnings, selected_enclosure_id)
         if self.system.truenas.platform == "esxi":
-            return self._correlate_esxi_host(ssh_data, warnings, selected_enclosure_id)
+            return self._correlate_esxi_host(ssh_data, warnings, selected_enclosure_id, bmc_inventory)
+        if self.system.truenas.platform == "ipmi":
+            return self._correlate_bmc_host(warnings, selected_enclosure_id, bmc_inventory)
         if self.system.truenas.platform == "quantastor":
             return self._correlate_quantastor(raw_data, warnings, selected_enclosure_id, quantastor_ses_data or ParsedSSHData())
         if self.system.truenas.platform == "scale" and self._has_scale_linux_ses(ssh_data):
@@ -2267,11 +2603,17 @@ class InventoryService:
         raw_data: TrueNASRawData,
         ssh_data: ParsedSSHData,
         selected_enclosure_id: str | None,
+        bmc_inventory: BMCInventory | None = None,
     ) -> list[DiskRecord]:
         if self.system.truenas.platform == "linux":
             return self._build_linux_disk_records(ssh_data)
         if self.system.truenas.platform == "esxi":
-            return self._build_esxi_disk_records(ssh_data)
+            records = self._build_esxi_disk_records(ssh_data)
+            if bmc_inventory is not None:
+                records.extend(self._build_bmc_disk_records(bmc_inventory))
+            return records
+        if self.system.truenas.platform == "ipmi":
+            return self._build_bmc_disk_records(bmc_inventory)
         if self.system.truenas.platform == "quantastor":
             return self._build_quantastor_disk_records(raw_data, selected_enclosure_id)
         return self._build_disk_records(
@@ -2296,6 +2638,7 @@ class InventoryService:
             source_bundle.raw_data,
             ssh_data,
             snapshot.selected_enclosure_id,
+            source_bundle.bmc_inventory,
         )
         assigned_lookup_keys = self._collect_assigned_lookup_keys(snapshot.slots)
         allow_virtual_reuse = self.system.truenas.platform == "esxi"
@@ -2346,10 +2689,11 @@ class InventoryService:
                 disk.slot is not None
                 or isinstance(disk.raw.get("vendor_slot"), int)
             )
-        if self.system.truenas.platform == "esxi":
+        if self.system.truenas.platform in {"esxi", "ipmi"}:
             # ESXi StorCLI members are physical slots and also the source for
-            # the inferred AOC carrier-card view, so let the virtual view reuse
-            # them instead of hiding them as already assigned.
+            # inferred virtual/storage-view layouts. IPMI-only systems need the
+            # same reuse so front-bay correlation does not hide rear BMC-only
+            # candidates from storage views.
             return False
         return bool(
             disk.enclosure_id is not None
@@ -2576,8 +2920,16 @@ class InventoryService:
         ssh_data: ParsedSSHData,
         warnings: list[str],
         selected_enclosure_id: str | None,
+        bmc_inventory: BMCInventory | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
-        available_enclosures = self._build_esxi_enclosure_options()
+        available_enclosures = (
+            self._build_bmc_enclosure_options(bmc_inventory)
+            if bmc_inventory is not None and (
+                self.system.default_profile_id
+                or self._infer_bmc_profile_id(bmc_inventory) == SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID
+            )
+            else self._build_esxi_enclosure_options()
+        )
         selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
         if selected_option is None:
             warnings.append("No profile-backed ESXi enclosure is configured for this host yet.")
@@ -2597,10 +2949,16 @@ class InventoryService:
             return [], available_enclosures, self._enclosure_option_meta(selected_option), [], 0, 0
 
         if not ssh_data.esxi_storcli_physical_drives:
-            warnings.append(
-                "ESXi SSH inventory ran, but StorCLI physical-drive JSON was not available. "
-                "The AOC carrier-card view needs StorCLI to map physical M.2 slots behind the RAID LUNs."
-            )
+            if selected_profile.id == ESXI_AOC_SLG4_2H8M2_PROFILE_ID:
+                warnings.append(
+                    "ESXi SSH inventory ran, but StorCLI physical-drive JSON was not available. "
+                    "The AOC carrier-card view needs StorCLI to map physical M.2 slots behind the RAID LUNs."
+                )
+            elif bmc_inventory is None:
+                warnings.append(
+                    "ESXi SSH inventory did not return StorCLI physical-drive rows, so host-side slot mapping "
+                    "details are unavailable for this chassis on the current refresh."
+                )
 
         layout_rows = copy_layout_rows(selected_profile.slot_layout)
         layout_slot_count = infer_slot_count_from_layout(layout_rows, selected_option.slot_count)
@@ -2611,28 +2969,68 @@ class InventoryService:
         disk_records = self._build_esxi_disk_records(ssh_data)
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
+        disks_by_bmc_slot: dict[int, DiskRecord] = {}
+        disks_by_bmc_enclosure_slot: dict[tuple[str | None, int], DiskRecord] = {}
         for disk in disk_records:
             for key in disk.lookup_keys:
                 disks_by_key[key] = disk
             if disk.slot is not None:
                 disks_by_slot[(selected_option.id, disk.slot)] = disk
                 disks_by_slot[(None, disk.slot)] = disk
+                disks_by_bmc_slot[disk.slot] = disk
+                enclosure_id = normalize_text(
+                    disk.raw.get("storcli_enclosure_id")
+                    or disk.raw.get("bmc_enclosure_id")
+                )
+                if enclosure_id:
+                    disks_by_bmc_enclosure_slot[(enclosure_id, disk.slot)] = disk
 
         esxi_topology_members = self._build_esxi_topology_members(disk_records)
         slot_hints = selected_profile.slot_hints or {}
+        bmc_slot_hints = self._profile_bmc_slot_numbers(selected_profile)
+        bmc_disk_records = self._build_bmc_disk_records(bmc_inventory)
+        bmc_disks_by_slot = {
+            disk.slot: disk
+            for disk in bmc_disk_records
+            if isinstance(disk.slot, int)
+        }
         slot_views: list[SlotView] = []
         for slot in range(layout_slot_count):
             row_index, column_index = slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))
             hint_values = [normalize_text(value) for value in slot_hints.get(slot, []) if normalize_text(value)]
+            bmc_slot_number = bmc_slot_hints.get(slot)
+            slot_hint_values = list(hint_values)
+            if isinstance(bmc_slot_number, int):
+                bmc_slot_hint = f"bmc-slot:{bmc_slot_number}"
+                if bmc_slot_hint not in slot_hint_values:
+                    slot_hint_values.append(bmc_slot_hint)
             raw_slot_status: dict[str, Any] = {
-                "device_names": hint_values,
-                "device_hint": hint_values[0] if hint_values else None,
+                "device_names": slot_hint_values,
+                "device_hint": slot_hint_values[0] if slot_hint_values else None,
                 "enclosure_id": selected_option.id,
                 "enclosure_label": selected_option.label,
                 "enclosure_name": selected_option.name,
-                "present": None,
+                "present": False if isinstance(bmc_slot_number, int) else None,
             }
-            disk = disks_by_slot.get((selected_option.id, slot)) or disks_by_slot.get((None, slot))
+            bmc_disk = bmc_disks_by_slot.get(bmc_slot_number) if isinstance(bmc_slot_number, int) else None
+            if bmc_disk is not None:
+                self._apply_bmc_drive_to_raw_slot_status(raw_slot_status, bmc_disk)
+
+            disk = None
+            if bmc_disk is not None and isinstance(bmc_disk.slot, int):
+                bmc_enclosure_id = normalize_text(bmc_disk.raw.get("bmc_enclosure_id"))
+                if bmc_enclosure_id:
+                    disk = disks_by_bmc_enclosure_slot.get((bmc_enclosure_id, bmc_disk.slot))
+                if disk is None:
+                    disk = disks_by_bmc_slot.get(bmc_disk.slot)
+                if disk is None and bmc_disk.serial:
+                    disk = disks_by_key.get(bmc_disk.serial.lower())
+
+            if disk is None and isinstance(bmc_slot_number, int):
+                disk = disks_by_bmc_slot.get(bmc_slot_number)
+
+            if disk is None:
+                disk = disks_by_slot.get((selected_option.id, slot)) or disks_by_slot.get((None, slot))
             if disk:
                 raw_slot_status.update(
                     {
@@ -2640,7 +3038,23 @@ class InventoryService:
                         "status": disk.health,
                         "value": disk.health,
                         "device_hint": disk.device_name,
-                        "device_names": list(dict.fromkeys([value for value in [disk.device_name, *hint_values] if value])),
+                        "device_names": list(
+                            dict.fromkeys(
+                                [
+                                    value
+                                    for value in [
+                                        disk.device_name,
+                                        *slot_hint_values,
+                                        *(
+                                            raw_slot_status.get("device_names")
+                                            if isinstance(raw_slot_status.get("device_names"), list)
+                                            else []
+                                        ),
+                                    ]
+                                    if value
+                                ]
+                            )
+                        ),
                         "serial_hint": disk.serial,
                         "model_hint": disk.model,
                         "reported_size": format_bytes(disk.size_bytes),
@@ -2648,6 +3062,10 @@ class InventoryService:
                         "storcli_slot": disk.raw.get("storcli_slot"),
                         "storcli_enclosure_id": disk.raw.get("storcli_enclosure_id"),
                         "transport_address": disk.raw.get("transport_address"),
+                        "esxi_device_id": disk.raw.get("esxi_device_id"),
+                        "esxi_runtime_name": disk.raw.get("esxi_runtime_name"),
+                        "esxi_drive_type": disk.raw.get("esxi_drive_type"),
+                        "esxi_raid_level": disk.raw.get("esxi_raid_level"),
                     }
                 )
             mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
@@ -2676,6 +3094,114 @@ class InventoryService:
             )
             if mapping and not disk:
                 warnings.append(f"Manual mapping for slot {slot:02d} did not match any current ESXi StorCLI member.")
+            slot_views.append(slot_view)
+
+        return (
+            slot_views,
+            available_enclosures,
+            selected_meta,
+            layout_rows,
+            layout_slot_count,
+            layout_columns,
+        )
+
+    def _correlate_bmc_host(
+        self,
+        warnings: list[str],
+        selected_enclosure_id: str | None,
+        bmc_inventory: BMCInventory | None,
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
+        if bmc_inventory is None:
+            warnings.append("BMC / IPMI inventory is not available for this system yet.")
+            return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
+
+        available_enclosures = self._build_bmc_enclosure_options(bmc_inventory)
+        selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
+        if selected_option is None:
+            warnings.append("No profile-backed BMC enclosure is configured for this host yet.")
+            return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
+
+        selected_profile = self.profile_registry.resolve_for_enclosure(
+            self.system,
+            selected_option,
+            fallback_label=selected_option.label,
+            fallback_rows=selected_option.rows or self.settings.layout.rows,
+            fallback_columns=selected_option.columns or self.settings.layout.columns,
+            fallback_slot_count=selected_option.slot_count or self.settings.layout.slot_count,
+            fallback_slot_layout=selected_option.slot_layout,
+        )
+        if selected_profile is None:
+            warnings.append("This BMC host is missing an enclosure profile for rendering.")
+            return [], available_enclosures, self._enclosure_option_meta(selected_option), [], 0, 0
+
+        layout_rows = copy_layout_rows(selected_profile.slot_layout)
+        layout_slot_count = infer_slot_count_from_layout(layout_rows, selected_option.slot_count)
+        layout_columns = selected_profile.columns
+        slot_positions = layout_slot_positions(layout_rows)
+        selected_meta = self._enclosure_option_meta(selected_option)
+
+        disk_records = self._build_bmc_disk_records(bmc_inventory)
+        disks_by_key: dict[str, DiskRecord] = {}
+        disks_by_slot: dict[int, DiskRecord] = {}
+        for disk in disk_records:
+            for key in disk.lookup_keys:
+                disks_by_key[key] = disk
+            if isinstance(disk.slot, int):
+                disks_by_slot[disk.slot] = disk
+
+        bmc_slot_hints = self._profile_bmc_slot_numbers(selected_profile)
+        discovered_slot_numbers = sorted(disks_by_slot)
+        if not bmc_slot_hints and discovered_slot_numbers:
+            warnings.append(
+                "This BMC profile does not define explicit BMC slot hints yet, so bays are being mapped "
+                "from discovered slot numbers in ascending order."
+            )
+
+        empty_ssh = ParsedSSHData()
+        slot_views: list[SlotView] = []
+        for slot in range(layout_slot_count):
+            row_index, column_index = slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))
+            mapped_bmc_slot = bmc_slot_hints.get(slot)
+            if mapped_bmc_slot is None and slot < len(discovered_slot_numbers):
+                mapped_bmc_slot = discovered_slot_numbers[slot]
+            slot_hint = f"bmc-slot:{mapped_bmc_slot}" if isinstance(mapped_bmc_slot, int) else None
+            raw_slot_status: dict[str, Any] = {
+                "device_names": [slot_hint] if slot_hint else [],
+                "device_hint": slot_hint,
+                "enclosure_id": selected_option.id,
+                "enclosure_label": selected_option.label,
+                "enclosure_name": selected_option.name,
+                "present": False if slot_hint else None,
+            }
+            disk = disks_by_slot.get(mapped_bmc_slot) if isinstance(mapped_bmc_slot, int) else None
+            if disk is not None:
+                self._apply_bmc_drive_to_raw_slot_status(raw_slot_status, disk)
+            mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            if mapping and disk is None:
+                disk = self._resolve_disk_for_slot(
+                    slot,
+                    selected_option.id,
+                    mapping,
+                    disks_by_key,
+                    {},
+                    {},
+                    raw_slot_status,
+                    empty_ssh,
+                )
+            slot_view = self._build_slot_view(
+                slot=slot,
+                row_index=row_index,
+                column_index=column_index,
+                enclosure_meta=selected_meta,
+                raw_slot_status=raw_slot_status,
+                disk=disk,
+                mapping=mapping,
+                ssh_data=empty_ssh,
+                api_topology_members={},
+                api_enclosure_ids=set(),
+            )
+            if mapping and not disk:
+                warnings.append(f"Manual mapping for slot {slot:02d} did not match any current BMC disk.")
             slot_views.append(slot_view)
 
         return (
@@ -3906,6 +4432,128 @@ class InventoryService:
             return "Degraded"
         return text
 
+    @staticmethod
+    def _esxi_bool(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value != 0
+        text = normalize_text(str(value) if value is not None else None)
+        if not text:
+            return None
+        lowered = text.lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        return None
+
+    @classmethod
+    def _esxi_storage_device_is_local(cls, device: dict[str, Any] | None) -> bool | None:
+        if not isinstance(device, dict):
+            return None
+        local = cls._esxi_bool(device.get("is_local"))
+        if local is not None:
+            return local
+        display_name = normalize_text(device.get("display_name"))
+        if not display_name:
+            return None
+        lowered = display_name.lower()
+        if "iscsi" in lowered or "fibre channel" in lowered or "fiber channel" in lowered:
+            return False
+        if lowered.startswith("local "):
+            return True
+        return None
+
+    @staticmethod
+    def _esxi_storage_device_lookup_keys(device: dict[str, Any]) -> set[str]:
+        lookup_keys: set[str] = set()
+        for value in (
+            device.get("id"),
+            device.get("display_name"),
+            device.get("devfs_path"),
+        ):
+            text = normalize_text(str(value) if value is not None else None)
+            if not text:
+                continue
+            lowered = text.lower()
+            lookup_keys.add(lowered)
+            if "/" in lowered:
+                lookup_keys.add(lowered.rsplit("/", 1)[-1])
+        return lookup_keys
+
+    @classmethod
+    def _build_esxi_storage_device_index(cls, ssh_data: ParsedSSHData) -> dict[str, dict[str, Any]]:
+        devices_by_key: dict[str, dict[str, Any]] = {}
+        for device in ssh_data.esxi_storage_devices:
+            if not isinstance(device, dict):
+                continue
+            for key in cls._esxi_storage_device_lookup_keys(device):
+                devices_by_key[key] = device
+        return devices_by_key
+
+    @classmethod
+    def _resolve_esxi_storage_device(
+        cls,
+        devices_by_key: dict[str, dict[str, Any]],
+        identifier: Any,
+    ) -> dict[str, Any] | None:
+        text = normalize_text(str(identifier) if identifier is not None else None)
+        if not text:
+            return None
+        lowered = text.lower()
+        return devices_by_key.get(lowered) or devices_by_key.get(lowered.rsplit("/", 1)[-1])
+
+    @staticmethod
+    def _int_like(value: Any) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        text = normalize_text(str(value) if value is not None else None)
+        if not text:
+            return None
+        match = re.search(r"-?\d+", text)
+        if not match:
+            return None
+        try:
+            return int(match.group(0))
+        except ValueError:
+            return None
+
+    @classmethod
+    def _resolve_esxi_storage_path_for_drive(
+        cls,
+        ssh_data: ParsedSSHData,
+        storage_devices_by_key: dict[str, dict[str, Any]],
+        drive: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        device_id = cls._int_like(drive.get("device_id"))
+        transport = (normalize_text(drive.get("interface")) or "").lower()
+        matches: list[dict[str, Any]] = []
+        for path in ssh_data.esxi_storage_paths:
+            if not isinstance(path, dict):
+                continue
+            path_transport = (normalize_text(path.get("transport")) or "").lower()
+            if transport and path_transport and transport != path_transport:
+                continue
+            path_target = cls._int_like(path.get("target"))
+            if device_id is not None and path_target != device_id:
+                continue
+            backing_device = cls._resolve_esxi_storage_device(storage_devices_by_key, path.get("device"))
+            if backing_device is not None and cls._esxi_storage_device_is_local(backing_device) is False:
+                continue
+            matches.append(path)
+
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        for path in matches:
+            if normalize_text(path.get("state")) == "active":
+                return path
+        return matches[0]
+
     def _build_esxi_platform_context(self, ssh_data: ParsedSSHData) -> dict[str, Any]:
         sections: list[dict[str, Any]] = []
         controller = ssh_data.esxi_storcli_controller if isinstance(ssh_data.esxi_storcli_controller, dict) else {}
@@ -3913,6 +4561,18 @@ class InventoryService:
         version = controller.get("Version") if isinstance(controller.get("Version"), dict) else {}
         bus = controller.get("Bus") if isinstance(controller.get("Bus"), dict) else {}
         status = controller.get("Status") if isinstance(controller.get("Status"), dict) else {}
+        storcli_member_details_available = bool(ssh_data.esxi_storcli_physical_drives)
+        storage_devices_by_key = self._build_esxi_storage_device_index(ssh_data)
+        local_storage_devices = [
+            device
+            for device in ssh_data.esxi_storage_devices
+            if isinstance(device, dict) and self._esxi_storage_device_is_local(device) is True
+        ]
+        remote_storage_device_count = sum(
+            1
+            for device in ssh_data.esxi_storage_devices
+            if isinstance(device, dict) and self._esxi_storage_device_is_local(device) is False
+        )
 
         overview = self._platform_details_section(
             "overview",
@@ -4004,11 +4664,16 @@ class InventoryService:
         }
         datastore_groups: list[dict[str, Any]] = []
         datastore_names: list[str] = []
+        remote_datastore_count = 0
         for extent in ssh_data.esxi_vmfs_extents:
             if not isinstance(extent, dict):
                 continue
             volume_name = normalize_text(extent.get("volume_name"))
             if not volume_name:
+                continue
+            backing_device = self._resolve_esxi_storage_device(storage_devices_by_key, extent.get("device_name"))
+            if backing_device is not None and self._esxi_storage_device_is_local(backing_device) is False:
+                remote_datastore_count += 1
                 continue
             datastore_names.append(volume_name)
             filesystem = filesystems_by_volume.get(volume_name) or {}
@@ -4023,6 +4688,10 @@ class InventoryService:
                     entries=[
                         self._platform_details_entry("Mounted", filesystem.get("mounted")),
                         self._platform_details_entry("Device", extent.get("device_name"), copyable=True),
+                        self._platform_details_entry(
+                            "Backing Device",
+                            backing_device.get("display_name") if isinstance(backing_device, dict) else None,
+                        ),
                         self._platform_details_entry("Partition", extent.get("partition")),
                         self._platform_details_entry("Mount Point", filesystem.get("mount_point")),
                         self._platform_details_entry("Free", format_bytes(parse_size_to_bytes(filesystem.get("free")))),
@@ -4033,7 +4702,8 @@ class InventoryService:
             "datastores",
             "Datastore Context",
             summary=self._platform_details_summary(
-                f"{len(datastore_names)}" if datastore_names else None,
+                f"{len(datastore_names)} local shown" if datastore_names else None,
+                f"{remote_datastore_count} remote SAN omitted" if remote_datastore_count else None,
                 " / ".join(datastore_names[:3]) if datastore_names else None,
             ),
             groups=datastore_groups,
@@ -4105,15 +4775,60 @@ class InventoryService:
         if member_capabilities:
             sections.append(member_capabilities)
 
+        if not storcli_member_details_available:
+            local_device_groups: list[dict[str, Any]] = []
+            for device in local_storage_devices:
+                device_id = normalize_text(device.get("id"))
+                display_name = normalize_text(device.get("display_name"))
+                local_device_groups.append(
+                    self._platform_details_group(
+                        display_name or device_id or "Local Device",
+                        summary=self._platform_details_summary(
+                            normalize_text(device.get("model")),
+                            format_bytes(parse_size_to_bytes(device.get("size"))),
+                        ),
+                        entries=[
+                            self._platform_details_entry("Status", device.get("status")),
+                            self._platform_details_entry("Device", device_id, copyable=True),
+                            self._platform_details_entry("Vendor", device.get("vendor")),
+                            self._platform_details_entry("Model", device.get("model")),
+                            self._platform_details_entry("Revision", device.get("revision")),
+                            self._platform_details_entry("Size", format_bytes(parse_size_to_bytes(device.get("size")))),
+                            self._platform_details_entry("Device Type", device.get("device_type")),
+                            self._platform_details_entry("Multipath Plugin", device.get("multipath_plugin")),
+                            self._platform_details_entry("SSD", self._esxi_bool(device.get("is_ssd"))),
+                            self._platform_details_entry("Boot Device", self._esxi_bool(device.get("is_boot_device"))),
+                            self._platform_details_entry("Devfs Path", device.get("devfs_path"), copyable=True),
+                        ],
+                    )
+                )
+            local_devices = self._platform_details_section(
+                "local-devices",
+                "Local Device Context",
+                summary=self._platform_details_summary(
+                    f"{len(local_device_groups)} local shown" if local_device_groups else None,
+                    f"{remote_storage_device_count} remote SAN omitted" if remote_storage_device_count else None,
+                ),
+                groups=local_device_groups,
+            )
+            if local_devices:
+                sections.append(local_devices)
+
         if not sections:
             return {}
+        details_summary = (
+            "Read-only controller, local datastore, and member capability context surfaced from the "
+            "existing ESXi SSH plus StorCLI inventory path."
+            if storcli_member_details_available
+            else "Read-only local-device and local-datastore context surfaced from the existing ESXi SSH inventory path. "
+            "StorCLI physical-member detail is unavailable on this host."
+        )
+        if remote_datastore_count or remote_storage_device_count:
+            details_summary = f"{details_summary} Remote iSCSI / FC presentations are hidden."
         return {
             "details": {
                 "title": "Platform Details",
-                "summary": (
-                    "Read-only controller, datastore, and member capability context surfaced from the "
-                    "existing ESXi SSH plus StorCLI inventory path."
-                ),
+                "summary": details_summary,
                 "sections": sections,
             }
         }
@@ -4129,12 +4844,31 @@ class InventoryService:
         smart_alert = normalize_text(raw_drive.get("smart_alert"))
         smart_alert_bool = self._storcli_bool(smart_alert)
         health_text = normalize_text(slot_view.health)
-        smart_health_status = "FAILED" if smart_alert_bool is True else "PASSED" if health_text == "ONLINE" else health_text
+        raw_state = normalize_text(raw_drive.get("state"))
+        effective_health = health_text or self._storcli_state_health(raw_state)
+        smart_health_status = (
+            "FAILED"
+            if smart_alert_bool is True
+            else "PASSED"
+            if effective_health in {"ONLINE", "JBOD"}
+            else effective_health
+        )
         trim_supported = self._storcli_bool(raw_drive.get("unmap_capable"))
         media_errors = raw_drive.get("media_errors") if isinstance(raw_drive.get("media_errors"), int) else None
         predictive_errors = raw_drive.get("predictive_errors") if isinstance(raw_drive.get("predictive_errors"), int) else None
         non_medium_errors = raw_drive.get("other_errors") if isinstance(raw_drive.get("other_errors"), int) else None
         transport_protocol = normalize_text(raw_drive.get("interface"))
+        normalized_transport = (transport_protocol or "").upper()
+        form_factor = normalize_text(raw_drive.get("form_factor"))
+        if (
+            form_factor is None
+            and normalized_transport == "NVME"
+            and (
+                slot_view.enclosure_id == ESXI_AOC_SLG4_2H8M2_PROFILE_ID
+                or self.system.default_profile_id == ESXI_AOC_SLG4_2H8M2_PROFILE_ID
+            )
+        ):
+            form_factor = "M.2"
         return SmartSummaryView(
             available=True,
             temperature_c=slot_view.temperature_c,
@@ -4144,17 +4878,95 @@ class InventoryService:
             non_medium_errors=non_medium_errors,
             logical_block_size=slot_view.logical_block_size,
             physical_block_size=slot_view.physical_block_size,
-            rotation_rate_rpm=0 if (transport_protocol or "").upper() == "NVME" else None,
-            form_factor="M.2",
+            rotation_rate_rpm=0 if normalized_transport == "NVME" else None,
+            form_factor=form_factor,
             firmware_version=normalize_text(raw_drive.get("firmware")),
             trim_supported=trim_supported,
             transport_protocol=transport_protocol,
             negotiated_link_rate=normalize_text(raw_drive.get("link_speed")),
             message=(
-                "ESXi reports the RAID LUNs as logical devices, so this detail comes from "
-                "StorCLI physical-drive health rather than raw NVMe SMART."
+                "ESXi exposes controller-backed members as logical devices, so this detail comes from "
+                "StorCLI physical-drive health rather than host-level SMART."
             ),
         )
+
+    async def _build_esxi_slot_smart_summary(self, slot_view: SlotView) -> SmartSummaryView:
+        summary = self._merge_smart_summary(slot_view, self._build_esxi_smart_summary(slot_view))
+        host_summary = await self._fetch_esxi_host_smart_summary(slot_view)
+        if host_summary is None:
+            return summary
+
+        summary = self._merge_missing_smart_fields(
+            summary,
+            self._merge_smart_summary(slot_view, host_summary),
+        )
+        raw_drive = slot_view.raw_status.get("storcli_physical_drive") if isinstance(slot_view.raw_status, dict) else None
+        drive_type = normalize_text(raw_drive.get("esxi_drive_type")) if isinstance(raw_drive, dict) else None
+        raid_level = normalize_text(raw_drive.get("esxi_raid_level")) if isinstance(raw_drive, dict) else None
+        if (drive_type or "").lower() == "physical" and (not raid_level or raid_level.upper() == "NA"):
+            summary.message = (
+                "ESXi exposes this JBOD disk as a local physical device, so host SMART counters are shown from "
+                "`esxcli storage core device smart get` and supplemented with StorCLI physical-drive health."
+            )
+        else:
+            summary.message = (
+                "ESXi host SMART counters were merged from `esxcli storage core device smart get`, "
+                "supplemented with StorCLI physical-drive health and slot mapping."
+            )
+        return summary
+
+    async def _fetch_esxi_host_smart_summary(self, slot_view: SlotView) -> SmartSummaryView | None:
+        if self.system.truenas.platform != "esxi" or not self.system.ssh.enabled:
+            return None
+
+        raw_drive = slot_view.raw_status.get("storcli_physical_drive") if isinstance(slot_view.raw_status, dict) else None
+        if not isinstance(raw_drive, dict):
+            return None
+
+        drive_type = normalize_text(raw_drive.get("esxi_drive_type"))
+        raid_level = normalize_text(raw_drive.get("esxi_raid_level"))
+        if drive_type and drive_type.lower() != "physical":
+            return None
+        if raid_level and raid_level.upper() not in {"NA", "NONE"}:
+            return None
+
+        logical_block_size = slot_view.logical_block_size or self._int_like(raw_drive.get("logical_block_size"))
+        for device_name in self._esxi_host_smart_device_candidates(slot_view, raw_drive):
+            result = await self._run_ssh_command(
+                shlex.join(["esxcli", "storage", "core", "device", "smart", "get", "-d", device_name])
+            )
+            if not result.stdout.strip():
+                continue
+            summary = SmartSummaryView.model_validate(
+                parse_esxcli_smart_get(result.stdout, logical_block_size)
+            )
+            if summary.available:
+                return summary
+        return None
+
+    @staticmethod
+    def _esxi_host_smart_device_candidates(slot_view: SlotView, raw_drive: dict[str, Any]) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def append(value: str | None) -> None:
+            normalized = normalize_device_name(value)
+            if not normalized:
+                return
+            lowered = normalized.lower()
+            if lowered in seen:
+                return
+            seen.add(lowered)
+            candidates.append(normalized)
+
+        append(normalize_text(raw_drive.get("esxi_device_id")))
+        other_uids = normalize_text(raw_drive.get("esxi_other_uids"))
+        if other_uids:
+            for token in re.split(r"[\s,]+", other_uids):
+                append(token)
+        for device_name in slot_view.smart_device_names or []:
+            append(device_name)
+        return candidates
 
     def _build_quantastor_smart_summary(self, slot_view: SlotView) -> SmartSummaryView:
         raw_disk = slot_view.raw_status.get("disk_raw") if isinstance(slot_view.raw_status, dict) else None
@@ -4754,6 +5566,194 @@ class InventoryService:
             )
         ]
 
+    def _build_bmc_enclosure_options(self, bmc_inventory: BMCInventory | None) -> list[EnclosureOption]:
+        profile_id = self.system.default_profile_id or self._infer_bmc_profile_id(bmc_inventory)
+        if not profile_id:
+            return []
+        profile = self.profile_registry.get(profile_id)
+        if profile is None:
+            return []
+        slot_count = infer_slot_count_from_layout(profile.slot_layout, profile.rows * profile.columns)
+        label = profile.panel_title or profile.label
+        name = normalize_text(bmc_inventory.system_model if bmc_inventory is not None else None) or profile.label
+        return [
+            EnclosureOption(
+                id=profile.id,
+                label=label,
+                name=name,
+                profile_id=profile.id,
+                rows=profile.rows,
+                columns=profile.columns,
+                slot_count=slot_count,
+                slot_layout=profile.slot_layout,
+            )
+        ]
+
+    def _infer_bmc_profile_id(self, bmc_inventory: BMCInventory | None) -> str | None:
+        if bmc_inventory is None:
+            return None
+        model_text = " ".join(
+            filter(
+                None,
+                [
+                    normalize_text(bmc_inventory.system_model),
+                    normalize_text(self.system.label),
+                ],
+            )
+        ).lower()
+        discovered_slots = {
+            drive.slot_number
+            for drive in bmc_inventory.drives
+            if isinstance(drive.slot_number, int)
+        }
+        if (
+            "f629" in model_text
+            or "fat twin" in model_text
+            or discovered_slots.issuperset({0, 1, 2, 3, 4, 5, 6, 7})
+        ):
+            return SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID
+        return None
+
+    @staticmethod
+    def _profile_bmc_slot_numbers(profile: Any) -> dict[int, int]:
+        mapping: dict[int, int] = {}
+        slot_hints = getattr(profile, "slot_hints", {}) or {}
+        for slot, hints in slot_hints.items():
+            if not isinstance(slot, int) or not isinstance(hints, list):
+                continue
+            for hint in hints:
+                match = BMC_SLOT_HINT_REGEX.fullmatch(str(hint).strip())
+                if match:
+                    mapping[slot] = int(match.group(1))
+                    break
+        return mapping
+
+    def _build_bmc_disk_records(self, bmc_inventory: BMCInventory | None) -> list[DiskRecord]:
+        if bmc_inventory is None:
+            return []
+
+        records: list[DiskRecord] = []
+        for drive in bmc_inventory.drives:
+            slot_hint = f"bmc-slot:{drive.slot_number}" if isinstance(drive.slot_number, int) else None
+            lookup_keys: set[str] = set()
+            for value in (
+                drive.serial,
+                drive.model,
+                drive.vendor,
+                slot_hint,
+                f"{drive.enclosure_id}:{drive.slot_number}"
+                if drive.enclosure_id is not None and isinstance(drive.slot_number, int)
+                else None,
+            ):
+                lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+
+            logical_block_size = (
+                drive.raw.get("logical_block_size")
+                if isinstance(drive.raw.get("logical_block_size"), int)
+                else None
+            )
+            records.append(
+                DiskRecord(
+                    raw={
+                        **drive.raw,
+                        "platform": "bmc",
+                        "bmc_slot_number": drive.slot_number,
+                        "bmc_enclosure_id": drive.enclosure_id,
+                        "bmc_physical_index": drive.physical_index,
+                        "bmc_controller_id": drive.controller_id,
+                        "bmc_identify_active": drive.identify_active,
+                        "logical_block_size": logical_block_size,
+                    },
+                    device_name=None,
+                    path_device_name=None,
+                    multipath_name=None,
+                    multipath_member=None,
+                    serial=drive.serial,
+                    model=drive.model or drive.vendor,
+                    size_bytes=drive.size_bytes,
+                    identifier=drive.serial or slot_hint or f"bmc-{drive.controller_id}-{drive.physical_index}",
+                    health=normalize_text(drive.health),
+                    pool_name=None,
+                    lunid=None,
+                    bus=(normalize_text(drive.interface_type) or normalize_text(drive.media_type) or "BMC").upper(),
+                    temperature_c=drive.temperature_c,
+                    last_smart_test_type=None,
+                    last_smart_test_status=None,
+                    last_smart_test_lifetime_hours=None,
+                    logical_block_size=logical_block_size,
+                    physical_block_size=logical_block_size,
+                    enclosure_id=drive.enclosure_id,
+                    slot=drive.slot_number,
+                    smart_devices=[slot_hint] if slot_hint else [],
+                    lookup_keys=lookup_keys,
+                )
+            )
+        return records
+
+    @staticmethod
+    def _build_bmc_platform_context(bmc_inventory: BMCInventory) -> dict[str, Any]:
+        return {
+            "source": "supermicro_bmc",
+            "system_model": bmc_inventory.system_model,
+            "system_serial": bmc_inventory.system_serial,
+            "indicator_led": bmc_inventory.system_indicator_led,
+            "uid_active": bmc_inventory.uid_active,
+            "controller_count": len(bmc_inventory.controllers),
+            "drive_count": len(bmc_inventory.drives),
+            "controllers": [
+                {
+                    "controller_id": controller.controller_id,
+                    "status": controller.status,
+                    "product_name": controller.product_name,
+                    "serial": controller.serial,
+                    "firmware_version": controller.firmware_version,
+                    "bios_version": controller.bios_version,
+                    "package_version": controller.package_version,
+                    "jbod_enabled": controller.jbod_enabled,
+                    "location": controller.location,
+                    "logical_drive_count": controller.logical_drive_count,
+                }
+                for controller in bmc_inventory.controllers
+            ],
+            "warnings": list(bmc_inventory.warnings),
+        }
+
+    @staticmethod
+    def _apply_bmc_drive_to_raw_slot_status(raw_slot_status: dict[str, Any], drive: DiskRecord | None) -> None:
+        if drive is None:
+            return
+        device_names = list(
+            dict.fromkeys(
+                [
+                    *(
+                        raw_slot_status.get("device_names")
+                        if isinstance(raw_slot_status.get("device_names"), list)
+                        else []
+                    ),
+                    *drive.smart_devices,
+                ]
+            )
+        )
+        raw_slot_status.update(
+            {
+                "device_names": device_names,
+                "device_hint": device_names[0] if device_names else raw_slot_status.get("device_hint"),
+                "present": True,
+                "status": drive.health,
+                "value": drive.health,
+                "serial_hint": drive.serial,
+                "model_hint": drive.model,
+                "reported_size": format_bytes(drive.size_bytes),
+                "identify_active": bool(drive.raw.get("bmc_identify_active")),
+                "bmc_slot_number": drive.raw.get("bmc_slot_number"),
+                "bmc_enclosure_id": drive.raw.get("bmc_enclosure_id"),
+                "bmc_physical_index": drive.raw.get("bmc_physical_index"),
+                "bmc_controller_id": drive.raw.get("bmc_controller_id"),
+                "bmc_identify_active": drive.raw.get("bmc_identify_active"),
+                "logical_block_size": drive.raw.get("logical_block_size"),
+            }
+        )
+
     def _build_enclosure_options(
         self,
         raw_data: TrueNASRawData,
@@ -5066,7 +6066,7 @@ class InventoryService:
         if not text:
             return None
         lowered = text.lower()
-        if lowered in {"onln", "online", "optl", "optimal", "good"}:
+        if lowered in {"onln", "online", "optl", "optimal", "good", "jbod"}:
             return "ONLINE"
         if lowered in {"ubad", "failed", "fail", "offln", "offline"}:
             return "FAULT"
@@ -5092,6 +6092,7 @@ class InventoryService:
 
     def _build_esxi_disk_records(self, ssh_data: ParsedSSHData) -> list[DiskRecord]:
         vd_names_by_slot = self._storcli_virtual_drive_names_for_slots(ssh_data.esxi_storcli_virtual_drives)
+        storage_devices_by_key = self._build_esxi_storage_device_index(ssh_data)
         records: list[DiskRecord] = []
         for drive in ssh_data.esxi_storcli_physical_drives:
             slot = drive.get("slot") if isinstance(drive.get("slot"), int) else None
@@ -5103,11 +6104,39 @@ class InventoryService:
             connected_port = normalize_text(drive.get("connected_port"))
             controller_id = normalize_text(drive.get("controller_id")) or "c0"
             virtual_drive_names = vd_names_by_slot.get(slot_key, [])
-            pool_name = " + ".join(virtual_drive_names) if virtual_drive_names else "ESXi local RAID"
-            state = self._storcli_state_health(normalize_text(drive.get("state"))) or "ONLINE"
+            storcli_state = normalize_text(drive.get("state"))
+            is_jbod_member = (storcli_state or "").upper() == "JBOD" and not virtual_drive_names
+            pool_name = " + ".join(virtual_drive_names) if virtual_drive_names else (
+                "ESXi local JBOD" if is_jbod_member else "ESXi local RAID"
+            )
+            state = self._storcli_state_health(storcli_state) or "ONLINE"
             serial = normalize_text(drive.get("serial"))
             model = normalize_text(drive.get("model"))
             device_name = slot_key
+            matched_path = self._resolve_esxi_storage_path_for_drive(ssh_data, storage_devices_by_key, drive)
+            matched_device = (
+                self._resolve_esxi_storage_device(storage_devices_by_key, matched_path.get("device"))
+                if isinstance(matched_path, dict)
+                else None
+            )
+            esxi_device_id = normalize_text(
+                str((matched_device or {}).get("id") or (matched_path or {}).get("device"))
+                if ((matched_device or {}).get("id") or (matched_path or {}).get("device")) is not None
+                else None
+            )
+            other_uids = normalize_text(
+                str((matched_device or {}).get("other_uids"))
+                if (matched_device or {}).get("other_uids") is not None
+                else None
+            )
+            smart_devices: list[str] = []
+            for candidate in [
+                esxi_device_id,
+                *([token for token in re.split(r"[\s,]+", other_uids) if token] if other_uids else []),
+            ]:
+                normalized_candidate = normalize_device_name(candidate)
+                if normalized_candidate and normalized_candidate not in smart_devices:
+                    smart_devices.append(normalized_candidate)
             lookup_keys: set[str] = set()
             for value in (
                 device_name,
@@ -5116,6 +6145,8 @@ class InventoryService:
                 model,
                 connector_name,
                 connected_port,
+                esxi_device_id,
+                other_uids,
                 f"{controller_id}/e{enclosure_id}/s{slot}" if enclosure_id is not None else None,
                 f"/{controller_id}/e{enclosure_id}/s{slot}" if enclosure_id is not None else None,
             ):
@@ -5127,6 +6158,7 @@ class InventoryService:
                     raw={
                         "platform": "esxi",
                         "storcli_physical_drive": drive,
+                        "storcli_state": storcli_state,
                         "storcli_slot": slot_key,
                         "storcli_enclosure_id": enclosure_id,
                         "controllerId": controller_id,
@@ -5143,6 +6175,16 @@ class InventoryService:
                         "firmware": drive.get("firmware"),
                         "link_speed": drive.get("link_speed"),
                         "unmap_capable": drive.get("unmap_capable"),
+                        "esxi_device_id": esxi_device_id,
+                        "esxi_device_display_name": normalize_text((matched_device or {}).get("display_name")),
+                        "esxi_devfs_path": normalize_text((matched_device or {}).get("devfs_path")),
+                        "esxi_other_uids": other_uids,
+                        "esxi_runtime_name": normalize_text((matched_path or {}).get("runtime_name")),
+                        "esxi_target_identifier": normalize_text((matched_path or {}).get("target_identifier")),
+                        "esxi_drive_type": normalize_text((matched_device or {}).get("drive_type")),
+                        "esxi_raid_level": normalize_text((matched_device or {}).get("raid_level")),
+                        "esxi_transport": normalize_text((matched_path or {}).get("transport")),
+                        "logical_block_size": logical_block_size,
                     },
                     device_name=device_name,
                     path_device_name=None,
@@ -5151,11 +6193,15 @@ class InventoryService:
                     serial=serial,
                     model=model,
                     size_bytes=parse_size_to_bytes(drive.get("size")) or parse_size_to_bytes(drive.get("raw_size")),
-                    identifier=serial or slot_key,
+                    identifier=serial or esxi_device_id or slot_key,
                     health=state,
                     pool_name=pool_name,
-                    lunid=None,
-                    bus=(normalize_text(drive.get("interface")) or "NVMe").upper(),
+                    lunid=esxi_device_id,
+                    bus=(
+                        normalize_text((matched_path or {}).get("transport"))
+                        or normalize_text(drive.get("interface"))
+                        or "NVME"
+                    ).upper(),
                     temperature_c=drive.get("temperature_c") if isinstance(drive.get("temperature_c"), int) else None,
                     last_smart_test_type=None,
                     last_smart_test_status=None,
@@ -5164,7 +6210,7 @@ class InventoryService:
                     physical_block_size=logical_block_size,
                     enclosure_id=ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
                     slot=slot,
-                    smart_devices=[],
+                    smart_devices=smart_devices,
                     lookup_keys=lookup_keys,
                 )
             )
@@ -5625,20 +6671,48 @@ class InventoryService:
         members: dict[str, ZpoolMember] = {}
         for disk in disk_records:
             slot_key = normalize_text(disk.raw.get("storcli_slot")) or normalize_text(disk.device_name)
-            pool_name = normalize_text(disk.pool_name) or "ESXi local RAID"
-            topology_label = " > ".join(
-                filter(
-                    None,
-                    [
-                        pool_name,
-                        "RAID1 member",
-                        f"slot {slot_key}" if slot_key else None,
-                    ],
+            storcli_state = normalize_text(
+                disk.raw.get("storcli_state")
+                or (
+                    disk.raw.get("storcli_physical_drive", {}).get("state")
+                    if isinstance(disk.raw.get("storcli_physical_drive"), dict)
+                    else None
                 )
             )
+            is_jbod_member = (storcli_state or "").upper() == "JBOD" and not normalize_text(
+                " + ".join(disk.raw.get("virtual_drive_names") or [])
+                if isinstance(disk.raw.get("virtual_drive_names"), list)
+                else None
+            )
+            if is_jbod_member:
+                pool_name = normalize_text(disk.pool_name) or "ESXi local JBOD"
+                topology_label = " > ".join(
+                    filter(
+                        None,
+                        [
+                            "ESXi local Enc",
+                            f"slot {slot_key}" if slot_key else None,
+                            "direct disk",
+                        ],
+                    )
+                )
+                vdev_class = "JBOD"
+            else:
+                pool_name = normalize_text(disk.pool_name) or "ESXi local RAID"
+                topology_label = " > ".join(
+                    filter(
+                        None,
+                        [
+                            pool_name,
+                            "RAID1 member",
+                            f"slot {slot_key}" if slot_key else None,
+                        ],
+                    )
+                )
+                vdev_class = "raid1"
             member = ZpoolMember(
                 pool_name=pool_name,
-                vdev_class="raid1",
+                vdev_class=vdev_class,
                 vdev_name=slot_key or disk.device_name,
                 topology_label=topology_label,
                 health=disk.health,
@@ -5893,8 +6967,14 @@ class InventoryService:
         faulty = self._status_contains(raw_slot_status, "fault") or self._health_is_bad(
             disk.health if disk else None,
             zpool.health if zpool else None,
+            normalize_text(raw_slot_status.get("status")),
+            normalize_text(raw_slot_status.get("value")),
         )
         raw_present = raw_slot_status.get("present") if isinstance(raw_slot_status.get("present"), bool) else None
+        bmc_present = raw_present is True and any(
+            raw_slot_status.get(key) is not None
+            for key in ("bmc_slot_number", "bmc_enclosure_id", "bmc_physical_index", "bmc_controller_id")
+        )
         quantastor_ses_empty = (
             self.system.truenas.platform == "quantastor"
             and raw_present is False
@@ -5922,7 +7002,7 @@ class InventoryService:
             state = SlotState.fault
         elif quantastor_ses_empty or empty:
             state = SlotState.empty
-        elif disk:
+        elif disk or bmc_present:
             state = SlotState.healthy
         elif mapping:
             state = SlotState.unmapped
@@ -5995,7 +7075,16 @@ class InventoryService:
             and self.system.ssh.enabled
             and isinstance(unifi_vendor_slot_number, int)
         )
-        if self.system.truenas.platform == "quantastor" and self.system.ssh.enabled and ses_targets:
+        bmc_led_supported = bool(
+            self.bmc_service is not None
+            and isinstance(raw_slot_status.get("bmc_controller_id"), int)
+            and isinstance(raw_slot_status.get("bmc_physical_index"), int)
+        )
+        if bmc_led_supported:
+            led_supported = True
+            led_backend = "supermicro_bmc"
+            led_reason = None
+        elif self.system.truenas.platform == "quantastor" and self.system.ssh.enabled and ses_targets:
             led_supported = True
             led_backend = "quantastor_sg_ses"
             led_reason = None
@@ -6099,6 +7188,8 @@ class InventoryService:
                 if mapping
                 else "ssh"
                 if ses_device or self.system.truenas.platform in {"linux", "esxi"}
+                else "bmc"
+                if self.system.truenas.platform == "ipmi" and disk
                 else "api"
                 if disk
                 else "unknown"
@@ -6383,7 +7474,10 @@ class InventoryService:
 
     @staticmethod
     def _is_placeholder_hint_device(value: str | None) -> bool:
-        return bool(value and HCTL_NAME_REGEX.fullmatch(value.strip()))
+        if not value:
+            return False
+        trimmed = value.strip()
+        return bool(HCTL_NAME_REGEX.fullmatch(trimmed) or BMC_SLOT_HINT_REGEX.fullmatch(trimmed))
 
     @staticmethod
     def _lookup_disk_temperature(
@@ -6555,6 +7649,8 @@ class InventoryService:
                 summary.annualized_bytes_written,
                 summary.estimated_lifetime_bytes_written,
                 summary.estimated_remaining_bytes_written,
+                summary.read_error_count,
+                summary.write_error_count,
                 summary.media_errors,
                 summary.predictive_errors,
                 summary.non_medium_errors,
@@ -6635,6 +7731,8 @@ class InventoryService:
             "estimated_remaining_bytes_written",
             "read_commands",
             "write_commands",
+            "read_error_count",
+            "write_error_count",
             "media_errors",
             "predictive_errors",
             "non_medium_errors",

@@ -24,6 +24,7 @@ class AdminSettings(BaseModel):
     container_version_probe_timeout_seconds: float = 1.5
     public_origin: str | None = None
     clean_backup_targets: list[str] = Field(default_factory=lambda: ["ui", "history"])
+    host_prep_temp_dir: str = "/tmp/truenas-jbod-ui-host-prep"
 
 
 ENV_OVERRIDES: dict[str, str] = {
@@ -42,6 +43,7 @@ ENV_OVERRIDES: dict[str, str] = {
     "ADMIN_CONTAINER_VERSION_PROBE_TIMEOUT_SECONDS": "container_version_probe_timeout_seconds",
     "ADMIN_PUBLIC_ORIGIN": "public_origin",
     "ADMIN_CLEAN_BACKUP_TARGETS_JSON": "clean_backup_targets",
+    "ADMIN_HOST_PREP_TEMP_DIR": "host_prep_temp_dir",
 }
 
 
@@ -71,4 +73,5 @@ def get_admin_settings() -> AdminSettings:
 
     settings = AdminSettings.model_validate(payload)
     Path("/tmp").mkdir(parents=True, exist_ok=True)
+    Path(settings.host_prep_temp_dir).mkdir(parents=True, exist_ok=True)
     return settings
