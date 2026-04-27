@@ -3,6 +3,7 @@ import unittest
 from app.services.parsers import (
     canonicalize_ssh_command,
     parse_camcontrol_devlist,
+    parse_esxcli_smart_get,
     parse_gmultipath_list,
     parse_lsblk_json,
     parse_mdadm_detail_scan,
@@ -984,6 +985,31 @@ Logical Unit id:      0x00e04c2020202000error: designator length
 
         self.assertFalse(parsed["available"])
         self.assertEqual(parsed["message"], "SMART JSON parsing failed.")
+
+    def test_parse_esxcli_smart_get_keeps_host_error_counts_distinct_from_uncorrected(self) -> None:
+        output = """
+Parameter                 Value         Threshold  Worst  Raw
+------------------------  ------------  ---------  -----  ---
+Health Status             OK            N/A        N/A    N/A
+Write Error Count         0             N/A        N/A    N/A
+Read Error Count          444578        N/A        N/A    N/A
+Power Cycle Count         29            N/A        N/A    N/A
+Reallocated Sector Count  0             N/A        N/A    N/A
+Drive Temperature         34            N/A        N/A    N/A
+Write Sectors TOT Count   224246729061  N/A        N/A    N/A
+Read Sectors TOT Count    49378996762   N/A        N/A    N/A
+Program Fail Count        0             N/A        N/A    N/A
+Erase Fail Count          0             N/A        N/A    N/A
+""".strip()
+
+        parsed = parse_esxcli_smart_get(output, logical_block_size=512)
+
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["smart_health_status"], "OK")
+        self.assertEqual(parsed["read_error_count"], 444578)
+        self.assertEqual(parsed["write_error_count"], 0)
+        self.assertNotIn("uncorrected_read_errors", parsed)
+        self.assertNotIn("uncorrected_write_errors", parsed)
 
 
 if __name__ == "__main__":

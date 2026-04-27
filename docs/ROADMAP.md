@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.14.2`.
+This file tracks the current intended release direction after `v0.15.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -14,6 +14,25 @@ Detailed execution plans live here:
 - [`docs/V0_9_0_PLAN.md`](./V0_9_0_PLAN.md)
 - [`docs/V0_11_0_PLAN.md`](./V0_11_0_PLAN.md)
 - [`docs/PROFILE_AUTHORING.md`](./PROFILE_AUTHORING.md)
+
+## Current Snapshot
+
+`v0.15.0` just shipped the Supermicro BMC / IPMI-first FatTwin slice:
+
+- first-class `ipmi` platform support
+- validated FatTwin front-six plus inferred rear-two profiles
+- BMC-backed slot truth and identify
+- ESXi host prep for operator-supplied StorCLI bundles
+- much tighter published-image and optional-sidecar docs
+
+The next cycle should stay narrower than that release:
+
+- confirm the remaining sibling FatTwin ESXi node behavior
+- live-confirm rear-bay numbering later
+- decide whether chassis locator/UID graduates from backend-only to a visible
+  UI affordance
+- keep Linux Docker as the primary perf truth while chasing the still-slow
+  local Windows history/export path
 
 ## Guiding Principle
 

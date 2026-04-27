@@ -102,7 +102,7 @@ class TrueNASConfig(BaseModel):
     api_key: str = ""
     api_user: str = ""
     api_password: str = ""
-    platform: Literal["core", "scale", "linux", "quantastor", "esxi"] = "core"
+    platform: Literal["core", "scale", "linux", "quantastor", "esxi", "ipmi"] = "core"
     verify_ssl: bool = True
     tls_ca_bundle_path: str | None = None
     tls_server_name: str | None = None
@@ -161,6 +161,25 @@ class SSHConfig(BaseModel):
             seen.add(dedupe_key)
             normalized.append(node)
         return normalized
+
+
+class BMCConfig(BaseModel):
+    enabled: bool = False
+    host: str = ""
+    username: str = ""
+    password: str = ""
+    verify_ssl: bool = True
+    timeout_seconds: int = 15
+
+    @field_validator("host", "username", mode="before")
+    @classmethod
+    def _normalize_text_fields(cls, value: Any) -> str:
+        return normalize_text(str(value) if value is not None else None) or ""
+
+    @field_validator("password", mode="before")
+    @classmethod
+    def _normalize_secret_field(cls, value: Any) -> str:
+        return str(value) if value is not None else ""
 
 
 class EnclosureProfileConfig(BaseModel):
@@ -351,6 +370,7 @@ class SystemConfig(BaseModel):
     label: str | None = None
     truenas: TrueNASConfig = Field(default_factory=TrueNASConfig)
     ssh: SSHConfig = Field(default_factory=SSHConfig)
+    bmc: BMCConfig = Field(default_factory=BMCConfig)
     default_profile_id: str | None = None
     enclosure_profiles: dict[str, str] = Field(default_factory=dict)
     storage_views: list[StorageViewConfig] = Field(default_factory=list)

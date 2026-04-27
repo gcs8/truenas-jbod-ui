@@ -299,6 +299,7 @@
                   <option value="linux">Generic Linux</option>
                   <option value="quantastor">Quantastor</option>
                   <option value="esxi">VMware ESXi</option>
+                  <option value="ipmi">IPMI / BMC Only</option>
                 </select>
               </label>
               <label class="field">
@@ -363,6 +364,47 @@
                 <span>API Password</span>
                 <input id="setup-api-password" type="password" placeholder="Optional unless the platform needs it">
               </label>
+            </div>
+            <div class="key-mode-panel">
+              <div class="setup-step-header">
+                <span class="badge">BMC</span>
+                <div>
+                  <h3>BMC / IPMI Access</h3>
+                  <p class="subtle">
+                    Use this for Supermicro-style out-of-band inventory, drive locate control, and node UID control.
+                    It can stand on its own for BMC-only systems or enrich ESXi and other host-managed platforms later.
+                  </p>
+                </div>
+              </div>
+              <label class="toggle">
+                <input id="setup-bmc-enabled" type="checkbox">
+                <span>Enable BMC / IPMI access for this system</span>
+              </label>
+              <div class="form-grid">
+                <label class="field field-span">
+                  <span>BMC Host</span>
+                  <input id="setup-bmc-host" data-bmc-field type="text" placeholder="https://10.13.0.20 or 10.13.0.20">
+                </label>
+                <label class="field">
+                  <span>BMC Username</span>
+                  <input id="setup-bmc-username" data-bmc-field type="text" placeholder="ADMIN">
+                </label>
+                <label class="field">
+                  <span>BMC Password</span>
+                  <input id="setup-bmc-password" data-bmc-field type="password" placeholder="Required when BMC access is enabled">
+                </label>
+                <label class="toggle">
+                  <input id="setup-bmc-verify-ssl" data-bmc-field type="checkbox" checked>
+                  <span>Verify BMC TLS certificate</span>
+                </label>
+                <label class="field">
+                  <span>BMC Timeout (Seconds)</span>
+                  <input id="setup-bmc-timeout-seconds" data-bmc-field type="number" min="1" max="300" value="15">
+                </label>
+              </div>
+              <p id="setup-bmc-help" class="subtle action-note">
+                Supermicro BMC support prefers Redfish when the enclosure endpoints are available, then falls back to the validated web XML path for storage locate and UID control.
+              </p>
             </div>
             <div class="key-mode-panel">
               <div class="setup-step-header">
@@ -453,11 +495,12 @@
                   <option value="reuse">Reuse Existing Key Pair</option>
                   <option value="generate">Generate New Ed25519 Key Pair</option>
                   <option value="manual">Manual Path</option>
+                  <option value="none">Password Only / No Key</option>
                 </select>
               </label>
               <label class="field field-span">
                 <span>SSH Key Path</span>
-                <input id="setup-ssh-key-path" data-ssh-field type="text" value="/run/ssh/id_truenas">
+                <input id="setup-ssh-key-path" data-ssh-field type="text" value="/run/ssh/id_truenas" placeholder="Leave blank for password-only auth">
               </label>
               <label class="field">
                 <span>Saved SSH Password</span>
@@ -629,6 +672,42 @@
                 <pre id="setup-bootstrap-sudoers-preview" class="sudoers-preview"># Building sudoers preview...</pre>
               </div>
               </div>
+            </div>
+
+            <div id="setup-esxi-host-prep-panel" class="key-mode-panel hidden">
+              <div class="setup-step-header">
+                <span class="badge">ESXi</span>
+                <div>
+                  <h3>Host Prep / Vendor Tool Upload</h3>
+                  <p id="setup-esxi-host-prep-copy" class="subtle">
+                    Upload an operator-supplied ESXi offline bundle or VIB into the admin sidecar temp area, then copy/install it on this host with the saved SSH credentials above.
+                  </p>
+                </div>
+              </div>
+              <div class="import-picker">
+                <input id="setup-esxi-host-prep-file" type="file" accept=".zip,.vib,application/zip,application/octet-stream" class="hidden">
+                <button id="setup-esxi-host-prep-pick-button" class="button secondary small" data-ssh-field type="button">Choose ESXi Package</button>
+                <span id="setup-esxi-host-prep-file-label" class="file-label">No file selected</span>
+              </div>
+              <div class="button-row">
+                <button id="setup-esxi-host-prep-upload-button" class="button secondary small" data-ssh-field type="button">Stage In Admin Temp</button>
+              </div>
+              <div class="form-grid compact-grid">
+                <label class="field field-span">
+                  <span>Staged Package</span>
+                  <select id="setup-esxi-host-prep-package-select" data-ssh-field></select>
+                </label>
+              </div>
+              <p class="subtle action-note">
+                Staged files live temporarily under <code id="setup-esxi-host-prep-temp-dir">/tmp/truenas-jbod-ui-host-prep</code>. This flow expects you to supply the vendor package yourself; the project does not bundle Broadcom files.
+              </p>
+              <div class="button-row">
+                <button id="setup-esxi-host-prep-install-button" class="button secondary" data-ssh-field type="button">Upload To Host And Install</button>
+              </div>
+              <p id="setup-esxi-host-prep-result" class="subtle action-note">
+                Upload a user-supplied ESXi .zip or .vib first. The sidecar stages it temporarily and does not bundle vendor files into this project.
+              </p>
+              <pre id="setup-esxi-host-prep-detail" class="sudoers-preview"></pre>
             </div>
 
             <label class="field">

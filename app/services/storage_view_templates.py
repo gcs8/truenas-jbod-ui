@@ -168,6 +168,38 @@ def list_storage_view_templates() -> list[StorageViewTemplate]:
             notes="Useful for mirrored boot devices or SATADOM pairs. Hide it from the main read UI later if you only want it as a maintenance view.",
         ),
         StorageViewTemplate(
+            id="fat-twin-rear-2",
+            label="FatTwin Rear 2",
+            default_id="fat-twin-rear",
+            default_label="Rear 2 Bay",
+            kind="manual",
+            summary="Two rear hot-swap bays on a Supermicro FatTwin node, suitable for SAS or U.2 / NVMe media.",
+            rows=2,
+            columns=1,
+            slot_count=2,
+            slot_layout=[[1], [0]],
+            default_render=StorageViewRenderConfig(
+                show_in_main_ui=True,
+                show_in_admin_ui=True,
+                default_collapsed=True,
+            ),
+            default_binding=StorageViewBindingConfig(
+                mode="hybrid",
+                device_names=["bmc-slot:6", "bmc-slot:7"],
+            ),
+            default_slot_labels={
+                0: "Rear 1",
+                1: "Rear 2",
+            },
+            supports_led=False,
+            supports_auto_discovery=False,
+            notes=(
+                "First-pass rear two-bay view for FatTwin nodes. The stacked rear carrier renders "
+                "slot 01 above slot 00, and the BMC inventory path can bind those bays by "
+                "out-of-band slot number even when the host OS changes later."
+            ),
+        ),
+        StorageViewTemplate(
             id="embedded-boot-media-1",
             label="Embedded Boot Media",
             default_id="embedded-boot-media",

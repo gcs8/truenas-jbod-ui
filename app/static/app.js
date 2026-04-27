@@ -3421,6 +3421,28 @@
     return formatOptionalCount(smartEntry?.data?.write_commands, smartEntry);
   }
 
+  function formatReadErrorCountValue(smartEntry) {
+    if (smartEntry?.data?.read_error_count !== undefined && smartEntry?.data?.read_error_count !== null) {
+      return formatOptionalCount(smartEntry?.data?.read_error_count, smartEntry);
+    }
+    return formatOptionalCount(smartEntry?.data?.uncorrected_read_errors, smartEntry);
+  }
+
+  function formatWriteErrorCountValue(smartEntry) {
+    if (smartEntry?.data?.write_error_count !== undefined && smartEntry?.data?.write_error_count !== null) {
+      return formatOptionalCount(smartEntry?.data?.write_error_count, smartEntry);
+    }
+    return formatOptionalCount(smartEntry?.data?.uncorrected_write_errors, smartEntry);
+  }
+
+  function readErrorCountLabel(smartEntry) {
+    return Number.isInteger(smartEntry?.data?.read_error_count) ? "Read Error Count" : "Uncorrected Read";
+  }
+
+  function writeErrorCountLabel(smartEntry) {
+    return Number.isInteger(smartEntry?.data?.write_error_count) ? "Write Error Count" : "Uncorrected Write";
+  }
+
   function formatMediaErrorsValue(smartEntry) {
     return formatOptionalCount(smartEntry?.data?.media_errors, smartEntry);
   }
@@ -3431,14 +3453,6 @@
 
   function formatNonMediumErrorsValue(smartEntry) {
     return formatOptionalCount(smartEntry?.data?.non_medium_errors, smartEntry);
-  }
-
-  function formatUncorrectedReadErrorsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.uncorrected_read_errors, smartEntry);
-  }
-
-  function formatUncorrectedWriteErrorsValue(smartEntry) {
-    return formatOptionalCount(smartEntry?.data?.uncorrected_write_errors, smartEntry);
   }
 
   function formatUnsafeShutdownsValue(smartEntry) {
@@ -5434,8 +5448,8 @@
       kvRowIfMeaningful("Media Errors", formatMediaErrorsValue(smartEntry)),
       kvRowIfMeaningful("Predictive Errors", formatPredictiveErrorsValue(smartEntry)),
       kvRowIfMeaningful("Non-Medium Errors", formatNonMediumErrorsValue(smartEntry)),
-      kvRowIfMeaningful("Uncorrected Read", formatUncorrectedReadErrorsValue(smartEntry)),
-      kvRowIfMeaningful("Uncorrected Write", formatUncorrectedWriteErrorsValue(smartEntry)),
+      kvRowIfMeaningful(readErrorCountLabel(smartEntry), formatReadErrorCountValue(smartEntry)),
+      kvRowIfMeaningful(writeErrorCountLabel(smartEntry), formatWriteErrorCountValue(smartEntry)),
       kvRowIfMeaningful("Unsafe Shutdowns", formatUnsafeShutdownsValue(smartEntry)),
       kvRowIfMeaningful("Hardware Resets", formatHardwareResetsValue(smartEntry)),
       kvRowIfMeaningful("Interface CRC Errors", formatInterfaceCrcErrorsValue(smartEntry)),
@@ -5571,8 +5585,8 @@
         kvRowIfMeaningful("Media Errors", formatMediaErrorsValue(smartEntry)),
         kvRowIfMeaningful("Predictive Errors", formatPredictiveErrorsValue(smartEntry)),
         kvRowIfMeaningful("Non-Medium Errors", formatNonMediumErrorsValue(smartEntry)),
-        kvRowIfMeaningful("Uncorrected Read", formatUncorrectedReadErrorsValue(smartEntry)),
-        kvRowIfMeaningful("Uncorrected Write", formatUncorrectedWriteErrorsValue(smartEntry)),
+        kvRowIfMeaningful(readErrorCountLabel(smartEntry), formatReadErrorCountValue(smartEntry)),
+        kvRowIfMeaningful(writeErrorCountLabel(smartEntry), formatWriteErrorCountValue(smartEntry)),
         kvRowIfMeaningful("Unsafe Shutdowns", formatUnsafeShutdownsValue(smartEntry)),
         kvRowIfMeaningful("Hardware Resets", formatHardwareResetsValue(smartEntry)),
         kvRowIfMeaningful("Interface CRC Errors", formatInterfaceCrcErrorsValue(smartEntry)),

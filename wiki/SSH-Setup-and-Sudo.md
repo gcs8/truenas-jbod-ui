@@ -13,6 +13,8 @@ Current ESXi support is the exception to that pattern: it is SSH-only,
 read-only, and intentionally skips the Linux bootstrap/sudo flow. On the
 validated ESXi host the saved SSH user stays `root`, and the app uses direct
 read-only runtime commands instead of trying to synthesize Linux sudo rules.
+If the host is using password auth, leave `key_path` blank and use the admin
+sidecar's `Password Only / No Key` mode instead of forcing a fake key path.
 
 ## Recommended SSH User Pattern
 
@@ -44,6 +46,17 @@ ssh:
 
 If the appliance only supports password SSH, set `ssh.password` and leave
 `key_path` empty or unset.
+
+For ESXi specifically, password-only auth is a normal supported case:
+
+```yaml
+ssh:
+  enabled: true
+  host: 10.13.37.121
+  user: root
+  key_path: ""
+  password: "your-esxi-root-password"
+```
 
 With that default, the first successful SSH connection pins the observed host
 key into `/app/data/known_hosts`, and later connections must match it unless
@@ -97,6 +110,12 @@ esxcli storage san sas list
 /opt/lsi/storcli64/storcli64 /c0/eall/sall show all J
 ```
 
+On validated Broadcom / AVAGO MegaRAID hosts, `lsi_mr3` and
+`lsuv2-lsiv2-drivers-plugin` alone are not enough for the richer member-detail
+path. If StorCLI is missing, the admin sidecar's `Host Prep / Vendor Tool
+Upload` panel is the intended place to stage and install an operator-supplied
+Broadcom bundle or VIB. The project does not ship that vendor package itself.
+
 ## On-Demand Commands The App Runs Separately
 
 These do not have to live in the standing command list:
@@ -112,6 +131,9 @@ But the SSH user still needs sudo permission for them if the host requires root.
 
 ESXi does not use Linux sudo. Keep that path as direct read-only root or
 key-based SSH instead of trying to reuse the CORE/SCALE/Linux sudoers model.
+If you do not want to touch the host OS at all, the current Supermicro FatTwin
+path can also run as `ipmi` / BMC-only inventory and skip ESXi SSH entirely,
+with ESXi added later only as optional enrichment.
 
 ## Example Narrow Sudoers Entries
 

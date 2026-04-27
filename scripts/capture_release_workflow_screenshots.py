@@ -26,6 +26,7 @@ BOOT_DOMS_VIEW_ID = "boot-doms"
 QUANTASTOR_SYSTEM_ID = "qsosn-ha"
 QUANTASTOR_SATADOMS_RIGHT_VIEW_ID = "boot-satadoms-right"
 BUILDER_SOURCE_PROFILE_ID = "generic-front-24-1x24"
+ESXI_HOST_PREP_CANDIDATE_IDS = ("esxi-ft-node-2", "esxi-ft-node-3")
 
 
 def hide_debug_chrome(page: Page) -> None:
@@ -74,6 +75,15 @@ def wait_for_builder_ready(page: Page) -> None:
     page.wait_for_function(
         """() => document.querySelectorAll('#profile-catalog .profile-card').length > 0""",
         timeout=120_000,
+    )        
+
+
+def available_saved_system_ids(page: Page) -> list[str]:
+    return page.locator("#existing-system-select option").evaluate_all(
+        """(options) =>
+            options
+              .map((option) => option.value)
+              .filter((value) => typeof value === 'string' && value.length > 0)"""
     )
 
 
@@ -267,6 +277,39 @@ def capture_admin_setup(page: Page) -> None:
     write_page_screenshot(page, f"admin-setup-{SCREENSHOT_TAG}.png")
 
 
+def capture_admin_esxi_host_prep(page: Page) -> None:
+    page.set_viewport_size({"width": 1900, "height": 1550})
+    page.goto(ADMIN_URL, wait_until="domcontentloaded", timeout=120_000)
+    wait_for_admin_ready(page)
+    systems = available_saved_system_ids(page)
+    esxi_system_id = next((system_id for system_id in ESXI_HOST_PREP_CANDIDATE_IDS if system_id in systems), None)
+    if not esxi_system_id:
+        raise RuntimeError("No saved FatTwin ESXi system was found for admin host-prep screenshot capture.")
+    page.locator("#existing-system-select").select_option(esxi_system_id)
+    page.locator("#existing-system-load-button").click()
+    page.locator("#setup-system-id").wait_for(state="visible", timeout=120_000)
+    page.wait_for_function(
+        """([systemId]) => {
+            const field = document.getElementById('setup-system-id');
+            return field && field.value === systemId;
+        }""",
+        arg=[esxi_system_id],
+        timeout=120_000,
+    )
+    host_prep_panel = page.locator("#setup-esxi-host-prep-panel")
+    host_prep_panel.wait_for(state="visible", timeout=120_000)
+    page.wait_for_function(
+        """() => {
+            const panel = document.getElementById('setup-esxi-host-prep-panel');
+            return panel && !panel.classList.contains('hidden');
+        }""",
+        timeout=120_000,
+    )
+    host_prep_panel.scroll_into_view_if_needed()
+    page.wait_for_timeout(700)
+    write_locator_screenshot(host_prep_panel, f"admin-esxi-host-prep-{SCREENSHOT_TAG}.png")
+
+
 def capture_admin_maintenance(page: Page) -> None:
     page.set_viewport_size({"width": 1900, "height": 1450})
     page.goto(ADMIN_URL, wait_until="domcontentloaded", timeout=120_000)
@@ -315,6 +358,7 @@ def main() -> None:
         capture_archive_core_front_24(page)
         capture_quantastor_satadoms(page)
         capture_admin_setup(page)
+        capture_admin_esxi_host_prep(page)
         capture_admin_maintenance(page)
         capture_builder_workspace(page)
         browser.close()

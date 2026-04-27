@@ -7,6 +7,7 @@ from typing import Any
 import yaml
 
 from app.config import (
+    BMCConfig,
     HANodeConfig,
     SSHConfig,
     StorageViewBindingConfig,
@@ -55,6 +56,8 @@ def default_ssh_commands_for_platform(platform: str) -> list[str]:
             "/opt/lsi/storcli64/storcli64 /c0/vall show all J",
             "/opt/lsi/storcli64/storcli64 /c0/eall/sall show all J",
         ]
+    if normalized == "ipmi":
+        return []
     return list(SSHConfig().commands)
 
 
@@ -233,6 +236,14 @@ class SystemSetupService:
                         else payload.ssh_timeout_seconds
                     ),
                     commands=list(ssh_commands),
+                ),
+                bmc=BMCConfig(
+                    enabled=bool(payload.bmc_enabled),
+                    host=payload.bmc_host or "",
+                    username=payload.bmc_username or "",
+                    password=payload.bmc_password or "",
+                    verify_ssl=payload.bmc_verify_ssl,
+                    timeout_seconds=payload.bmc_timeout_seconds,
                 ),
             )
 

@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+## v0.15.0 - 2026-04-27
+
+### Added
+
+- A new `ipmi` platform path and Supermicro BMC inventory backend now let the
+  app render validated FatTwin front and rear views from out-of-band storage
+  truth, including Broadcom slot inventory, slot identify, and node/chassis
+  locator support
+- ESXi setups on the validated Supermicro FatTwin path can now reuse BMC slot
+  truth, optional operator-supplied StorCLI host prep, and host-side SMART
+  enrichment for direct JBOD members without pretending ESXi is the primary
+  hardware source
+- The admin sidecar now includes an ESXi `Host Prep / Vendor Tool Upload`
+  workflow for staging user-supplied `.zip` / `.vib` packages and installing
+  them onto a saved ESXi host over SSH
+
+### Changed
+
+- The shipped compose layout now uses `docker-compose.yml` as the default
+  published-image path and `docker-compose.dev.yml` as the source-build path,
+  while the history and admin sidecars are documented as first-class optional
+  runtime services rather than as dev-only extras
+- ESXi platform details, slot history, and slot detail wording now describe
+  direct `JBOD` members honestly, keep enclosure-first topology labels, and
+  only infer `M.2` when the hardware path really warrants it
+- Release-facing docs, screenshots, and the checked-in wiki pages now center
+  the Supermicro FatTwin / ESXi host-prep story and the simplified GitHub
+  landing-page README
+
+### Fixed
+
+- FatTwin slot-state merging now treats BMC-confirmed present/online disks as
+  healthy instead of dropping them into `UNKNOWN` whenever host-side enrichment
+  is missing or incomplete
+- ESXi StorCLI warning paths now distinguish `tool missing`, `controller
+  hidden by passthrough`, and `controller visible but member detail absent`
+  instead of reusing the older AOC/NVMe-only warning copy
+- ESXi SMART parsing now keeps generic host counters such as `Read Error Count`
+  and `Write Error Count` in their own fields instead of overstating them as
+  uncorrected media errors
+
 ## v0.14.2 - 2026-04-26
 
 ### Added

@@ -28,6 +28,7 @@ from app.config import (
 )
 from app.main import app as main_app
 from app.main import resolve_admin_launch_url
+from app.models.domain import ESXiHostPrepInstallRequest
 from app.models.domain import EnclosureOption
 from app.models.domain import EnclosureProfileRequest
 from app.models.domain import HistoryAdoptRequest
@@ -68,6 +69,8 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertIn("/api/admin/system-setup/bootstrap", paths)
         self.assertIn("/api/admin/system-setup/sudoers-preview", paths)
+        self.assertIn("/api/admin/esxi-host-prep/upload", paths)
+        self.assertIn("/api/admin/esxi-host-prep/install", paths)
         self.assertIn("/api/admin/system-setup/{system_id}", paths)
         self.assertIn("/api/admin/system-setup/demo", paths)
         self.assertIn("/api/admin/profiles", paths)
@@ -97,6 +100,7 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertIn("/api/storage-views", paths)
         self.assertIn("/api/storage-views/{view_id}/slots/{slot_index}/history", paths)
+        self.assertIn("/api/system-locator", paths)
         self.assertIn("/livez", paths)
         self.assertIn("/healthz", paths)
 
@@ -127,6 +131,9 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertIn('id="admin-app-version"', template_text)
         self.assertIn('id="admin-release-note"', template_text)
+        self.assertIn('<option value="none">Password Only / No Key</option>', template_text)
+        self.assertIn('id="setup-esxi-host-prep-panel"', template_text)
+        self.assertIn('id="setup-esxi-host-prep-package-select"', template_text)
 
     def test_main_ui_script_filters_admin_only_storage_views_from_selector(self) -> None:
         script_path = Path(__file__).resolve().parents[1] / "app" / "static" / "app.js"
@@ -155,9 +162,14 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("platformSupportsBootstrap", script_text)
         self.assertIn("setupPlatformUsesSshOnlyHost", script_text)
         self.assertIn("truenas_host: primaryHost", script_text)
+        self.assertIn('value === "generate" || value === "manual" || value === "none"', script_text)
         self.assertIn('setupSshSudoPasswordField.classList.toggle("hidden", !savedSudoSupported)', script_text)
         self.assertIn("VMware ESXi does not use the one-time Linux service-account bootstrap.", script_text)
         self.assertIn("VMware ESXi does not use the Linux sudoers/bootstrap path.", script_text)
+        self.assertIn("Password-only mode does not provide a service key for bootstrap.", script_text)
+        self.assertIn("platformSupportsEsxiHostPrep", script_text)
+        self.assertIn("/api/admin/esxi-host-prep/upload", script_text)
+        self.assertIn("/api/admin/esxi-host-prep/install", script_text)
 
     def test_main_app_livez_is_lightweight(self) -> None:
         response = self._call_main_route("/livez")
@@ -363,19 +375,32 @@ class AdminStatePayloadTests(unittest.TestCase):
                 "algorithm": "ed25519",
             }
         ]
+        host_prep_service = MagicMock()
+        host_prep_service.list_staged_packages.return_value = [
+            {
+                "token": "storcli-1",
+                "filename": "BCM-vmware-storcli64.zip",
+                "extension": ".zip",
+                "install_mode": "component_bundle",
+                "size_bytes": 4096,
+                "created_at": "2026-04-26T20:00:00+00:00",
+                "staged_path": "/tmp/truenas-jbod-ui-host-prep/storcli-1/BCM-vmware-storcli64.zip",
+            }
+        ]
 
         with patch("admin_service.main.reload_app_settings", return_value=settings):
             with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
                 with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch(
-                        "admin_service.main.get_admin_settings",
-                        return_value=AdminSettings(auto_stop_seconds=3600),
-                    ):
+                    with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
                         with patch(
-                            "admin_service.main.get_history_settings",
-                            return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
+                            "admin_service.main.get_admin_settings",
+                            return_value=AdminSettings(auto_stop_seconds=3600, host_prep_temp_dir="/tmp/truenas-jbod-ui-host-prep"),
                         ):
-                            payload = asyncio.run(build_admin_state_payload(request))
+                            with patch(
+                                "admin_service.main.get_history_settings",
+                                return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
+                            ):
+                                payload = asyncio.run(build_admin_state_payload(request))
 
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["app_version"], __version__)
@@ -386,6 +411,7 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(payload["systems"][0]["tls_ca_bundle_path"], "/app/config/tls/archive-core.pem")
         self.assertEqual(payload["systems"][0]["tls_server_name"], "TrueNAS.gcs8.io")
         self.assertTrue(payload["systems"][0]["ssh_enabled"])
+        self.assertFalse(payload["systems"][0]["bmc_enabled"])
         self.assertEqual(payload["systems"][0]["ssh_key_path"], "/run/ssh/id_truenas")
         self.assertEqual(payload["systems"][0]["storage_views"][0]["id"], "front-bays")
         self.assertEqual(payload["systems"][0]["storage_views"][0]["template_id"], "ses-auto")
@@ -398,7 +424,10 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(custom_profile["reference_count"], 2)
         self.assertIn("core", payload["setup_platform_defaults"])
         self.assertIn("esxi", payload["setup_platform_defaults"])
+        self.assertIn("ipmi", payload["setup_platform_defaults"])
         self.assertEqual(payload["ssh_keys"][0]["name"], "id_truenas")
+        self.assertEqual(payload["esxi_host_prep"]["temp_dir"], "/tmp/truenas-jbod-ui-host-prep")
+        self.assertEqual(payload["esxi_host_prep"]["staged_packages"][0]["filename"], "BCM-vmware-storcli64.zip")
         self.assertEqual(payload["paths"]["history_db"], "/tmp/history/history.db")
         self.assertEqual(payload["paths"]["tls_dir"], str(Path("C:/tmp/config") / "tls"))
         self.assertIn("included_paths", payload["backup_defaults"])
@@ -438,6 +467,51 @@ class AdminStatePayloadTests(unittest.TestCase):
 
         self.assertEqual(payload["release_status"]["status"], "dev-build")
         self.assertEqual(payload["release_status"]["latest_tag"], "v0.14.1")
+
+    def test_build_admin_state_payload_preserves_password_only_ssh_details(self) -> None:
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="esxi-ft-node-2",
+                    label="esxi-ft-node-2",
+                    truenas=TrueNASConfig(
+                        host="10.13.37.121",
+                        platform="esxi",
+                        verify_ssl=False,
+                    ),
+                    ssh=SSHConfig(
+                        enabled=True,
+                        host="10.13.37.121",
+                        user="root",
+                        key_path="",
+                        password="#EDC2wsx!QAZ",
+                        strict_host_key_checking=False,
+                        commands=["vmware -v"],
+                    ),
+                )
+            ],
+            default_system_id="esxi-ft-node-2",
+        )
+        runtime_service = MagicMock()
+        runtime_service.status_payload.return_value = {"available": False, "detail": None, "containers": []}
+        key_manager = MagicMock()
+        key_manager.list_keys.return_value = []
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+                        with patch(
+                            "admin_service.main.get_history_settings",
+                            return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
+                        ):
+                            payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
+
+        saved_system = payload["systems"][0]
+        self.assertEqual(saved_system["truenas_host"], "10.13.37.121")
+        self.assertEqual(saved_system["ssh_host"], "10.13.37.121")
+        self.assertEqual(saved_system["ssh_key_path"], "")
+        self.assertEqual(saved_system["ssh_password"], "#EDC2wsx!QAZ")
 
     def test_annotate_runtime_versions_marks_out_of_sync_services(self) -> None:
         runtime_payload = {
@@ -1415,3 +1489,61 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("does not use the Linux one-time bootstrap or sudoers flow", str(context.exception.detail))
+
+    def test_esxi_host_prep_upload_route_stages_raw_body_and_returns_packages(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/upload")
+        request = MagicMock()
+        request.body = AsyncMock(return_value=b"storcli-bytes")
+        host_prep_service = MagicMock()
+        host_prep_service.stage_package.return_value = {
+            "token": "storcli-1",
+            "filename": "BCM-vmware-storcli64.zip",
+        }
+        host_prep_service.list_staged_packages.return_value = [host_prep_service.stage_package.return_value]
+
+        with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+            response = asyncio.run(route.endpoint(request=request, filename="BCM-vmware-storcli64.zip"))
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["package"]["token"], "storcli-1")
+        self.assertEqual(payload["packages"][0]["filename"], "BCM-vmware-storcli64.zip")
+        host_prep_service.stage_package.assert_called_once_with("BCM-vmware-storcli64.zip", b"storcli-bytes")
+
+    def test_esxi_host_prep_install_route_returns_install_status_payload(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/install")
+        host_prep_service = MagicMock()
+        host_prep_service.install_package.return_value = {
+            "ok": False,
+            "detail": "StorCLI is installed, but no compatible MegaRAID controller is currently visible to it on this ESXi host.",
+            "remote_path": "/tmp/truenas-jbod-ui-storcli.zip",
+            "install_command": "esxcli software component apply -d /tmp/truenas-jbod-ui-storcli.zip",
+            "install_result": {"ok": False, "exit_code": 1, "stdout": "", "stderr": "Controller 0 not found"},
+            "verification": {"summary": {"controller_visible": False, "controller_count": 0}},
+            "cleanup_result": {"ok": True, "exit_code": 0, "stdout": "", "stderr": ""},
+        }
+        host_prep_service.list_staged_packages.return_value = [
+            {"token": "storcli-1", "filename": "BCM-vmware-storcli64.zip"}
+        ]
+
+        with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+            response = asyncio.run(
+                route.endpoint(
+                    payload=ESXiHostPrepInstallRequest(
+                        host="10.13.37.121",
+                        user="root",
+                        password="secret",
+                        upload_token="storcli-1",
+                    )
+                )
+            )
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["install_ok"])
+        self.assertIn("no compatible MegaRAID controller", payload["detail"])
+        self.assertEqual(payload["packages"][0]["token"], "storcli-1")

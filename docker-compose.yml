@@ -1,8 +1,6 @@
 services:
   enclosure-ui:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-ui
     user: "0:0"
     env_file:
@@ -32,9 +30,7 @@ services:
   enclosure-history:
     profiles:
       - history
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-history
     user: "0:0"
     command: ["uvicorn", "history_service.main:app", "--host", "0.0.0.0", "--port", "8001"]
@@ -70,9 +66,7 @@ services:
   enclosure-admin:
     profiles:
       - admin
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-admin
     user: "0:0"
     command: ["uvicorn", "admin_service.main:app", "--host", "0.0.0.0", "--port", "8002"]

@@ -12,16 +12,22 @@ When the optional history sidecar is running, the main UI can:
 - render temperature and read/write history in browser-local time
 - export a frozen offline HTML snapshot of the current enclosure
 
-The history sidecar is optional. If it is unavailable, the live app keeps
-working and snapshot exports still work, but they omit historical samples and
-events.
+The history sidecar is optional, but it is a normal supported runtime service,
+not a dev-only helper. If it is unavailable, the live app keeps working and
+snapshot exports still work, but they omit historical samples and events.
 
 ## Start The Optional History Sidecar
 
-From the repo root:
+From the repo root, start it from the default published-image path:
 
 ```bash
-docker compose --profile history up -d --build
+docker compose --profile history up -d
+```
+
+If you are intentionally building from source instead:
+
+```bash
+docker compose -f docker-compose.dev.yml --profile history up -d --build
 ```
 
 That keeps the main UI on `:8080` and starts the small history collector/API

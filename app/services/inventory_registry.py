@@ -7,6 +7,7 @@ from app.services.profile_registry import ProfileRegistry
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.ssh_probe import SSHProbe
 from app.services.slot_detail_store import SlotDetailStore
+from app.services.supermicro_bmc import SupermicroBMCService
 from app.services.truenas_ws import TrueNASWebsocketClient
 
 
@@ -40,6 +41,7 @@ class InventoryRegistry:
                 system=system,
                 truenas_client=api_client,
                 ssh_probe=SSHProbe(system.ssh),
+                bmc_service=SupermicroBMCService(system.bmc) if system.bmc.enabled else None,
                 mapping_store=self.mapping_store,
                 profile_registry=self.profile_registry,
                 slot_detail_store=self.slot_detail_store,

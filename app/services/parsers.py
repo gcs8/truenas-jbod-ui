@@ -61,6 +61,7 @@ class ParsedSSHData:
     unifi_led_states: dict[int, bool] = field(default_factory=dict)
     esxi_storage_adapters: list[dict[str, Any]] = field(default_factory=list)
     esxi_storage_devices: list[dict[str, Any]] = field(default_factory=list)
+    esxi_storage_paths: list[dict[str, Any]] = field(default_factory=list)
     esxi_filesystems: list[dict[str, Any]] = field(default_factory=list)
     esxi_vmfs_extents: list[dict[str, Any]] = field(default_factory=list)
     esxi_sas_adapters: list[dict[str, Any]] = field(default_factory=list)
@@ -2415,6 +2416,10 @@ def canonicalize_ssh_command(command: str) -> str:
             return "esxcli storage vmfs extent list"
         if lowered_args[:4] == ["storage", "san", "sas", "list"]:
             return "esxcli storage san sas list"
+        if lowered_args[:4] == ["hardware", "pci", "pcipassthru", "list"]:
+            return "esxcli hardware pci pcipassthru list"
+    if executable == "lspci":
+        return "lspci"
     if executable in {"storcli", "storcli64"}:
         normalized_args = [arg for arg in args if arg]
         has_json = any(arg.lower() == "j" for arg in normalized_args)
@@ -2528,6 +2533,59 @@ def parse_esxcli_table(output: str) -> list[dict[str, Any]]:
             continue
         rows.append({header: values[index].strip() for index, header in enumerate(headers) if header})
     return rows
+
+
+def parse_esxcli_smart_get(output: str, logical_block_size: int | None = None) -> dict[str, Any]:
+    values: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        if not line or line.startswith("Parameter") or set(line.strip()) <= {"-", " "}:
+            continue
+        parts = re.split(r"\s{2,}", line.strip())
+        if len(parts) < 2:
+            continue
+        values[parts[0].strip().lower()] = parts[1].strip()
+
+    def as_int(label: str) -> int | None:
+        return _coerce_int_like(values.get(label))
+
+    bytes_read = None
+    bytes_written = None
+    if isinstance(logical_block_size, int) and logical_block_size > 0:
+        read_sectors = as_int("read sectors tot count")
+        write_sectors = as_int("write sectors tot count")
+        if read_sectors is not None:
+            bytes_read = read_sectors * logical_block_size
+        if write_sectors is not None:
+            bytes_written = write_sectors * logical_block_size
+
+    health_status = normalize_text(values.get("health status"))
+    summary = {
+        "available": any(
+            value is not None
+            for value in (
+                health_status,
+                as_int("drive temperature"),
+                as_int("power cycle count"),
+                bytes_read,
+                bytes_written,
+                as_int("read error count"),
+                as_int("write error count"),
+            )
+        ),
+        "smart_health_status": health_status,
+        "temperature_c": as_int("drive temperature"),
+        "power_cycle_count": as_int("power cycle count"),
+        "bytes_read": bytes_read,
+        "bytes_written": bytes_written,
+        "read_error_count": as_int("read error count"),
+        "write_error_count": as_int("write error count"),
+        "message": (
+            "ESXi returned host SMART counters for this local physical device via "
+            "`esxcli storage core device smart get`."
+        ),
+    }
+    return summary
 
 
 def _parse_storcli_json(output: str) -> dict[str, Any]:
@@ -2919,6 +2977,8 @@ def parse_ssh_outputs(
         parsed.esxi_storage_adapters = parse_esxcli_table(normalized_outputs["esxcli storage core adapter list"])
     if normalized_outputs.get("esxcli storage core device list"):
         parsed.esxi_storage_devices = parse_esxcli_key_value_sections(normalized_outputs["esxcli storage core device list"])
+    if normalized_outputs.get("esxcli storage core path list"):
+        parsed.esxi_storage_paths = parse_esxcli_key_value_sections(normalized_outputs["esxcli storage core path list"])
     if normalized_outputs.get("esxcli storage filesystem list"):
         parsed.esxi_filesystems = parse_esxcli_table(normalized_outputs["esxcli storage filesystem list"])
     if normalized_outputs.get("esxcli storage vmfs extent list"):

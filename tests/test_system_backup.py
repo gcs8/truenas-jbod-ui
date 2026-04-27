@@ -641,6 +641,20 @@ class SecretWhitespaceModelTests(unittest.TestCase):
         self.assertEqual(linux_payload.truenas_host, "gpu-server.local")
         self.assertEqual(linux_payload.ssh_host, "gpu-server.local")
 
+    def test_system_setup_request_uses_bmc_host_for_ipmi_only_platform(self) -> None:
+        payload = SystemSetupRequest(
+            label="FatTwin Node 1",
+            platform="ipmi",
+            truenas_host="",
+            bmc_enabled=True,
+            bmc_host="10.13.0.20",
+            bmc_username="ADMIN",
+            bmc_password="secret",
+        )
+
+        self.assertEqual(payload.truenas_host, "10.13.0.20")
+        self.assertEqual(payload.bmc_host, "10.13.0.20")
+
     def test_bootstrap_request_preserves_secret_whitespace(self) -> None:
         payload = SystemSetupBootstrapRequest(
             host="archive-core.local",
@@ -715,6 +729,62 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(created.ssh.host, "10.88.88.20")
         self.assertEqual(saved["systems"][0]["truenas"]["host"], "10.88.88.20")
         self.assertEqual(saved["systems"][0]["ssh"]["host"], "10.88.88.20")
+
+    def test_create_system_can_persist_password_only_ssh_without_key_path(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(config_path, {})
+
+        service = SystemSetupService(str(config_path))
+        created = service.create_system(
+            SystemSetupRequest(
+                label="FatTwin ESXi",
+                platform="esxi",
+                truenas_host="",
+                ssh_enabled=True,
+                ssh_host="10.13.37.121",
+                ssh_user="root",
+                ssh_key_path="",
+                ssh_password="#EDC2wsx!QAZ",
+            )
+        )
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(created.truenas.host, "10.13.37.121")
+        self.assertEqual(created.ssh.key_path, "")
+        self.assertEqual(created.ssh.password, "#EDC2wsx!QAZ")
+        self.assertEqual(saved["systems"][0]["ssh"]["key_path"], "")
+        self.assertEqual(saved["systems"][0]["ssh"]["password"], "#EDC2wsx!QAZ")
+
+    def test_create_system_persists_bmc_config_for_ipmi_platform(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(config_path, {})
+
+        service = SystemSetupService(str(config_path))
+        created = service.create_system(
+            SystemSetupRequest(
+                label="FatTwin Node 1",
+                system_id="ft-node-1",
+                platform="ipmi",
+                truenas_host="",
+                bmc_enabled=True,
+                bmc_host="10.13.0.20",
+                bmc_username="ADMIN",
+                bmc_password="secret",
+                bmc_verify_ssl=False,
+                default_profile_id="supermicro-fat-twin-front-6",
+            )
+        )
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(created.truenas.host, "10.13.0.20")
+        self.assertTrue(created.bmc.enabled)
+        self.assertEqual(saved["systems"][0]["bmc"]["host"], "10.13.0.20")
+        self.assertFalse(saved["systems"][0]["bmc"]["verify_ssl"])
+        self.assertEqual(saved["systems"][0]["default_profile_id"], "supermicro-fat-twin-front-6")
 
     def test_save_system_updates_existing_entry_when_replace_existing_is_true(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

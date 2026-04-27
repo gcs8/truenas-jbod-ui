@@ -28,6 +28,8 @@ from app.models.domain import (
     SmartBatchResponse,
     SmartSummaryView,
     StorageViewRuntimePayload,
+    SystemLocatorRequest,
+    SystemLocatorStatusView,
 )
 from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
 from app.services.history_backend import HistoryBackendClient
@@ -212,6 +214,32 @@ def create_app() -> FastAPI:
         service.invalidate_snapshot_cache(reason="route.set_slot_led", cache_keys=[enclosure_id, None])
         snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": True, "snapshot": snapshot.model_dump(mode="json")})
+
+    @app.get("/api/system-locator", response_model=SystemLocatorStatusView)
+    async def get_system_locator(
+        system_id: str | None = None,
+    ) -> SystemLocatorStatusView:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform)
+        return await service.get_system_locator_status()
+
+    @app.post("/api/system-locator", response_model=SystemLocatorStatusView)
+    async def set_system_locator(
+        payload: SystemLocatorRequest,
+        system_id: str | None = None,
+    ) -> SystemLocatorStatusView:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        add_perf_metadata(
+            system_id=service.system.id,
+            platform=service.system.truenas.platform,
+            locator_active=payload.active,
+        )
+        try:
+            return await service.set_system_locator(payload.active)
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/slots/{slot}/mapping")
     async def save_mapping(

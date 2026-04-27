@@ -10,6 +10,7 @@
     storageViewTemplates: Array.isArray(bootstrap.storage_view_templates) ? bootstrap.storage_view_templates : [],
     platformDefaults: bootstrap.setup_platform_defaults || {},
     sshKeys: Array.isArray(bootstrap.ssh_keys) ? bootstrap.ssh_keys : [],
+    esxiHostPrep: bootstrap.esxi_host_prep || { temp_dir: "", staged_packages: [] },
     runtime: bootstrap.runtime || { available: false, detail: null, containers: [] },
     backupDefaults: bootstrap.backup_defaults || {},
     selectedBackupPaths: Array.isArray(bootstrap.backup_defaults?.included_paths)
@@ -60,6 +61,9 @@
     sshCommandsAutoPlatform: null,
     sshUserAutoPlatform: null,
     sshKeysLoading: false,
+    selectedEsxiHostPrepToken:
+      (Array.isArray(bootstrap.esxi_host_prep?.staged_packages) && bootstrap.esxi_host_prep.staged_packages[0]?.token)
+      || "",
     refreshInFlight: false,
     countdownTimerId: null,
     sudoersPreviewTimerId: null,
@@ -142,6 +146,13 @@
     setupApiKey: document.getElementById("setup-api-key"),
     setupApiUser: document.getElementById("setup-api-user"),
     setupApiPassword: document.getElementById("setup-api-password"),
+    setupBmcEnabled: document.getElementById("setup-bmc-enabled"),
+    setupBmcHost: document.getElementById("setup-bmc-host"),
+    setupBmcUsername: document.getElementById("setup-bmc-username"),
+    setupBmcPassword: document.getElementById("setup-bmc-password"),
+    setupBmcVerifySsl: document.getElementById("setup-bmc-verify-ssl"),
+    setupBmcTimeoutSeconds: document.getElementById("setup-bmc-timeout-seconds"),
+    setupBmcHelp: document.getElementById("setup-bmc-help"),
     setupInspectTlsButton: document.getElementById("setup-inspect-tls-button"),
     setupTrustRemoteTlsButton: document.getElementById("setup-trust-remote-tls-button"),
     setupTlsTrustPill: document.getElementById("setup-tls-trust-pill"),
@@ -191,6 +202,17 @@
     setupBootstrapSudoersName: document.getElementById("setup-bootstrap-sudoers-name"),
     setupBootstrapSudoersDetail: document.getElementById("setup-bootstrap-sudoers-detail"),
     setupBootstrapSudoersPreview: document.getElementById("setup-bootstrap-sudoers-preview"),
+    setupEsxiHostPrepPanel: document.getElementById("setup-esxi-host-prep-panel"),
+    setupEsxiHostPrepCopy: document.getElementById("setup-esxi-host-prep-copy"),
+    setupEsxiHostPrepTempDir: document.getElementById("setup-esxi-host-prep-temp-dir"),
+    setupEsxiHostPrepFile: document.getElementById("setup-esxi-host-prep-file"),
+    setupEsxiHostPrepPickButton: document.getElementById("setup-esxi-host-prep-pick-button"),
+    setupEsxiHostPrepFileLabel: document.getElementById("setup-esxi-host-prep-file-label"),
+    setupEsxiHostPrepUploadButton: document.getElementById("setup-esxi-host-prep-upload-button"),
+    setupEsxiHostPrepPackageSelect: document.getElementById("setup-esxi-host-prep-package-select"),
+    setupEsxiHostPrepInstallButton: document.getElementById("setup-esxi-host-prep-install-button"),
+    setupEsxiHostPrepResult: document.getElementById("setup-esxi-host-prep-result"),
+    setupEsxiHostPrepDetail: document.getElementById("setup-esxi-host-prep-detail"),
     setupSshCommands: document.getElementById("setup-ssh-commands"),
     setupSshCommandsNote: document.getElementById("setup-ssh-commands-note"),
     setupLoadRecommendedButton: document.getElementById("setup-load-recommended-button"),
@@ -394,6 +416,24 @@
       return String(value);
     }
     return date.toLocaleString();
+  }
+
+  function formatBytes(value) {
+    const size = Number(value);
+    if (!Number.isFinite(size) || size < 0) {
+      return "n/a";
+    }
+    if (size < 1024) {
+      return `${size} B`;
+    }
+    const units = ["KiB", "MiB", "GiB", "TiB"];
+    let scaled = size;
+    let unitIndex = -1;
+    while (scaled >= 1024 && unitIndex < units.length - 1) {
+      scaled /= 1024;
+      unitIndex += 1;
+    }
+    return `${scaled.toFixed(scaled >= 10 || unitIndex === 0 ? 1 : 2)} ${units[Math.max(unitIndex, 0)]}`;
   }
 
   function renderTlsTrustStatus() {
@@ -764,16 +804,24 @@
   }
 
   function platformSupportsBootstrap(platform = currentSetupPlatform()) {
-    return String(platform || "").toLowerCase() !== "esxi";
+    return !["esxi", "ipmi"].includes(String(platform || "").toLowerCase());
+  }
+
+  function platformSupportsEsxiHostPrep(platform = currentSetupPlatform()) {
+    return String(platform || "").toLowerCase() === "esxi";
   }
 
   function platformSupportsSavedSudo(platform = currentSetupPlatform()) {
-    return String(platform || "").toLowerCase() !== "esxi";
+    return !["esxi", "ipmi"].includes(String(platform || "").toLowerCase());
   }
 
   function setupPlatformUsesSshOnlyHost(platform = currentSetupPlatform()) {
     const normalized = String(platform || "").toLowerCase();
     return normalized === "linux" || normalized === "esxi";
+  }
+
+  function setupPlatformUsesBmcOnlyHost(platform = currentSetupPlatform()) {
+    return String(platform || "").toLowerCase() === "ipmi";
   }
 
   function normalizeHaNode(rawNode) {
@@ -3026,7 +3074,9 @@
       case "quantastor":
         return "Quantastor normally uses API user/password auth, with SSH reserved for the richer shared-slot and SES details.";
       case "esxi":
-        return "VMware ESXi is read-only and SSH-only in this first pass; StorCLI provides the physical RAID-member truth, the saved SSH user normally stays root, and the Linux bootstrap/sudo flow is intentionally disabled.";
+        return "VMware ESXi stays host-managed, with SSH and StorCLI providing the primary inventory while optional BMC access can add out-of-band drive locate and chassis UID control.";
+      case "ipmi":
+        return "IPMI / BMC Only systems use the out-of-band controller as the primary inventory path. Supermicro first-pass support prefers Redfish where it works, then falls back to the validated web XML path for drive locate and node UID control.";
       default:
         return "TrueNAS CORE usually wants an API key, with SSH as the optional fallback for enclosure mapping and LED control.";
     }
@@ -3082,6 +3132,7 @@
     const platform = currentSetupPlatform();
     const bootstrapSupported = platformSupportsBootstrap(platform);
     const savedSudoSupported = platformSupportsSavedSudo(platform);
+    const ipmiOnly = platform === "ipmi";
     if (elements.setupSshSudoPasswordField) {
       elements.setupSshSudoPasswordField.classList.toggle("hidden", !savedSudoSupported);
     }
@@ -3094,12 +3145,43 @@
     if (elements.setupBootstrapCopy) {
       elements.setupBootstrapCopy.textContent = bootstrapSupported
         ? "Use temporary root or installer credentials once to create the final service account, install the selected public key, and optionally write limited sudo rules."
-        : "VMware ESXi stays on the saved SSH credentials or key directly. The Linux-style one-time service-account bootstrap and sudoers flow are intentionally disabled here.";
+        : ipmiOnly
+          ? "IPMI / BMC Only entries skip the Linux bootstrap and sudoers flow. Save the BMC credentials directly here, and add SSH later only when you want extra host-side enrichment."
+          : "VMware ESXi stays on the saved SSH credentials or key directly. The Linux-style one-time service-account bootstrap and sudoers flow are intentionally disabled here.";
     }
     if (elements.setupSshCommandsNote) {
       elements.setupSshCommandsNote.innerHTML = bootstrapSupported
         ? "These are the exact SSH commands the app runs. When you use the one-time bootstrap, any <code>sudo -n ...</code> lines here are also converted into <code>NOPASSWD</code> sudo rules for the final service account, with the platform's on-demand smartctl and LED-control extras kept in place."
-        : "These are the exact SSH commands the app runs on the ESXi host. This path stays read-only and SSH-only, so no Linux sudoers/bootstrap conversion is used.";
+        : ipmiOnly
+          ? "These are optional host-side SSH commands only. The primary inventory path for an IPMI / BMC Only system is the saved BMC access above, so leaving SSH off is a valid first pass."
+          : "These are the exact SSH commands the app runs on the ESXi host. This path stays read-only and SSH-only, so no Linux sudoers/bootstrap conversion is used.";
+    }
+  }
+
+  function syncBmcFields() {
+    const platform = currentSetupPlatform();
+    const ipmiOnly = platform === "ipmi";
+    const enabled = ipmiOnly || Boolean(elements.setupBmcEnabled?.checked);
+    if (elements.setupBmcEnabled) {
+      elements.setupBmcEnabled.checked = enabled;
+      elements.setupBmcEnabled.disabled = ipmiOnly;
+    }
+    document.querySelectorAll("[data-bmc-field]").forEach((field) => {
+      field.disabled = !enabled;
+    });
+    if (enabled && elements.setupBmcHost && !elements.setupBmcHost.value.trim()) {
+      elements.setupBmcHost.value = suggestedConnectionHost();
+    }
+    if (elements.setupBmcHelp) {
+      if (ipmiOnly) {
+        elements.setupBmcHelp.textContent = enabled
+          ? "This system uses BMC inventory as the primary path. Pick a profile that matches the chassis face so empty slots can render even when only a few drives are installed."
+          : "Enable BMC access here. IPMI / BMC Only systems require it.";
+      } else if (enabled) {
+        elements.setupBmcHelp.textContent = "BMC access is enabled as optional out-of-band enrichment. The runtime will prefer Redfish where it works, then use the validated Supermicro web XML path for drive locate and UID control.";
+      } else {
+        elements.setupBmcHelp.textContent = "Leave this off when the platform API and SSH path already give you everything you need. Turn it on when you want Supermicro out-of-band inventory, drive locate control, or chassis UID support.";
+      }
     }
   }
 
@@ -3264,6 +3346,10 @@
   }
 
   function suggestedConnectionHost() {
+    const explicitBmcHost = normalizeConnectionHost(elements.setupBmcHost?.value);
+    if (explicitBmcHost) {
+      return explicitBmcHost;
+    }
     const explicitSshHost = normalizeConnectionHost(elements.setupSshHost?.value);
     if (explicitSshHost) {
       return explicitSshHost;
@@ -3293,7 +3379,7 @@
   }
 
   function normalizeKeyMode(value) {
-    return value === "generate" || value === "manual" ? value : "reuse";
+    return value === "generate" || value === "manual" || value === "none" ? value : "reuse";
   }
 
   function normalizeKeyName(value) {
@@ -3386,6 +3472,10 @@
       elements.setupSshKeyHelp.textContent = `New Ed25519 key pairs are written under config/ssh and become available at /run/ssh immediately. Suggested name: ${generatedName}.`;
       return;
     }
+    if (mode === "none") {
+      elements.setupSshKeyHelp.textContent = "Password-only mode clears the saved SSH key path. Use this when the target host accepts password auth and you do not want the runtime to try a private key first.";
+      return;
+    }
     elements.setupSshKeyHelp.textContent = `Manual mode leaves the key path editable. Current path: ${elements.setupSshKeyPath?.value || "/run/ssh/id_truenas"}.`;
   }
 
@@ -3405,12 +3495,17 @@
     }
     if (elements.setupSshKeyPath) {
       elements.setupSshKeyPath.readOnly = mode !== "manual";
+      if (mode === "none") {
+        elements.setupSshKeyPath.value = "";
+      }
     }
     if (elements.setupGenerateKeyName && mode === "generate" && !elements.setupGenerateKeyName.value.trim()) {
       elements.setupGenerateKeyName.value = suggestedKeyName();
     }
     renderSshKeyOptions(elements.setupSshExistingKey?.value || "");
-    applySelectedKey();
+    if (mode === "reuse") {
+      applySelectedKey();
+    }
     syncKeyHelp();
   }
 
@@ -3439,6 +3534,7 @@
     }
     syncPlatformSpecificSetupFields();
     syncBootstrapFields();
+    syncEsxiHostPrepFields();
     syncKeyMode();
     syncKeyHelp();
   }
@@ -3477,6 +3573,90 @@
         elements.setupBootstrapResult.textContent = "VMware ESXi does not use the one-time Linux service-account bootstrap. Save the SSH host, root or key-based auth, and read-only runtime commands directly instead.";
       } else if (!bootstrapEnabled) {
         elements.setupBootstrapResult.textContent = "Bootstrap is off by default for saved systems. Enable it only when you intend to run one-time service-account setup.";
+      }
+    }
+  }
+
+  function currentStagedEsxiHostPrepPackages() {
+    return Array.isArray(state.esxiHostPrep?.staged_packages) ? state.esxiHostPrep.staged_packages : [];
+  }
+
+  function getSelectedEsxiHostPrepPackage() {
+    const token = elements.setupEsxiHostPrepPackageSelect?.value || state.selectedEsxiHostPrepToken || "";
+    return currentStagedEsxiHostPrepPackages().find((item) => item.token === token) || null;
+  }
+
+  function renderEsxiHostPrepPackages(preferredToken = state.selectedEsxiHostPrepToken || "") {
+    const packages = currentStagedEsxiHostPrepPackages();
+    if (elements.setupEsxiHostPrepTempDir) {
+      elements.setupEsxiHostPrepTempDir.textContent = state.esxiHostPrep?.temp_dir || "/tmp";
+    }
+    if (!elements.setupEsxiHostPrepPackageSelect) {
+      return;
+    }
+    if (!packages.length) {
+      elements.setupEsxiHostPrepPackageSelect.innerHTML = '<option value="">No staged ESXi packages yet</option>';
+      elements.setupEsxiHostPrepPackageSelect.value = "";
+      state.selectedEsxiHostPrepToken = "";
+      return;
+    }
+    const selectedToken = packages.some((item) => item.token === preferredToken)
+      ? preferredToken
+      : (packages[0]?.token || "");
+    elements.setupEsxiHostPrepPackageSelect.innerHTML = packages
+      .map((item) => {
+        const parts = [
+          item.filename || item.token,
+          item.install_mode === "vib" ? "VIB" : "ZIP",
+          formatBytes(item.size_bytes),
+          formatLocalTimestamp(item.created_at),
+        ].filter(Boolean);
+        return `<option value="${escapeHtml(item.token || "")}">${escapeHtml(parts.join(" · "))}</option>`;
+      })
+      .join("");
+    elements.setupEsxiHostPrepPackageSelect.value = selectedToken;
+    state.selectedEsxiHostPrepToken = selectedToken;
+    if (elements.setupEsxiHostPrepDetail) {
+      const selectedPackage = packages.find((item) => item.token === selectedToken) || null;
+      elements.setupEsxiHostPrepDetail.textContent = selectedPackage
+        ? JSON.stringify(selectedPackage, null, 2)
+        : "";
+    }
+  }
+
+  function syncEsxiHostPrepFields() {
+    const esxiSupported = platformSupportsEsxiHostPrep();
+    const sshEnabled = Boolean(elements.setupSshEnabled?.checked);
+    const packages = currentStagedEsxiHostPrepPackages();
+    if (elements.setupEsxiHostPrepPanel) {
+      elements.setupEsxiHostPrepPanel.classList.toggle("hidden", !esxiSupported);
+    }
+    if (!esxiSupported) {
+      return;
+    }
+    renderEsxiHostPrepPackages(state.selectedEsxiHostPrepToken);
+    if (elements.setupEsxiHostPrepCopy) {
+      elements.setupEsxiHostPrepCopy.textContent = sshEnabled
+        ? "Upload an operator-supplied ESXi offline bundle or VIB into the admin sidecar temp area, then copy/install it on this host with the saved SSH credentials above."
+        : "Enable SSH enrichment above first. This ESXi host-prep path reuses the current SSH host, user, and password or key settings from this form.";
+    }
+    if (elements.setupEsxiHostPrepPickButton) {
+      elements.setupEsxiHostPrepPickButton.disabled = !sshEnabled;
+    }
+    if (elements.setupEsxiHostPrepUploadButton) {
+      elements.setupEsxiHostPrepUploadButton.disabled = !sshEnabled;
+    }
+    if (elements.setupEsxiHostPrepPackageSelect) {
+      elements.setupEsxiHostPrepPackageSelect.disabled = !sshEnabled || !packages.length;
+    }
+    if (elements.setupEsxiHostPrepInstallButton) {
+      elements.setupEsxiHostPrepInstallButton.disabled = !sshEnabled || !packages.length;
+    }
+    if (elements.setupEsxiHostPrepResult) {
+      if (!sshEnabled) {
+        elements.setupEsxiHostPrepResult.textContent = "Enable SSH enrichment first so the admin sidecar can copy and install the staged package on the ESXi host.";
+      } else if (!packages.length) {
+        elements.setupEsxiHostPrepResult.textContent = "Upload a user-supplied ESXi .zip or .vib first. The sidecar stages it temporarily and does not bundle vendor files into this project.";
       }
     }
   }
@@ -3653,6 +3833,24 @@
     if (elements.setupApiPassword) {
       elements.setupApiPassword.value = "";
     }
+    if (elements.setupBmcEnabled) {
+      elements.setupBmcEnabled.checked = false;
+    }
+    if (elements.setupBmcHost) {
+      elements.setupBmcHost.value = "";
+    }
+    if (elements.setupBmcUsername) {
+      elements.setupBmcUsername.value = "";
+    }
+    if (elements.setupBmcPassword) {
+      elements.setupBmcPassword.value = "";
+    }
+    if (elements.setupBmcVerifySsl) {
+      elements.setupBmcVerifySsl.checked = true;
+    }
+    if (elements.setupBmcTimeoutSeconds) {
+      elements.setupBmcTimeoutSeconds.value = "15";
+    }
     if (elements.setupSshEnabled) {
       elements.setupSshEnabled.checked = false;
     }
@@ -3722,6 +3920,18 @@
     if (elements.setupBootstrapResult) {
       elements.setupBootstrapResult.textContent = "Bootstrap is off by default for saved systems. Enable it only when you intend to run one-time service-account setup.";
     }
+    if (elements.setupEsxiHostPrepFile) {
+      elements.setupEsxiHostPrepFile.value = "";
+    }
+    if (elements.setupEsxiHostPrepFileLabel) {
+      elements.setupEsxiHostPrepFileLabel.textContent = "No file selected";
+    }
+    if (elements.setupEsxiHostPrepResult) {
+      elements.setupEsxiHostPrepResult.textContent = "Upload a user-supplied ESXi .zip or .vib first. The sidecar stages it temporarily and does not bundle vendor files into this project.";
+    }
+    if (elements.setupEsxiHostPrepDetail) {
+      elements.setupEsxiHostPrepDetail.textContent = "";
+    }
     if (elements.setupResult) {
       elements.setupResult.textContent = "Saving here updates the mounted config file; restart the read UI after a new system is added so it picks the new list up cleanly.";
     }
@@ -3736,6 +3946,7 @@
     renderQuantastorHaSection();
     renderStorageViews();
     renderTlsInspection();
+    syncBmcFields();
     syncSshFields();
     updateCreateButton();
     renderExistingSystems();
@@ -3792,6 +4003,24 @@
     if (elements.setupApiPassword) {
       elements.setupApiPassword.value = system.api_password || "";
     }
+    if (elements.setupBmcEnabled) {
+      elements.setupBmcEnabled.checked = Boolean(system.bmc_enabled);
+    }
+    if (elements.setupBmcHost) {
+      elements.setupBmcHost.value = system.bmc_host || "";
+    }
+    if (elements.setupBmcUsername) {
+      elements.setupBmcUsername.value = system.bmc_username || "";
+    }
+    if (elements.setupBmcPassword) {
+      elements.setupBmcPassword.value = system.bmc_password || "";
+    }
+    if (elements.setupBmcVerifySsl) {
+      elements.setupBmcVerifySsl.checked = system.bmc_verify_ssl !== false;
+    }
+    if (elements.setupBmcTimeoutSeconds) {
+      elements.setupBmcTimeoutSeconds.value = String(system.bmc_timeout_seconds || 15);
+    }
     if (elements.setupSshEnabled) {
       elements.setupSshEnabled.checked = Boolean(system.ssh_enabled);
     }
@@ -3846,6 +4075,18 @@
     if (elements.setupBootstrapSudoPassword) {
       elements.setupBootstrapSudoPassword.value = "";
     }
+    if (elements.setupEsxiHostPrepFile) {
+      elements.setupEsxiHostPrepFile.value = "";
+    }
+    if (elements.setupEsxiHostPrepFileLabel) {
+      elements.setupEsxiHostPrepFileLabel.textContent = "No file selected";
+    }
+    if (elements.setupEsxiHostPrepResult) {
+      elements.setupEsxiHostPrepResult.textContent = "";
+    }
+    if (elements.setupEsxiHostPrepDetail) {
+      elements.setupEsxiHostPrepDetail.textContent = "";
+    }
     state.tlsInspection = null;
     if (elements.setupTlsCaFile) {
       elements.setupTlsCaFile.value = "";
@@ -3869,10 +4110,10 @@
       applySelectedKey();
     } else {
       if (elements.setupSshKeyMode) {
-        elements.setupSshKeyMode.value = "manual";
+        elements.setupSshKeyMode.value = system.ssh_key_path ? "manual" : "none";
       }
       if (elements.setupSshKeyPath) {
-        elements.setupSshKeyPath.value = system.ssh_key_path || "/run/ssh/id_truenas";
+        elements.setupSshKeyPath.value = system.ssh_key_path || "";
       }
     }
     syncPlatformHelp();
@@ -3884,6 +4125,7 @@
     renderQuantastorHaSection();
     renderStorageViews();
     renderTlsInspection();
+    syncBmcFields();
     syncSshFields();
     updateCreateButton();
     renderExistingSystems();
@@ -3899,10 +4141,18 @@
     const platform = elements.setupPlatform?.value || "core";
     const sshEnabled = Boolean(elements.setupSshEnabled?.checked);
     const sshHost = normalizeConnectionHost(elements.setupSshHost?.value) || null;
+    const sshKeyMode = normalizeKeyMode(elements.setupSshKeyMode?.value);
+    const sshKeyPath = sshKeyMode === "none"
+      ? ""
+      : (elements.setupSshKeyPath?.value?.trim() || null);
+    const bmcHost = normalizeConnectionHost(elements.setupBmcHost?.value) || null;
+    const bmcEnabled = setupPlatformUsesBmcOnlyHost(platform) || Boolean(elements.setupBmcEnabled?.checked);
     const sshUser = elements.setupSshUser?.value?.trim() || (sshEnabled ? recommendedSshUserForPlatform() : null);
     const normalizedSystemId = elements.setupSystemId?.value?.trim() || null;
     const apiHost = elements.setupTruenasHost?.value?.trim() || "";
-    const primaryHost = apiHost || (setupPlatformUsesSshOnlyHost(platform) ? (sshHost || "") : "");
+    const primaryHost = apiHost
+      || (setupPlatformUsesSshOnlyHost(platform) ? (sshHost || "") : "")
+      || (setupPlatformUsesBmcOnlyHost(platform) ? (bmcHost || "") : "");
     return {
       system_id: normalizedSystemId,
       label: elements.setupSystemLabel?.value?.trim() || "",
@@ -3923,12 +4173,18 @@
         : [],
       ssh_port: Number(elements.setupSshPort?.value) || 22,
       ssh_user: sshUser,
-      ssh_key_path: elements.setupSshKeyPath?.value?.trim() || null,
+      ssh_key_path: sshKeyPath,
       ssh_password: elements.setupSshPassword?.value || null,
       ssh_sudo_password: platformSupportsSavedSudo() ? (elements.setupSshSudoPassword?.value || null) : null,
       ssh_known_hosts_path: elements.setupSshKnownHosts?.value?.trim() || null,
       ssh_strict_host_key_checking: Boolean(elements.setupSshStrictHostKey?.checked),
       ssh_commands: collectSetupCommands(),
+      bmc_enabled: bmcEnabled,
+      bmc_host: bmcHost,
+      bmc_username: elements.setupBmcUsername?.value?.trim() || null,
+      bmc_password: elements.setupBmcPassword?.value || null,
+      bmc_verify_ssl: Boolean(elements.setupBmcVerifySsl?.checked),
+      bmc_timeout_seconds: Number(elements.setupBmcTimeoutSeconds?.value) || 15,
       default_profile_id: elements.setupProfile?.value || null,
       storage_views: state.storageViews
         .slice()
@@ -4010,6 +4266,9 @@
     if (mode === "generate") {
       throw new Error("Generate the SSH key pair first, then run the one-time bootstrap.");
     }
+    if (mode === "none") {
+      throw new Error("Password-only mode does not provide a service key for bootstrap. Switch SSH Key Source to Reuse Existing Key Pair or Manual Path first.");
+    }
     if (mode === "reuse") {
       const selectedKey = getSshKeyByName(elements.setupSshExistingKey?.value);
       if (!selectedKey?.name) {
@@ -4064,6 +4323,41 @@
       install_sudo_rules: Boolean(elements.setupBootstrapInstallSudo?.checked),
       sudo_commands: collectBootstrapSudoCommands(),
       ...resolveBootstrapServiceKey(),
+    };
+  }
+
+  function collectEsxiHostPrepInstallPayload() {
+    const setupPayload = collectSetupPayload();
+    if (!platformSupportsEsxiHostPrep(setupPayload.platform)) {
+      throw new Error("ESXi host prep is only available for VMware ESXi systems.");
+    }
+    if (!setupPayload.ssh_enabled) {
+      throw new Error("Enable SSH enrichment first so the admin sidecar can reach the ESXi host.");
+    }
+    if (!setupPayload.ssh_host) {
+      throw new Error("Enter the ESXi SSH host before running host prep.");
+    }
+    if (!setupPayload.ssh_user) {
+      throw new Error("Enter the ESXi SSH user before running host prep.");
+    }
+    if (!setupPayload.ssh_password && !setupPayload.ssh_key_path) {
+      throw new Error("Provide either the ESXi SSH password or key path before running host prep.");
+    }
+    const selectedPackage = getSelectedEsxiHostPrepPackage();
+    if (!selectedPackage?.token) {
+      throw new Error("Choose a staged ESXi package before running host prep.");
+    }
+    const requestedTimeout = Number(setupPayload.ssh_timeout_seconds) || 15;
+    return {
+      host: setupPayload.ssh_host,
+      port: setupPayload.ssh_port || 22,
+      user: setupPayload.ssh_user,
+      key_path: setupPayload.ssh_key_path || null,
+      password: setupPayload.ssh_password || null,
+      known_hosts_path: setupPayload.ssh_known_hosts_path || "/app/data/known_hosts",
+      strict_host_key_checking: Boolean(setupPayload.ssh_strict_host_key_checking),
+      timeout_seconds: Math.max(requestedTimeout, 120),
+      upload_token: selectedPackage.token,
     };
   }
 
@@ -4141,6 +4435,127 @@
       reader.onerror = () => reject(reader.error || new Error("Unable to read the selected PEM file."));
       reader.readAsText(file);
     });
+  }
+
+  async function uploadEsxiHostPrepPackage() {
+    if (!platformSupportsEsxiHostPrep()) {
+      setBanner("ESXi host prep is only available when the current platform is VMware ESXi.", "error");
+      return;
+    }
+    if (!elements.setupSshEnabled?.checked) {
+      setBanner("Enable SSH enrichment first so the admin sidecar can reuse the ESXi SSH host and auth.", "error");
+      return;
+    }
+    const file = elements.setupEsxiHostPrepFile?.files?.[0] || null;
+    if (!file) {
+      setBanner("Choose an ESXi .zip or .vib package first.", "error");
+      return;
+    }
+    if (elements.setupEsxiHostPrepUploadButton) {
+      elements.setupEsxiHostPrepUploadButton.disabled = true;
+    }
+    if (elements.setupEsxiHostPrepResult) {
+      elements.setupEsxiHostPrepResult.textContent = `Uploading ${file.name} into the admin host-prep temp area...`;
+    }
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const response = await fetchJson(
+        `/api/admin/esxi-host-prep/upload?filename=${encodeURIComponent(file.name)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: arrayBuffer,
+        }
+      );
+      state.esxiHostPrep = {
+        ...(state.esxiHostPrep || {}),
+        staged_packages: Array.isArray(response.packages) ? response.packages : currentStagedEsxiHostPrepPackages(),
+      };
+      state.selectedEsxiHostPrepToken = response.package?.token || state.selectedEsxiHostPrepToken;
+      renderEsxiHostPrepPackages(state.selectedEsxiHostPrepToken);
+      if (elements.setupEsxiHostPrepFile) {
+        elements.setupEsxiHostPrepFile.value = "";
+      }
+      if (elements.setupEsxiHostPrepFileLabel) {
+        elements.setupEsxiHostPrepFileLabel.textContent = response.package?.filename || file.name;
+      }
+      if (elements.setupEsxiHostPrepResult) {
+        elements.setupEsxiHostPrepResult.textContent = `Staged ${response.package?.filename || file.name} in ${state.esxiHostPrep?.temp_dir || "/tmp"} for later ESXi install.`;
+      }
+      if (elements.setupEsxiHostPrepDetail) {
+        elements.setupEsxiHostPrepDetail.textContent = JSON.stringify(response.package || {}, null, 2);
+      }
+      syncEsxiHostPrepFields();
+      setBanner(`Staged ESXi package ${response.package?.filename || file.name}.`, "success");
+    } catch (error) {
+      if (elements.setupEsxiHostPrepResult) {
+        elements.setupEsxiHostPrepResult.textContent = `ESXi package upload failed: ${error.message || error}`;
+      }
+      setBanner(`ESXi package upload failed: ${error.message || error}`, "error");
+    } finally {
+      if (elements.setupEsxiHostPrepUploadButton) {
+        elements.setupEsxiHostPrepUploadButton.disabled = false;
+      }
+    }
+  }
+
+  async function installEsxiHostPrepPackage() {
+    let payload;
+    try {
+      payload = collectEsxiHostPrepInstallPayload();
+    } catch (error) {
+      if (elements.setupEsxiHostPrepResult) {
+        elements.setupEsxiHostPrepResult.textContent = error.message || String(error);
+      }
+      setBanner(error.message || String(error), "error");
+      return;
+    }
+    const selectedPackage = getSelectedEsxiHostPrepPackage();
+    if (elements.setupEsxiHostPrepInstallButton) {
+      elements.setupEsxiHostPrepInstallButton.disabled = true;
+    }
+    if (elements.setupEsxiHostPrepResult) {
+      elements.setupEsxiHostPrepResult.textContent = `Uploading ${selectedPackage?.filename || "the staged package"} to ${payload.host} and running the ESXi install command...`;
+    }
+    try {
+      const result = await fetchJson("/api/admin/esxi-host-prep/install", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      state.esxiHostPrep = {
+        ...(state.esxiHostPrep || {}),
+        staged_packages: Array.isArray(result.packages) ? result.packages : currentStagedEsxiHostPrepPackages(),
+      };
+      renderEsxiHostPrepPackages(payload.upload_token);
+      if (elements.setupEsxiHostPrepResult) {
+        elements.setupEsxiHostPrepResult.textContent = result.detail || "ESXi host prep finished.";
+      }
+      if (elements.setupEsxiHostPrepDetail) {
+        elements.setupEsxiHostPrepDetail.textContent = JSON.stringify(
+          {
+            remote_path: result.remote_path,
+            install_command: result.install_command,
+            install_result: result.install_result,
+            verification: result.verification?.summary || result.verification,
+            cleanup_result: result.cleanup_result,
+          },
+          null,
+          2
+        );
+      }
+      syncEsxiHostPrepFields();
+      setBanner(result.detail || "ESXi host prep finished.", result.install_ok ? "success" : "error");
+    } catch (error) {
+      if (elements.setupEsxiHostPrepResult) {
+        elements.setupEsxiHostPrepResult.textContent = `ESXi host prep failed: ${error.message || error}`;
+      }
+      setBanner(`ESXi host prep failed: ${error.message || error}`, "error");
+    } finally {
+      if (elements.setupEsxiHostPrepInstallButton) {
+        elements.setupEsxiHostPrepInstallButton.disabled = false;
+      }
+    }
   }
 
   async function inspectTlsCertificate() {
@@ -4324,6 +4739,12 @@
       state.storageViewTemplates = Array.isArray(payload.storage_view_templates) ? payload.storage_view_templates : [];
       state.platformDefaults = payload.setup_platform_defaults || {};
       state.sshKeys = Array.isArray(payload.ssh_keys) ? payload.ssh_keys : [];
+      state.esxiHostPrep = payload.esxi_host_prep || state.esxiHostPrep;
+      if (
+        !currentStagedEsxiHostPrepPackages().some((item) => item.token === state.selectedEsxiHostPrepToken)
+      ) {
+        state.selectedEsxiHostPrepToken = currentStagedEsxiHostPrepPackages()[0]?.token || "";
+      }
       state.runtime = payload.runtime || { available: false, detail: null, containers: [] };
       state.backupDefaults = payload.backup_defaults || state.backupDefaults;
       if (!state.selectedBackupPaths.length && Array.isArray(state.backupDefaults?.included_paths)) {
@@ -5150,6 +5571,7 @@
     renderProfileCatalog();
     renderProfileBuilder();
     renderQuantastorHaSection();
+    renderEsxiHostPrepPackages(state.selectedEsxiHostPrepToken);
     renderStorageViews();
     syncPlatformHelp();
     syncVerifySslHelp();
@@ -5267,6 +5689,7 @@
       syncPlatformHelp();
       maybeLoadRecommendedSshUser();
       maybeLoadRecommendedCommands();
+      syncBmcFields();
       syncSshFields();
       renderQuantastorHaSection();
       renderStorageViews();
@@ -5323,6 +5746,8 @@
       renderProfileBuilder();
       renderStorageViews();
     });
+    elements.setupBmcEnabled?.addEventListener("change", syncBmcFields);
+    elements.setupBmcHost?.addEventListener("input", syncBmcFields);
     elements.setupHaEnabled?.addEventListener("change", () => {
       renderQuantastorHaSection();
       renderStorageViews();
@@ -5496,6 +5921,7 @@
       if (elements.setupSshEnabled?.checked) {
         maybeLoadRecommendedCommands();
       }
+      syncBmcFields();
       syncSshFields();
       scheduleSudoersPreviewRefresh();
     });
@@ -5526,6 +5952,30 @@
     });
     elements.setupBootstrapButton?.addEventListener("click", () => {
       void bootstrapServiceAccount();
+    });
+    elements.setupEsxiHostPrepPickButton?.addEventListener("click", () => {
+      elements.setupEsxiHostPrepFile?.click();
+    });
+    elements.setupEsxiHostPrepFile?.addEventListener("change", () => {
+      const file = elements.setupEsxiHostPrepFile?.files?.[0] || null;
+      if (elements.setupEsxiHostPrepFileLabel) {
+        elements.setupEsxiHostPrepFileLabel.textContent = file ? file.name : "No file selected";
+      }
+    });
+    elements.setupEsxiHostPrepPackageSelect?.addEventListener("change", () => {
+      state.selectedEsxiHostPrepToken = elements.setupEsxiHostPrepPackageSelect?.value || "";
+      const selectedPackage = getSelectedEsxiHostPrepPackage();
+      if (elements.setupEsxiHostPrepDetail) {
+        elements.setupEsxiHostPrepDetail.textContent = selectedPackage
+          ? JSON.stringify(selectedPackage, null, 2)
+          : "";
+      }
+    });
+    elements.setupEsxiHostPrepUploadButton?.addEventListener("click", () => {
+      void uploadEsxiHostPrepPackage();
+    });
+    elements.setupEsxiHostPrepInstallButton?.addEventListener("click", () => {
+      void installEsxiHostPrepPackage();
     });
     elements.setupGenerateKeyName?.addEventListener("input", syncKeyHelp);
     elements.setupSshKeyPath?.addEventListener("input", syncKeyHelp);

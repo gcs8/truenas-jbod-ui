@@ -38,7 +38,9 @@ UNVR_PRO_PARAMS = {
 QUANTASTOR_PARAMS = {
     "system_id": "qsosn-ha",
 }
-ESXI_PARAMS = {
+ESXI_FATTWIN_CANDIDATE_IDS = ("esxi-ft-node-2", "esxi-ft-node-3")
+ESXI_FATTWIN_ENCLOSURE_ID = "supermicro-fat-twin-front-6"
+ESXI_AOC_PARAMS = {
     "system_id": "cryostorage-esxi",
 }
 
@@ -95,6 +97,17 @@ def open_and_select_slot(page: Page, params: dict[str, str], slot: int) -> None:
     page.locator("#detail-content").wait_for(state="visible", timeout=120_000)
 
 
+def available_system_ids(page: Page) -> list[str]:
+    page.goto(BASE_URL, wait_until="domcontentloaded")
+    page.locator("#system-select").wait_for(state="visible", timeout=120_000)
+    return page.locator("#system-select option").evaluate_all(
+        """(options) =>
+            options
+              .map((option) => option.value)
+              .filter((value) => typeof value === 'string' && value.length > 0)"""
+    )
+
+
 def capture_core(page: Page) -> None:
     open_and_select_slot(page, CORE_PARAMS, 21)
     for label in ("Read Cache", "Transport", "Link Rate"):
@@ -138,11 +151,29 @@ def capture_quantastor(page: Page) -> None:
 
 
 def capture_esxi(page: Page) -> None:
-    open_and_select_slot(page, ESXI_PARAMS, 1)
-    page.locator(".nvme-carrier-board-image").wait_for(state="visible", timeout=120_000)
-    for label in ("Pool", "Transport", "Link Rate"):
-        wait_for_kv_value(page, label)
-    capture_app_shell(page, f"esxi-overview-{SCREENSHOT_TAG}.png")
+    systems = available_system_ids(page)
+    fattwin_system_id = next((system_id for system_id in ESXI_FATTWIN_CANDIDATE_IDS if system_id in systems), None)
+    if fattwin_system_id:
+        open_and_select_slot(
+            page,
+            {
+                "system_id": fattwin_system_id,
+                "enclosure_id": ESXI_FATTWIN_ENCLOSURE_ID,
+            },
+            2,
+        )
+        for label in ("Pool", "Transport", "Power Cycles"):
+            wait_for_kv_value(page, label)
+        capture_app_shell(page, f"esxi-overview-{SCREENSHOT_TAG}.png")
+        return
+    if ESXI_AOC_PARAMS["system_id"] in systems:
+        open_and_select_slot(page, ESXI_AOC_PARAMS, 1)
+        page.locator(".nvme-carrier-board-image").wait_for(state="visible", timeout=120_000)
+        for label in ("Pool", "Transport", "Link Rate"):
+            wait_for_kv_value(page, label)
+        capture_app_shell(page, f"esxi-overview-{SCREENSHOT_TAG}.png")
+        return
+    raise RuntimeError("No supported saved ESXi system was found for screenshot capture.")
 
 
 def main() -> None:

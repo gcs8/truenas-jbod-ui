@@ -82,8 +82,9 @@ test.describe("admin sidecar smoke", () => {
     await page.locator("#setup-platform").selectOption("esxi");
     await page.locator("#setup-ssh-enabled").check();
 
-    await expect(page.locator("#setup-platform-help")).toContainText("SSH-only");
-    await expect(page.locator("#setup-platform-help")).toContainText("bootstrap");
+    await expect(page.locator("#setup-platform-help")).toContainText("host-managed");
+    await expect(page.locator("#setup-platform-help")).toContainText("StorCLI");
+    await expect(page.locator("#setup-platform-help")).toContainText("BMC");
     await expect(page.locator("#setup-ssh-user")).toHaveValue("root");
     await expect(page.locator("#setup-ssh-sudo-password-field")).toBeHidden();
     await expect(page.locator("#setup-bootstrap-enabled")).toBeDisabled();

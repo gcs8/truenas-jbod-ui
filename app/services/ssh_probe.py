@@ -48,6 +48,11 @@ class SSHProbe:
     def __init__(self, config: SSHConfig) -> None:
         self.config = config
 
+    def open_client(self) -> paramiko.SSHClient:
+        if not self.config.enabled:
+            raise ValueError("SSH fallback is disabled.")
+        return self._client()
+
     async def run_commands(self) -> list[SSHCommandResult]:
         if not self.config.enabled:
             return []
