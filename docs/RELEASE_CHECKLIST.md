@@ -130,7 +130,7 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - add the release section to `CHANGELOG.md`
 - refresh any checked-in draft release-notes file if the repo is using one
 - refresh the checked-in release notes file for the target tag, for example
-  `docs/RELEASE_NOTES_0.14.2.md`
+  `docs/RELEASE_NOTES_0.15.0.md`
 - review `README.md` for stale version or milestone wording
 - review `docs/ROADMAP.md` for stale "current direction" text
 - review profile/config docs for dead or outdated comments, especially builder

@@ -99,11 +99,11 @@ It gives you:
   UniFi-family systems persist cleanly when no API host should be required
 - `0.14.2` added the first ESXi `Platform Details` panel plus live version
   visibility across the main UI, history sidecar, and admin runtime cards
-- the current `0.15.0-dev` carry-over slice is broadening that ESXi work into
-  a Supermicro BMC / IPMI-first inventory path: validated FatTwin front/rear
-  profiles, BMC-backed slot truth and identify, optional ESXi host-prep for
-  operator-supplied StorCLI bundles, and direct JBOD SMART enrichment when the
-  host exposes both StorCLI and `esxcli storage core device smart get`
+- `0.15.0` broadens that ESXi work into a Supermicro BMC / IPMI-first
+  inventory path: validated FatTwin front/rear profiles, BMC-backed slot truth
+  and identify, optional ESXi host-prep for operator-supplied StorCLI bundles,
+  and direct JBOD SMART enrichment when the host exposes both StorCLI and
+  `esxcli storage core device smart get`
 
 ## Visual Walkthrough
 
