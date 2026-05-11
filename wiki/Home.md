@@ -109,6 +109,8 @@ It gives you:
   Prometheus metrics on all three services, low-cardinality inventory/cache
   counters, and checked-in Grafana dashboards for backend/runtime plus
   history/data visibility
+- `0.16.1` is a narrow offline snapshot hotfix so exported HTML artifacts render
+  embedded slot history again when opened away from the live history sidecar
 
 ## Visual Walkthrough
 
