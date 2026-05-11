@@ -2657,15 +2657,32 @@
     return `${systemPart}|${enclosurePart}|${slot.slot}|${slot.device_name || "unknown"}`;
   }
 
-  function getHistoryCacheKey(slot) {
+  function getHistoryCacheKey(slot, options = {}) {
     const systemPart = state.snapshot.selected_system_id || state.selectedSystemId || "system";
     const enclosurePart =
       slot?.enclosure_id ||
       state.snapshot.selected_enclosure_id ||
       state.selectedEnclosureId ||
       "all-enclosures";
+    if (options.includeWindow === false) {
+      return `${systemPart}|${enclosurePart}|${slot.slot}`;
+    }
     const windowPart = currentHistoryWindowHours() === null ? "all" : String(currentHistoryWindowHours());
     return `${systemPart}|${enclosurePart}|${slot.slot}|${windowPart}`;
+  }
+
+  function getCachedHistoryPayload(historyTarget) {
+    if (!historyTarget) {
+      return null;
+    }
+    const directPayload = state.history.slotCache[historyTarget.cacheKey];
+    if (directPayload) {
+      return directPayload;
+    }
+    if (!state.snapshotMode || !historyTarget.slot) {
+      return null;
+    }
+    return state.history.slotCache[getHistoryCacheKey(historyTarget.slot, { includeWindow: false })] || null;
   }
 
   function getStorageViewSmartCacheKey(view, slot) {
@@ -5159,7 +5176,7 @@
       detailHistoryNote.textContent = "";
     }
 
-    const payload = historyTarget ? state.history.slotCache[historyTarget.cacheKey] : null;
+    const payload = getCachedHistoryPayload(historyTarget);
     detailHistorySummary.textContent = payload?.available ? buildHistorySummary(payload, windowHours, referenceTimestampMs) : "";
 
     if (state.history.panelLoading) {
@@ -5304,7 +5321,7 @@
       renderHistoryPanel();
       return;
     }
-    if (!force && state.history.slotCache[cacheKey]) {
+    if (!force && getCachedHistoryPayload(historyTarget)) {
       state.history.panelError = null;
       renderHistoryPanel();
       return;
