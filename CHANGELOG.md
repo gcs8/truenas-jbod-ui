@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v0.16.1 - 2026-05-11
+
+### Fixed
+
+- offline enclosure snapshot exports now render preloaded slot history again
+  when the history drawer is open, instead of staying on the lazy-load
+  placeholder in a frozen artifact
+
 ## v0.16.0 - 2026-04-27
 
 ### Added
