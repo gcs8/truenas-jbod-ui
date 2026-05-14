@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.16.2 - 2026-05-14
+
+### Fixed
+
+- snapshot export packaging changes now reuse the already-calculated estimate,
+  so switching from Auto to Force ZIP updates the dialog without recalculating
+  the full export payload
+- slot details now prefer real zpool GPTID paths over TrueNAS
+  `{serial_lunid}` fallback identifiers, and label the fallback as
+  `Serial/LUN ID` when no stronger persistent ID is available
+- detail-rail copy buttons now fall back cleanly when the browser does not
+  expose `navigator.clipboard.writeText` on LAN HTTP
+
 ## v0.16.1 - 2026-05-11
 
 ### Fixed

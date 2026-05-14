@@ -427,7 +427,9 @@ test.describe("browser qa smoke", () => {
   });
 
   test("export snapshot dialog renders estimate UI", async ({ page }) => {
+    let estimateRequests = 0;
     await page.route("**/api/export/enclosure-snapshot/estimate**", async (route) => {
+      estimateRequests += 1;
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -436,13 +438,17 @@ test.describe("browser qa smoke", () => {
           effective_packaging: "html",
           auto_packaging: "html",
           allow_oversize: false,
+          html_size_bytes: 6501171,
           html_size_label: "6.2 MiB",
           html_within_limit: true,
+          zip_size_bytes: 2516582,
           zip_size_label: "2.4 MiB",
           zip_within_limit: true,
           selected_size_label: "6.2 MiB",
+          selected_size_bytes: 6501171,
           selected_within_limit: true,
           selected_allowed: true,
+          size_limit_bytes: 25165824,
           size_limit_label: "24 MiB",
           downsampling_label: "None",
           metric_sample_count: 128,
@@ -462,5 +468,12 @@ test.describe("browser qa smoke", () => {
     await expect(page.locator("#export-snapshot-note")).toContainText("Scope");
     await expect(page.locator("#export-snapshot-estimate")).toContainText("Current Choice");
     await expect(page.locator("#export-snapshot-estimate")).toContainText("Auto -> HTML");
+    await expect.poll(() => estimateRequests).toBe(1);
+
+    await page.locator("#export-packaging-select").selectOption("zip");
+
+    await expect(page.locator("#export-snapshot-estimate")).toContainText("ZIP");
+    await expect(page.locator("#export-snapshot-estimate")).toContainText("2.4 MiB");
+    await expect.poll(() => estimateRequests).toBe(1);
   });
 });

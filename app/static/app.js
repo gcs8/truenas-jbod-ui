@@ -3942,6 +3942,36 @@
     return kvRow(label, value, copyable);
   }
 
+  async function copyTextToClipboard(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+
+    if (!document.body || typeof document.execCommand !== "function") {
+      throw new Error("Clipboard API unavailable");
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.left = "-1000px";
+    textarea.style.top = "-1000px";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+
+    try {
+      const copied = document.execCommand("copy");
+      if (!copied) {
+        throw new Error("Clipboard API unavailable");
+      }
+    } finally {
+      textarea.remove();
+    }
+  }
+
   function wireCopyButtons(root) {
     if (!root) {
       return;
@@ -3949,7 +3979,7 @@
     root.querySelectorAll("[data-copy]").forEach((button) => {
       button.addEventListener("click", async () => {
         try {
-          await navigator.clipboard.writeText(decodeURIComponent(button.dataset.copy));
+          await copyTextToClipboard(decodeURIComponent(button.dataset.copy));
           setStatus("Copied to clipboard.");
         } catch (error) {
           setStatus(`Copy failed: ${error}`, "error");
@@ -4179,6 +4209,13 @@
     };
   }
 
+  function snapshotExportEstimateBasisKey() {
+    const payload = snapshotExportRequestPayload();
+    delete payload.packaging;
+    delete payload.allow_oversize;
+    return JSON.stringify(payload);
+  }
+
   function estimatePackagingLabel(packaging) {
     if (packaging === "zip") {
       return "ZIP";
@@ -4275,6 +4312,62 @@
     return "Estimate ready.";
   }
 
+  function estimatePackagingSizeDetails(estimate, packaging) {
+    if (packaging === "html") {
+      return {
+        bytes: Number.isFinite(Number(estimate.html_size_bytes)) ? Number(estimate.html_size_bytes) : null,
+        label: estimate.html_size_label || null,
+        withinLimit: Boolean(estimate.html_within_limit),
+      };
+    }
+    if (packaging === "zip") {
+      return {
+        bytes: Number.isFinite(Number(estimate.zip_size_bytes)) ? Number(estimate.zip_size_bytes) : null,
+        label: estimate.zip_size_label || null,
+        withinLimit: Boolean(estimate.zip_within_limit),
+      };
+    }
+    return { bytes: null, label: null, withinLimit: false };
+  }
+
+  function estimateEffectivePackagingForSelection(estimate, requestedPackaging, allowOversize) {
+    if (requestedPackaging === "html" || requestedPackaging === "zip") {
+      return requestedPackaging;
+    }
+    if (estimate.auto_packaging === "html" || estimate.auto_packaging === "zip") {
+      return estimate.auto_packaging;
+    }
+    return allowOversize ? "zip" : null;
+  }
+
+  function updateSnapshotExportEstimateSelectionFromCache() {
+    const estimate = state.export.estimate.data;
+    if (!estimate) {
+      return false;
+    }
+
+    const requestedPackaging = normalizePersistedPackaging(state.export.packaging);
+    const allowOversize = Boolean(state.export.allowOversize);
+    const effectivePackaging = estimateEffectivePackagingForSelection(estimate, requestedPackaging, allowOversize);
+    const selected = estimatePackagingSizeDetails(estimate, effectivePackaging);
+    const hasSelectedSize = selected.bytes !== null || Boolean(selected.label);
+
+    state.export.estimate.requestToken += 1;
+    state.export.estimate.loading = false;
+    state.export.estimate.error = null;
+    state.export.estimate.data = {
+      ...estimate,
+      selected_packaging: requestedPackaging,
+      effective_packaging: effectivePackaging,
+      selected_size_bytes: selected.bytes,
+      selected_size_label: selected.label,
+      selected_within_limit: selected.withinLimit,
+      selected_allowed: Boolean(hasSelectedSize && (selected.withinLimit || allowOversize)),
+      allow_oversize: allowOversize,
+    };
+    return true;
+  }
+
   function renderSnapshotExportEstimate() {
     if (!exportSnapshotEstimate) {
       return;
@@ -4333,6 +4426,11 @@
     if (state.snapshotMode || !exportSnapshotDialog || !exportSnapshotDialog.open) {
       return;
     }
+    const estimateBasisKey = snapshotExportEstimateBasisKey();
+    if (state.export.estimate.data?._estimate_basis_key === estimateBasisKey && updateSnapshotExportEstimateSelectionFromCache()) {
+      syncSnapshotExportDialog();
+      return;
+    }
     const nextToken = state.export.estimate.requestToken + 1;
     state.export.estimate.requestToken = nextToken;
     state.export.estimate.loading = true;
@@ -4360,7 +4458,10 @@
       if (nextToken !== state.export.estimate.requestToken) {
         return;
       }
-      state.export.estimate.data = estimate;
+      state.export.estimate.data = {
+        ...estimate,
+        _estimate_basis_key: estimateBasisKey,
+      };
       state.export.estimate.error = null;
     } catch (error) {
       if (nextToken !== state.export.estimate.requestToken) {
@@ -6874,16 +6975,24 @@
           ? "html"
           : "auto";
       persistExportUiPreferences();
-      syncSnapshotExportDialog();
-      void refreshSnapshotExportEstimate();
+      if (updateSnapshotExportEstimateSelectionFromCache()) {
+        syncSnapshotExportDialog();
+      } else {
+        syncSnapshotExportDialog();
+        void refreshSnapshotExportEstimate();
+      }
     });
   }
   if (exportAllowOversizeToggle) {
     exportAllowOversizeToggle.addEventListener("change", (event) => {
       state.export.allowOversize = Boolean(event.target.checked);
       persistExportUiPreferences();
-      syncSnapshotExportDialog();
-      void refreshSnapshotExportEstimate();
+      if (updateSnapshotExportEstimateSelectionFromCache()) {
+        syncSnapshotExportDialog();
+      } else {
+        syncSnapshotExportDialog();
+        void refreshSnapshotExportEstimate();
+      }
     });
   }
   if (exportSnapshotDialog) {
