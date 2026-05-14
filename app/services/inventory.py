@@ -95,6 +95,7 @@ logger = logging.getLogger(__name__)
 METRICS_SERVICE_NAME = "enclosure-ui"
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
 BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
+SERIAL_LUNID_IDENTIFIER_REGEX = re.compile(r"^\{\$?serial_lunid\}\$?(?P<identifier>.+)$", re.IGNORECASE)
 UNIFI_GPIO_LED_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
@@ -214,6 +215,8 @@ def build_lunid_aliases(value: str | None, platform: str) -> set[str]:
 
 
 def resolve_persistent_id(*candidates: str | None) -> tuple[str | None, str | None]:
+    fallback_value: str | None = None
+    fallback_label: str | None = None
     for candidate in candidates:
         value = normalize_text(candidate)
         if not value:
@@ -230,15 +233,22 @@ def resolve_persistent_id(*candidates: str | None) -> tuple[str | None, str | No
                 return leaf, "WWN"
             return leaf, "Disk ID"
         if lowered.startswith("gptid/") or "/gptid/" in lowered:
-            return value, "GPTID"
+            return normalize_gptid(value) or value, "GPTID"
         if leaf_lowered.startswith("wwn-"):
             return leaf, "WWN"
         if leaf_lowered.startswith("eui."):
             return leaf, "EUI64"
 
-        return value, None
+        if fallback_value is None:
+            serial_lunid_match = SERIAL_LUNID_IDENTIFIER_REGEX.match(value)
+            if serial_lunid_match:
+                fallback_value = re.sub(r"\s+", "", serial_lunid_match.group("identifier").strip())
+                fallback_label = "Serial/LUN ID"
+            else:
+                fallback_value = value
+                fallback_label = None
 
-    return None, None
+    return fallback_value, fallback_label
 
 
 @dataclass(slots=True)

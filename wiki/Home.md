@@ -111,6 +111,8 @@ It gives you:
   history/data visibility
 - `0.16.1` is a narrow offline snapshot hotfix so exported HTML artifacts render
   embedded slot history again when opened away from the live history sidecar
+- `0.16.2` fixes snapshot-export packaging recalculation, persistent-ID
+  labeling for `{serial_lunid}` fallback values, and copy buttons on LAN HTTP
 
 ## Visual Walkthrough
 

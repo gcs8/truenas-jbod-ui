@@ -2189,6 +2189,21 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(value, "eui.000000000000001000a075012b91c7cf")
         self.assertEqual(label, "EUI64")
 
+    def test_resolve_persistent_id_labels_serial_lunid_identifier_without_marker(self) -> None:
+        value, label = resolve_persistent_id("{$serial_lunid}$S49PNA0N309263      _5002538b103e71d0")
+
+        self.assertEqual(value, "S49PNA0N309263_5002538b103e71d0")
+        self.assertEqual(label, "Serial/LUN ID")
+
+    def test_resolve_persistent_id_prefers_later_gptid_over_serial_lunid_fallback(self) -> None:
+        value, label = resolve_persistent_id(
+            "{serial_lunid}S49PNY0M300264      _5002538b09339f30",
+            "/dev/gptid/8fadc7eb-fe53-11ec-b425-0cc47a8ff400",
+        )
+
+        self.assertEqual(value, "gptid/8fadc7eb-fe53-11ec-b425-0cc47a8ff400")
+        self.assertEqual(label, "GPTID")
+
     def test_extract_quantastor_slot_normalizes_mixed_zero_padded_values(self) -> None:
         self.assertEqual(InventoryService._extract_quantastor_slot({"slot": "01"}), 0)
         self.assertEqual(InventoryService._extract_quantastor_slot({"slot": "08"}), 7)
@@ -2860,6 +2875,8 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
 
             self.assertEqual(slot_view.pool_name, "The-Repository")
             self.assertEqual(slot_view.vdev_class, "special")
+            self.assertEqual(slot_view.gptid, "gptid/example")
+            self.assertEqual(slot_view.persistent_id_label, "GPTID")
 
 
 class InventoryBmcCorrelationTests(unittest.TestCase):
