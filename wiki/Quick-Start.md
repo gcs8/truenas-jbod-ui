@@ -76,7 +76,7 @@ If you want to pin a specific published image tag instead of `latest`, set this
 in `.env` before you start:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.17.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.18.0
 ```
 
 If you want the fuller published-image walkthrough, including update commands,
@@ -89,6 +89,12 @@ stable-vs-dev tag guidance, and running all sidecars from GHCR, use:
 ```text
 http://your-docker-host:8080
 ```
+
+If you are only looking for a public try-before-install demo, that is planned
+but not live yet. The intended shape is a static GitHub Pages site loaded with
+scrubbed sample data, not a hosted backend connected to anyone's storage host:
+
+- [[Public Demo Site|Public-Demo-Site]]
 
 ## 7. Check Health
 

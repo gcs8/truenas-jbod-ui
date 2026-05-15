@@ -179,6 +179,7 @@ the wiki:
 - [SSH Setup and Sudo](wiki/SSH-Setup-and-Sudo.md)
 - [Live Enclosures and Storage Views](wiki/Live-Enclosures-and-Storage-Views.md)
 - [History and Snapshot Export](wiki/History-and-Snapshot-Export.md)
+- [Public Demo Site](wiki/Public-Demo-Site.md)
 - [Docker and GHCR Deployment](wiki/Docker-and-GHCR-Deployment.md)
 - [Troubleshooting](wiki/Troubleshooting.md)
 

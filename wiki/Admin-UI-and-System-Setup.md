@@ -295,6 +295,11 @@ without pointing at a real host first. The action seeds:
 After saving a new system into the mounted config, restart the read UI so the
 runtime selector picks the updated system list up cleanly.
 
+This local seed path is different from the planned public demo site. The public
+demo should use scrubbed or synthetic sample data in a static browser page and
+must not expose real local config, history, hostnames, SSH material, or restore
+bundles. See [[Public Demo Site|Public-Demo-Site]].
+
 ## History Maintenance And Recovery
 
 The same backup/restore area now also holds the safe cleanup tools for saved
@@ -337,4 +342,5 @@ attach the new profile-backed saved chassis layout there.
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 - [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[Public Demo Site|Public-Demo-Site]]
 - [[Advanced Configuration|Advanced-Configuration]]

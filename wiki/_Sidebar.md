@@ -18,6 +18,7 @@ Feature Guides
 - [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
 - [[Heat Map Mode|Heat-Map-Mode]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[Public Demo Site|Public-Demo-Site]]
 - [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
 
 Configuration

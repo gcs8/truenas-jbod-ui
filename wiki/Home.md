@@ -30,6 +30,8 @@ If you want operator feature guides, use:
 
 - [[Heat Map Mode|Heat-Map-Mode]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[Public Demo Site|Public-Demo-Site]] for the planned GitHub Pages demo
+  boundary
 - [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
 
 If you want to really tune things, use:
@@ -71,6 +73,8 @@ It gives you:
 - heat-map overlays for temperature, activity, endurance, risk, and other
   numeric metrics
 - both local-build and published-GHCR deployment paths
+- a documented path toward a future static public demo site without exposing
+  real lab data
 - a main UI that can run alone plus optional history/admin services that share
   the same supported deployment model
 
@@ -127,6 +131,9 @@ It gives you:
   including history-backed timeline scrubbing for supported metrics. Timeline
   starts on the latest sample; click the scrub slider and use the arrow keys
   for fine one-sample steps.
+- the next planning slice treats a GitHub Pages public demo as a static,
+  sample-data experience, not as a hosted copy of the live Docker app. See
+  [[Public Demo Site|Public-Demo-Site]].
 
 ## Visual Walkthrough
 
@@ -134,6 +141,7 @@ If you learn better by seeing the flow first, start here:
 
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
 - [[Heat Map Mode|Heat-Map-Mode]]
+- [[Public Demo Site|Public-Demo-Site]]
 
 Those pages show:
 
@@ -141,5 +149,6 @@ Those pages show:
 - heat-map overlays for the physical bay layout
 - the export snapshot dialog with live size estimates
 - the frozen offline snapshot HTML after export
+- the planned boundary for a future static public demo
 - the maintenance/recovery follow-up lives on
   [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]

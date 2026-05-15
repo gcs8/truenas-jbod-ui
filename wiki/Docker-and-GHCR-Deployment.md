@@ -20,7 +20,7 @@ This package is public, so normal pulls do not require `docker login`.
 
 Choose the GHCR path if you want to:
 
-- pull a tagged release image such as `v0.17.0`
+- pull a tagged release image such as `v0.18.0`
 - keep a server on a pinned known-good image
 - update with `docker compose pull` instead of rebuilding locally
 
@@ -205,16 +205,16 @@ JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:latest
 You can pin a specific image in `.env`:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.17.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.18.0
 ```
 
 Useful tag shapes:
 
 - `latest`
   Best for people who want the newest published stable image
-- `v0.17.0`
+- `v0.18.0`
   Best when you want the exact release-tag name from the repo
-- `0.14.1`
+- `0.18.0`
   Equivalent stable version tag without the `v`
 - `dev`
   Useful for testing the current published development image; do not treat it
@@ -306,7 +306,7 @@ If you pin a specific tag:
 Example:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.17.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.18.0
 ```
 
 ```bash
@@ -349,4 +349,5 @@ docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure
 - [[Quick Start|Quick-Start]]
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[Public Demo Site|Public-Demo-Site]]
 - [[Troubleshooting]]

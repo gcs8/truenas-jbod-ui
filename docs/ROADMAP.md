@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.16.0`.
+This file tracks the current intended release direction after `v0.18.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -17,25 +17,24 @@ Detailed execution plans live here:
 
 ## Current Snapshot
 
-`v0.16.0` just shipped the first observability/runtime-operations slice:
+`v0.18.0` just shipped the first read-only heat-map release:
 
-- optional generic syslog shipping
-- shared JSON log output across UI/history/admin
-- scrape-based Prometheus/OpenMetrics endpoints on all three services
-- first-pass inventory/cache metrics plus checked-in Grafana dashboards
-- live Windows-vs-Linux comparison strong enough to keep Linux as the primary
-  perf truth and local Windows Docker Desktop as the slower tuning target
+- physical-bay heat overlays for live enclosures and saved storage views
+- temperature, activity, endurance, risk, and computed heat-map metrics
+- history-backed timeline scrubbing for supported heat-map metrics
+- bounded metric-only history reads for read/write rate views
+- standalone main-UI behavior when history/admin sidecars are stopped
 
-The next cycle should stay narrower than that release:
+The next cycle should stay practical and public-facing:
 
-- keep Linux Docker as the primary perf truth while chasing the still-slow
-  local Windows `history_status` and snapshot-export path
-- decide whether the observability slice grows alert rules, richer structured
-  perf-event logging, or optional host-level `node_exporter` coverage
-- investigate the intermittent `unvr-pro` SSH slow path without widening the
-  app's normal request path around one slow UniFi box
-- confirm the remaining sibling FatTwin ESXi node behavior and live-confirm
-  rear-bay numbering later once hardware is available
+- keep the shipped `0.18.0` image stable unless a real runtime regression
+  appears
+- use `0.19.0-dev` for the public demo / GitHub Pages exploration instead of
+  cutting a `0.18.1` patch just for planning docs
+- treat a future public demo as static, scrubbed sample data that can run on
+  GitHub Pages, not as a hosted FastAPI/Docker deployment
+- reuse the offline snapshot and demo-builder lessons where they help, while
+  keeping backup/restore and real admin maintenance flows separate
 
 ## Guiding Principle
 
@@ -405,6 +404,35 @@ Current status:
 - the later ESXi credential model question, shared `ses_enclosure` geometry
   cleanup, and Windows `history_status` tuning remain intentionally deferred
 
+## v0.19.0 - Public Demo Site And Demo Mode
+
+Goal:
+
+- make the project easier to evaluate before someone runs Docker against real
+  hardware
+
+Primary outcomes:
+
+- a GitHub Pages-compatible static demo site backed by scrubbed or synthetic
+  sample data
+- a clear `Demo / Offline` boundary so visitors never confuse the public demo
+  with a live appliance connection
+- reuse of the existing physical layout, slot detail, storage-view, and
+  heat-map interaction patterns where practical
+- no admin sidecar, restore, LED identify, SSH/API collection, or secret-bearing
+  workflows in the public site
+- a possible local/demo import path later, modeled more like offline snapshot
+  viewing than full backup restore
+
+Current notes:
+
+- [`docs/DEMO_SITE_PLAN.md`](./DEMO_SITE_PLAN.md)
+
+Current status:
+
+- planning only; the wiki now documents the boundary, but no Pages workflow or
+  runtime demo mode has shipped yet
+
 ## Longer-Term Ideas
 
 - broader chassis-profile sharing and import/export
@@ -412,3 +440,4 @@ Current status:
 - additional platforms only after the adapter and profile boundaries are proven
 - optional richer topology visualization once the current compact context view
   stops being enough
+- richer public demo fixtures once the first static site proves useful
