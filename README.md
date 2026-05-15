@@ -16,22 +16,22 @@ there.
 
 ### Archive CORE
 
-![Archive CORE overview](docs/images/screenshots/core-overview-v0.17.0.png)
+![Archive CORE overview](docs/images/screenshots/core-overview-v0.18.0.png)
 
 ### ESXi FatTwin
 
-![ESXi FatTwin overview](docs/images/screenshots/esxi-overview-v0.17.0.png)
+![ESXi FatTwin overview](docs/images/screenshots/esxi-overview-v0.18.0.png)
 
 ### More
 
-- Offsite SCALE: [docs/images/screenshots/scale-overview-v0.17.0.png](docs/images/screenshots/scale-overview-v0.17.0.png)
-- Quantastor HA: [docs/images/screenshots/quantastor-overview-v0.17.0.png](docs/images/screenshots/quantastor-overview-v0.17.0.png)
-- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.17.0.png](docs/images/screenshots/gpu-server-overview-v0.17.0.png)
-- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.17.0.png](docs/images/screenshots/unvr-overview-v0.17.0.png)
-- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.17.0.png](docs/images/screenshots/unvr-pro-overview-v0.17.0.png)
-- History drawer: [docs/images/screenshots/history-drawer-v0.17.0.png](docs/images/screenshots/history-drawer-v0.17.0.png)
-- Admin setup: [docs/images/screenshots/admin-setup-v0.17.0.png](docs/images/screenshots/admin-setup-v0.17.0.png)
-- Admin ESXi host prep: [docs/images/screenshots/admin-esxi-host-prep-v0.17.0.png](docs/images/screenshots/admin-esxi-host-prep-v0.17.0.png)
+- Offsite SCALE: [docs/images/screenshots/scale-overview-v0.18.0.png](docs/images/screenshots/scale-overview-v0.18.0.png)
+- Quantastor HA: [docs/images/screenshots/quantastor-overview-v0.18.0.png](docs/images/screenshots/quantastor-overview-v0.18.0.png)
+- GPU Server Linux: [docs/images/screenshots/gpu-server-overview-v0.18.0.png](docs/images/screenshots/gpu-server-overview-v0.18.0.png)
+- UniFi UNVR: [docs/images/screenshots/unvr-overview-v0.18.0.png](docs/images/screenshots/unvr-overview-v0.18.0.png)
+- UniFi UNVR Pro: [docs/images/screenshots/unvr-pro-overview-v0.18.0.png](docs/images/screenshots/unvr-pro-overview-v0.18.0.png)
+- History drawer: [docs/images/screenshots/history-drawer-v0.18.0.png](docs/images/screenshots/history-drawer-v0.18.0.png)
+- Admin setup: [docs/images/screenshots/admin-setup-v0.18.0.png](docs/images/screenshots/admin-setup-v0.18.0.png)
+- Admin ESXi host prep: [docs/images/screenshots/admin-esxi-host-prep-v0.18.0.png](docs/images/screenshots/admin-esxi-host-prep-v0.18.0.png)
 
 ## Features
 

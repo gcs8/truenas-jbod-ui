@@ -14,23 +14,27 @@ For installation steps, start with [[Quick Start|Quick-Start]]. For the
 container/service map, use
 [[Architecture and Services|Architecture-and-Services]].
 
+Screenshots on this page were refreshed from the `0.18.0` UI.
+
 ## Main Enclosure View
 
 The primary screen is a physical slot map. The goal is to make the bay location
 obvious first, then expose disk and topology detail when you inspect a slot.
+For CORE, the main example is the 60-bay top-loading shelf because that is the
+representative day-to-day chassis view.
 
-![Archive CORE Front 24 Bay live enclosure](images/archive-core-front-24-v0.17.0.png)
+![Archive CORE 60-bay live enclosure](images/archive-core-60-bay-v0.18.0.png)
 
 ## Runtime Selector
 
 The selector groups runtime targets by what they are:
 
-- `Live Enclosures` are discovered from a host.
-- `Saved Chassis Views` are operator-created layout overlays.
+- `Live Enclosures` are physical targets discovered from a host.
+- `Saved Chassis Views` are operator-created layout overlays, when configured.
 - `Virtual Storage Views` are internal or logical disk groups such as boot
   devices or carrier cards.
 
-![Grouped runtime selector on archive-core](images/live-vs-storage-views-v0.17.0.png)
+![Grouped runtime selector on archive-core](images/runtime-selector-groups-v0.18.0.png)
 
 ## Heat Map Mode
 
@@ -45,14 +49,10 @@ The details live in [[Heat Map Mode|Heat-Map-Mode]].
 ## History Drawer
 
 When the optional history sidecar is running, populated slots can open a
-history drawer under the enclosure.
+history drawer under the enclosure. Storage views use the same drawer when the
+selected internal disk has a stable identity.
 
-![Live slot history drawer](images/history-drawer-v0.17.0.png)
-
-Storage views use the same history model when the app can identify the disk or
-view scope clearly:
-
-![Storage-view history on Boot SATADOMs](images/storage-view-history-v0.17.0.png)
+![Live slot history drawer](images/history-drawer-v0.18.0.png)
 
 The details live in
 [[History and Snapshot Export|History-and-Snapshot-Export]].
@@ -63,7 +63,7 @@ The optional admin sidecar handles guided setup, system config, SSH material,
 runtime controls, profile authoring, backup/restore tools, and maintenance
 flows.
 
-![Admin sidecar grouped setup view](images/admin-setup-v0.17.0.png)
+![Admin sidecar grouped setup view](images/admin-setup-v0.18.0.png)
 
 Use [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for launch and
 setup. Use
@@ -75,7 +75,7 @@ backup, restore, debug bundles, and destructive-maintenance guardrails.
 The builder workspace creates reusable custom enclosure profiles without
 hand-editing `profiles.yaml` first.
 
-![Builder workspace with full-width preview](images/builder-workspace-v0.17.0.png)
+![Builder workspace with full-width preview](images/builder-workspace-v0.18.0.png)
 
 The details live in
 [[Profiles and Custom Layouts|Profiles-and-Custom-Layouts]].
@@ -85,11 +85,11 @@ The details live in
 The main UI can export a self-contained offline HTML artifact for the current
 enclosure or storage view.
 
-![Snapshot export dialog with live estimate](images/snapshot-export-dialog-v0.17.0.png)
+![Snapshot export dialog with live estimate](images/snapshot-export-dialog-v0.18.0.png)
 
 The exported file opens away from the live app:
 
-![Frozen offline enclosure snapshot](images/offline-snapshot-v0.17.0.png)
+![Frozen offline enclosure snapshot](images/offline-snapshot-v0.18.0.png)
 
 The boundaries between public demo, offline snapshot, debug bundle, and full
 backup are summarized in
@@ -100,7 +100,7 @@ backup are summarized in
 History cleanup and adoption tools live in the admin sidecar because they can
 rewrite local sidecar data.
 
-![Admin maintenance bundle and history tools](images/admin-maintenance-v0.17.0.png)
+![Admin maintenance bundle and history tools](images/admin-maintenance-v0.18.0.png)
 
 Use [[History Maintenance and Recovery|History-Maintenance-and-Recovery]] for
 the history-specific cleanup flow.

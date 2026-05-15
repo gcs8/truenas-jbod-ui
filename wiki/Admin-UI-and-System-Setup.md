@@ -70,7 +70,7 @@ The top of the admin page now has two section targets:
 
 ## What The Page Looks Like
 
-![Admin sidecar grouped setup view](images/admin-setup-v0.17.0.png)
+![Admin sidecar grouped setup view](images/admin-setup-v0.18.0.png)
 
 The page is organized around one saved system at a time.
 
@@ -110,7 +110,7 @@ This is where you confirm the intended chassis shape before you save.
 The admin sidecar now also has a dedicated builder workspace for reusable
 custom chassis profiles.
 
-![Builder workspace with full-width preview](images/builder-workspace-v0.17.0.png)
+![Builder workspace with full-width preview](images/builder-workspace-v0.18.0.png)
 
 Use it when you want to:
 
@@ -165,7 +165,7 @@ For VMware ESXi, the admin sidecar now keeps the setup intentionally narrower:
 The setup form now also includes an ESXi-only `Host Prep / Vendor Tool Upload`
 panel for operator-supplied vendor packages.
 
-![Admin ESXi host prep panel](images/admin-esxi-host-prep-v0.17.0.png)
+![Admin ESXi host prep panel](images/admin-esxi-host-prep-v0.18.0.png)
 
 Use it when the host needs something like Broadcom StorCLI before the main UI
 can enrich controller-backed disks properly.
@@ -247,7 +247,7 @@ demo/offline artifacts visibly separate from restore-grade backup bundles.
 The same backup/restore area now also holds the safe cleanup tools for saved
 history:
 
-![Admin maintenance bundle and history tools](images/admin-maintenance-v0.17.0.png)
+![Admin maintenance bundle and history tools](images/admin-maintenance-v0.18.0.png)
 
 Use that panel when you need to:
 

@@ -7,7 +7,7 @@ This page is the quick mental model for what the selector is showing.
 The current `archive-core` runtime selector shows the live and virtual groups
 that are actually configured today:
 
-![Grouped runtime selector on archive-core](images/live-vs-storage-views-v0.17.0.png)
+![Grouped runtime selector on archive-core](images/runtime-selector-groups-v0.18.0.png)
 
 `archive-core` intentionally does not keep a duplicate saved chassis view by
 default, so the `Saved Chassis Views` runtime group only appears after an
@@ -70,7 +70,7 @@ dividers should therefore match when those surfaces point at the same profile.
 
 Here is the current admin-side grouped picker and profile catalog:
 
-![Admin sidecar grouped Add Storage View flow](images/admin-setup-v0.17.0.png)
+![Admin sidecar grouped Add Storage View flow](images/admin-setup-v0.18.0.png)
 
 ## Profiles Vs Storage Views
 
@@ -101,10 +101,9 @@ thing:
 If you later add a saved mirrored `Front Bays` or `Primary Chassis` view, that
 becomes a `Saved Chassis View`, not a second physical shelf.
 
-The separate `Front 24 Bay` live enclosure now also shows up as its own
-runtime target on `archive-core`:
-
-![Archive CORE Front 24 Bay live enclosure](images/archive-core-front-24-v0.17.0.png)
+The separate `Front 24 Bay` live enclosure can still show up as its own runtime
+target on `archive-core`, but the canonical CORE walkthroughs use the 60-bay
+top-loading shelf because that is the main operator view.
 
 ## Related Pages
 
