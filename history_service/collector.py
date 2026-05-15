@@ -210,7 +210,7 @@ class HistoryCollector:
                     result="success",
                     duration_seconds=time.perf_counter() - started_monotonic,
                     status=self.status(),
-                    counts=self.store.counts(),
+                    counts=self.store.estimated_counts(),
                 )
             except Exception as exc:  # noqa: BLE001 - keep the collector alive across transient appliance errors.
                 logger.exception("History collection pass failed")

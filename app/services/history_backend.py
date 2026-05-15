@@ -32,7 +32,7 @@ class HistoryBackendClient:
             }
 
         try:
-            payload = await self._fetch_json("/api/history/overview")
+            payload = await self._fetch_json("/healthz")
         except Exception as exc:  # noqa: BLE001 - surface optional-backend errors as degraded status.
             return {
                 "configured": True,
@@ -46,7 +46,7 @@ class HistoryBackendClient:
         return {
             "configured": True,
             "available": True,
-            "detail": None,
+            "detail": payload.get("last_error") if payload.get("status") == "degraded" else None,
             "counts": payload.get("counts", {}),
             "collector": payload.get("collector", {}),
             "scopes": payload.get("scopes", []),

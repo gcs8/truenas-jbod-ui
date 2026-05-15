@@ -96,6 +96,9 @@ METRICS_SERVICE_NAME = "enclosure-ui"
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
 BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
 SERIAL_LUNID_IDENTIFIER_REGEX = re.compile(r"^\{\$?serial_lunid\}\$?(?P<identifier>.+)$", re.IGNORECASE)
+SCALE_CONFIGURED_SG_SES_FAILURE_REGEX = re.compile(
+    r"^SSH command failed: .*\bsg_ses\b\s+-p\s+(?:aes|ec)\s+/dev/sg\d+\s+\(exit\s+\d+\)$"
+)
 UNIFI_GPIO_LED_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
@@ -1302,6 +1305,38 @@ class InventoryService:
         )
 
     @staticmethod
+    def _is_configured_sg_ses_page_probe_failure(message: str) -> bool:
+        return bool(SCALE_CONFIGURED_SG_SES_FAILURE_REGEX.match(normalize_text(message) or ""))
+
+    @classmethod
+    def _suppress_scale_configured_sg_ses_failures(
+        cls,
+        warnings: list[str],
+        ssh_failures: list[str],
+    ) -> tuple[list[str], list[str]]:
+        if not ssh_failures:
+            return warnings, ssh_failures
+
+        remaining_failures: list[str] = []
+        suppressed_failures: list[str] = []
+        for failure in ssh_failures:
+            if cls._is_configured_sg_ses_page_probe_failure(failure):
+                suppressed_failures.append(failure)
+            else:
+                remaining_failures.append(failure)
+
+        if not suppressed_failures:
+            return warnings, ssh_failures
+
+        remaining_warnings = list(warnings)
+        for failure in suppressed_failures:
+            try:
+                remaining_warnings.remove(failure)
+            except ValueError:
+                pass
+        return remaining_warnings, remaining_failures
+
+    @staticmethod
     def _esxi_storcli_runtime_warning(outputs: dict[str, str]) -> str | None:
         normalized_outputs = {
             canonicalize_ssh_command(command): output
@@ -1557,6 +1592,7 @@ class InventoryService:
                 warnings.extend(scale_ses_failures)
 
             if scale_ses_loaded:
+                warnings, ssh_failures = self._suppress_scale_configured_sg_ses_failures(warnings, ssh_failures)
                 sources["ssh"] = SourceStatus(
                     enabled=True,
                     ok=not ssh_failures and not scale_ses_failures,

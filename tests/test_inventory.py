@@ -255,6 +255,18 @@ class InventoryHelpersTests(unittest.TestCase):
         )
         self.assertEqual(status_message, "StorCLI commands unavailable.")
 
+    def test_suppress_scale_configured_sg_ses_failures_keeps_other_ssh_warnings(self) -> None:
+        sg_ses_failure = "SSH command failed: sudo -n /usr/bin/sg_ses -p aes /dev/sg27 (exit 5)"
+        smart_failure = "SSH command failed: smartctl -x -j /dev/sda (exit 2)"
+
+        warnings, failures = InventoryService._suppress_scale_configured_sg_ses_failures(
+            [sg_ses_failure, smart_failure],
+            [sg_ses_failure, smart_failure],
+        )
+
+        self.assertEqual(warnings, [smart_failure])
+        self.assertEqual(failures, [smart_failure])
+
     def test_esxi_storcli_runtime_warning_reports_zero_visible_controllers(self) -> None:
         warning = InventoryService._esxi_storcli_runtime_warning(
             {
@@ -1939,6 +1951,124 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(saved_view.slots[0].slot_label, "00")
         self.assertEqual(saved_view.slots[-1].slot_label, "23")
         self.assertIn("Generic Front 24", saved_view.notes[0])
+
+    def test_get_storage_view_runtime_preserves_saved_ses_top_loader_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="archive-core",
+                label="Archive CORE",
+                storage_views=[
+                    {
+                        "id": "top-loader",
+                        "label": "Top Loader",
+                        "kind": "ses_enclosure",
+                        "template_id": "ses-auto",
+                        "profile_id": CORE_CSE_946_PROFILE_ID,
+                        "enabled": True,
+                        "order": 10,
+                        "render": {
+                            "show_in_main_ui": True,
+                            "show_in_admin_ui": True,
+                            "default_collapsed": False,
+                        },
+                        "binding": {
+                            "mode": "auto",
+                            "enclosure_ids": [],
+                            "pool_names": [],
+                            "serials": [],
+                            "pcie_addresses": [],
+                            "device_names": [],
+                        },
+                    }
+                ],
+                truenas=TrueNASConfig(
+                    host="https://archive-core.local",
+                    api_key="token",
+                    platform="core",
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            live_profile = service.profile_registry.get("generic-front-24-1x24")
+            saved_profile = service.profile_registry.get(CORE_CSE_946_PROFILE_ID)
+
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[
+                        SlotView(
+                            slot=0,
+                            slot_label="00",
+                            row_index=0,
+                            column_index=0,
+                            present=True,
+                            state=SlotState.healthy,
+                            device_name="da0",
+                        ),
+                        SlotView(
+                            slot=59,
+                            slot_label="59",
+                            row_index=3,
+                            column_index=14,
+                            present=True,
+                            state=SlotState.healthy,
+                            device_name="da59",
+                        ),
+                    ],
+                    refresh_interval_seconds=30,
+                    selected_system_id="archive-core",
+                    selected_system_label="Archive CORE",
+                    selected_enclosure_id="front-24",
+                    selected_enclosure_label="Front 24 Bay",
+                    selected_profile=live_profile,
+                    layout_rows=live_profile.slot_layout,
+                    layout_slot_count=24,
+                    layout_columns=24,
+                )
+            )
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[],
+                        disks=[],
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    ),
+                    ssh_outputs={},
+                    ssh_collected=True,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+
+            runtime = asyncio.run(service.get_storage_view_runtime())
+
+        saved_view = next(view for view in runtime.views if view.id == "top-loader")
+        self.assertEqual(saved_view.profile_id, CORE_CSE_946_PROFILE_ID)
+        self.assertEqual(saved_view.profile_label, saved_profile.label)
+        self.assertEqual(saved_view.face_style, "top-loader")
+        self.assertEqual(saved_view.latch_edge, "bottom")
+        self.assertEqual(saved_view.bay_size, "3.5")
+        self.assertEqual(saved_view.row_groups, [6, 6, 3])
+        self.assertEqual(saved_view.slot_layout, saved_profile.slot_layout)
+        self.assertEqual(saved_view.slot_count, 60)
+        profile_slot_order = [
+            slot_value
+            for row in saved_profile.slot_layout
+            for slot_value in row
+            if isinstance(slot_value, int)
+        ]
+        self.assertEqual(saved_view.slots[0].slot_index, profile_slot_order[0])
+        self.assertEqual(saved_view.slots[-1].slot_index, profile_slot_order[-1])
+        self.assertIn(saved_profile.label, saved_view.notes[0])
 
     def test_get_storage_view_slot_smart_summary_reuses_snapshot_slot_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4430,6 +4560,104 @@ Enclosure Status diagnostic page:
             self.assertTrue(slot0.identify_active)
             self.assertEqual(slot0.ssh_ses_targets[0]["ssh_host"], "10.0.0.20")
             self.assertEqual(slot0.ssh_ses_targets[0]["ses_device"], "/dev/sg27")
+
+    async def test_scale_snapshot_hides_stale_configured_sg_ses_failures_after_rediscovery(self) -> None:
+        class DummyScaleClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                return TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            configured_commands = [
+                "sudo -n /usr/bin/sg_ses -p aes /dev/sg27",
+                "sudo -n /usr/bin/sg_ses -p aes /dev/sg38",
+                "sudo -n /usr/bin/sg_ses -p ec /dev/sg27",
+                "sudo -n /usr/bin/sg_ses -p ec /dev/sg38",
+            ]
+            system = SystemConfig(
+                id="offsite-scale",
+                label="Offsite SCALE",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="10.0.0.10",
+                    extra_hosts=["10.0.0.20"],
+                    user="jbodmap",
+                    commands=configured_commands,
+                ),
+            )
+            ssh_probe = AsyncMock()
+            ssh_probe.run_commands.return_value = [
+                SSHCommandResult(command=configured_commands[0], ok=False, exit_code=5),
+                SSHCommandResult(command=configured_commands[1], ok=False, exit_code=9),
+                SSHCommandResult(command=configured_commands[2], ok=False, exit_code=5),
+                SSHCommandResult(command=configured_commands[3], ok=False, exit_code=9),
+            ]
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyScaleClient(),
+                ssh_probe,
+                temp_dir,
+            )
+
+            aes_output = """  SMCDRS2U  SAS3x40           0701
+  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 0
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5003048026b2ff7f
+          SAS address: 0x5002538b496a5512
+          phy identifier: 0x0
+"""
+            ec_output = """  SMCDRS2U  SAS3x40           0701
+Enclosure Status diagnostic page:
+  generation code: 0x0
+  status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Overall descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+      Element 0 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+        Ready to insert=0, RMV=0, Ident=1, Report=0
+"""
+            ses_overlay = parse_ssh_outputs(
+                {
+                    "sudo -n /usr/bin/sg_ses -p aes /dev/sg27": aes_output,
+                    "sudo -n /usr/bin/sg_ses -p ec /dev/sg27": ec_output,
+                },
+                60,
+                None,
+                None,
+            )
+            service._tag_ses_overlay(ses_overlay, "10.0.0.20")
+            service._fetch_scale_ses_overlay = AsyncMock(return_value=(ses_overlay, []))
+
+            snapshot = await service.get_snapshot()
+            warning_text = "\n".join(snapshot.warnings)
+
+            self.assertEqual(snapshot.sources["ssh"].message, "SSH probe and SCALE SES rediscovery completed.")
+            self.assertTrue(snapshot.sources["ssh"].ok)
+            self.assertNotIn("SSH command failed:", warning_text)
+            self.assertNotIn("sg_ses -p aes", warning_text)
+            self.assertNotIn("sg_ses -p ec", warning_text)
+            self.assertIn(
+                "TrueNAS SCALE did not return enclosure rows, so this view is using Linux SES AES page parsing "
+                "for slot mapping on the selected enclosure.",
+                snapshot.warnings,
+            )
 
     async def test_quantastor_cli_enrichment_surfaces_in_smart_summary(self) -> None:
         class DummyQuantastorClient:

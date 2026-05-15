@@ -121,19 +121,31 @@ async function fetchStorageViewsForSystem(page, systemId) {
   }, systemId);
 }
 
-async function findLiveBackedSavedChassisTarget(page) {
+function isOccupiedSnapshotBackedSlot(slot) {
+  return Boolean(slot?.occupied) && Number.isInteger(slot.snapshot_slot);
+}
+
+function isSnapshotBackedSlot(slot) {
+  return Number.isInteger(slot?.snapshot_slot);
+}
+
+async function findLiveBackedSavedChassisTarget(page, predicate = () => true, options = {}) {
+  const slotPredicate = options.requireOccupied === false
+    ? isSnapshotBackedSlot
+    : isOccupiedSnapshotBackedSlot;
   const systems = await getSelectValues(page, "#system-select");
   for (const systemId of systems) {
     const payload = await fetchStorageViewsForSystem(page, systemId);
     const view = (payload.views || []).find((candidate) =>
+      predicate(candidate) &&
       candidate.kind === "ses_enclosure" &&
       Array.isArray(candidate.slots) &&
-      candidate.slots.some((slot) => Number.isInteger(slot.snapshot_slot))
+      candidate.slots.some(slotPredicate)
     );
     if (!view) {
       continue;
     }
-    const slot = view.slots.find((candidate) => Number.isInteger(candidate.snapshot_slot));
+    const slot = view.slots.find(slotPredicate);
     if (!slot) {
       continue;
     }
@@ -143,6 +155,10 @@ async function findLiveBackedSavedChassisTarget(page) {
       slotIndex: slot.slot_index,
       snapshotSlot: slot.snapshot_slot,
       backingEnclosureId: view.backing_enclosure_id || null,
+      faceStyle: view.face_style || null,
+      baySize: view.bay_size || null,
+      rowGroups: Array.isArray(view.row_groups) ? view.row_groups : [],
+      rowCount: Array.isArray(view.slot_layout) ? view.slot_layout.length : 0,
     };
   }
   return null;
@@ -424,6 +440,37 @@ test.describe("browser qa smoke", () => {
     await expect(page.locator("#detail-secondary")).toBeVisible();
     await expect(page.locator("#history-toggle-button")).toBeHidden();
     await expect(page.locator("#detail-led-controls")).toBeHidden();
+  });
+
+  test("top-loader saved chassis preserves profile row dividers and shell geometry", async ({ page }) => {
+    await gotoApp(page);
+    await setAutoRefresh(page, false);
+
+    const target = await findLiveBackedSavedChassisTarget(
+      page,
+      (view) =>
+        view.face_style === "top-loader" &&
+        Array.isArray(view.row_groups) &&
+        view.row_groups.length > 1,
+      { requireOccupied: false }
+    );
+    test.skip(!target, "Need one snapshot-backed top-loader saved chassis view for geometry coverage.");
+
+    await switchSystem(page, target.systemId);
+    await switchEnclosure(page, `view:${target.viewId}`);
+
+    const shell = page.locator("#chassis-shell");
+    await expect(shell).toHaveAttribute("data-face-style", "top-loader");
+    await expect(shell).toHaveAttribute("data-drive-scale", target.baySize || "3.5");
+    await expect(shell).toHaveAttribute("data-layout-mode", /top-loader/);
+    await expect(shell).toHaveAttribute("data-layout-rows", String(target.rowCount));
+
+    await expect(page.locator("#slot-grid .row-slots-flat-grouped")).toHaveCount(target.rowCount);
+    const expectedDividerCount = target.rowCount * Math.max(target.rowGroups.length - 1, 0);
+    await expect(page.locator("#slot-grid .row-metal-divider")).toHaveCount(expectedDividerCount);
+
+    const tile = page.locator(`#slot-grid .slot-tile[data-slot="${target.slotIndex}"]`);
+    await expect(tile).toBeVisible();
   });
 
   test("export snapshot dialog renders estimate UI", async ({ page }) => {

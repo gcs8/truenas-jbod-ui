@@ -190,6 +190,90 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(counts["event_count"], 1)
         self.assertEqual(counts["metric_sample_count"], 1)
 
+    def test_store_fast_overview_uses_estimated_activity_counts(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid="gptid/slot-5",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+        )
+
+        store.upsert_slot_state(record, "2026-04-16T22:05:00+00:00")
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-16T22:10:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name="temperature_c",
+                    value_integer=31,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                ),
+                MetricSample(
+                    observed_at="2026-04-16T22:15:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name="temperature_c",
+                    value_integer=32,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                ),
+            ]
+        )
+        with sqlite3.connect(store.file_path) as connection:
+            connection.execute("DELETE FROM metric_samples WHERE id = 1")
+            connection.commit()
+
+        exact_counts = store.counts()
+        estimated_counts = store.estimated_counts()
+        fast_scopes = store.list_scopes(include_activity_counts=False)
+        exact_scopes = store.list_scopes()
+
+        self.assertEqual(exact_counts["tracked_slots"], 1)
+        self.assertEqual(exact_counts["metric_sample_count"], 1)
+        self.assertEqual(estimated_counts["tracked_slots"], 1)
+        self.assertEqual(estimated_counts["metric_sample_count"], 2)
+        self.assertTrue(estimated_counts["estimated"])
+        self.assertEqual(estimated_counts["count_mode"], "id_upper_bound")
+        self.assertEqual(len(fast_scopes), 1)
+        self.assertEqual(fast_scopes[0]["tracked_slots"], 1)
+        self.assertIsNone(fast_scopes[0]["event_count"])
+        self.assertIsNone(fast_scopes[0]["metric_sample_count"])
+        self.assertEqual(fast_scopes[0]["activity_counts_deferred"], 1)
+        self.assertEqual(exact_scopes[0]["metric_sample_count"], 1)
+
     def test_get_slot_history_bundle_auto_follows_matching_disk_metrics_across_homes(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))

@@ -97,4 +97,44 @@ test.describe("admin sidecar smoke", () => {
     await page.locator("#setup-load-recommended-button").click();
     await expect(page.locator("#setup-ssh-commands")).toHaveValue(/\/opt\/lsi\/storcli64\/storcli64 \/c0\/eall\/sall show all J/);
   });
+
+  async function expectTopLoaderPreviewGeometry(selector, page) {
+    const previewGrid = page.locator(selector);
+    await expect(previewGrid).toHaveAttribute("data-face-style", "top-loader");
+    await expect(previewGrid).toHaveAttribute("data-layout-mode", /top-loader/);
+    await expect(previewGrid).toHaveAttribute("data-layout-rows", "4");
+    await expect(page.locator(`${selector} .profile-preview-row.is-flat-grouped`)).toHaveCount(4);
+    await expect(page.locator(`${selector} .profile-preview-divider`)).toHaveCount(8);
+  }
+
+  test("admin previews keep top-loader row group geometry", async ({ page }) => {
+    await gotoAdmin(page);
+
+    const topLoaderOption = page.locator('#setup-profile option[value="supermicro-cse-946-top-60"]');
+    test.skip((await topLoaderOption.count()) === 0, "Need the built-in Supermicro CSE-946 top-loader profile.");
+
+    await page.locator("#setup-profile").selectOption("supermicro-cse-946-top-60");
+
+    await expectTopLoaderPreviewGeometry("#profile-preview-grid", page);
+
+    await page.locator('[data-admin-view-button="builder"]').click();
+    await page.locator("#profile-builder-load-button").click();
+
+    await expectTopLoaderPreviewGeometry("#profile-builder-preview-grid", page);
+
+    await page.locator('[data-admin-view-button="operations"]').click();
+
+    const topLoaderAddOption = page.locator(
+      '#setup-storage-view-template option[value="profile:supermicro-cse-946-top-60"]'
+    );
+    test.skip(
+      (await topLoaderAddOption.count()) === 0,
+      "Need the top-loader profile available as an addable saved chassis view."
+    );
+
+    await page.locator("#setup-storage-view-template").selectOption("profile:supermicro-cse-946-top-60");
+    await page.locator("#setup-storage-view-add-button").click();
+
+    await expectTopLoaderPreviewGeometry("#setup-storage-view-preview-grid", page);
+  });
 });

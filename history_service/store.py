@@ -1110,8 +1110,34 @@ class HistoryStore:
 
         return payload_by_slot
 
-    def list_scopes(self) -> list[dict[str, Any]]:
+    def list_scopes(self, *, include_activity_counts: bool = True) -> list[dict[str, Any]]:
         with closing(self._connect()) as connection:
+            if not include_activity_counts:
+                rows = connection.execute(
+                    """
+                    SELECT
+                        current.system_id,
+                        current.system_label,
+                        current.enclosure_id,
+                        current.enclosure_label,
+                        current.enclosure_key,
+                        COUNT(*) AS tracked_slots,
+                        MAX(current.last_seen_at) AS last_seen_at,
+                        NULL AS event_count,
+                        NULL AS metric_sample_count,
+                        1 AS activity_counts_deferred
+                    FROM slot_state_current current
+                    GROUP BY
+                        current.system_id,
+                        current.system_label,
+                        current.enclosure_id,
+                        current.enclosure_label,
+                        current.enclosure_key
+                    ORDER BY current.system_label, current.enclosure_label
+                    """
+                ).fetchall()
+                return [dict(row) for row in rows]
+
             rows = connection.execute(
                 """
                 SELECT
@@ -1156,6 +1182,24 @@ class HistoryStore:
             "event_count": event_count,
             "metric_sample_count": metric_sample_count,
         }
+
+    def estimated_counts(self) -> dict[str, Any]:
+        with closing(self._connect()) as connection:
+            tracked_slots = int(connection.execute("SELECT COUNT(*) FROM slot_state_current").fetchone()[0])
+            event_count = self._table_id_upper_bound(connection, "slot_events")
+            metric_sample_count = self._table_id_upper_bound(connection, "metric_samples")
+        return {
+            "tracked_slots": tracked_slots,
+            "event_count": event_count,
+            "metric_sample_count": metric_sample_count,
+            "estimated": True,
+            "count_mode": "id_upper_bound",
+        }
+
+    @staticmethod
+    def _table_id_upper_bound(connection: sqlite3.Connection, table_name: str) -> int:
+        row = connection.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table_name}").fetchone()
+        return int(row[0] or 0)
 
     def list_history_system_summaries(
         self,

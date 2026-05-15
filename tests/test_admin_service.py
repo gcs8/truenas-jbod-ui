@@ -262,6 +262,25 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertIsNone(launch_url)
 
+    def test_resolve_admin_launch_url_hides_button_when_sidecar_times_out(self) -> None:
+        request = make_request(port=8080)
+        settings = Settings(
+            admin=AdminSurfaceConfig(
+                service_url="http://enclosure-admin:8002",
+                public_url="http://127.0.0.1:8082",
+                port=8082,
+                timeout_seconds=0.5,
+            )
+        )
+
+        with patch(
+            "app.main.urllib.request.urlopen",
+            side_effect=TimeoutError("timed out"),
+        ):
+            launch_url = resolve_admin_launch_url(request, settings)
+
+        self.assertIsNone(launch_url)
+
 
 class AdminHeaderDecodeTests(unittest.TestCase):
     def test_decode_optional_secret_header_preserves_trailing_spaces(self) -> None:

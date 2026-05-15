@@ -671,7 +671,7 @@ def resolve_admin_launch_url(request: Request, settings: Settings) -> str | None
         with urllib.request.urlopen(health_url, timeout=settings.admin.timeout_seconds) as response:
             if getattr(response, "status", 200) >= 400:
                 return None
-    except (urllib.error.URLError, ValueError):
+    except (TimeoutError, urllib.error.URLError, ValueError):
         return None
 
     public_url = str(settings.admin.public_url or "").strip()

@@ -64,6 +64,7 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
             "_fetch_json",
             AsyncMock(
                 return_value={
+                    "status": "ok",
                     "counts": {"tracked_slots": 12, "metric_sample_count": 48},
                     "collector": {"last_completed_at": "2026-04-16T23:10:00+00:00"},
                     "scopes": [{"system_id": "archive-core", "enclosure_id": "front"}],
@@ -77,7 +78,33 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["counts"]["tracked_slots"], 12)
         self.assertEqual(payload["collector"]["last_completed_at"], "2026-04-16T23:10:00+00:00")
         self.assertEqual(len(payload["scopes"]), 1)
-        fetch_json.assert_awaited_once_with("/api/history/overview")
+        fetch_json.assert_awaited_once_with("/healthz")
+
+    async def test_get_status_uses_lightweight_health_shape_when_counts_are_absent(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+
+        with patch.object(
+            client,
+            "_fetch_json",
+            AsyncMock(
+                return_value={
+                    "status": "degraded",
+                    "last_error": "collector timed out",
+                    "collector": {"last_success_at": "2026-05-14T23:10:00+00:00"},
+                }
+            ),
+        ) as fetch_json:
+            payload = await client.get_status()
+
+        self.assertTrue(payload["configured"])
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["detail"], "collector timed out")
+        self.assertEqual(payload["counts"], {})
+        self.assertEqual(payload["collector"]["last_success_at"], "2026-05-14T23:10:00+00:00")
+        self.assertEqual(payload["scopes"], [])
+        fetch_json.assert_awaited_once_with("/healthz")
 
     async def test_get_slot_history_shapes_metric_and_event_payloads(self) -> None:
         client = HistoryBackendClient(

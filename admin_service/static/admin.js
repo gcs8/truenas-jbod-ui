@@ -1435,20 +1435,183 @@
     return buildRectangularProfileLayout(profile.rows, profile.columns, slotCount, "row-major-bottom");
   }
 
-  function renderProfilePreviewCells(previewRows, columnCount) {
-    return previewRows
-      .flatMap((row) => {
-        const paddedRow = Array.isArray(row) ? row.slice() : [];
-        while (paddedRow.length < columnCount) {
+  function normalizeProfilePreviewRows(rows) {
+    return Array.isArray(rows) ? rows.filter((row) => Array.isArray(row)) : [];
+  }
+
+  function countProfilePreviewSlots(rows) {
+    return normalizeProfilePreviewRows(rows).reduce(
+      (total, row) => total + row.filter((slotValue) => Number.isInteger(slotValue)).length,
+      0
+    );
+  }
+
+  function normalizeProfilePreviewRowGroups(profile) {
+    return (Array.isArray(profile?.row_groups) ? profile.row_groups : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0);
+  }
+
+  function inferProfilePreviewDriveScale(profile, slotCount) {
+    if (profile?.bay_size === "3.5" || profile?.bay_size === "2.5") {
+      return profile.bay_size;
+    }
+    if (profile?.face_style === "top-loader" || profile?.face_style === "unifi-drive") {
+      return "3.5";
+    }
+    if (slotCount <= 2) {
+      return "2.5";
+    }
+    if (profile?.face_style === "front-drive" || profile?.face_style === "rear-drive") {
+      return "3.5";
+    }
+    return "default";
+  }
+
+  function inferProfilePreviewLayoutMode(profile, rows, slotCount, driveScale) {
+    const rowCount = normalizeProfilePreviewRows(rows).length;
+    const faceStyle = profile?.face_style || "generic";
+    if (faceStyle === "nvme-carrier") {
+      return "nvme-carrier";
+    }
+    if (faceStyle === "boot-devices") {
+      return "boot-devices";
+    }
+    if (faceStyle === "unifi-drive") {
+      return rowCount > 1 ? "unifi-2row" : "unifi-1row";
+    }
+    if (slotCount <= 2) {
+      return "compact";
+    }
+    if (faceStyle === "top-loader") {
+      return driveScale === "2.5" ? "top-loader-2.5" : "top-loader-3.5";
+    }
+    if (faceStyle === "front-drive" || faceStyle === "rear-drive") {
+      if (slotCount >= 20) {
+        return driveScale === "2.5" ? "dense-2.5" : "dense-3.5";
+      }
+      if (slotCount >= 8) {
+        return driveScale === "2.5" ? "standard-2.5" : "standard-3.5";
+      }
+    }
+    return driveScale === "2.5" ? "compact" : "standard-3.5";
+  }
+
+  function buildProfilePreviewGeometry(profile, previewRows, columnCount) {
+    const rows = normalizeProfilePreviewRows(previewRows);
+    const slotCount = Number(profile?.slot_count) || countProfilePreviewSlots(rows);
+    const driveScale = inferProfilePreviewDriveScale(profile, slotCount);
+    return {
+      faceStyle: profile?.face_style || "generic",
+      latchEdge: profile?.latch_edge || "bottom",
+      baySize: profile?.bay_size || null,
+      rowGroups: normalizeProfilePreviewRowGroups(profile),
+      rows,
+      columnCount: Math.max(1, Number(columnCount) || 1),
+      slotCount,
+      driveScale,
+      layoutMode: inferProfilePreviewLayoutMode(profile, rows, slotCount, driveScale),
+    };
+  }
+
+  function applyProfilePreviewGeometry(grid, geometry) {
+    if (!grid) {
+      return;
+    }
+    grid.classList.add("is-row-renderer");
+    grid.dataset.faceStyle = geometry.faceStyle;
+    grid.dataset.latchEdge = geometry.latchEdge;
+    grid.dataset.driveScale = geometry.driveScale;
+    grid.dataset.layoutMode = geometry.layoutMode;
+    grid.dataset.layoutRows = String(geometry.rows.length || 0);
+  }
+
+  function clearProfilePreviewGeometry(grid) {
+    if (!grid) {
+      return;
+    }
+    grid.classList.remove("is-row-renderer");
+    delete grid.dataset.faceStyle;
+    delete grid.dataset.latchEdge;
+    delete grid.dataset.driveScale;
+    delete grid.dataset.layoutMode;
+    delete grid.dataset.layoutRows;
+  }
+
+  function splitProfilePreviewRowIntoGroups(row, geometry) {
+    const groups = Array.isArray(geometry?.rowGroups) ? geometry.rowGroups : [];
+    if (!groups.length) {
+      return [row];
+    }
+    const totalColumns = groups.reduce((sum, value) => sum + value, 0);
+    if (totalColumns !== row.length) {
+      return [row];
+    }
+    const groupedRows = [];
+    let offset = 0;
+    groups.forEach((groupSize) => {
+      groupedRows.push(row.slice(offset, offset + groupSize));
+      offset += groupSize;
+    });
+    return groupedRows.filter((group) => group.length > 0);
+  }
+
+  function profilePreviewBreakpoints(rowGroups) {
+    if (!Array.isArray(rowGroups) || rowGroups.length <= 1) {
+      return [];
+    }
+    const breakpoints = [];
+    let offset = 0;
+    rowGroups.forEach((group, index) => {
+      offset += group.length;
+      if (index < rowGroups.length - 1) {
+        breakpoints.push(offset);
+      }
+    });
+    return breakpoints;
+  }
+
+  function profilePreviewFlatGroupedTemplate(slotCount, breakpoints) {
+    const columns = [];
+    for (let index = 0; index < slotCount; index += 1) {
+      columns.push("minmax(0, 1fr)");
+      if (breakpoints.includes(index + 1)) {
+        columns.push("8px");
+      }
+    }
+    return columns.join(" ");
+  }
+
+  function defaultProfilePreviewCell(slotValue) {
+    if (slotValue === null || slotValue === undefined) {
+      return '<div class="profile-preview-cell is-gap">Gap</div>';
+    }
+    return `<div class="profile-preview-cell">${escapeHtml(String(slotValue).padStart(2, "0"))}</div>`;
+  }
+
+  function renderProfilePreviewCells(previewRows, columnCount, { profile = null, cellRenderer = defaultProfilePreviewCell } = {}) {
+    const geometry = buildProfilePreviewGeometry(profile, previewRows, columnCount);
+    return geometry.rows
+      .map((row) => {
+        const paddedRow = row.slice();
+        while (paddedRow.length < geometry.columnCount) {
           paddedRow.push(null);
         }
-        return paddedRow;
-      })
-      .map((slotValue) => {
-        if (slotValue === null || slotValue === undefined) {
-          return '<div class="profile-preview-cell is-gap">Gap</div>';
-        }
-        return `<div class="profile-preview-cell">${escapeHtml(String(slotValue).padStart(2, "0"))}</div>`;
+        const rowGroups = splitProfilePreviewRowIntoGroups(paddedRow, geometry);
+        const isFlatTopLoaderGrouping = String(geometry.layoutMode || "").startsWith("top-loader") && rowGroups.length > 1;
+        const breakpoints = profilePreviewBreakpoints(rowGroups);
+        const rowMarkup = paddedRow
+          .map((slotValue, index) => {
+            const divider = isFlatTopLoaderGrouping && breakpoints.includes(index + 1)
+              ? '<span class="profile-preview-divider" aria-hidden="true"></span>'
+              : "";
+            return `${cellRenderer(slotValue)}${divider}`;
+          })
+          .join("");
+        const template = isFlatTopLoaderGrouping
+          ? profilePreviewFlatGroupedTemplate(paddedRow.length, breakpoints)
+          : `repeat(${geometry.columnCount}, minmax(0, 1fr))`;
+        return `<div class="profile-preview-row${isFlatTopLoaderGrouping ? " is-flat-grouped" : ""}" style="grid-template-columns: ${template}">${rowMarkup}</div>`;
       })
       .join("");
   }
@@ -1749,6 +1912,7 @@
       elements.profileBuilderPreviewSummary.textContent = "Load a source profile above to preview the custom geometry that will be saved.";
       elements.profileBuilderPreviewGrid.innerHTML = "";
       elements.profileBuilderPreviewMeta.innerHTML = "";
+      clearProfilePreviewGeometry(elements.profileBuilderPreviewGrid);
       elements.profileBuilderDeleteButton.disabled = true;
       elements.profileBuilderOrdering.dataset.previousValue = "source-layout";
       elements.profileBuilderLayoutEditor.classList.add("hidden");
@@ -1763,8 +1927,12 @@
     elements.profileBuilderBadge.textContent = state.loadedBuilderProfileId ? "Editing Custom" : "Clone To Custom";
     elements.profileBuilderPreviewBadge.textContent = layoutResolution.badge;
     elements.profileBuilderPreviewSummary.textContent = layoutResolution.summary;
-    elements.profileBuilderPreviewGrid.style.gridTemplateColumns = `repeat(${columnCount}, minmax(0, 1fr))`;
-    elements.profileBuilderPreviewGrid.innerHTML = renderProfilePreviewCells(previewRows, columnCount);
+    elements.profileBuilderPreviewGrid.style.gridTemplateColumns = "";
+    applyProfilePreviewGeometry(
+      elements.profileBuilderPreviewGrid,
+      buildProfilePreviewGeometry(draft, previewRows, columnCount)
+    );
+    elements.profileBuilderPreviewGrid.innerHTML = renderProfilePreviewCells(previewRows, columnCount, { profile: draft });
     elements.profileBuilderOrdering.dataset.previousValue = draft.ordering_preset;
     elements.profileBuilderLayoutEditor.classList.toggle("hidden", draft.ordering_preset !== "custom-layout");
     const chips = [
@@ -1799,6 +1967,7 @@
       elements.profilePreviewSummary.textContent = "No enclosure profiles are loaded right now.";
       elements.profilePreviewGrid.innerHTML = "";
       elements.profilePreviewMeta.innerHTML = "";
+      clearProfilePreviewGeometry(elements.profilePreviewGrid);
       return;
     }
 
@@ -1810,8 +1979,12 @@
     elements.profilePreviewBadge.textContent = elements.setupProfile?.value ? "Pinned Profile" : "Auto Preview";
     elements.profilePreviewSummary.textContent = profile.summary
       || "Profile preview for the currently selected enclosure layout.";
-    elements.profilePreviewGrid.style.gridTemplateColumns = `repeat(${columnCount}, minmax(0, 1fr))`;
-    elements.profilePreviewGrid.innerHTML = renderProfilePreviewCells(previewRows, columnCount);
+    elements.profilePreviewGrid.style.gridTemplateColumns = "";
+    applyProfilePreviewGeometry(
+      elements.profilePreviewGrid,
+      buildProfilePreviewGeometry(profile, previewRows, columnCount)
+    );
+    elements.profilePreviewGrid.innerHTML = renderProfilePreviewCells(previewRows, columnCount, { profile });
     const slotCount = Number(profile.slot_count) || previewRows.flat().filter((value) => Number.isInteger(value)).length;
     const chips = [
       `${profile.rows} rows`,
@@ -2640,6 +2813,7 @@
       elements.setupStorageViewPreviewSummary.textContent = "Add a storage view to see its template preview here.";
       elements.setupStorageViewPreviewGrid.innerHTML = "";
       elements.setupStorageViewPreviewMeta.innerHTML = "";
+      clearProfilePreviewGeometry(elements.setupStorageViewPreviewGrid);
       return;
     }
 
@@ -2647,6 +2821,7 @@
     const selectedProfile = storageViewProfile(storageView);
     const previewRows = buildStorageViewRows(storageView);
     const columnCount = Math.max(1, ...previewRows.map((row) => (Array.isArray(row) ? row.length : 0)));
+    const usesProfileGeometry = storageView.kind === "ses_enclosure" && Boolean(selectedProfile);
     elements.setupStorageViewKindBadge.textContent = storageViewKindLabel(storageView);
     elements.setupStorageViewPreviewSummary.textContent =
       storageView.kind === "ses_enclosure" && selectedProfile
@@ -2654,19 +2829,37 @@
           ? `Using the saved chassis layout ${selectedProfile.label} as the preview shape for this saved chassis view.`
           : `Using the current live profile ${selectedProfile.label} as the preview shape until this saved chassis view pins its own layout.`)
         : template?.summary || "Storage view preview for the selected template.";
-    elements.setupStorageViewPreviewGrid.style.gridTemplateColumns = `repeat(${columnCount}, minmax(0, 1fr))`;
     elements.setupStorageViewPreviewGrid.classList.toggle("is-nvme-carrier", storageView.kind === "nvme_carrier");
     elements.setupStorageViewPreviewGrid.classList.toggle("is-boot-device", storageView.kind === "boot_devices");
     elements.setupStorageViewPreviewGrid.classList.toggle("is-satadom", isSatadomBootTemplate(storageView));
-    elements.setupStorageViewPreviewGrid.innerHTML = previewRows
-      .flat()
-      .map((slotValue) => {
-        if (slotValue === null || slotValue === undefined) {
-          return '<div class="profile-preview-cell is-gap">Gap</div>';
-        }
-        return buildStorageViewPreviewCell(storageView, slotValue);
-      })
-      .join("");
+    if (usesProfileGeometry) {
+      elements.setupStorageViewPreviewGrid.style.gridTemplateColumns = "";
+      applyProfilePreviewGeometry(
+        elements.setupStorageViewPreviewGrid,
+        buildProfilePreviewGeometry(selectedProfile, previewRows, columnCount)
+      );
+      elements.setupStorageViewPreviewGrid.innerHTML = renderProfilePreviewCells(previewRows, columnCount, {
+        profile: selectedProfile,
+        cellRenderer: (slotValue) => {
+          if (slotValue === null || slotValue === undefined) {
+            return defaultProfilePreviewCell(slotValue);
+          }
+          return buildStorageViewPreviewCell(storageView, slotValue);
+        },
+      });
+    } else {
+      clearProfilePreviewGeometry(elements.setupStorageViewPreviewGrid);
+      elements.setupStorageViewPreviewGrid.style.gridTemplateColumns = `repeat(${columnCount}, minmax(0, 1fr))`;
+      elements.setupStorageViewPreviewGrid.innerHTML = previewRows
+        .flat()
+        .map((slotValue) => {
+          if (slotValue === null || slotValue === undefined) {
+            return '<div class="profile-preview-cell is-gap">Gap</div>';
+          }
+          return buildStorageViewPreviewCell(storageView, slotValue);
+        })
+        .join("");
+    }
     elements.setupStorageViewPreviewMeta.innerHTML = collectStorageViewMeta(storageView)
       .map((item) => `<span class="meta-chip">${escapeHtml(item)}</span>`)
       .join("");

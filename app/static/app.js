@@ -319,6 +319,7 @@
         latch_edge: selectedStorageView.latch_edge || "bottom",
         bay_size: selectedStorageView.bay_size || null,
         row_groups: Array.isArray(selectedStorageView.row_groups) ? selectedStorageView.row_groups : [],
+        slot_layout: Array.isArray(selectedStorageView.slot_layout) ? selectedStorageView.slot_layout : [],
       };
     }
     return state.snapshot.selected_profile || null;
@@ -761,8 +762,6 @@
     const slotsByIndex = new Map((selectedView?.slots || []).map((slot) => [Number(slot.slot_index), slot]));
     const peerContext = getSelectedPeerContext();
     const profile = buildViewProfile();
-    const driveScale = inferDominantDriveScale(profile);
-    const layoutMode = inferChassisLayoutMode(profile, driveScale);
 
     if (selectedView.kind === "nvme_carrier") {
       const boardLayout = nvmeCarrierBoardLayout(selectedView);
@@ -821,120 +820,86 @@
       return;
     }
 
-    slotLayout.forEach((row) => {
-      const rowWrapper = document.createElement("div");
-      rowWrapper.className = "slot-row";
-      const rowSlots = document.createElement("div");
-      rowSlots.className = "row-slots";
-      rowSlots.dataset.slotCount = String(row.length);
-      const rowGroups = splitRowIntoGroups(row);
-      const isFlatTopLoaderGrouping = String(layoutMode || "").startsWith("top-loader") && rowGroups.length > 1;
-      const flatGroupBreakpoints = rowGroupBreakpoints(rowGroups);
-
-      const appendTile = (container, slotValue) => {
-        if (!Number.isInteger(slotValue)) {
-          const gapTile = document.createElement("div");
-          gapTile.className = "slot-gap";
-          gapTile.setAttribute("aria-hidden", "true");
-          container.appendChild(gapTile);
-          return;
+    const geometry = buildChassisGeometry(profile, slotLayout);
+    const appendTile = (container, slotValue, tileIndex = null, breakpoints = []) => {
+      if (!Number.isInteger(slotValue)) {
+        const gapTile = document.createElement("div");
+        gapTile.className = "slot-gap";
+        if (tileIndex !== null && breakpoints.includes(tileIndex + 1)) {
+          gapTile.classList.add("group-divider-after");
         }
-
-        const slot = slotsByIndex.get(Number(slotValue)) || {
-          slot_index: Number(slotValue),
-          slot_label: `Slot ${Number(slotValue) + 1}`,
-          occupied: false,
-          state: "empty",
-          slot_size: null,
-        };
-        const visualState = slot.state === "matched" ? "healthy" : slot.state;
-        const liveSlot = getLiveBackedStorageViewSlot(selectedView, slot);
-        const tile = document.createElement("button");
-        tile.type = "button";
-        tile.className = liveSlot
-          ? `slot-tile state-${liveSlot.state || "unknown"}`
-          : `slot-tile state-${visualState} storage-view-slot`;
-        if (selectedView.kind === "nvme_carrier") {
-          tile.classList.add("storage-view-slot-nvme");
-        }
-        if (selectedView.kind === "boot_devices") {
-          tile.classList.add("storage-view-slot-boot");
-        }
-        if (liveSlot ? !passesFilter(liveSlot) : !storageViewRuntimeMatchesFilter(slot)) {
-          tile.classList.add("filtered-out");
-        }
-        if (state.selectedSlot === slot.slot_index) {
-          tile.classList.add("selected");
-        } else if (liveSlot && peerContext.active && peerContext.peerSlots.has(slot.slot_index)) {
-          tile.classList.add("peer-highlight");
-        } else if (liveSlot && peerContext.active) {
-          tile.classList.add("peer-dimmed");
-        }
-        tile.dataset.slot = String(slot.slot_index);
-        if (slot.slot_size) {
-          tile.dataset.slotSize = String(slot.slot_size);
-        } else {
-          delete tile.dataset.slotSize;
-        }
-        tile.setAttribute(
-          "aria-label",
-          liveSlot
-            ? slotTooltip(liveSlot, getStorageViewSmartSummaryEntry(selectedView, slot) || getSmartSummaryEntry(liveSlot))
-            : buildStorageViewRuntimeTooltip(slot, selectedView)
-        );
-        tile.innerHTML =
-          selectedView.kind === "nvme_carrier"
-            ? buildNvmeRuntimeTileMarkup(slot, selectedView)
-            : selectedView.kind === "boot_devices"
-              ? (isSatadomBootTemplate(selectedView)
-                ? buildSatadomRuntimeTileMarkup(slot, selectedView)
-                : buildEmbeddedBootMediaRuntimeTileMarkup(slot))
-            : liveSlot
-              ? buildLiveSlotTileMarkup(liveSlot)
-            : `
-              <span class="slot-status-led" aria-hidden="true"></span>
-              <span class="slot-number">${escapeHtml(slot.slot_label)}</span>
-              <span class="slot-device">${escapeHtml(storageViewRuntimeShortLabel(slot))}</span>
-              <span class="slot-pool">${escapeHtml(storageViewRuntimeSecondaryLabel(slot) || storageViewRuntimeTertiaryLabel(slot) || stateLabel(slot))}</span>
-              <span class="slot-tertiary">${escapeHtml(storageViewRuntimeTertiaryLabel(slot))}</span>
-              <span class="slot-latch" aria-hidden="true"></span>
-            `;
-        bindStorageViewTileInteractions(tile, slot, selectedView);
-        container.appendChild(tile);
-      };
-
-      if (isFlatTopLoaderGrouping) {
-        rowSlots.classList.add("row-slots-flat-grouped");
-        row.forEach((slotValue, tileIndex) => {
-          appendTile(rowSlots, slotValue);
-          if (flatGroupBreakpoints.includes(tileIndex + 1)) {
-            const divider = document.createElement("span");
-            divider.className = "row-metal-divider";
-            divider.setAttribute("aria-hidden", "true");
-            rowSlots.appendChild(divider);
-          }
-        });
-      } else {
-        rowGroups.forEach((group) => {
-          const rowGroup = document.createElement("div");
-          rowGroup.className = "row-group";
-          rowGroup.dataset.slotCount = String(group.length);
-          rowGroup.style.setProperty("--group-columns", String(group.length));
-
-          group.forEach((slotValue) => {
-            appendTile(rowGroup, slotValue);
-          });
-
-          rowSlots.appendChild(rowGroup);
-        });
+        gapTile.setAttribute("aria-hidden", "true");
+        container.appendChild(gapTile);
+        return;
       }
 
-      rowWrapper.appendChild(rowSlots);
-      grid.appendChild(rowWrapper);
-      rowSlots.style.gridTemplateColumns = isFlatTopLoaderGrouping
-        ? flatGroupedColumnTemplate(row.length, flatGroupBreakpoints)
-        : groupColumnTemplate(rowGroups, layoutMode);
-    });
+      const slot = slotsByIndex.get(Number(slotValue)) || {
+        slot_index: Number(slotValue),
+        slot_label: `Slot ${Number(slotValue) + 1}`,
+        occupied: false,
+        state: "empty",
+        slot_size: null,
+      };
+      const visualState = slot.state === "matched" ? "healthy" : slot.state;
+      const liveSlot = getLiveBackedStorageViewSlot(selectedView, slot);
+      const tile = document.createElement("button");
+      tile.type = "button";
+      tile.className = liveSlot
+        ? `slot-tile state-${liveSlot.state || "unknown"}`
+        : `slot-tile state-${visualState} storage-view-slot`;
+      if (selectedView.kind === "nvme_carrier") {
+        tile.classList.add("storage-view-slot-nvme");
+      }
+      if (selectedView.kind === "boot_devices") {
+        tile.classList.add("storage-view-slot-boot");
+      }
+      if (liveSlot ? !passesFilter(liveSlot) : !storageViewRuntimeMatchesFilter(slot)) {
+        tile.classList.add("filtered-out");
+      }
+      if (state.selectedSlot === slot.slot_index) {
+        tile.classList.add("selected");
+      } else if (liveSlot && peerContext.active && peerContext.peerSlots.has(slot.slot_index)) {
+        tile.classList.add("peer-highlight");
+      } else if (liveSlot && peerContext.active) {
+        tile.classList.add("peer-dimmed");
+      }
+      if (tileIndex !== null && breakpoints.includes(tileIndex + 1)) {
+        tile.classList.add("group-divider-after");
+      }
+      tile.dataset.slot = String(slot.slot_index);
+      if (slot.slot_size) {
+        tile.dataset.slotSize = String(slot.slot_size);
+      } else {
+        delete tile.dataset.slotSize;
+      }
+      tile.setAttribute(
+        "aria-label",
+        liveSlot
+          ? slotTooltip(liveSlot, getStorageViewSmartSummaryEntry(selectedView, slot) || getSmartSummaryEntry(liveSlot))
+          : buildStorageViewRuntimeTooltip(slot, selectedView)
+      );
+      tile.innerHTML =
+        selectedView.kind === "nvme_carrier"
+          ? buildNvmeRuntimeTileMarkup(slot, selectedView)
+          : selectedView.kind === "boot_devices"
+            ? (isSatadomBootTemplate(selectedView)
+              ? buildSatadomRuntimeTileMarkup(slot, selectedView)
+              : buildEmbeddedBootMediaRuntimeTileMarkup(slot))
+          : liveSlot
+            ? buildLiveSlotTileMarkup(liveSlot)
+          : `
+            <span class="slot-status-led" aria-hidden="true"></span>
+            <span class="slot-number">${escapeHtml(slot.slot_label)}</span>
+            <span class="slot-device">${escapeHtml(storageViewRuntimeShortLabel(slot))}</span>
+            <span class="slot-pool">${escapeHtml(storageViewRuntimeSecondaryLabel(slot) || storageViewRuntimeTertiaryLabel(slot) || stateLabel(slot))}</span>
+            <span class="slot-tertiary">${escapeHtml(storageViewRuntimeTertiaryLabel(slot))}</span>
+            <span class="slot-latch" aria-hidden="true"></span>
+          `;
+      bindStorageViewTileInteractions(tile, slot, selectedView);
+      container.appendChild(tile);
+    };
+
+    renderChassisRows(slotLayout, geometry, appendTile);
   }
 
   function renderLiveNvmeCarrierGrid(selectedProfile) {
@@ -1186,6 +1151,8 @@
               ? `Saved chassis view layered on top of the live enclosure ${selectedStorageView.backing_enclosure_label}.`
               : "Runtime storage-view map for the selected saved hardware view.";
       return {
+        profileId: profile?.id || selectedStorageView.profile_id || null,
+        profileLabel: profile?.label || selectedStorageView.profile_label || null,
         eyebrow:
           selectedStorageView.kind === "ses_enclosure"
             ? (profile?.eyebrow || `${systemLabel} / ${storageViewKindLabel(selectedStorageView)}`)
@@ -1217,9 +1184,14 @@
             ? (profile?.latch_edge || "bottom")
             : "bottom",
         baySize: selectedStorageView.kind === "ses_enclosure" ? (profile?.bay_size || null) : "2.5",
+        rowGroups: Array.isArray(profile?.row_groups) ? profile.row_groups : [],
+        slotLayout: Array.isArray(selectedStorageView.slot_layout) ? selectedStorageView.slot_layout : [],
+        slotCount: Number(selectedStorageView.slot_count) || countLayoutSlots(selectedStorageView.slot_layout || []),
       };
     }
     return {
+      profileId: profile?.id || null,
+      profileLabel: profile?.label || null,
       eyebrow: profile?.eyebrow || systemLabel,
       summary: profile?.summary || "Drive-bay map with API-or-SSH enrichment for the selected enclosure.",
       enclosureTitle: profile?.panel_title || enclosureLabel,
@@ -1227,6 +1199,9 @@
       faceStyle: profile?.face_style || "generic",
       latchEdge: profile?.latch_edge || "bottom",
       baySize: profile?.bay_size || null,
+      rowGroups: Array.isArray(profile?.row_groups) ? profile.row_groups : [],
+      slotLayout: Array.isArray(profile?.slot_layout) ? profile.slot_layout : [],
+      slotCount: Number(state.snapshot.layout_slot_count) || countLayoutSlots(activeLayoutRows()),
     };
   }
 
@@ -1249,23 +1224,37 @@
 
   function countLayoutSlots(rows) {
     return (rows || []).reduce(
-      (total, row) => total + row.filter((slotNumber) => Number.isInteger(slotNumber)).length,
+      (total, row) => total + (Array.isArray(row) ? row.filter((slotNumber) => Number.isInteger(slotNumber)).length : 0),
       0
     );
   }
 
-  function inferDominantDriveScale(profile) {
-    if (profile.baySize === "3.5" || profile.baySize === "2.5") {
-      return profile.baySize;
+  function normalizeLayoutRows(rows) {
+    return Array.isArray(rows) ? rows.filter((row) => Array.isArray(row)) : [];
+  }
+
+  function normalizeGeometryRowGroups(profile) {
+    const rawGroups = Array.isArray(profile?.rowGroups)
+      ? profile.rowGroups
+      : (Array.isArray(profile?.row_groups) ? profile.row_groups : []);
+    return rawGroups
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0);
+  }
+
+  function inferDominantDriveScale(profile, slotCount = currentLayoutSlotCount()) {
+    profile = profile || {};
+    const baySize = profile.baySize || profile.bay_size || null;
+    const faceStyle = profile.faceStyle || profile.face_style || "generic";
+    if (baySize === "3.5" || baySize === "2.5") {
+      return baySize;
     }
 
-    const slotCount = currentLayoutSlotCount();
-
-    if (profile.faceStyle === "unifi-drive") {
+    if (faceStyle === "unifi-drive") {
       return "3.5";
     }
 
-    if (profile.faceStyle === "top-loader") {
+    if (faceStyle === "top-loader") {
       return "3.5";
     }
 
@@ -1286,26 +1275,27 @@
       return counts["3.5"] >= counts["2.5"] ? "3.5" : "2.5";
     }
 
-    if (profile.faceStyle === "front-drive" || profile.faceStyle === "rear-drive") {
+    if (faceStyle === "front-drive" || faceStyle === "rear-drive") {
       return "3.5";
     }
 
     return "default";
   }
 
-  function inferChassisLayoutMode(profile, driveScale) {
-    const rowCount = activeLayoutRows().length || 0;
-    const slotCount = currentLayoutSlotCount();
+  function inferChassisLayoutMode(profile, driveScale, layoutRows = activeLayoutRows(), slotCount = currentLayoutSlotCount()) {
+    profile = profile || {};
+    const faceStyle = profile.faceStyle || profile.face_style || "generic";
+    const rowCount = normalizeLayoutRows(layoutRows).length || 0;
 
-    if (profile.faceStyle === "nvme-carrier") {
+    if (faceStyle === "nvme-carrier") {
       return "nvme-carrier";
     }
 
-    if (profile.faceStyle === "boot-devices") {
+    if (faceStyle === "boot-devices") {
       return "boot-devices";
     }
 
-    if (profile.faceStyle === "unifi-drive") {
+    if (faceStyle === "unifi-drive") {
       return rowCount > 1 ? "unifi-2row" : "unifi-1row";
     }
 
@@ -1313,11 +1303,11 @@
       return "compact";
     }
 
-    if (profile.faceStyle === "top-loader") {
+    if (faceStyle === "top-loader") {
       return driveScale === "2.5" ? "top-loader-2.5" : "top-loader-3.5";
     }
 
-    if (profile.faceStyle === "front-drive" || profile.faceStyle === "rear-drive") {
+    if (faceStyle === "front-drive" || faceStyle === "rear-drive") {
       if (slotCount >= 20) {
         return driveScale === "2.5" ? "dense-2.5" : "dense-3.5";
       }
@@ -1329,19 +1319,47 @@
     return driveScale === "2.5" ? "compact" : "standard-3.5";
   }
 
+  function buildChassisGeometry(profile, layoutRows = activeLayoutRows()) {
+    const normalizedLayoutRows = normalizeLayoutRows(layoutRows);
+    const slotCount = Number(profile?.slotCount) || countLayoutSlots(normalizedLayoutRows);
+    const normalizedProfile = {
+      ...(profile || {}),
+      faceStyle: profile?.faceStyle || profile?.face_style || "generic",
+      latchEdge: profile?.latchEdge || profile?.latch_edge || "bottom",
+      baySize: profile?.baySize || profile?.bay_size || null,
+    };
+    const rowGroups = normalizeGeometryRowGroups(normalizedProfile);
+    const driveScale = inferDominantDriveScale(normalizedProfile, slotCount);
+    const layoutMode = inferChassisLayoutMode(normalizedProfile, driveScale, normalizedLayoutRows, slotCount);
+    return {
+      profileId: profile?.profileId || profile?.id || null,
+      profileLabel: profile?.profileLabel || profile?.label || null,
+      faceStyle: normalizedProfile.faceStyle,
+      latchEdge: normalizedProfile.latchEdge,
+      baySize: normalizedProfile.baySize,
+      rowGroups,
+      layoutRows: normalizedLayoutRows,
+      slotCount,
+      driveScale,
+      layoutMode,
+    };
+  }
+
   function applyChassisDriveScale(profile) {
     if (!chassisShell) {
       return;
     }
-    const scale = inferDominantDriveScale(profile);
-    const layoutMode = inferChassisLayoutMode(profile, scale);
-    chassisShell.dataset.driveScale = scale;
-    chassisShell.dataset.layoutMode = layoutMode;
-    chassisShell.dataset.layoutRows = String(activeLayoutRows().length || 0);
+    const geometry = buildChassisGeometry(profile);
+    chassisShell.dataset.driveScale = geometry.driveScale;
+    chassisShell.dataset.layoutMode = geometry.layoutMode;
+    chassisShell.dataset.layoutRows = String(geometry.layoutRows.length || 0);
   }
 
-  function splitRowIntoGroups(row) {
-    const groups = Array.isArray(getSelectedProfile()?.row_groups) ? getSelectedProfile().row_groups : [];
+  function splitRowIntoGroups(row, geometry = null) {
+    const selectedProfile = getSelectedProfile();
+    const groups = Array.isArray(geometry?.rowGroups)
+      ? geometry.rowGroups
+      : (Array.isArray(selectedProfile?.row_groups) ? selectedProfile.row_groups : []);
     if (!groups.length) {
       return [row];
     }
@@ -1414,6 +1432,53 @@
         return `calc((100% - ${totalGapPixels}px) * ${slotShareText} + ${internalGapPixels}px)`;
       })
       .join(" ");
+  }
+
+  function renderChassisRows(layoutRows, geometry, appendTile) {
+    normalizeLayoutRows(layoutRows).forEach((row) => {
+      const rowWrapper = document.createElement("div");
+      rowWrapper.className = "slot-row";
+
+      const rowSlots = document.createElement("div");
+      rowSlots.className = "row-slots";
+      rowSlots.dataset.slotCount = String(row.length);
+
+      const rowGroups = splitRowIntoGroups(row, geometry);
+      const isFlatTopLoaderGrouping = String(geometry?.layoutMode || "").startsWith("top-loader") && rowGroups.length > 1;
+      const flatGroupBreakpoints = rowGroupBreakpoints(rowGroups);
+
+      if (isFlatTopLoaderGrouping) {
+        rowSlots.classList.add("row-slots-flat-grouped");
+        row.forEach((slotValue, tileIndex) => {
+          appendTile(rowSlots, slotValue, tileIndex, flatGroupBreakpoints);
+          if (flatGroupBreakpoints.includes(tileIndex + 1)) {
+            const divider = document.createElement("span");
+            divider.className = "row-metal-divider";
+            divider.setAttribute("aria-hidden", "true");
+            rowSlots.appendChild(divider);
+          }
+        });
+      } else {
+        rowGroups.forEach((group) => {
+          const rowGroup = document.createElement("div");
+          rowGroup.className = "row-group";
+          rowGroup.dataset.slotCount = String(group.length);
+          rowGroup.style.setProperty("--group-columns", String(group.length));
+
+          group.forEach((slotValue) => {
+            appendTile(rowGroup, slotValue);
+          });
+
+          rowSlots.appendChild(rowGroup);
+        });
+      }
+
+      rowWrapper.appendChild(rowSlots);
+      grid.appendChild(rowWrapper);
+      rowSlots.style.gridTemplateColumns = isFlatTopLoaderGrouping
+        ? flatGroupedColumnTemplate(row.length, flatGroupBreakpoints)
+        : groupColumnTemplate(rowGroups, geometry?.layoutMode || "");
+    });
   }
 
   function buildSelectionParams({ includeStorageView = false } = {}) {
@@ -3798,128 +3863,84 @@
     grid.innerHTML = "";
     const slotsByNumber = new Map(state.snapshot.slots.map((slot) => [slot.slot, slot]));
     const peerContext = getSelectedPeerContext();
-
-    activeLayoutRows().forEach((row) => {
-      const rowWrapper = document.createElement("div");
-      rowWrapper.className = "slot-row";
-
-      const rowSlots = document.createElement("div");
-      rowSlots.className = "row-slots";
-      rowSlots.dataset.slotCount = String(row.length);
-      const rowGroups = splitRowIntoGroups(row);
-      const profile = buildViewProfile();
-      const driveScale = inferDominantDriveScale(profile);
-      const layoutMode = inferChassisLayoutMode(profile, driveScale);
-      const isFlatTopLoaderGrouping = String(layoutMode || "").startsWith("top-loader") && rowGroups.length > 1;
-      const flatGroupBreakpoints = rowGroupBreakpoints(rowGroups);
-
-      const appendTile = (container, slotNumber, tileIndex = null, breakpoints = []) => {
-        if (!Number.isInteger(slotNumber)) {
-          const gapTile = document.createElement("div");
-          gapTile.className = "slot-gap";
-          if (tileIndex !== null && breakpoints.includes(tileIndex + 1)) {
-            gapTile.classList.add("group-divider-after");
-          }
-          gapTile.setAttribute("aria-hidden", "true");
-          container.appendChild(gapTile);
+    const layoutRows = activeLayoutRows();
+    const geometry = buildChassisGeometry(buildViewProfile(), layoutRows);
+    const appendTile = (container, slotNumber, tileIndex = null, breakpoints = []) => {
+      if (!Number.isInteger(slotNumber)) {
+        const gapTile = document.createElement("div");
+        gapTile.className = "slot-gap";
+        if (tileIndex !== null && breakpoints.includes(tileIndex + 1)) {
+          gapTile.classList.add("group-divider-after");
+        }
+        gapTile.setAttribute("aria-hidden", "true");
+        container.appendChild(gapTile);
+        return;
+      }
+      const slot = slotsByNumber.get(slotNumber) || {
+        slot: slotNumber,
+        slot_label: formatSlotLabel(slotNumber),
+        state: "unknown",
+      };
+      const tile = document.createElement("button");
+      tile.type = "button";
+      tile.className = `slot-tile state-${slot.state}`;
+      if (!passesFilter(slot)) {
+        tile.classList.add("filtered-out");
+      }
+      if (state.selectedSlot === slot.slot) {
+        tile.classList.add("selected");
+      } else if (peerContext.active && peerContext.peerSlots.has(slot.slot)) {
+        tile.classList.add("peer-highlight");
+      } else if (peerContext.active) {
+        tile.classList.add("peer-dimmed");
+      }
+      if (tileIndex !== null && breakpoints.includes(tileIndex + 1)) {
+        tile.classList.add("group-divider-after");
+      }
+      tile.dataset.slot = String(slot.slot);
+      tile.setAttribute("aria-label", slotTooltip(slot, getSmartSummaryEntry(slot)));
+      tile.innerHTML = buildLiveSlotTileMarkup(slot);
+      tile.addEventListener("mouseenter", (event) => {
+        state.hoveredSlot = slot.slot;
+        refreshHoveredTooltip(tile);
+        positionSlotTooltip(event.clientX, event.clientY);
+        void ensureSmartSummary(slot);
+      });
+      tile.addEventListener("mousemove", (event) => {
+        if (state.hoveredSlot === slot.slot) {
+          positionSlotTooltip(event.clientX, event.clientY);
+        }
+      });
+      tile.addEventListener("mouseleave", () => {
+        if (state.hoveredSlot === slot.slot) {
+          state.hoveredSlot = null;
+        }
+        hideSlotTooltip();
+      });
+      tile.addEventListener("focus", () => {
+        state.hoveredSlot = slot.slot;
+        refreshHoveredTooltip(tile);
+        positionSlotTooltipFromElement(tile);
+        void ensureSmartSummary(slot);
+      });
+      tile.addEventListener("blur", () => {
+        if (state.hoveredSlot === slot.slot) {
+          state.hoveredSlot = null;
+        }
+        hideSlotTooltip();
+      });
+      tile.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (state.selectedSlot === slot.slot) {
+          clearSelectedSlot();
           return;
         }
-        const slot = slotsByNumber.get(slotNumber) || {
-          slot: slotNumber,
-          slot_label: formatSlotLabel(slotNumber),
-          state: "unknown",
-        };
-        const tile = document.createElement("button");
-        tile.type = "button";
-        tile.className = `slot-tile state-${slot.state}`;
-        if (!passesFilter(slot)) {
-          tile.classList.add("filtered-out");
-        }
-        if (state.selectedSlot === slot.slot) {
-          tile.classList.add("selected");
-        } else if (peerContext.active && peerContext.peerSlots.has(slot.slot)) {
-          tile.classList.add("peer-highlight");
-        } else if (peerContext.active) {
-          tile.classList.add("peer-dimmed");
-        }
-        if (tileIndex !== null && breakpoints.includes(tileIndex + 1)) {
-          tile.classList.add("group-divider-after");
-        }
-        tile.dataset.slot = String(slot.slot);
-        tile.setAttribute("aria-label", slotTooltip(slot, getSmartSummaryEntry(slot)));
-        tile.innerHTML = buildLiveSlotTileMarkup(slot);
-        tile.addEventListener("mouseenter", (event) => {
-          state.hoveredSlot = slot.slot;
-          refreshHoveredTooltip(tile);
-          positionSlotTooltip(event.clientX, event.clientY);
-          void ensureSmartSummary(slot);
-        });
-        tile.addEventListener("mousemove", (event) => {
-          if (state.hoveredSlot === slot.slot) {
-            positionSlotTooltip(event.clientX, event.clientY);
-          }
-        });
-        tile.addEventListener("mouseleave", () => {
-          if (state.hoveredSlot === slot.slot) {
-            state.hoveredSlot = null;
-          }
-          hideSlotTooltip();
-        });
-        tile.addEventListener("focus", () => {
-          state.hoveredSlot = slot.slot;
-          refreshHoveredTooltip(tile);
-          positionSlotTooltipFromElement(tile);
-          void ensureSmartSummary(slot);
-        });
-        tile.addEventListener("blur", () => {
-          if (state.hoveredSlot === slot.slot) {
-            state.hoveredSlot = null;
-          }
-          hideSlotTooltip();
-        });
-        tile.addEventListener("click", (event) => {
-          event.stopPropagation();
-          if (state.selectedSlot === slot.slot) {
-            clearSelectedSlot();
-            return;
-          }
-          selectSlot(slot.slot);
-        });
-        container.appendChild(tile);
-      };
+        selectSlot(slot.slot);
+      });
+      container.appendChild(tile);
+    };
 
-      if (isFlatTopLoaderGrouping) {
-        rowSlots.classList.add("row-slots-flat-grouped");
-        row.forEach((slotNumber, tileIndex) => {
-          appendTile(rowSlots, slotNumber, tileIndex, flatGroupBreakpoints);
-          if (flatGroupBreakpoints.includes(tileIndex + 1)) {
-            const divider = document.createElement("span");
-            divider.className = "row-metal-divider";
-            divider.setAttribute("aria-hidden", "true");
-            rowSlots.appendChild(divider);
-          }
-        });
-      } else {
-        rowGroups.forEach((group) => {
-          const rowGroup = document.createElement("div");
-          rowGroup.className = "row-group";
-          rowGroup.dataset.slotCount = String(group.length);
-          rowGroup.style.setProperty("--group-columns", String(group.length));
-
-          group.forEach((slotNumber) => {
-            appendTile(rowGroup, slotNumber);
-          });
-
-          rowSlots.appendChild(rowGroup);
-        });
-      }
-
-      rowWrapper.appendChild(rowSlots);
-      grid.appendChild(rowWrapper);
-      rowSlots.style.gridTemplateColumns = isFlatTopLoaderGrouping
-        ? flatGroupedColumnTemplate(row.length, flatGroupBreakpoints)
-        : groupColumnTemplate(rowGroups, layoutMode);
-    });
+    renderChassisRows(layoutRows, geometry, appendTile);
   }
 
   function kvRow(label, value, copyable = false) {

@@ -66,19 +66,20 @@ install_metrics(app, service_name="enclosure-history", version=__version__)
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
+async def index(exact_counts: bool = Query(default=False)) -> HTMLResponse:
     status = collector.status()
-    counts = store.counts()
-    scopes = store.list_scopes()
+    counts = store.counts() if exact_counts else store.estimated_counts()
+    scopes = store.list_scopes(include_activity_counts=exact_counts)
     return HTMLResponse(render_dashboard(status, counts, scopes, app_version=__version__, release_status=get_release_status_service().snapshot()))
 
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
+    collector_status = collector.status()
     payload = {
         "status": "ok" if not collector.last_error else "degraded",
-        **collector.status(),
-        **store.counts(),
+        "collector": collector_status,
+        **collector_status,
     }
     return JSONResponse(payload, status_code=200)
 
@@ -95,11 +96,12 @@ async def livez() -> JSONResponse:
 
 
 @app.get("/api/history/overview")
-async def overview() -> dict[str, object]:
+async def overview(exact_counts: bool = Query(default=False)) -> dict[str, object]:
     return {
         "collector": collector.status(),
-        "counts": store.counts(),
-        "scopes": store.list_scopes(),
+        "counts": store.counts() if exact_counts else store.estimated_counts(),
+        "counts_exact": exact_counts,
+        "scopes": store.list_scopes(include_activity_counts=exact_counts),
     }
 
 
@@ -188,12 +190,20 @@ async def scope_slot_history(
 
 def render_dashboard(
     status: dict[str, object],
-    counts: dict[str, int],
+    counts: dict[str, object],
     scopes: list[dict[str, object]],
     *,
     app_version: str,
     release_status: dict[str, object] | None = None,
 ) -> str:
+    counts_are_estimated = bool(counts.get("estimated"))
+
+    def format_count(value: object, *, estimated: bool = False) -> str:
+        if value is None:
+            return "deferred"
+        prefix = "~" if estimated else ""
+        return f"{prefix}{value}"
+
     release_payload = release_status or {}
     release_summary = html.escape(str(release_payload.get("summary") or "Checking releases..."))
     latest_url = str(release_payload.get("latest_url") or "").strip()
@@ -209,8 +219,8 @@ def render_dashboard(
             f"<td>{html.escape(str(scope.get('system_label') or scope.get('system_id') or 'unknown'))}</td>"
             f"<td>{html.escape(str(scope.get('enclosure_label') or scope.get('enclosure_id') or 'default'))}</td>"
             f"<td>{html.escape(str(scope.get('tracked_slots') or 0))}</td>"
-            f"<td>{html.escape(str(scope.get('event_count') or 0))}</td>"
-            f"<td>{html.escape(str(scope.get('metric_sample_count') or 0))}</td>"
+            f"<td>{html.escape(format_count(scope.get('event_count')))}</td>"
+            f"<td>{html.escape(format_count(scope.get('metric_sample_count')))}</td>"
             f"<td>{html.escape(str(scope.get('last_seen_at') or 'never'))}</td>"
             "</tr>"
         )
@@ -334,11 +344,11 @@ def render_dashboard(
         </div>
         <div class="card">
           <div class="label">Slot Events</div>
-          <div class="value">{counts.get('event_count', 0)}</div>
+          <div class="value">{html.escape(format_count(counts.get('event_count', 0), estimated=counts_are_estimated))}</div>
         </div>
         <div class="card">
           <div class="label">Metric Samples</div>
-          <div class="value">{counts.get('metric_sample_count', 0)}</div>
+          <div class="value">{html.escape(format_count(counts.get('metric_sample_count', 0), estimated=counts_are_estimated))}</div>
         </div>
         <div class="card">
           <div class="label">Version</div>

@@ -1299,6 +1299,42 @@ h3 {
   border: 1px solid var(--line);
 }
 
+.profile-preview-grid.is-row-renderer {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+}
+
+.profile-preview-row {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.profile-preview-row.is-flat-grouped {
+  gap: 6px;
+}
+
+.profile-preview-row > .profile-preview-cell {
+  min-width: 0;
+  height: 100%;
+}
+
+.profile-preview-divider {
+  display: block;
+  align-self: stretch;
+  min-height: 36px;
+  border-radius: 4px;
+  border: 1px solid rgba(143, 165, 177, 0.26);
+  background:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.12), transparent 34%, rgba(0, 0, 0, 0.22) 68%),
+    rgba(81, 101, 114, 0.46);
+  box-shadow: inset 1px 0 rgba(255, 255, 255, 0.08), inset -1px 0 rgba(0, 0, 0, 0.42);
+}
+
+.profile-preview-grid[data-layout-mode^="top-loader"] .profile-preview-cell {
+  border-radius: 8px;
+}
+
 .profile-preview-cell {
   min-height: 36px;
   border-radius: 10px;
@@ -1316,6 +1352,18 @@ h3 {
   background: rgba(255, 255, 255, 0.02);
   border-style: dashed;
   color: rgba(162, 184, 207, 0.34);
+}
+
+.builder-preview-card .profile-preview-row {
+  gap: 10px;
+}
+
+.builder-preview-card .profile-preview-row.is-flat-grouped {
+  gap: 8px;
+}
+
+.builder-preview-card .profile-preview-divider {
+  min-height: 52px;
 }
 
 .profile-preview-meta {
