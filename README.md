@@ -66,8 +66,11 @@ there.
 ### Run the published image
 
 ```bash
-cp .env.example .env
-cp config/config.example.yaml config/config.yaml
+mkdir -p /docker-local/truenas-jbod-ui/{config/ssh,data,history/backups/long-term,logs}
+cd /docker-local/truenas-jbod-ui
+curl -fsSL -o compose.yaml https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/docker-compose.yml
+# create .env with your TRUENAS_HOST / TRUENAS_API_KEY first
+docker compose pull
 docker compose up -d
 ```
 
@@ -90,7 +93,11 @@ Open:
 
 ### Build from source
 
+Use this only for development or branch testing.
+
 ```bash
+git clone https://github.com/gcs8/truenas-jbod-ui.git
+cd truenas-jbod-ui
 cp .env.example .env
 cp config/config.example.yaml config/config.yaml
 docker compose -f docker-compose.dev.yml up -d --build

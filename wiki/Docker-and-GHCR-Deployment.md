@@ -35,7 +35,7 @@ Choose the local build path if you are:
 The published image does not remove the need for local config and persistent
 data folders.
 
-Create or keep these paths beside the repo checkout:
+Create or keep these paths beside your Compose file:
 
 ```text
 ./config
@@ -45,8 +45,8 @@ Create or keep these paths beside the repo checkout:
 ./logs
 ```
 
-From the repo root on Linux, this one command creates the full directory tree
-the UI, history sidecar, and admin sidecar expect to find:
+On Linux, this creates the full directory tree the UI, history sidecar, and
+admin sidecar expect to find:
 
 ```bash
 mkdir -p config config/ssh data history/backups/long-term logs
@@ -54,15 +54,18 @@ mkdir -p config config/ssh data history/backups/long-term logs
 
 That is safe to run even if some of the directories already exist.
 
-Copy the usual example files first:
+For a no-clone install, download the release Compose file into that folder:
 
 ```bash
-cp .env.example .env
-cp config/config.example.yaml config/config.yaml
-cp config/profiles.example.yaml config/profiles.yaml
+curl -fsSL \
+  -o compose.yaml \
+  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/docker-compose.yml
 ```
 
-If you do not need custom profiles yet, `config/profiles.yaml` can stay absent.
+Then create `.env` with your appliance connection. For a simple single-system
+install, `.env` can carry the first connection by itself; `config/config.yaml`
+and `config/profiles.yaml` can stay absent until you need saved multi-system
+config, custom profiles, or admin-managed storage views.
 
 ## Compose File
 

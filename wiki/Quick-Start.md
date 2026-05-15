@@ -1,134 +1,188 @@
 # Quick Start
 
-This page is the fastest path to a working app.
+This page is the fastest normal-user path to a working Docker install from the
+published image.
+
+No repo clone is required for the basic path. You only need a Docker host, a
+folder for this app, and a small `.env` file with your appliance connection.
+Repo cloning and local builds are for development or advanced testing.
 
 If you want to see the screens before installing, use
-[[Visual Tour|Visual-Tour]]. If you want to understand the three service
-containers first, use
+[[Visual Tour|Visual-Tour]]. If you want the service map first, use
 [[Architecture and Services|Architecture-and-Services]].
 
-It assumes:
+## What You Need
 
-- you have Docker and Docker Compose
-- you can reach the storage host over the network
-- you already have the right API credential for the target platform
+- Docker with Docker Compose
+- network access from the Docker host to the storage host
+- an API key or API user/password for the target platform
 
-## 1. Clone The Repo
+## 1. Make An App Folder
 
-```bash
-git clone <your-repo-url> truenas-jbod-ui
-cd truenas-jbod-ui
-```
-
-## 2. Make The Runtime Folders
+Use whatever folder you normally keep Compose apps in. The examples below use
+`/docker-local/truenas-jbod-ui`.
 
 ```bash
-mkdir -p config config/ssh data logs
+sudo mkdir -p /docker-local/truenas-jbod-ui
+sudo chown "$USER":"$USER" /docker-local/truenas-jbod-ui
+cd /docker-local/truenas-jbod-ui
+mkdir -p config/ssh data history/backups/long-term logs
 ```
 
-## 3. Copy The Example Files
+## 2. Download The Compose File
 
 ```bash
-cp .env.example .env
-cp config/config.example.yaml config/config.yaml
-cp config/profiles.example.yaml config/profiles.yaml
+curl -fsSL \
+  -o compose.yaml \
+  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/docker-compose.yml
 ```
 
-If you do not need custom profiles yet, `config/profiles.yaml` can stay absent.
+That Compose file runs the public image from:
 
-## 4. Fill In The Basics
+```text
+ghcr.io/gcs8/truenas-jbod-ui
+```
 
-Edit `.env`:
+Public pulls do not require `docker login`.
 
-- `TRUENAS_HOST`
-- `TRUENAS_PLATFORM`
-- `SSH_ENABLED`
-- `SSH_HOST`
+## 3. Create `.env`
 
-Credential note:
+For a simple single-system TrueNAS CORE install:
 
-- TrueNAS CORE/SCALE use `TRUENAS_API_KEY`
-- Quantastor uses `TRUENAS_API_USER` and `TRUENAS_API_PASSWORD`
-
-For a simple single-system CORE setup, the minimum useful values usually look like:
-
-```dotenv
+```bash
+cat > .env <<'EOF'
 APP_PORT=8080
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:latest
+
 TRUENAS_HOST=https://truenas.example.local
 TRUENAS_API_KEY=replace_me
 TRUENAS_PLATFORM=core
 TRUENAS_VERIFY_SSL=false
+
 SSH_ENABLED=false
+EOF
 ```
 
-## 5. Start The App
+Edit the values before starting:
 
-Choose one path:
+- `TRUENAS_HOST` is the appliance URL, without `/api/v2.0`
+- `TRUENAS_API_KEY` is for TrueNAS CORE/SCALE
+- `TRUENAS_PLATFORM` is usually `core` or `scale` for a first install
+- `TRUENAS_VERIFY_SSL=false` is common for a lab box with a self-signed cert
+- `SSH_ENABLED=false` is fine for the first boot; SSH can be added later
 
-- published GHCR image, no local build:
-
-  ```bash
-  docker compose up -d
-  ```
-
-- local source build:
-
-  ```bash
-  docker compose -f docker-compose.dev.yml up -d --build
-  ```
-
-If you want to pin a specific published image tag instead of `latest`, set this
-in `.env` before you start:
+For Quantastor, use API user/password instead of a TrueNAS API key:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.18.0
+TRUENAS_PLATFORM=quantastor
+TRUENAS_API_KEY=
+TRUENAS_API_USER=replace_me
+TRUENAS_API_PASSWORD=replace_me
 ```
 
-If you want the fuller published-image walkthrough, including update commands,
-stable-vs-dev tag guidance, and running all sidecars from GHCR, use:
+## 4. Pull And Start
 
-- [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]]
+```bash
+docker compose pull
+docker compose up -d
+```
 
-## 6. Open It
+Open:
 
 ```text
 http://your-docker-host:8080
 ```
 
-If you are only looking for a public try-before-install demo, that is planned
-but not live yet. The intended shape is a static GitHub Pages site loaded with
-scrubbed sample data, not a hosted backend connected to anyone's storage host:
-
-- [[Public Demo Site|Public-Demo-Site]]
-
-## 7. Check Health
+Check the lightweight health endpoint:
 
 ```bash
 curl http://your-docker-host:8080/livez
 ```
 
-Expected for the lightweight container health path:
+Expected shape:
 
 ```json
 {"status":"ok", ...}
 ```
 
-If you want the cached dependency/readiness view too:
+## Updates
+
+If you use `latest`, updates are the normal Compose flow:
 
 ```bash
-curl http://your-docker-host:8080/healthz
+cd /docker-local/truenas-jbod-ui
+docker compose pull
+docker compose up -d
 ```
 
-## 8. Add SSH Later If You Want Better Data
+If you pin a version, edit `JBOD_UI_IMAGE` in `.env` first:
 
-The app works in API-only mode, but SSH can add:
+```dotenv
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.18.0
+```
+
+Then run:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+## Optional: History Sidecar
+
+The app works without history. Turn this on when you want slot-history charts,
+timeline heat maps, and offline snapshot exports with history samples.
+
+```bash
+docker compose --profile history pull
+docker compose --profile history up -d
+```
+
+The history sidecar listens on `127.0.0.1:8081` by default and stores its
+database under:
+
+```text
+./history/history.db
+```
+
+Use [[History and Snapshot Export|History-and-Snapshot-Export]] for the
+walkthrough.
+
+## Optional: Admin UI
+
+The admin UI is optional. Turn it on when you want guided setup, storage-view
+editing, backups/restores, runtime controls, or the profile builder.
+
+```bash
+docker compose --profile admin pull
+docker compose --profile admin up -d enclosure-admin
+```
+
+Open:
+
+```text
+http://your-docker-host:8082
+```
+
+Use [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for the walkthrough.
+
+## Optional: Run Everything
+
+```bash
+docker compose --profile history --profile admin pull
+docker compose --profile history --profile admin up -d
+```
+
+## Add SSH Later
+
+API-only mode is the easiest first boot. SSH can add:
 
 - better slot correlation
 - richer SMART detail
 - SES or `sg_ses` LED control
 - Linux inventory support
 
-Use these pages when you are ready:
+When you are ready, use the setup page for your platform:
 
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 - [[TrueNAS CORE Setup|TrueNAS-CORE-Setup]]
@@ -136,67 +190,29 @@ Use these pages when you are ready:
 - [[Quantastor Setup|Quantastor-Setup]]
 - [[Generic Linux Setup|Generic-Linux-Setup]]
 
-## 9. Optional: Turn On The Admin UI
+## Advanced: Source Builds
 
-The admin UI is optional, but it is a normal supported runtime service rather
-than a dev-only extra.
-
-If you want the guided setup, runtime control, backup/restore, storage-view
-editing flow, or the dedicated custom-profile builder workspace, start the
-admin sidecar:
+Clone the repo only if you are developing, testing branch changes, or
+intentionally building the image yourself.
 
 ```bash
-docker compose --profile admin up -d enclosure-admin
+git clone https://github.com/gcs8/truenas-jbod-ui.git
+cd truenas-jbod-ui
+cp .env.example .env
+cp config/config.example.yaml config/config.yaml
+docker compose -f docker-compose.dev.yml up -d --build
 ```
 
-Or from source:
-
-```bash
-docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin
-```
-
-Then open:
-
-```text
-http://your-docker-host:8082
-```
-
-Use this page for the walkthrough:
-
-- [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
-
-## 10. Optional: Turn On History And Snapshot Export
-
-The history sidecar is also a normal supported runtime service.
-
-If you want historical slot lookback and the offline HTML snapshot export flow,
-start the history sidecar:
-
-```bash
-docker compose --profile history up -d
-```
-
-Or from source:
-
-```bash
-docker compose -f docker-compose.dev.yml --profile history up -d --build
-```
-
-By default that stores the live history DB under `./history/history.db`, keeps
-short-term rotating backups under `./history/backups`, and promotes weekly plus
-monthly long-term copies under `./history/backups/long-term`.
-
-Then use:
-
-- [[History and Snapshot Export|History-and-Snapshot-Export]]
+For the normal homelab install and update path, stay with the published-image
+Compose flow above.
 
 ## Where To Go Next
 
 - use [[Visual Tour|Visual-Tour]] to recognize the main screens
-- use [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]] for the fuller
-  published-image path
+- use [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]] for tag
+  pinning, sidecars, and update details
 - use [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]] for
-  updates, logs, syslog, metrics, and Grafana
+  logs, syslog, metrics, and Grafana
 - use [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for guided setup
   and saved storage views
 - use [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]]
