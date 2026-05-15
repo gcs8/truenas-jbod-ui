@@ -125,6 +125,12 @@
         <option value="300">5 min</option>
       </select>
     </label>
+    <div id="refresh-timing-strip" class="refresh-timing-strip" aria-live="polite">
+      <span id="refresh-countdown-label" class="refresh-countdown-label">Next refresh pending</span>
+      <div class="refresh-progress" aria-hidden="true">
+        <span id="refresh-countdown-bar"></span>
+      </div>
+    </div>
   </section>
 
   {% if not snapshot_mode %}
@@ -174,6 +180,7 @@
     <div class="status-chip" id="api-status-chip">API</div>
     <div class="status-chip" id="ssh-status-chip">SSH</div>
     <div class="status-chip hidden" id="history-status-chip">HIST</div>
+    <div class="cache-timing-chips" id="cache-timing-chips" aria-label="Cache timing"></div>
     <div class="status-text" id="status-text">Ready.</div>
   </section>
 
@@ -493,6 +500,13 @@
     smartPrefetchSingleThreshold: {{ settings.app.smart_prefetch_single_threshold }},
     smartPrefetchChunkSize: {{ settings.app.smart_prefetch_chunk_size }},
     smartPrefetchBatchConcurrency: {{ settings.app.smart_prefetch_batch_concurrency }},
+    refreshTiming: {
+      snapshotCacheTtlSeconds: {{ settings.app.snapshot_cache_ttl_seconds }},
+      sourceBundleCacheTtlSeconds: {{ settings.app.source_bundle_cache_ttl_seconds }},
+      smartCacheTtlSeconds: {{ settings.app.smart_cache_ttl_seconds }},
+      sgSesDeviceCacheTtlSeconds: {{ settings.app.sg_ses_device_cache_ttl_seconds }},
+      historyStatusCacheTtlSeconds: 15,
+    },
     uiPerfEnabled: {{ settings.perf.enabled | tojson }},
     slotCount: {{ snapshot.layout_slot_count or settings.layout.slot_count }},
     historyConfigured: {{ history_configured | tojson }},

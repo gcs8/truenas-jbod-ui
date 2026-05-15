@@ -12,6 +12,7 @@
     sshKeys: Array.isArray(bootstrap.ssh_keys) ? bootstrap.ssh_keys : [],
     esxiHostPrep: bootstrap.esxi_host_prep || { temp_dir: "", staged_packages: [] },
     runtime: bootstrap.runtime || { available: false, detail: null, containers: [] },
+    runtimeBehavior: bootstrap.runtime_behavior || { fields: [] },
     backupDefaults: bootstrap.backup_defaults || {},
     selectedBackupPaths: Array.isArray(bootstrap.backup_defaults?.included_paths)
       ? [...bootstrap.backup_defaults.included_paths]
@@ -95,6 +96,10 @@
     releaseNote: document.getElementById("admin-release-note"),
     runtimeDetail: document.getElementById("runtime-detail"),
     runtimeCards: document.getElementById("runtime-cards"),
+    runtimeBehaviorDetail: document.getElementById("runtime-behavior-detail"),
+    runtimeBehaviorFields: document.getElementById("runtime-behavior-fields"),
+    runtimeBehaviorSaveButton: document.getElementById("runtime-behavior-save-button"),
+    runtimeBehaviorResult: document.getElementById("runtime-behavior-result"),
     backupPathList: document.getElementById("backup-path-list"),
     backupPathSummary: document.getElementById("backup-path-summary"),
     debugPathList: document.getElementById("debug-path-list"),
@@ -740,6 +745,104 @@
         `;
       })
       .join("");
+  }
+
+  function runtimeBehaviorOwnerLabel(field) {
+    const labels = state.runtimeBehavior?.owner_labels || {};
+    return labels[field?.owner] || field?.owner || "Admin";
+  }
+
+  function renderRuntimeBehaviorSettings() {
+    if (!elements.runtimeBehaviorFields || !elements.runtimeBehaviorDetail) {
+      return;
+    }
+    const behavior = state.runtimeBehavior || {};
+    const fields = Array.isArray(behavior.fields) ? behavior.fields : [];
+    elements.runtimeBehaviorDetail.textContent = behavior.override_file
+      ? `Override file: ${behavior.override_file}`
+      : "";
+    elements.runtimeBehaviorFields.innerHTML = fields
+      .map((field) => {
+        const key = String(field.key || "");
+        const disabled = !field.writable;
+        const ownerLabel = runtimeBehaviorOwnerLabel(field);
+        const source = String(field.source || "").trim();
+        const description = [field.description, source ? `Source: ${source}` : ""]
+          .filter(Boolean)
+          .join(" ");
+        const minimum = Number(field.minimum);
+        const maximum = Number(field.maximum);
+        const minAttr = Number.isFinite(minimum) ? ` min="${minimum}"` : "";
+        const maxAttr = Number.isFinite(maximum) ? ` max="${maximum}"` : "";
+        return `
+          <label class="field runtime-behavior-field${disabled ? " is-env-owned" : ""}">
+            <span class="runtime-behavior-label">
+              <span>${escapeHtml(field.label || key)}</span>
+              <span class="runtime-behavior-owner">${escapeHtml(ownerLabel)}</span>
+            </span>
+            <input
+              type="number"
+              step="1"
+              inputmode="numeric"
+              data-runtime-behavior-key="${escapeHtml(key)}"
+              value="${escapeHtml(field.value ?? "")}"
+              ${minAttr}
+              ${maxAttr}
+              ${disabled ? "disabled" : ""}
+            >
+            <small class="runtime-behavior-help">${escapeHtml(description)}</small>
+          </label>
+        `;
+      })
+      .join("");
+    if (elements.runtimeBehaviorSaveButton) {
+      elements.runtimeBehaviorSaveButton.disabled = !fields.some((field) => field.writable);
+    }
+  }
+
+  function collectRuntimeBehaviorValues() {
+    const values = {};
+    elements.runtimeBehaviorFields
+      ?.querySelectorAll("input[data-runtime-behavior-key]:not(:disabled)")
+      .forEach((input) => {
+        values[input.dataset.runtimeBehaviorKey || ""] = input.value;
+      });
+    delete values[""];
+    return values;
+  }
+
+  async function saveRuntimeBehaviorSettings() {
+    if (!elements.runtimeBehaviorSaveButton) {
+      return;
+    }
+    const values = collectRuntimeBehaviorValues();
+    elements.runtimeBehaviorSaveButton.disabled = true;
+    if (elements.runtimeBehaviorResult) {
+      elements.runtimeBehaviorResult.textContent = "Saving runtime behavior overrides...";
+    }
+    try {
+      const payload = await fetchJson("/api/admin/runtime-behavior", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ values }),
+      });
+      state.runtimeBehavior = payload.runtime_behavior || state.runtimeBehavior;
+      state.runtime = payload.runtime || state.runtime;
+      renderRuntimeBehaviorSettings();
+      renderRuntimeCards();
+      const detail = payload.detail || "Runtime behavior overrides saved.";
+      if (elements.runtimeBehaviorResult) {
+        elements.runtimeBehaviorResult.textContent = detail;
+      }
+      setBanner(detail, "success");
+    } catch (error) {
+      const message = `Runtime behavior save failed: ${error.message || error}`;
+      if (elements.runtimeBehaviorResult) {
+        elements.runtimeBehaviorResult.textContent = message;
+      }
+      setBanner(message, "error");
+      renderRuntimeBehaviorSettings();
+    }
   }
 
   function getSystemById(systemId) {
@@ -4939,6 +5042,7 @@
         state.selectedEsxiHostPrepToken = currentStagedEsxiHostPrepPackages()[0]?.token || "";
       }
       state.runtime = payload.runtime || { available: false, detail: null, containers: [] };
+      state.runtimeBehavior = payload.runtime_behavior || state.runtimeBehavior;
       state.backupDefaults = payload.backup_defaults || state.backupDefaults;
       if (!state.selectedBackupPaths.length && Array.isArray(state.backupDefaults?.included_paths)) {
         state.selectedBackupPaths = [...state.backupDefaults.included_paths];
@@ -5758,6 +5862,7 @@
     renderBackupPaths();
     renderHistoryMaintenance();
     renderRuntimeCards();
+    renderRuntimeBehaviorSettings();
     renderExistingSystems();
     renderProfileOptions();
     renderProfilePreview();
@@ -5802,6 +5907,9 @@
         return;
       }
       void runRuntimeAction(button.dataset.containerKey, button.dataset.runtimeAction);
+    });
+    elements.runtimeBehaviorSaveButton?.addEventListener("click", () => {
+      void saveRuntimeBehaviorSettings();
     });
 
     elements.backupPathList?.addEventListener("click", (event) => {

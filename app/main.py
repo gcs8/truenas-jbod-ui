@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -45,6 +49,16 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 logger = logging.getLogger(__name__)
 
 
+@dataclass(slots=True)
+class SnapshotExportSourceCacheEntry:
+    stored_at_monotonic: float
+    snapshot: InventorySnapshot
+    smart_summary_cache: dict[str, dict[str, Any]]
+
+
+SNAPSHOT_EXPORT_SOURCE_CACHE: OrderedDict[str, SnapshotExportSourceCacheEntry] = OrderedDict()
+
+
 @lru_cache
 def get_inventory_registry() -> InventoryRegistry:
     settings = get_settings()
@@ -77,6 +91,102 @@ def get_release_status_service() -> ReleaseStatusService:
         interval_seconds=settings.app.release_check_interval_seconds,
         timeout_seconds=settings.app.release_check_timeout_seconds,
     )
+
+
+def _snapshot_export_source_cache_key(
+    *,
+    system_id: str,
+    enclosure_id: str | None,
+    payload: SnapshotExportRequest,
+) -> str:
+    request_basis = payload.model_dump(mode="json")
+    request_basis.pop("packaging", None)
+    request_basis.pop("allow_oversize", None)
+    request_basis["system_id"] = system_id
+    request_basis["enclosure_id"] = enclosure_id
+    return json.dumps(request_basis, sort_keys=True, separators=(",", ":"))
+
+
+def _get_snapshot_export_source_cache_entry(
+    cache_key: str,
+    settings: Settings,
+) -> SnapshotExportSourceCacheEntry | None:
+    ttl_seconds = max(0, int(settings.app.export_cache_ttl_seconds))
+    if ttl_seconds <= 0:
+        return None
+    entry = SNAPSHOT_EXPORT_SOURCE_CACHE.get(cache_key)
+    if entry is None:
+        return None
+    if time.monotonic() - entry.stored_at_monotonic > ttl_seconds:
+        SNAPSHOT_EXPORT_SOURCE_CACHE.pop(cache_key, None)
+        return None
+    SNAPSHOT_EXPORT_SOURCE_CACHE.move_to_end(cache_key)
+    return entry
+
+
+def _store_snapshot_export_source_cache_entry(
+    cache_key: str,
+    *,
+    snapshot: InventorySnapshot,
+    smart_summary_cache: dict[str, dict[str, Any]],
+    settings: Settings,
+) -> None:
+    ttl_seconds = max(0, int(settings.app.export_cache_ttl_seconds))
+    max_entries = max(0, int(settings.app.export_cache_max_entries))
+    if ttl_seconds <= 0 or max_entries <= 0:
+        return
+    SNAPSHOT_EXPORT_SOURCE_CACHE[cache_key] = SnapshotExportSourceCacheEntry(
+        stored_at_monotonic=time.monotonic(),
+        snapshot=snapshot,
+        smart_summary_cache=smart_summary_cache,
+    )
+    SNAPSHOT_EXPORT_SOURCE_CACHE.move_to_end(cache_key)
+    while len(SNAPSHOT_EXPORT_SOURCE_CACHE) > max_entries:
+        SNAPSHOT_EXPORT_SOURCE_CACHE.popitem(last=False)
+
+
+async def _load_snapshot_export_source(
+    *,
+    service: Any,
+    payload: SnapshotExportRequest,
+    enclosure_id: str | None,
+    stage_prefix: str,
+    settings: Settings,
+) -> tuple[InventorySnapshot, dict[str, dict[str, Any]]]:
+    cache_key = _snapshot_export_source_cache_key(
+        system_id=service.system.id,
+        enclosure_id=enclosure_id,
+        payload=payload,
+    )
+    cached_entry = _get_snapshot_export_source_cache_entry(cache_key, settings)
+    if cached_entry is not None:
+        add_perf_metadata(snapshot_export_source_cache="hit")
+        return cached_entry.snapshot, cached_entry.smart_summary_cache
+
+    add_perf_metadata(snapshot_export_source_cache="miss")
+    with perf_stage(f"{stage_prefix}.load_snapshot"):
+        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+    with perf_stage(f"{stage_prefix}.load_smart_summaries", slot_count=len(snapshot.slots)):
+        smart_summaries = await service.get_slot_smart_summaries(
+            [slot.slot for slot in snapshot.slots],
+            selected_enclosure_id=enclosure_id,
+            allow_stale_cache=True,
+        )
+    smart_summary_cache = {
+        str(item.slot): item.summary.model_dump(mode="json")
+        for item in smart_summaries
+    }
+    _store_snapshot_export_source_cache_entry(
+        cache_key,
+        snapshot=snapshot,
+        smart_summary_cache=smart_summary_cache,
+        settings=settings,
+    )
+    return snapshot, smart_summary_cache
+
+
+def _clear_snapshot_export_source_cache_for_tests() -> None:
+    SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
 
 
 def create_app() -> FastAPI:
@@ -478,20 +588,17 @@ def create_app() -> FastAPI:
         system_id: str | None = None,
         enclosure_id: str | None = None,
     ) -> Response:
+        settings = get_settings()
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, enclosure_id=enclosure_id)
-        with perf_stage("route.export_snapshot.load_snapshot"):
-            snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
-        with perf_stage("route.export_snapshot.load_smart_summaries", slot_count=len(snapshot.slots)):
-            smart_summaries = await service.get_slot_smart_summaries(
-                [slot.slot for slot in snapshot.slots],
-                selected_enclosure_id=enclosure_id,
-            )
-        smart_summary_cache = {
-            str(item.slot): item.summary.model_dump(mode="json")
-            for item in smart_summaries
-        }
+        snapshot, smart_summary_cache = await _load_snapshot_export_source(
+            service=service,
+            payload=payload,
+            enclosure_id=enclosure_id,
+            stage_prefix="route.export_snapshot",
+            settings=settings,
+        )
         exporter = get_snapshot_export_service()
         try:
             with perf_stage("route.export_snapshot.build_artifact"):
@@ -529,20 +636,17 @@ def create_app() -> FastAPI:
         system_id: str | None = None,
         enclosure_id: str | None = None,
     ) -> JSONResponse:
+        settings = get_settings()
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, enclosure_id=enclosure_id)
-        with perf_stage("route.export_snapshot_estimate.load_snapshot"):
-            snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
-        with perf_stage("route.export_snapshot_estimate.load_smart_summaries", slot_count=len(snapshot.slots)):
-            smart_summaries = await service.get_slot_smart_summaries(
-                [slot.slot for slot in snapshot.slots],
-                selected_enclosure_id=enclosure_id,
-            )
-        smart_summary_cache = {
-            str(item.slot): item.summary.model_dump(mode="json")
-            for item in smart_summaries
-        }
+        snapshot, smart_summary_cache = await _load_snapshot_export_source(
+            service=service,
+            payload=payload,
+            enclosure_id=enclosure_id,
+            stage_prefix="route.export_snapshot_estimate",
+            settings=settings,
+        )
         exporter = get_snapshot_export_service()
         with perf_stage("route.export_snapshot_estimate.build_estimate"):
             estimate = await exporter.estimate_enclosure_snapshot_export(

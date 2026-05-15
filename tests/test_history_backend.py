@@ -235,11 +235,30 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
                 }
             ),
         ) as fetch_json:
-            payload = await client.get_scope_history(system_id="archive-core", enclosure_id="front", slots=[5, 6])
+            with patch.object(
+                client,
+                "_build_since_isoformat",
+                return_value="2026-04-15T23:10:00+00:00",
+            ):
+                payload = await client.get_scope_history(
+                    system_id="archive-core",
+                    enclosure_id="front",
+                    slots=[5, 6],
+                    window_hours=24,
+                )
 
         self.assertEqual(payload[5]["latest_values"]["temperature_c"], 31)
         self.assertEqual(payload[6]["sample_counts"]["temperature_c"], 0)
-        fetch_json.assert_awaited_once()
+        fetch_json.assert_awaited_once_with(
+            "/api/history/scopes/slots",
+            params={
+                "system_id": "archive-core",
+                "enclosure_id": "front",
+                "slots": [5, 6],
+                "since": "2026-04-15T23:10:00+00:00",
+                "event_limit": 12,
+            },
+        )
 
     async def test_get_scope_history_falls_back_to_per_slot_fetch_on_scope_error(self) -> None:
         client = HistoryBackendClient(
@@ -261,7 +280,12 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(client, "_fetch_json", AsyncMock(side_effect=RuntimeError("boom"))):
             with patch.object(client, "get_slot_history", AsyncMock(return_value=per_slot_payload)) as get_slot_history:
-                payload = await client.get_scope_history(system_id="archive-core", enclosure_id="front", slots=[5])
+                payload = await client.get_scope_history(
+                    system_id="archive-core",
+                    enclosure_id="front",
+                    slots=[5],
+                    window_hours=24,
+                )
 
         self.assertEqual(payload[5]["slot"], 5)
-        get_slot_history.assert_awaited_once_with(5, "archive-core", "front")
+        get_slot_history.assert_awaited_once_with(5, "archive-core", "front", window_hours=24)

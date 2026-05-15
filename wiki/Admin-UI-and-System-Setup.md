@@ -70,7 +70,7 @@ The top of the admin page now has two section targets:
 
 ## What The Page Looks Like
 
-![Admin sidecar grouped setup view](images/admin-setup-v0.15.0.png)
+![Admin sidecar grouped setup view](images/admin-setup-v0.17.0.png)
 
 The page is organized around one saved system at a time.
 
@@ -110,7 +110,7 @@ This is where you confirm the intended chassis shape before you save.
 The admin sidecar now also has a dedicated builder workspace for reusable
 custom chassis profiles.
 
-![Builder workspace with full-width preview](images/builder-workspace-v0.15.0.png)
+![Builder workspace with full-width preview](images/builder-workspace-v0.17.0.png)
 
 Use it when you want to:
 
@@ -165,7 +165,7 @@ For VMware ESXi, the admin sidecar now keeps the setup intentionally narrower:
 The setup form now also includes an ESXi-only `Host Prep / Vendor Tool Upload`
 panel for operator-supplied vendor packages.
 
-![Admin ESXi host prep panel](images/admin-esxi-host-prep-v0.15.0.png)
+![Admin ESXi host prep panel](images/admin-esxi-host-prep-v0.17.0.png)
 
 Use it when the host needs something like Broadcom StorCLI before the main UI
 can enrich controller-backed disks properly.
@@ -205,6 +205,7 @@ Use runtime control when you need to:
 - restart the read UI
 - restart the history sidecar
 - coordinate backup or restore work with a cleaner maintenance window
+- confirm whether UI, history, and admin are all running the same app version
 
 The pills on the page can show whether each service is:
 
@@ -215,6 +216,16 @@ The pills on the page can show whether each service is:
 Each runtime card also shows the live running app version it probed from that
 container plus the latest tagged stable release, so you can spot a stale or
 partially updated sidecar without jumping across three separate pages.
+
+### Runtime Behavior
+
+The admin sidecar also exposes the supported runtime behavior knobs for cache
+and refresh timing.
+
+Fields owned by `.env` stay read-only and show their source. Fields owned by
+admin runtime overrides are editable and save to
+`config/runtime-overrides.yaml`. After saving those values, restart the read UI
+from the runtime cards so the main surface picks up the new timing behavior.
 
 ## Backup and Restore
 
@@ -247,6 +258,12 @@ The locked pills are the secret-material path:
 Selecting any locked pill forces encrypted portable `.7z` export. That keeps
 secret material out of plaintext bundles while still letting the admin import
 path restore those same selected files later.
+
+For release-candidate or migration testing, do import/restore, runtime
+override edits, purge/adopt/delete cleanup, and container stop/start
+failure-mode checks in a disposable QA Docker stack with separate ports and
+separate runtime directories. Keep the long-running stack read-only except for
+explicitly approved live LED identify checks.
 
 ### Debug Bundles
 
@@ -283,7 +300,7 @@ runtime selector picks the updated system list up cleanly.
 The same backup/restore area now also holds the safe cleanup tools for saved
 history:
 
-![Admin maintenance bundle and history tools](images/admin-maintenance-v0.15.0.png)
+![Admin maintenance bundle and history tools](images/admin-maintenance-v0.17.0.png)
 
 Use that panel when you need to:
 

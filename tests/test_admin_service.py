@@ -6,6 +6,7 @@ import urllib.error
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
@@ -28,14 +29,17 @@ from app.config import (
 )
 from app.main import app as main_app
 from app.main import resolve_admin_launch_url
+from app.main import _clear_snapshot_export_source_cache_for_tests
 from app.models.domain import ESXiHostPrepInstallRequest
 from app.models.domain import EnclosureOption
 from app.models.domain import EnclosureProfileRequest
 from app.models.domain import HistoryAdoptRequest
 from app.models.domain import QuantastorNodeDiscoveryRequest
+from app.models.domain import SnapshotExportRequest
 from app.models.domain import SystemSetupBootstrapRequest
 from app.models.domain import SystemSetupSudoPreviewRequest
 from app.services.profile_registry import UNIFI_UNVR_FRONT_4_PROFILE_ID
+from app.services.snapshot_export import PackagedSnapshotExport
 from history_service.config import HistorySettings
 from history_service.main import app as history_app
 from app.services.truenas_ws import TrueNASRawData
@@ -59,6 +63,9 @@ def make_request(host: str = "localhost", port: int = 8082) -> Request:
 
 
 class MainAppBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _clear_snapshot_export_source_cache_for_tests()
+
     @staticmethod
     def _call_main_route(path: str) -> object:
         route = next(route for route in main_app.routes if route.path == path)
@@ -79,6 +86,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("/api/admin/history/orphaned", paths)
         self.assertIn("/api/admin/history/adopt-removed-system", paths)
         self.assertIn("/api/admin/debug/export", paths)
+        self.assertIn("/api/admin/runtime-behavior", paths)
 
     def test_main_app_does_not_expose_embedded_admin_routes(self) -> None:
         paths = {route.path for route in main_app.routes}
@@ -125,6 +133,17 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn('id="app-version-value"', template_text)
         self.assertIn('id="app-version-note"', template_text)
 
+    def test_main_ui_template_exposes_refresh_timing_bootstrap(self) -> None:
+        template_path = Path(__file__).resolve().parents[1] / "app" / "templates" / "index.html"
+        template_text = template_path.read_text(encoding="utf-8")
+
+        self.assertIn('id="refresh-timing-strip"', template_text)
+        self.assertIn('id="cache-timing-chips"', template_text)
+        self.assertIn("snapshotCacheTtlSeconds", template_text)
+        self.assertIn("sourceBundleCacheTtlSeconds", template_text)
+        self.assertIn("smartCacheTtlSeconds", template_text)
+        self.assertIn("sgSesDeviceCacheTtlSeconds", template_text)
+
     def test_admin_ui_template_includes_version_stat(self) -> None:
         template_path = Path(__file__).resolve().parents[1] / "admin_service" / "templates" / "index.html"
         template_text = template_path.read_text(encoding="utf-8")
@@ -155,6 +174,16 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn('void refreshSnapshot(true, `${reason}-led-verify`);', script_text)
         self.assertIn("snapshotMatchesSelectedSystem()", script_text)
 
+    def test_main_ui_script_uses_bootstrap_refresh_timing(self) -> None:
+        script_path = Path(__file__).resolve().parents[1] / "app" / "static" / "app.js"
+        script_text = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("const refreshTiming = bootstrap.refreshTiming || {};", script_text)
+        self.assertIn("const SMART_SUMMARY_CACHE_TTL_MS = SMART_CACHE_TTL_SECONDS * 1000;", script_text)
+        self.assertIn("renderCacheTimingChips", script_text)
+        self.assertIn("data-cache-timing-key", script_text)
+        self.assertNotIn("const SMART_SUMMARY_CACHE_TTL_MS = 5 * 60 * 1000;", script_text)
+
     def test_admin_script_disables_linux_bootstrap_flow_for_esxi(self) -> None:
         script_path = Path(__file__).resolve().parents[1] / "admin_service" / "static" / "admin.js"
         script_text = script_path.read_text(encoding="utf-8")
@@ -170,6 +199,9 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("platformSupportsEsxiHostPrep", script_text)
         self.assertIn("/api/admin/esxi-host-prep/upload", script_text)
         self.assertIn("/api/admin/esxi-host-prep/install", script_text)
+        self.assertIn("runtime-behavior-save-button", script_text)
+        self.assertIn("/api/admin/runtime-behavior", script_text)
+        self.assertIn("is-env-owned", script_text)
 
     def test_main_app_livez_is_lightweight(self) -> None:
         response = self._call_main_route("/livez")
@@ -224,6 +256,118 @@ class MainAppBoundaryTests(unittest.TestCase):
         payload = json.loads(response.body)
         self.assertEqual(payload["dependency_status"], "unknown")
         self.assertEqual(payload["cache_state"], "empty")
+
+    def test_snapshot_export_estimate_uses_stale_smart_cache(self) -> None:
+        route = next(route for route in main_app.routes if route.path == "/api/export/enclosure-snapshot/estimate")
+        snapshot = MagicMock()
+        snapshot.slots = [SimpleNamespace(slot=0), SimpleNamespace(slot=1)]
+        fake_summary = MagicMock()
+        fake_summary.model_dump.return_value = {"available": True}
+        fake_service = MagicMock()
+        fake_service.system.id = "archive-core"
+        fake_service.system.truenas.platform = "core"
+        fake_service.get_snapshot = AsyncMock(return_value=snapshot)
+        fake_service.get_slot_smart_summaries = AsyncMock(
+            return_value=[SimpleNamespace(slot=0, summary=fake_summary)]
+        )
+        fake_registry = MagicMock()
+        fake_registry.get_service.return_value = fake_service
+        fake_exporter = MagicMock()
+        fake_exporter.estimate_enclosure_snapshot_export = AsyncMock(return_value={"ok": True})
+
+        with (
+            patch("app.main.get_inventory_registry", return_value=fake_registry),
+            patch("app.main.get_snapshot_export_service", return_value=fake_exporter),
+        ):
+            response = asyncio.run(
+                route.endpoint(
+                    make_request(port=8080),
+                    SnapshotExportRequest(selected_slot=0),
+                    system_id=None,
+                    enclosure_id="front",
+                )
+            )
+
+        self.assertEqual(response.status_code, 200)
+        fake_service.get_slot_smart_summaries.assert_awaited_once_with(
+            [0, 1],
+            selected_enclosure_id="front",
+            allow_stale_cache=True,
+        )
+
+    def test_snapshot_export_download_reuses_estimate_source_inputs_when_packaging_changes(self) -> None:
+        estimate_route = next(route for route in main_app.routes if route.path == "/api/export/enclosure-snapshot/estimate")
+        export_route = next(route for route in main_app.routes if route.path == "/api/export/enclosure-snapshot")
+        snapshot = MagicMock()
+        snapshot.slots = [SimpleNamespace(slot=0), SimpleNamespace(slot=1)]
+        fake_summary = MagicMock()
+        fake_summary.model_dump.return_value = {"available": True}
+        fake_service = MagicMock()
+        fake_service.system.id = "archive-core"
+        fake_service.system.truenas.platform = "core"
+        fake_service.get_snapshot = AsyncMock(return_value=snapshot)
+        fake_service.get_slot_smart_summaries = AsyncMock(
+            return_value=[SimpleNamespace(slot=0, summary=fake_summary)]
+        )
+        fake_registry = MagicMock()
+        fake_registry.get_service.return_value = fake_service
+        fake_exporter = MagicMock()
+        fake_exporter.estimate_enclosure_snapshot_export = AsyncMock(return_value={"ok": True})
+        fake_exporter.build_enclosure_snapshot_export = AsyncMock(
+            return_value=PackagedSnapshotExport(
+                filename="snapshot.zip",
+                content=b"zip",
+                media_type="application/zip",
+                size_bytes=3,
+                html_size_bytes=12,
+                packaging="zip",
+                redaction="full",
+                size_limit_bytes=24 * 1024 * 1024,
+            )
+        )
+
+        with (
+            patch("app.main.get_inventory_registry", return_value=fake_registry),
+            patch("app.main.get_snapshot_export_service", return_value=fake_exporter),
+        ):
+            estimate_response = asyncio.run(
+                estimate_route.endpoint(
+                    make_request(port=8080),
+                    SnapshotExportRequest(
+                        selected_slot=0,
+                        history_window_hours=168,
+                        history_panel_open=True,
+                        io_chart_mode="total",
+                        packaging="auto",
+                    ),
+                    system_id=None,
+                    enclosure_id="front",
+                )
+            )
+            export_response = asyncio.run(
+                export_route.endpoint(
+                    make_request(port=8080),
+                    SnapshotExportRequest(
+                        selected_slot=0,
+                        history_window_hours=168,
+                        history_panel_open=True,
+                        io_chart_mode="total",
+                        packaging="zip",
+                    ),
+                    system_id=None,
+                    enclosure_id="front",
+                )
+            )
+
+        self.assertEqual(estimate_response.status_code, 200)
+        self.assertEqual(export_response.status_code, 200)
+        self.assertEqual(export_response.headers["X-Export-Packaging"], "zip")
+        fake_service.get_snapshot.assert_awaited_once_with(selected_enclosure_id="front")
+        fake_service.get_slot_smart_summaries.assert_awaited_once_with(
+            [0, 1],
+            selected_enclosure_id="front",
+            allow_stale_cache=True,
+        )
 
     def test_resolve_admin_launch_url_returns_public_url_when_sidecar_is_healthy(self) -> None:
         request = make_request(port=8080)
@@ -300,6 +444,7 @@ class AdminStatePayloadTests(unittest.TestCase):
         settings = Settings(
             config_file="C:/tmp/config/config.yaml",
             paths=PathConfig(
+                runtime_overrides_file="C:/tmp/config/runtime-overrides.yaml",
                 mapping_file="C:/tmp/data/slot_mappings.json",
                 log_file="C:/tmp/logs/app.log",
                 profile_file="C:/tmp/config/profiles.yaml",
@@ -437,6 +582,8 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(payload["systems"][0]["storage_views"][0]["profile_id"], "lab-4x4")
         self.assertEqual(payload["storage_view_templates"][0]["id"], "ses-auto")
         self.assertTrue(any(template["id"] == "aoc-slg4-2h8m2-2" for template in payload["storage_view_templates"]))
+        self.assertIn("runtime_behavior", payload)
+        self.assertTrue(any(field["key"] == "source_bundle_cache_ttl_seconds" for field in payload["runtime_behavior"]["fields"]))
         custom_profile = next(profile for profile in payload["profiles"] if profile["id"] == "lab-4x4")
         self.assertEqual(custom_profile["slot_count"], 16)
         self.assertTrue(custom_profile["is_custom"])
@@ -448,9 +595,11 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(payload["esxi_host_prep"]["temp_dir"], "/tmp/truenas-jbod-ui-host-prep")
         self.assertEqual(payload["esxi_host_prep"]["staged_packages"][0]["filename"], "BCM-vmware-storcli64.zip")
         self.assertEqual(payload["paths"]["history_db"], "/tmp/history/history.db")
+        self.assertEqual(payload["paths"]["runtime_overrides_file"], "C:/tmp/config/runtime-overrides.yaml")
         self.assertEqual(payload["paths"]["tls_dir"], str(Path("C:/tmp/config") / "tls"))
         self.assertIn("included_paths", payload["backup_defaults"])
         self.assertIn("debug_included_paths", payload["backup_defaults"])
+        self.assertIn("runtime_overrides_file", payload["backup_defaults"]["included_paths"])
         self.assertTrue(payload["backup_defaults"]["debug_scrub_secrets"])
         self.assertTrue(payload["backup_defaults"]["debug_scrub_disk_identifiers"])
         self.assertTrue(any(group["key"] == "ssh_keys" for group in payload["backup_defaults"]["path_groups"]))
@@ -809,6 +958,36 @@ class AdminStatePayloadTests(unittest.TestCase):
 
 
 class AdminSudoPreviewRouteTests(unittest.TestCase):
+    def test_runtime_behavior_route_marks_read_ui_restart(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/runtime-behavior")
+        settings = Settings(config_file="C:/tmp/config/config.yaml")
+        runtime_service = MagicMock()
+        runtime_service.status_payload.return_value = {
+            "available": True,
+            "detail": None,
+            "containers": [],
+        }
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+                with patch(
+                    "admin_service.main.save_runtime_behavior_overrides",
+                    return_value={"fields": [{"key": "source_bundle_cache_ttl_seconds", "owner": "admin"}]},
+                ) as save_overrides:
+                    with patch(
+                        "admin_service.main.build_runtime_payload",
+                        new=AsyncMock(return_value={"available": True, "containers": []}),
+                    ):
+                        response = asyncio.run(
+                            route.endpoint({"values": {"source_bundle_cache_ttl_seconds": 120}})
+                        )
+
+        payload = json.loads(response.body)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["runtime_behavior"]["fields"][0]["key"], "source_bundle_cache_ttl_seconds")
+        save_overrides.assert_called_once_with(settings, {"source_bundle_cache_ttl_seconds": 120})
+        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+
     def test_create_demo_system_route_accepts_missing_payload_and_marks_ui_restart(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/demo")
         initial_settings = Settings(

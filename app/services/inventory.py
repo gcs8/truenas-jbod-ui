@@ -329,6 +329,7 @@ class InventoryService:
         )
         self._scale_preferred_ses_host: str | None = None
         self._quantastor_preferred_ses_host: str | None = None
+        self._sg_ses_device_cache: dict[str, tuple[list[str], datetime]] = {}
 
     def _metrics_labels(self) -> dict[str, str | None]:
         return {
@@ -460,7 +461,9 @@ class InventoryService:
                 self._observe_inventory_snapshot_request(refresh_trigger)
                 return snapshot
             self._cache[cache_key] = snapshot
-            self._cache_until[cache_key] = utcnow() + timedelta(seconds=self.settings.app.cache_ttl_seconds)
+            self._cache_until[cache_key] = utcnow() + timedelta(
+                seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
+            )
             self._observe_inventory_cache_metrics()
             self._observe_inventory_snapshot_request(refresh_trigger)
             return snapshot
@@ -1170,6 +1173,8 @@ class InventoryService:
                 return self._source_bundle
 
             refresh_trigger = "forced-refresh" if force_refresh else "miss"
+            if force_refresh:
+                self._sg_ses_device_cache.clear()
             add_perf_metadata(
                 inventory_source_cache=refresh_trigger,
                 system_id=self.system.id,
@@ -1178,7 +1183,9 @@ class InventoryService:
             build_started = time.perf_counter()
             bundle = await self._collect_inventory_source_bundle()
             self._source_bundle = bundle
-            self._source_bundle_until = utcnow() + timedelta(seconds=self.settings.app.cache_ttl_seconds)
+            self._source_bundle_until = utcnow() + timedelta(
+                seconds=max(0, int(self.settings.app.source_bundle_cache_ttl_seconds))
+            )
             self._observe_inventory_source_bundle_build(
                 trigger=refresh_trigger,
                 duration_seconds=time.perf_counter() - build_started,
@@ -2069,6 +2076,9 @@ class InventoryService:
                 allow_stale_cache=allow_stale_cache,
             )
 
+    def _smart_cache_expiry(self) -> datetime:
+        return utcnow() + timedelta(seconds=max(0, int(self.settings.app.smart_cache_ttl_seconds)))
+
     async def _get_slot_smart_summary_for_slot_view(
         self,
         slot_view: SlotView,
@@ -2080,7 +2090,7 @@ class InventoryService:
         if self.system.truenas.platform == "esxi":
             summary = await self._build_esxi_slot_smart_summary(slot_view)
             self._smart_cache[f"{self.system.id}|esxi|{slot}"] = summary
-            self._smart_cache_until[f"{self.system.id}|esxi|{slot}"] = utcnow() + timedelta(minutes=5)
+            self._smart_cache_until[f"{self.system.id}|esxi|{slot}"] = self._smart_cache_expiry()
             self._persist_slot_detail_cache(slot_view, smart_summary=summary)
             self._observe_inventory_cache_metrics()
             self._observe_smart_summary_request("esxi-live")
@@ -2100,7 +2110,7 @@ class InventoryService:
                         self._merge_smart_summary(slot_view, ssh_summary),
                     )
             self._smart_cache[f"{self.system.id}|quantastor|{slot}"] = summary
-            self._smart_cache_until[f"{self.system.id}|quantastor|{slot}"] = utcnow() + timedelta(minutes=5)
+            self._smart_cache_until[f"{self.system.id}|quantastor|{slot}"] = self._smart_cache_expiry()
             self._persist_slot_detail_cache(slot_view, smart_summary=summary)
             self._observe_inventory_cache_metrics()
             self._observe_smart_summary_request("quantastor-live")
@@ -2148,7 +2158,7 @@ class InventoryService:
             if summary is not None:
                 summary = self._merge_smart_summary(slot_view, summary)
                 self._smart_cache[cache_key] = summary
-                self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
+                self._smart_cache_until[cache_key] = self._smart_cache_expiry()
                 self._persist_slot_detail_cache(slot_view, smart_summary=summary)
                 self._observe_inventory_cache_metrics()
                 self._observe_smart_summary_request("ssh-live")
@@ -2211,7 +2221,7 @@ class InventoryService:
                     )
 
             self._smart_cache[cache_key] = api_summary
-            self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
+            self._smart_cache_until[cache_key] = self._smart_cache_expiry()
             self._persist_slot_detail_cache(slot_view, smart_summary=api_summary)
             self._observe_inventory_cache_metrics()
             self._observe_smart_summary_request("api-live")
@@ -2225,7 +2235,7 @@ class InventoryService:
             if ssh_summary is not None:
                 ssh_summary = self._merge_smart_summary(slot_view, ssh_summary)
                 self._smart_cache[cache_key] = ssh_summary
-                self._smart_cache_until[cache_key] = utcnow() + timedelta(minutes=5)
+                self._smart_cache_until[cache_key] = self._smart_cache_expiry()
                 self._persist_slot_detail_cache(slot_view, smart_summary=ssh_summary)
                 self._observe_inventory_cache_metrics()
                 self._observe_smart_summary_request("ssh-live")
@@ -5340,6 +5350,97 @@ class InventoryService:
             return overlay, []
         return overlay, failures
 
+    def _get_cached_sg_ses_devices(self, host: str) -> list[str]:
+        normalized_host = normalize_text(host)
+        if not normalized_host:
+            return []
+        entry = self._sg_ses_device_cache.get(normalized_host)
+        if entry is None:
+            return []
+        devices, expires_at = entry
+        if utcnow() >= expires_at:
+            self._sg_ses_device_cache.pop(normalized_host, None)
+            return []
+        return list(devices)
+
+    def _remember_sg_ses_devices(self, host: str, devices: Iterable[str]) -> None:
+        normalized_host = normalize_text(host)
+        if not normalized_host:
+            return
+        ttl_seconds = max(0, int(self.settings.app.sg_ses_device_cache_ttl_seconds))
+        if ttl_seconds <= 0:
+            self._sg_ses_device_cache.pop(normalized_host, None)
+            return
+        unique_devices: list[str] = []
+        for device in devices:
+            normalized_device = normalize_text(device)
+            if normalized_device and normalized_device not in unique_devices:
+                unique_devices.append(normalized_device)
+        if not unique_devices:
+            return
+        self._sg_ses_device_cache[normalized_host] = (
+            unique_devices,
+            utcnow() + timedelta(seconds=ttl_seconds),
+        )
+
+    @staticmethod
+    def _parse_sg_ses_discovery_devices(stdout: str) -> list[str]:
+        devices: list[str] = []
+        for line in stdout.splitlines():
+            device = normalize_text(line)
+            if device and device.startswith("/dev/sg") and device not in devices:
+                devices.append(device)
+        return devices
+
+    @staticmethod
+    def _score_sg_ses_overlay(overlay: ParsedSSHData) -> int:
+        return sum(len(enclosure.slots) for enclosure in overlay.ses_enclosures)
+
+    async def _discover_sg_ses_devices(self, host: str, *, failure_prefix: str) -> tuple[list[str], list[str]]:
+        device_discovery = await self._run_ssh_command(self._build_sg_ses_discovery_command(), host)
+        if not device_discovery.ok:
+            detail = normalize_text(device_discovery.stderr) or normalize_text(device_discovery.stdout) or (
+                f"exit {device_discovery.exit_code}"
+            )
+            return [], [f"{failure_prefix} discovery failed on {host}: {detail}"]
+
+        devices = self._parse_sg_ses_discovery_devices(device_discovery.stdout)
+        if not devices:
+            return [], [f"{failure_prefix} discovery found no usable sg_ses devices on {host}."]
+        return devices, []
+
+    async def _fetch_sg_ses_host_overlay(
+        self,
+        host: str,
+        devices: Iterable[str],
+        *,
+        failure_prefix: str,
+    ) -> tuple[ParsedSSHData, list[str]]:
+        host_overlay = ParsedSSHData()
+        host_failures: list[str] = []
+        for device in devices:
+            aes_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "aes", device])
+            aes_result = await self._run_ssh_command(aes_command, host)
+            if not aes_result.ok:
+                detail = normalize_text(aes_result.stderr) or normalize_text(aes_result.stdout) or (
+                    f"exit {aes_result.exit_code}"
+                )
+                host_failures.append(f"{failure_prefix} AES page probe failed on {host} {device}: {detail}")
+                continue
+
+            outputs = {aes_command: aes_result.stdout}
+            ec_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "ec", device])
+            ec_result = await self._run_ssh_command(ec_command, host)
+            if ec_result.ok:
+                outputs[ec_command] = ec_result.stdout
+
+            parsed = parse_ssh_outputs(outputs, self.settings.layout.slot_count, None, None)
+            if not parsed.ses_enclosures:
+                continue
+            self._tag_ses_overlay(parsed, host)
+            host_overlay = self._merge_ses_overlay_data(host_overlay, parsed)
+        return host_overlay, host_failures
+
     async def _fetch_sg_ses_overlay(
         self,
         hosts: list[str],
@@ -5354,50 +5455,43 @@ class InventoryService:
         successful_overlays: list[ParsedSSHData] = []
 
         for host in hosts:
-            device_discovery = await self._run_ssh_command(self._build_sg_ses_discovery_command(), host)
-            if not device_discovery.ok:
-                detail = normalize_text(device_discovery.stderr) or normalize_text(device_discovery.stdout) or (
-                    f"exit {device_discovery.exit_code}"
+            cached_devices = self._get_cached_sg_ses_devices(host)
+            cached_failures: list[str] = []
+            if cached_devices:
+                cached_overlay, cached_failures = await self._fetch_sg_ses_host_overlay(
+                    host,
+                    cached_devices,
+                    failure_prefix=failure_prefix,
                 )
-                failures.append(f"{failure_prefix} discovery failed on {host}: {detail}")
-                continue
+                cached_score = self._score_sg_ses_overlay(cached_overlay)
+                if cached_score > 0 and not cached_failures:
+                    if merge_hosts:
+                        successful_overlays.append(cached_overlay)
+                    if cached_score > best_score:
+                        best_overlay = cached_overlay
+                        best_score = cached_score
+                        best_host = host
+                    continue
+                self._sg_ses_device_cache.pop(normalize_text(host), None)
 
-            devices = [
-                normalize_text(line)
-                for line in device_discovery.stdout.splitlines()
-                if normalize_text(line) and normalize_text(line).startswith("/dev/sg")
-            ]
+            devices, discovery_failures = await self._discover_sg_ses_devices(host, failure_prefix=failure_prefix)
             if not devices:
-                failures.append(f"{failure_prefix} discovery found no usable sg_ses devices on {host}.")
+                failures.extend(discovery_failures)
+                if cached_failures:
+                    failures.extend(cached_failures)
                 continue
 
-            host_overlay = ParsedSSHData()
-            host_failures: list[str] = []
-            for device in devices:
-                aes_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "aes", device])
-                aes_result = await self._run_ssh_command(aes_command, host)
-                if not aes_result.ok:
-                    detail = normalize_text(aes_result.stderr) or normalize_text(aes_result.stdout) or (
-                        f"exit {aes_result.exit_code}"
-                    )
-                    host_failures.append(f"{failure_prefix} AES page probe failed on {host} {device}: {detail}")
-                    continue
-
-                outputs = {aes_command: aes_result.stdout}
-                ec_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "ec", device])
-                ec_result = await self._run_ssh_command(ec_command, host)
-                if ec_result.ok:
-                    outputs[ec_command] = ec_result.stdout
-
-                parsed = parse_ssh_outputs(outputs, self.settings.layout.slot_count, None, None)
-                if not parsed.ses_enclosures:
-                    continue
-                self._tag_ses_overlay(parsed, host)
-                host_overlay = self._merge_ses_overlay_data(host_overlay, parsed)
+            host_overlay, host_failures = await self._fetch_sg_ses_host_overlay(
+                host,
+                devices,
+                failure_prefix=failure_prefix,
+            )
 
             if host_failures:
                 failures.extend(host_failures)
-            host_score = sum(len(enclosure.slots) for enclosure in host_overlay.ses_enclosures)
+            host_score = self._score_sg_ses_overlay(host_overlay)
+            if host_score > 0:
+                self._remember_sg_ses_devices(host, devices)
             if merge_hosts and host_score > 0:
                 successful_overlays.append(host_overlay)
             if host_score > best_score:

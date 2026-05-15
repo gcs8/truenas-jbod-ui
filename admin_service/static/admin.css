@@ -317,6 +317,49 @@ h3 {
   margin-top: 18px;
 }
 
+.runtime-behavior-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.runtime-behavior-field {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 14px;
+  background: rgba(10, 18, 28, 0.5);
+}
+
+.runtime-behavior-field.is-env-owned {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.runtime-behavior-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.runtime-behavior-owner {
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 4px 8px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.runtime-behavior-help {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.runtime-behavior-actions {
+  margin-top: 16px;
+}
+
 .runtime-card,
 .preview-card,
 .backup-column {

@@ -44,12 +44,33 @@ If you later mount a separate disk or NFS path for longer-lived copies, point
 `HISTORY_LONG_TERM_BACKUP_DIR` there and keep the short-term local path in
 place.
 
+## History Sidecar Dashboard
+
+Open the history sidecar directly when you want to see what the collector is
+doing:
+
+```text
+http://your-docker-host:8081
+```
+
+The dashboard now updates without a browser refresh:
+
+- the collector status block follows cheap `/healthz` polling
+- count cards, DB size, and tracked scopes follow the overview poll
+- `Refresh Fast` runs the cached-root-only path for the current root scope
+- `Refresh Full` runs the slower forced-inventory path and records stage
+  timings so you can see where the time went
+
+On a cold cache, a fast refresh may record a bounded `smart.failed` stage after
+roughly five seconds. That means the cached SMART batch was unavailable or
+slow; it should not set `last_error` or leave the collector stuck.
+
 ## What The Live History Drawer Looks Like
 
 Once the sidecar is healthy, pick a populated slot and use the `History`
 button in Slot Details.
 
-![Live slot history drawer](images/history-drawer-v0.14.0.png)
+![Live slot history drawer](images/history-drawer-v0.17.0.png)
 
 Things to notice:
 
@@ -61,7 +82,7 @@ Things to notice:
 The same history drawer is also available for inventory-bound
 storage views such as `Boot SATADOMs` and the internal NVMe carrier:
 
-![Storage-view history on Boot SATADOMs](images/storage-view-history-v0.14.0.png)
+![Storage-view history on Boot SATADOMs](images/storage-view-history-v0.17.0.png)
 
 Things to notice:
 
@@ -77,7 +98,7 @@ Things to notice:
 
 Use `Export Snapshot` from the main toolbar.
 
-![Snapshot export dialog with live estimate](images/snapshot-export-dialog-v0.14.0.png)
+![Snapshot export dialog with live estimate](images/snapshot-export-dialog-v0.17.0.png)
 
 Things to notice:
 
@@ -85,6 +106,8 @@ Things to notice:
 - redaction and packaging controls before download
 - a clear note that snapshot history uses the current History drawer window
 - downsampling feedback if larger exports need rollups later
+- packaging changes reuse the estimate already on screen instead of
+  recalculating the whole export payload
 
 If you want a different snapshot history range, change the window in the
 History drawer first, then open the export dialog.
@@ -94,7 +117,7 @@ History drawer first, then open the export dialog.
 The export produces a self-contained HTML file that opens locally without
 access to the live app.
 
-![Frozen offline enclosure snapshot](images/offline-snapshot-v0.14.0.png)
+![Frozen offline enclosure snapshot](images/offline-snapshot-v0.17.0.png)
 
 Things to notice:
 

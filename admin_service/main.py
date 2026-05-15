@@ -28,6 +28,8 @@ from app.config import (
     Settings,
     TrueNASConfig,
     get_settings,
+    runtime_behavior_settings_payload,
+    save_runtime_behavior_overrides,
 )
 from app.logging_config import configure_service_logging
 from app.metrics import install_metrics
@@ -220,6 +222,30 @@ def create_app() -> FastAPI:
     @app.get("/api/admin/state")
     async def get_admin_state(request: Request) -> JSONResponse:
         return JSONResponse(await build_admin_state_payload(request))
+
+    @app.post("/api/admin/runtime-behavior")
+    async def update_runtime_behavior(payload: dict[str, Any]) -> JSONResponse:
+        settings = reload_app_settings()
+        values = payload.get("values") if isinstance(payload, dict) else None
+        try:
+            runtime_behavior = await asyncio.to_thread(
+                save_runtime_behavior_overrides,
+                settings,
+                values if isinstance(values, dict) else {},
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        runtime_service = get_runtime_service()
+        await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
+        return JSONResponse(
+            {
+                "ok": True,
+                "runtime_behavior": runtime_behavior,
+                "runtime": await build_runtime_payload(runtime_service),
+                "detail": "Runtime behavior overrides saved. Restart the Read UI container to apply them.",
+            }
+        )
 
     @app.post("/api/admin/runtime/containers/{container_key}/stop")
     async def stop_container(container_key: str) -> JSONResponse:
@@ -965,6 +991,7 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
             "staged_packages": await asyncio.to_thread(get_esxi_host_prep_service().list_staged_packages),
         },
         "runtime": runtime_payload,
+        "runtime_behavior": runtime_behavior_settings_payload(settings),
         "backup_defaults": {
             "packaging": "tar.zst",
             "stop_services": False,
@@ -984,6 +1011,7 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
         },
         "paths": {
             "config_file": settings.config_file,
+            "runtime_overrides_file": settings.paths.runtime_overrides_file,
             "profile_file": settings.paths.profile_file,
             "mapping_file": settings.paths.mapping_file,
             "slot_detail_cache_file": settings.paths.slot_detail_cache_file,

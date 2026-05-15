@@ -29,6 +29,7 @@ def _derive_runtime_layout_paths(config_path: str | Path) -> dict[str, str]:
         log_root = runtime_root
     return {
         "config_file": str(resolved_config_path),
+        "runtime_overrides_file": str(config_root / "runtime-overrides.yaml"),
         "profile_file": str(config_root / "profiles.yaml"),
         "mapping_file": str(data_root / "slot_mappings.json"),
         "slot_detail_cache_file": str(data_root / "slot_detail_cache.json"),
@@ -43,6 +44,10 @@ def _default_config_file() -> str:
 
 def _default_profile_file() -> str:
     return _derive_runtime_layout_paths(_standard_runtime_config_path())["profile_file"]
+
+
+def _default_runtime_overrides_file() -> str:
+    return _derive_runtime_layout_paths(_standard_runtime_config_path())["runtime_overrides_file"]
 
 
 def _default_mapping_file() -> str:
@@ -69,7 +74,11 @@ class AppConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
     refresh_interval_seconds: int = 30
+    snapshot_cache_ttl_seconds: int = 10
+    source_bundle_cache_ttl_seconds: int = 60
     cache_ttl_seconds: int = 10
+    smart_cache_ttl_seconds: int = 300
+    sg_ses_device_cache_ttl_seconds: int = 300
     release_check_enabled: bool = True
     release_check_repo: str = "gcs8/truenas-jbod-ui"
     release_check_interval_seconds: int = 86400
@@ -347,6 +356,7 @@ class LayoutConfig(BaseModel):
 
 
 class PathConfig(BaseModel):
+    runtime_overrides_file: str = Field(default_factory=_default_runtime_overrides_file)
     mapping_file: str = Field(default_factory=_default_mapping_file)
     log_file: str = Field(default_factory=_default_log_file)
     profile_file: str = Field(default_factory=_default_profile_file)
@@ -395,7 +405,11 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "APP_HOST": ("app", "host"),
     "APP_PORT": ("app", "port"),
     "APP_REFRESH_INTERVAL": ("app", "refresh_interval_seconds"),
+    "APP_SNAPSHOT_CACHE_TTL_SECONDS": ("app", "snapshot_cache_ttl_seconds"),
+    "APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS": ("app", "source_bundle_cache_ttl_seconds"),
     "APP_CACHE_TTL": ("app", "cache_ttl_seconds"),
+    "APP_SMART_CACHE_TTL_SECONDS": ("app", "smart_cache_ttl_seconds"),
+    "APP_SG_SES_DEVICE_CACHE_TTL_SECONDS": ("app", "sg_ses_device_cache_ttl_seconds"),
     "RELEASE_CHECK_ENABLED": ("app", "release_check_enabled"),
     "RELEASE_CHECK_REPO": ("app", "release_check_repo"),
     "RELEASE_CHECK_INTERVAL_SECONDS": ("app", "release_check_interval_seconds"),
@@ -460,6 +474,51 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
 }
 
 
+RUNTIME_BEHAVIOR_APP_FIELDS: dict[str, dict[str, Any]] = {
+    "refresh_interval_seconds": {
+        "label": "UI Auto Refresh",
+        "description": "Default browser auto-refresh cadence.",
+        "env": ("APP_REFRESH_INTERVAL",),
+        "minimum": 5,
+        "maximum": 3600,
+        "unit": "seconds",
+    },
+    "snapshot_cache_ttl_seconds": {
+        "label": "Snapshot Cache TTL",
+        "description": "Fresh-cache window before stale-first background refresh begins.",
+        "env": ("APP_SNAPSHOT_CACHE_TTL_SECONDS", "APP_CACHE_TTL"),
+        "minimum": 0,
+        "maximum": 3600,
+        "unit": "seconds",
+    },
+    "source_bundle_cache_ttl_seconds": {
+        "label": "Source Bundle Cache TTL",
+        "description": "Reuse window for expensive API, SSH, and BMC source reads.",
+        "env": ("APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS", "APP_CACHE_TTL"),
+        "minimum": 0,
+        "maximum": 3600,
+        "unit": "seconds",
+    },
+    "smart_cache_ttl_seconds": {
+        "label": "SMART Cache TTL",
+        "description": "Reuse window for per-slot SMART detail before stale-fill refresh.",
+        "env": ("APP_SMART_CACHE_TTL_SECONDS",),
+        "minimum": 0,
+        "maximum": 86400,
+        "unit": "seconds",
+    },
+    "sg_ses_device_cache_ttl_seconds": {
+        "label": "SES Device Path Cache TTL",
+        "description": "Reuse window for validated sg_ses device paths before rediscovery.",
+        "env": ("APP_SG_SES_DEVICE_CACHE_TTL_SECONDS",),
+        "minimum": 0,
+        "maximum": 86400,
+        "unit": "seconds",
+    },
+}
+RUNTIME_BEHAVIOR_LEGACY_APP_FIELDS: set[str] = {"cache_ttl_seconds"}
+
+
 def _parse_scalar(value: str) -> Any:
     lowered = value.strip().lower()
     if lowered in {"true", "false"}:
@@ -506,6 +565,195 @@ def _load_yaml_config(config_path: Path) -> dict[str, Any]:
         return loaded
 
 
+def _load_runtime_overrides_config(config_path: Path) -> dict[str, Any]:
+    loaded = _load_yaml_config(config_path)
+    app_payload = loaded.get("app")
+    if not isinstance(app_payload, dict):
+        return {}
+    allowed_app_fields = set(RUNTIME_BEHAVIOR_APP_FIELDS) | RUNTIME_BEHAVIOR_LEGACY_APP_FIELDS
+    filtered_app = {
+        key: value
+        for key, value in app_payload.items()
+        if key in allowed_app_fields
+    }
+    if not filtered_app:
+        return {}
+    return {"app": filtered_app}
+
+
+def _has_path(source: dict[str, Any], path: tuple[str, ...]) -> bool:
+    cursor: Any = source
+    for key in path:
+        if not isinstance(cursor, dict) or key not in cursor:
+            return False
+        cursor = cursor[key]
+    return True
+
+
+def _get_path_value(source: dict[str, Any], path: tuple[str, ...]) -> Any:
+    cursor: Any = source
+    for key in path:
+        if not isinstance(cursor, dict):
+            return None
+        cursor = cursor.get(key)
+    return cursor
+
+
+def _explicit_app_field(source: dict[str, Any], field_name: str) -> bool:
+    return _has_path(source, ("app", field_name))
+
+
+def _apply_legacy_cache_ttl_compat(
+    merged: dict[str, Any],
+    yaml_config: dict[str, Any],
+    runtime_overrides: dict[str, Any],
+) -> None:
+    app_payload = merged.setdefault("app", {})
+    legacy_explicit = (
+        _explicit_app_field(yaml_config, "cache_ttl_seconds")
+        or _explicit_app_field(runtime_overrides, "cache_ttl_seconds")
+        or os.getenv("APP_CACHE_TTL") is not None
+    )
+    if not legacy_explicit:
+        return
+
+    legacy_value = app_payload.get("cache_ttl_seconds")
+    if (
+        not _explicit_app_field(yaml_config, "snapshot_cache_ttl_seconds")
+        and not _explicit_app_field(runtime_overrides, "snapshot_cache_ttl_seconds")
+        and os.getenv("APP_SNAPSHOT_CACHE_TTL_SECONDS") is None
+    ):
+        app_payload["snapshot_cache_ttl_seconds"] = legacy_value
+    if (
+        not _explicit_app_field(yaml_config, "source_bundle_cache_ttl_seconds")
+        and not _explicit_app_field(runtime_overrides, "source_bundle_cache_ttl_seconds")
+        and os.getenv("APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS") is None
+    ):
+        app_payload["source_bundle_cache_ttl_seconds"] = legacy_value
+
+
+def _runtime_behavior_env_owner(
+    field_name: str,
+    yaml_config: dict[str, Any] | None = None,
+    runtime_overrides: dict[str, Any] | None = None,
+) -> str | None:
+    metadata = RUNTIME_BEHAVIOR_APP_FIELDS.get(field_name) or {}
+    for env_name in metadata.get("env") or ():
+        normalized_env_name = str(env_name)
+        if os.getenv(normalized_env_name) is None:
+            continue
+        if (
+            normalized_env_name == "APP_CACHE_TTL"
+            and field_name in {"snapshot_cache_ttl_seconds", "source_bundle_cache_ttl_seconds"}
+            and (
+                _explicit_app_field(yaml_config or {}, field_name)
+                or _explicit_app_field(runtime_overrides or {}, field_name)
+            )
+        ):
+            continue
+        return normalized_env_name
+    return None
+
+
+def _runtime_behavior_source_detail(
+    *,
+    field_name: str,
+    yaml_config: dict[str, Any],
+    runtime_overrides: dict[str, Any],
+    env_name: str | None,
+) -> str:
+    if env_name:
+        return env_name
+    if _explicit_app_field(runtime_overrides, field_name):
+        return "runtime-overrides.yaml"
+    if _explicit_app_field(yaml_config, field_name):
+        return "config.yaml"
+    if field_name in {"snapshot_cache_ttl_seconds", "source_bundle_cache_ttl_seconds"} and _explicit_app_field(
+        yaml_config,
+        "cache_ttl_seconds",
+    ):
+        return "config.yaml cache_ttl_seconds"
+    return "defaults"
+
+
+def runtime_behavior_settings_payload(settings: Settings | None = None) -> dict[str, Any]:
+    effective_settings = settings or get_settings()
+    yaml_config = _load_yaml_config(Path(effective_settings.config_file))
+    runtime_overrides_path = Path(effective_settings.paths.runtime_overrides_file)
+    runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
+    fields: list[dict[str, Any]] = []
+    for field_name, metadata in RUNTIME_BEHAVIOR_APP_FIELDS.items():
+        env_name = _runtime_behavior_env_owner(field_name, yaml_config, runtime_overrides)
+        value = getattr(effective_settings.app, field_name)
+        owner = ".env" if env_name else "admin"
+        fields.append(
+            {
+                "key": field_name,
+                "label": metadata["label"],
+                "description": metadata["description"],
+                "value": value,
+                "unit": metadata["unit"],
+                "minimum": metadata["minimum"],
+                "maximum": metadata["maximum"],
+                "owner": owner,
+                "source": _runtime_behavior_source_detail(
+                    field_name=field_name,
+                    yaml_config=yaml_config,
+                    runtime_overrides=runtime_overrides,
+                    env_name=env_name,
+                ),
+                "writable": owner == "admin",
+            }
+        )
+    return {
+        "owner_labels": {
+            "admin": "Admin",
+            ".env": ".env",
+        },
+        "override_file": str(runtime_overrides_path),
+        "fields": fields,
+    }
+
+
+def save_runtime_behavior_overrides(settings: Settings, values: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(values, dict):
+        raise ValueError("Runtime behavior settings payload must be a mapping.")
+
+    yaml_config = _load_yaml_config(Path(settings.config_file))
+    runtime_overrides_path = Path(settings.paths.runtime_overrides_file)
+    runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
+    clean_values: dict[str, int] = {}
+    for field_name, raw_value in values.items():
+        metadata = RUNTIME_BEHAVIOR_APP_FIELDS.get(field_name)
+        if metadata is None:
+            raise ValueError(f"Unknown runtime behavior setting '{field_name}'.")
+        env_name = _runtime_behavior_env_owner(field_name, yaml_config, runtime_overrides)
+        if env_name:
+            raise ValueError(f"{metadata['label']} is owned by .env ({env_name}) and cannot be saved from admin.")
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{metadata['label']} must be a whole number of seconds.") from exc
+        minimum = int(metadata["minimum"])
+        maximum = int(metadata["maximum"])
+        if value < minimum or value > maximum:
+            raise ValueError(f"{metadata['label']} must be between {minimum} and {maximum} seconds.")
+        clean_values[field_name] = value
+
+    app_payload = runtime_overrides.setdefault("app", {})
+    if not isinstance(app_payload, dict):
+        raise ValueError(f"{runtime_overrides_path} must contain an 'app' mapping if it defines app overrides.")
+    app_payload.update(clean_values)
+
+    runtime_overrides_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = runtime_overrides_path.with_suffix(".tmp")
+    with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+        yaml.safe_dump(runtime_overrides, handle, sort_keys=False)
+    temp_path.replace(runtime_overrides_path)
+    get_settings.cache_clear()
+    return runtime_behavior_settings_payload(get_settings())
+
+
 def _load_profile_yaml(profile_path: Path) -> dict[str, Any]:
     if not profile_path.exists():
         return {}
@@ -536,7 +784,7 @@ def _apply_config_path_relative_defaults(
     merged["config_file"] = derived["config_file"]
 
     merged_paths = merged.setdefault("paths", {})
-    for key in ("mapping_file", "log_file", "profile_file", "slot_detail_cache_file"):
+    for key in ("mapping_file", "log_file", "profile_file", "slot_detail_cache_file", "runtime_overrides_file"):
         if key not in merged_paths or merged_paths.get(key) in {defaults["paths"][key], legacy[key]}:
             merged_paths[key] = derived[key]
 
@@ -683,13 +931,17 @@ def get_settings() -> Settings:
     defaults = Settings().model_dump()
     config_path = Path(os.getenv("APP_CONFIG_PATH", defaults["config_file"]))
     yaml_config = _load_yaml_config(config_path)
+    runtime_overrides_path = Path(_derive_runtime_layout_paths(config_path)["runtime_overrides_file"])
+    runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
     merged = _deep_merge(defaults, yaml_config)
+    merged = _deep_merge(merged, runtime_overrides)
 
     for env_name, target_path in ENV_OVERRIDES.items():
         raw_value = os.getenv(env_name)
         if raw_value is None:
             continue
         _set_path_value(merged, target_path, _parse_scalar(raw_value))
+    _apply_legacy_cache_ttl_compat(merged, yaml_config, runtime_overrides)
 
     merged = _apply_config_path_relative_defaults(
         merged,

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
+from history_service import main as history_main
 from history_service.collector import HistoryCollector, ScopeSnapshot
 from history_service.config import HistorySettings
-from history_service.domain import MetricSample, SlotStateRecord, build_slot_events
+from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
 from history_service.store import HistoryStore
 
 
@@ -91,6 +95,23 @@ class HistoryDomainTests(unittest.TestCase):
 
 
 class HistoryConfigTests(unittest.TestCase):
+    def test_history_settings_default_request_timeout_allows_slow_live_inventory(self) -> None:
+        self.assertEqual(HistorySettings().request_timeout_seconds, 45)
+
+    def test_history_settings_default_failure_backoff_is_bounded(self) -> None:
+        settings = HistorySettings()
+
+        self.assertEqual(settings.failure_backoff_initial_seconds, 30)
+        self.assertEqual(settings.failure_backoff_max_seconds, 900)
+
+    def test_history_settings_default_backup_interval_matches_slow_interval(self) -> None:
+        settings = HistorySettings()
+
+        self.assertEqual(settings.backup_interval_seconds, settings.slow_interval_seconds)
+
+    def test_history_settings_fast_collection_uses_cached_inventory_by_default(self) -> None:
+        self.assertFalse(HistorySettings().force_inventory_on_fast_collection)
+
     def test_history_settings_uses_sqlite_parent_for_backup_dirs_when_sqlite_path_changes(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         settings = HistorySettings(sqlite_path=str(temp_dir / "history.db"))
@@ -105,7 +126,222 @@ class HistoryConfigTests(unittest.TestCase):
         self.assertEqual(settings.long_term_backup_dir, str(temp_dir / "backups" / "long-term"))
 
 
+class HistoryDashboardRouteTests(unittest.TestCase):
+    def test_dashboard_renders_fast_and_full_refresh_controls(self) -> None:
+        markup = history_main.render_dashboard(
+            {"collector_running": True},
+            {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
+            [],
+            app_version="0.test",
+            release_status={"summary": "dev build"},
+        )
+
+        self.assertIn('id="history-refresh-fast"', markup)
+        self.assertIn('id="history-refresh-full"', markup)
+        self.assertIn("/api/history/refresh?mode=", markup)
+        self.assertIn("const body = await response.text();", markup)
+        self.assertIn("JSON.parse(body)", markup)
+        self.assertIn("Next background pass", markup)
+        self.assertIn("Background backoff", markup)
+        self.assertIn("Last collection duration", markup)
+        self.assertIn("Last collection inventory", markup)
+        self.assertIn("DB Size", markup)
+        self.assertIn("collector-activity-banner", markup)
+        self.assertIn("pollCollectorStatus", markup)
+        self.assertIn("pollOverviewStatus", markup)
+        self.assertIn("__HISTORY_DASHBOARD_POLL", markup)
+        self.assertIn('id="status-current-collection"', markup)
+        self.assertIn('id="collector-state-value"', markup)
+        self.assertIn('id="tracked-scopes-body"', markup)
+
+    def test_dashboard_renders_collection_activity_banner_state(self) -> None:
+        markup = history_main.render_dashboard(
+            {
+                "collector_running": True,
+                "collection_running": True,
+                "collection_kind": "background",
+                "collection_activity": "collecting SMART metrics for Archive CORE / Front Shelf (1/2)",
+                "collection_elapsed_seconds": 42,
+            },
+            {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
+            [],
+            app_version="0.test",
+            database_size_bytes=1536,
+        )
+
+        self.assertIn("collecting SMART metrics", markup)
+        self.assertIn("1.5 KiB", markup)
+        self.assertIn("History ${kind} collection running", markup)
+        self.assertIn("renderCollectorStatus(payload)", markup)
+        self.assertIn("renderOverview(initialOverviewPayload)", markup)
+
+    def test_history_refresh_endpoint_forces_fast_collection(self) -> None:
+        route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
+
+        with (
+            patch.object(history_main.collector, "run_once", new_callable=AsyncMock) as run_once,
+            patch.object(history_main.collector, "status", return_value={"collector_running": True}),
+            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "list_scopes", return_value=[]),
+        ):
+            payload = asyncio.run(route.endpoint(mode="fast"))
+
+        run_once.assert_awaited_once_with(
+            force_fast=True,
+            force_slow=False,
+            include_due_intervals=False,
+            cached_root_only=True,
+        )
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["mode"], "fast")
+        self.assertFalse(payload["counts_exact"])
+
+    def test_history_refresh_endpoint_forces_full_collection(self) -> None:
+        route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
+
+        with (
+            patch.object(history_main.collector, "run_once", new_callable=AsyncMock) as run_once,
+            patch.object(history_main.collector, "status", return_value={"collector_running": True}),
+            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "list_scopes", return_value=[]),
+        ):
+            payload = asyncio.run(route.endpoint(mode="full"))
+
+        run_once.assert_awaited_once_with(
+            force_fast=True,
+            force_slow=True,
+            include_due_intervals=False,
+            cached_root_only=False,
+        )
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["mode"], "full")
+
+    def test_history_refresh_endpoint_returns_json_error_on_collection_failure(self) -> None:
+        route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
+
+        with (
+            patch.object(
+                history_main.collector,
+                "run_once",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("POST http://enclosure-ui:8000/api/slots/smart-batch timed out after 45s"),
+            ) as run_once,
+            patch.object(
+                history_main.collector,
+                "status",
+                return_value={
+                    "collector_running": True,
+                    "last_error": "POST http://enclosure-ui:8000/api/slots/smart-batch timed out after 45s",
+                },
+            ),
+            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "list_scopes", return_value=[]),
+            patch.object(history_main.logger, "exception"),
+        ):
+            response = asyncio.run(route.endpoint(mode="full"))
+
+        run_once.assert_awaited_once_with(
+            force_fast=True,
+            force_slow=True,
+            include_due_intervals=False,
+            cached_root_only=False,
+        )
+        self.assertEqual(response.status_code, 500)
+        payload = json.loads(response.body)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["mode"], "full")
+        self.assertIn("timed out after 45s", payload["detail"])
+        self.assertFalse(payload["counts_exact"])
+
+    def test_history_refresh_endpoint_reports_existing_collection_as_conflict(self) -> None:
+        route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
+
+        with (
+            patch.object(type(history_main.collector), "collection_running", new_callable=PropertyMock, return_value=True),
+            patch.object(history_main.collector, "run_once", new_callable=AsyncMock) as run_once,
+            patch.object(
+                history_main.collector,
+                "status",
+                return_value={"collector_running": True, "collection_running": True},
+            ),
+            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "list_scopes", return_value=[]),
+        ):
+            response = asyncio.run(route.endpoint(mode="full"))
+
+        run_once.assert_not_awaited()
+        self.assertEqual(response.status_code, 409)
+        payload = json.loads(response.body)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["mode"], "full")
+        self.assertIn("already running", payload["detail"])
+
+    def test_history_overview_includes_database_size(self) -> None:
+        route = next(route for route in history_main.app.routes if route.path == "/api/history/overview")
+
+        with (
+            patch.object(history_main.collector, "status", return_value={"collector_running": True}),
+            patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
+            patch.object(history_main.store, "database_size_bytes", return_value=4096),
+            patch.object(history_main.store, "list_scopes", return_value=[]),
+        ):
+            payload = asyncio.run(route.endpoint(exact_counts=False))
+
+        self.assertEqual(payload["database"]["size_bytes"], 4096)
+
+    def test_history_fetch_json_timeout_reports_url_and_timeout(self) -> None:
+        collector = HistoryCollector(
+            HistorySettings(source_base_url="http://enclosure-ui:8000", request_timeout_seconds=7),
+            MagicMock(),
+        )
+
+        with patch("history_service.collector.urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(RuntimeError) as captured:
+                collector._fetch_json_sync(
+                    "/api/slots/smart-batch",
+                    {"system_id": "scale-a", "fresh": "true"},
+                    "POST",
+                    b'{"slots":[1]}',
+                    {"Content-Type": "application/json"},
+                )
+
+        self.assertIn(
+            "POST http://enclosure-ui:8000/api/slots/smart-batch?system_id=scale-a&fresh=true timed out after 7s",
+            str(captured.exception),
+        )
+
+
 class HistoryStoreTests(unittest.TestCase):
+    def test_database_size_bytes_includes_wal_and_shm_files(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        store = HistoryStore(str(db_path))
+        base_size = db_path.stat().st_size
+        Path(f"{db_path}-wal").write_bytes(b"w" * 7)
+        Path(f"{db_path}-shm").write_bytes(b"s" * 11)
+
+        self.assertEqual(store.database_size_bytes(), base_size + 18)
+
+    def test_latest_backup_snapshot_at_uses_newest_rotated_backup(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        backup_dir = temp_dir / "backups"
+        backup_dir.mkdir()
+        store = HistoryStore(str(db_path))
+        older = backup_dir / "history-20260515T010000Z.sqlite3"
+        newer = backup_dir / "history-20260515T020000Z.sqlite3"
+        older.write_bytes(b"older")
+        newer.write_bytes(b"newer")
+        older_time = datetime(2026, 5, 15, 1, 0, tzinfo=timezone.utc).timestamp()
+        newer_time = datetime(2026, 5, 15, 2, 0, tzinfo=timezone.utc).timestamp()
+        os.utime(older, (older_time, older_time))
+        os.utime(newer, (newer_time, newer_time))
+
+        self.assertEqual(
+            store.latest_backup_snapshot_at(backup_dir),
+            datetime(2026, 5, 15, 2, 0, tzinfo=timezone.utc),
+        )
+
     def test_store_persists_scope_events_and_metrics(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
@@ -189,6 +425,91 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(counts["tracked_slots"], 1)
         self.assertEqual(counts["event_count"], 1)
         self.assertEqual(counts["metric_sample_count"], 1)
+
+    def test_scope_history_applies_since_window_before_metric_rank(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid="eui.000000000000001000a075012b91c7cf",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+            persistent_id_label="EUI64",
+            logical_unit_id="0x5000cca27c7f0005",
+            sas_address="0x5000cca27c7f1005",
+        )
+        store.upsert_slot_state(record, "2026-04-16T22:05:00+00:00")
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-15T22:10:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name="temperature_c",
+                    value_integer=29,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                    gptid="eui.000000000000001000a075012b91c7cf",
+                    persistent_id_label="EUI64",
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
+                ),
+                MetricSample(
+                    observed_at="2026-04-16T22:10:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name="temperature_c",
+                    value_integer=31,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                    gptid="eui.000000000000001000a075012b91c7cf",
+                    persistent_id_label="EUI64",
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
+                ),
+            ]
+        )
+
+        payload = store.list_scope_history(
+            "archive-core",
+            "enc-a",
+            slots=[5],
+            metric_limits={"temperature_c": 10},
+            since="2026-04-16T00:00:00+00:00",
+        )
+
+        self.assertEqual([sample["value"] for sample in payload[5]["metrics"]["temperature_c"]], [31])
+        self.assertEqual(payload[5]["sample_counts"]["temperature_c"], 1)
+        self.assertEqual(payload[5]["latest_values"]["temperature_c"], 31)
 
     def test_store_fast_overview_uses_estimated_activity_counts(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -1616,6 +1937,84 @@ class HistoryStoreTests(unittest.TestCase):
 
 
 class HistoryCollectorTests(unittest.TestCase):
+    def test_background_startup_collection_is_fast_only(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = MagicMock()
+        store.estimated_counts.return_value = {}
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+
+        async def run_once(**_: object) -> None:
+            collector.last_success_at = isoformat_utc()
+            collector._stopping.set()
+
+        collector.run_once = AsyncMock(side_effect=run_once)  # type: ignore[method-assign]
+
+        with patch("history_service.collector.observe_history_collection_run"):
+            asyncio.run(collector._run_loop())
+
+        collector.run_once.assert_awaited_once_with(  # type: ignore[attr-defined]
+            force_fast=True,
+            force_slow=False,
+            include_due_intervals=False,
+            cached_root_only=True,
+            collection_kind="background",
+        )
+
+    def test_background_failure_backoff_grows_and_caps(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                failure_backoff_initial_seconds=5,
+                failure_backoff_max_seconds=12,
+                startup_grace_seconds=0,
+            ),
+            MagicMock(),
+        )
+        now = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+        collector._record_background_failure(now)
+        self.assertEqual(collector.background_consecutive_failures, 1)
+        self.assertEqual(collector.background_backoff_until, now + timedelta(seconds=5))
+
+        collector._record_background_failure(now + timedelta(seconds=5))
+        self.assertEqual(collector.background_consecutive_failures, 2)
+        self.assertEqual(collector.background_backoff_until, now + timedelta(seconds=15))
+
+        collector._record_background_failure(now + timedelta(seconds=15))
+        self.assertEqual(collector.background_consecutive_failures, 3)
+        self.assertEqual(collector.background_backoff_until, now + timedelta(seconds=27))
+        self.assertEqual(collector.next_collection_at, collector.background_backoff_until)
+        self.assertGreater(collector.status()["background_backoff_seconds_remaining"], 0)
+
+    def test_run_once_success_clears_background_failure_backoff(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        collector._record_background_failure(datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc))
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once())
+
+        self.assertEqual(collector.background_consecutive_failures, 0)
+        self.assertIsNone(collector.background_backoff_until)
+        self.assertEqual(collector.background_backoff_seconds_remaining, 0)
+
     def test_record_slot_changes_backfills_extended_state_without_event_noise(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
@@ -1762,6 +2161,319 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(storage_scope.snapshot["slots"][0]["logical_unit_id"], "0x5000c500abcd0000")
         self.assertEqual(storage_scope.snapshot["slots"][0]["sas_address"], "0x5000c500abcd0001")
         self.assertEqual(storage_scope.snapshot["storage_view_backing_enclosure_id"], "enc-a")
+        self.assertEqual(
+            collector._fetch_inventory.await_args_list[0].kwargs,  # type: ignore[attr-defined]
+            {"force": True},
+        )
+        self.assertEqual(
+            collector._fetch_inventory.await_args_list[1].kwargs,  # type: ignore[attr-defined]
+            {"system_id": "archive-core", "force": True},
+        )
+        self.assertEqual(
+            collector._fetch_storage_views.await_args.kwargs,  # type: ignore[attr-defined]
+            {"system_id": "archive-core", "force": True},
+        )
+
+    def test_enumerate_scopes_can_use_cached_inventory_for_lazy_fast_passes(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        root_snapshot = {
+            "systems": [
+                {
+                    "id": "archive-core",
+                    "label": "Archive CORE",
+                }
+            ]
+        }
+        system_snapshot = {
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+            "selected_system_platform": "core",
+            "sources": {
+                "api": {
+                    "enabled": True,
+                    "ok": True,
+                    "message": "TrueNAS API reachable.",
+                }
+            },
+            "enclosures": [],
+        }
+
+        collector._fetch_inventory = AsyncMock(side_effect=[root_snapshot, system_snapshot])  # type: ignore[method-assign]
+        collector._fetch_storage_views = AsyncMock(return_value={"system_label": "Archive CORE", "views": []})  # type: ignore[method-assign]
+
+        scopes = asyncio.run(collector._enumerate_scopes(force_inventory=False))
+
+        self.assertEqual(len(scopes), 1)
+        self.assertEqual(
+            collector._fetch_inventory.await_args_list[0].kwargs,  # type: ignore[attr-defined]
+            {"force": False},
+        )
+        self.assertEqual(
+            collector._fetch_inventory.await_args_list[1].kwargs,  # type: ignore[attr-defined]
+            {"system_id": "archive-core", "force": False},
+        )
+        self.assertEqual(
+            collector._fetch_storage_views.await_args.kwargs,  # type: ignore[attr-defined]
+            {"system_id": "archive-core", "force": False},
+        )
+
+    def test_enumerate_scopes_cached_root_only_does_not_walk_all_systems(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        root_snapshot = {
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+            "selected_enclosure_id": "front",
+            "selected_enclosure_label": "Front 24 Bay",
+            "systems": [
+                {"id": "archive-core", "label": "Archive CORE"},
+                {"id": "unvr-pro", "label": "UniFi UNVR Pro"},
+            ],
+            "enclosures": [
+                {"id": "front", "label": "Front 24 Bay"},
+                {"id": "rear", "label": "Rear 12 Bay"},
+            ],
+            "slots": [],
+        }
+        collector._fetch_inventory = AsyncMock(return_value=root_snapshot)  # type: ignore[method-assign]
+        collector._fetch_storage_views = AsyncMock(return_value={})  # type: ignore[method-assign]
+
+        scopes = asyncio.run(collector._enumerate_scopes(force_inventory=False, cached_root_only=True))
+
+        self.assertEqual(len(scopes), 1)
+        self.assertEqual(scopes[0].system_id, "archive-core")
+        self.assertEqual(scopes[0].enclosure_id, "front")
+        collector._fetch_inventory.assert_awaited_once_with(force=False)  # type: ignore[attr-defined]
+        collector._fetch_storage_views.assert_not_awaited()  # type: ignore[attr-defined]
+
+    def test_run_once_fast_collection_uses_cached_inventory_and_records_timings(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        collector.last_fast_metrics_at = collector.started_at
+        collector.last_slow_metrics_at = collector.started_at
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once(force_fast=True))
+
+        collector._enumerate_scopes.assert_awaited_once_with(force_inventory=False)  # type: ignore[attr-defined]
+        status = collector.status()
+        self.assertFalse(status["last_collection_inventory_forced"])
+        self.assertIsNotNone(status["last_collection_duration_seconds"])
+        self.assertIn(
+            "enumerate.scopes",
+            [entry["stage"] for entry in status["collection_stage_timings"]],
+        )
+
+    def test_manual_fast_collection_ignores_due_slow_interval(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False, cached_root_only=True))
+
+        collector._enumerate_scopes.assert_awaited_once_with(  # type: ignore[attr-defined]
+            force_inventory=False,
+            cached_root_only=True,
+        )
+        status = collector.status()
+        self.assertFalse(status["last_collection_inventory_forced"])
+        self.assertIsNotNone(collector.last_fast_metrics_at)
+        self.assertIsNone(collector.last_slow_metrics_at)
+
+    def test_run_once_full_collection_forces_inventory(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        collector.last_fast_metrics_at = collector.started_at
+        collector.last_slow_metrics_at = collector.started_at
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once(force_fast=True, force_slow=True))
+
+        collector._enumerate_scopes.assert_awaited_once_with(force_inventory=True)  # type: ignore[attr-defined]
+        self.assertTrue(collector.status()["last_collection_inventory_forced"])
+
+    def test_run_once_records_smart_failure_without_failing_collection(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.create_backup = MagicMock(return_value=None)  # type: ignore[method-assign]
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                ScopeSnapshot(
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    snapshot={
+                        "selected_system_id": "archive-core",
+                        "selected_system_label": "Archive CORE",
+                        "selected_enclosure_id": "enc-a",
+                        "selected_enclosure_label": "Front Shelf",
+                        "slots": [
+                            {
+                                "slot": 0,
+                                "present": True,
+                                "serial": "S1",
+                                "device_name": "da0",
+                                "state": "OK",
+                            }
+                        ],
+                    },
+                )
+            ]
+        )
+        collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("POST http://enclosure-ui:8000/api/slots/smart-batch timed out after 45s")
+        )
+
+        asyncio.run(collector.run_once(force_slow=True, include_due_intervals=False))
+
+        status = collector.status()
+        self.assertIsNone(status["last_error"])
+        self.assertIsNotNone(status["last_success_at"])
+        self.assertIsNotNone(status["last_slow_metrics_at"])
+        failed_stage = next(entry for entry in status["collection_stage_timings"] if entry["stage"] == "smart.failed")
+        self.assertEqual(failed_stage["system_id"], "archive-core")
+        self.assertTrue(failed_stage["force_fresh"])
+        self.assertIn("timed out", failed_stage["error"])
+
+    def test_run_once_skips_recent_history_backup_during_slow_collection(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                backup_interval_seconds=3600,
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        recent_backup_at = datetime.now(timezone.utc)
+        store.latest_backup_snapshot_at = MagicMock(return_value=recent_backup_at)  # type: ignore[method-assign]
+        store.create_backup = MagicMock()  # type: ignore[method-assign]
+        collector.last_fast_metrics_at = collector.started_at
+        collector.last_slow_metrics_at = collector.started_at
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once(force_slow=True))
+
+        store.create_backup.assert_not_called()  # type: ignore[attr-defined]
+        status = collector.status()
+        self.assertEqual(status["last_backup_at"], isoformat_utc(recent_backup_at))
+        self.assertIn(
+            "db.backup.skipped",
+            [entry["stage"] for entry in status["collection_stage_timings"]],
+        )
+
+    def test_fetch_inventory_omits_force_param_when_cached_inventory_requested(self) -> None:
+        collector = HistoryCollector(HistorySettings(source_base_url="http://enclosure-ui:8000"), MagicMock())
+        collector._fetch_json = AsyncMock(return_value={})  # type: ignore[method-assign]
+
+        asyncio.run(collector._fetch_inventory(system_id="scale-a", enclosure_id="front", force=False))
+
+        collector._fetch_json.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "/api/inventory",
+            params={
+                "system_id": "scale-a",
+                "enclosure_id": "front",
+            },
+        )
+
+    def test_enumerate_scopes_skips_timed_out_saved_system(self) -> None:
+        collector = HistoryCollector(HistorySettings(source_base_url="http://enclosure-ui:8000"), MagicMock())
+        root_snapshot = {
+            "systems": [
+                {"id": "slow-system", "label": "Slow System"},
+                {"id": "archive-core", "label": "Archive CORE"},
+            ],
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+        }
+        archive_snapshot = {
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+            "selected_enclosure_id": "enc-a",
+            "selected_enclosure_label": "Front Shelf",
+            "enclosures": [{"id": "enc-a", "label": "Front Shelf"}],
+            "slots": [{"slot": 0, "present": True, "serial": "S1"}],
+        }
+
+        async def fetch_inventory(
+            system_id: str | None = None,
+            enclosure_id: str | None = None,
+            *,
+            force: bool = True,
+        ) -> dict[str, object]:
+            if system_id is None:
+                return root_snapshot
+            if system_id == "slow-system":
+                raise RuntimeError("GET http://enclosure-ui:8000/api/inventory?force=true timed out after 45s")
+            self.assertEqual(system_id, "archive-core")
+            self.assertIsNone(enclosure_id)
+            self.assertTrue(force)
+            return archive_snapshot
+
+        collector._fetch_inventory = fetch_inventory  # type: ignore[method-assign]
+        collector._enumerate_storage_view_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        scopes = asyncio.run(collector._enumerate_scopes(force_inventory=True))
+
+        self.assertEqual(len(scopes), 1)
+        self.assertEqual(scopes[0].system_id, "archive-core")
+        stages = collector.current_collection_stage_timings
+        self.assertIn("inventory.system_failed", [entry["stage"] for entry in stages])
+        failed_stage = next(entry for entry in stages if entry["stage"] == "inventory.system_failed")
+        self.assertEqual(failed_stage["system_id"], "slow-system")
+        self.assertIn("timed out", failed_stage["error"])
 
     def test_run_once_records_inventory_bound_storage_view_metrics(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -1812,7 +2524,7 @@ class HistoryCollectorTests(unittest.TestCase):
             ],
         }
 
-        async def enumerate_scopes() -> list[ScopeSnapshot]:
+        async def enumerate_scopes(*, force_inventory: bool = True) -> list[ScopeSnapshot]:
             return [
                 ScopeSnapshot(
                     system_id="archive-core",
@@ -1922,6 +2634,38 @@ class HistoryCollectorTests(unittest.TestCase):
             collector._fetch_json.await_args.kwargs["method"],  # type: ignore[attr-defined]
             "POST",
         )
+        self.assertIsNone(collector._fetch_json.await_args.kwargs["timeout_seconds"])  # type: ignore[attr-defined]
+
+    def test_fetch_smart_summaries_uses_short_timeout_for_cached_batch(self) -> None:
+        collector = HistoryCollector(
+            HistorySettings(source_base_url="http://enclosure-ui:8000", request_timeout_seconds=45),
+            MagicMock(),
+        )
+        scope = ScopeSnapshot(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            snapshot={
+                "selected_system_id": "archive-core",
+                "selected_system_label": "Archive CORE",
+                "selected_enclosure_id": "enc-a",
+                "selected_enclosure_label": "Front Shelf",
+                "slots": [],
+            },
+        )
+        collector._fetch_json = AsyncMock(return_value={"summaries": []})  # type: ignore[method-assign]
+
+        asyncio.run(collector._fetch_smart_summaries(scope, [5, 6], force_fresh=False))
+
+        self.assertEqual(
+            collector._fetch_json.await_args.kwargs["params"],  # type: ignore[attr-defined]
+            {
+                "system_id": "archive-core",
+                "enclosure_id": "enc-a",
+            },
+        )
+        self.assertEqual(collector._fetch_json.await_args.kwargs["timeout_seconds"], 5)  # type: ignore[attr-defined]
 
     def test_run_once_force_slow_recollects_even_when_slow_interval_not_due(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -1975,7 +2719,7 @@ class HistoryCollectorTests(unittest.TestCase):
             ],
         }
 
-        async def enumerate_scopes() -> list[ScopeSnapshot]:
+        async def enumerate_scopes(*, force_inventory: bool = True) -> list[ScopeSnapshot]:
             return [
                 ScopeSnapshot(
                     system_id="archive-core",
@@ -2103,7 +2847,7 @@ class HistoryCollectorTests(unittest.TestCase):
 
         store.upsert_slot_state(baseline, "2026-04-17T05:52:26+00:00")
 
-        async def enumerate_scopes() -> list[ScopeSnapshot]:
+        async def enumerate_scopes(*, force_inventory: bool = True) -> list[ScopeSnapshot]:
             return [
                 ScopeSnapshot(
                     system_id="archive-core",
@@ -2201,7 +2945,7 @@ class HistoryCollectorTests(unittest.TestCase):
 
         store.upsert_slot_state(baseline, "2026-04-17T03:20:00+00:00")
 
-        async def enumerate_scopes() -> list[ScopeSnapshot]:
+        async def enumerate_scopes(*, force_inventory: bool = True) -> list[ScopeSnapshot]:
             return [
                 ScopeSnapshot(
                     system_id="qs-cryostorage",

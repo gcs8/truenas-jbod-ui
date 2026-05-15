@@ -554,7 +554,10 @@ class SnapshotExportService:
         generated_at = datetime.now(timezone.utc)
 
         with perf_stage("snapshot_export.collect_slot_histories", slot_count=len(snapshot.slots)):
-            raw_history_cache = await self._collect_slot_histories(snapshot)
+            raw_history_cache = await self._collect_slot_histories(
+                snapshot,
+                history_window_hours=normalized_window_hours,
+            )
         base_smart_summary_cache = {
             str(slot_number): summary
             for slot_number, summary in (smart_summary_cache or {}).items()
@@ -930,14 +933,22 @@ class SnapshotExportService:
             return f"~{minutes}m"
         return f"~{interval_seconds}s"
 
-    async def _collect_slot_histories(self, snapshot: InventorySnapshot) -> dict[str, dict[str, Any]]:
+    async def _collect_slot_histories(
+        self,
+        snapshot: InventorySnapshot,
+        *,
+        history_window_hours: int | None,
+    ) -> dict[str, dict[str, Any]]:
         if not self.history_backend.configured:
             return {}
 
         system_id = snapshot.selected_system_id
         enclosure_id = snapshot.selected_enclosure_id
         slot_numbers = [slot.slot for slot in snapshot.slots]
-        history_cache_key = self._build_history_snapshot_cache_key(snapshot)
+        history_cache_key = self._build_history_snapshot_cache_key(
+            snapshot,
+            history_window_hours=history_window_hours,
+        )
         cached_history = self._get_cached_value(self._history_cache, history_cache_key)
         if cached_history is not None:
             add_perf_metadata(
@@ -971,6 +982,7 @@ class SnapshotExportService:
             system_id=system_id,
             enclosure_id=enclosure_id,
             slots=slot_numbers,
+            window_hours=history_window_hours,
         )
         payload = {
             self._build_history_cache_key(system_id, enclosure_id, slot_number): scope_history.get(
@@ -1122,8 +1134,14 @@ class SnapshotExportService:
             ]
         )
 
-    def _build_history_snapshot_cache_key(self, snapshot: InventorySnapshot) -> str:
-        return f"history|{self._build_snapshot_signature(snapshot)}"
+    def _build_history_snapshot_cache_key(
+        self,
+        snapshot: InventorySnapshot,
+        *,
+        history_window_hours: int | None,
+    ) -> str:
+        window = history_window_hours if history_window_hours is not None else "all"
+        return f"history|window={window}|{self._build_snapshot_signature(snapshot)}"
 
     def _inline_static_assets(self, request: Request, html: str) -> str:
         inline_css = (STATIC_DIR / "style.css").read_text(encoding="utf-8")

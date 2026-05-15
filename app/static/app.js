@@ -2,6 +2,7 @@
   const bootstrap = window.APP_BOOTSTRAP || {};
   const supportedRefreshIntervals = [15, 30, 60, 300];
   const bootstrapRefreshInterval = Number(bootstrap.refreshIntervalSeconds) || 30;
+  const refreshTiming = bootstrap.refreshTiming || {};
   const SMART_BATCH_REQUEST_MAX_CONCURRENCY = Math.max(1, Number(bootstrap.smartBatchMaxConcurrency) || 12);
   const SMART_PREFETCH_DELAY_MS = Math.max(1, Number(bootstrap.smartPrefetchDelayMs) || 120);
   const SMART_PREFETCH_STRATEGY = ["auto", "single", "chunked"].includes(String(bootstrap.smartPrefetchStrategy || "").toLowerCase())
@@ -11,14 +12,25 @@
   const SMART_PREFETCH_CHUNK_SIZE = Math.max(1, Number(bootstrap.smartPrefetchChunkSize) || 24);
   const SMART_PREFETCH_BATCH_CONCURRENCY = Math.max(1, Number(bootstrap.smartPrefetchBatchConcurrency) || 2);
   const SMART_PREFETCH_STALE_MS = 15000;
-  const SMART_SUMMARY_CACHE_TTL_MS = 5 * 60 * 1000;
-  const HISTORY_STATUS_CACHE_TTL_MS = 15 * 1000;
+  const SNAPSHOT_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.snapshotCacheTtlSeconds, 10);
+  const SOURCE_BUNDLE_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.sourceBundleCacheTtlSeconds, 60);
+  const SMART_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.smartCacheTtlSeconds, 300);
+  const SG_SES_DEVICE_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.sgSesDeviceCacheTtlSeconds, 300);
+  const HISTORY_STATUS_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.historyStatusCacheTtlSeconds, 15);
+  const SMART_SUMMARY_CACHE_TTL_MS = SMART_CACHE_TTL_SECONDS * 1000;
+  const HISTORY_STATUS_CACHE_TTL_MS = HISTORY_STATUS_CACHE_TTL_SECONDS * 1000;
   const DEFAULT_HISTORY_TIMEFRAME_HOURS = 24;
   const HISTORY_UI_STORAGE_KEY = "truenas-jbod-ui.history-ui.v1";
   const EXPORT_UI_STORAGE_KEY = "truenas-jbod-ui.export-ui.v1";
   const snapshotMode = Boolean(bootstrap.snapshotMode);
   const UI_PERF_ENABLED = Boolean(bootstrap.uiPerfEnabled) && !snapshotMode;
   const UI_PERF_HISTORY_LIMIT = 6;
+
+  function positiveSeconds(value, fallbackSeconds) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric > 0 ? numeric : fallbackSeconds;
+  }
+
   const persistedHistoryUi = snapshotMode ? null : loadStoredJson(HISTORY_UI_STORAGE_KEY);
   const persistedExportUi = snapshotMode ? null : loadStoredJson(EXPORT_UI_STORAGE_KEY);
   const initialHistoryWindowHours = bootstrap.initialHistoryTimeframeHours === null
@@ -62,6 +74,10 @@
     autoRefresh: snapshotMode ? false : true,
     refreshIntervalSeconds: supportedRefreshIntervals.includes(bootstrapRefreshInterval) ? bootstrapRefreshInterval : 30,
     timerId: null,
+    timerScheduledAt: 0,
+    timerDueAt: 0,
+    timerDelayMs: 0,
+    timingTickId: null,
     identifyVerifyTimerId: null,
     refreshesInFlight: 0,
     latestRefreshToken: 0,
@@ -154,6 +170,9 @@
   const refreshButton = document.getElementById("refresh-button");
   const autoRefreshToggle = document.getElementById("auto-refresh-toggle");
   const refreshIntervalSelect = document.getElementById("refresh-interval-select");
+  const refreshTimingStrip = document.getElementById("refresh-timing-strip");
+  const refreshCountdownLabel = document.getElementById("refresh-countdown-label");
+  const refreshCountdownBar = document.getElementById("refresh-countdown-bar");
   const systemSelect = document.getElementById("system-select");
   const enclosureSelect = document.getElementById("enclosure-select");
   const lastUpdated = document.getElementById("last-updated");
@@ -164,6 +183,7 @@
   const apiStatusChip = document.getElementById("api-status-chip");
   const sshStatusChip = document.getElementById("ssh-status-chip");
   const historyStatusChip = document.getElementById("history-status-chip");
+  const cacheTimingChips = document.getElementById("cache-timing-chips");
   const statusText = document.getElementById("status-text");
   const summaryDiskCount = document.getElementById("summary-disk-count");
   const summaryPoolCount = document.getElementById("summary-pool-count");
@@ -6314,6 +6334,157 @@
     refreshButton.disabled = state.snapshotMode;
     autoRefreshToggle.disabled = state.snapshotMode;
     refreshIntervalSelect.disabled = state.snapshotMode || !state.autoRefresh;
+    renderTimingSurfaces();
+    ensureTimingTick();
+  }
+
+  function formatTimingDuration(seconds) {
+    const rounded = Math.max(0, Math.ceil(Number(seconds) || 0));
+    if (rounded < 60) {
+      return `${rounded}s`;
+    }
+    const minutes = Math.floor(rounded / 60);
+    const remainingSeconds = rounded % 60;
+    if (minutes < 60) {
+      return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+    }
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+  }
+
+  function parseTimestampMs(value) {
+    const parsed = Date.parse(value || "");
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function latestSmartCacheRequestedAt() {
+    return Object.values(state.smartSummaries || {}).reduce((latest, entry) => {
+      if (!entry?.data) {
+        return latest;
+      }
+      const requestedAt = Number(entry.requestedAt) || 0;
+      return Math.max(latest, requestedAt);
+    }, 0);
+  }
+
+  function cacheCountdownParts(startMs, ttlSeconds) {
+    const ttlMs = Math.max(0, Number(ttlSeconds) || 0) * 1000;
+    if (!startMs || ttlMs <= 0) {
+      return { remainingMs: 0, percent: 0, expired: true, label: "pending" };
+    }
+    const remainingMs = Math.max(0, startMs + ttlMs - Date.now());
+    const percent = Math.max(0, Math.min(1, remainingMs / ttlMs));
+    return {
+      remainingMs,
+      percent,
+      expired: remainingMs <= 0,
+      label: remainingMs > 0 ? formatTimingDuration(remainingMs / 1000) : "expired",
+    };
+  }
+
+  function cacheTimingDefinitions() {
+    const snapshotStartMs = parseTimestampMs(state.snapshot?.last_updated);
+    const smartStartMs = latestSmartCacheRequestedAt();
+    return [
+      {
+        key: "snapshot",
+        label: "Snapshot",
+        ttlSeconds: SNAPSHOT_CACHE_TTL_SECONDS,
+        startMs: snapshotStartMs,
+        title: "Browser-side countdown from the last accepted inventory snapshot.",
+      },
+      {
+        key: "sources",
+        label: "Sources",
+        ttlSeconds: SOURCE_BUNDLE_CACHE_TTL_SECONDS,
+        startMs: snapshotStartMs,
+        title: "Approximate API/SSH/BMC source-bundle reuse window for this view.",
+      },
+      {
+        key: "smart",
+        label: "SMART",
+        ttlSeconds: SMART_CACHE_TTL_SECONDS,
+        startMs: smartStartMs,
+        title: smartStartMs
+          ? "Countdown from the latest loaded SMART summary."
+          : "SMART cache countdown starts after summaries load.",
+      },
+      {
+        key: "ses",
+        label: "SES Paths",
+        ttlSeconds: SG_SES_DEVICE_CACHE_TTL_SECONDS,
+        startMs: snapshotStartMs,
+        title: "Approximate validated sg_ses device-path reuse window for dynamic SES discovery.",
+      },
+    ];
+  }
+
+  function renderCacheTimingChips() {
+    if (!cacheTimingChips) {
+      return;
+    }
+    cacheTimingChips.classList.toggle("hidden", state.snapshotMode);
+    if (state.snapshotMode) {
+      cacheTimingChips.innerHTML = "";
+      return;
+    }
+    cacheTimingChips.innerHTML = cacheTimingDefinitions()
+      .map((item) => {
+        const countdown = cacheCountdownParts(item.startMs, item.ttlSeconds);
+        const classes = ["cache-timing-chip", countdown.expired ? "is-expired" : ""].filter(Boolean).join(" ");
+        return `
+          <div class="${classes}" data-cache-timing-key="${escapeHtml(item.key)}" title="${escapeHtml(item.title)}">
+            <span class="cache-timing-chip-label">${escapeHtml(item.label)}</span>
+            <span class="cache-timing-chip-value">${escapeHtml(countdown.label)}</span>
+            <span class="cache-timing-chip-bar" aria-hidden="true">
+              <span style="width: ${Math.round(countdown.percent * 100)}%"></span>
+            </span>
+          </div>
+        `;
+      })
+      .join("");
+  }
+
+  function renderRefreshTiming() {
+    if (!refreshTimingStrip || !refreshCountdownLabel || !refreshCountdownBar) {
+      return;
+    }
+    refreshTimingStrip.classList.toggle("hidden", state.snapshotMode);
+    if (state.snapshotMode) {
+      return;
+    }
+    if (state.refreshesInFlight > 0) {
+      refreshCountdownLabel.textContent = "Refresh running";
+      refreshCountdownBar.style.width = "100%";
+      return;
+    }
+    if (!state.autoRefresh) {
+      refreshCountdownLabel.textContent = "Auto refresh off";
+      refreshCountdownBar.style.width = "0%";
+      return;
+    }
+    if (!state.timerDueAt || !state.timerDelayMs) {
+      refreshCountdownLabel.textContent = `Next refresh: ${formatRefreshInterval(state.refreshIntervalSeconds)}`;
+      refreshCountdownBar.style.width = "0%";
+      return;
+    }
+    const remainingMs = Math.max(0, state.timerDueAt - Date.now());
+    const progress = Math.max(0, Math.min(1, remainingMs / state.timerDelayMs));
+    refreshCountdownLabel.textContent = `Next refresh in ${formatTimingDuration(remainingMs / 1000)}`;
+    refreshCountdownBar.style.width = `${Math.round(progress * 100)}%`;
+  }
+
+  function renderTimingSurfaces() {
+    renderRefreshTiming();
+    renderCacheTimingChips();
+  }
+
+  function ensureTimingTick() {
+    if (state.snapshotMode || state.timingTickId) {
+      return;
+    }
+    state.timingTickId = window.setInterval(renderTimingSurfaces, 1000);
   }
 
   function renderSelectors() {
@@ -6861,6 +7032,10 @@
       window.clearTimeout(state.timerId);
       state.timerId = null;
     }
+    state.timerScheduledAt = 0;
+    state.timerDueAt = 0;
+    state.timerDelayMs = 0;
+    renderTimingSurfaces();
   }
 
   function scheduleAutoRefresh(delayMs = state.refreshIntervalSeconds * 1000) {
@@ -6869,8 +7044,17 @@
       return;
     }
     const waitMs = Math.max(1000, Number.isFinite(delayMs) ? delayMs : state.refreshIntervalSeconds * 1000);
+    state.timerScheduledAt = Date.now();
+    state.timerDueAt = state.timerScheduledAt + waitMs;
+    state.timerDelayMs = waitMs;
+    renderTimingSurfaces();
+    ensureTimingTick();
     state.timerId = window.setTimeout(async () => {
       state.timerId = null;
+      state.timerScheduledAt = 0;
+      state.timerDueAt = 0;
+      state.timerDelayMs = 0;
+      renderTimingSurfaces();
       if (state.refreshesInFlight > 0) {
         scheduleAutoRefresh();
         return;

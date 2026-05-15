@@ -520,6 +520,11 @@ def main() -> int:
         help="Skip the snapshot export estimate workflow when focusing on live read-path timings.",
     )
     parser.add_argument(
+        "--skip-mappings-import-roundtrip",
+        action="store_true",
+        help="Skip the mappings import roundtrip; use this for long-running real stacks where the harness must stay read-only.",
+    )
+    parser.add_argument(
         "--record-dir",
         default=str(REPO_ROOT / "data" / "perf"),
         help="Directory for latest/history perf artifacts.",
@@ -626,7 +631,7 @@ def main() -> int:
         workflows.append(("smart_batch", smart_batch))
         if len(probe_slots) > 1:
             workflows.append(("smart_prefetch_chunked", smart_prefetch_chunked))
-    if not mappings:
+    if not mappings and not args.skip_mappings_import_roundtrip:
         workflows.append(("mappings_import_roundtrip", mappings_import_roundtrip))
     if not args.skip_snapshot_export_estimate:
         workflows.append(("snapshot_export_estimate", snapshot_estimate))

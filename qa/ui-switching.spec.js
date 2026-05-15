@@ -181,6 +181,138 @@ test.describe("browser qa smoke", () => {
     }
   });
 
+  test("refresh timing strip shows cache TTLs and auto-refresh state", async ({ page }) => {
+    await gotoApp(page);
+
+    await expect(page.locator("#refresh-timing-strip")).toBeVisible();
+    await expect(page.locator("#cache-timing-chips")).toBeVisible();
+    await expect(page.locator('[data-cache-timing-key="snapshot"]')).toContainText("Snapshot");
+    await expect(page.locator('[data-cache-timing-key="sources"]')).toContainText("Sources");
+    await expect(page.locator('[data-cache-timing-key="smart"]')).toContainText("SMART");
+    await expect(page.locator('[data-cache-timing-key="ses"]')).toContainText("SES Paths");
+    await expect(page.locator(".cache-timing-chip-bar")).toHaveCount(4);
+
+    await page.locator("#refresh-interval-select").selectOption("15");
+    await expect(page.locator("#refresh-countdown-label")).toContainText(/Next refresh/);
+
+    await setAutoRefresh(page, false);
+    await expect(page.locator("#refresh-countdown-label")).toHaveText("Auto refresh off");
+
+    await setAutoRefresh(page, true);
+    await expect(page.locator("#refresh-countdown-label")).toContainText(/Next refresh/);
+  });
+
+  test("history sidecar exposes fast and full refresh actions", async ({ page }) => {
+    const historyBaseURL = process.env.PLAYWRIGHT_HISTORY_BASE_URL || "http://127.0.0.1:8081";
+    const modes = [];
+
+    await page.route("**/api/history/refresh?mode=*", async (route) => {
+      const url = new URL(route.request().url());
+      const mode = url.searchParams.get("mode");
+      modes.push(mode);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          mode,
+          detail: `History ${mode} refresh completed.`,
+        }),
+      });
+    });
+    await page.route("**/healthz", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "ok",
+          collector: {
+            collector_running: true,
+            collection_running: true,
+            collection_kind: "background",
+            collection_activity: "collecting SMART metrics for Archive CORE / Front Shelf (1/2)",
+            collection_elapsed_seconds: 42,
+            last_inventory_at: "2026-05-15T04:20:49.054763+00:00",
+            last_collection_duration_seconds: 508,
+            last_collection_inventory_forced: true,
+            background_backoff_seconds_remaining: 0,
+            source_base_url: "http://enclosure-ui:8000",
+            sqlite_path: "/app/history/history.db",
+            next_collection_at: "2026-05-15T04:34:17+00:00",
+          },
+          database_size_bytes: 484569088,
+        }),
+      });
+    });
+    await page.route("**/api/history/overview**", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          collector: {
+            collector_running: true,
+            collection_running: false,
+            last_inventory_at: "2026-05-15T04:20:49.054763+00:00",
+            last_fast_metrics_at: "2026-05-15T04:20:49.054763+00:00",
+            last_slow_metrics_at: "2026-05-15T04:20:49.054763+00:00",
+            last_collection_duration_seconds: 508,
+            last_collection_inventory_forced: true,
+            next_collection_at: "2026-05-15T04:34:17+00:00",
+            background_backoff_seconds_remaining: 0,
+            source_base_url: "http://enclosure-ui:8000",
+            sqlite_path: "/app/history/history.db",
+          },
+          counts: {
+            tracked_slots: 227,
+            event_count: 887,
+            metric_sample_count: 660430,
+          },
+          counts_exact: false,
+          database: {
+            size_bytes: 484569088,
+          },
+          scopes: [
+            {
+              system_label: "Archive CORE",
+              enclosure_label: "Front 24 Bay",
+              tracked_slots: 24,
+              event_count: null,
+              metric_sample_count: null,
+              last_seen_at: "2026-05-15T04:20:49.054763+00:00",
+            },
+          ],
+        }),
+      });
+    });
+
+    const response = await page.goto(historyBaseURL, { waitUntil: "domcontentloaded" }).catch(() => null);
+    test.skip(!response || !response.ok(), "History sidecar is not available for browser QA.");
+
+    await expect(page.locator("#history-refresh-fast")).toBeVisible();
+    await expect(page.locator("#history-refresh-full")).toBeVisible();
+    await expect(page.getByText("DB Size")).toBeVisible();
+    await expect(page.getByText("Last collection duration")).toBeVisible();
+    await expect(page.getByText("Last collection inventory")).toBeVisible();
+    await expect(page.locator("#collector-activity-banner")).toContainText("collecting SMART metrics", { timeout: 7000 });
+    await expect(page.locator("#status-current-collection")).toContainText("collecting SMART metrics", { timeout: 7000 });
+    await expect(page.locator("#status-last-collection-duration")).toContainText("508.0s");
+    await expect(page.locator("#status-last-collection-inventory")).toContainText("forced");
+    await page.evaluate(() => window.__HISTORY_DASHBOARD_POLL?.pollOverviewStatus());
+    await expect(page.locator("#tracked-slots-value")).toContainText("227");
+    await expect(page.locator("#db-size-value")).toContainText("462.1 MiB");
+    await expect(page.locator("#tracked-scopes-body")).toContainText("Front 24 Bay");
+
+    await page.locator("#history-refresh-fast").click();
+    await expect(page.locator("#history-refresh-status")).toContainText("History fast refresh completed.");
+    await expect.poll(() => modes.includes("fast")).toBeTruthy();
+
+    await page.waitForLoadState("domcontentloaded");
+    await expect(page.locator("#history-refresh-full")).toBeVisible();
+    await page.locator("#history-refresh-full").click();
+    await expect(page.locator("#history-refresh-status")).toContainText("History full refresh completed.");
+    await expect.poll(() => modes.includes("full")).toBeTruthy();
+  });
+
   test("system switches reuse the cached path and complete cleanly", async ({ page }) => {
     await gotoApp(page);
     await setAutoRefresh(page, false);

@@ -7,7 +7,7 @@ This page is the quick mental model for what the selector is showing.
 The current `archive-core` runtime selector shows the live and virtual groups
 that are actually configured today:
 
-![Grouped runtime selector on archive-core](images/live-vs-storage-views-v0.14.0.png)
+![Grouped runtime selector on archive-core](images/live-vs-storage-views-v0.17.0.png)
 
 `archive-core` intentionally does not keep a duplicate saved chassis view by
 default, so the `Saved Chassis Views` runtime group only appears after an
@@ -63,9 +63,14 @@ view now carries its own `profile_id`, so a `Generic Front 24` or other common
 layout can stay pinned even when the active live enclosure is using a
 different profile.
 
+The same profile geometry is shared across the live main UI, saved chassis
+views, admin setup preview, profile builder preview, storage-view preview, and
+offline snapshot rendering. Tray rows, latch placement, LED spacing, and row
+dividers should therefore match when those surfaces point at the same profile.
+
 Here is the current admin-side grouped picker and profile catalog:
 
-![Admin sidecar grouped Add Storage View flow](images/admin-setup-v0.14.0.png)
+![Admin sidecar grouped Add Storage View flow](images/admin-setup-v0.17.0.png)
 
 ## Profiles Vs Storage Views
 
@@ -99,4 +104,4 @@ becomes a `Saved Chassis View`, not a second physical shelf.
 The separate `Front 24 Bay` live enclosure now also shows up as its own
 runtime target on `archive-core`:
 
-![Archive CORE Front 24 Bay live enclosure](images/archive-core-front-24-v0.14.0.png)
+![Archive CORE Front 24 Bay live enclosure](images/archive-core-front-24-v0.17.0.png)

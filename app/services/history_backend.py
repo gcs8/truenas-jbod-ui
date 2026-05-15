@@ -119,6 +119,7 @@ class HistoryBackendClient:
         system_id: str | None,
         enclosure_id: str | None,
         slots: list[int],
+        window_hours: int | None = None,
     ) -> dict[int, dict[str, Any]]:
         if not slots:
             return {}
@@ -135,6 +136,7 @@ class HistoryBackendClient:
                     "system_id": system_id,
                     "enclosure_id": enclosure_id,
                     "slots": slots,
+                    "since": self._build_since_isoformat(window_hours),
                     "event_limit": 12,
                 },
             )
@@ -143,7 +145,17 @@ class HistoryBackendClient:
                 slot: history
                 for slot, history in zip(
                     slots,
-                    await asyncio.gather(*(self.get_slot_history(slot, system_id, enclosure_id) for slot in slots)),
+                    await asyncio.gather(
+                        *(
+                            self.get_slot_history(
+                                slot,
+                                system_id,
+                                enclosure_id,
+                                window_hours=window_hours,
+                            )
+                            for slot in slots
+                        )
+                    ),
                     strict=False,
                 )
             }
@@ -154,7 +166,17 @@ class HistoryBackendClient:
                 slot: history
                 for slot, history in zip(
                     slots,
-                    await asyncio.gather(*(self.get_slot_history(slot, system_id, enclosure_id) for slot in slots)),
+                    await asyncio.gather(
+                        *(
+                            self.get_slot_history(
+                                slot,
+                                system_id,
+                                enclosure_id,
+                                window_hours=window_hours,
+                            )
+                            for slot in slots
+                        )
+                    ),
                     strict=False,
                 )
             }

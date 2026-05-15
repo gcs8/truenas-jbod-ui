@@ -6445,6 +6445,43 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(truenas_client.fetch_all_calls, 1)
             self.assertIs(first, second)
 
+    async def test_force_source_bundle_refresh_clears_sg_ses_device_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="offsite-scale", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service._sg_ses_device_cache["10.0.0.10"] = (
+                ["/dev/sg26"],
+                datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+            service._collect_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[],
+                        disks=[],
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    ),
+                    ssh_outputs={},
+                    ssh_collected=False,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+
+            await service._get_inventory_source_bundle(force_refresh=True)
+
+            self.assertEqual(service._sg_ses_device_cache, {})
+
     async def test_quantastor_refresh_preserves_last_trusted_topology_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -6943,6 +6980,142 @@ Enclosure Status diagnostic page:
                     ("10.0.0.30", "/dev/sg27"),
                 ],
             )
+
+    async def test_sg_ses_overlay_reuses_valid_cached_devices_without_discovery(self) -> None:
+        class DummyTrueNASClient:
+            pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="offsite-scale",
+                label="Offsite SCALE",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service._sg_ses_device_cache["10.0.0.10"] = (
+                ["/dev/sg26"],
+                datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+            discovery_command = service._build_sg_ses_discovery_command()
+            aes_output = """  SMCDRS2U  SAS3x40           0701
+  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 0
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5003048026b2ff7f
+          SAS address: 0x5002538b496a5512
+          phy identifier: 0x0
+"""
+            ec_output = """  SMCDRS2U  SAS3x40           0701
+Enclosure Status diagnostic page:
+  status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element 0 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+        Ready to insert=0, RMV=0, Ident=1, Report=0
+"""
+
+            async def run_command(command: str, host: str | None = None) -> SSHCommandResult:
+                if command == discovery_command:
+                    raise AssertionError("cached sg_ses devices should skip discovery")
+                if "sg_ses -p aes /dev/sg26" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout=aes_output, stderr="", exit_code=0)
+                if "sg_ses -p ec /dev/sg26" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout=ec_output, stderr="", exit_code=0)
+                raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
+
+            service._run_ssh_command = AsyncMock(side_effect=run_command)
+
+            overlay, failures = await service._fetch_scale_ses_overlay()
+
+            self.assertEqual(failures, [])
+            slot0 = overlay.ses_slot_candidates[0]
+            self.assertEqual(slot0["ses_device"], "/dev/sg26")
+            self.assertTrue(slot0["identify_active"])
+            awaited_commands = [call.args[0] for call in service._run_ssh_command.await_args_list]
+            self.assertNotIn(discovery_command, awaited_commands)
+
+    async def test_sg_ses_overlay_falls_back_to_discovery_when_cached_device_fails(self) -> None:
+        class DummyTrueNASClient:
+            pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="offsite-scale",
+                label="Offsite SCALE",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service._sg_ses_device_cache["10.0.0.10"] = (
+                ["/dev/sg27"],
+                datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+            discovery_command = service._build_sg_ses_discovery_command()
+            aes_output = """  SMCDRS2U  SAS3x40           0701
+  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 0
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5003048026b2ff7f
+          SAS address: 0x5002538b496a5512
+          phy identifier: 0x0
+"""
+            ec_output = """  SMCDRS2U  SAS3x40           0701
+Enclosure Status diagnostic page:
+  status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element 0 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+"""
+
+            async def run_command(command: str, host: str | None = None) -> SSHCommandResult:
+                if command == discovery_command:
+                    return SSHCommandResult(command=command, ok=True, stdout="/dev/sg26\n", stderr="", exit_code=0)
+                if "sg_ses -p aes /dev/sg27" in command:
+                    return SSHCommandResult(command=command, ok=False, stdout="", stderr="not an enclosure", exit_code=5)
+                if "sg_ses -p aes /dev/sg26" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout=aes_output, stderr="", exit_code=0)
+                if "sg_ses -p ec /dev/sg26" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout=ec_output, stderr="", exit_code=0)
+                raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
+
+            service._run_ssh_command = AsyncMock(side_effect=run_command)
+
+            overlay, failures = await service._fetch_scale_ses_overlay()
+
+            self.assertEqual(failures, [])
+            slot0 = overlay.ses_slot_candidates[0]
+            self.assertEqual(slot0["ses_device"], "/dev/sg26")
+            self.assertEqual(service._sg_ses_device_cache["10.0.0.10"][0], ["/dev/sg26"])
+            awaited_commands = [call.args[0] for call in service._run_ssh_command.await_args_list]
+            self.assertIn(discovery_command, awaited_commands)
 
     async def test_unifi_led_control_uses_sata_led_sm_set_fault(self) -> None:
         class DummyTrueNASClient:

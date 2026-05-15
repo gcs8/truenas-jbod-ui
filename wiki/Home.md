@@ -113,6 +113,10 @@ It gives you:
   embedded slot history again when opened away from the live history sidecar
 - `0.16.2` fixes snapshot-export packaging recalculation, persistent-ID
   labeling for `{serial_lunid}` fallback values, and copy buttons on LAN HTTP
+- `0.17.0` is the current release line for shared profile-driven enclosure
+  rendering, clearer refresh/cache timing, live history dashboard updates,
+  explicit history fast/full refresh, admin-owned runtime behavior overrides,
+  and disposable backup/restore QA drills
 
 ## Visual Walkthrough
 

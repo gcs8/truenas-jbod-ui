@@ -181,6 +181,19 @@ class HistoryStore:
             raise
         return connection
 
+    def database_size_bytes(self) -> int:
+        total = 0
+        for path in (
+            self.file_path,
+            Path(f"{self.file_path}-wal"),
+            Path(f"{self.file_path}-shm"),
+        ):
+            try:
+                total += path.stat().st_size
+            except FileNotFoundError:
+                continue
+        return total
+
     def _initialize(self) -> None:
         self._normalize_database_permissions()
         try:
@@ -348,6 +361,16 @@ class HistoryStore:
 
         return final_path
 
+    def latest_backup_snapshot_at(self, backup_dir: str | Path) -> datetime | None:
+        backup_root = Path(backup_dir)
+        if not backup_root.exists():
+            return None
+        snapshots = list(backup_root.glob(f"{self.file_path.stem}-*.sqlite3"))
+        if not snapshots:
+            return None
+        latest = max(snapshots, key=lambda candidate: candidate.stat().st_mtime)
+        return datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc)
+
     def restore_backup(self, source_path: str | Path) -> None:
         source = Path(source_path)
         if not source.exists():
@@ -389,7 +412,7 @@ class HistoryStore:
             return
         snapshots = sorted(
             backup_root.glob(f"{self.file_path.stem}-*.sqlite3"),
-            key=lambda candidate: candidate.stat().st_mtime,
+            key=lambda candidate: candidate.name,
             reverse=True,
         )
         for stale_path in snapshots[retention_count:]:
@@ -979,6 +1002,7 @@ class HistoryStore:
         slots: list[int] | None = None,
         event_limit: int = 12,
         metric_limits: dict[str, int] | None = None,
+        since: str | None = None,
     ) -> dict[int, dict[str, Any]]:
         enclosure_key = enclosure_id or ""
         slot_numbers = sorted({int(slot) for slot in (slots or [])})
@@ -1065,6 +1089,11 @@ class HistoryStore:
                 )["events"].append(item)
 
             for metric_name, limit in metric_limits.items():
+                metric_where_clauses = [*where_clauses, "metric_name = ?"]
+                metric_parameters = [*parameters, metric_name]
+                if since:
+                    metric_where_clauses.append("observed_at >= ?")
+                    metric_parameters.append(since)
                 metric_rows = connection.execute(
                     f"""
                     SELECT *
@@ -1073,15 +1102,15 @@ class HistoryStore:
                             *,
                             ROW_NUMBER() OVER (
                                 PARTITION BY slot, metric_name
-                                ORDER BY observed_at DESC, id DESC
-                            ) AS row_number
+                            ORDER BY observed_at DESC, id DESC
+                        ) AS row_number
                         FROM metric_samples
-                        WHERE {scope_where} AND metric_name = ?
+                        WHERE {' AND '.join(metric_where_clauses)}
                     )
                     WHERE row_number <= ?
                     ORDER BY slot, observed_at DESC, id DESC
                     """,
-                    [*parameters, metric_name, limit],
+                    [*metric_parameters, limit],
                 ).fetchall()
                 for row in metric_rows:
                     item = dict(row)

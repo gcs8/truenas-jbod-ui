@@ -15,6 +15,13 @@ run_perf_harness = importlib.util.module_from_spec(SPEC)
 sys.modules["run_perf_harness"] = run_perf_harness
 SPEC.loader.exec_module(run_perf_harness)
 
+HISTORY_MODULE_PATH = Path(__file__).resolve().parent.parent / "scripts" / "run_history_perf_harness.py"
+HISTORY_SPEC = importlib.util.spec_from_file_location("run_history_perf_harness", HISTORY_MODULE_PATH)
+assert HISTORY_SPEC and HISTORY_SPEC.loader
+run_history_perf_harness = importlib.util.module_from_spec(HISTORY_SPEC)
+sys.modules["run_history_perf_harness"] = run_history_perf_harness
+HISTORY_SPEC.loader.exec_module(run_history_perf_harness)
+
 
 class PerfHarnessTests(unittest.TestCase):
     def test_parse_server_timing_extracts_named_stage_durations(self) -> None:
@@ -117,3 +124,110 @@ class PerfHarnessTests(unittest.TestCase):
             csv_text = history_csv.read_text(encoding="utf-8")
             self.assertIn("inventory_force", csv_text)
             self.assertIn("baseline", csv_text)
+
+
+class HistoryPerfHarnessTests(unittest.TestCase):
+    def test_collector_stage_totals_from_payload_sums_duplicate_stages(self) -> None:
+        payload = {
+            "collector": {
+                "collection_stage_timings": [
+                    {"stage": "enumerate.scopes", "duration_ms": 12.5},
+                    {"stage": "smart.batch", "duration_ms": "40.25"},
+                    {"stage": "smart.batch", "duration_ms": 1.25},
+                    {"stage": None, "duration_ms": 99},
+                    {"stage": "bad", "duration_ms": "not-a-number"},
+                ]
+            }
+        }
+
+        totals = run_history_perf_harness.collector_stage_totals_from_payload(payload)
+
+        self.assertEqual(totals["collector.enumerate.scopes"], 12.5)
+        self.assertEqual(totals["collector.smart.batch"], 41.5)
+        self.assertNotIn("collector.bad", totals)
+
+    def test_history_markdown_includes_collector_and_database_snapshot(self) -> None:
+        payload = {
+            "run_id": "history-1",
+            "recorded_at": "2026-05-15T04:00:00Z",
+            "label": "history-local",
+            "base_url": "http://127.0.0.1:8081",
+            "include_exact_counts": False,
+            "git": {"branch": "topic", "commit": "abc123", "dirty": True},
+            "collector_snapshot": {
+                "collector_running": True,
+                "collection_running": True,
+                "collection_activity": "collecting SMART metrics",
+                "last_collection_duration_seconds": 508.0,
+            },
+            "overview_counts": {
+                "tracked_slots": 227,
+                "event_count": 887,
+                "metric_sample_count": 660430,
+            },
+            "overview_counts_exact": False,
+            "database_size_bytes": 484569088,
+            "summary": [
+                {
+                    "name": "overview_estimated",
+                    "iterations": 3,
+                    "avg_requests": 1.0,
+                    "min_ms": 10.0,
+                    "avg_ms": 12.0,
+                    "p50_ms": 12.0,
+                    "p95_ms": 15.0,
+                    "max_ms": 15.0,
+                    "stage_summary": [],
+                }
+            ],
+            "comparison": [],
+            "baseline": None,
+            "artifacts": None,
+        }
+
+        markdown = run_history_perf_harness.render_markdown(payload)
+
+        self.assertIn("History Perf Harness Summary", markdown)
+        self.assertIn("collecting SMART metrics", markdown)
+        self.assertIn("462.1 MiB", markdown)
+        self.assertIn("overview_estimated", markdown)
+
+    def test_write_history_perf_files_creates_latest_and_csv_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            record_dir = Path(temp_dir)
+            payload = {
+                "run_id": "history-2",
+                "recorded_at": "2026-05-15T04:00:00Z",
+                "label": "history-baseline",
+                "base_url": "http://127.0.0.1:8081",
+                "include_exact_counts": False,
+                "git": {"branch": "topic", "commit": "abc123", "dirty": False},
+                "collector_snapshot": {},
+                "overview_counts": {},
+                "overview_counts_exact": False,
+                "database_size_bytes": 0,
+                "summary": [
+                    {
+                        "name": "sidecar_healthz",
+                        "iterations": 2,
+                        "avg_requests": 1.0,
+                        "min_ms": 4.0,
+                        "avg_ms": 5.0,
+                        "p50_ms": 5.0,
+                        "p95_ms": 6.0,
+                        "max_ms": 6.0,
+                        "stage_summary": [],
+                    }
+                ],
+                "comparison": [],
+                "baseline": None,
+                "artifacts": None,
+            }
+
+            artifacts = run_history_perf_harness.write_history_perf_files(record_dir, payload)
+
+            self.assertTrue(Path(artifacts["latest_json"]).exists())
+            self.assertTrue(Path(artifacts["latest_md"]).exists())
+            csv_text = Path(artifacts["history_csv"]).read_text(encoding="utf-8")
+            self.assertIn("sidecar_healthz", csv_text)
+            self.assertIn("history-baseline", csv_text)

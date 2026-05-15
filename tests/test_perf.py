@@ -9,7 +9,13 @@ from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from app.config import PerfConfig, Settings, get_settings
+from app.config import (
+    PerfConfig,
+    Settings,
+    get_settings,
+    runtime_behavior_settings_payload,
+    save_runtime_behavior_overrides,
+)
 from app.perf import (
     PerfStageSample,
     PerfTrace,
@@ -36,6 +42,7 @@ class PerfConfigTests(unittest.TestCase):
             self.assertEqual(Path(settings.paths.mapping_file), temp_root / "slot_mappings.json")
             self.assertEqual(Path(settings.paths.slot_detail_cache_file), temp_root / "slot_detail_cache.json")
             self.assertEqual(Path(settings.paths.log_file), temp_root / "app.log")
+            self.assertEqual(Path(settings.paths.runtime_overrides_file), temp_root / "runtime-overrides.yaml")
             self.assertEqual(Path(settings.ssh.known_hosts_path), temp_root / "known_hosts")
 
     def test_get_settings_reads_perf_env_overrides(self) -> None:
@@ -77,6 +84,140 @@ class PerfConfigTests(unittest.TestCase):
             self.assertTrue(settings.perf.log_all_requests)
             self.assertEqual(settings.perf.slow_request_ms, 1500)
             self.assertEqual(settings.perf.slow_stage_ms, 300)
+
+    def test_runtime_behavior_overrides_update_admin_owned_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            config_path = temp_root / "config" / "config.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "app:",
+                        "  cache_ttl_seconds: 10",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict("os.environ", {"APP_CONFIG_PATH": config_path.as_posix()}, clear=True):
+                get_settings.cache_clear()
+                settings = get_settings()
+                payload = save_runtime_behavior_overrides(
+                    settings,
+                    {
+                        "source_bundle_cache_ttl_seconds": "120",
+                        "smart_cache_ttl_seconds": 45,
+                    },
+                )
+                updated_settings = get_settings()
+                get_settings.cache_clear()
+
+            self.assertEqual(Path(settings.paths.runtime_overrides_file), config_path.parent / "runtime-overrides.yaml")
+            self.assertEqual(updated_settings.app.source_bundle_cache_ttl_seconds, 120)
+            self.assertEqual(updated_settings.app.smart_cache_ttl_seconds, 45)
+            source_field = next(
+                field for field in payload["fields"] if field["key"] == "source_bundle_cache_ttl_seconds"
+            )
+            self.assertEqual(source_field["owner"], "admin")
+            self.assertTrue(source_field["writable"])
+            self.assertEqual(source_field["source"], "runtime-overrides.yaml")
+
+    def test_runtime_behavior_env_owned_values_are_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text("{}", encoding="utf-8")
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "APP_CONFIG_PATH": config_path.as_posix(),
+                    "APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS": "90",
+                },
+                clear=True,
+            ):
+                get_settings.cache_clear()
+                settings = get_settings()
+                payload = runtime_behavior_settings_payload(settings)
+                with self.assertRaisesRegex(ValueError, "owned by .env"):
+                    save_runtime_behavior_overrides(settings, {"source_bundle_cache_ttl_seconds": 120})
+                get_settings.cache_clear()
+
+            source_field = next(
+                field for field in payload["fields"] if field["key"] == "source_bundle_cache_ttl_seconds"
+            )
+            self.assertEqual(source_field["value"], 90)
+            self.assertEqual(source_field["owner"], ".env")
+            self.assertFalse(source_field["writable"])
+            self.assertEqual(source_field["source"], "APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS")
+
+    def test_legacy_cache_ttl_env_only_owns_split_fields_when_effective(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "app:",
+                        "  source_bundle_cache_ttl_seconds: 60",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "APP_CONFIG_PATH": config_path.as_posix(),
+                    "APP_CACHE_TTL": "10",
+                },
+                clear=True,
+            ):
+                get_settings.cache_clear()
+                settings = get_settings()
+                payload = runtime_behavior_settings_payload(settings)
+                get_settings.cache_clear()
+
+            snapshot_field = next(
+                field for field in payload["fields"] if field["key"] == "snapshot_cache_ttl_seconds"
+            )
+            source_field = next(
+                field for field in payload["fields"] if field["key"] == "source_bundle_cache_ttl_seconds"
+            )
+            self.assertEqual(settings.app.snapshot_cache_ttl_seconds, 10)
+            self.assertEqual(snapshot_field["owner"], ".env")
+            self.assertEqual(snapshot_field["source"], "APP_CACHE_TTL")
+            self.assertEqual(settings.app.source_bundle_cache_ttl_seconds, 60)
+            self.assertEqual(source_field["owner"], "admin")
+            self.assertEqual(source_field["source"], "config.yaml")
+
+    def test_runtime_overrides_file_only_applies_behavior_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            config_path = temp_root / "config" / "config.yaml"
+            override_path = temp_root / "config" / "runtime-overrides.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text("{}", encoding="utf-8")
+            override_path.write_text(
+                "\n".join(
+                    [
+                        "app:",
+                        "  port: 9099",
+                        "  source_bundle_cache_ttl_seconds: 150",
+                        "paths:",
+                        "  mapping_file: C:/should/not/win.json",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict("os.environ", {"APP_CONFIG_PATH": config_path.as_posix()}, clear=True):
+                get_settings.cache_clear()
+                settings = get_settings()
+                get_settings.cache_clear()
+
+            self.assertEqual(settings.app.port, 8080)
+            self.assertEqual(settings.app.source_bundle_cache_ttl_seconds, 150)
+            self.assertNotEqual(Path(settings.paths.mapping_file), Path("C:/should/not/win.json"))
 
 
 class PerfTraceTests(unittest.TestCase):

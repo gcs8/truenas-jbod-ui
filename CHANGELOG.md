@@ -1,6 +1,46 @@
 # Changelog
 
-## Unreleased
+## v0.17.0 - 2026-05-15
+
+### Added
+
+- shared profile-driven enclosure row geometry now covers live enclosures,
+  saved `ses_enclosure` chassis views, admin setup previews, builder previews,
+  storage-view previews, and offline snapshot rendering
+- the history sidecar dashboard now updates collector status, counts, DB size,
+  and tracked scopes without a browser refresh, and exposes explicit
+  `Refresh Fast` / `Refresh Full` actions
+- the admin sidecar now separates `.env`-owned runtime behavior from
+  admin-owned cache timing overrides and marks the read UI for restart after
+  runtime behavior changes
+- the `v0.17.0` release-candidate runbook now includes disposable
+  backup/restore, mutation, and failure-mode QA stacks for Windows and Linux
+- refreshed `v0.17.0` README/wiki screenshot assets for the updated geometry,
+  history, admin, and export workflows
+
+### Changed
+
+- main UI refresh timing now has a compact toolbar countdown plus separate
+  cache timing chips for snapshot, source bundle, SMART, and SES behavior
+- history startup/manual fast collection now stays cached-root-only for the
+  current root scope, while deliberate full/slow passes keep the heavier
+  forced all-system sweep
+- snapshot export estimate/export now reuses stale SMART cache data and pushes
+  the requested history window into the history sidecar batch query
+- snapshot export download now reuses source inputs staged by the estimate when
+  only packaging or oversize choice changes
+
+### Fixed
+
+- history sidecar fast paths no longer fan out into per-slot history fallback
+  calls when the batched history endpoint can satisfy the requested window
+- cold cached-SMART misses during fast history collection are now bounded and
+  recorded as `smart.failed` stage telemetry instead of poisoning the whole
+  collector pass
+- full/slow history collection now skips isolated saved-system enumeration or
+  per-scope SMART failures instead of leaving the sidecar in `last_error`
+- daily history backup pruning now sorts by snapshot filename instead of
+  filesystem mtime, making retention deterministic on fast filesystems
 
 ## v0.16.2 - 2026-05-14
 

@@ -29,6 +29,7 @@ from history_service.domain import MetricSample, SlotStateRecord
 from history_service.store import HistoryStore
 from history_service.system_backup import (
     DEBUG_BUNDLE_FORMAT,
+    RUNTIME_OVERRIDES_FILE_KEY,
     SEVEN_ZIP_SIGNATURE,
     SSH_KEYS_KEY,
     TLS_TRUST_KEY,
@@ -45,6 +46,7 @@ class SystemBackupServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = Path(tempfile.mkdtemp())
         self.config_path = self.temp_dir / "config.yaml"
+        self.runtime_overrides_path = self.temp_dir / "runtime-overrides.yaml"
         self.profile_path = self.temp_dir / "profiles.yaml"
         self.mapping_path = self.temp_dir / "slot_mappings.json"
         self.slot_detail_path = self.temp_dir / "slot_detail_cache.json"
@@ -129,6 +131,10 @@ class SystemBackupServiceTests(unittest.TestCase):
                     }
                 ]
             },
+        )
+        write_yaml(
+            self.runtime_overrides_path,
+            {"app": {"source_bundle_cache_ttl_seconds": 123}},
         )
         self.mapping_path.write_text(
             json.dumps(
@@ -382,8 +388,11 @@ class SystemBackupServiceTests(unittest.TestCase):
                         self.assertTrue(artifact.filename.endswith(suffix))
                         self.assertTrue(artifact.content.startswith(signature))
                         self.assertEqual(artifact.manifest["packaging"], packaging)
+                        group_entries = {entry["key"]: entry for entry in artifact.manifest.get("groups", [])}
+                        self.assertTrue(group_entries[RUNTIME_OVERRIDES_FILE_KEY]["selected"])
 
                         write_yaml(self.config_path, {"default_system_id": "broken", "systems": []})
+                        self.runtime_overrides_path.unlink(missing_ok=True)
                         self.profile_path.unlink(missing_ok=True)
                         self.mapping_path.write_text("{}", encoding="utf-8")
                         self.slot_detail_path.write_text("{}", encoding="utf-8")
@@ -400,7 +409,12 @@ class SystemBackupServiceTests(unittest.TestCase):
                         self.assertTrue(result["ok"])
                         self.assertEqual(result["packaging"], packaging)
                         self.assertEqual(restored_settings.default_system_id, "archive-core")
+                        self.assertEqual(restored_settings.app.source_bundle_cache_ttl_seconds, 123)
                         self.assertEqual(len(restored_settings.systems), 1)
+                        restored_overrides = yaml.safe_load(
+                            self.runtime_overrides_path.read_text(encoding="utf-8")
+                        )
+                        self.assertEqual(restored_overrides["app"]["source_bundle_cache_ttl_seconds"], 123)
                         self.assertIn("archive-core:enc-a:0", restored_mapping["slot_mappings"])
                         self.assertIn("archive-core:enc-a:0", restored_slot_detail["slot_details"])
                         self.assertEqual(counts["tracked_slots"], 1)

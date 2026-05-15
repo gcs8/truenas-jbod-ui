@@ -12,6 +12,8 @@ data/slot_mappings.json
 data/slot_detail_cache.json
 data/perf/*
 !data/perf/README.md
+data/history-perf/*
+!data/history-perf/README.md
 data/support/
 history/*
 !history/backups/

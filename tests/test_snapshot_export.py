@@ -76,6 +76,7 @@ class FakeHistoryBackend:
         system_id: str | None,
         enclosure_id: str | None,
         slots: list[int],
+        window_hours: int | None = None,
     ) -> dict[int, dict[str, object]]:
         return {
             slot: await self.get_slot_history(slot, system_id, enclosure_id)
@@ -87,6 +88,7 @@ class CountingHistoryBackend(FakeHistoryBackend):
     def __init__(self) -> None:
         self.status_calls = 0
         self.scope_history_calls = 0
+        self.last_window_hours: int | None = None
 
     async def get_status(self) -> dict[str, object]:
         self.status_calls += 1
@@ -105,12 +107,15 @@ class CountingHistoryBackend(FakeHistoryBackend):
         system_id: str | None,
         enclosure_id: str | None,
         slots: list[int],
+        window_hours: int | None = None,
     ) -> dict[int, dict[str, object]]:
         self.scope_history_calls += 1
+        self.last_window_hours = window_hours
         return await super().get_scope_history(
             system_id=system_id,
             enclosure_id=enclosure_id,
             slots=slots,
+            window_hours=window_hours,
         )
 
 
@@ -209,6 +214,7 @@ class DenseHistoryBackend:
         system_id: str | None,
         enclosure_id: str | None,
         slots: list[int],
+        window_hours: int | None = None,
     ) -> dict[int, dict[str, object]]:
         return {
             slot: await self.get_slot_history(slot, system_id, enclosure_id)
@@ -254,6 +260,7 @@ class UnavailableHistoryBackend:
         system_id: str | None,
         enclosure_id: str | None,
         slots: list[int],
+        window_hours: int | None = None,
     ) -> dict[int, dict[str, object]]:
         return {
             slot: await self.get_slot_history(slot, system_id, enclosure_id)
@@ -288,6 +295,7 @@ class StatusUnavailableHistoryBackend:
         system_id: str | None,
         enclosure_id: str | None,
         slots: list[int],
+        window_hours: int | None = None,
     ) -> dict[int, dict[str, object]]:
         raise AssertionError("Scope history fetch should be skipped when status is unavailable")
 
@@ -659,6 +667,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(estimate["ok"])
         self.assertGreater(artifact.size_bytes, 0)
         self.assertEqual(history_backend.scope_history_calls, 1)
+        self.assertEqual(history_backend.last_window_hours, 24)
         self.assertEqual(zip_build_calls, 1)
 
     async def test_render_option_changes_reuse_cached_scope_history(self) -> None:
@@ -675,18 +684,18 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
             io_chart_mode="total",
             packaging="auto",
         )
-        wide_window = await exporter.estimate_enclosure_snapshot_export(
+        average_chart = await exporter.estimate_enclosure_snapshot_export(
             request=build_request(),
             snapshot=snapshot,
             smart_summary_cache=build_smart_summary_cache(),
             selected_slot=0,
-            history_window_hours=None,
-            io_chart_mode="total",
+            history_window_hours=24,
+            io_chart_mode="average",
             packaging="auto",
         )
 
         self.assertTrue(narrow_window["ok"])
-        self.assertTrue(wide_window["ok"])
+        self.assertTrue(average_chart["ok"])
         self.assertEqual(history_backend.scope_history_calls, 1)
 
     async def test_snapshot_export_omits_history_when_backend_is_unavailable(self) -> None:

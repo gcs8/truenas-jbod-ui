@@ -33,6 +33,7 @@ BUNDLE_FORMAT = "truenas-jbod-ui-backup"
 DEBUG_BUNDLE_FORMAT = "truenas-jbod-ui-debug-bundle"
 
 CONFIG_FILE_KEY = "config_file"
+RUNTIME_OVERRIDES_FILE_KEY = "runtime_overrides_file"
 PROFILE_FILE_KEY = "profile_file"
 MAPPING_FILE_KEY = "mapping_file"
 SLOT_DETAIL_FILE_KEY = "slot_detail_file"
@@ -47,6 +48,15 @@ BACKUP_GROUP_METADATA: dict[str, dict[str, Any]] = {
     CONFIG_FILE_KEY: {
         "label": "Config",
         "archive_root": "config/config.yaml",
+        "sensitive": False,
+        "bundle_types": ("backup", "debug"),
+        "default_backup": True,
+        "default_debug": True,
+        "restore_mode": "file",
+    },
+    RUNTIME_OVERRIDES_FILE_KEY: {
+        "label": "Runtime Overrides",
+        "archive_root": "config/runtime-overrides.yaml",
         "sensitive": False,
         "bundle_types": ("backup", "debug"),
         "default_backup": True,
@@ -217,6 +227,7 @@ def describe_bundle_groups(
     config_root = Path(app_settings.config_file).parent
     source_paths = {
         CONFIG_FILE_KEY: app_settings.config_file,
+        RUNTIME_OVERRIDES_FILE_KEY: app_settings.paths.runtime_overrides_file,
         PROFILE_FILE_KEY: app_settings.paths.profile_file,
         MAPPING_FILE_KEY: app_settings.paths.mapping_file,
         SLOT_DETAIL_FILE_KEY: app_settings.paths.slot_detail_cache_file,
@@ -263,6 +274,7 @@ class DebugScrubber:
         "known_hosts_path",
         "tls_ca_bundle_path",
         "config_file",
+        "runtime_overrides_file",
         "profile_file",
         "mapping_file",
         "slot_detail_cache_file",
@@ -555,6 +567,16 @@ class SystemBackupService:
 
         imported_settings = self._load_app_settings()
         self._restore_file_group(
+            RUNTIME_OVERRIDES_FILE_KEY,
+            manifest,
+            group_entries,
+            extracted,
+            Path(imported_settings.paths.runtime_overrides_file),
+            restored_paths,
+        )
+
+        imported_settings = self._load_app_settings()
+        self._restore_file_group(
             PROFILE_FILE_KEY,
             manifest,
             group_entries,
@@ -726,6 +748,12 @@ class SystemBackupService:
                     Path(app_settings.config_file),
                     selected=selected,
                 )
+            elif group_key == RUNTIME_OVERRIDES_FILE_KEY:
+                group, members = self._collect_file_group(
+                    group_key,
+                    Path(app_settings.paths.runtime_overrides_file),
+                    selected=selected,
+                )
             elif group_key == PROFILE_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
@@ -804,6 +832,14 @@ class SystemBackupService:
                     content_bytes,
                     selected=selected,
                     source_path=app_settings.config_file,
+                )
+            elif group_key == RUNTIME_OVERRIDES_FILE_KEY:
+                content_bytes = self._read_scrubbed_yaml_file(Path(app_settings.paths.runtime_overrides_file), scrubber)
+                group, members = self._collect_generated_file_group(
+                    group_key,
+                    content_bytes,
+                    selected=selected,
+                    source_path=app_settings.paths.runtime_overrides_file,
                 )
             elif group_key == PROFILE_FILE_KEY:
                 content_bytes = self._read_scrubbed_yaml_file(Path(app_settings.paths.profile_file), scrubber)

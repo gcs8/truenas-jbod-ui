@@ -36,15 +36,19 @@ class HistorySettings(BaseModel):
     sqlite_path: str = Field(default_factory=_default_history_sqlite_path)
     backup_dir: str = Field(default_factory=_default_history_backup_dir)
     backup_retention_count: int = 28
+    backup_interval_seconds: int = 3600
     long_term_backup_dir: str | None = Field(default_factory=_default_history_long_term_backup_dir)
     weekly_backup_retention_count: int = 4
     monthly_backup_retention_count: int = 3
     poll_interval_seconds: int = 300
     fast_interval_seconds: int = 300
     slow_interval_seconds: int = 3600
-    request_timeout_seconds: int = 20
+    request_timeout_seconds: int = 45
+    failure_backoff_initial_seconds: int = 30
+    failure_backoff_max_seconds: int = 900
     smart_batch_size: int = 24
     startup_grace_seconds: int = 20
+    force_inventory_on_fast_collection: bool = False
 
     @model_validator(mode="after")
     def align_backup_paths(self) -> "HistorySettings":
@@ -75,6 +79,7 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_SQLITE_PATH": "sqlite_path",
     "HISTORY_BACKUP_DIR": "backup_dir",
     "HISTORY_BACKUP_RETENTION_COUNT": "backup_retention_count",
+    "HISTORY_BACKUP_INTERVAL_SECONDS": "backup_interval_seconds",
     "HISTORY_LONG_TERM_BACKUP_DIR": "long_term_backup_dir",
     "HISTORY_WEEKLY_BACKUP_RETENTION_COUNT": "weekly_backup_retention_count",
     "HISTORY_MONTHLY_BACKUP_RETENTION_COUNT": "monthly_backup_retention_count",
@@ -82,8 +87,11 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_FAST_INTERVAL_SECONDS": "fast_interval_seconds",
     "HISTORY_SLOW_INTERVAL_SECONDS": "slow_interval_seconds",
     "HISTORY_REQUEST_TIMEOUT_SECONDS": "request_timeout_seconds",
+    "HISTORY_FAILURE_BACKOFF_INITIAL_SECONDS": "failure_backoff_initial_seconds",
+    "HISTORY_FAILURE_BACKOFF_MAX_SECONDS": "failure_backoff_max_seconds",
     "HISTORY_SMART_BATCH_SIZE": "smart_batch_size",
     "HISTORY_STARTUP_GRACE_SECONDS": "startup_grace_seconds",
+    "HISTORY_FORCE_INVENTORY_ON_FAST_COLLECTION": "force_inventory_on_fast_collection",
 }
 
 
