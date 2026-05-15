@@ -275,6 +275,31 @@ shows a real gap that BMC data can fill.
 - Keep the hardware template separate from the ESXi adapter so the same
   AOC-SLG4-2H8M2 view can be reused for a Linux or future non-ESXi host.
 
+## Credential Decision
+
+Decision on `2026-05-14`: keep the local ESXi dev entries on password-only
+`root` SSH for this cycle, and keep that secret in the ignored local config or
+the admin sidecar secret flow. Do not commit root credentials to the repo,
+docs, screenshots, wiki, or test fixtures.
+
+Rationale:
+
+- The validated ESXi inventory path currently depends on root-level commands:
+  `esxcli ...`, `/opt/lsi/storcli64/storcli64 ...`, and host-side SMART reads.
+- The ESXi host-prep flow intentionally performs root-level package staging and
+  `esxcli software ...` install/apply commands when an operator uploads vendor
+  tooling such as StorCLI.
+- ESXi does not provide the same sudoers/service-account bootstrap shape as
+  CORE, SCALE, or generic Linux, and the app intentionally disables the Linux
+  bootstrap/sudoers flow for `esxi` systems.
+- The app already supports the operational mode we are using: `Password Only /
+  No Key` with an empty `ssh.key_path`.
+
+Revisit this only if a dedicated ESXi account or key-auth setup is proven to
+run the read-only inventory commands cleanly. If that ever works, keep host-prep
+as an explicit root/admin operation rather than silently broadening the normal
+read path.
+
 ## Recommendation
 
 Keep ESXi support measured and read-only for now.
