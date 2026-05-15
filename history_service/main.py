@@ -33,6 +33,7 @@ SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "temperature_c": 96,
     "bytes_read": 60,
     "bytes_written": 60,
+    "annualized_bytes_read": 60,
     "annualized_bytes_written": 60,
     "power_on_hours": 60,
 }
@@ -245,18 +246,25 @@ async def slot_history_bundle(
 async def scope_slot_history(
     system_id: str = Query(...),
     enclosure_id: str | None = Query(default=None),
-    slots: list[int] = Query(default=[]),
+    slots: list[int] | None = Query(default=None),
+    metrics: list[str] | None = Query(default=None),
     since: str | None = Query(default=None),
-    event_limit: int = Query(default=12, ge=1, le=1000),
+    event_limit: int = Query(default=12, ge=0, le=1000),
 ) -> dict[str, object]:
+    requested_metrics = [
+        metric_name
+        for metric_name in (metrics or SLOT_HISTORY_METRIC_LIMITS.keys())
+        if metric_name in SLOT_HISTORY_METRIC_LIMITS
+    ]
     histories = store.list_scope_history(
         system_id,
         enclosure_id,
-        slots=slots,
+        slots=slots or [],
         event_limit=event_limit,
         since=since,
         metric_limits={
-            **SLOT_HISTORY_METRIC_LIMITS,
+            metric_name: SLOT_HISTORY_METRIC_LIMITS[metric_name]
+            for metric_name in requested_metrics
         },
     )
     return {

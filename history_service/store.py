@@ -1053,40 +1053,41 @@ class HistoryStore:
                     },
                 )
 
-            event_rows = connection.execute(
-                f"""
-                SELECT *
-                FROM (
-                    SELECT
-                        *,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY slot
-                            ORDER BY observed_at DESC, id DESC
-                        ) AS row_number
-                    FROM slot_events
-                    WHERE {scope_where}
-                )
-                WHERE row_number <= ?
-                ORDER BY slot, observed_at DESC, id DESC
-                """,
-                [*parameters, event_limit],
-            ).fetchall()
-            for row in event_rows:
-                item = dict(row)
-                slot = int(item["slot"])
-                item.pop("row_number", None)
-                payload_by_slot.setdefault(
-                    slot,
-                    {
-                        "events": [],
-                        "metrics": {
-                            metric_name: []
-                            for metric_name in metric_limits
+            if event_limit > 0:
+                event_rows = connection.execute(
+                    f"""
+                    SELECT *
+                    FROM (
+                        SELECT
+                            *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY slot
+                                ORDER BY observed_at DESC, id DESC
+                            ) AS row_number
+                        FROM slot_events
+                        WHERE {scope_where}
+                    )
+                    WHERE row_number <= ?
+                    ORDER BY slot, observed_at DESC, id DESC
+                    """,
+                    [*parameters, event_limit],
+                ).fetchall()
+                for row in event_rows:
+                    item = dict(row)
+                    slot = int(item["slot"])
+                    item.pop("row_number", None)
+                    payload_by_slot.setdefault(
+                        slot,
+                        {
+                            "events": [],
+                            "metrics": {
+                                metric_name: []
+                                for metric_name in metric_limits
+                            },
+                            "sample_counts": {},
+                            "latest_values": {},
                         },
-                        "sample_counts": {},
-                        "latest_values": {},
-                    },
-                )["events"].append(item)
+                    )["events"].append(item)
 
             for metric_name, limit in metric_limits.items():
                 metric_where_clauses = [*where_clauses, "metric_name = ?"]

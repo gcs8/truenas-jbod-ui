@@ -10,6 +10,8 @@ When the optional history sidecar is running, the main UI can:
 - show a `History` button in Slot Details
 - open a wide slot-history drawer under the enclosure
 - render temperature and read/write history in browser-local time
+- provide sampled data for [[Heat Map Mode|Heat-Map-Mode]] timelines and
+  history-backed heat-map metrics
 - export a frozen offline HTML snapshot of the current enclosure
 
 The history sidecar is optional, but it is a normal supported runtime service,
@@ -93,6 +95,16 @@ Things to notice:
 - if you are renaming or deleting whole systems, use
   [[History Maintenance and Recovery|History-Maintenance-and-Recovery]] for the
   cleanup/adoption tools instead of trying to hand-edit the SQLite DB
+
+## Heat Map Timelines
+
+Heat map mode has its own feature guide now:
+[[Heat Map Mode|Heat-Map-Mode]].
+
+The short version: history-backed heat-map metrics can switch from `Current`
+to `Timeline`, start on the newest available sample, and scrub backward through
+the selected window. After clicking the sample slider, use the left and right
+arrow keys for fine one-sample steps.
 
 ## What The Snapshot Export Dialog Looks Like
 

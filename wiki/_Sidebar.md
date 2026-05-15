@@ -13,14 +13,18 @@ Platform Guides
 - [[Quantastor Setup|Quantastor-Setup]]
 - [[Generic Linux Setup|Generic-Linux-Setup]]
 
+Feature Guides
+
+- [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
+- [[Heat Map Mode|Heat-Map-Mode]]
+- [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
+
 Configuration
 
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 - [[Profiles and Custom Layouts|Profiles-and-Custom-Layouts]]
-- [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
-- [[History and Snapshot Export|History-and-Snapshot-Export]]
-- [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
 - [[Advanced Configuration|Advanced-Configuration]]
 
 Maintainers

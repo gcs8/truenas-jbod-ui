@@ -511,6 +511,72 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(payload[5]["sample_counts"]["temperature_c"], 1)
         self.assertEqual(payload[5]["latest_values"]["temperature_c"], 31)
 
+    def test_scope_history_can_skip_events_for_metric_only_reads(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid="eui.000000000000001000a075012b91c7cf",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+            persistent_id_label="EUI64",
+            logical_unit_id="0x5000cca27c7f0005",
+            sas_address="0x5000cca27c7f1005",
+        )
+        store.upsert_slot_state(record, "2026-04-16T22:00:00+00:00")
+        store.insert_events(
+            build_slot_events(record, replace(record, health="DEGRADED"), "2026-04-16T22:10:00+00:00")
+        )
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-16T22:10:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name="bytes_written",
+                    value_integer=100,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                    gptid="eui.000000000000001000a075012b91c7cf",
+                    persistent_id_label="EUI64",
+                    logical_unit_id="0x5000cca27c7f0005",
+                    sas_address="0x5000cca27c7f1005",
+                )
+            ]
+        )
+
+        payload = store.list_scope_history(
+            "archive-core",
+            "enc-a",
+            slots=[5],
+            event_limit=0,
+            metric_limits={"bytes_written": 10},
+        )
+
+        self.assertEqual(payload[5]["events"], [])
+        self.assertEqual(payload[5]["latest_values"]["bytes_written"], 100)
+
     def test_store_fast_overview_uses_estimated_activity_counts(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
@@ -2542,6 +2608,7 @@ class HistoryCollectorTests(unittest.TestCase):
                 "temperature_c": 31,
                 "bytes_read": 100,
                 "bytes_written": 200,
+                "annualized_bytes_read": 25,
                 "annualized_bytes_written": None,
                 "power_on_hours": 48,
             }
@@ -2561,15 +2628,23 @@ class HistoryCollectorTests(unittest.TestCase):
             0,
             metric_name="bytes_read",
         )
+        annualized_read_samples = store.list_metric_samples(
+            "archive-core",
+            "storage-view:boot-doms",
+            0,
+            metric_name="annualized_bytes_read",
+        )
         loaded = store.get_slot_state("archive-core", "storage-view:boot-doms", 0)
 
         self.assertEqual(len(temperature_samples), 1)
         self.assertEqual(len(read_samples), 1)
+        self.assertEqual(len(annualized_read_samples), 1)
         self.assertIsNotNone(loaded)
         self.assertEqual(temperature_samples[0]["persistent_id_label"], "GPTID")
         self.assertEqual(temperature_samples[0]["logical_unit_id"], "0x5000c500abcd0000")
         self.assertEqual(temperature_samples[0]["sas_address"], "0x5000c500abcd0001")
         self.assertEqual(read_samples[0]["gptid"], "gptid/dom-a")
+        self.assertEqual(annualized_read_samples[0]["value"], 25)
         self.assertEqual(loaded.persistent_id_label, "GPTID")
         self.assertEqual(loaded.logical_unit_id, "0x5000c500abcd0000")
         self.assertEqual(loaded.sas_address, "0x5000c500abcd0001")
@@ -2737,6 +2812,7 @@ class HistoryCollectorTests(unittest.TestCase):
                 "temperature_c": 31,
                 "bytes_read": 100,
                 "bytes_written": 200,
+                "annualized_bytes_read": 25,
                 "annualized_bytes_written": 50,
                 "power_on_hours": 48,
             }
@@ -2756,9 +2832,16 @@ class HistoryCollectorTests(unittest.TestCase):
             0,
             metric_name="bytes_read",
         )
+        annualized_read_samples = store.list_metric_samples(
+            "archive-core",
+            "storage-view:boot-doms",
+            0,
+            metric_name="annualized_bytes_read",
+        )
 
         self.assertEqual(len(temperature_samples), 0)
         self.assertEqual(len(read_samples), 1)
+        self.assertEqual(len(annualized_read_samples), 1)
         self.assertEqual(
             collector._fetch_json.await_args_list[0].kwargs["params"],  # type: ignore[attr-defined]
             {

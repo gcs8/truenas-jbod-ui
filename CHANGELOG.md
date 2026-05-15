@@ -1,6 +1,38 @@
 # Changelog
 
-## Unreleased
+## v0.18.0 - 2026-05-15
+
+### Added
+
+- first-class `Heat Map` mode in the main enclosure view, with a metric
+  dropdown, inline legend, tray-shaped color overlays, centered values, hover
+  tooltip context, and neutral missing-value rendering
+- heat-map metrics for temperature, temperature versus view average,
+  power-on hours, lifetime read/write, read/write rates, Annualized Read,
+  Annualized Write, Read/Write Ratio, endurance, SMART error counters, unsafe
+  shutdowns, and an explainable Attention Score
+- history-backed heat-map timeline mode with a sample scrub slider that opens
+  on the latest available sample and lets operators step backward through the
+  selected window
+- first-class `annualized_bytes_read` parsing, inventory, history-sidecar
+  collection, and history-bundle support
+
+### Changed
+
+- read/write heat-map rates now request only the needed raw counter metric
+  from the history sidecar with events disabled, instead of pulling a full slot
+  history bundle for every visible bay
+- heat-map rate and timeline controls share the selected trailing window, and
+  the color scale can be adjusted locally without changing the displayed
+  metric values
+
+### Fixed
+
+- empty bays and missing timeline samples no longer become fake zeroes in the
+  heat-map scale
+- history-backed heat-map metrics now show a clean `History unavailable` state
+  when the optional history sidecar is down, while the main UI continues to
+  run standalone
 
 ## v0.17.0 - 2026-05-15
 

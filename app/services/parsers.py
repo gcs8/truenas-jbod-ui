@@ -298,15 +298,24 @@ def _scsi_gigabytes_processed_to_bytes(value: Any) -> int | None:
         return None
 
 
+def _annualize_bytes(
+    byte_count: int | None,
+    power_on_hours: int | None,
+    *,
+    minimum_hours: int = 24 * 30,
+) -> int | None:
+    if byte_count is None or not isinstance(power_on_hours, int) or power_on_hours < minimum_hours:
+        return None
+    return int(byte_count * 24 * 365 / power_on_hours)
+
+
 def _annualize_bytes_written(
     bytes_written: int | None,
     power_on_hours: int | None,
     *,
     minimum_hours: int = 24 * 30,
 ) -> int | None:
-    if bytes_written is None or not isinstance(power_on_hours, int) or power_on_hours < minimum_hours:
-        return None
-    return int(bytes_written * 24 * 365 / power_on_hours)
+    return _annualize_bytes(bytes_written, power_on_hours, minimum_hours=minimum_hours)
 
 
 def _kelvin_to_celsius(value: Any) -> int | None:
@@ -1834,6 +1843,7 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         endurance_used_percent = _extract_ata_device_stat_int(payload, "Percentage Used Endurance Indicator")
     if endurance_remaining_percent is None and endurance_used_percent is not None:
         endurance_remaining_percent = max(0, 100 - endurance_used_percent)
+    annualized_bytes_read = _annualize_bytes(bytes_read, power_on_hours)
     annualized_bytes_written = _annualize_bytes_written(bytes_written, power_on_hours)
     estimated_lifetime_bytes_written = (
         int(bytes_written * 100 / endurance_used_percent)
@@ -1966,6 +1976,7 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
                 endurance_remaining_percent,
                 bytes_read,
                 bytes_written,
+                annualized_bytes_read,
                 annualized_bytes_written,
                 estimated_remaining_bytes_written,
                 read_commands,
@@ -2016,6 +2027,7 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         "endurance_remaining_percent": endurance_remaining_percent,
         "bytes_read": bytes_read,
         "bytes_written": bytes_written,
+        "annualized_bytes_read": annualized_bytes_read,
         "annualized_bytes_written": annualized_bytes_written,
         "estimated_lifetime_bytes_written": estimated_lifetime_bytes_written,
         "estimated_remaining_bytes_written": estimated_remaining_bytes_written,
@@ -2065,6 +2077,7 @@ def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
     bytes_written = _nvme_data_units_to_bytes(payload.get("data_units_written"))
     media_errors = _coerce_non_negative_int(payload.get("media_errors"))
     unsafe_shutdowns = _coerce_non_negative_int(payload.get("unsafe_shutdowns"))
+    annualized_bytes_read = _annualize_bytes(bytes_read, power_on_hours)
     annualized_bytes_written = _annualize_bytes_written(bytes_written, power_on_hours)
     estimated_lifetime_bytes_written = (
         int(bytes_written * 100 / endurance_used_percent)
@@ -2091,6 +2104,7 @@ def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
                 endurance_remaining_percent,
                 bytes_read,
                 bytes_written,
+                annualized_bytes_read,
                 annualized_bytes_written,
                 estimated_remaining_bytes_written,
                 media_errors,
@@ -2106,6 +2120,7 @@ def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
         "endurance_remaining_percent": endurance_remaining_percent,
         "bytes_read": bytes_read,
         "bytes_written": bytes_written,
+        "annualized_bytes_read": annualized_bytes_read,
         "annualized_bytes_written": annualized_bytes_written,
         "estimated_lifetime_bytes_written": estimated_lifetime_bytes_written,
         "estimated_remaining_bytes_written": estimated_remaining_bytes_written,

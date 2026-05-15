@@ -558,6 +558,7 @@ Enclosure status diagnostic page:
 
         self.assertEqual(parsed["bytes_written"], 18148583424000)
         self.assertEqual(parsed["bytes_read"], 302427648)
+        self.assertIsNone(parsed["annualized_bytes_read"])
         self.assertIsNone(parsed["annualized_bytes_written"])
 
     def test_parse_smartctl_summary_extracts_ata_host_counters_with_32mib_units(self) -> None:
@@ -579,6 +580,7 @@ Enclosure status diagnostic page:
 
         self.assertEqual(parsed["bytes_written"], 205990658048)
         self.assertEqual(parsed["bytes_read"], 197367169024)
+        self.assertEqual(parsed["annualized_bytes_read"], 28156280443)
         self.assertEqual(parsed["annualized_bytes_written"], 29386502149)
 
     def test_parse_smartctl_summary_prefers_ata_device_statistics_over_vendor_host_units(self) -> None:
@@ -672,6 +674,7 @@ Enclosure status diagnostic page:
         self.assertEqual(parsed["endurance_remaining_percent"], 90)
         self.assertEqual(parsed["bytes_written"], 524288)
         self.assertEqual(parsed["bytes_read"], 1048576)
+        self.assertEqual(parsed["annualized_bytes_read"], 9185525)
         self.assertEqual(parsed["annualized_bytes_written"], 4592762)
         self.assertEqual(parsed["estimated_lifetime_bytes_written"], 5242880)
         self.assertEqual(parsed["estimated_remaining_bytes_written"], 4718592)
@@ -747,6 +750,7 @@ Enclosure status diagnostic page:
         self.assertEqual(parsed["negotiated_link_rate"], "phy enabled; 12 Gbps")
         self.assertEqual(parsed["bytes_read"], 330638625000000)
         self.assertEqual(parsed["bytes_written"], 111254503000000)
+        self.assertEqual(parsed["annualized_bytes_read"], 58936886598567)
         self.assertEqual(parsed["annualized_bytes_written"], 19831300795214)
 
     def test_parse_smartctl_summary_strips_scsi_identifier_error_suffixes(self) -> None:
@@ -818,6 +822,7 @@ Write cache is: Enabled
         self.assertEqual(parsed["endurance_remaining_percent"], 75)
         self.assertEqual(parsed["bytes_read"], 1024000000000)
         self.assertEqual(parsed["bytes_written"], 512000000000)
+        self.assertEqual(parsed["annualized_bytes_read"], 8970240000000)
         self.assertEqual(parsed["annualized_bytes_written"], 4485120000000)
         self.assertEqual(parsed["estimated_lifetime_bytes_written"], 2048000000000)
         self.assertEqual(parsed["estimated_remaining_bytes_written"], 1536000000000)
@@ -850,6 +855,7 @@ Write cache is: Enabled
         self.assertEqual(parsed["endurance_remaining_percent"], 94)
         self.assertEqual(parsed["bytes_read"], 16925054630912000)
         self.assertEqual(parsed["bytes_written"], 2367984228864000)
+        self.assertEqual(parsed["annualized_bytes_read"], 4592617742055854)
         self.assertEqual(parsed["media_errors"], 0)
         self.assertEqual(parsed["unsafe_shutdowns"], 61)
         self.assertEqual(parsed["transport_protocol"], "NVMe")

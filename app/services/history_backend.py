@@ -120,6 +120,8 @@ class HistoryBackendClient:
         enclosure_id: str | None,
         slots: list[int],
         window_hours: int | None = None,
+        metrics: list[str] | None = None,
+        event_limit: int = 12,
     ) -> dict[int, dict[str, Any]]:
         if not slots:
             return {}
@@ -130,15 +132,18 @@ class HistoryBackendClient:
             }
 
         try:
+            params: dict[str, Any] = {
+                "system_id": system_id,
+                "enclosure_id": enclosure_id,
+                "slots": slots,
+                "since": self._build_since_isoformat(window_hours),
+                "event_limit": event_limit,
+            }
+            if metrics:
+                params["metrics"] = metrics
             payload = await self._fetch_json(
                 "/api/history/scopes/slots",
-                params={
-                    "system_id": system_id,
-                    "enclosure_id": enclosure_id,
-                    "slots": slots,
-                    "since": self._build_since_isoformat(window_hours),
-                    "event_limit": 12,
-                },
+                params=params,
             )
         except Exception:
             return {

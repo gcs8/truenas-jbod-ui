@@ -20,6 +20,14 @@
   const SMART_SUMMARY_CACHE_TTL_MS = SMART_CACHE_TTL_SECONDS * 1000;
   const HISTORY_STATUS_CACHE_TTL_MS = HISTORY_STATUS_CACHE_TTL_SECONDS * 1000;
   const DEFAULT_HISTORY_TIMEFRAME_HOURS = 24;
+  const HEATMAP_DEFAULT_METRIC = "attention_score";
+  const HEATMAP_HISTORY_METRIC_IDS = new Set(["read_rate", "write_rate"]);
+  const HEATMAP_MIN_SCALE_SENSITIVITY = 0.5;
+  const HEATMAP_MAX_SCALE_SENSITIVITY = 2;
+  const HEATMAP_DEFAULT_SCALE_SENSITIVITY = 1;
+  const HEATMAP_HISTORY_MODE_CURRENT = "current";
+  const HEATMAP_HISTORY_MODE_TIMELINE = "timeline";
+  const ANNUALIZED_MIN_POWER_ON_HOURS = 24 * 30;
   const HISTORY_UI_STORAGE_KEY = "truenas-jbod-ui.history-ui.v1";
   const EXPORT_UI_STORAGE_KEY = "truenas-jbod-ui.export-ui.v1";
   const snapshotMode = Boolean(bootstrap.snapshotMode);
@@ -139,6 +147,22 @@
       open: false,
       expandedSections: {},
     },
+    heatmap: {
+      enabled: false,
+      metric: HEATMAP_DEFAULT_METRIC,
+      timeframeHours: Number.isFinite(Number(restoredHistoryWindowHours))
+        ? Number(restoredHistoryWindowHours)
+        : DEFAULT_HISTORY_TIMEFRAME_HOURS,
+      historyMode: HEATMAP_HISTORY_MODE_CURRENT,
+      playbackIndex: null,
+      sensitivity: HEATMAP_DEFAULT_SCALE_SENSITIVITY,
+      histories: {},
+      loading: false,
+      error: null,
+      scopeKey: null,
+      pendingScopeKey: null,
+      requestToken: 0,
+    },
   };
 
   const grid = document.getElementById("slot-grid");
@@ -152,6 +176,23 @@
   const platformDetailsTitle = document.getElementById("platform-details-title");
   const platformDetailsSummary = document.getElementById("platform-details-summary");
   const platformDetailsSections = document.getElementById("platform-details-sections");
+  const heatmapToggleButton = document.getElementById("heatmap-toggle-button");
+  const heatmapControls = document.getElementById("heatmap-controls");
+  const heatmapMetricField = document.getElementById("heatmap-metric-field");
+  const heatmapMetricSelect = document.getElementById("heatmap-metric-select");
+  const heatmapTimeframeField = document.getElementById("heatmap-timeframe-field");
+  const heatmapTimeframeSelect = document.getElementById("heatmap-timeframe-select");
+  const heatmapPlaybackField = document.getElementById("heatmap-playback-field");
+  const heatmapPlaybackSelect = document.getElementById("heatmap-playback-select");
+  const heatmapScrubField = document.getElementById("heatmap-scrub-field");
+  const heatmapScrubSlider = document.getElementById("heatmap-scrub-slider");
+  const heatmapScrubValue = document.getElementById("heatmap-scrub-value");
+  const heatmapScaleSlider = document.getElementById("heatmap-scale-slider");
+  const heatmapScaleValue = document.getElementById("heatmap-scale-value");
+  const heatmapLegend = document.getElementById("heatmap-legend");
+  const heatmapLegendMin = document.getElementById("heatmap-legend-min");
+  const heatmapLegendMax = document.getElementById("heatmap-legend-max");
+  const heatmapLegendStatus = document.getElementById("heatmap-legend-status");
   const chassisShell = document.getElementById("chassis-shell");
   const slotTooltipEl = document.getElementById("slot-tooltip");
   const detailEmpty = document.getElementById("detail-empty");
@@ -782,6 +823,8 @@
     const slotsByIndex = new Map((selectedView?.slots || []).map((slot) => [Number(slot.slot_index), slot]));
     const peerContext = getSelectedPeerContext();
     const profile = buildViewProfile();
+    const heatmapContext = buildHeatmapContext();
+    renderHeatmapControls(heatmapContext);
 
     if (selectedView.kind === "nvme_carrier") {
       const boardLayout = nvmeCarrierBoardLayout(selectedView);
@@ -827,6 +870,7 @@
         }
         tile.setAttribute("aria-label", buildStorageViewRuntimeTooltip(slot, selectedView));
         tile.innerHTML = buildNvmeRuntimeTileMarkup(slot, selectedView);
+        applyHeatmapToTile(tile, heatmapContext, slot.slot_index);
         bindStorageViewTileInteractions(tile, slot, selectedView);
         board.appendChild(tile);
       });
@@ -915,6 +959,7 @@
             <span class="slot-tertiary">${escapeHtml(storageViewRuntimeTertiaryLabel(slot))}</span>
             <span class="slot-latch" aria-hidden="true"></span>
           `;
+      applyHeatmapToTile(tile, heatmapContext, slot.slot_index);
       bindStorageViewTileInteractions(tile, slot, selectedView);
       container.appendChild(tile);
     };
@@ -929,6 +974,8 @@
     const slotsByNumber = new Map(state.snapshot.slots.map((slot) => [slot.slot, slot]));
     const peerContext = getSelectedPeerContext();
     const boardLayout = nvmeCarrierBoardLayout(selectedProfile);
+    const heatmapContext = buildHeatmapContext();
+    renderHeatmapControls(heatmapContext);
     const board = document.createElement("div");
     board.className = ["nvme-carrier-canvas", boardLayout.className].filter(Boolean).join(" ");
     const boardImage = document.createElement("img");
@@ -981,6 +1028,7 @@
       tile.style.minHeight = metrics.minHeight;
       tile.setAttribute("aria-label", slotTooltip(liveSlot, getSmartSummaryEntry(liveSlot)));
       tile.innerHTML = buildNvmeRuntimeTileMarkup(displaySlot, { kind: "nvme_carrier" });
+      applyHeatmapToTile(tile, heatmapContext, liveSlot.slot);
       tile.addEventListener("mouseenter", (event) => {
         state.hoveredSlot = liveSlot.slot;
         refreshHoveredTooltip(tile);
@@ -2904,6 +2952,10 @@
   }
 
   function updateSmartPrefetchViews() {
+    if (state.heatmap.enabled) {
+      renderGrid();
+      return;
+    }
     const profile = buildViewProfile();
     const slotCount = currentLayoutSlotCount();
     const usesStaticGeometry =
@@ -3500,6 +3552,31 @@
     return formatBytesValue(smartEntry?.data?.bytes_read, smartEntry);
   }
 
+  function computeAnnualizedBytes(totalBytes, powerOnHours, minimumHours = ANNUALIZED_MIN_POWER_ON_HOURS) {
+    const bytes = Number(totalBytes);
+    const hours = Number(powerOnHours);
+    if (!Number.isFinite(bytes) || !Number.isFinite(hours) || hours < minimumHours || hours <= 0) {
+      return null;
+    }
+    return Math.round(bytes * 24 * 365 / hours);
+  }
+
+  function formatAnnualizedReadValue(smartEntry) {
+    const annualizedRead = smartEntry?.data?.annualized_bytes_read
+      ?? computeAnnualizedBytes(
+        smartEntry?.data?.bytes_read,
+        smartEntry?.data?.power_on_hours
+      );
+    const formatted = formatMetricBytes(annualizedRead);
+    if (formatted) {
+      return `${formatted}/yr`;
+    }
+    if (smartEntry?.loading) {
+      return "Loading...";
+    }
+    return "n/a";
+  }
+
   function formatAnnualizedWriteValue(smartEntry) {
     const formatted = formatMetricBytes(smartEntry?.data?.annualized_bytes_written);
     if (formatted) {
@@ -3580,6 +3657,1025 @@
     return "n/a";
   }
 
+  function heatmapMetricDefinitions() {
+    return [
+      {
+        id: "attention_score",
+        label: "Attention Score",
+        shortLabel: "Score",
+        fixedRange: [0, 100],
+        value: (entry, entries) => computeAttentionScore(entry, entries),
+        format: (value) => `${Math.round(value)}`,
+      },
+      {
+        id: "temperature_c",
+        label: "Temperature",
+        shortLabel: "Temp",
+        historyMetrics: ["temperature_c"],
+        value: (entry, _entries, evaluation) => heatmapMetricNumber(entry, "temperature_c", entry.slot?.temperature_c, evaluation),
+        format: (value) => `${Math.round(value)} C`,
+      },
+      {
+        id: "temperature_delta_c",
+        label: "Temp vs View Avg",
+        shortLabel: "Delta",
+        historyMetrics: ["temperature_c"],
+        value: (entry, entries, evaluation) => computeTemperatureDelta(entry, entries, evaluation),
+        format: (value) => `${value >= 0 ? "+" : ""}${roundHeatmapValue(value)} C`,
+      },
+      {
+        id: "power_on_hours",
+        label: "Power-On Hours",
+        shortLabel: "Hours",
+        historyMetrics: ["power_on_hours"],
+        value: (entry, _entries, evaluation) => heatmapMetricNumber(entry, "power_on_hours", null, evaluation),
+        format: (value) => `${Math.round(value).toLocaleString()} hr`,
+      },
+      {
+        id: "bytes_read",
+        label: "Lifetime Read",
+        shortLabel: "Read",
+        historyMetrics: ["bytes_read"],
+        value: (entry, _entries, evaluation) => heatmapMetricNumber(entry, "bytes_read", null, evaluation),
+        format: (value) => formatMetricBytes(value) || "0 B",
+      },
+      {
+        id: "bytes_written",
+        label: "Lifetime Write",
+        shortLabel: "Write",
+        historyMetrics: ["bytes_written"],
+        value: (entry, _entries, evaluation) => heatmapMetricNumber(entry, "bytes_written", null, evaluation),
+        format: (value) => formatMetricBytes(value) || "0 B",
+      },
+      {
+        id: "read_rate",
+        label: "Read Rate",
+        shortLabel: "Read/hr",
+        requiresHistory: true,
+        historyMetrics: ["bytes_read"],
+        value: (entry, _entries, evaluation) => heatmapHistoryRate(entry, "bytes_read", evaluation),
+        format: (value) => formatHistoryRateValue(value),
+      },
+      {
+        id: "write_rate",
+        label: "Write Rate",
+        shortLabel: "Write/hr",
+        requiresHistory: true,
+        historyMetrics: ["bytes_written"],
+        value: (entry, _entries, evaluation) => heatmapHistoryRate(entry, "bytes_written", evaluation),
+        format: (value) => formatHistoryRateValue(value),
+      },
+      {
+        id: "annualized_bytes_read",
+        label: "Annualized Read",
+        shortLabel: "Read/yr",
+        historyMetrics: ["annualized_bytes_read"],
+        value: (entry, _entries, evaluation) => heatmapAnnualizedRead(entry, evaluation),
+        format: (value) => {
+          const formatted = formatMetricBytes(value);
+          return formatted ? `${formatted}/yr` : "0 B/yr";
+        },
+      },
+      {
+        id: "annualized_bytes_written",
+        label: "Annualized Write",
+        shortLabel: "Write/yr",
+        historyMetrics: ["annualized_bytes_written"],
+        value: (entry, _entries, evaluation) => heatmapAnnualizedWrite(entry, evaluation),
+        format: (value) => {
+          const formatted = formatMetricBytes(value);
+          return formatted ? `${formatted}/yr` : "0 B/yr";
+        },
+      },
+      {
+        id: "read_write_ratio",
+        label: "Read/Write Ratio",
+        shortLabel: "R/W",
+        fixedRange: [-4, 4],
+        historyMetrics: ["bytes_read", "bytes_written"],
+        value: (entry, _entries, evaluation) => heatmapReadWriteRatio(entry, evaluation),
+        format: (value) => formatReadWriteRatioValue(value),
+      },
+      {
+        id: "endurance_used_percent",
+        label: "Endurance Used",
+        shortLabel: "Used",
+        fixedRange: [0, 100],
+        value: (entry) => heatmapSmartNumber(entry, "endurance_used_percent"),
+        format: (value) => `${Math.round(value)}% used`,
+      },
+      {
+        id: "endurance_remaining_percent",
+        label: "Endurance Remaining",
+        shortLabel: "Remain",
+        polarity: "low",
+        fixedRange: [0, 100],
+        value: (entry) => heatmapSmartNumber(entry, "endurance_remaining_percent"),
+        format: (value) => `${Math.round(value)}% left`,
+      },
+      {
+        id: "estimated_remaining_bytes_written",
+        label: "Estimated TBW Left",
+        shortLabel: "TBW Left",
+        polarity: "low",
+        value: (entry) => heatmapSmartNumber(entry, "estimated_remaining_bytes_written"),
+        format: (value) => formatMetricBytes(value) || "0 B",
+      },
+      {
+        id: "media_errors",
+        label: "Media Errors",
+        shortLabel: "Media",
+        value: (entry) => heatmapSmartNumber(entry, "media_errors"),
+        format: (value) => Math.round(value).toLocaleString(),
+      },
+      {
+        id: "predictive_errors",
+        label: "Predictive Errors",
+        shortLabel: "Predict",
+        value: (entry) => heatmapSmartNumber(entry, "predictive_errors"),
+        format: (value) => Math.round(value).toLocaleString(),
+      },
+      {
+        id: "interface_crc_errors",
+        label: "Interface CRC Errors",
+        shortLabel: "CRC",
+        value: (entry) => heatmapSmartNumber(entry, "interface_crc_errors"),
+        format: (value) => Math.round(value).toLocaleString(),
+      },
+      {
+        id: "unsafe_shutdowns",
+        label: "Unsafe Shutdowns",
+        shortLabel: "Unsafe",
+        value: (entry) => heatmapSmartNumber(entry, "unsafe_shutdowns"),
+        format: (value) => Math.round(value).toLocaleString(),
+      },
+    ];
+  }
+
+  function heatmapMetricDefinition(metricId = state.heatmap.metric) {
+    return heatmapMetricDefinitions().find((metric) => metric.id === metricId) || heatmapMetricDefinitions()[0];
+  }
+
+  function normalizeHeatmapMetricSelection() {
+    if (!heatmapMetricDefinitions().some((metric) => metric.id === state.heatmap.metric)) {
+      state.heatmap.metric = HEATMAP_DEFAULT_METRIC;
+    }
+  }
+
+  function normalizeHeatmapScaleSensitivity(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+      return HEATMAP_DEFAULT_SCALE_SENSITIVITY;
+    }
+    return Math.max(HEATMAP_MIN_SCALE_SENSITIVITY, Math.min(HEATMAP_MAX_SCALE_SENSITIVITY, numeric));
+  }
+
+  function formatHeatmapScaleSensitivity(value) {
+    return `${Math.round(normalizeHeatmapScaleSensitivity(value) * 100)}%`;
+  }
+
+  function heatmapMetricSupportsTimeline(metric = heatmapMetricDefinition()) {
+    return Array.isArray(metric?.historyMetrics) && metric.historyMetrics.length > 0;
+  }
+
+  function heatmapTimelineActive(metricId = state.heatmap.metric) {
+    const metric = heatmapMetricDefinition(metricId);
+    return state.heatmap.historyMode === HEATMAP_HISTORY_MODE_TIMELINE && heatmapMetricSupportsTimeline(metric);
+  }
+
+  function heatmapMetricNeedsHistory(metricId = state.heatmap.metric) {
+    const metric = heatmapMetricDefinition(metricId);
+    return Boolean(metric.requiresHistory || HEATMAP_HISTORY_METRIC_IDS.has(metric.id) || heatmapTimelineActive(metric.id));
+  }
+
+  function currentHeatmapWindowHours() {
+    return state.heatmap.timeframeHours === null ? null : Number(state.heatmap.timeframeHours) || DEFAULT_HISTORY_TIMEFRAME_HOURS;
+  }
+
+  function heatmapHistoryMetricNames(metricId = state.heatmap.metric) {
+    const metric = heatmapMetricDefinition(metricId);
+    if (Array.isArray(metric.historyMetrics) && metric.historyMetrics.length) {
+      return [...new Set(metric.historyMetrics)];
+    }
+    return [];
+  }
+
+  function heatmapSmartNumber(entry, fieldName, fallback = null) {
+    if (!entry || !heatmapEntryOccupied(entry)) {
+      return null;
+    }
+    const value = entry.smartEntry?.data?.[fieldName] ?? fallback;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+
+  function heatmapMetricNumber(entry, fieldName, fallback = null, evaluation = null) {
+    if (evaluation?.timelineActive) {
+      return heatmapTimelineSampleValue(entry, fieldName, evaluation.playbackTimestampMs);
+    }
+    return heatmapSmartNumber(entry, fieldName, fallback);
+  }
+
+  function heatmapAnnualizedBytes(entry, fieldName) {
+    if (fieldName === "bytes_read") {
+      const storedValue = heatmapSmartNumber(entry, "annualized_bytes_read");
+      if (Number.isFinite(storedValue)) {
+        return storedValue;
+      }
+    }
+    const totalBytes = heatmapSmartNumber(entry, fieldName);
+    const powerOnHours = heatmapSmartNumber(entry, "power_on_hours");
+    return computeAnnualizedBytes(totalBytes, powerOnHours);
+  }
+
+  function heatmapAnnualizedRead(entry, evaluation = null) {
+    if (evaluation?.timelineActive) {
+      return heatmapMetricNumber(entry, "annualized_bytes_read", null, evaluation);
+    }
+    return heatmapAnnualizedBytes(entry, "bytes_read");
+  }
+
+  function heatmapAnnualizedWrite(entry, evaluation = null) {
+    if (evaluation?.timelineActive) {
+      return heatmapMetricNumber(entry, "annualized_bytes_written", null, evaluation);
+    }
+    return heatmapSmartNumber(entry, "annualized_bytes_written");
+  }
+
+  function heatmapReadWriteRatio(entry, evaluation = null) {
+    if (!entry || !heatmapEntryOccupied(entry)) {
+      return null;
+    }
+    const bytesRead = heatmapMetricNumber(entry, "bytes_read", null, evaluation);
+    const bytesWritten = heatmapMetricNumber(entry, "bytes_written", null, evaluation);
+    if (!Number.isFinite(bytesRead) || !Number.isFinite(bytesWritten)) {
+      return null;
+    }
+    if (bytesRead <= 0 && bytesWritten <= 0) {
+      return 0;
+    }
+    if (bytesWritten <= 0) {
+      return 8;
+    }
+    if (bytesRead <= 0) {
+      return -8;
+    }
+    return Math.log2(bytesRead / bytesWritten);
+  }
+
+  function formatReadWriteRatioValue(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+      return "n/a";
+    }
+    if (Math.abs(numeric) < 0.05) {
+      return "1:1";
+    }
+    const ratio = 2 ** numeric;
+    const formattedRatio = ratio >= 100 ? ratio.toFixed(0) : ratio >= 10 ? ratio.toFixed(1) : ratio.toFixed(2);
+    if (numeric >= 0) {
+      return `${formattedRatio}:1 R/W`;
+    }
+    const inverse = 1 / ratio;
+    const formattedInverse = inverse >= 100 ? inverse.toFixed(0) : inverse >= 10 ? inverse.toFixed(1) : inverse.toFixed(2);
+    return `1:${formattedInverse} R/W`;
+  }
+
+  function roundHeatmapValue(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+      return "n/a";
+    }
+    const abs = Math.abs(numeric);
+    const digits = abs >= 100 ? 0 : abs >= 10 ? 1 : 2;
+    return numeric.toFixed(digits);
+  }
+
+  function heatmapTimelineMetricSamples(entry, metricName) {
+    return Array.isArray(entry?.historyPayload?.metrics?.[metricName])
+      ? entry.historyPayload.metrics[metricName]
+      : [];
+  }
+
+  function heatmapTimelineSampleValue(entry, metricName, timestampMs) {
+    const samples = heatmapTimelineMetricSamples(entry, metricName);
+    if (!Number.isFinite(timestampMs) || !samples.length) {
+      return null;
+    }
+    let selected = null;
+    let selectedDistance = Number.POSITIVE_INFINITY;
+    samples.forEach((sample) => {
+      const sampleMs = sampleTimestampMs(sample);
+      const numericValue = Number(sample?.value);
+      if (!Number.isFinite(sampleMs) || !Number.isFinite(numericValue)) {
+        return;
+      }
+      const distance = Math.abs(sampleMs - timestampMs);
+      if (distance < selectedDistance) {
+        selected = numericValue;
+        selectedDistance = distance;
+      }
+    });
+    return Number.isFinite(selected) ? selected : null;
+  }
+
+  function heatmapTimelineSamplesAscending(entry, metricName) {
+    return sortHistorySamplesAscending(heatmapTimelineMetricSamples(entry, metricName))
+      .filter((sample) => Number.isFinite(sampleTimestampMs(sample)));
+  }
+
+  function heatmapTimelineRateAt(entry, metricName, timestampMs) {
+    const samples = heatmapTimelineSamplesAscending(entry, metricName);
+    if (!Number.isFinite(timestampMs) || samples.length < 2) {
+      return null;
+    }
+    let selectedIndex = -1;
+    let selectedDistance = Number.POSITIVE_INFINITY;
+    samples.forEach((sample, index) => {
+      const distance = Math.abs(sampleTimestampMs(sample) - timestampMs);
+      if (distance < selectedDistance) {
+        selectedIndex = index;
+        selectedDistance = distance;
+      }
+    });
+    if (selectedIndex <= 0) {
+      return null;
+    }
+    const previous = samples[selectedIndex - 1];
+    const current = samples[selectedIndex];
+    const previousValue = Number(previous?.value);
+    const currentValue = Number(current?.value);
+    const previousTimestamp = sampleTimestampMs(previous);
+    const currentTimestamp = sampleTimestampMs(current);
+    if (
+      !Number.isFinite(previousValue)
+      || !Number.isFinite(currentValue)
+      || currentValue < previousValue
+      || isHistoryCounterScaleDiscontinuity(metricName, previousValue, currentValue)
+      || !Number.isFinite(previousTimestamp)
+      || !Number.isFinite(currentTimestamp)
+      || currentTimestamp <= previousTimestamp
+    ) {
+      return null;
+    }
+    const elapsedHours = (currentTimestamp - previousTimestamp) / 3600000;
+    return elapsedHours > 0 ? (currentValue - previousValue) / elapsedHours : null;
+  }
+
+  function heatmapPlaybackTimeline(entries, metric) {
+    if (!heatmapMetricSupportsTimeline(metric)) {
+      return [];
+    }
+    const timestamps = new Set();
+    const metricNames = heatmapHistoryMetricNames(metric.id);
+    entries.forEach((entry) => {
+      metricNames.forEach((metricName) => {
+        heatmapTimelineMetricSamples(entry, metricName).forEach((sample) => {
+          const sampleMs = sampleTimestampMs(sample);
+          if (Number.isFinite(sampleMs)) {
+            timestamps.add(sampleMs);
+          }
+        });
+      });
+    });
+    return [...timestamps].sort((left, right) => left - right);
+  }
+
+  function normalizeHeatmapPlaybackIndex(timeline) {
+    if (!timeline.length) {
+      state.heatmap.playbackIndex = null;
+      return null;
+    }
+    const maxIndex = timeline.length - 1;
+    const requested = state.heatmap.playbackIndex === null || state.heatmap.playbackIndex === undefined
+      ? NaN
+      : Number(state.heatmap.playbackIndex);
+    const nextIndex = Number.isInteger(requested)
+      ? Math.max(0, Math.min(maxIndex, requested))
+      : maxIndex;
+    state.heatmap.playbackIndex = nextIndex;
+    return nextIndex;
+  }
+
+  function formatHeatmapPlaybackLabel(timestampMs, index, total) {
+    if (!Number.isFinite(timestampMs) || !total) {
+      return "No samples";
+    }
+    const samplePart = `${index + 1}/${total}`;
+    return `${samplePart} ${formatTimestamp(new Date(timestampMs).toISOString())}`;
+  }
+
+  function heatmapHistoryRate(entry, metricName, evaluation = null) {
+    if (!entry || !heatmapEntryOccupied(entry)) {
+      return null;
+    }
+    const samples = entry.historyPayload?.metrics?.[metricName] || [];
+    if (evaluation?.timelineActive) {
+      return heatmapTimelineRateAt(entry, metricName, evaluation.playbackTimestampMs);
+    }
+    return computeHistoryCounterAverage(
+      metricName,
+      samples,
+      currentHeatmapWindowHours(),
+      currentHistoryReferenceTimestampMs()
+    );
+  }
+
+  function heatmapEntryOccupied(entry) {
+    const slot = entry?.slot || {};
+    const storageViewSlot = entry?.storageViewSlot || null;
+    const slotState = String(slot.state || storageViewSlot?.state || "").toLowerCase();
+    if (slotState === "empty") {
+      return false;
+    }
+    if (slot.device_name || slot.serial || slot.pool_name || ["healthy", "identify", "fault", "unmapped"].includes(slotState)) {
+      return true;
+    }
+    if (storageViewSlot) {
+      const storageState = String(storageViewSlot.state || "").toLowerCase();
+      if (storageState === "empty") {
+        return false;
+      }
+      return Boolean(storageViewSlot.device_name || storageViewSlot.serial || storageViewSlot.pool_name);
+    }
+    return false;
+  }
+
+  function heatmapSlotState(entry) {
+    return String(entry?.slot?.state || entry?.storageViewSlot?.state || "unknown").toLowerCase();
+  }
+
+  function heatmapSlotLabel(entry) {
+    return entry?.storageViewSlot?.slot_label || entry?.slot?.slot_label || `Slot ${entry?.key || "?"}`;
+  }
+
+  function computeTemperatureDelta(entry, entries, evaluation = null) {
+    const value = heatmapMetricNumber(entry, "temperature_c", entry.slot?.temperature_c, evaluation);
+    if (!Number.isFinite(value)) {
+      return null;
+    }
+    const values = entries
+      .map((candidate) => heatmapMetricNumber(candidate, "temperature_c", candidate.slot?.temperature_c, evaluation))
+      .filter((candidateValue) => Number.isFinite(candidateValue));
+    if (!values.length) {
+      return null;
+    }
+    const average = values.reduce((sum, candidateValue) => sum + candidateValue, 0) / values.length;
+    return value - average;
+  }
+
+  function countRisk(value, lowStep, highStep, highCap) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+      return 0;
+    }
+    return Math.min(highCap, numeric >= highStep ? highCap : lowStep);
+  }
+
+  function computeAttentionScore(entry, entries) {
+    if (!entry || !heatmapEntryOccupied(entry)) {
+      return { value: null, reasons: [] };
+    }
+    const data = entry.smartEntry?.data || {};
+    const reasons = [];
+    let score = 0;
+
+    const slotState = heatmapSlotState(entry);
+    if (slotState === "fault") {
+      score += 30;
+      reasons.push("slot fault state");
+    } else if (slotState === "unmapped") {
+      score += 18;
+      reasons.push("unmapped disk");
+    } else if (slotState === "unknown") {
+      score += 12;
+      reasons.push("unknown slot state");
+    } else if (slotState === "identify") {
+      score += 5;
+      reasons.push("identify active");
+    }
+
+    if (entry.smartEntry?.data?.available === false || (entry.smartEntry && !entry.smartEntry.loading && data.message && !data.available)) {
+      score += 10;
+      reasons.push("SMART unavailable");
+    }
+
+    const health = String(data.smart_health_status || "").trim().toLowerCase();
+    if (health && !["passed", "pass", "ok", "healthy"].includes(health)) {
+      score += 35;
+      reasons.push(`SMART ${data.smart_health_status}`);
+    }
+
+    const temperature = heatmapSmartNumber(entry, "temperature_c", entry.slot?.temperature_c);
+    const warningTemp = Number(data.warning_temperature_c);
+    const criticalTemp = Number(data.critical_temperature_c);
+    if (Number.isFinite(temperature) && Number.isFinite(criticalTemp) && temperature >= criticalTemp) {
+      score += 40;
+      reasons.push(`at critical temp ${Math.round(temperature)} C`);
+    } else if (Number.isFinite(temperature) && Number.isFinite(warningTemp) && temperature >= warningTemp) {
+      score += 24;
+      reasons.push(`at warning temp ${Math.round(temperature)} C`);
+    } else if (Number.isFinite(temperature) && temperature >= 45) {
+      score += 15;
+      reasons.push(`${Math.round(temperature)} C`);
+    } else if (Number.isFinite(temperature) && temperature >= 40) {
+      score += 8;
+      reasons.push(`${Math.round(temperature)} C`);
+    }
+
+    const tempDelta = computeTemperatureDelta(entry, entries);
+    if (Number.isFinite(tempDelta) && tempDelta >= 8) {
+      score += 12;
+      reasons.push(`${roundHeatmapValue(tempDelta)} C over view avg`);
+    } else if (Number.isFinite(tempDelta) && tempDelta >= 5) {
+      score += 7;
+      reasons.push(`${roundHeatmapValue(tempDelta)} C over view avg`);
+    }
+
+    const used = Number(data.endurance_used_percent);
+    const remaining = Number(data.endurance_remaining_percent);
+    if (Number.isFinite(used) && used >= 90) {
+      score += 35;
+      reasons.push(`${Math.round(used)}% endurance used`);
+    } else if (Number.isFinite(used) && used >= 75) {
+      score += 22;
+      reasons.push(`${Math.round(used)}% endurance used`);
+    } else if (Number.isFinite(used) && used >= 50) {
+      score += 10;
+      reasons.push(`${Math.round(used)}% endurance used`);
+    }
+    if (Number.isFinite(remaining) && remaining <= 10) {
+      score += 35;
+      reasons.push(`${Math.round(remaining)}% endurance remaining`);
+    } else if (Number.isFinite(remaining) && remaining <= 25) {
+      score += 22;
+      reasons.push(`${Math.round(remaining)}% endurance remaining`);
+    }
+
+    const mediaRisk = countRisk(data.media_errors, 10, 10, 24);
+    if (mediaRisk) {
+      score += mediaRisk;
+      reasons.push(`${data.media_errors} media errors`);
+    }
+    const predictiveRisk = countRisk(data.predictive_errors, 12, 5, 28);
+    if (predictiveRisk) {
+      score += predictiveRisk;
+      reasons.push(`${data.predictive_errors} predictive errors`);
+    }
+    const nonMediumRisk = countRisk(data.non_medium_errors, 6, 50, 14);
+    if (nonMediumRisk) {
+      score += nonMediumRisk;
+      reasons.push(`${data.non_medium_errors} non-medium errors`);
+    }
+    const readErrorValue = Number.isFinite(Number(data.read_error_count)) ? data.read_error_count : data.uncorrected_read_errors;
+    const writeErrorValue = Number.isFinite(Number(data.write_error_count)) ? data.write_error_count : data.uncorrected_write_errors;
+    const readErrorRisk = countRisk(readErrorValue, 8, 10, 18);
+    if (readErrorRisk) {
+      score += readErrorRisk;
+      reasons.push(`${readErrorValue} read errors`);
+    }
+    const writeErrorRisk = countRisk(writeErrorValue, 8, 10, 18);
+    if (writeErrorRisk) {
+      score += writeErrorRisk;
+      reasons.push(`${writeErrorValue} write errors`);
+    }
+    const crcRisk = countRisk(data.interface_crc_errors, 5, 100, 16);
+    if (crcRisk) {
+      score += crcRisk;
+      reasons.push(`${data.interface_crc_errors} CRC errors`);
+    }
+    const unsafeRisk = countRisk(data.unsafe_shutdowns, 3, 20, 10);
+    if (unsafeRisk) {
+      score += unsafeRisk;
+      reasons.push(`${data.unsafe_shutdowns} unsafe shutdowns`);
+    }
+
+    const annualizedWrite = heatmapSmartNumber(entry, "annualized_bytes_written");
+    const peerWrites = entries
+      .filter((candidate) => candidate !== entry)
+      .map((candidate) => heatmapSmartNumber(candidate, "annualized_bytes_written"))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .sort((left, right) => left - right);
+    if (Number.isFinite(annualizedWrite) && peerWrites.length >= 3) {
+      const median = peerWrites[Math.floor(peerWrites.length / 2)];
+      if (median > 0 && annualizedWrite >= median * 4) {
+        score += 15;
+        reasons.push("write pace high vs peers");
+      } else if (median > 0 && annualizedWrite >= median * 2) {
+        score += 8;
+        reasons.push("write pace above peers");
+      }
+    }
+
+    return {
+      value: Math.max(0, Math.min(100, Math.round(score))),
+      reasons: reasons.slice(0, 4),
+    };
+  }
+
+  function heatmapLiveEntry(slot) {
+    const historyPayload = state.heatmap.histories[String(slot.slot)] || (
+      state.snapshotMode
+        ? getCachedHistoryPayload({ slot, cacheKey: getHistoryCacheKey(slot) })
+        : null
+    );
+    return {
+      key: String(slot.slot),
+      slot,
+      smartEntry: getSmartSummaryEntry(slot),
+      historyPayload,
+    };
+  }
+
+  function heatmapStorageViewEntry(view, storageViewSlot) {
+    const liveSlot = getLiveBackedStorageViewSlot(view, storageViewSlot);
+    const slotLike = liveSlot
+      ? { ...liveSlot, slot_label: storageViewSlot.slot_label || liveSlot.slot_label }
+      : {
+          ...storageViewSlot,
+          slot: storageViewSlot.slot_index,
+          present: Boolean(storageViewSlot.occupied),
+        };
+    return {
+      key: String(storageViewSlot.slot_index),
+      slot: slotLike,
+      storageViewSlot,
+      liveSlot,
+      smartEntry: getStorageViewSmartSummaryEntry(view, storageViewSlot) || (liveSlot ? getSmartSummaryEntry(liveSlot) : null),
+      historyPayload: state.heatmap.histories[String(storageViewSlot.slot_index)] || null,
+    };
+  }
+
+  function currentHeatmapEntries() {
+    const selectedView = getSelectedStorageViewRuntime();
+    if (selectedView) {
+      return (selectedView.slots || []).map((slot) => heatmapStorageViewEntry(selectedView, slot));
+    }
+    return (state.snapshot.slots || []).map((slot) => heatmapLiveEntry(slot));
+  }
+
+  function buildHeatmapContext() {
+    if (!state.heatmap.enabled) {
+      return { enabled: false };
+    }
+    normalizeHeatmapMetricSelection();
+    const metric = heatmapMetricDefinition();
+    const entries = currentHeatmapEntries();
+    const timelineActive = heatmapTimelineActive(metric.id);
+    const playbackTimeline = timelineActive ? heatmapPlaybackTimeline(entries, metric) : [];
+    const playbackIndex = timelineActive ? normalizeHeatmapPlaybackIndex(playbackTimeline) : null;
+    const playbackTimestampMs = Number.isInteger(playbackIndex) ? playbackTimeline[playbackIndex] : null;
+    const evaluation = {
+      timelineActive,
+      playbackIndex,
+      playbackTimestampMs,
+      playbackTimeline,
+    };
+    const records = new Map();
+    const numericValues = [];
+
+    entries.forEach((entry) => {
+      const isEmptySlot = heatmapSlotState(entry) === "empty" || String(entry?.storageViewSlot?.state || "").toLowerCase() === "empty";
+      const rawResult = isEmptySlot ? null : metric.value(entry, entries, evaluation);
+      const value = typeof rawResult === "object" && rawResult !== null ? rawResult.value : rawResult;
+      const numericValue = value === null || value === undefined || value === "" ? null : Number(value);
+      const hasDiskIdentity = Boolean(entry?.slot?.device_name || entry?.slot?.serial || entry?.slot?.pool_name || entry?.storageViewSlot?.device_name || entry?.storageViewSlot?.serial || entry?.storageViewSlot?.pool_name);
+      const reasons = typeof rawResult === "object" && rawResult !== null && Array.isArray(rawResult.reasons)
+        ? rawResult.reasons
+        : [];
+      const record = {
+        entry,
+        value: hasDiskIdentity && Number.isFinite(numericValue) ? numericValue : null,
+        reasons,
+      };
+      records.set(entry.key, record);
+      if (Number.isFinite(record.value)) {
+        numericValues.push(record.value);
+      }
+    });
+
+    const fixedRange = Array.isArray(metric.fixedRange) ? metric.fixedRange : null;
+    const min = fixedRange ? fixedRange[0] : (numericValues.length ? Math.min(...numericValues) : null);
+    const max = fixedRange ? fixedRange[1] : (numericValues.length ? Math.max(...numericValues) : null);
+    return {
+      enabled: true,
+      metric,
+      entries,
+      records,
+      min,
+      max,
+      sensitivity: state.heatmap.sensitivity,
+      valueCount: numericValues.length,
+      timelineActive,
+      playbackIndex,
+      playbackTimestampMs,
+      playbackTimeline,
+    };
+  }
+
+  function heatmapIntensity(record, context) {
+    if (!record || !Number.isFinite(record.value) || !Number.isFinite(context.min) || !Number.isFinite(context.max)) {
+      return null;
+    }
+    const span = context.max - context.min;
+    let intensity = span > 0 ? (record.value - context.min) / span : (record.value === 0 ? 0 : 0.72);
+    if (context.metric.polarity === "low") {
+      intensity = 1 - intensity;
+    }
+    const sensitivity = normalizeHeatmapScaleSensitivity(context.sensitivity);
+    intensity = 0.5 + ((intensity - 0.5) * sensitivity);
+    return Math.max(0, Math.min(1, intensity));
+  }
+
+  function interpolateRgb(start, end, amount) {
+    return start.map((component, index) => Math.round(component + ((end[index] - component) * amount)));
+  }
+
+  function heatmapRgbForIntensity(intensity) {
+    const clamped = Math.max(0, Math.min(1, Number(intensity) || 0));
+    const blue = [47, 110, 187];
+    const green = [44, 171, 103];
+    const amber = [215, 182, 43];
+    const red = [210, 74, 74];
+    if (clamped <= 0.3) {
+      return interpolateRgb(blue, green, clamped / 0.3);
+    }
+    if (clamped <= 0.68) {
+      return interpolateRgb(green, amber, (clamped - 0.3) / 0.38);
+    }
+    return interpolateRgb(amber, red, (clamped - 0.68) / 0.32);
+  }
+
+  function applyHeatmapToTile(tile, context, entryKey) {
+    if (!tile || !context?.enabled) {
+      return;
+    }
+    const record = context.records.get(String(entryKey));
+    const metric = context.metric;
+    const badge = document.createElement("span");
+    badge.className = "slot-heatmap-value";
+    if (tile.classList.contains("state-empty") || !record || !Number.isFinite(record.value)) {
+      tile.classList.add("heatmap-missing");
+      badge.textContent = "--";
+      badge.title = `${metric.label}: unknown`;
+      tile.appendChild(badge);
+      return;
+    }
+    const intensity = heatmapIntensity(record, context);
+    if (intensity === null) {
+      tile.classList.add("heatmap-missing");
+      badge.textContent = metric.format(record.value);
+      tile.appendChild(badge);
+      return;
+    }
+    const rgb = heatmapRgbForIntensity(intensity);
+    tile.classList.add("heatmap-active");
+    tile.style.setProperty("--heatmap-rgb", rgb.join(", "));
+    tile.style.setProperty("--heatmap-alpha", String(0.5 + (intensity * 0.25)));
+    tile.style.setProperty("--heatmap-border-alpha", String(0.58 + (intensity * 0.32)));
+    badge.textContent = metric.format(record.value);
+    badge.title = `${metric.label}: ${metric.format(record.value)}`;
+    tile.appendChild(badge);
+  }
+
+  function heatmapTooltipLines(entryKey, context = null) {
+    const heatmapContext = context || buildHeatmapContext();
+    if (!heatmapContext.enabled) {
+      return [];
+    }
+    const record = heatmapContext.records.get(String(entryKey));
+    const metric = heatmapContext.metric;
+    if (!record || !Number.isFinite(record.value)) {
+      return [`Heat Map: ${metric.label} unknown`];
+    }
+    const lines = [`Heat Map: ${metric.label} ${metric.format(record.value)}`];
+    if (heatmapContext.timelineActive) {
+      lines.push(`Sample: ${formatHeatmapPlaybackLabel(
+        heatmapContext.playbackTimestampMs,
+        heatmapContext.playbackIndex || 0,
+        (heatmapContext.playbackTimeline || []).length
+      )}`);
+    }
+    (record.reasons || []).forEach((reason) => {
+      lines.push(`Reason: ${reason}`);
+    });
+    return lines;
+  }
+
+  function appendHeatmapTooltipLines(lines, entryKey) {
+    if (!state.heatmap.enabled) {
+      return lines;
+    }
+    return [...lines, ...heatmapTooltipLines(entryKey)];
+  }
+
+  function heatmapHistoryScopeRequest() {
+    if (state.snapshotMode || !state.heatmap.enabled || !heatmapMetricNeedsHistory() || !isHistoryAvailable()) {
+      return null;
+    }
+    const selectedView = getSelectedStorageViewRuntime();
+    const params = buildSelectionParams();
+    const windowHours = currentHeatmapWindowHours();
+    if (Number.isInteger(windowHours)) {
+      params.set("window_hours", String(windowHours));
+    }
+    params.set("event_limit", "0");
+    heatmapHistoryMetricNames().forEach((metricName) => {
+      params.append("metrics", metricName);
+    });
+    let slotCount = 0;
+    let url = "";
+    if (selectedView) {
+      slotCount = (selectedView.slots || []).length;
+      url = `/api/storage-views/${encodeURIComponent(selectedView.id)}/history?${params.toString()}`;
+    } else {
+      const slots = (state.snapshot.slots || []).map((slot) => slot.slot).filter((slot) => Number.isInteger(slot));
+      slotCount = slots.length;
+      slots.forEach((slot) => params.append("slots", String(slot)));
+      url = `/api/history/scope?${params.toString()}`;
+    }
+    if (!slotCount) {
+      return null;
+    }
+    return {
+      url,
+      scopeKey: `${state.heatmap.metric}|${url}`,
+    };
+  }
+
+  async function refreshHeatmapHistoryIfNeeded(force = false) {
+    const request = heatmapHistoryScopeRequest();
+    if (!request) {
+      return;
+    }
+    if (!force && state.heatmap.scopeKey === request.scopeKey && Object.keys(state.heatmap.histories || {}).length) {
+      return;
+    }
+    if (!force && state.heatmap.loading && state.heatmap.pendingScopeKey === request.scopeKey) {
+      return;
+    }
+    const requestToken = state.heatmap.requestToken + 1;
+    state.heatmap.requestToken = requestToken;
+    state.heatmap.loading = true;
+    state.heatmap.pendingScopeKey = request.scopeKey;
+    state.heatmap.error = null;
+    renderHeatmapControls();
+    try {
+      const payload = await fetchJson(request.url);
+      if (requestToken !== state.heatmap.requestToken) {
+        return;
+      }
+      state.heatmap.histories = payload.histories || {};
+      state.heatmap.scopeKey = request.scopeKey;
+      state.heatmap.error = null;
+    } catch (error) {
+      if (requestToken !== state.heatmap.requestToken) {
+        return;
+      }
+      state.heatmap.error = error.message || String(error);
+      state.heatmap.histories = {};
+      state.heatmap.scopeKey = null;
+    } finally {
+      if (requestToken === state.heatmap.requestToken) {
+        state.heatmap.loading = false;
+        state.heatmap.pendingScopeKey = null;
+        renderGrid();
+        renderHeatmapControls();
+      }
+    }
+  }
+
+  function resetHeatmapHistoryCache() {
+    state.heatmap.histories = {};
+    state.heatmap.scopeKey = null;
+    state.heatmap.pendingScopeKey = null;
+    state.heatmap.error = null;
+    state.heatmap.playbackIndex = null;
+    state.heatmap.requestToken += 1;
+  }
+
+  function renderHeatmapControls(context = null) {
+    normalizeHeatmapMetricSelection();
+    state.heatmap.sensitivity = normalizeHeatmapScaleSensitivity(state.heatmap.sensitivity);
+    const metric = heatmapMetricDefinition();
+    const supportsTimeline = heatmapMetricSupportsTimeline(metric);
+    const timelineActive = heatmapTimelineActive(metric.id);
+    const needsHistory = heatmapMetricNeedsHistory();
+    if (heatmapToggleButton) {
+      heatmapToggleButton.classList.toggle("active", state.heatmap.enabled);
+      heatmapToggleButton.setAttribute("aria-pressed", state.heatmap.enabled ? "true" : "false");
+    }
+    if (heatmapControls) {
+      heatmapControls.classList.toggle("hidden", !state.heatmap.enabled);
+    }
+    if (heatmapMetricSelect && !heatmapMetricSelect.options.length) {
+      heatmapMetricSelect.innerHTML = heatmapMetricDefinitions()
+        .map((metric) => `<option value="${escapeHtml(metric.id)}">${escapeHtml(metric.label)}</option>`)
+        .join("");
+    }
+    if (heatmapMetricSelect) {
+      heatmapMetricSelect.value = state.heatmap.metric;
+    }
+    if (heatmapMetricField) {
+      heatmapMetricField.classList.toggle("hidden", !state.heatmap.enabled);
+    }
+    if (heatmapTimeframeField) {
+      heatmapTimeframeField.classList.toggle("hidden", !state.heatmap.enabled || !needsHistory);
+    }
+    if (heatmapTimeframeSelect) {
+      heatmapTimeframeSelect.value = currentHeatmapWindowHours() === null ? "all" : String(currentHeatmapWindowHours());
+    }
+    if (heatmapPlaybackField) {
+      heatmapPlaybackField.classList.toggle("hidden", !state.heatmap.enabled || !supportsTimeline);
+    }
+    if (heatmapPlaybackSelect) {
+      heatmapPlaybackSelect.value = timelineActive ? HEATMAP_HISTORY_MODE_TIMELINE : HEATMAP_HISTORY_MODE_CURRENT;
+      heatmapPlaybackSelect.disabled = !supportsTimeline;
+    }
+    if (heatmapScaleSlider) {
+      heatmapScaleSlider.value = String(state.heatmap.sensitivity);
+    }
+    if (heatmapScaleValue) {
+      heatmapScaleValue.value = formatHeatmapScaleSensitivity(state.heatmap.sensitivity);
+      heatmapScaleValue.textContent = formatHeatmapScaleSensitivity(state.heatmap.sensitivity);
+    }
+    if (heatmapLegend) {
+      heatmapLegend.classList.toggle("hidden", !state.heatmap.enabled);
+    }
+    if (!state.heatmap.enabled) {
+      return;
+    }
+    const heatmapContext = context || buildHeatmapContext();
+    const activeMetric = heatmapContext.metric || metric;
+    const playbackTimeline = heatmapContext.playbackTimeline || [];
+    const playbackIndex = Number.isInteger(heatmapContext.playbackIndex) ? heatmapContext.playbackIndex : null;
+    const playbackLabel = timelineActive
+      ? formatHeatmapPlaybackLabel(heatmapContext.playbackTimestampMs, playbackIndex || 0, playbackTimeline.length)
+      : "Live";
+    if (heatmapScrubField) {
+      heatmapScrubField.classList.toggle("hidden", !state.heatmap.enabled || !timelineActive);
+    }
+    if (heatmapScrubSlider) {
+      heatmapScrubSlider.min = "0";
+      heatmapScrubSlider.max = String(Math.max(0, playbackTimeline.length - 1));
+      heatmapScrubSlider.value = String(playbackIndex ?? 0);
+      heatmapScrubSlider.disabled = !timelineActive || playbackTimeline.length < 2;
+    }
+    if (heatmapScrubValue) {
+      heatmapScrubValue.value = playbackLabel;
+      heatmapScrubValue.textContent = playbackLabel;
+    }
+    if (heatmapLegendMin) {
+      heatmapLegendMin.textContent = Number.isFinite(heatmapContext.min) ? activeMetric.format(heatmapContext.min) : "Low";
+    }
+    if (heatmapLegendMax) {
+      heatmapLegendMax.textContent = Number.isFinite(heatmapContext.max) ? activeMetric.format(heatmapContext.max) : "High";
+    }
+    if (heatmapLegendStatus) {
+      if (state.heatmap.loading) {
+        heatmapLegendStatus.textContent = needsHistory ? `Loading ${formatHistoryWindowLabel(currentHeatmapWindowHours())}` : "Loading";
+      } else if (needsHistory && state.history.loading && !state.history.checked) {
+        heatmapLegendStatus.textContent = "Checking history";
+        heatmapLegendStatus.title = "";
+      } else if (needsHistory && !isHistoryAvailable()) {
+        heatmapLegendStatus.textContent = "History unavailable";
+        heatmapLegendStatus.title = state.history.detail || "The history sidecar is not available.";
+      } else if (state.heatmap.error) {
+        heatmapLegendStatus.textContent = "History unavailable";
+        heatmapLegendStatus.title = state.heatmap.error;
+      } else {
+        const valueCount = heatmapContext.valueCount || 0;
+        const windowLabel = needsHistory ? ` - ${formatHistoryWindowLabel(currentHeatmapWindowHours())}` : "";
+        const timelineLabel = timelineActive ? ` - ${playbackLabel}` : "";
+        const scaleLabel = state.heatmap.sensitivity !== HEATMAP_DEFAULT_SCALE_SENSITIVITY
+          ? ` - scale ${formatHeatmapScaleSensitivity(state.heatmap.sensitivity)}`
+          : "";
+        heatmapLegendStatus.textContent = `${valueCount} value${valueCount === 1 ? "" : "s"}${windowLabel}${timelineLabel}${scaleLabel}`;
+        heatmapLegendStatus.title = "";
+      }
+    }
+  }
+
+  function ensureHeatmapData() {
+    if (!state.heatmap.enabled) {
+      return;
+    }
+    if (heatmapMetricNeedsHistory()) {
+      void refreshHeatmapHistoryIfNeeded(false);
+    }
+    const selectedView = getSelectedStorageViewRuntime();
+    if (!state.snapshotMode && selectedView && !isLiveStyledStorageView(selectedView)) {
+      (selectedView.slots || [])
+        .filter((slot) => slot.occupied || slot.device_name || slot.serial)
+        .slice(0, 32)
+        .forEach((slot) => {
+          void ensureStorageViewSmartSummary(selectedView, slot);
+        });
+    } else if (!state.snapshotMode && !selectedView) {
+      scheduleSmartPrefetch();
+    }
+  }
+
   function appendSmartTooltipMetrics(lines, slot, smartEntry) {
     if (smartEntry?.loading) {
       lines.push("SMART: loading...");
@@ -3619,6 +4715,11 @@
     const bytesWritten = formatBytesWrittenValue(smartEntry);
     if (bytesWritten !== "n/a") {
       lines.push(`Writes: ${bytesWritten}`);
+    }
+
+    const annualizedRead = formatAnnualizedReadValue(smartEntry);
+    if (annualizedRead !== "n/a") {
+      lines.push(`Annualized Read: ${annualizedRead}`);
     }
 
     const annualizedWrite = formatAnnualizedWriteValue(smartEntry);
@@ -3704,7 +4805,7 @@
       lines.push(`Source: ${slot.source}`);
     }
 
-    return lines;
+    return appendHeatmapTooltipLines(lines, slot.slot_index);
   }
 
   function buildTooltipLines(slot, smartEntry) {
@@ -3733,7 +4834,7 @@
       }
     }
 
-    return lines;
+    return appendHeatmapTooltipLines(lines, slot.slot);
   }
 
   function slotTooltip(slot, smartEntry) {
@@ -3885,6 +4986,8 @@
     const peerContext = getSelectedPeerContext();
     const layoutRows = activeLayoutRows();
     const geometry = buildChassisGeometry(buildViewProfile(), layoutRows);
+    const heatmapContext = buildHeatmapContext();
+    renderHeatmapControls(heatmapContext);
     const appendTile = (container, slotNumber, tileIndex = null, breakpoints = []) => {
       if (!Number.isInteger(slotNumber)) {
         const gapTile = document.createElement("div");
@@ -3920,6 +5023,7 @@
       tile.dataset.slot = String(slot.slot);
       tile.setAttribute("aria-label", slotTooltip(slot, getSmartSummaryEntry(slot)));
       tile.innerHTML = buildLiveSlotTileMarkup(slot);
+      applyHeatmapToTile(tile, heatmapContext, slot.slot);
       tile.addEventListener("mouseenter", (event) => {
         state.hoveredSlot = slot.slot;
         refreshHoveredTooltip(tile);
@@ -4101,6 +5205,7 @@
       case "bytes_read":
       case "bytes_written":
         return formatMetricBytes(numericValue) || "n/a";
+      case "annualized_bytes_read":
       case "annualized_bytes_written": {
         const formatted = formatMetricBytes(numericValue);
         return formatted ? `${formatted}/yr` : "n/a";
@@ -4886,9 +5991,9 @@
     const lowHourAnnualizedNote = (
       Number.isInteger(smartEntry?.data?.power_on_hours)
       && smartEntry.data.power_on_hours < (24 * 30)
-      && Number.isInteger(smartEntry?.data?.bytes_written)
+      && (Number.isInteger(smartEntry?.data?.bytes_read) || Number.isInteger(smartEntry?.data?.bytes_written))
     )
-      ? "Annualized write stays hidden until the disk has at least about 30 days of power-on time."
+      ? "Annualized read/write stays hidden until the disk has at least about 30 days of power-on time."
       : null;
     if (lowHourAnnualizedNote) {
       notes.push(lowHourAnnualizedNote);
@@ -4902,7 +6007,7 @@
     }
 
     const temperatureSamples = Number(payload?.sample_counts?.temperature_c);
-    const slowMetricCounts = ["bytes_read", "bytes_written", "annualized_bytes_written", "power_on_hours"]
+    const slowMetricCounts = ["bytes_read", "bytes_written", "annualized_bytes_read", "annualized_bytes_written", "power_on_hours"]
       .map((metricName) => Number(payload?.sample_counts?.[metricName]))
       .filter((count) => Number.isFinite(count) && count > 0);
     if (
@@ -5355,6 +6460,7 @@
       historyMetricCard("Temperature", "temperature_c", payload, windowHours, referenceTimestampMs),
       historyMetricCard("Bytes Read", "bytes_read", payload, windowHours, referenceTimestampMs),
       historyMetricCard("Bytes Written", "bytes_written", payload, windowHours, referenceTimestampMs),
+      historyMetricCard("Annualized Read", "annualized_bytes_read", payload, windowHours, referenceTimestampMs),
       historyMetricCard("Annualized Write", "annualized_bytes_written", payload, windowHours, referenceTimestampMs),
       historyMetricCard("Power On", "power_on_hours", payload, windowHours, referenceTimestampMs),
     ].join("");
@@ -5447,6 +6553,7 @@
 
       renderStatus();
       renderHistoryPanel();
+      ensureHeatmapData();
     })();
     await state.history.statusRefreshPromise;
   }
@@ -5506,9 +6613,9 @@
     const lowHourAnnualizedNote = (
       Number.isInteger(smartEntry?.data?.power_on_hours)
       && smartEntry.data.power_on_hours < (24 * 30)
-      && Number.isInteger(smartEntry?.data?.bytes_written)
+      && (Number.isInteger(smartEntry?.data?.bytes_read) || Number.isInteger(smartEntry?.data?.bytes_written))
     )
-      ? "Annualized write is hidden until the disk has at least about 30 days of power-on time."
+      ? "Annualized read/write is hidden until the disk has at least about 30 days of power-on time."
       : null;
     const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
       ? "Estimated write-endurance values extrapolate current writes against the NVMe percentage-used SMART field."
@@ -5600,6 +6707,7 @@
       kvRowIfMeaningful("TRIM", formatTrimSupportedValue(smartEntry)),
       kvRowIfMeaningful("Bytes Read", formatBytesReadValue(smartEntry)),
       kvRowIfMeaningful("Bytes Written", formatBytesWrittenValue(smartEntry)),
+      kvRowIfMeaningful("Annualized Read", formatAnnualizedReadValue(smartEntry)),
       kvRowIfMeaningful("Annualized Write", formatAnnualizedWriteValue(smartEntry)),
       kvRowIfMeaningful("Est. TBW Left", formatEstimatedRemainingWriteValue(smartEntry)),
       kvRowIfMeaningful("Read Commands", formatReadCommandsValue(smartEntry)),
@@ -5737,6 +6845,7 @@
         kvRowIfMeaningful("TRIM", formatTrimSupportedValue(smartEntry)),
         kvRowIfMeaningful("Bytes Read", formatBytesReadValue(smartEntry)),
         kvRowIfMeaningful("Bytes Written", formatBytesWrittenValue(smartEntry)),
+        kvRowIfMeaningful("Annualized Read", formatAnnualizedReadValue(smartEntry)),
         kvRowIfMeaningful("Annualized Write", formatAnnualizedWriteValue(smartEntry)),
         kvRowIfMeaningful("Est. TBW Left", formatEstimatedRemainingWriteValue(smartEntry)),
         kvRowIfMeaningful("Read Commands", formatReadCommandsValue(smartEntry)),
@@ -6737,6 +7846,7 @@
         currentSmartPrefetchScopeKey()
       );
       scheduleSmartPrefetch();
+      ensureHeatmapData();
       maybeFinalizeUiPerfRun(perfRun);
       setStatus("Inventory updated.");
     } catch (error) {
@@ -6959,6 +8069,9 @@
     if (state.hoveredSlot === slot.slot) {
       refreshHoveredTooltip();
     }
+    if (state.heatmap.enabled) {
+      renderGrid();
+    }
   }
 
   async function ensureStorageViewSmartSummary(view, slot) {
@@ -7009,6 +8122,9 @@
     }
     if (state.selectedStorageViewRuntimeId === view.id && state.hoveredSlot === slot.slot_index) {
       refreshHoveredTooltip();
+    }
+    if (state.heatmap.enabled) {
+      renderGrid();
     }
   }
 
@@ -7084,6 +8200,7 @@
       };
       state.storageViewsRuntimeLoading = true;
       state.selectedStorageViewRuntimeId = "";
+      resetHeatmapHistoryCache();
       clearSelectedSlot();
       applyReusableSnapshot(state.selectedSystemId, null);
       await refreshSnapshot(false, "system-switch");
@@ -7094,11 +8211,13 @@
     enclosureSelect.addEventListener("change", async (event) => {
       const rawValue = event.target.value || "";
       clearSelectedSlot();
+      resetHeatmapHistoryCache();
       if (rawValue.startsWith("view:")) {
         state.selectedStorageViewRuntimeId = rawValue.slice("view:".length);
         state.selectedEnclosureId = currentLiveEnclosureId();
         renderAll();
         syncLocation();
+        ensureHeatmapData();
         return;
       }
       state.selectedStorageViewRuntimeId = "";
@@ -7124,7 +8243,10 @@
         return;
       }
       state.selectedStorageViewRuntimeId = button.dataset.storageViewRuntimeId || "";
+      resetHeatmapHistoryCache();
       renderStorageViewsRuntime();
+      renderGrid();
+      ensureHeatmapData();
     });
   }
   autoRefreshToggle.addEventListener("change", (event) => {
@@ -7334,6 +8456,62 @@
       }
     });
   }
+  if (heatmapToggleButton) {
+    heatmapToggleButton.addEventListener("click", () => {
+      state.heatmap.enabled = !state.heatmap.enabled;
+      if (!state.heatmap.enabled) {
+        resetHeatmapHistoryCache();
+      }
+      renderGrid();
+      renderHeatmapControls();
+      ensureHeatmapData();
+    });
+  }
+  if (heatmapMetricSelect) {
+    heatmapMetricSelect.addEventListener("change", () => {
+      state.heatmap.metric = heatmapMetricSelect.value || HEATMAP_DEFAULT_METRIC;
+      resetHeatmapHistoryCache();
+      renderGrid();
+      renderHeatmapControls();
+      ensureHeatmapData();
+    });
+  }
+  if (heatmapTimeframeSelect) {
+    heatmapTimeframeSelect.addEventListener("change", () => {
+      const nextValue = heatmapTimeframeSelect.value;
+      state.heatmap.timeframeHours = nextValue === "all" ? null : Number(nextValue) || DEFAULT_HISTORY_TIMEFRAME_HOURS;
+      resetHeatmapHistoryCache();
+      renderGrid();
+      renderHeatmapControls();
+      ensureHeatmapData();
+    });
+  }
+  if (heatmapPlaybackSelect) {
+    heatmapPlaybackSelect.addEventListener("change", () => {
+      state.heatmap.historyMode = heatmapPlaybackSelect.value === HEATMAP_HISTORY_MODE_TIMELINE
+        ? HEATMAP_HISTORY_MODE_TIMELINE
+        : HEATMAP_HISTORY_MODE_CURRENT;
+      state.heatmap.playbackIndex = null;
+      renderGrid();
+      renderHeatmapControls();
+      ensureHeatmapData();
+    });
+  }
+  if (heatmapScrubSlider) {
+    heatmapScrubSlider.addEventListener("input", () => {
+      const nextIndex = Number(heatmapScrubSlider.value);
+      state.heatmap.playbackIndex = Number.isInteger(nextIndex) ? nextIndex : null;
+      renderGrid();
+      renderHeatmapControls();
+    });
+  }
+  if (heatmapScaleSlider) {
+    heatmapScaleSlider.addEventListener("input", () => {
+      state.heatmap.sensitivity = normalizeHeatmapScaleSensitivity(heatmapScaleSlider.value);
+      renderGrid();
+      renderHeatmapControls();
+    });
+  }
   if (historyCloseButton) {
     historyCloseButton.addEventListener("click", () => {
       state.history.panelOpen = false;
@@ -7386,6 +8564,8 @@
   initializeSystemSetupForm();
   syncSystemBackupControls();
   renderAll();
+  renderHeatmapControls();
+  ensureHeatmapData();
   renderUiPerfPanel();
   if (state.snapshotMode) {
     setStatus("Frozen offline snapshot loaded. Live actions are disabled.");

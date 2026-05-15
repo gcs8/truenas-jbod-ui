@@ -5211,6 +5211,11 @@ class InventoryService:
             ),
             bytes_read=bytes_read,
             bytes_written=bytes_written,
+            annualized_bytes_read=(
+                int(bytes_read / max(power_on_hours / 8760, 1 / 8760))
+                if isinstance(bytes_read, int) and isinstance(power_on_hours, int) and power_on_hours > 0
+                else None
+            ),
             annualized_bytes_written=(
                 int(bytes_written / max(power_on_hours / 8760, 1 / 8760))
                 if isinstance(bytes_written, int) and isinstance(power_on_hours, int) and power_on_hours > 0
@@ -8015,6 +8020,7 @@ class InventoryService:
                 summary.endurance_remaining_percent,
                 summary.bytes_read,
                 summary.bytes_written,
+                summary.annualized_bytes_read,
                 summary.annualized_bytes_written,
                 summary.estimated_lifetime_bytes_written,
                 summary.estimated_remaining_bytes_written,
@@ -8095,6 +8101,7 @@ class InventoryService:
             "endurance_remaining_percent",
             "bytes_read",
             "bytes_written",
+            "annualized_bytes_read",
             "annualized_bytes_written",
             "estimated_lifetime_bytes_written",
             "estimated_remaining_bytes_written",

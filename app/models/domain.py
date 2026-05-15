@@ -102,6 +102,7 @@ class SmartSummaryView(BaseModel):
     endurance_remaining_percent: int | None = None
     bytes_read: int | None = None
     bytes_written: int | None = None
+    annualized_bytes_read: int | None = None
     annualized_bytes_written: int | None = None
     estimated_lifetime_bytes_written: int | None = None
     estimated_remaining_bytes_written: int | None = None

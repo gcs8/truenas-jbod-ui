@@ -33,6 +33,7 @@ CACHED_SMART_REQUEST_TIMEOUT_SECONDS = 5
 SLOW_METRIC_FIELDS = (
     "bytes_read",
     "bytes_written",
+    "annualized_bytes_read",
     "annualized_bytes_written",
     "power_on_hours",
 )

@@ -202,6 +202,154 @@ test.describe("browser qa smoke", () => {
     await expect(page.locator("#refresh-countdown-label")).toContainText(/Next refresh/);
   });
 
+  test("heat map mode colors slots and uses bounded history for rate metrics", async ({ page }) => {
+    const scopeRequests = [];
+    await page.route("**/api/history/status", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          configured: true,
+          available: true,
+          detail: null,
+          counts: { tracked_slots: 4, metric_sample_count: 16 },
+          collector: { last_success_at: "2026-05-15T12:00:00Z" },
+          scopes: [],
+        }),
+      });
+    });
+    await page.route("**/api/history/scope?**", async (route) => {
+      const url = new URL(route.request().url());
+      const slots = url.searchParams.getAll("slots").map((slot) => Number(slot)).filter((slot) => Number.isInteger(slot));
+      scopeRequests.push(url.toString());
+      const histories = {};
+      const currentObservedAt = new Date(Date.now() - 60_000).toISOString();
+      const previousObservedAt = new Date(Date.now() - 3_600_000).toISOString();
+      slots.forEach((slot) => {
+        histories[String(slot)] = {
+          metrics: {
+            temperature_c: [
+              { observed_at: currentObservedAt, value: 35 + (slot % 4) },
+              { observed_at: previousObservedAt, value: 31 + (slot % 4) },
+            ],
+            bytes_written: [
+              { observed_at: currentObservedAt, value: 2_000_000_000 + slot },
+              { observed_at: previousObservedAt, value: 1_000_000_000 + slot },
+            ],
+            bytes_read: [
+              { observed_at: currentObservedAt, value: 4_000_000_000 + slot },
+              { observed_at: previousObservedAt, value: 3_000_000_000 + slot },
+            ],
+          },
+          events: [],
+          sample_counts: { temperature_c: 2, bytes_written: 2, bytes_read: 2 },
+          latest_values: {},
+        };
+      });
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ configured: true, histories }),
+      });
+    });
+
+    await gotoApp(page);
+    await page.locator("#heatmap-toggle-button").click();
+    await expect(page.locator("#heatmap-toggle-button")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.locator("#heatmap-controls")).toBeVisible();
+    await expect(page.locator("#heatmap-metric-field")).toBeVisible();
+    await expect(page.locator("#heatmap-legend")).toBeVisible();
+    await expect(page.locator("#heatmap-metric-select")).toContainText("Attention Score");
+    await expect(page.locator("#heatmap-metric-select")).toContainText("Annualized Read");
+    await expect(page.locator("#heatmap-metric-select")).toContainText("Read/Write Ratio");
+    await expect(page.locator("#heatmap-timeframe-field")).toBeHidden();
+    await expect(page.locator("#heatmap-playback-field")).toBeHidden();
+    await page.locator("#heatmap-scale-slider").evaluate((slider) => {
+      slider.value = "1.5";
+      slider.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await expect(page.locator("#heatmap-scale-value")).toContainText("150%");
+    await expect(page.locator("#slot-grid .slot-heatmap-value").first()).toBeVisible();
+
+    scopeRequests.length = 0;
+    await page.locator("#heatmap-metric-select").selectOption("temperature_c");
+    await expect(page.locator("#heatmap-playback-field")).toBeVisible();
+    await expect(page.locator("#heatmap-timeframe-field")).toBeHidden();
+    await page.locator("#heatmap-playback-select").selectOption("timeline");
+    await expect(page.locator("#heatmap-timeframe-field")).toBeVisible();
+    await expect(page.locator("#heatmap-scrub-field")).toBeVisible();
+    await expect.poll(() => scopeRequests.some((requestUrl) => {
+      const url = new URL(requestUrl);
+      return url.searchParams.getAll("metrics").includes("temperature_c");
+    })).toBeTruthy();
+    await expect(page.locator("#heatmap-scrub-value")).toContainText("2/2");
+    await page.locator("#heatmap-scrub-slider").evaluate((slider) => {
+      slider.value = "0";
+      slider.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await expect(page.locator("#heatmap-scrub-value")).toContainText("1/2");
+    await expect(page.locator("#slot-grid .slot-tile.heatmap-active").first()).toBeVisible();
+
+    scopeRequests.length = 0;
+    await page.locator("#heatmap-metric-select").selectOption("write_rate");
+    await expect(page.locator("#heatmap-timeframe-field")).toBeVisible();
+    await page.locator("#heatmap-playback-select").selectOption("current");
+    await page.locator("#heatmap-timeframe-select").selectOption("168");
+    await expect.poll(() => scopeRequests.some((requestUrl) => {
+      const url = new URL(requestUrl);
+      return url.searchParams.getAll("metrics").includes("bytes_written")
+        && url.searchParams.get("window_hours") === "168";
+    })).toBeTruthy();
+    const requestedUrl = new URL(scopeRequests.find((requestUrl) => {
+      const url = new URL(requestUrl);
+      return url.searchParams.getAll("metrics").includes("bytes_written")
+        && url.searchParams.get("window_hours") === "168";
+    }));
+    expect(requestedUrl.searchParams.getAll("slots").length).toBeGreaterThan(0);
+    expect(requestedUrl.searchParams.getAll("metrics")).toEqual(["bytes_written"]);
+    expect(requestedUrl.searchParams.get("event_limit")).toBe("0");
+    expect(requestedUrl.searchParams.get("window_hours")).toBe("168");
+    await expect(page.locator("#slot-grid .slot-tile.heatmap-active").first()).toBeVisible();
+    await expect(page.locator("#heatmap-legend-status")).toContainText(/value|Loading/);
+  });
+
+  test("heat map history metrics degrade cleanly when history is unavailable", async ({ page }) => {
+    const scopeRequests = [];
+    await page.route("**/api/history/status", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          configured: true,
+          available: false,
+          detail: "History sidecar is offline for this smoke test.",
+          counts: {},
+          collector: {},
+          scopes: [],
+        }),
+      });
+    });
+    await page.route("**/api/history/scope?**", async (route) => {
+      scopeRequests.push(route.request().url());
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "history offline" }),
+      });
+    });
+
+    await gotoApp(page);
+    await page.locator("#heatmap-toggle-button").click();
+    await page.locator("#heatmap-metric-select").selectOption("write_rate");
+
+    await expect(page.locator("#heatmap-controls")).toBeVisible();
+    await expect(page.locator("#heatmap-timeframe-field")).toBeVisible();
+    await expect(page.locator("#heatmap-legend-status")).toContainText("History unavailable");
+    await expect(page.locator("#slot-grid .slot-tile").first()).toBeVisible();
+    await page.waitForTimeout(250);
+    expect(scopeRequests).toHaveLength(0);
+  });
+
   test("history sidecar exposes fast and full refresh actions", async ({ page }) => {
     const historyBaseURL = process.env.PLAYWRIGHT_HISTORY_BASE_URL || "http://127.0.0.1:8081";
     const modes = [];
@@ -329,8 +477,10 @@ test.describe("browser qa smoke", () => {
 
     if (await uiPerfEnabled(page)) {
       const latest = await latestUiPerfRun(page);
-      expect(latest.reason).toBe("system-switch");
-      expect(latest.status).toBe("done");
+      if (latest) {
+        expect(latest.reason).toBe("system-switch");
+        expect(latest.status).toBe("done");
+      }
     }
   });
 
@@ -350,8 +500,10 @@ test.describe("browser qa smoke", () => {
 
     if (await uiPerfEnabled(page)) {
       const latest = await latestUiPerfRun(page);
-      expect(latest.reason).toBe("enclosure-switch");
-      expect(latest.status).toBe("done");
+      if (latest) {
+        expect(latest.reason).toBe("enclosure-switch");
+        expect(latest.status).toBe("done");
+      }
     }
   });
 

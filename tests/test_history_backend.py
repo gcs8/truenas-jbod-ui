@@ -149,6 +149,7 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
                                     "value": 1099511627776,
                                 }
                             ],
+                            "annualized_bytes_read": [],
                             "annualized_bytes_written": [],
                             "power_on_hours": [
                                 {
@@ -161,6 +162,7 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
                             "temperature_c": 1,
                             "bytes_read": 1,
                             "bytes_written": 1,
+                            "annualized_bytes_read": 0,
                             "annualized_bytes_written": 0,
                             "power_on_hours": 1,
                         },
@@ -168,6 +170,7 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
                             "temperature_c": 31,
                             "bytes_read": 549755813888,
                             "bytes_written": 1099511627776,
+                            "annualized_bytes_read": None,
                             "annualized_bytes_written": None,
                             "power_on_hours": 10101,
                         },
@@ -188,10 +191,12 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["enclosure_id"], "front")
         self.assertEqual(payload["sample_counts"]["temperature_c"], 1)
         self.assertEqual(payload["sample_counts"]["bytes_read"], 1)
+        self.assertEqual(payload["sample_counts"]["annualized_bytes_read"], 0)
         self.assertEqual(payload["sample_counts"]["annualized_bytes_written"], 0)
         self.assertEqual(payload["latest_values"]["temperature_c"], 31)
         self.assertEqual(payload["latest_values"]["bytes_read"], 549755813888)
         self.assertEqual(payload["latest_values"]["bytes_written"], 1099511627776)
+        self.assertIsNone(payload["latest_values"]["annualized_bytes_read"])
         self.assertIsNone(payload["latest_values"]["annualized_bytes_written"])
         self.assertEqual(payload["latest_values"]["power_on_hours"], 10101)
         self.assertEqual(len(payload["events"]), 1)
@@ -257,6 +262,42 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
                 "slots": [5, 6],
                 "since": "2026-04-15T23:10:00+00:00",
                 "event_limit": 12,
+            },
+        )
+
+    async def test_get_scope_history_can_request_only_needed_metrics(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+
+        with patch.object(
+            client,
+            "_fetch_json",
+            AsyncMock(return_value={"histories": {"5": {"slot": 5, "metrics": {"bytes_written": []}}}}),
+        ) as fetch_json:
+            with patch.object(
+                client,
+                "_build_since_isoformat",
+                return_value="2026-04-15T23:10:00+00:00",
+            ):
+                await client.get_scope_history(
+                    system_id="archive-core",
+                    enclosure_id="front",
+                    slots=[5],
+                    window_hours=24,
+                    metrics=["bytes_written"],
+                    event_limit=0,
+                )
+
+        fetch_json.assert_awaited_once_with(
+            "/api/history/scopes/slots",
+            params={
+                "system_id": "archive-core",
+                "enclosure_id": "front",
+                "slots": [5],
+                "since": "2026-04-15T23:10:00+00:00",
+                "event_limit": 0,
+                "metrics": ["bytes_written"],
             },
         )
 

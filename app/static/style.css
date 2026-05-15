@@ -691,6 +691,13 @@ textarea {
   padding: 8px 12px;
 }
 
+.button.active,
+.button[aria-pressed="true"] {
+  border-color: rgba(91, 183, 255, 0.72);
+  background: rgba(91, 183, 255, 0.16);
+  color: #eff8ff;
+}
+
 .status-chip,
 .state-pill {
   display: inline-flex;
@@ -897,6 +904,94 @@ textarea {
   flex-wrap: wrap;
   gap: 10px;
   justify-content: end;
+}
+
+.heatmap-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.heatmap-control-field {
+  width: 190px;
+  margin: 0;
+}
+
+.heatmap-timeframe-field {
+  width: 92px;
+}
+
+.heatmap-playback-field {
+  width: 112px;
+}
+
+.heatmap-scrub-field {
+  width: 180px;
+}
+
+.heatmap-scale-field {
+  width: 128px;
+}
+
+.heatmap-control-field span {
+  font-size: 0.66rem;
+}
+
+.heatmap-scrub-field span,
+.heatmap-scale-field span {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.heatmap-scrub-field output,
+.heatmap-scale-field output {
+  color: #c5d4e6;
+  font-family: var(--mono);
+}
+
+.heatmap-control-field select {
+  min-height: 34px;
+  padding: 7px 9px;
+}
+
+.heatmap-scrub-field input[type="range"],
+.heatmap-scale-field input[type="range"] {
+  width: 100%;
+  min-height: 34px;
+  accent-color: #5bb7ff;
+}
+
+.heatmap-legend {
+  display: grid;
+  grid-template-columns: auto minmax(96px, 150px) auto;
+  grid-template-rows: auto auto;
+  gap: 4px 8px;
+  align-items: center;
+  min-width: 260px;
+  padding: 8px 10px;
+  border: 1px solid rgba(122, 169, 255, 0.2);
+  border-radius: 12px;
+  background: rgba(15, 20, 26, 0.72);
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.heatmap-legend-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2f6ebb, #2cab67 30%, #d7b62b 68%, #d24a4a);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
+.heatmap-legend-status {
+  grid-column: 1 / -1;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: #c5d4e6;
 }
 
 .legend-item {
@@ -1390,6 +1485,25 @@ textarea {
   transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
 }
 
+.slot-tile.heatmap-active {
+  border-color: rgba(var(--heatmap-rgb), var(--heatmap-border-alpha, 0.62));
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0) 10%),
+    linear-gradient(180deg, #171c21 0%, #0f1317 16%, #11161a 80%, #1f242a 100%);
+  box-shadow:
+    0 0 0 1px rgba(var(--heatmap-rgb), 0.28),
+    0 10px 24px rgba(var(--heatmap-rgb), 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -10px 16px rgba(0, 0, 0, 0.34);
+}
+
+.slot-tile.heatmap-missing {
+  border-color: rgba(170, 184, 198, 0.24);
+  background:
+    repeating-linear-gradient(135deg, rgba(255,255,255,0.05) 0 6px, rgba(255,255,255,0) 6px 13px),
+    linear-gradient(180deg, rgba(76, 85, 96, 0.62), rgba(20, 25, 31, 0.94));
+}
+
 .slot-gap {
   pointer-events: none;
   padding: 0;
@@ -1701,6 +1815,51 @@ textarea {
   inset: 5px 5px 5px 22px;
 }
 
+.slot-tile.heatmap-active::before {
+  z-index: 2;
+  inset: 5px 5px 22px;
+  border-radius: 5px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.04) 20%, rgba(0, 0, 0, 0.14) 100%),
+    linear-gradient(180deg, rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)), rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -14px 18px rgba(0, 0, 0, 0.22),
+    0 0 16px rgba(var(--heatmap-rgb), 0.18);
+}
+
+.slot-tile.heatmap-missing::before {
+  z-index: 2;
+  background:
+    repeating-linear-gradient(135deg, rgba(255, 255, 255, 0.12) 0 6px, rgba(255, 255, 255, 0.02) 6px 13px),
+    linear-gradient(180deg, rgba(95, 105, 116, 0.62), rgba(36, 43, 50, 0.72));
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile.heatmap-active::before {
+  z-index: 2;
+  inset: 2px 2px 11px;
+  border-radius: 1px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.04) 20%, rgba(0, 0, 0, 0.14) 100%),
+    linear-gradient(180deg, rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)), rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -14px 18px rgba(0, 0, 0, 0.22),
+    0 0 16px rgba(var(--heatmap-rgb), 0.18);
+}
+
+.chassis-shell[data-latch-edge="right"] .slot-tile.heatmap-active::before {
+  inset: 5px 22px 5px 5px;
+}
+
+.chassis-shell[data-latch-edge="top"] .slot-tile.heatmap-active::before {
+  inset: 22px 5px 5px 5px;
+}
+
+.chassis-shell[data-latch-edge="left"] .slot-tile.heatmap-active::before {
+  inset: 5px 5px 5px 22px;
+}
+
 .slot-status-led {
   position: absolute;
   top: 8px;
@@ -1713,6 +1872,11 @@ textarea {
   box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.34);
 }
 
+.slot-tile.heatmap-active .slot-status-led,
+.slot-tile.heatmap-missing .slot-status-led {
+  z-index: 6;
+}
+
 .slot-number {
   position: relative;
   z-index: 1;
@@ -1722,6 +1886,27 @@ textarea {
   padding: 2px 5px;
   border-radius: 6px;
   background: rgba(214, 222, 230, 0.09);
+}
+
+.slot-tile.heatmap-active .slot-number,
+.slot-tile.heatmap-missing .slot-number {
+  z-index: 6;
+}
+
+.slot-tile.heatmap-active .slot-device,
+.slot-tile.heatmap-active .slot-pool,
+.slot-tile.heatmap-active .slot-tertiary,
+.slot-tile.heatmap-missing .slot-device,
+.slot-tile.heatmap-missing .slot-pool,
+.slot-tile.heatmap-missing .slot-tertiary {
+  position: relative;
+  z-index: 1;
+  opacity: 0.45;
+}
+
+.slot-tile.selected::after,
+.slot-tile.peer-highlight::after {
+  z-index: 7;
 }
 
 .slot-tile.selected .slot-number {
@@ -1749,6 +1934,45 @@ textarea {
 .slot-pool {
   font-size: 0.72rem;
   color: var(--muted);
+}
+
+.slot-heatmap-value {
+  position: absolute;
+  z-index: 6;
+  left: 50%;
+  top: 50%;
+  width: calc(100% - 12px);
+  min-height: 28px;
+  padding: 4px 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transform: translate(-50%, -42%);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(5, 8, 12, 0.62);
+  color: #f4f7fb;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  font-weight: 800;
+  line-height: 1.06;
+  text-align: center;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.72);
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  pointer-events: none;
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-heatmap-value {
+  top: 52%;
+  width: calc(100% - 8px);
+  min-height: 24px;
+  max-height: 42px;
+  padding: 3px 3px;
+  border-radius: 5px;
+  font-size: 0.68rem;
+  line-height: 1.02;
 }
 
 .slot-tertiary {
@@ -2323,6 +2547,38 @@ textarea {
   opacity: 0.56;
 }
 
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.heatmap-active::before,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.heatmap-active::before {
+  content: "";
+  display: block;
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  border-radius: 14px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.04) 20%, rgba(0, 0, 0, 0.14) 100%),
+    linear-gradient(180deg, rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)), rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -14px 18px rgba(0, 0, 0, 0.22),
+    0 0 16px rgba(var(--heatmap-rgb), 0.18);
+  pointer-events: none;
+}
+
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.heatmap-missing::before,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.heatmap-missing::before {
+  content: "";
+  display: block;
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  border-radius: 14px;
+  background:
+    repeating-linear-gradient(135deg, rgba(255, 255, 255, 0.12) 0 6px, rgba(255, 255, 255, 0.02) 6px 13px),
+    linear-gradient(180deg, rgba(95, 105, 116, 0.62), rgba(36, 43, 50, 0.72));
+  pointer-events: none;
+}
+
 .slot-latch {
   position: absolute;
   z-index: 0;
@@ -2426,6 +2682,32 @@ textarea {
 
 .chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty::before {
   content: none;
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty.heatmap-active::before {
+  content: "";
+  z-index: 2;
+  inset: 2px 2px 11px;
+  border-radius: 1px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.04) 20%, rgba(0, 0, 0, 0.14) 100%),
+    linear-gradient(180deg, rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)), rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)));
+  opacity: 1;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -14px 18px rgba(0, 0, 0, 0.22),
+    0 0 16px rgba(var(--heatmap-rgb), 0.18);
+}
+
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty.heatmap-missing::before {
+  content: "";
+  z-index: 2;
+  inset: 2px 2px 11px;
+  border-radius: 1px;
+  background:
+    repeating-linear-gradient(135deg, rgba(255, 255, 255, 0.12) 0 6px, rgba(255, 255, 255, 0.02) 6px 13px),
+    linear-gradient(180deg, rgba(95, 105, 116, 0.62), rgba(36, 43, 50, 0.72));
+  opacity: 1;
 }
 
 .chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty .slot-device,

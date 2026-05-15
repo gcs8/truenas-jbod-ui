@@ -50,6 +50,7 @@ class FakeHistoryBackend:
                 "temperature_c": samples,
                 "bytes_read": [],
                 "bytes_written": [],
+                "annualized_bytes_read": [],
                 "annualized_bytes_written": [],
                 "power_on_hours": [],
             },
@@ -58,6 +59,7 @@ class FakeHistoryBackend:
                 "temperature_c": 2,
                 "bytes_read": 0,
                 "bytes_written": 0,
+                "annualized_bytes_read": 0,
                 "annualized_bytes_written": 0,
                 "power_on_hours": 0,
             },
@@ -65,6 +67,7 @@ class FakeHistoryBackend:
                 "temperature_c": 37,
                 "bytes_read": None,
                 "bytes_written": None,
+                "annualized_bytes_read": None,
                 "annualized_bytes_written": None,
                 "power_on_hours": None,
             },
@@ -162,6 +165,13 @@ class DenseHistoryBackend:
             }
             for idx, sample in enumerate(samples)
         ]
+        annualized_read_samples = [
+            {
+                "observed_at": sample["observed_at"],
+                "value": 12_000_000_000_000 + (idx * 1_000_000),
+            }
+            for idx, sample in enumerate(samples)
+        ]
         power_on_samples = [
             {
                 "observed_at": sample["observed_at"],
@@ -188,6 +198,7 @@ class DenseHistoryBackend:
                 "temperature_c": samples,
                 "bytes_read": bytes_read_samples,
                 "bytes_written": bytes_written_samples,
+                "annualized_bytes_read": annualized_read_samples,
                 "annualized_bytes_written": annualized_samples,
                 "power_on_hours": power_on_samples,
             },
@@ -196,6 +207,7 @@ class DenseHistoryBackend:
                 "temperature_c": len(samples),
                 "bytes_read": len(bytes_read_samples),
                 "bytes_written": len(bytes_written_samples),
+                "annualized_bytes_read": len(annualized_read_samples),
                 "annualized_bytes_written": len(annualized_samples),
                 "power_on_hours": len(power_on_samples),
             },
@@ -203,6 +215,7 @@ class DenseHistoryBackend:
                 "temperature_c": samples[-1]["value"],
                 "bytes_read": bytes_read_samples[-1]["value"],
                 "bytes_written": bytes_written_samples[-1]["value"],
+                "annualized_bytes_read": annualized_read_samples[-1]["value"],
                 "annualized_bytes_written": annualized_samples[-1]["value"],
                 "power_on_hours": power_on_samples[-1]["value"],
             },

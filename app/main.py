@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -580,6 +580,113 @@ def create_app() -> FastAPI:
             window_hours=window_hours,
         )
         return JSONResponse(payload)
+
+    @app.get("/api/history/scope")
+    async def get_history_scope(
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+        slots: list[int] | None = Query(default=None),
+        window_hours: int | None = None,
+        metrics: list[str] | None = Query(default=None),
+        event_limit: int = Query(default=12, ge=0, le=1000),
+    ) -> JSONResponse:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        normalized_slots = sorted({int(slot) for slot in (slots or [])})
+        for slot in normalized_slots:
+            ensure_slot_bounds(get_settings(), slot)
+        add_perf_metadata(
+            system_id=service.system.id,
+            platform=service.system.truenas.platform,
+            enclosure_id=enclosure_id,
+            slot_count=len(normalized_slots),
+            history_window_hours=window_hours,
+        )
+        history_backend = get_history_backend()
+        payload = await history_backend.get_scope_history(
+            system_id=service.system.id,
+            enclosure_id=enclosure_id,
+            slots=normalized_slots,
+            window_hours=window_hours,
+            metrics=metrics,
+            event_limit=event_limit,
+        )
+        return JSONResponse(
+            {
+                "configured": history_backend.configured,
+                "system_id": service.system.id,
+                "enclosure_id": enclosure_id,
+                "histories": {str(slot): history for slot, history in payload.items()},
+            }
+        )
+
+    @app.get("/api/storage-views/{view_id}/history")
+    async def get_storage_view_history(
+        view_id: str,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+        window_hours: int | None = None,
+        metrics: list[str] | None = Query(default=None),
+        event_limit: int = Query(default=12, ge=0, le=1000),
+    ) -> JSONResponse:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        try:
+            runtime = await service.get_storage_view_runtime(
+                force_refresh=False,
+                selected_enclosure_id=enclosure_id,
+            )
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        runtime_view = next((view for view in runtime.views if view.id == view_id), None)
+        if not runtime_view:
+            raise HTTPException(status_code=404, detail=f"Storage view {view_id!r} is not present for this system.")
+
+        display_slot_by_target: dict[tuple[str | None, int], list[int]] = {}
+        slots_by_enclosure: dict[str | None, set[int]] = {}
+        for runtime_slot in runtime_view.slots:
+            if runtime_slot.snapshot_slot is not None:
+                history_slot = int(runtime_slot.snapshot_slot)
+                history_enclosure_id = enclosure_id or runtime_view.backing_enclosure_id
+            else:
+                history_slot = int(runtime_slot.slot_index)
+                history_enclosure_id = f"storage-view:{runtime_view.id}"
+            slots_by_enclosure.setdefault(history_enclosure_id, set()).add(history_slot)
+            display_slot_by_target.setdefault(
+                (history_enclosure_id, history_slot),
+                [],
+            ).append(int(runtime_slot.slot_index))
+
+        add_perf_metadata(
+            system_id=service.system.id,
+            platform=service.system.truenas.platform,
+            storage_view_id=view_id,
+            slot_count=len(runtime_view.slots),
+            history_window_hours=window_hours,
+        )
+        history_backend = get_history_backend()
+        histories_by_display_slot: dict[str, dict[str, Any]] = {}
+        for history_enclosure_id, history_slots in slots_by_enclosure.items():
+            scope_payload = await history_backend.get_scope_history(
+                system_id=service.system.id,
+                enclosure_id=history_enclosure_id,
+                slots=sorted(history_slots),
+                window_hours=window_hours,
+                metrics=metrics,
+                event_limit=event_limit,
+            )
+            for history_slot, history_payload in scope_payload.items():
+                for display_slot in display_slot_by_target.get((history_enclosure_id, int(history_slot)), []):
+                    histories_by_display_slot[str(display_slot)] = history_payload
+
+        return JSONResponse(
+            {
+                "configured": history_backend.configured,
+                "system_id": service.system.id,
+                "storage_view_id": runtime_view.id,
+                "histories": histories_by_display_slot,
+            }
+        )
 
     @app.post("/api/export/enclosure-snapshot")
     async def export_enclosure_snapshot(

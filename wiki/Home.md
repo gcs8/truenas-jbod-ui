@@ -26,13 +26,17 @@ If you want to control what the enclosure looks like, use:
 - [[Profiles and Custom Layouts|Profiles-and-Custom-Layouts]]
 - [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
 
+If you want operator feature guides, use:
+
+- [[Heat Map Mode|Heat-Map-Mode]]
+- [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
+
 If you want to really tune things, use:
 
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]]
 - [[Advanced Configuration|Advanced-Configuration]]
-- [[History and Snapshot Export|History-and-Snapshot-Export]]
-- [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 
 If something is wrong, use:
@@ -64,6 +68,8 @@ It gives you:
 - manual slot calibration
 - multi-system selection
 - profile-driven enclosure layouts
+- heat-map overlays for temperature, activity, endurance, risk, and other
+  numeric metrics
 - both local-build and published-GHCR deployment paths
 - a main UI that can run alone plus optional history/admin services that share
   the same supported deployment model
@@ -113,20 +119,26 @@ It gives you:
   embedded slot history again when opened away from the live history sidecar
 - `0.16.2` fixes snapshot-export packaging recalculation, persistent-ID
   labeling for `{serial_lunid}` fallback values, and copy buttons on LAN HTTP
-- `0.17.0` is the current release line for shared profile-driven enclosure
-  rendering, clearer refresh/cache timing, live history dashboard updates,
-  explicit history fast/full refresh, admin-owned runtime behavior overrides,
-  and disposable backup/restore QA drills
+- `0.17.0` shipped shared profile-driven enclosure rendering, clearer
+  refresh/cache timing, live history dashboard updates, explicit history
+  fast/full refresh, admin-owned runtime behavior overrides, and disposable
+  backup/restore QA drills
+- `0.18.0` is the current read-only [[Heat Map Mode|Heat-Map-Mode]] release,
+  including history-backed timeline scrubbing for supported metrics. Timeline
+  starts on the latest sample; click the scrub slider and use the arrow keys
+  for fine one-sample steps.
 
 ## Visual Walkthrough
 
 If you learn better by seeing the flow first, start here:
 
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[Heat Map Mode|Heat-Map-Mode]]
 
-That page shows:
+Those pages show:
 
 - the live history drawer on a populated slot
+- heat-map overlays for the physical bay layout
 - the export snapshot dialog with live size estimates
 - the frozen offline snapshot HTML after export
 - the maintenance/recovery follow-up lives on
