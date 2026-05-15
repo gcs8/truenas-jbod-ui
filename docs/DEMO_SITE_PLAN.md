@@ -5,6 +5,12 @@ Date: `2026-05-15`
 Status: planning only. This pass does not add a GitHub Pages workflow, change
 runtime code, or cut a `0.18.1` release.
 
+Public-facing wiki context:
+
+- `wiki/Public-Demo-Site.md`
+- `wiki/Demo-and-Offline-Workflows.md`
+- `wiki/Architecture-and-Services.md`
+
 ## Decision
 
 Track the public demo idea as a `0.19.0-dev` follow-up unless we deliberately

@@ -4,6 +4,10 @@ This is the planning page for a future public, interactive demo.
 
 It is not live yet.
 
+For the broader comparison between public demo, local demo seed, offline
+snapshot, debug bundle, and full backup, see
+[[Demo and Offline Workflows|Demo-and-Offline-Workflows]].
+
 ## Can GitHub Host It?
 
 Yes, with the right boundary.
@@ -76,6 +80,8 @@ because this planning page exists.
 ## Related Pages
 
 - [[Quick Start|Quick-Start]]
+- [[Demo and Offline Workflows|Demo-and-Offline-Workflows]]
+- [[Architecture and Services|Architecture-and-Services]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]]

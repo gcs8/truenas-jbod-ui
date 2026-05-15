@@ -145,3 +145,10 @@ Heat map mode is intentionally a first pass:
 
 For history sidecar setup, storage, and snapshot export behavior, see
 [[History and Snapshot Export|History-and-Snapshot-Export]].
+
+## Related Pages
+
+- [[Visual Tour|Visual-Tour]]
+- [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
+- [[Demo and Offline Workflows|Demo-and-Offline-Workflows]]

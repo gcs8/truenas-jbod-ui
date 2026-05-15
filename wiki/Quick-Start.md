@@ -2,6 +2,11 @@
 
 This page is the fastest path to a working app.
 
+If you want to see the screens before installing, use
+[[Visual Tour|Visual-Tour]]. If you want to understand the three service
+containers first, use
+[[Architecture and Services|Architecture-and-Services]].
+
 It assumes:
 
 - you have Docker and Docker Compose
@@ -184,3 +189,15 @@ monthly long-term copies under `./history/backups/long-term`.
 Then use:
 
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
+
+## Where To Go Next
+
+- use [[Visual Tour|Visual-Tour]] to recognize the main screens
+- use [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]] for the fuller
+  published-image path
+- use [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]] for
+  updates, logs, syslog, metrics, and Grafana
+- use [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for guided setup
+  and saved storage views
+- use [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]]
+  before restore, migration, or destructive maintenance work

@@ -3,6 +3,12 @@
 This page is the visual guide for the optional history sidecar and the offline
 snapshot export flow.
 
+Use it when you want historical charts, timeline-backed heat maps, or one
+self-contained offline HTML view of an enclosure. If you are trying to choose
+between snapshot export, debug bundles, full backups, and the planned public
+demo, start with
+[[Demo and Offline Workflows|Demo-and-Offline-Workflows]].
+
 ## What This Adds
 
 When the optional history sidecar is running, the main UI can:
@@ -158,6 +164,9 @@ The debug bundle is not a standalone HTML viewer and it is not an import path
 today. It does, however, support separate `Scrub obvious secrets` and `Scrub
 disk identifiers` toggles so you can choose how much local detail to share.
 
+The full backup/debug-bundle details live in
+[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]].
+
 ## If History Is Unavailable
 
 The app should degrade like this:
@@ -166,3 +175,11 @@ The app should degrade like this:
 - the export dialog warns that history will be omitted
 - snapshot estimate and export still work
 - the exported snapshot opens without historical charts or events
+
+## Related Pages
+
+- [[Visual Tour|Visual-Tour]]
+- [[Heat Map Mode|Heat-Map-Mode]]
+- [[Demo and Offline Workflows|Demo-and-Offline-Workflows]]
+- [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]]
+- [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]

@@ -83,115 +83,22 @@ same image. The history and admin sidecars are optional services, not dev-only
 ones, so the default `docker-compose.yml` is the first-class path for all three
 runtime roles.
 
-## Optional Syslog Shipping
+## Optional Operations Hooks
 
-If you want the same plain `docker compose up -d` command to also ship
-container logs to a remote syslog receiver, use a local override file:
+The deployment can also expose logs, syslog, Prometheus/OpenMetrics endpoints,
+and starter Grafana dashboards.
 
-```bash
-cp docker-compose.override.yml.example docker-compose.override.yml
-```
+Those are day-two operations details, so they live on their own page now:
 
-Then set the matching keys in `.env`:
+- [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]]
 
-```dotenv
-LOG_SYSLOG_ADDRESS=udp://syslog.example.local:514
-LOG_SYSLOG_FORMAT=rfc5424micro
-LOG_SYSLOG_FACILITY=local0
-```
-
-Optional structured stdout/syslog logs:
+The most common knobs are:
 
 ```dotenv
 LOG_FORMAT=json
-```
-
-After that, the normal default path stays the same:
-
-```bash
-docker compose up -d
-```
-
-`docker compose` auto-loads `docker-compose.override.yml` beside the default
-`docker-compose.yml`, so no extra `-f` arguments are needed for the normal
-published-image workflow.
-
-If you are intentionally running the source-build path with an explicit compose
-file, include the override explicitly too:
-
-```bash
-docker compose -f docker-compose.dev.yml -f docker-compose.override.yml up -d --build
-```
-
-The first pass keeps the transport generic: RFC5424-style syslog over the
-Docker `syslog` logging driver. Backend-specific parsing belongs on the
-receiver side, whether that is Splunk, ELK/Logstash, Graylog, rsyslog, or
-syslog-ng.
-
-## Optional Metrics Endpoints
-
-All three services now expose a scrape-based Prometheus/OpenMetrics endpoint
-over HTTP by default:
-
-- main UI: `http://your-docker-host:8080/metrics`
-- history sidecar: `http://your-docker-host:8081/metrics` after setting
-  `HISTORY_BIND_ADDRESS=0.0.0.0` in `.env`
-- admin sidecar: `http://your-docker-host:8082/metrics`
-
-This first pass is intentionally collector-agnostic. It is just a normal
-scrape endpoint, so Prometheus, Grafana Alloy, VictoriaMetrics, Telegraf, or
-an Influx scraper can all sit outside the stack and pull from it.
-
-What you get in the first pass:
-
-- standard Python/process metrics from `prometheus_client`
-- shared HTTP request count, in-flight, and latency metrics for all services
-- build/version info for the running service
-- history-sidecar collector gauges and counters such as last-success
-  timestamps, tracked-slot counts, and collection-pass duration
-
-Starter Grafana dashboards are checked in under `grafana/dashboards/` too:
-
-- `TrueNAS JBOD UI - Backend Overview`
-- `TrueNAS JBOD UI - History & Data`
-
-They were built around the current first-pass metrics slice, so they focus on
-request/perf health plus collector/data freshness rather than pretending the
-app already exports deep per-system business metrics.
-
-If you do not want to expose the scrape endpoint, set this in `.env`:
-
-```dotenv
-METRICS_ENABLED=false
-```
-
-You can also move the endpoint off `/metrics` if needed:
-
-```dotenv
+METRICS_ENABLED=true
 METRICS_PATH=/metrics
-```
-
-The history sidecar stays localhost-only by default, matching the older
-compose behavior. If you want another host to scrape it directly, open that
-bind address intentionally:
-
-```dotenv
-HISTORY_BIND_ADDRESS=0.0.0.0
-```
-
-Small Prometheus example:
-
-```yaml
-scrape_configs:
-  - job_name: truenas-jbod-ui
-    static_configs:
-      - targets:
-          - your-docker-host:8080
-          - your-docker-host:8082
-  - job_name: truenas-jbod-history
-    static_configs:
-      - targets:
-          - your-docker-host:8081
+HISTORY_BIND_ADDRESS=127.0.0.1
 ```
 
 ## Pick A Tag
@@ -347,6 +254,8 @@ docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure
 ## Related Pages
 
 - [[Quick Start|Quick-Start]]
+- [[Architecture and Services|Architecture-and-Services]]
+- [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]]
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
 - [[Public Demo Site|Public-Demo-Site]]

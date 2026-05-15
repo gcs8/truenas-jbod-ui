@@ -227,78 +227,20 @@ admin runtime overrides are editable and save to
 `config/runtime-overrides.yaml`. After saving those values, restart the read UI
 from the runtime cards so the main surface picks up the new timing behavior.
 
-## Backup and Restore
+## Backup, Restore, Debug, And Demo Data
 
-The admin sidecar is also the supported place for:
+The setup page exposes these tools, but the detailed guidance now lives on
+separate pages so the setup walkthrough stays readable:
 
-- restore-grade full backup export
-- full backup bundle import or restore
-- frozen debug bundle export for support review
+- [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]]
+  explains full backups, encrypted secret-material exports, debug bundles, and
+  safe restore patterns.
+- [[Demo and Offline Workflows|Demo-and-Offline-Workflows]] explains how the
+  local `Add Demo Builder System` seed differs from offline snapshots, debug
+  bundles, full backups, and the planned public demo site.
 
-This keeps write-capable maintenance actions out of the normal enclosure
-viewer.
-
-### Full Backup Bundles
-
-The `Included Paths` pills are now selectable instead of just descriptive.
-
-Use the default plaintext scope when you only need the core app state:
-
-- `config/config.yaml`
-- `config/profiles.yaml`
-- slot mappings and slot-detail cache JSON
-- the history SQLite database
-
-The locked pills are the secret-material path:
-
-- `config/ssh`
-- imported TLS trust bundles
-- shared `known_hosts`
-
-Selecting any locked pill forces encrypted portable `.7z` export. That keeps
-secret material out of plaintext bundles while still letting the admin import
-path restore those same selected files later.
-
-For release-candidate or migration testing, do import/restore, runtime
-override edits, purge/adopt/delete cleanup, and container stop/start
-failure-mode checks in a disposable QA Docker stack with separate ports and
-separate runtime directories. Keep the long-running stack read-only except for
-explicitly approved live LED identify checks.
-
-### Debug Bundles
-
-The `Debug Bundle` card is a different tool from the restore bundle.
-
-Use it when you want a frozen support snapshot of the local stack for offline
-inspection. It:
-
-- exports a normal archive, not a self-contained HTML file
-- is not an importable restore path
-- can stop/restart the UI and history sidecar around capture
-- has separate `Scrub obvious secrets` and `Scrub disk identifiers` toggles
-
-If `Scrub obvious secrets` stays on, the locked secret-path pills remain
-disabled in the debug bundle so private keys and trust material do not
-accidentally ride along.
-
-### Demo Builder Seed
-
-The setup form now also exposes `Add Demo Builder System`.
-
-Use it when you want a safe local fixture for custom enclosure/profile work
-without pointing at a real host first. The action seeds:
-
-- a synthetic `demo-builder-lab` system
-- a matching custom demo chassis profile
-- sample saved/virtual storage views for builder and layout checks
-
-After saving a new system into the mounted config, restart the read UI so the
-runtime selector picks the updated system list up cleanly.
-
-This local seed path is different from the planned public demo site. The public
-demo should use scrubbed or synthetic sample data in a static browser page and
-must not expose real local config, history, hostnames, SSH material, or restore
-bundles. See [[Public Demo Site|Public-Demo-Site]].
+The short rule: use the admin sidecar for real local maintenance, but keep
+demo/offline artifacts visibly separate from restore-grade backup bundles.
 
 ## History Maintenance And Recovery
 
@@ -342,5 +284,7 @@ attach the new profile-backed saved chassis layout there.
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 - [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]]
+- [[Demo and Offline Workflows|Demo-and-Offline-Workflows]]
 - [[Public Demo Site|Public-Demo-Site]]
 - [[Advanced Configuration|Advanced-Configuration]]

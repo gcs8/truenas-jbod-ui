@@ -11,6 +11,9 @@ The goal is simple:
 If you are new here, start with:
 
 - [[Quick Start|Quick-Start]]
+- [[Visual Tour|Visual-Tour]] if you want to see the screens first
+- [[Architecture and Services|Architecture-and-Services]] if you want the
+  `:8080` / `:8081` / `:8082` mental model
 - [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]] if you want the
   published-image path instead of local builds
 
@@ -28,8 +31,10 @@ If you want to control what the enclosure looks like, use:
 
 If you want operator feature guides, use:
 
+- [[Visual Tour|Visual-Tour]]
 - [[Heat Map Mode|Heat-Map-Mode]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[Demo and Offline Workflows|Demo-and-Offline-Workflows]]
 - [[Public Demo Site|Public-Demo-Site]] for the planned GitHub Pages demo
   boundary
 - [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
@@ -37,6 +42,8 @@ If you want operator feature guides, use:
 If you want to really tune things, use:
 
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
+- [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]]
+- [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]]
 - [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]]
 - [[Advanced Configuration|Advanced-Configuration]]
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
@@ -139,6 +146,7 @@ It gives you:
 
 If you learn better by seeing the flow first, start here:
 
+- [[Visual Tour|Visual-Tour]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
 - [[Heat Map Mode|Heat-Map-Mode]]
 - [[Public Demo Site|Public-Demo-Site]]
@@ -152,3 +160,17 @@ Those pages show:
 - the planned boundary for a future static public demo
 - the maintenance/recovery follow-up lives on
   [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
+
+## Page Map
+
+The wiki is organized so the top of each page gives the practical answer first,
+then deeper details below it.
+
+| Need | Pages |
+| --- | --- |
+| Setup and orientation | [[Quick Start|Quick-Start]], [[Visual Tour|Visual-Tour]], [[Architecture and Services|Architecture-and-Services]] |
+| Deployment and operations | [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]], [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]] |
+| Platform setup | [[TrueNAS CORE Setup|TrueNAS-CORE-Setup]], [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]], [[Quantastor Setup|Quantastor-Setup]], [[Generic Linux Setup|Generic-Linux-Setup]] |
+| Day-to-day features | [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]], [[Heat Map Mode|Heat-Map-Mode]], [[History and Snapshot Export|History-and-Snapshot-Export]] |
+| Admin and safety | [[Admin UI and System Setup|Admin-UI-and-System-Setup]], [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]], [[History Maintenance and Recovery|History-Maintenance-and-Recovery]] |
+| Demo and offline boundaries | [[Demo and Offline Workflows|Demo-and-Offline-Workflows]], [[Public Demo Site|Public-Demo-Site]] |
