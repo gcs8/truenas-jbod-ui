@@ -8,14 +8,15 @@ The goal is simple:
 - let an intermediate user enable richer SSH-based mapping and SMART detail
 - let an advanced user tune profiles, command sets, and multi-system layouts
 
-If you are new here, start with:
+If you are new here, use this order:
 
-- [[Quick Start|Quick-Start]]
-- [[Visual Tour|Visual-Tour]] if you want to see the screens first
-- [[Architecture and Services|Architecture-and-Services]] if you want the
-  `:8080` / `:8081` / `:8082` mental model
-- [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]] if you want the
-  published-image path instead of local builds
+1. [[Visual Tour|Visual-Tour]] if you want to see what the app looks like
+2. [[Quick Start|Quick-Start]] to install with Docker Compose and published
+   images
+3. [[TrueNAS CORE Setup|TrueNAS-CORE-Setup]] or
+   [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]] for the host-side bits
+4. [[Troubleshooting]] if the page loads but the disks, slots, or history do
+   not look right yet
 
 If you already know what kind of host you are targeting, jump to:
 
@@ -31,20 +32,20 @@ If you want to control what the enclosure looks like, use:
 
 If you want operator feature guides, use:
 
-- [[Visual Tour|Visual-Tour]]
 - [[Heat Map Mode|Heat-Map-Mode]]
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
+- [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[Demo and Offline Workflows|Demo-and-Offline-Workflows]]
 - [[Public Demo Site|Public-Demo-Site]] for the planned GitHub Pages demo
   boundary
 - [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
 
-If you want to really tune things, use:
+If you want deeper runtime and tuning detail, use:
 
-- [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]]
 - [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]]
 - [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]]
+- [[Architecture and Services|Architecture-and-Services]]
 - [[Advanced Configuration|Advanced-Configuration]]
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 
@@ -58,15 +59,20 @@ If you are maintaining the GitHub wiki itself, use:
 
 ## What This App Does
 
-The app runs off-box in Docker and talks to storage hosts over:
+The app runs off-box in Docker. For the normal homelab path, it talks to
+TrueNAS CORE or SCALE, maps the storage host into a physical bay view, and lets
+you inspect disks without logging into the NAS every time.
 
-- the TrueNAS middleware websocket API for CORE and SCALE
-- optional SSH for richer disk, enclosure, and LED detail
-- SSH-only inventory for supported generic Linux hosts
-- generic Linux coverage is broad enough to handle appliance-style boxes such
-  as UniFi UNVR when SSH works but the vendor API does not expose disk slots
-- Quantastor REST plus optional SSH/`qs`/`sg_ses` enrichment for supported HA
-  appliances
+![60-bay TrueNAS CORE enclosure view](images/archive-core-60-bay-v0.18.0.png)
+
+The main UI is read-oriented and runs on `:8080`. Optional sidecars can add:
+
+- history collection and offline snapshot export on `:8081`
+- setup, backup/restore, profile building, and runtime maintenance on `:8082`
+
+Less common targets such as Quantastor, generic Linux, UniFi, IPMI/BMC, and
+ESXi are supported through their own setup pages, but they do not need to be in
+the first-run path for a TrueNAS box.
 
 It gives you:
 
@@ -79,13 +85,15 @@ It gives you:
 - profile-driven enclosure layouts
 - heat-map overlays for temperature, activity, endurance, risk, and other
   numeric metrics
-- both local-build and published-GHCR deployment paths
-- a documented path toward a future static public demo site without exposing
-  real lab data
-- a main UI that can run alone plus optional history/admin services that share
-  the same supported deployment model
+- published-image Docker Compose install and update commands
+- optional history, admin, backup, restore, and debug workflows once the main
+  read view is working
 
 ## Current Validated Hardware
+
+TrueNAS CORE and SCALE are the main audience. The broader lab coverage below
+shows what has been exercised so far; platform-specific pages carry the deeper
+setup notes.
 
 - TrueNAS CORE on a Supermicro CSE-946 style `60`-bay top-loading shelf
 - TrueNAS SCALE on a Supermicro `SSG-6048R-E1CR36L` with front `24` and rear `12`
@@ -104,43 +112,18 @@ It gives you:
 - UniFi UNVR Pro as generic Linux over SSH with a built-in `7`-bay `3-over-4`
   profile and experimental vendor-local LED control
 
-## Current Direction
+## Current Version
 
-- `0.13.0` shipped the selectable backup/debug-bundle scope work, the demo
-  builder seed path, the first embedded boot-media view for UniFi, and the
-  current internal-view visual polish
-- `0.14.0` added the first read-only ESXi path on the validated
-  `AOC-SLG4-2H8M2` carrier view, plus tighter admin guardrails around
-  SSH-first non-Linux hosts
-- `0.14.1` locked in the SSH-only setup hotfix so `esxi`, generic Linux, and
-  UniFi-family systems persist cleanly when no API host should be required
-- `0.14.2` added the first ESXi `Platform Details` panel plus live version
-  visibility across the main UI, history sidecar, and admin runtime cards
-- `0.15.0` broadens that ESXi work into a Supermicro BMC / IPMI-first
-  inventory path: validated FatTwin front/rear profiles, BMC-backed slot truth
-  and identify, optional ESXi host-prep for operator-supplied StorCLI bundles,
-  and direct JBOD SMART enrichment when the host exposes both StorCLI and
-  `esxcli storage core device smart get`
-- `0.16.0` turns the new runtime story into a first observability slice:
-  optional generic syslog shipping, shared JSON log output, scrape-based
-  Prometheus metrics on all three services, low-cardinality inventory/cache
-  counters, and checked-in Grafana dashboards for backend/runtime plus
-  history/data visibility
-- `0.16.1` is a narrow offline snapshot hotfix so exported HTML artifacts render
-  embedded slot history again when opened away from the live history sidecar
-- `0.16.2` fixes snapshot-export packaging recalculation, persistent-ID
-  labeling for `{serial_lunid}` fallback values, and copy buttons on LAN HTTP
-- `0.17.0` shipped shared profile-driven enclosure rendering, clearer
-  refresh/cache timing, live history dashboard updates, explicit history
-  fast/full refresh, admin-owned runtime behavior overrides, and disposable
-  backup/restore QA drills
-- `0.18.0` is the current read-only [[Heat Map Mode|Heat-Map-Mode]] release,
-  including history-backed timeline scrubbing for supported metrics. Timeline
-  starts on the latest sample; click the scrub slider and use the arrow keys
-  for fine one-sample steps.
-- the next planning slice treats a GitHub Pages public demo as a static,
-  sample-data experience, not as a hosted copy of the live Docker app. See
-  [[Public Demo Site|Public-Demo-Site]].
+`0.18.0` is the current stable release. Its headline feature is read-only
+[[Heat Map Mode|Heat-Map-Mode]], including history-backed timeline scrubbing
+for supported metrics.
+
+The next planning slice is the public demo idea: a static GitHub Pages sample
+data experience, not a hosted copy of the live Docker app. See
+[[Public Demo Site|Public-Demo-Site]].
+
+For older release-by-release detail, use the project changelog and GitHub
+releases instead of treating the wiki home page as release notes.
 
 ## Visual Walkthrough
 
@@ -168,9 +151,10 @@ then deeper details below it.
 
 | Need | Pages |
 | --- | --- |
-| Setup and orientation | [[Quick Start|Quick-Start]], [[Visual Tour|Visual-Tour]], [[Architecture and Services|Architecture-and-Services]] |
-| Deployment and operations | [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]], [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]] |
-| Platform setup | [[TrueNAS CORE Setup|TrueNAS-CORE-Setup]], [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]], [[Quantastor Setup|Quantastor-Setup]], [[Generic Linux Setup|Generic-Linux-Setup]] |
+| First install | [[Quick Start|Quick-Start]], [[Visual Tour|Visual-Tour]], [[TrueNAS CORE Setup|TrueNAS-CORE-Setup]], [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]] |
+| Fix the common stuff | [[Troubleshooting]], [[SSH Setup and Sudo|SSH-Setup-and-Sudo]] |
 | Day-to-day features | [[Live Enclosures and Storage Views|Live-Enclosures-and-Storage-Views]], [[Heat Map Mode|Heat-Map-Mode]], [[History and Snapshot Export|History-and-Snapshot-Export]] |
 | Admin and safety | [[Admin UI and System Setup|Admin-UI-and-System-Setup]], [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]], [[History Maintenance and Recovery|History-Maintenance-and-Recovery]] |
+| Less common platforms | [[Quantastor Setup|Quantastor-Setup]], [[Generic Linux Setup|Generic-Linux-Setup]] |
+| Deeper operations | [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]], [[Operations, Logging, and Metrics|Operations-Logging-and-Metrics]], [[Architecture and Services|Architecture-and-Services]], [[Advanced Configuration|Advanced-Configuration]] |
 | Demo and offline boundaries | [[Demo and Offline Workflows|Demo-and-Offline-Workflows]], [[Public Demo Site|Public-Demo-Site]] |

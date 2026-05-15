@@ -26,16 +26,12 @@ snapshot exports still work, but they omit historical samples and events.
 
 ## Start The Optional History Sidecar
 
-From the repo root, start it from the default published-image path:
+Use the same folder you created in [[Quick Start|Quick-Start]], where
+`compose.yaml` and `.env` live:
 
 ```bash
+docker compose --profile history pull
 docker compose --profile history up -d
-```
-
-If you are intentionally building from source instead:
-
-```bash
-docker compose -f docker-compose.dev.yml --profile history up -d --build
 ```
 
 That keeps the main UI on `:8080` and starts the small history collector/API
@@ -166,6 +162,18 @@ disk identifiers` toggles so you can choose how much local detail to share.
 
 The full backup/debug-bundle details live in
 [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]].
+
+## Advanced Source Builds
+
+Most users should use the published-image commands above. Use the source-build
+command only when you are editing the app, testing an unmerged branch, or
+intentionally rebuilding the image on that machine.
+
+From a cloned repo:
+
+```bash
+docker compose -f docker-compose.dev.yml --profile history up -d --build
+```
 
 ## If History Is Unavailable
 

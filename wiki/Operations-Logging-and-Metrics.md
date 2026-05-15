@@ -13,7 +13,7 @@ For first install, use [[Quick Start|Quick-Start]]. For the service map, use
 | --- | --- |
 | Confirm a service is alive | `curl http://your-docker-host:8080/livez` |
 | Check cached dependency/readiness state | `curl http://your-docker-host:8080/healthz` |
-| Update a GHCR deployment | `docker compose pull` then `docker compose up -d` |
+| Update a published-image install | `docker compose pull` then `docker compose up -d` |
 | See the exact image on the host | `docker compose images` |
 | Follow container logs | `docker compose logs -f` |
 | Turn off metrics endpoints | `METRICS_ENABLED=false` |
@@ -115,12 +115,9 @@ docker compose up -d
 ```
 
 `docker compose` auto-loads `docker-compose.override.yml` beside the default
-`docker-compose.yml`. If you are intentionally running the source-build path
-with an explicit compose file, include the override explicitly:
-
-```bash
-docker compose -f docker-compose.dev.yml -f docker-compose.override.yml up -d --build
-```
+Compose file. If you are intentionally running a source-build dev setup, adapt
+the same override there; that path is for branch testing and app development,
+not the normal homelab install.
 
 The app keeps syslog transport generic. Backend-specific parsing belongs on
 the receiver side, whether that is Splunk, ELK/Logstash, Graylog, rsyslog, or

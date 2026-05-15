@@ -20,30 +20,29 @@ runtime service rather than a dev-only helper.
 
 ## How To Launch It
 
-From the repo root, start the admin sidecar profile from the default published
-image path:
+Use the same folder you created in [[Quick Start|Quick-Start]], where
+`compose.yaml` and `.env` live.
+
+If the main UI is already running and you only want to add the admin sidecar:
 
 ```bash
+docker compose --profile admin pull
 docker compose --profile admin up -d enclosure-admin
 ```
 
-If you are intentionally building from source instead:
+If you want the main UI and admin sidecar started together:
 
 ```bash
-docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin
+docker compose --profile admin pull
+docker compose --profile admin up -d
 ```
 
 If you also want the history sidecar at the same time from the published-image
 path:
 
 ```bash
+docker compose --profile admin --profile history pull
 docker compose --profile admin --profile history up -d
-```
-
-If you want the source-build variant instead:
-
-```bash
-docker compose -f docker-compose.dev.yml --profile admin --profile history up -d --build
 ```
 
 Then open:
@@ -277,6 +276,24 @@ For a first-time setup on a new host:
 If you also need a custom chassis profile, do that in the builder workspace
 after the basic system entry is saved, then come back to the setup view and
 attach the new profile-backed saved chassis layout there.
+
+## Advanced Source Builds
+
+Most users should use the published-image commands above. Use the source-build
+commands only when you are editing the app, testing an unmerged branch, or
+intentionally rebuilding the image on that machine.
+
+From a cloned repo:
+
+```bash
+docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin
+```
+
+With history too:
+
+```bash
+docker compose -f docker-compose.dev.yml --profile admin --profile history up -d --build
+```
 
 ## Related Pages
 
