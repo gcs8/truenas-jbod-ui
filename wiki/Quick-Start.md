@@ -1,7 +1,7 @@
 # Quick Start
 
-This page is the fastest normal-user path to a working Docker install from the
-published image.
+This page is the fastest normal-user path to a working TrueNAS-focused Docker
+install from the published image.
 
 No repo clone is required for the basic path. You only need a Docker host, a
 folder for this app, and a small `.env` file with your appliance connection.
@@ -14,8 +14,8 @@ If you want to see the screens before installing, use
 ## What You Need
 
 - Docker with Docker Compose
-- network access from the Docker host to the storage host
-- an API key or API user/password for the target platform
+- network access from the Docker host to the TrueNAS host
+- a TrueNAS CORE or SCALE API key
 
 ## 1. Make An App Folder
 
@@ -71,14 +71,8 @@ Edit the values before starting:
 - `TRUENAS_VERIFY_SSL=false` is common for a lab box with a self-signed cert
 - `SSH_ENABLED=false` is fine for the first boot; SSH can be added later
 
-For Quantastor, use API user/password instead of a TrueNAS API key:
-
-```dotenv
-TRUENAS_PLATFORM=quantastor
-TRUENAS_API_KEY=
-TRUENAS_API_USER=replace_me
-TRUENAS_API_PASSWORD=replace_me
-```
+Start with CORE or SCALE here. Less common adapters are covered on their
+platform-specific setup pages so this first-run path stays focused.
 
 ## 4. Pull And Start
 
@@ -187,7 +181,6 @@ When you are ready, use the setup page for your platform:
 - [[SSH Setup and Sudo|SSH-Setup-and-Sudo]]
 - [[TrueNAS CORE Setup|TrueNAS-CORE-Setup]]
 - [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]]
-- [[Quantastor Setup|Quantastor-Setup]]
 - [[Generic Linux Setup|Generic-Linux-Setup]]
 
 ## Advanced: Source Builds
