@@ -3216,6 +3216,234 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
             self.assertEqual(slot_views[2].health, "ONLINE")
             self.assertEqual(slot_views[2].state, SlotState.healthy)
 
+    def test_bmc_serial_index_rejects_duplicate_serials(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="core-1", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bmc_inventory = BMCInventory(
+                drives=[
+                    BMCDriveRecord(controller_id=0, physical_index=0, slot_number=1, serial="SERIAL-1"),
+                    BMCDriveRecord(controller_id=0, physical_index=1, slot_number=2, serial="SERIAL-1"),
+                ],
+            )
+
+            index = service._build_bmc_serial_disk_index(bmc_inventory)
+
+            self.assertNotIn("serial-1", index)
+
+    def test_core_slot_is_augmented_by_matching_bmc_serial(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="core-1",
+                truenas=TrueNASConfig(platform="core"),
+                bmc=BMCConfig(enabled=True, host="10.13.0.20", username="ADMIN", password="secret"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+                bmc_service=MagicMock(),
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[
+                    {
+                        "id": "enc-1",
+                        "label": "Core Front",
+                        "elements": [{"slot": 1, "dev": "/dev/da0", "status": "OK"}],
+                    }
+                ],
+                disks=[
+                    {
+                        "name": "da0",
+                        "serial": "SERIAL-1",
+                        "model": "H7240AS60SUN4.0T",
+                        "size": 4_000_000_000_000,
+                        "status": "ONLINE",
+                        "enclosure": {"id": "enc-1", "slot": 1},
+                    }
+                ],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+            bmc_inventory = BMCInventory(
+                drives=[
+                    BMCDriveRecord(
+                        controller_id=0,
+                        physical_index=7,
+                        slot_number=9,
+                        enclosure_id="252",
+                        serial="SERIAL-1",
+                        model="H7240AS60SUN4.0T",
+                        health="ONLINE",
+                        identify_active=True,
+                    )
+                ],
+            )
+
+            slot_views, _enclosures, _selected_meta, _layout_rows, _layout_slot_count, _layout_columns = service._correlate(
+                raw_data,
+                ParsedSSHData(),
+                [],
+                bmc_inventory=bmc_inventory,
+            )
+
+            self.assertEqual(slot_views[0].device_name, "da0")
+            self.assertEqual(slot_views[0].serial, "SERIAL-1")
+            self.assertTrue(slot_views[0].identify_active)
+            self.assertEqual(slot_views[0].led_backend, "supermicro_bmc")
+            self.assertEqual(slot_views[0].raw_status["bmc_match_source"], "serial")
+            self.assertEqual(slot_views[0].raw_status["bmc_slot_number"], 9)
+            self.assertEqual(slot_views[0].raw_status["bmc_physical_index"], 7)
+
+    def test_scale_linux_ses_slot_is_augmented_by_matching_bmc_serial(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="scale-1",
+                truenas=TrueNASConfig(platform="scale"),
+                bmc=BMCConfig(enabled=True, host="10.13.0.20", username="ADMIN", password="secret"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+                bmc_service=MagicMock(),
+            )
+            ssh_data = ParsedSSHData(
+                ses_enclosures=[
+                    SESMapEnclosure(
+                        ses_device="/dev/sg27",
+                        enclosure_id="scale-ses",
+                        enclosure_label="Scale SES",
+                        slots={
+                            0: SESMapSlot(
+                                slot_number=0,
+                                element_id=0,
+                                device_names=["sda"],
+                                status="OK",
+                                present=True,
+                            )
+                        },
+                    )
+                ],
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                disks=[
+                    {
+                        "name": "sda",
+                        "serial": "SCALE-1",
+                        "model": "SAS Disk",
+                        "size": 4_000_000_000_000,
+                        "status": "ONLINE",
+                    }
+                ],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+            bmc_inventory = BMCInventory(
+                drives=[
+                    BMCDriveRecord(
+                        controller_id=1,
+                        physical_index=3,
+                        slot_number=4,
+                        serial="SCALE-1",
+                        model="SAS Disk",
+                        health="ONLINE",
+                    )
+                ],
+            )
+
+            slot_views, _enclosures, _selected_meta, _layout_rows, _layout_slot_count, _layout_columns = service._correlate(
+                raw_data,
+                ssh_data,
+                [],
+                bmc_inventory=bmc_inventory,
+            )
+
+            self.assertEqual(slot_views[0].device_name, "sda")
+            self.assertEqual(slot_views[0].led_backend, "supermicro_bmc")
+            self.assertEqual(slot_views[0].raw_status["bmc_match_source"], "serial")
+            self.assertEqual(slot_views[0].raw_status["bmc_controller_id"], 1)
+            self.assertEqual(slot_views[0].raw_status["bmc_physical_index"], 3)
+
+    def test_quantastor_slot_is_augmented_by_matching_bmc_serial_without_collapsing_system_view(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="qsosn-ha",
+                truenas=TrueNASConfig(platform="quantastor"),
+                bmc=BMCConfig(enabled=True, host="10.13.0.20", username="ADMIN", password="secret"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+                bmc_service=MagicMock(),
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[{"id": "node-a", "name": "QSOSN Left"}],
+                disks=[
+                    {
+                        "id": "pdisk-1",
+                        "storageSystemId": "node-a",
+                        "devicePath": "/dev/sdb",
+                        "serialNumber": "QS123",
+                        "vendorId": "WDC",
+                        "productId": "Ultrastar",
+                        "size": 4_000_000_000_000,
+                        "healthStatus": "ONLINE",
+                        "slot": "01",
+                    }
+                ],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+            bmc_inventory = BMCInventory(
+                drives=[
+                    BMCDriveRecord(
+                        controller_id=0,
+                        physical_index=5,
+                        slot_number=12,
+                        serial="QS123",
+                        model="Ultrastar",
+                        health="ONLINE",
+                    )
+                ],
+            )
+
+            slot_views, _enclosures, selected_meta, _layout_rows, _layout_slot_count, _layout_columns = service._correlate(
+                raw_data,
+                ParsedSSHData(),
+                [],
+                selected_enclosure_id="node-a",
+                quantastor_ses_data=ParsedSSHData(),
+                bmc_inventory=bmc_inventory,
+            )
+
+            self.assertEqual(selected_meta["id"], "node-a")
+            self.assertEqual(slot_views[0].device_name, "sdb")
+            self.assertEqual(slot_views[0].serial, "QS123")
+            self.assertEqual(slot_views[0].led_backend, "supermicro_bmc")
+            self.assertEqual(slot_views[0].raw_status["bmc_match_source"], "serial")
+            self.assertEqual(slot_views[0].raw_status["bmc_slot_number"], 12)
+
 
 class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod

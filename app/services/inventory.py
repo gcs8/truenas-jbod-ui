@@ -2650,9 +2650,15 @@ class InventoryService:
         if self.system.truenas.platform == "ipmi":
             return self._correlate_bmc_host(warnings, selected_enclosure_id, bmc_inventory)
         if self.system.truenas.platform == "quantastor":
-            return self._correlate_quantastor(raw_data, warnings, selected_enclosure_id, quantastor_ses_data or ParsedSSHData())
+            return self._correlate_quantastor(
+                raw_data,
+                warnings,
+                selected_enclosure_id,
+                quantastor_ses_data or ParsedSSHData(),
+                bmc_inventory,
+            )
         if self.system.truenas.platform == "scale" and self._has_scale_linux_ses(ssh_data):
-            return self._correlate_scale_linux(raw_data, ssh_data, warnings, selected_enclosure_id)
+            return self._correlate_scale_linux(raw_data, ssh_data, warnings, selected_enclosure_id, bmc_inventory)
 
         slot_count = self.settings.layout.slot_count
         api_candidates, api_selected_meta = extract_enclosure_slot_candidates(
@@ -2724,12 +2730,13 @@ class InventoryService:
                 disks_by_slot[(None, disk.slot)] = disk
             for alias in build_lunid_aliases(disk.lunid, self.system.truenas.platform):
                 disks_by_sas[alias] = disk
+        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
 
         slot_views: list[SlotView] = []
 
         for slot in range(layout_slot_count):
             row_index, column_index = slot_positions.get(slot, (slot // layout_columns, slot % layout_columns))
-            candidate = slot_candidates.get(slot, {})
+            candidate = dict(slot_candidates.get(slot, {}))
             enclosure_id = selected_meta.get("id") or normalize_text(candidate.get("enclosure_id"))
             mapping = self.mapping_store.get_mapping(self.system.id, enclosure_id, slot)
             disk = self._resolve_disk_for_slot(
@@ -2742,6 +2749,9 @@ class InventoryService:
                 candidate,
                 ssh_data,
             )
+            bmc_disk = self._match_bmc_disk_by_serial(disk, bmc_disks_by_serial)
+            if bmc_disk is not None:
+                self._apply_bmc_serial_match_to_raw_slot_status(candidate, bmc_disk, disk)
             slot_view = self._build_slot_view(
                 slot=slot,
                 row_index=row_index,
@@ -3388,6 +3398,7 @@ class InventoryService:
         ssh_data: ParsedSSHData,
         warnings: list[str],
         selected_enclosure_id: str | None,
+        bmc_inventory: BMCInventory | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         available_enclosures = self._build_scale_linux_enclosure_options(ssh_data)
         selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
@@ -3445,6 +3456,7 @@ class InventoryService:
             if disk.lunid:
                 for alias in build_lunid_aliases(disk.lunid, self.system.truenas.platform):
                     disks_by_sas[alias] = disk
+        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
 
         columns = (
             selected_profile.columns
@@ -3462,7 +3474,7 @@ class InventoryService:
         slot_views: list[SlotView] = []
 
         for slot in range(slot_count):
-            candidate = slot_candidates.get(slot, {})
+            candidate = dict(slot_candidates.get(slot, {}))
             mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
             disk = self._resolve_disk_for_slot(
                 slot,
@@ -3474,6 +3486,9 @@ class InventoryService:
                 candidate,
                 ssh_data,
             )
+            bmc_disk = self._match_bmc_disk_by_serial(disk, bmc_disks_by_serial)
+            if bmc_disk is not None:
+                self._apply_bmc_serial_match_to_raw_slot_status(candidate, bmc_disk, disk)
             slot_view = self._build_slot_view(
                 slot=slot,
                 row_index=slot_positions.get(slot, (slot // columns, slot % columns))[0],
@@ -3505,6 +3520,7 @@ class InventoryService:
         warnings: list[str],
         selected_enclosure_id: str | None,
         quantastor_ses_data: ParsedSSHData,
+        bmc_inventory: BMCInventory | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         available_enclosures = self._build_quantastor_enclosure_options(raw_data)
         preferred_enclosure_id = selected_enclosure_id or self._select_quantastor_default_enclosure_id(
@@ -3548,6 +3564,7 @@ class InventoryService:
                 disks_by_slot[(None, disk.slot)] = disk
             for alias in self._disk_sas_aliases(disk):
                 disks_by_sas[alias] = disk
+        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
 
         api_topology_members = self._build_quantastor_topology_members(raw_data, disk_records)
         selected_meta = self._enclosure_option_meta(selected_option)
@@ -3591,6 +3608,9 @@ class InventoryService:
                 "disk_raw": disk.raw if disk else None,
             }
             self._merge_quantastor_ses_candidate(raw_slot_status, ses_candidate)
+            bmc_disk = self._match_bmc_disk_by_serial(disk, bmc_disks_by_serial)
+            if bmc_disk is not None:
+                self._apply_bmc_serial_match_to_raw_slot_status(raw_slot_status, bmc_disk, disk)
 
             slot_view = self._build_slot_view(
                 slot=slot,
@@ -5860,6 +5880,48 @@ class InventoryService:
         return records
 
     @staticmethod
+    def _disk_record_serial_identity_keys(disk: DiskRecord | None) -> set[str]:
+        if disk is None:
+            return set()
+
+        keys: set[str] = set()
+        for value in (
+            disk.serial,
+            disk.raw.get("serial"),
+            disk.raw.get("serialNumber"),
+            disk.raw.get("serialNum"),
+            disk.raw.get("physicalDiskSerialNumber"),
+        ):
+            keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+        return keys
+
+    def _build_bmc_serial_disk_index(self, bmc_inventory: BMCInventory | None) -> dict[str, DiskRecord]:
+        index: dict[str, DiskRecord] = {}
+        ambiguous_keys: set[str] = set()
+        for disk in self._build_bmc_disk_records(bmc_inventory):
+            for key in self._disk_record_serial_identity_keys(disk):
+                if key in ambiguous_keys:
+                    continue
+                existing = index.get(key)
+                if existing is not None:
+                    ambiguous_keys.add(key)
+                    index.pop(key, None)
+                    continue
+                index[key] = disk
+        return {key: disk for key, disk in index.items() if key not in ambiguous_keys}
+
+    def _match_bmc_disk_by_serial(
+        self,
+        disk: DiskRecord | None,
+        bmc_disks_by_serial: dict[str, DiskRecord],
+    ) -> DiskRecord | None:
+        for key in self._disk_record_serial_identity_keys(disk):
+            matched = bmc_disks_by_serial.get(key)
+            if matched is not None:
+                return matched
+        return None
+
+    @staticmethod
     def _build_bmc_platform_context(bmc_inventory: BMCInventory) -> dict[str, Any]:
         return {
             "source": "supermicro_bmc",
@@ -5922,6 +5984,50 @@ class InventoryService:
                 "logical_block_size": drive.raw.get("logical_block_size"),
             }
         )
+
+    @staticmethod
+    def _apply_bmc_serial_match_to_raw_slot_status(
+        raw_slot_status: dict[str, Any],
+        drive: DiskRecord,
+        platform_disk: DiskRecord | None,
+    ) -> None:
+        device_names = list(
+            dict.fromkeys(
+                [
+                    *(
+                        raw_slot_status.get("device_names")
+                        if isinstance(raw_slot_status.get("device_names"), list)
+                        else []
+                    ),
+                    *drive.smart_devices,
+                ]
+            )
+        )
+        raw_slot_status.update(
+            {
+                "device_names": device_names,
+                "identify_active": bool(raw_slot_status.get("identify_active"))
+                or bool(drive.raw.get("bmc_identify_active")),
+                "bmc_match_source": "serial",
+                "bmc_serial": drive.serial,
+                "bmc_model": drive.model,
+                "bmc_health": drive.health,
+                "bmc_slot_number": drive.raw.get("bmc_slot_number"),
+                "bmc_enclosure_id": drive.raw.get("bmc_enclosure_id"),
+                "bmc_physical_index": drive.raw.get("bmc_physical_index"),
+                "bmc_controller_id": drive.raw.get("bmc_controller_id"),
+                "bmc_identify_active": drive.raw.get("bmc_identify_active"),
+            }
+        )
+        if not normalize_text(raw_slot_status.get("status")) and not normalize_text(platform_disk.health if platform_disk else None):
+            raw_slot_status["status"] = drive.health
+            raw_slot_status["value"] = drive.health
+        if not normalize_text(raw_slot_status.get("serial_hint")):
+            raw_slot_status["serial_hint"] = drive.serial
+        if not normalize_text(raw_slot_status.get("model_hint")):
+            raw_slot_status["model_hint"] = drive.model
+        if not normalize_text(raw_slot_status.get("reported_size")):
+            raw_slot_status["reported_size"] = format_bytes(drive.size_bytes)
 
     def _build_enclosure_options(
         self,
