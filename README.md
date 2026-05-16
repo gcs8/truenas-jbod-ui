@@ -12,6 +12,10 @@ It does not install anything on TrueNAS CORE or SCALE. The app talks to storage
 hosts over their existing API, SSH, or BMC paths and renders what it can from
 there.
 
+Public demo:
+
+- [https://gcs8.github.io/truenas-jbod-ui/](https://gcs8.github.io/truenas-jbod-ui/)
+
 ## Screenshots
 
 ### Archive CORE

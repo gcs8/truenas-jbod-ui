@@ -236,7 +236,7 @@ separate pages so the setup walkthrough stays readable:
   safe restore patterns.
 - [[Demo and Offline Workflows|Demo-and-Offline-Workflows]] explains how the
   local `Add Demo Builder System` seed differs from offline snapshots, debug
-  bundles, full backups, and the planned public demo site.
+  bundles, full backups, and the public demo site.
 
 The short rule: use the admin sidecar for real local maintenance, but keep
 demo/offline artifacts visibly separate from restore-grade backup bundles.

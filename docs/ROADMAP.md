@@ -31,7 +31,7 @@ The next cycle should stay practical and public-facing:
   appears
 - use `0.19.0-dev` for the public demo / GitHub Pages exploration instead of
   cutting a `0.18.1` patch just for planning docs
-- treat a future public demo as static, scrubbed sample data that can run on
+- treat the public demo as static, scrubbed sample data that can run on
   GitHub Pages, not as a hosted FastAPI/Docker deployment
 - reuse the offline snapshot and demo-builder lessons where they help, while
   keeping backup/restore and real admin maintenance flows separate
@@ -430,8 +430,10 @@ Current notes:
 
 Current status:
 
-- planning only; the wiki now documents the boundary, but no Pages workflow or
-  runtime demo mode has shipped yet
+- first static path implemented on the `0.19.0-dev` branch: the repo carries a
+  live-derived, scrubbed TN Core public-demo artifact, a GitHub Pages workflow
+  for publishing `public-demo/`, static artifact checks, and Playwright smoke
+  coverage; runtime demo/import mode remains later work
 
 ## Longer-Term Ideas
 

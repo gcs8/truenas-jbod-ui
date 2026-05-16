@@ -15,6 +15,10 @@
   `4x NVMe Carrier Card` and `Boot SATADOMs` views, a neutral no-bay-selected
   start state, a 7-day real-history window, scrub checks, and a static
   Playwright smoke test
+- GitHub Pages publication for the checked-in `public-demo/` artifact, with a
+  workflow that smoke-tests the static file, checks for obvious unsafe content,
+  uploads the Pages artifact, and deploys it through the official Pages Actions
+  path on `main` or manual dispatch
 
 ### Fixed
 

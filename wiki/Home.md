@@ -36,8 +36,8 @@ If you want operator feature guides, use:
 - [[History and Snapshot Export|History-and-Snapshot-Export]]
 - [[Admin UI and System Setup|Admin-UI-and-System-Setup]]
 - [[Demo and Offline Workflows|Demo-and-Offline-Workflows]]
-- [[Public Demo Site|Public-Demo-Site]] for the planned GitHub Pages demo
-  boundary
+- [[Public Demo Site|Public-Demo-Site]] for the static GitHub Pages demo
+  boundary and public link
 - [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
 
 If you want deeper runtime and tuning detail, use:
@@ -118,9 +118,10 @@ setup notes.
 [[Heat Map Mode|Heat-Map-Mode]], including history-backed timeline scrubbing
 for supported metrics.
 
-The next planning slice is the public demo idea: a static GitHub Pages sample
+The active `0.19.0-dev` slice is the public demo: a static GitHub Pages sample
 data experience, not a hosted copy of the live Docker app. See
-[[Public Demo Site|Public-Demo-Site]].
+[[Public Demo Site|Public-Demo-Site]] or open
+https://gcs8.github.io/truenas-jbod-ui/.
 
 For older release-by-release detail, use the project changelog and GitHub
 releases instead of treating the wiki home page as release notes.
@@ -140,7 +141,7 @@ Those pages show:
 - heat-map overlays for the physical bay layout
 - the export snapshot dialog with live size estimates
 - the frozen offline snapshot HTML after export
-- the planned boundary for a future static public demo
+- the static public demo boundary and published demo link
 - the maintenance/recovery follow-up lives on
   [[History Maintenance and Recovery|History-Maintenance-and-Recovery]]
 

@@ -5,8 +5,8 @@ snapshot export flow.
 
 Use it when you want historical charts, timeline-backed heat maps, or one
 self-contained offline HTML view of an enclosure. If you are trying to choose
-between snapshot export, debug bundles, full backups, and the planned public
-demo, start with
+between snapshot export, debug bundles, full backups, and the public demo, start
+with
 [[Demo and Offline Workflows|Demo-and-Offline-Workflows]].
 
 ## What This Adds
@@ -150,8 +150,8 @@ These are intentionally different tools:
   selected config/history/support files for offline troubleshooting
 - `Full Backup` in the admin sidecar creates the restore-grade bundle you use
   for import or cross-host recovery
-- the planned [[Public Demo Site|Public-Demo-Site]] should be a static sample
-  data experience, not a backup/restore path and not a live hosted backend
+- the [[Public Demo Site|Public-Demo-Site]] is a static sample data
+  experience, not a backup/restore path and not a live hosted backend
 
 Use the debug bundle when you want to hand someone a frozen stack state to
 inspect. Use full backup when you actually need to restore the app later.

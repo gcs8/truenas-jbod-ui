@@ -26,7 +26,7 @@ flowchart LR
     Logs["./logs\nlocal logs"]
     Hosts["Storage hosts\nTrueNAS, Quantastor, ESXi, Linux, UniFi, BMC"]
     GHCR["GHCR image\nghcr.io/gcs8/truenas-jbod-ui"]
-    Pages["Future GitHub Pages demo\nstatic sample data only"]
+    Pages["GitHub Pages demo\nstatic sample data only"]
 
     Browser --> UI
     Browser --> History
@@ -92,11 +92,11 @@ hosts, any host-prep package staging is an explicit admin action.
 
 ## Public Demo Boundary
 
-A future GitHub Pages demo belongs outside this live service map.
+A GitHub Pages demo belongs outside this live service map.
 
-It should load scrubbed or synthetic sample data directly in the browser. It
-must not connect to your storage hosts, run the FastAPI backend, hold secrets,
-or expose admin maintenance actions.
+It loads scrubbed sample data directly in the browser from the checked-in
+`public-demo/` artifact. It must not connect to your storage hosts, run the
+FastAPI backend, hold secrets, or expose admin maintenance actions.
 
 See [[Public Demo Site|Public-Demo-Site]] and
 [[Demo and Offline Workflows|Demo-and-Offline-Workflows]].

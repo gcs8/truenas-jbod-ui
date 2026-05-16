@@ -3,7 +3,12 @@
 This page tracks the public, interactive demo.
 
 A static demo artifact now exists in the source tree as `public-demo/index.html`.
-It is not published to GitHub Pages yet.
+The repo also has a GitHub Pages workflow that publishes the checked-in
+`public-demo/` directory after static artifact checks pass.
+
+Public demo:
+
+- https://gcs8.github.io/truenas-jbod-ui/
 
 For the broader comparison between public demo, local demo seed, offline
 snapshot, debug bundle, and full backup, see
@@ -82,17 +87,25 @@ Local build/check commands:
 ```powershell
 python scripts/build_public_demo.py --output public-demo/index.html
 python scripts/build_public_demo.py --output public-demo/index.html --check
+python scripts/check_public_demo_artifact.py public-demo
 ```
 
-## Possible First Published Version
+GitHub-hosted runners do not rebuild the demo from live source data. The Pages
+workflow smoke-tests the checked-in artifact by setting
+`PUBLIC_DEMO_ARTIFACT=public-demo/index.html`, runs the publishability checker,
+uploads `public-demo/`, and deploys it through GitHub Pages on `main` or manual
+workflow dispatch.
 
-1. Generate or hand-curate a scrubbed demo fixture.
-2. Build a static page that loads that fixture in the browser.
-3. Reuse the normal enclosure, slot detail, storage-view, and heat-map
-   interaction patterns where practical.
-4. Hide or disable live-only controls.
-5. Publish the static output with GitHub Pages after the generated artifact is
-   reviewed.
+## Published Version
+
+1. The local build script generates `public-demo/index.html` from scrubbed
+   live-derived TN Core source data.
+2. The checked-in artifact loads directly in the browser and reuses the normal
+   enclosure, slot detail, storage-view, and heat-map interaction patterns.
+3. Live-only controls are hidden or disabled by snapshot mode.
+4. `.github/workflows/publish-public-demo.yml` checks the artifact, runs the
+   static Playwright smoke, uploads `public-demo/`, and deploys with GitHub
+   Pages.
 
 Later, a local `Import demo snapshot` path could let people load a scrubbed
 demo fixture in browser memory. That should stay separate from admin full
@@ -102,7 +115,7 @@ backup restore, which is a real local-stack maintenance workflow.
 
 This is now active `0.19.0-dev` work.
 
-The remaining publication step is a GitHub Pages workflow and link pass. The
+The Pages publication workflow and public link are now in the source tree. The
 shipped `0.18.0` image does not need a runtime patch for this foundation.
 
 ## Related Pages

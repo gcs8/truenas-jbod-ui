@@ -9,7 +9,7 @@ different jobs and should not be treated as interchangeable.
 
 | Workflow | Exists today? | Needs Docker? | Uses real local data? | Purpose |
 | --- | --- | --- | --- | --- |
-| Public demo site | artifact exists, Pages not published | no | no | let visitors explore scrubbed sample data in a static browser page |
+| Public demo site | yes, static Pages workflow | no | no | let visitors explore scrubbed sample data in a static browser page |
 | Demo Builder Seed | yes | yes | synthetic config only | create a local fake system/profile/views for builder testing |
 | Export Snapshot | yes | no after export | yes, but frozen/redacted by export settings | share one offline enclosure or storage-view HTML artifact |
 | Debug Bundle | yes | no after export | yes, optionally scrubbed | send support evidence for inspection |
@@ -17,16 +17,20 @@ different jobs and should not be treated as interchangeable.
 
 ## Public Demo Site
 
-The public demo is becoming a GitHub Pages-compatible static site. The current
-source tree can generate `public-demo/index.html` from live-derived TN Core /
-Supermicro CSE-946-style data through the offline snapshot exporter, and the
-page clearly marks itself as an offline artifact. Critical serial, SAS, NAA, and
-persistent identifiers are scrambled consistently, while make, model, capacity,
-configured storage-view names, SMART summaries, and history samples come from
-the source data. Its pool topology follows the validated CORE 60-bay membership
-pattern, including data `raidz2` groups, the spare bay, special mirror members,
-matching empty bays, the `4x NVMe Carrier Card`, and `Boot SATADOMs`. It opens
-with no bay selected and preserves a 7-day history window.
+The public demo is a GitHub Pages-compatible static site. The current source
+tree generates `public-demo/index.html` from live-derived TN Core / Supermicro
+CSE-946-style data through the offline snapshot exporter, and the page clearly
+marks itself as an offline artifact. Critical serial, SAS, NAA, and persistent
+identifiers are scrambled consistently, while make, model, capacity, configured
+storage-view names, SMART summaries, and history samples come from the source
+data. Its pool topology follows the validated CORE 60-bay membership pattern,
+including data `raidz2` groups, the spare bay, special mirror members, matching
+empty bays, the `4x NVMe Carrier Card`, and `Boot SATADOMs`. It opens with no
+bay selected and preserves a 7-day history window.
+
+Public demo:
+
+- https://gcs8.github.io/truenas-jbod-ui/
 
 It must not:
 

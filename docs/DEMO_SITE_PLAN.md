@@ -2,12 +2,17 @@
 
 Date: `2026-05-15`
 
-Status: implementation foundation in progress for `0.19.0-dev`.
+Status: first static publication path in progress for `0.19.0-dev`.
 
 Current code adds a deterministic, live-derived TN Core / Supermicro CSE-946
 public demo artifact at `public-demo/index.html`, plus tests proving the
-artifact is stable, scrubbed, and explorable without a live backend. This does
-not yet add a GitHub Pages publish workflow or cut a release.
+artifact is stable, scrubbed, and explorable without a live backend. The repo
+now also includes a GitHub Pages workflow that publishes the checked-in
+`public-demo/` directory after static artifact checks pass.
+
+Public demo URL:
+
+- https://gcs8.github.io/truenas-jbod-ui/
 
 Public-facing wiki context:
 
@@ -77,7 +82,10 @@ scrubbed demo fixtures.
   - current: `qa/public-demo.spec.js`
 - publish through a GitHub Pages workflow only after the static artifact is
   deterministic and scrubbed
-  - remaining: add the Pages workflow after review of the generated artifact
+  - current: `.github/workflows/publish-public-demo.yml` checks the static
+    artifact, runs the public demo Playwright smoke against the checked-in
+    file, uploads `public-demo/`, and deploys through GitHub Pages on `main`
+    or manual workflow dispatch
 
 ### Phase 2 - Demo Mode In The App
 
@@ -115,8 +123,9 @@ usage limits:
 ## Acceptance Criteria For A First Shippable Demo
 
 - a Pages URL loads a static demo without Docker
-  - not yet: generated artifact exists locally; Pages workflow/URL remains
-    future work
+  - current: workflow publishes `public-demo/` to
+    `https://gcs8.github.io/truenas-jbod-ui/` after the branch reaches `main`;
+    the repository Pages source is configured for GitHub Actions
 - at least one sample physical enclosure renders from scrubbed data
   - current: the live-derived CSE-946-style 60-bay top-loader renders from
     scrubbed fixture data
@@ -129,8 +138,8 @@ usage limits:
   - current: covered by `qa/public-demo.spec.js`
 - a README/wiki link explains the boundary between demo, offline snapshot,
   full backup, and the real Docker deployment
-  - current: docs and wiki pages describe the boundary; publish/update still
-    needed when the Pages workflow lands
+  - current: README/docs/wiki pages link the public demo and explain the
+    boundary
 
 ## Open Decisions
 
@@ -140,5 +149,5 @@ usage limits:
   long-term or add a small index shell after Pages publication
 - whether local fixture import belongs in the first version or should wait
   until the static sample proves useful
-- whether to publish from `main` plus GitHub Actions or keep a dedicated
-  `gh-pages` branch
+- whether the later local import/demo mode should reuse HTML snapshots directly
+  or accept a smaller JSON fixture

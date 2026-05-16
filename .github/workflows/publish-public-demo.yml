@@ -1,0 +1,84 @@
+name: Publish Public Demo
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/publish-public-demo.yml"
+      - "public-demo/**"
+      - "qa/public-demo.spec.js"
+      - "scripts/check_public_demo_artifact.py"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/publish-public-demo.yml"
+      - "public-demo/**"
+      - "qa/public-demo.spec.js"
+      - "scripts/check_public_demo_artifact.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-demo-pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify static public demo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check publishable artifact
+        run: python scripts/check_public_demo_artifact.py public-demo
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install browser QA dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Smoke test checked-in artifact
+        env:
+          PUBLIC_DEMO_ARTIFACT: public-demo/index.html
+        run: npx playwright test qa/public-demo.spec.js
+
+      - name: Configure Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: public-demo
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy static demo
+        id: deployment
+        uses: actions/deploy-pages@v4

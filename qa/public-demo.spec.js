@@ -5,8 +5,20 @@ const os = require("os");
 const path = require("path");
 const { pathToFileURL } = require("url");
 
-function buildPublicDemoFixture() {
-  const repoRoot = path.resolve(__dirname, "..");
+const repoRoot = path.resolve(__dirname, "..");
+
+function resolvePublicDemoArtifact() {
+  if (process.env.PUBLIC_DEMO_ARTIFACT) {
+    const requestedPath = process.env.PUBLIC_DEMO_ARTIFACT;
+    const artifactPath = path.isAbsolute(requestedPath)
+      ? requestedPath
+      : path.resolve(repoRoot, requestedPath);
+    if (!fs.existsSync(artifactPath)) {
+      throw new Error(`PUBLIC_DEMO_ARTIFACT does not exist: ${artifactPath}`);
+    }
+    return artifactPath;
+  }
+
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-public-demo-"));
   const outputPath = path.join(tempDir, "index.html");
   const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
@@ -21,7 +33,7 @@ function buildPublicDemoFixture() {
 }
 
 test("public demo static artifact is explorable without a live backend", async ({ page }) => {
-  const demoPath = buildPublicDemoFixture();
+  const demoPath = resolvePublicDemoArtifact();
   const consoleErrors = [];
   page.on("console", (message) => {
     if (message.type() === "error") {
