@@ -27,6 +27,7 @@
   const HEATMAP_DEFAULT_SCALE_SENSITIVITY = 1;
   const HEATMAP_HISTORY_MODE_CURRENT = "current";
   const HEATMAP_HISTORY_MODE_TIMELINE = "timeline";
+  const heatmapSampleCache = new WeakMap();
   const ANNUALIZED_MIN_POWER_ON_HOURS = 24 * 30;
   const HISTORY_UI_STORAGE_KEY = "truenas-jbod-ui.history-ui.v1";
   const EXPORT_UI_STORAGE_KEY = "truenas-jbod-ui.export-ui.v1";
@@ -55,6 +56,9 @@
     : normalizePersistedIoChartMode(persistedHistoryUi?.ioChartMode);
   const preloadedHistoryBySlot = bootstrap.preloadedHistoryBySlot || {};
   const preloadedSmartSummariesBySlot = bootstrap.preloadedSmartSummariesBySlot || {};
+  const preloadedSnapshotsByEnclosure = bootstrap.preloadedSnapshotsByEnclosure || {};
+  const preloadedSnapshotSmartSummaries = bootstrap.preloadedSnapshotSmartSummaries || {};
+  const preloadedStorageViewSmartSummaries = bootstrap.preloadedStorageViewSmartSummaries || {};
   const preloadedHistorySummary = bootstrap.preloadedHistorySummary || { counts: {}, collector: {} };
   const availableSetupProfiles = Array.isArray(bootstrap.availableSetupProfiles) ? bootstrap.availableSetupProfiles : [];
   const setupPlatformDefaults = bootstrap.setupPlatformDefaults || {};
@@ -92,6 +96,9 @@
     storageViewsRuntimeRequestToken: 0,
     smartSummaries: {},
     preloadedSmartSummariesBySlot,
+    preloadedSnapshotsByEnclosure,
+    preloadedSnapshotSmartSummaries,
+    preloadedStorageViewSmartSummaries,
     smartSummaryGeneration: 0,
     smartPrefetchToken: 0,
     smartPrefetchTimerId: null,
@@ -101,6 +108,10 @@
       redactSensitive: Boolean(persistedExportUi?.redactSensitive),
       packaging: normalizePersistedPackaging(persistedExportUi?.packaging),
       allowOversize: Boolean(persistedExportUi?.allowOversize),
+      includeLiveEnclosures: false,
+      selectedEnclosureIds: [],
+      includeStorageViews: false,
+      selectedStorageViewIds: [],
       running: false,
       estimate: {
         loading: false,
@@ -155,6 +166,9 @@
         : DEFAULT_HISTORY_TIMEFRAME_HOURS,
       historyMode: HEATMAP_HISTORY_MODE_CURRENT,
       playbackIndex: null,
+      overlayFrameId: null,
+      timelineCacheKey: null,
+      timelineCache: [],
       sensitivity: HEATMAP_DEFAULT_SCALE_SENSITIVITY,
       histories: {},
       loading: false,
@@ -254,6 +268,10 @@
   const exportRedactToggle = document.getElementById("export-redact-toggle");
   const exportPackagingSelect = document.getElementById("export-packaging-select");
   const exportAllowOversizeToggle = document.getElementById("export-allow-oversize-toggle");
+  const exportIncludeEnclosuresToggle = document.getElementById("export-include-enclosures-toggle");
+  const exportEnclosureSelection = document.getElementById("export-enclosure-selection");
+  const exportIncludeViewsToggle = document.getElementById("export-include-views-toggle");
+  const exportViewSelection = document.getElementById("export-view-selection");
   const exportSnapshotConfirm = document.getElementById("export-snapshot-confirm");
   const exportSnapshotCancel = document.getElementById("export-snapshot-cancel");
   const exportSnapshotNote = document.getElementById("export-snapshot-note");
@@ -360,6 +378,46 @@
       return state.selectedEnclosureId;
     }
     return snapshotMatchesSelectedSystem() ? (state.snapshot.selected_enclosure_id || null) : null;
+  }
+
+  function snapshotEnclosureKey(enclosureId) {
+    return enclosureId || "__default__";
+  }
+
+  function getPreloadedSnapshotForEnclosureId(enclosureId) {
+    if (!state.snapshotMode || !enclosureId) {
+      return null;
+    }
+    return (
+      state.preloadedSnapshotsByEnclosure?.[enclosureId] ||
+      state.preloadedSnapshotsByEnclosure?.[snapshotEnclosureKey(enclosureId)] ||
+      null
+    );
+  }
+
+  function hasPreloadedSnapshotForEnclosureId(enclosureId) {
+    return Boolean(getPreloadedSnapshotForEnclosureId(enclosureId));
+  }
+
+  function getPreloadedSmartSummariesForEnclosureId(enclosureId) {
+    if (!state.snapshotMode || !enclosureId) {
+      return state.preloadedSmartSummariesBySlot || {};
+    }
+    return (
+      state.preloadedSnapshotSmartSummaries?.[enclosureId] ||
+      state.preloadedSnapshotSmartSummaries?.[snapshotEnclosureKey(enclosureId)] ||
+      state.preloadedSmartSummariesBySlot ||
+      {}
+    );
+  }
+
+  function applyPreloadedSnapshotForEnclosureId(enclosureId) {
+    const preloadedSnapshot = getPreloadedSnapshotForEnclosureId(enclosureId);
+    if (!preloadedSnapshot) {
+      return false;
+    }
+    applySnapshot(cloneJsonValue(preloadedSnapshot));
+    return true;
   }
 
   function currentLiveEnclosureLabel() {
@@ -2885,9 +2943,10 @@
     if (liveEntry) {
       return liveEntry;
     }
+    const preloadedBySlot = getPreloadedSmartSummariesForEnclosureId(slot.enclosure_id || currentLiveEnclosureId());
     const preloadedSummary =
-      state.preloadedSmartSummariesBySlot[String(slot.slot)] ||
-      state.preloadedSmartSummariesBySlot[slot.slot] ||
+      preloadedBySlot[String(slot.slot)] ||
+      preloadedBySlot[slot.slot] ||
       null;
     if (!preloadedSummary) {
       return null;
@@ -2903,7 +2962,24 @@
 
   function getStorageViewSmartSummaryEntry(view, slot) {
     if (!view || !slot) return null;
-    return state.smartSummaries[getStorageViewSmartCacheKey(view, slot)] || null;
+    const liveEntry = state.smartSummaries[getStorageViewSmartCacheKey(view, slot)] || null;
+    if (liveEntry) {
+      return liveEntry;
+    }
+    const preloadedSummary =
+      state.preloadedStorageViewSmartSummaries?.[view.id]?.[String(slot.slot_index)] ||
+      state.preloadedStorageViewSmartSummaries?.[view.id]?.[slot.slot_index] ||
+      null;
+    if (!preloadedSummary) {
+      return null;
+    }
+    return {
+      loading: false,
+      refreshing: false,
+      data: preloadedSummary,
+      requestedAt: 0,
+      generation: state.smartSummaryGeneration,
+    };
   }
 
   function currentSmartPrefetchScopeKey() {
@@ -3957,31 +4033,62 @@
       : [];
   }
 
-  function heatmapTimelineSampleValue(entry, metricName, timestampMs) {
-    const samples = heatmapTimelineMetricSamples(entry, metricName);
-    if (!Number.isFinite(timestampMs) || !samples.length) {
+  function heatmapPreparedTimelineSamples(entry, metricName) {
+    const payload = entry?.historyPayload;
+    if (!payload || typeof payload !== "object") {
+      return [];
+    }
+    let payloadCache = heatmapSampleCache.get(payload);
+    if (!payloadCache) {
+      payloadCache = new Map();
+      heatmapSampleCache.set(payload, payloadCache);
+    }
+    if (payloadCache.has(metricName)) {
+      return payloadCache.get(metricName);
+    }
+    const prepared = heatmapTimelineMetricSamples(entry, metricName)
+      .map((sample) => ({
+        timestampMs: sampleTimestampMs(sample),
+        value: Number(sample?.value),
+      }))
+      .filter((sample) => Number.isFinite(sample.timestampMs) && Number.isFinite(sample.value))
+      .sort((left, right) => left.timestampMs - right.timestampMs);
+    payloadCache.set(metricName, prepared);
+    return prepared;
+  }
+
+  function nearestPreparedTimelineSample(samples, timestampMs) {
+    if (!Number.isFinite(timestampMs) || !Array.isArray(samples) || !samples.length) {
       return null;
     }
-    let selected = null;
-    let selectedDistance = Number.POSITIVE_INFINITY;
-    samples.forEach((sample) => {
-      const sampleMs = sampleTimestampMs(sample);
-      const numericValue = Number(sample?.value);
-      if (!Number.isFinite(sampleMs) || !Number.isFinite(numericValue)) {
-        return;
+    let low = 0;
+    let high = samples.length - 1;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (samples[mid].timestampMs < timestampMs) {
+        low = mid + 1;
+      } else {
+        high = mid;
       }
-      const distance = Math.abs(sampleMs - timestampMs);
-      if (distance < selectedDistance) {
-        selected = numericValue;
-        selectedDistance = distance;
-      }
-    });
-    return Number.isFinite(selected) ? selected : null;
+    }
+    const candidate = samples[low];
+    const previous = low > 0 ? samples[low - 1] : null;
+    if (previous && Math.abs(previous.timestampMs - timestampMs) <= Math.abs(candidate.timestampMs - timestampMs)) {
+      return previous;
+    }
+    return candidate;
+  }
+
+  function heatmapTimelineSampleValue(entry, metricName, timestampMs) {
+    const selected = nearestPreparedTimelineSample(
+      heatmapPreparedTimelineSamples(entry, metricName),
+      timestampMs
+    );
+    return selected ? selected.value : null;
   }
 
   function heatmapTimelineSamplesAscending(entry, metricName) {
-    return sortHistorySamplesAscending(heatmapTimelineMetricSamples(entry, metricName))
-      .filter((sample) => Number.isFinite(sampleTimestampMs(sample)));
+    return heatmapPreparedTimelineSamples(entry, metricName);
   }
 
   function heatmapTimelineRateAt(entry, metricName, timestampMs) {
@@ -3992,7 +4099,7 @@
     let selectedIndex = -1;
     let selectedDistance = Number.POSITIVE_INFINITY;
     samples.forEach((sample, index) => {
-      const distance = Math.abs(sampleTimestampMs(sample) - timestampMs);
+      const distance = Math.abs(sample.timestampMs - timestampMs);
       if (distance < selectedDistance) {
         selectedIndex = index;
         selectedDistance = distance;
@@ -4003,10 +4110,10 @@
     }
     const previous = samples[selectedIndex - 1];
     const current = samples[selectedIndex];
-    const previousValue = Number(previous?.value);
-    const currentValue = Number(current?.value);
-    const previousTimestamp = sampleTimestampMs(previous);
-    const currentTimestamp = sampleTimestampMs(current);
+    const previousValue = previous?.value;
+    const currentValue = current?.value;
+    const previousTimestamp = previous?.timestampMs;
+    const currentTimestamp = current?.timestampMs;
     if (
       !Number.isFinite(previousValue)
       || !Number.isFinite(currentValue)
@@ -4026,19 +4133,33 @@
     if (!heatmapMetricSupportsTimeline(metric)) {
       return [];
     }
+    const selectedView = getSelectedStorageViewRuntime();
+    const scopePart = selectedView
+      ? `view:${selectedView.id}`
+      : `live:${state.selectedSystemId || ""}:${state.selectedEnclosureId || ""}`;
+    const cacheKey = [
+      scopePart,
+      metric.id,
+      currentHeatmapWindowHours() ?? "all",
+      state.heatmap.scopeKey || "snapshot",
+      state.snapshot?.generated_at || state.snapshot?.last_updated || "",
+    ].join("|");
+    if (state.heatmap.timelineCacheKey === cacheKey && Array.isArray(state.heatmap.timelineCache)) {
+      return state.heatmap.timelineCache;
+    }
     const timestamps = new Set();
     const metricNames = heatmapHistoryMetricNames(metric.id);
     entries.forEach((entry) => {
       metricNames.forEach((metricName) => {
-        heatmapTimelineMetricSamples(entry, metricName).forEach((sample) => {
-          const sampleMs = sampleTimestampMs(sample);
-          if (Number.isFinite(sampleMs)) {
-            timestamps.add(sampleMs);
-          }
+        heatmapPreparedTimelineSamples(entry, metricName).forEach((sample) => {
+          timestamps.add(sample.timestampMs);
         });
       });
     });
-    return [...timestamps].sort((left, right) => left - right);
+    const timeline = [...timestamps].sort((left, right) => left - right);
+    state.heatmap.timelineCacheKey = cacheKey;
+    state.heatmap.timelineCache = timeline;
+    return timeline;
   }
 
   function normalizeHeatmapPlaybackIndex(timeline) {
@@ -4289,6 +4410,12 @@
 
   function heatmapStorageViewEntry(view, storageViewSlot) {
     const liveSlot = getLiveBackedStorageViewSlot(view, storageViewSlot);
+    const historySlot = buildStorageViewHistoryContextSlot(view, storageViewSlot);
+    const historyPayload = state.heatmap.histories[String(storageViewSlot.slot_index)] || (
+      state.snapshotMode && historySlot
+        ? getCachedHistoryPayload({ slot: historySlot, cacheKey: getHistoryCacheKey(historySlot) })
+        : null
+    );
     const slotLike = liveSlot
       ? { ...liveSlot, slot_label: storageViewSlot.slot_label || liveSlot.slot_label }
       : {
@@ -4302,7 +4429,7 @@
       storageViewSlot,
       liveSlot,
       smartEntry: getStorageViewSmartSummaryEntry(view, storageViewSlot) || (liveSlot ? getSmartSummaryEntry(liveSlot) : null),
-      historyPayload: state.heatmap.histories[String(storageViewSlot.slot_index)] || null,
+      historyPayload,
     };
   }
 
@@ -4406,7 +4533,23 @@
     return interpolateRgb(amber, red, (clamped - 0.68) / 0.32);
   }
 
+  function resetHeatmapTile(tile) {
+    if (!tile) {
+      return;
+    }
+    tile.classList.remove("heatmap-active", "heatmap-missing");
+    tile.style.removeProperty("--heatmap-rgb");
+    tile.style.removeProperty("--heatmap-alpha");
+    tile.style.removeProperty("--heatmap-border-alpha");
+    Array.from(tile.children).forEach((child) => {
+      if (child.classList?.contains("slot-heatmap-value")) {
+        child.remove();
+      }
+    });
+  }
+
   function applyHeatmapToTile(tile, context, entryKey) {
+    resetHeatmapTile(tile);
     if (!tile || !context?.enabled) {
       return;
     }
@@ -4436,6 +4579,31 @@
     badge.textContent = metric.format(record.value);
     badge.title = `${metric.label}: ${metric.format(record.value)}`;
     tile.appendChild(badge);
+  }
+
+  function refreshHeatmapTileOverlays(context = null) {
+    const heatmapContext = context || buildHeatmapContext();
+    grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
+      applyHeatmapToTile(tile, heatmapContext, tile.dataset.slot);
+    });
+    renderHeatmapControls(heatmapContext);
+    const hoveredTile = Number.isInteger(state.hoveredSlot)
+      ? Array.from(grid.querySelectorAll(".slot-tile[data-slot]"))
+        .find((tile) => Number(tile.dataset.slot) === state.hoveredSlot)
+      : null;
+    if (hoveredTile) {
+      refreshHoveredTooltip(hoveredTile);
+    }
+  }
+
+  function scheduleHeatmapTileOverlayRefresh() {
+    if (state.heatmap.overlayFrameId !== null) {
+      cancelAnimationFrame(state.heatmap.overlayFrameId);
+    }
+    state.heatmap.overlayFrameId = requestAnimationFrame(() => {
+      state.heatmap.overlayFrameId = null;
+      refreshHeatmapTileOverlays();
+    });
   }
 
   function heatmapTooltipLines(entryKey, context = null) {
@@ -4551,6 +4719,8 @@
     state.heatmap.pendingScopeKey = null;
     state.heatmap.error = null;
     state.heatmap.playbackIndex = null;
+    state.heatmap.timelineCacheKey = null;
+    state.heatmap.timelineCache = [];
     state.heatmap.requestToken += 1;
   }
 
@@ -5342,6 +5512,35 @@
     });
   }
 
+  function exportableStorageViews() {
+    return getMainUiStorageViewRuntimeOptions();
+  }
+
+  function exportableLiveEnclosures() {
+    return (state.snapshot.enclosures || []).filter((enclosure) => enclosure && enclosure.id);
+  }
+
+  function selectedExportEnclosureIds() {
+    const currentId = currentLiveEnclosureId();
+    if (!state.export.includeLiveEnclosures) {
+      return [];
+    }
+    const availableIds = new Set(exportableLiveEnclosures().map((enclosure) => enclosure.id).filter(Boolean));
+    const selectedIds = state.export.selectedEnclosureIds.filter((enclosureId) => availableIds.has(enclosureId));
+    if (currentId && availableIds.has(currentId) && !selectedIds.includes(currentId)) {
+      selectedIds.unshift(currentId);
+    }
+    return selectedIds;
+  }
+
+  function selectedExportStorageViewIds() {
+    if (!state.export.includeStorageViews) {
+      return [];
+    }
+    const availableIds = new Set(exportableStorageViews().map((view) => view.id).filter(Boolean));
+    return state.export.selectedStorageViewIds.filter((viewId) => availableIds.has(viewId));
+  }
+
   function snapshotExportRequestPayload() {
     const includeHistoryPanel = Boolean(state.history.panelOpen && isHistoryAvailable());
     return {
@@ -5352,6 +5551,10 @@
       redact_sensitive: state.export.redactSensitive,
       packaging: state.export.packaging,
       allow_oversize: state.export.allowOversize,
+      include_live_enclosures: state.export.includeLiveEnclosures,
+      enclosure_ids: selectedExportEnclosureIds(),
+      include_storage_views: state.export.includeStorageViews,
+      storage_view_ids: selectedExportStorageViewIds(),
     };
   }
 
@@ -5568,6 +5771,71 @@
     `;
   }
 
+  function renderSnapshotExportScopeControls() {
+    if (exportIncludeEnclosuresToggle && exportEnclosureSelection) {
+      const enclosures = exportableLiveEnclosures();
+      const currentId = currentLiveEnclosureId();
+      exportIncludeEnclosuresToggle.checked = state.export.includeLiveEnclosures;
+      exportIncludeEnclosuresToggle.disabled = enclosures.length <= 1 || state.export.running || state.export.estimate.loading;
+      exportEnclosureSelection.classList.toggle("hidden", !state.export.includeLiveEnclosures || enclosures.length <= 1);
+      if (!enclosures.length || enclosures.length <= 1) {
+        exportEnclosureSelection.innerHTML = "";
+      } else {
+        const selectedIds = new Set(selectedExportEnclosureIds());
+        exportEnclosureSelection.innerHTML = enclosures
+          .map((enclosure) => {
+            const isCurrent = enclosure.id === currentId;
+            const checked = selectedIds.has(enclosure.id) || isCurrent ? " checked" : "";
+            const disabled = isCurrent || state.export.running || state.export.estimate.loading ? " disabled" : "";
+            const shape = [
+              Number.isFinite(Number(enclosure.slot_count)) ? `${Number(enclosure.slot_count)} bays` : "",
+              enclosure.profile_id || "",
+            ].filter(Boolean).join(" / ");
+            const meta = isCurrent ? "Current enclosure, always included" : shape;
+            return `
+              <label class="snapshot-export-view-option">
+                <input type="checkbox" data-export-enclosure-id="${escapeHtml(enclosure.id)}"${checked}${disabled}>
+                <span>
+                  ${escapeHtml(enclosure.label || enclosure.id)}
+                  ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
+                </span>
+              </label>
+            `;
+          })
+          .join("");
+      }
+    }
+    if (!exportIncludeViewsToggle || !exportViewSelection) {
+      return;
+    }
+    const views = exportableStorageViews();
+    exportIncludeViewsToggle.checked = state.export.includeStorageViews;
+    exportIncludeViewsToggle.disabled = !views.length || state.export.running || state.export.estimate.loading;
+    exportViewSelection.classList.toggle("hidden", !state.export.includeStorageViews || !views.length);
+    if (!views.length) {
+      exportViewSelection.innerHTML = "";
+      return;
+    }
+    const selectedIds = new Set(selectedExportStorageViewIds());
+    exportViewSelection.innerHTML = views
+      .map((view) => {
+        const checked = selectedIds.has(view.id) ? " checked" : "";
+        const meta = [storageViewKindLabel(view), view.template_label || view.template_id]
+          .filter(Boolean)
+          .join(" / ");
+        return `
+          <label class="snapshot-export-view-option">
+            <input type="checkbox" data-export-storage-view-id="${escapeHtml(view.id)}"${checked}>
+            <span>
+              ${escapeHtml(view.label || view.id)}
+              ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
+            </span>
+          </label>
+        `;
+      })
+      .join("");
+  }
+
   async function refreshSnapshotExportEstimate() {
     if (state.snapshotMode || !exportSnapshotDialog || !exportSnapshotDialog.open) {
       return;
@@ -5627,14 +5895,25 @@
     if (!exportSnapshotNote) {
       return;
     }
+    renderSnapshotExportScopeControls();
     const scopeLabel =
       getSelectedEnclosureOption()?.label ||
       state.snapshot.selected_enclosure_label ||
       state.snapshot.selected_enclosure_id ||
       "current enclosure";
+    const selectedEnclosureCount = selectedExportEnclosureIds().length;
+    const selectedViewCount = selectedExportStorageViewIds().length;
+    const scopeParts = [
+      selectedEnclosureCount > 1
+        ? `${selectedEnclosureCount} live enclosures`
+        : scopeLabel,
+      selectedViewCount
+        ? `${selectedViewCount} saved or virtual view${selectedViewCount === 1 ? "" : "s"}`
+        : "",
+    ].filter(Boolean);
     const slot = getSlotById(state.selectedSlot);
     const parts = [
-      `Scope ${scopeLabel}.`,
+      `Scope ${scopeParts.join(" plus ")}.`,
       `Window ${formatHistoryWindowDescription(currentHistoryWindowHours())}.`,
       state.export.packaging === "zip"
         ? "Force ZIP packaging."
@@ -5695,6 +5974,12 @@
     }
     if (exportAllowOversizeToggle) {
       exportAllowOversizeToggle.checked = state.export.allowOversize;
+    }
+    if (state.export.includeLiveEnclosures && selectedExportEnclosureIds().length <= 1) {
+      state.export.selectedEnclosureIds = exportableLiveEnclosures().map((enclosure) => enclosure.id).filter(Boolean);
+    }
+    if (state.export.includeStorageViews && !state.export.selectedStorageViewIds.length) {
+      state.export.selectedStorageViewIds = exportableStorageViews().map((view) => view.id).filter(Boolean);
     }
     syncSnapshotExportDialog();
     if (typeof exportSnapshotDialog.showModal === "function") {
@@ -7599,7 +7884,16 @@
   function renderSelectors() {
     const systems = state.snapshot.systems || [];
     const enclosures = state.snapshot.enclosures || [];
+    const hasPreloadedLiveSnapshots = state.snapshotMode && Object.keys(state.preloadedSnapshotsByEnclosure || {}).length > 0;
+    const visibleEnclosures = state.snapshotMode
+      ? enclosures.filter((enclosure) => (
+          hasPreloadedLiveSnapshots
+            ? hasPreloadedSnapshotForEnclosureId(enclosure.id)
+            : enclosure.id === currentLiveEnclosureId()
+        ))
+      : enclosures;
     const storageViews = getMainUiStorageViewRuntimeOptions();
+    const snapshotNavigationAvailable = state.snapshotMode && (visibleEnclosures.length + storageViews.length > 1);
 
     if (systemSelect) {
       systemSelect.innerHTML = systems
@@ -7615,10 +7909,10 @@
     }
 
     if (enclosureSelect) {
-      if (!enclosures.length && !storageViews.length) {
+      if (!visibleEnclosures.length && !storageViews.length) {
         enclosureSelect.innerHTML = '<option value="">Auto-selected</option>';
       } else {
-        const enclosureOptions = enclosures
+        const enclosureOptions = visibleEnclosures
           .map((enclosure) => `<option value="enclosure:${escapeHtml(enclosure.id)}">${escapeHtml(selectorLabelForEnclosureOption(enclosure))}</option>`)
           .join("");
         const savedChassisViewOptions = storageViews
@@ -7643,7 +7937,7 @@
       } else if (!enclosureSelect.value && enclosureSelect.options.length) {
         enclosureSelect.selectedIndex = 0;
       }
-      enclosureSelect.disabled = state.snapshotMode || (enclosures.length + storageViews.length) <= 1;
+      enclosureSelect.disabled = (state.snapshotMode && !snapshotNavigationAvailable) || (visibleEnclosures.length + storageViews.length) <= 1;
     }
   }
 
@@ -8220,6 +8514,19 @@
         ensureHeatmapData();
         return;
       }
+      if (state.snapshotMode) {
+        state.selectedStorageViewRuntimeId = "";
+        const selectedEnclosureId = rawValue.startsWith("enclosure:")
+          ? rawValue.slice("enclosure:".length)
+          : (rawValue || state.snapshot.selected_enclosure_id || null);
+        if (selectedEnclosureId && !applyPreloadedSnapshotForEnclosureId(selectedEnclosureId)) {
+          state.selectedEnclosureId = selectedEnclosureId;
+        }
+        renderAll();
+        syncLocation();
+        ensureHeatmapData();
+        return;
+      }
       state.selectedStorageViewRuntimeId = "";
       state.selectedEnclosureId = rawValue.startsWith("enclosure:") ? rawValue.slice("enclosure:".length) : (rawValue || null);
       state.storageViewsRuntimeLoading = true;
@@ -8320,6 +8627,70 @@
         syncSnapshotExportDialog();
         void refreshSnapshotExportEstimate();
       }
+    });
+  }
+  if (exportIncludeEnclosuresToggle) {
+    exportIncludeEnclosuresToggle.addEventListener("change", (event) => {
+      state.export.includeLiveEnclosures = Boolean(event.target.checked);
+      if (state.export.includeLiveEnclosures && selectedExportEnclosureIds().length <= 1) {
+        state.export.selectedEnclosureIds = exportableLiveEnclosures().map((enclosure) => enclosure.id).filter(Boolean);
+      }
+      state.export.estimate.data = null;
+      syncSnapshotExportDialog();
+      void refreshSnapshotExportEstimate();
+    });
+  }
+  if (exportEnclosureSelection) {
+    exportEnclosureSelection.addEventListener("change", (event) => {
+      const input = event.target.closest("[data-export-enclosure-id]");
+      if (!input) {
+        return;
+      }
+      const enclosureId = input.dataset.exportEnclosureId || "";
+      const selectedIds = new Set(selectedExportEnclosureIds());
+      if (input.checked) {
+        selectedIds.add(enclosureId);
+      } else {
+        selectedIds.delete(enclosureId);
+      }
+      const currentId = currentLiveEnclosureId();
+      if (currentId) {
+        selectedIds.add(currentId);
+      }
+      state.export.selectedEnclosureIds = [...selectedIds];
+      state.export.includeLiveEnclosures = state.export.selectedEnclosureIds.length > 1;
+      state.export.estimate.data = null;
+      syncSnapshotExportDialog();
+      void refreshSnapshotExportEstimate();
+    });
+  }
+  if (exportIncludeViewsToggle) {
+    exportIncludeViewsToggle.addEventListener("change", (event) => {
+      state.export.includeStorageViews = Boolean(event.target.checked);
+      if (state.export.includeStorageViews && !state.export.selectedStorageViewIds.length) {
+        state.export.selectedStorageViewIds = exportableStorageViews().map((view) => view.id).filter(Boolean);
+      }
+      syncSnapshotExportDialog();
+      void refreshSnapshotExportEstimate();
+    });
+  }
+  if (exportViewSelection) {
+    exportViewSelection.addEventListener("change", (event) => {
+      const input = event.target.closest("[data-export-storage-view-id]");
+      if (!input) {
+        return;
+      }
+      const viewId = input.dataset.exportStorageViewId || "";
+      const selectedIds = new Set(selectedExportStorageViewIds());
+      if (input.checked) {
+        selectedIds.add(viewId);
+      } else {
+        selectedIds.delete(viewId);
+      }
+      state.export.selectedStorageViewIds = [...selectedIds];
+      state.export.includeStorageViews = state.export.selectedStorageViewIds.length > 0;
+      syncSnapshotExportDialog();
+      void refreshSnapshotExportEstimate();
     });
   }
   if (exportSnapshotDialog) {
@@ -8501,15 +8872,13 @@
     heatmapScrubSlider.addEventListener("input", () => {
       const nextIndex = Number(heatmapScrubSlider.value);
       state.heatmap.playbackIndex = Number.isInteger(nextIndex) ? nextIndex : null;
-      renderGrid();
-      renderHeatmapControls();
+      scheduleHeatmapTileOverlayRefresh();
     });
   }
   if (heatmapScaleSlider) {
     heatmapScaleSlider.addEventListener("input", () => {
       state.heatmap.sensitivity = normalizeHeatmapScaleSensitivity(heatmapScaleSlider.value);
-      renderGrid();
-      renderHeatmapControls();
+      scheduleHeatmapTileOverlayRefresh();
     });
   }
   if (historyCloseButton) {

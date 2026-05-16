@@ -329,6 +329,22 @@ class SnapshotExportRequest(BaseModel):
     redact_sensitive: bool = False
     packaging: Literal["auto", "html", "zip"] = "auto"
     allow_oversize: bool = False
+    include_live_enclosures: bool = False
+    enclosure_ids: list[str] = Field(default_factory=list)
+    include_storage_views: bool = False
+    storage_view_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("enclosure_ids", "storage_view_ids")
+    @classmethod
+    def sanitize_scope_ids(cls, value: list[str]) -> list[str]:
+        cleaned_items: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            cleaned = trim_optional_text(str(item), max_length=256)
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                cleaned_items.append(cleaned)
+        return cleaned_items
 
 
 class SystemBackupExportRequest(BaseModel):

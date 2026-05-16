@@ -68,7 +68,13 @@
       </p>
       <div class="snapshot-banner-facts">
         <span class="snapshot-banner-fact">App v{{ snapshot_export_meta.app_version or "unknown" }}</span>
-        <span class="snapshot-banner-fact">{{ snapshot.layout_slot_count or (snapshot.slots | length) }} visible bays</span>
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.visible_bay_count or snapshot.layout_slot_count or (snapshot.slots | length) }} visible bays</span>
+        {% if snapshot_export_meta.enclosure_count and snapshot_export_meta.enclosure_count > 1 %}
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.enclosure_count }} live enclosures</span>
+        {% endif %}
+        {% if snapshot_export_meta.storage_view_count %}
+        <span class="snapshot-banner-fact">{{ snapshot_export_meta.storage_view_count }} saved/virtual views</span>
+        {% endif %}
         <span class="snapshot-banner-fact">{{ snapshot_export_meta.metric_sample_count or 0 }} metric samples</span>
         <span class="snapshot-banner-fact">{{ snapshot_export_meta.smart_summary_count or 0 }} SMART summaries</span>
         <span class="snapshot-banner-fact">{{ snapshot_export_meta.event_count or 0 }} events</span>
@@ -159,6 +165,18 @@
           <input id="export-allow-oversize-toggle" type="checkbox">
           <span>Allow oversize export</span>
         </label>
+      </div>
+      <div class="snapshot-export-scope">
+        <label class="toggle snapshot-export-toggle">
+          <input id="export-include-enclosures-toggle" type="checkbox">
+          <span>Include whole-system live enclosures</span>
+        </label>
+        <div id="export-enclosure-selection" class="snapshot-export-view-selection hidden"></div>
+        <label class="toggle snapshot-export-toggle">
+          <input id="export-include-views-toggle" type="checkbox">
+          <span>Include saved and virtual views</span>
+        </label>
+        <div id="export-view-selection" class="snapshot-export-view-selection hidden"></div>
       </div>
       <p id="export-snapshot-note" class="subtle snapshot-export-note">
         Default target stays under about 24 MiB. Auto will prefer HTML, then fall back to ZIP if needed.
@@ -562,6 +580,9 @@
     snapshotExportMeta: {{ snapshot_export_meta_json | safe }},
     preloadedHistoryBySlot: {{ preloaded_history_json | safe }},
     preloadedSmartSummariesBySlot: {{ preloaded_smart_summary_json | safe }},
+    preloadedSnapshotsByEnclosure: {{ preloaded_snapshots_json | safe }},
+    preloadedSnapshotSmartSummaries: {{ preloaded_snapshot_smart_summary_json | safe }},
+    preloadedStorageViewSmartSummaries: {{ preloaded_storage_view_smart_summary_json | safe }},
     preloadedHistorySummary: {{ preloaded_history_summary_json | safe }},
     initialSelectedSlot: {{ initial_selected_slot_json | safe }},
     initialHistoryTimeframeHours: {{ initial_history_timeframe_hours_json | safe }},

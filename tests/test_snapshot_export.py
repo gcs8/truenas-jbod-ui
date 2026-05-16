@@ -15,6 +15,9 @@ from app.models.domain import (
     SlotState,
     SlotView,
     SourceStatus,
+    StorageViewRuntimePayload,
+    StorageViewRuntimeSlot,
+    StorageViewRuntimeView,
     SystemOption,
 )
 from app.services.snapshot_export import (
@@ -334,6 +337,77 @@ def build_smart_summary_cache() -> dict[str, dict[str, object]]:
     }
 
 
+def build_storage_view_runtime() -> StorageViewRuntimePayload:
+    return StorageViewRuntimePayload(
+        system_id="archive-core",
+        system_label="Archive CORE",
+        views=[
+            StorageViewRuntimeView(
+                id="boot-doms",
+                label="Boot SATADOMs",
+                kind="boot_devices",
+                template_id="boot-devices-2",
+                template_label="Boot Devices",
+                slot_layout=[[0, 1]],
+                source="inventory_binding",
+                backing_enclosure_id="front",
+                backing_enclosure_label="Front Shelf",
+                matched_count=1,
+                slot_count=2,
+                slots=[
+                    StorageViewRuntimeSlot(
+                        slot_index=0,
+                        slot_label="Boot A",
+                        target_system_id="archive-core",
+                        target_system_label="Archive CORE",
+                        occupied=True,
+                        state="matched",
+                        source="inventory_candidate",
+                        match_reasons=["serial"],
+                        placement_key="boot bay a",
+                        assignment_rank=1,
+                        device_name="ada0",
+                        smart_device_names=["/dev/ada0"],
+                        serial="SATADOM123456",
+                        pool_name="freenas-boot",
+                        model="SATADOM",
+                        size_human="64 GB",
+                        gptid="gptid/boot-a",
+                        persistent_id_label="GPTID",
+                        temperature_c=41,
+                    ),
+                    StorageViewRuntimeSlot(
+                        slot_index=1,
+                        slot_label="Boot B",
+                        occupied=False,
+                        state="empty",
+                        source="placeholder",
+                        assignment_rank=2,
+                    ),
+                ],
+            )
+        ],
+    )
+
+
+def build_storage_view_smart_summary_cache() -> dict[str, dict[str, dict[str, object]]]:
+    return {
+        "boot-doms": {
+            "0": {
+                "available": True,
+                "temperature_c": 41,
+                "power_on_hours": 12800,
+                "logical_unit_id": "5000c500boot1234",
+                "sas_address": "5000c500boot1235",
+                "bytes_read": 8_000_000_000_000,
+                "bytes_written": 2_000_000_000_000,
+                "annualized_bytes_read": 600_000_000_000,
+                "annualized_bytes_written": 150_000_000_000,
+            }
+        }
+    }
+
+
 def build_snapshot() -> InventorySnapshot:
     return InventorySnapshot(
         slots=[
@@ -379,6 +453,82 @@ def build_snapshot() -> InventorySnapshot:
         ),
         warnings=["SSH timed out for 192.168.1.174 on Archive CORE."],
     )
+
+
+def build_snapshot_with_rear_option() -> InventorySnapshot:
+    snapshot = build_snapshot().model_copy(deep=True)
+    snapshot.enclosures = [
+        EnclosureOption(id="front", label="Front Shelf", rows=1, columns=1, slot_count=1, slot_layout=[[0]]),
+        EnclosureOption(id="rear", label="Rear Shelf", rows=1, columns=1, slot_count=1, slot_layout=[[0]]),
+    ]
+    snapshot.summary.enclosure_count = 2
+    return snapshot
+
+
+def build_rear_snapshot() -> InventorySnapshot:
+    return InventorySnapshot(
+        slots=[
+            SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="rear",
+                enclosure_label="Rear Shelf",
+                present=True,
+                state=SlotState.healthy,
+                device_name="da24",
+                serial="REAR123456",
+                model="Rear Disk Model",
+                size_human="2 TB",
+                pool_name="rear-tank",
+                vdev_name="mirror-1",
+                health="ONLINE",
+            )
+        ],
+        layout_rows=[[0]],
+        layout_slot_count=1,
+        layout_columns=1,
+        refresh_interval_seconds=30,
+        selected_system_id="archive-core",
+        selected_system_label="Archive CORE",
+        selected_enclosure_id="rear",
+        selected_enclosure_label="Rear Shelf",
+        systems=[SystemOption(id="archive-core", label="Archive CORE", platform="core")],
+        enclosures=[
+            EnclosureOption(id="front", label="Front Shelf", rows=1, columns=1, slot_count=1, slot_layout=[[0]]),
+            EnclosureOption(id="rear", label="Rear Shelf", rows=1, columns=1, slot_count=1, slot_layout=[[0]]),
+        ],
+        sources={
+            "api": SourceStatus(enabled=True, ok=True, message="API healthy on Archive CORE"),
+            "ssh": SourceStatus(enabled=False, ok=True, message="SSH disabled for 192.168.1.175"),
+        },
+        summary=InventorySummary(
+            disk_count=1,
+            pool_count=1,
+            enclosure_count=2,
+            mapped_slot_count=1,
+            manual_mapping_count=0,
+            ssh_slot_hint_count=0,
+        ),
+        warnings=["SSH timed out for 192.168.1.175 on Archive CORE rear shelf."],
+    )
+
+
+def build_rear_smart_summary_cache() -> dict[str, dict[str, object]]:
+    return {
+        "0": {
+            "available": True,
+            "temperature_c": 34,
+            "power_on_hours": 21000,
+            "logical_unit_id": "5000c500rear1224",
+            "sas_address": "5000c500rear1225",
+            "bytes_read": 4_000_000_000_000,
+            "bytes_written": 1_000_000_000_000,
+            "annualized_bytes_read": 300_000_000_000,
+            "annualized_bytes_written": 90_000_000_000,
+        }
+    }
 
 
 def build_request() -> Request:
@@ -446,6 +596,8 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rendered.export_meta["event_count"], 0)
         self.assertNotIn('src="/static/app.js"', rendered.html)
         self.assertNotIn('href="/static/style.css"', rendered.html)
+        self.assertNotIn("/static/images/hyper-m2-gen3-card.png", rendered.html)
+        self.assertIn("data:image/png;base64", rendered.html)
         self.assertNotIn("Export Snapshot", rendered.html)
 
     async def test_service_redacts_sensitive_values_with_stable_aliases(self) -> None:
@@ -749,6 +901,196 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(estimate["ok"])
         self.assertEqual(estimate["metric_sample_count"], 0)
         self.assertEqual(estimate["event_count"], 0)
+
+    async def test_service_embeds_storage_view_runtime_smart_and_history(self) -> None:
+        snapshot = build_snapshot()
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            storage_view_runtime=build_storage_view_runtime(),
+            storage_view_smart_summary_cache=build_storage_view_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            history_panel_open=True,
+            io_chart_mode="total",
+        )
+
+        self.assertIn("Boot SATADOMs", rendered.html)
+        self.assertIn("preloadedStorageViewSmartSummaries", rendered.html)
+        self.assertIn("SATADOM123456", rendered.html)
+        self.assertIn("5000c500boot1234", rendered.html)
+        self.assertEqual(rendered.export_meta["storage_view_count"], 1)
+        self.assertEqual(rendered.export_meta["smart_summary_count"], 2)
+        self.assertGreaterEqual(rendered.export_meta["metric_sample_count"], 4)
+        self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
+        self.assertTrue(rendered.history_cache["archive-core|storage-view:boot-doms|0"]["available"])
+
+    async def test_service_embeds_live_enclosure_snapshots_smart_and_history(self) -> None:
+        snapshot = build_snapshot_with_rear_option()
+        rear_snapshot = build_rear_snapshot()
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            live_enclosure_snapshots={
+                "front": snapshot,
+                "rear": rear_snapshot,
+            },
+            live_enclosure_smart_summary_cache={
+                "front": build_smart_summary_cache(),
+                "rear": build_rear_smart_summary_cache(),
+            },
+            storage_view_runtime=build_storage_view_runtime(),
+            storage_view_smart_summary_cache=build_storage_view_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            history_panel_open=True,
+            io_chart_mode="total",
+        )
+
+        self.assertIn("preloadedSnapshotsByEnclosure", rendered.html)
+        self.assertIn("preloadedSnapshotSmartSummaries", rendered.html)
+        self.assertIn("Rear Shelf", rendered.html)
+        self.assertIn("REAR123456", rendered.html)
+        self.assertEqual(rendered.export_meta["scope_kind"], "system")
+        self.assertEqual(rendered.export_meta["enclosure_count"], 2)
+        self.assertEqual(rendered.export_meta["storage_view_count"], 1)
+        self.assertEqual(rendered.export_meta["visible_bay_count"], 2)
+        self.assertEqual(rendered.export_meta["smart_summary_count"], 3)
+        self.assertGreaterEqual(rendered.export_meta["metric_sample_count"], 6)
+        self.assertIn("archive-core|front|0", rendered.history_cache)
+        self.assertIn("archive-core|rear|0", rendered.history_cache)
+        self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
+
+    async def test_storage_view_export_redaction_covers_view_payloads(self) -> None:
+        snapshot = build_snapshot()
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            storage_view_runtime=build_storage_view_runtime(),
+            storage_view_smart_summary_cache=build_storage_view_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            history_panel_open=True,
+            io_chart_mode="total",
+            redact_sensitive=True,
+        )
+
+        self.assertEqual(rendered.export_meta["redaction"], "partial")
+        self.assertIn("Boot SATADOMs", rendered.html)
+        self.assertIn("...3456", rendered.html)
+        self.assertNotIn("SATADOM123456", rendered.html)
+        self.assertNotIn("5000c500boot1234", rendered.html)
+        self.assertNotIn("Archive CORE", rendered.html)
+        self.assertIn("host-01", rendered.html)
+        self.assertEqual(rendered.export_meta["storage_view_count"], 1)
+
+    async def test_live_enclosure_export_redaction_covers_extra_snapshots(self) -> None:
+        snapshot = build_snapshot_with_rear_option()
+        rear_snapshot = build_rear_snapshot()
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            live_enclosure_snapshots={
+                "front": snapshot,
+                "rear": rear_snapshot,
+            },
+            live_enclosure_smart_summary_cache={
+                "front": build_smart_summary_cache(),
+                "rear": build_rear_smart_summary_cache(),
+            },
+            selected_slot=0,
+            history_window_hours=24,
+            history_panel_open=True,
+            io_chart_mode="total",
+            redact_sensitive=True,
+        )
+
+        self.assertEqual(rendered.export_meta["redaction"], "partial")
+        self.assertEqual(rendered.export_meta["enclosure_count"], 2)
+        self.assertIn("enc-02", rendered.html)
+        self.assertNotIn("Rear Shelf", rendered.html)
+        self.assertNotIn("REAR123456", rendered.html)
+        self.assertNotIn("5000c500rear1224", rendered.html)
+        self.assertIn("host-01|enc-02|0", rendered.history_cache)
+
+    async def test_dense_storage_view_history_is_downsampled_with_live_history(self) -> None:
+        snapshot = build_snapshot()
+        exporter = SnapshotExportService(
+            Settings(),
+            DenseHistoryBackend(),
+            templates,
+            size_limit_bytes=1024,
+        )
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            storage_view_runtime=build_storage_view_runtime(),
+            storage_view_smart_summary_cache=build_storage_view_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            history_panel_open=True,
+            io_chart_mode="average",
+        )
+
+        self.assertEqual(rendered.export_meta["storage_view_count"], 1)
+        self.assertNotEqual(rendered.export_meta["downsampling_label"], "None")
+        self.assertIn("rollups", rendered.export_meta["downsampling_note"])
+        self.assertLess(rendered.export_meta["metric_sample_count"], 288 * 5 * 2)
+        self.assertLess(rendered.export_meta["event_count"], 80 * 2)
+        self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
+
+    async def test_dense_live_enclosure_history_is_downsampled_with_storage_views(self) -> None:
+        snapshot = build_snapshot_with_rear_option()
+        rear_snapshot = build_rear_snapshot()
+        exporter = SnapshotExportService(
+            Settings(),
+            DenseHistoryBackend(),
+            templates,
+            size_limit_bytes=1024,
+        )
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            live_enclosure_snapshots={
+                "front": snapshot,
+                "rear": rear_snapshot,
+            },
+            live_enclosure_smart_summary_cache={
+                "front": build_smart_summary_cache(),
+                "rear": build_rear_smart_summary_cache(),
+            },
+            storage_view_runtime=build_storage_view_runtime(),
+            storage_view_smart_summary_cache=build_storage_view_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            history_panel_open=True,
+            io_chart_mode="average",
+        )
+
+        self.assertEqual(rendered.export_meta["enclosure_count"], 2)
+        self.assertEqual(rendered.export_meta["storage_view_count"], 1)
+        self.assertNotEqual(rendered.export_meta["downsampling_label"], "None")
+        self.assertIn("rollups", rendered.export_meta["downsampling_note"])
+        self.assertLess(rendered.export_meta["metric_sample_count"], 288 * 5 * 3)
+        self.assertLess(rendered.export_meta["event_count"], 80 * 3)
+        self.assertIn("archive-core|rear|0", rendered.history_cache)
+        self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
 
 
 if __name__ == "__main__":

@@ -2,8 +2,12 @@
 
 Date: `2026-05-15`
 
-Status: planning only. This pass does not add a GitHub Pages workflow, change
-runtime code, or cut a `0.18.1` release.
+Status: implementation foundation in progress for `0.19.0-dev`.
+
+Current code adds a deterministic, live-derived TN Core / Supermicro CSE-946
+public demo artifact at `public-demo/index.html`, plus tests proving the
+artifact is stable, scrubbed, and explorable without a live backend. This does
+not yet add a GitHub Pages publish workflow or cut a release.
 
 Public-facing wiki context:
 
@@ -49,13 +53,31 @@ scrubbed demo fixtures.
 ### Phase 1 - Static Sample Demo
 
 - add a committed `site/` or generated `public-demo/` artifact source
-- generate or hand-curate sanitized demo payloads with fake hostnames, serials,
-  pool names, and disk identifiers
+  - current: `scripts/build_public_demo.py` generates `public-demo/index.html`
+- generate a sanitized demo payload from the TN Core source data with fake
+  hostnames and scrambled critical disk identifiers
+  - current: `app.services.public_demo_fixture` builds a live-derived TN Core
+    60-bay top-loader sample with real make/model/capacity texture, saved
+    storage views, SMART summaries, and real history samples
+  - current: the pool topology follows the validated CORE 60-bay vdev
+    membership pattern, including data `raidz2` groups, `spare-1`, `mirror-8`
+    special members, and matching empty bays
+  - current: the saved `4x NVMe Carrier Card` and `Boot SATADOMs` views are
+    included by their real configured view names
+  - current: the artifact opens with no bay selected and a 7-day real-history
+    window
+  - current: critical serial, SAS, NAA, and GPTID values are scrambled
+    consistently across live slots, SMART payloads, storage views, and history
 - reuse current browser-side rendering where practical
+  - current: the public artifact is rendered through the same offline snapshot
+    exporter used by normal `Export Snapshot`
 - disable or hide controls that need a live backend
+  - current: snapshot mode hides setup/export actions and disables live refresh
 - add Playwright coverage against the static artifact
+  - current: `qa/public-demo.spec.js`
 - publish through a GitHub Pages workflow only after the static artifact is
   deterministic and scrubbed
+  - remaining: add the Pages workflow after review of the generated artifact
 
 ### Phase 2 - Demo Mode In The App
 
@@ -93,20 +115,29 @@ usage limits:
 ## Acceptance Criteria For A First Shippable Demo
 
 - a Pages URL loads a static demo without Docker
+  - not yet: generated artifact exists locally; Pages workflow/URL remains
+    future work
 - at least one sample physical enclosure renders from scrubbed data
+  - current: the live-derived CSE-946-style 60-bay top-loader renders from
+    scrubbed fixture data
 - slot details, storage-view navigation, and heat-map mode work against sample
   data
+  - current: covered by `qa/public-demo.spec.js`
 - all live-only actions are disabled or absent
+  - current: covered by `qa/public-demo.spec.js`
 - no browser console errors in the static demo smoke test
+  - current: covered by `qa/public-demo.spec.js`
 - a README/wiki link explains the boundary between demo, offline snapshot,
   full backup, and the real Docker deployment
+  - current: docs and wiki pages describe the boundary; publish/update still
+    needed when the Pages workflow lands
 
 ## Open Decisions
 
-- whether the first sample should be a small synthetic lab or a full
-  60-bay-style anonymized fixture
-- whether the static site should be generated from the FastAPI templates or use
-  a dedicated static shell
+- whether to add a second public sample later, or keep the TN Core 60-bay
+  sample as the main demo
+- whether to keep the static site as one generated offline snapshot artifact
+  long-term or add a small index shell after Pages publication
 - whether local fixture import belongs in the first version or should wait
   until the static sample proves useful
 - whether to publish from `main` plus GitHub Actions or keep a dedicated

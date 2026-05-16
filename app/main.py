@@ -185,6 +185,148 @@ async def _load_snapshot_export_source(
     return snapshot, smart_summary_cache
 
 
+def _filter_storage_view_runtime(
+    runtime: StorageViewRuntimePayload,
+    selected_view_ids: list[str],
+) -> StorageViewRuntimePayload:
+    selected_ids = {view_id for view_id in selected_view_ids if view_id}
+    views = [
+        view
+        for view in runtime.views
+        if view.enabled is not False
+        and view.render.show_in_main_ui is not False
+        and (not selected_ids or view.id in selected_ids)
+    ]
+    return StorageViewRuntimePayload(
+        system_id=runtime.system_id,
+        system_label=runtime.system_label,
+        views=views,
+    )
+
+
+async def _load_storage_view_export_source(
+    *,
+    service: Any,
+    payload: SnapshotExportRequest,
+    snapshot: InventorySnapshot,
+    enclosure_id: str | None,
+) -> tuple[StorageViewRuntimePayload | None, dict[str, dict[str, dict[str, Any]]]]:
+    if not payload.include_storage_views:
+        return None, {}
+    runtime = await service.get_storage_view_runtime(
+        selected_enclosure_id=enclosure_id,
+        snapshot=snapshot,
+    )
+    filtered_runtime = _filter_storage_view_runtime(runtime, payload.storage_view_ids)
+    if not filtered_runtime.views:
+        return filtered_runtime, {}
+
+    smart_summary_cache: dict[str, dict[str, dict[str, Any]]] = {}
+    for view in filtered_runtime.views:
+        slot_cache: dict[str, dict[str, Any]] = {}
+        for runtime_slot in view.slots:
+            if not runtime_slot.occupied:
+                continue
+            try:
+                summary = await service.get_storage_view_slot_smart_summary(
+                    view.id,
+                    runtime_slot.slot_index,
+                    selected_enclosure_id=enclosure_id,
+                    allow_stale_cache=True,
+                )
+            except TrueNASAPIError as exc:
+                slot_cache[str(runtime_slot.slot_index)] = {
+                    "available": False,
+                    "message": str(exc),
+                }
+                continue
+            slot_cache[str(runtime_slot.slot_index)] = summary.model_dump(mode="json")
+        smart_summary_cache[view.id] = slot_cache
+    return filtered_runtime, smart_summary_cache
+
+
+def _selected_snapshot_export_enclosure_ids(
+    *,
+    payload: SnapshotExportRequest,
+    snapshot: InventorySnapshot,
+    current_enclosure_id: str | None,
+) -> list[str]:
+    primary_enclosure_id = snapshot.selected_enclosure_id or current_enclosure_id
+    available_ids: list[str] = []
+    seen_available: set[str] = set()
+    for enclosure in snapshot.enclosures:
+        if enclosure.id and enclosure.id not in seen_available:
+            seen_available.add(enclosure.id)
+            available_ids.append(enclosure.id)
+
+    requested_ids = payload.enclosure_ids or available_ids
+    selected_ids: list[str] = []
+    seen_selected: set[str] = set()
+    if primary_enclosure_id:
+        selected_ids.append(primary_enclosure_id)
+        seen_selected.add(primary_enclosure_id)
+    if not payload.include_live_enclosures:
+        return selected_ids
+
+    for enclosure_id in requested_ids:
+        if enclosure_id not in seen_available or enclosure_id in seen_selected:
+            continue
+        seen_selected.add(enclosure_id)
+        selected_ids.append(enclosure_id)
+    return selected_ids
+
+
+async def _load_live_enclosure_export_sources(
+    *,
+    service: Any,
+    payload: SnapshotExportRequest,
+    snapshot: InventorySnapshot,
+    smart_summary_cache: dict[str, dict[str, Any]],
+    enclosure_id: str | None,
+    stage_prefix: str,
+    settings: Settings,
+) -> tuple[dict[str, InventorySnapshot] | None, dict[str, dict[str, dict[str, Any]]] | None]:
+    selected_enclosure_ids = _selected_snapshot_export_enclosure_ids(
+        payload=payload,
+        snapshot=snapshot,
+        current_enclosure_id=enclosure_id,
+    )
+    if not payload.include_live_enclosures or len(selected_enclosure_ids) <= 1:
+        return None, None
+
+    snapshots_by_enclosure: dict[str, InventorySnapshot] = {}
+    smart_summaries_by_enclosure: dict[str, dict[str, dict[str, Any]]] = {}
+    primary_enclosure_id = snapshot.selected_enclosure_id or enclosure_id
+    if primary_enclosure_id:
+        snapshots_by_enclosure[primary_enclosure_id] = snapshot
+        smart_summaries_by_enclosure[primary_enclosure_id] = {
+            str(slot_number): summary
+            for slot_number, summary in smart_summary_cache.items()
+        }
+
+    for selected_enclosure_id in selected_enclosure_ids:
+        if selected_enclosure_id in snapshots_by_enclosure:
+            continue
+        next_snapshot, next_smart_summary_cache = await _load_snapshot_export_source(
+            service=service,
+            payload=payload,
+            enclosure_id=selected_enclosure_id,
+            stage_prefix=stage_prefix,
+            settings=settings,
+        )
+        resolved_enclosure_id = next_snapshot.selected_enclosure_id or selected_enclosure_id
+        if not resolved_enclosure_id:
+            continue
+        snapshots_by_enclosure[resolved_enclosure_id] = next_snapshot
+        smart_summaries_by_enclosure[resolved_enclosure_id] = {
+            str(slot_number): summary
+            for slot_number, summary in next_smart_summary_cache.items()
+        }
+
+    add_perf_metadata(snapshot_export_live_enclosure_count=len(snapshots_by_enclosure))
+    return snapshots_by_enclosure, smart_summaries_by_enclosure
+
+
 def _clear_snapshot_export_source_cache_for_tests() -> None:
     SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
 
@@ -706,6 +848,21 @@ def create_app() -> FastAPI:
             stage_prefix="route.export_snapshot",
             settings=settings,
         )
+        storage_view_runtime, storage_view_smart_summary_cache = await _load_storage_view_export_source(
+            service=service,
+            payload=payload,
+            snapshot=snapshot,
+            enclosure_id=enclosure_id,
+        )
+        live_enclosure_snapshots, live_enclosure_smart_summary_cache = await _load_live_enclosure_export_sources(
+            service=service,
+            payload=payload,
+            snapshot=snapshot,
+            smart_summary_cache=smart_summary_cache,
+            enclosure_id=enclosure_id,
+            stage_prefix="route.export_snapshot",
+            settings=settings,
+        )
         exporter = get_snapshot_export_service()
         try:
             with perf_stage("route.export_snapshot.build_artifact"):
@@ -713,6 +870,10 @@ def create_app() -> FastAPI:
                     request=request,
                     snapshot=snapshot,
                     smart_summary_cache=smart_summary_cache,
+                    live_enclosure_snapshots=live_enclosure_snapshots,
+                    live_enclosure_smart_summary_cache=live_enclosure_smart_summary_cache,
+                    storage_view_runtime=storage_view_runtime,
+                    storage_view_smart_summary_cache=storage_view_smart_summary_cache,
                     selected_slot=payload.selected_slot,
                     history_window_hours=payload.history_window_hours,
                     history_panel_open=payload.history_panel_open,
@@ -754,12 +915,31 @@ def create_app() -> FastAPI:
             stage_prefix="route.export_snapshot_estimate",
             settings=settings,
         )
+        storage_view_runtime, storage_view_smart_summary_cache = await _load_storage_view_export_source(
+            service=service,
+            payload=payload,
+            snapshot=snapshot,
+            enclosure_id=enclosure_id,
+        )
+        live_enclosure_snapshots, live_enclosure_smart_summary_cache = await _load_live_enclosure_export_sources(
+            service=service,
+            payload=payload,
+            snapshot=snapshot,
+            smart_summary_cache=smart_summary_cache,
+            enclosure_id=enclosure_id,
+            stage_prefix="route.export_snapshot_estimate",
+            settings=settings,
+        )
         exporter = get_snapshot_export_service()
         with perf_stage("route.export_snapshot_estimate.build_estimate"):
             estimate = await exporter.estimate_enclosure_snapshot_export(
                 request=request,
                 snapshot=snapshot,
                 smart_summary_cache=smart_summary_cache,
+                live_enclosure_snapshots=live_enclosure_snapshots,
+                live_enclosure_smart_summary_cache=live_enclosure_smart_summary_cache,
+                storage_view_runtime=storage_view_runtime,
+                storage_view_smart_summary_cache=storage_view_smart_summary_cache,
                 selected_slot=payload.selected_slot,
                 history_window_hours=payload.history_window_hours,
                 history_panel_open=payload.history_panel_open,
@@ -837,6 +1017,9 @@ def build_index_context(
     snapshot_export_meta_json: str = "null",
     preloaded_history_json: str = "{}",
     preloaded_smart_summary_json: str = "{}",
+    preloaded_snapshots_json: str = "{}",
+    preloaded_snapshot_smart_summary_json: str = "{}",
+    preloaded_storage_view_smart_summary_json: str = "{}",
     preloaded_history_summary_json: str = "{\"counts\": {}, \"collector\": {}}",
     initial_selected_slot_json: str = "null",
     initial_history_timeframe_hours_json: str = "24",
@@ -858,6 +1041,9 @@ def build_index_context(
         "snapshot_export_meta_json": snapshot_export_meta_json,
         "preloaded_history_json": preloaded_history_json,
         "preloaded_smart_summary_json": preloaded_smart_summary_json,
+        "preloaded_snapshots_json": preloaded_snapshots_json,
+        "preloaded_snapshot_smart_summary_json": preloaded_snapshot_smart_summary_json,
+        "preloaded_storage_view_smart_summary_json": preloaded_storage_view_smart_summary_json,
         "preloaded_history_summary_json": preloaded_history_summary_json,
         "initial_selected_slot_json": initial_selected_slot_json,
         "initial_history_timeframe_hours_json": initial_history_timeframe_hours_json,

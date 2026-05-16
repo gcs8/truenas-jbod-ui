@@ -262,7 +262,7 @@ textarea {
 }
 
 .snapshot-export-dialog {
-  width: min(560px, calc(100vw - 32px));
+  width: min(680px, calc(100vw - 32px));
   padding: 0;
   border: 1px solid var(--panel-border);
   border-radius: 18px;
@@ -295,6 +295,40 @@ textarea {
   border-radius: 14px;
   border: 1px solid var(--panel-border);
   background: var(--surface);
+}
+
+.snapshot-export-scope {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.snapshot-export-view-selection {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.snapshot-export-view-option {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  color: var(--text);
+  font-size: 0.88rem;
+  line-height: 1.35;
+}
+
+.snapshot-export-view-option input {
+  margin-top: 2px;
+}
+
+.snapshot-export-view-option small {
+  display: block;
+  color: var(--muted);
+  font-size: 0.76rem;
 }
 
 .snapshot-export-note {
@@ -1173,6 +1207,7 @@ textarea {
 }
 
 .chassis-shell[data-face-style="nvme-carrier"] .slot-grid {
+  width: 100%;
   max-width: 960px;
   margin: 0 auto;
   padding: 0;
@@ -2026,7 +2061,8 @@ textarea {
   text-shadow: none;
 }
 
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute {
   position: absolute;
   min-height: 0;
   height: auto;
@@ -2049,16 +2085,26 @@ textarea {
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-device,
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-pool,
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-tertiary,
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-latch {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-latch,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute::before,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute::after,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute .slot-number,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute .slot-device,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute .slot-pool,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute .slot-tertiary,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute .slot-latch {
   display: none;
 }
 
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute:hover,
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.selected {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.selected,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute:hover,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.selected {
   transform: none;
 }
 
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute:hover .storage-view-runtime-card--nvme {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute:hover .storage-view-runtime-card--nvme,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute:hover .storage-view-runtime-card--nvme {
   transform: translateY(-2px);
   box-shadow:
     inset 0 0 0 1px rgba(7, 18, 30, 0.34),
@@ -2067,11 +2113,14 @@ textarea {
 }
 
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.selected::after,
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-highlight::after {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-highlight::after,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.selected::after,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.peer-highlight::after {
   display: none;
 }
 
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.selected .storage-view-runtime-card--nvme {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.selected .storage-view-runtime-card--nvme,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.selected .storage-view-runtime-card--nvme {
   border-color: rgba(91, 183, 255, 0.78);
   box-shadow:
     0 0 0 2px rgba(91, 183, 255, 0.38),
@@ -2079,7 +2128,8 @@ textarea {
     inset 0 0 0 1px rgba(7, 18, 30, 0.34);
 }
 
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-highlight .storage-view-runtime-card--nvme {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-highlight .storage-view-runtime-card--nvme,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.peer-highlight .storage-view-runtime-card--nvme {
   border-color: rgba(76, 216, 164, 0.5);
   box-shadow:
     0 0 0 1px rgba(76, 216, 164, 0.22),
@@ -2087,20 +2137,24 @@ textarea {
     inset 0 0 0 1px rgba(7, 18, 30, 0.34);
 }
 
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-dimmed {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-dimmed,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.peer-dimmed {
   filter: none;
 }
 
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-dimmed .storage-view-runtime-card--nvme {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-dimmed .storage-view-runtime-card--nvme,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.peer-dimmed .storage-view-runtime-card--nvme {
   filter: saturate(0.42) brightness(0.76);
   opacity: 0.52;
 }
 
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.filtered-out {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.filtered-out,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.filtered-out {
   opacity: 0.16;
 }
 
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-status-led {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-status-led,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute .slot-status-led {
   top: 8px;
   right: 10px;
   width: 9px;
@@ -2108,7 +2162,8 @@ textarea {
   box-shadow: 0 0 0 2px rgba(6, 16, 23, 0.86);
 }
 
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .storage-view-runtime-card--nvme {
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .storage-view-runtime-card--nvme,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute .storage-view-runtime-card--nvme {
   width: 100%;
 }
 
@@ -2548,6 +2603,7 @@ textarea {
 }
 
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.heatmap-active::before,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.heatmap-active::before,
 .chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.heatmap-active::before {
   content: "";
   display: block;
@@ -2566,6 +2622,7 @@ textarea {
 }
 
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.heatmap-missing::before,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.heatmap-missing::before,
 .chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.heatmap-missing::before {
   content: "";
   display: block;

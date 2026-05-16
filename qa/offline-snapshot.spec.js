@@ -158,6 +158,107 @@ asyncio.run(main())
   return outputPath;
 }
 
+function buildOfflineSnapshotWithViewsFixture() {
+  const repoRoot = path.resolve(__dirname, "..");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-offline-snapshot-views-"));
+  const outputPath = path.join(tempDir, "offline-views.html");
+  const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
+  const script = `
+import asyncio
+import importlib.util
+import pathlib
+import sys
+
+root = pathlib.Path.cwd()
+spec = importlib.util.spec_from_file_location("snapshot_export_fixtures", root / "tests" / "test_snapshot_export.py")
+module = importlib.util.module_from_spec(spec)
+assert spec is not None and spec.loader is not None
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+async def main():
+    snapshot = module.build_snapshot()
+    exporter = module.SnapshotExportService(module.Settings(), module.FakeHistoryBackend(), module.templates)
+    rendered = await exporter.build_enclosure_snapshot_html(
+        request=module.build_request(),
+        snapshot=snapshot,
+        smart_summary_cache=module.build_smart_summary_cache(),
+        storage_view_runtime=module.build_storage_view_runtime(),
+        storage_view_smart_summary_cache=module.build_storage_view_smart_summary_cache(),
+        selected_slot=0,
+        history_window_hours=24,
+        history_panel_open=True,
+        io_chart_mode="total",
+    )
+    pathlib.Path(sys.argv[1]).write_text(rendered.html, encoding="utf-8")
+
+asyncio.run(main())
+`;
+  const result = spawnSync(python, ["-c", script, outputPath], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(`Offline snapshot-with-views fixture generation failed:\n${result.stdout}\n${result.stderr}`);
+  }
+  return outputPath;
+}
+
+function buildOfflineSnapshotWithEnclosuresAndViewsFixture() {
+  const repoRoot = path.resolve(__dirname, "..");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-offline-snapshot-system-"));
+  const outputPath = path.join(tempDir, "offline-system.html");
+  const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
+  const script = `
+import asyncio
+import importlib.util
+import pathlib
+import sys
+
+root = pathlib.Path.cwd()
+spec = importlib.util.spec_from_file_location("snapshot_export_fixtures", root / "tests" / "test_snapshot_export.py")
+module = importlib.util.module_from_spec(spec)
+assert spec is not None and spec.loader is not None
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+async def main():
+    snapshot = module.build_snapshot_with_rear_option()
+    rear_snapshot = module.build_rear_snapshot()
+    exporter = module.SnapshotExportService(module.Settings(), module.FakeHistoryBackend(), module.templates)
+    rendered = await exporter.build_enclosure_snapshot_html(
+        request=module.build_request(),
+        snapshot=snapshot,
+        smart_summary_cache=module.build_smart_summary_cache(),
+        live_enclosure_snapshots={
+            "front": snapshot,
+            "rear": rear_snapshot,
+        },
+        live_enclosure_smart_summary_cache={
+            "front": module.build_smart_summary_cache(),
+            "rear": module.build_rear_smart_summary_cache(),
+        },
+        storage_view_runtime=module.build_storage_view_runtime(),
+        storage_view_smart_summary_cache=module.build_storage_view_smart_summary_cache(),
+        selected_slot=0,
+        history_window_hours=24,
+        history_panel_open=True,
+        io_chart_mode="total",
+    )
+    pathlib.Path(sys.argv[1]).write_text(rendered.html, encoding="utf-8")
+
+asyncio.run(main())
+`;
+  const result = spawnSync(python, ["-c", script, outputPath], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(`Offline whole-system snapshot fixture generation failed:\n${result.stdout}\n${result.stderr}`);
+  }
+  return outputPath;
+}
+
 test("offline snapshot renders preloaded slot history without a live backend", async ({ page }) => {
   const snapshotPath = buildOfflineSnapshotFixture();
 
@@ -186,4 +287,58 @@ test("offline top-loader snapshot keeps exported row geometry", async ({ page })
   await expect(page.locator('#slot-grid .slot-tile[data-slot="57"]')).toBeVisible();
   await expect(page.locator("#detail-history-panel")).toBeVisible();
   await expect(page.locator("#history-metric-grid")).toContainText("Temperature");
+});
+
+test("offline snapshot can navigate preloaded storage views without a live backend", async ({ page }) => {
+  const snapshotPath = buildOfflineSnapshotWithViewsFixture();
+  const consoleErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+
+  await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+
+  const selector = page.locator("#enclosure-select");
+  await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Offline Artifact");
+  await expect(selector).toBeEnabled();
+  await selector.selectOption("view:boot-doms");
+  await expect(page.locator("#enclosure-panel-title")).toContainText("Boot SATADOMs");
+  await page.locator('#slot-grid .slot-tile[data-slot="0"]').click();
+  await expect(page.locator("#detail-kv-grid")).toContainText("SATADOM");
+  await expect(page.locator("#detail-kv-grid")).toContainText("41 C");
+  await expect(page.locator("#history-toggle-button")).toBeVisible();
+  await page.locator("#history-toggle-button").click();
+  await expect(page.locator("#history-metric-grid")).toContainText("Temperature");
+  await page.locator("#heatmap-toggle-button").click();
+  await expect(page.locator("#slot-grid .slot-tile[data-slot=\"0\"] .slot-heatmap-value")).toBeVisible();
+  expect(consoleErrors).toEqual([]);
+});
+
+test("offline snapshot can navigate preloaded live enclosures without a live backend", async ({ page }) => {
+  const snapshotPath = buildOfflineSnapshotWithEnclosuresAndViewsFixture();
+  const consoleErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+
+  await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+
+  const selector = page.locator("#enclosure-select");
+  await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Offline Artifact");
+  await expect(page.locator(".snapshot-banner-facts")).toContainText("2 live enclosures");
+  await expect(selector).toBeEnabled();
+  await selector.selectOption("enclosure:rear");
+  await expect(page.locator("#enclosure-panel-title")).toContainText("Rear Shelf");
+  await page.locator('#slot-grid .slot-tile[data-slot="0"]').click();
+  await expect(page.locator("#detail-kv-grid")).toContainText("Rear Disk Model");
+  await expect(page.locator("#detail-kv-grid")).toContainText("34 C");
+  await expect(page.locator("#detail-history-panel")).toBeVisible();
+  await expect(page.locator("#history-metric-grid")).toContainText("Temperature");
+  await selector.selectOption("view:boot-doms");
+  await expect(page.locator("#enclosure-panel-title")).toContainText("Boot SATADOMs");
+  expect(consoleErrors).toEqual([]);
 });

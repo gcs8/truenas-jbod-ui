@@ -1,8 +1,9 @@
 # Public Demo Site
 
-This is the planning page for a future public, interactive demo.
+This page tracks the public, interactive demo.
 
-It is not live yet.
+A static demo artifact now exists in the source tree as `public-demo/index.html`.
+It is not published to GitHub Pages yet.
 
 For the broader comparison between public demo, local demo seed, offline
 snapshot, debug bundle, and full backup, see
@@ -31,7 +32,7 @@ The first useful demo should let someone explore the operator experience without
 owning the same hardware:
 
 - a static web page hosted from the project repository
-- one or more scrubbed sample systems
+- one or more scrubbed or live-derived sample systems
 - physical enclosure rendering
 - slot details
 - storage views
@@ -55,15 +56,43 @@ with sample data and a site-shaped entry point.
 - not a place for real serial numbers, hostnames, SSH keys, API keys, TLS trust
   bundles, or history databases
 
-## Possible First Version
+## Current Foundation
 
-1. Generate or hand-curate a synthetic demo fixture.
+The first `0.19.0-dev` foundation uses the existing offline snapshot exporter
+instead of a separate demo viewer.
+
+It includes:
+
+- `scripts/build_public_demo.py`
+- `public-demo/index.html`
+- live-derived `TN Core` data shaped like the Supermicro CSE-946 top-loader
+- one 60-bay live enclosure snapshot
+- saved/virtual `4x NVMe Carrier Card` and `Boot SATADOMs` storage views
+- CORE-shaped pool topology with data `raidz2` groups, `spare-1`, `mirror-8`
+  special members, and matching empty bays
+- scrubbed SMART summaries and a 7-day real-history window
+- no bay selected on first load, so visitors start from the whole enclosure
+- critical serial, SAS, NAA, and persistent IDs scrambled consistently across
+  the sample
+- snapshot-mode UI behavior, so setup/export actions are absent and live
+  refresh is disabled
+
+Local build/check commands:
+
+```powershell
+python scripts/build_public_demo.py --output public-demo/index.html
+python scripts/build_public_demo.py --output public-demo/index.html --check
+```
+
+## Possible First Published Version
+
+1. Generate or hand-curate a scrubbed demo fixture.
 2. Build a static page that loads that fixture in the browser.
 3. Reuse the normal enclosure, slot detail, storage-view, and heat-map
    interaction patterns where practical.
 4. Hide or disable live-only controls.
-5. Publish the static output with GitHub Pages after the fixture is scrubbed and
-   deterministic.
+5. Publish the static output with GitHub Pages after the generated artifact is
+   reviewed.
 
 Later, a local `Import demo snapshot` path could let people load a scrubbed
 demo fixture in browser memory. That should stay separate from admin full
@@ -71,11 +100,10 @@ backup restore, which is a real local-stack maintenance workflow.
 
 ## Tracking
 
-This is a `0.19.0-dev` follow-up candidate.
+This is now active `0.19.0-dev` work.
 
-A `0.18.1` patch would only make sense if we intentionally want a docs-only
-tracking release. The shipped `0.18.0` image does not need a runtime patch just
-because this planning page exists.
+The remaining publication step is a GitHub Pages workflow and link pass. The
+shipped `0.18.0` image does not need a runtime patch for this foundation.
 
 ## Related Pages
 

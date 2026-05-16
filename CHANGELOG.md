@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Added
+
+- offline snapshot export can now include selected saved/virtual storage views
+  and optional whole-system live enclosure snapshots in one self-contained
+  artifact, with redaction, SMART summaries, history, and adaptive
+  downsampling applied across the combined export
+- public demo generation now has a live-derived TN Core / Supermicro CSE-946
+  60-bay artifact built through the offline snapshot exporter, with critical
+  serial/SAS/NAA/GPTID values scrambled consistently while preserving the real
+  make/model/capacity texture, CORE vdev membership, empty bays, saved
+  `4x NVMe Carrier Card` and `Boot SATADOMs` views, a neutral no-bay-selected
+  start state, a 7-day real-history window, scrub checks, and a static
+  Playwright smoke test
+
+### Fixed
+
+- heat-map timeline scrubbing now updates existing slot overlays in place and
+  caches prepared sample timelines, avoiding full grid rebuilds on every scrub
+  tick in large 7-day offline/public-demo artifacts
+
 ## v0.18.0 - 2026-05-15
 
 ### Added
