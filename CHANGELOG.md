@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- next development slice starts here
+
 ## v0.19.0 - 2026-05-16
 
 ### Added
