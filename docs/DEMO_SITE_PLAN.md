@@ -2,7 +2,7 @@
 
 Date: `2026-05-15`
 
-Status: first static publication path in progress for `0.19.0-dev`.
+Status: first static publication path shipped in `v0.19.0`.
 
 Current code adds a deterministic, live-derived TN Core / Supermicro CSE-946
 public demo artifact at `public-demo/index.html`, plus tests proving the
@@ -22,8 +22,8 @@ Public-facing wiki context:
 
 ## Decision
 
-Track the public demo idea as a `0.19.0-dev` follow-up unless we deliberately
-decide that a docs-only patch release is useful for visibility.
+Track follow-up public-demo work after `v0.19.0` only when it materially
+improves the static sample or local demo/import workflow.
 
 GitHub Pages is a good fit for a static, client-side demo because it can host
 HTML, CSS, and JavaScript from the repository:

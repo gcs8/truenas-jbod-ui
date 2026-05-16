@@ -114,14 +114,12 @@ setup notes.
 
 ## Current Version
 
-`0.18.0` is the current stable release. Its headline feature is read-only
-[[Heat Map Mode|Heat-Map-Mode]], including history-backed timeline scrubbing
-for supported metrics.
+`0.19.0` is the current stable release. Its headline feature is the static
+[[Public Demo Site|Public-Demo-Site]] plus more robust offline snapshot export
+for saved views and whole-system enclosure captures.
 
-The active `0.19.0-dev` slice is the public demo: a static GitHub Pages sample
-data experience, not a hosted copy of the live Docker app. See
-[[Public Demo Site|Public-Demo-Site]] or open
-https://gcs8.github.io/truenas-jbod-ui/.
+The public demo is a static GitHub Pages sample data experience, not a hosted
+copy of the live Docker app. Open https://gcs8.github.io/truenas-jbod-ui/.
 
 For older release-by-release detail, use the project changelog and GitHub
 releases instead of treating the wiki home page as release notes.

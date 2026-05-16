@@ -63,7 +63,7 @@ with sample data and a site-shaped entry point.
 
 ## Current Foundation
 
-The first `0.19.0-dev` foundation uses the existing offline snapshot exporter
+The first `0.19.0` foundation uses the existing offline snapshot exporter
 instead of a separate demo viewer.
 
 It includes:
@@ -113,10 +113,11 @@ backup restore, which is a real local-stack maintenance workflow.
 
 ## Tracking
 
-This is now active `0.19.0-dev` work.
+This shipped in `v0.19.0`.
 
 The Pages publication workflow and public link are now in the source tree. The
-shipped `0.18.0` image does not need a runtime patch for this foundation.
+public demo does not need a Docker image or runtime patch because it is a
+static artifact.
 
 ## Related Pages
 

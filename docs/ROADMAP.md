@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.18.0`.
+This file tracks the current intended release direction after `v0.19.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -17,22 +17,20 @@ Detailed execution plans live here:
 
 ## Current Snapshot
 
-`v0.18.0` just shipped the first read-only heat-map release:
+`v0.19.0` just shipped the public demo and offline snapshot robustness release:
 
-- physical-bay heat overlays for live enclosures and saved storage views
-- temperature, activity, endurance, risk, and computed heat-map metrics
-- history-backed timeline scrubbing for supported heat-map metrics
-- bounded metric-only history reads for read/write rate views
-- standalone main-UI behavior when history/admin sidecars are stopped
+- selected saved/virtual storage views inside offline snapshot exports
+- optional whole-system live enclosure snapshots inside offline snapshot exports
+- a live-derived TN Core / Supermicro CSE-946 public demo artifact
+- GitHub Pages publication for the static `public-demo/` directory
+- faster heat-map timeline scrubbing in large offline/public-demo artifacts
 
 The next cycle should stay practical and public-facing:
 
-- keep the shipped `0.18.0` image stable unless a real runtime regression
+- keep the shipped `0.19.0` image stable unless a real runtime regression
   appears
-- use `0.19.0-dev` for the public demo / GitHub Pages exploration instead of
-  cutting a `0.18.1` patch just for planning docs
-- treat the public demo as static, scrubbed sample data that can run on
-  GitHub Pages, not as a hosted FastAPI/Docker deployment
+- treat the public demo as static, scrubbed sample data that runs on GitHub
+  Pages, not as a hosted FastAPI/Docker deployment
 - reuse the offline snapshot and demo-builder lessons where they help, while
   keeping backup/restore and real admin maintenance flows separate
 
@@ -430,7 +428,7 @@ Current notes:
 
 Current status:
 
-- first static path implemented on the `0.19.0-dev` branch: the repo carries a
+- first static path shipped in `v0.19.0`: the repo carries a
   live-derived, scrubbed TN Core public-demo artifact, a GitHub Pages workflow
   for publishing `public-demo/`, static artifact checks, and Playwright smoke
   coverage; runtime demo/import mode remains later work
