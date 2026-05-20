@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Reopened the post-`v0.20.0` development line as `0.20.1-dev` for focused
+  SAS Fabric diagnostic follow-ups.
+
 ## v0.20.0 - 2026-05-20
 
 ### Added
