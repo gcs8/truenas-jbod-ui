@@ -2229,8 +2229,10 @@
         sasFabricStatus.className = "warning-item compact";
         sasFabricStatus.textContent = sasFabricList(fabric.warnings)[0] || "SAS fabric is not available for this system.";
       } else if (sasFabricList(fabric?.warnings).length) {
-        sasFabricStatus.className = "warning-item compact";
-        sasFabricStatus.textContent = sasFabricList(fabric.warnings).join(" ");
+        const fabricWarnings = sasFabricList(fabric.warnings);
+        const enrichmentOnly = fabricWarnings.every(isSasFabricEnrichmentWarning);
+        sasFabricStatus.className = enrichmentOnly ? "warning-item muted compact" : "warning-item compact";
+        sasFabricStatus.textContent = fabricWarnings.join(" ");
       } else if (fabric) {
         sasFabricStatus.className = "warning-item muted compact";
         sasFabricStatus.textContent = `Fabric data loaded for ${fabric.selected_enclosure_label || fabric.system_label || "current selection"}.`;
@@ -2301,6 +2303,10 @@
         renderAll();
       }
     }
+  }
+
+  function isSasFabricEnrichmentWarning(warning) {
+    return String(warning || "").toLowerCase().includes("sas fabric enrichment probes");
   }
 
   function platformSetupCopy(platform) {

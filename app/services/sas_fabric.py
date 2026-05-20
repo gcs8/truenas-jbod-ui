@@ -566,6 +566,7 @@ def build_sas_fabric_snapshot(
     ssh_outputs: dict[str, str],
     sources: dict[str, SourceStatus] | None = None,
     warnings: list[str] | None = None,
+    command_failures: list[dict[str, Any]] | None = None,
     aliases: list[SasFabricAlias] | None = None,
 ) -> SasFabricSnapshot:
     normalized_outputs = _canonical_outputs(ssh_outputs)
@@ -584,6 +585,7 @@ def build_sas_fabric_snapshot(
             warnings=fabric_warnings,
             sources=sources or {},
             aliases=list(aliases or []),
+            raw={"command_failures": list(command_failures or [])},
         )
 
     nodes: dict[str, SasFabricNode] = {}
@@ -971,6 +973,7 @@ def build_sas_fabric_snapshot(
                 "controllers": sorted((mpr_kernel_diagnostics.get("by_controller") or {}).keys()),
                 "devices": sorted((mpr_kernel_diagnostics.get("by_device") or {}).keys()),
             },
+            "command_failures": list(command_failures or []),
         },
     )
 

@@ -255,6 +255,38 @@ class InventoryHelpersTests(unittest.TestCase):
         )
         self.assertEqual(status_message, "StorCLI commands unavailable.")
 
+    def test_summarize_ssh_failures_collapses_sas_fabric_enrichment_failures_with_debug_details(self) -> None:
+        command_results = [
+            SSHCommandResult(command="sudo -n /usr/sbin/mprutil show adapters", ok=True, stdout="/dev/mpr10 SAS3816 Broadcom 9500-16e 28.00.00.00"),
+            SSHCommandResult(
+                command="sudo -n /usr/sbin/mprutil -u 10 show iocfacts",
+                ok=False,
+                stderr="mprutil: ioctl MPRIO_READ_CFG_HEADER: Device not configured",
+                exit_code=1,
+            ),
+        ]
+
+        warnings, status_message = InventoryService._summarize_ssh_failures(
+            command_results,
+            {"sudo -n /usr/sbin/mprutil show adapters": command_results[0].stdout},
+        )
+        details = InventoryService._ssh_failure_details(command_results)
+
+        self.assertEqual(
+            warnings,
+            [
+                "SAS Fabric enrichment probes had partial command failures; topology can still render, "
+                "but IOC facts may be incomplete. Debug output keeps the command, exit code, and stderr details."
+            ],
+        )
+        self.assertEqual(status_message, "SAS Fabric enrichment completed with partial command failures.")
+        self.assertEqual(details[0]["canonical_command"], "mprutil -u 10 show iocfacts")
+        self.assertEqual(details[0]["controller"], "mpr10")
+        self.assertEqual(details[0]["context"], "sas_fabric_mprutil_iocfacts")
+        self.assertEqual(details[0]["criticality"], "enrichment")
+        self.assertEqual(details[0]["exit_code"], 1)
+        self.assertIn("Device not configured", details[0]["stderr"])
+
     def test_suppress_scale_configured_sg_ses_failures_keeps_other_ssh_warnings(self) -> None:
         sg_ses_failure = "SSH command failed: sudo -n /usr/bin/sg_ses -p aes /dev/sg27 (exit 5)"
         smart_failure = "SSH command failed: smartctl -x -j /dev/sda (exit 2)"

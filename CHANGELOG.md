@@ -6,6 +6,10 @@
 
 - Reopened the post-`v0.20.0` development line as `0.20.1-dev` for focused
   SAS Fabric diagnostic follow-ups.
+- SAS Fabric SSH probe failures now keep structured debug evidence with the
+  original command, canonical command, exit code, stderr/stdout snippets, and
+  probe context. Transient enrichment failures collapse to calmer UI copy when
+  topology data still loaded.
 
 ## v0.20.0 - 2026-05-20
 

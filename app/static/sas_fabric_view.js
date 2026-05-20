@@ -2179,8 +2179,17 @@
   function renderWarnings() {
     const warnings = list(state.fabric?.warnings);
     elements.warningList.innerHTML = warnings.length
-      ? warnings.map((warning) => `<div class="warning-item compact">${escapeHtml(warning)}</div>`).join("")
+      ? warnings.map((warning) => {
+        const tone = isSasFabricEnrichmentWarning(warning) && state.fabric?.available !== false
+          ? "muted compact"
+          : "compact";
+        return `<div class="warning-item ${tone}">${escapeHtml(warning)}</div>`;
+      }).join("")
       : "";
+  }
+
+  function isSasFabricEnrichmentWarning(warning) {
+    return String(warning || "").toLowerCase().includes("sas fabric enrichment probes");
   }
 
   function focusButton({ label, title, meta, ref, mode, tone = "" }) {

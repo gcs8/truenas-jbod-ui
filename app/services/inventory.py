@@ -7,7 +7,7 @@ import re
 import shlex
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
@@ -301,6 +301,7 @@ class InventorySourceBundle:
     sources: dict[str, SourceStatus]
     scale_ses_data: ParsedSSHData
     quantastor_ses_data: ParsedSSHData
+    ssh_failure_details: list[dict[str, Any]] = field(default_factory=list)
     bmc_inventory: BMCInventory | None = None
 
 
@@ -510,6 +511,7 @@ class InventoryService:
             ssh_outputs=source_bundle.ssh_outputs,
             sources=source_bundle.sources,
             warnings=source_bundle.warnings,
+            command_failures=source_bundle.ssh_failure_details,
             aliases=aliases,
         )
 
@@ -1312,8 +1314,9 @@ class InventoryService:
             self._snapshot_locks[cache_key] = lock
         return lock
 
-    @staticmethod
+    @classmethod
     def _summarize_ssh_failures(
+        cls,
         command_results: list[SSHCommandResult],
         outputs: dict[str, str],
     ) -> tuple[list[str], str]:
@@ -1390,6 +1393,32 @@ class InventoryService:
                 warning = f"{warning} Detail: {detail}."
             return ([warning], "StorCLI commands unavailable.")
 
+        failure_details = cls._ssh_failure_details(command_results)
+        enrichment_failures = [
+            detail
+            for detail in failure_details
+            if detail.get("criticality") == "enrichment"
+            and str(detail.get("context") or "").startswith("sas_fabric")
+        ]
+        if outputs and enrichment_failures and len(enrichment_failures) == len(failures):
+            affected_contexts = sorted(
+                {
+                    str(detail.get("context_label") or "SAS Fabric enrichment")
+                    for detail in enrichment_failures
+                }
+            )
+            context_text = ", ".join(affected_contexts[:3])
+            if len(affected_contexts) > 3:
+                context_text = f"{context_text}, +{len(affected_contexts) - 3} more"
+            return (
+                [
+                    "SAS Fabric enrichment probes had partial command failures; "
+                    f"topology can still render, but {context_text} may be incomplete. "
+                    "Debug output keeps the command, exit code, and stderr details."
+                ],
+                "SAS Fabric enrichment completed with partial command failures.",
+            )
+
         return (
             [
                 f"SSH command failed: {failure.command} (exit {failure.exit_code})"
@@ -1397,6 +1426,94 @@ class InventoryService:
             ],
             "Some SSH commands failed.",
         )
+
+    @classmethod
+    def _ssh_failure_details(cls, command_results: list[SSHCommandResult]) -> list[dict[str, Any]]:
+        details: list[dict[str, Any]] = []
+        for result in command_results:
+            if result.ok:
+                continue
+            canonical = canonicalize_ssh_command(result.command)
+            context = cls._ssh_command_failure_context(canonical)
+            details.append(
+                {
+                    "command": result.command,
+                    "canonical_command": canonical,
+                    "exit_code": result.exit_code,
+                    "stderr": cls._trim_command_failure_text(result.stderr),
+                    "stdout": cls._trim_command_failure_text(result.stdout),
+                    **context,
+                }
+            )
+        return details
+
+    @staticmethod
+    def _trim_command_failure_text(value: str | None, limit: int = 500) -> str:
+        cleaned = normalize_text(value) or ""
+        if len(cleaned) <= limit:
+            return cleaned
+        return f"{cleaned[:limit].rstrip()}..."
+
+    @staticmethod
+    def _ssh_command_failure_context(canonical_command: str) -> dict[str, str]:
+        if canonical_command == "dmesg mpr events":
+            return {
+                "context": "sas_fabric_kernel_events",
+                "context_label": "recent MPR/CAM event evidence",
+                "criticality": "enrichment",
+            }
+        if canonical_command == "pciconf -lv":
+            return {
+                "context": "sas_fabric_pci_inventory",
+                "context_label": "HBA PCI inventory",
+                "criticality": "enrichment",
+            }
+        if canonical_command == "dmidecode slot":
+            return {
+                "context": "sas_fabric_pcie_slots",
+                "context_label": "HBA slot labels",
+                "criticality": "enrichment",
+            }
+        if canonical_command == "mpr sysctl pci locations":
+            return {
+                "context": "sas_fabric_pci_location",
+                "context_label": "HBA PCI location corroboration",
+                "criticality": "enrichment",
+            }
+        unit_match = re.match(r"^mprutil -u (?P<unit>\d+) show (?P<subcommand>[a-z]+)$", canonical_command)
+        if unit_match:
+            subcommand = unit_match.group("subcommand")
+            context_labels = {
+                "adapter": "controller adapter detail",
+                "devices": "MPR device rows",
+                "enclosures": "MPR enclosure rows",
+                "expanders": "MPR expander rows",
+                "iocfacts": "IOC facts",
+                "all": "MPR all-command detail",
+            }
+            return {
+                "context": f"sas_fabric_mprutil_{subcommand}",
+                "context_label": context_labels.get(subcommand, f"mprutil {subcommand}"),
+                "controller": f"mpr{unit_match.group('unit')}",
+                "criticality": "enrichment",
+            }
+        if canonical_command == "mprutil show adapters":
+            return {
+                "context": "sas_fabric_adapter_discovery",
+                "context_label": "adapter discovery",
+                "criticality": "topology",
+            }
+        if canonical_command.startswith("mprutil "):
+            return {
+                "context": "sas_fabric_mprutil",
+                "context_label": "mprutil topology evidence",
+                "criticality": "topology",
+            }
+        return {
+            "context": "ssh_command",
+            "context_label": "SSH command",
+            "criticality": "inventory",
+        }
 
     @staticmethod
     def _is_configured_sg_ses_page_probe_failure(message: str) -> bool:
@@ -1639,6 +1756,7 @@ class InventoryService:
         ssh_outputs: dict[str, str] = {}
         ssh_collected = False
         ssh_failures: list[str] = []
+        ssh_failure_details: list[dict[str, Any]] = []
         quantastor_cli_loaded = False
         quantastor_cli_failures: list[str] = []
         scale_ses_loaded = False
@@ -1655,7 +1773,7 @@ class InventoryService:
             with perf_stage("inventory.api.fetch_all", platform=self.system.truenas.platform):
                 return await self.truenas_client.fetch_all()
 
-        async def load_ssh_payload() -> tuple[dict[str, str], bool, list[str], SourceStatus]:
+        async def load_ssh_payload() -> tuple[dict[str, str], bool, list[str], list[dict[str, Any]], SourceStatus]:
             with perf_stage("inventory.ssh.run_commands"):
                 command_results = await self.ssh_probe.run_commands()
                 for command in self._core_mprutil_seed_probe_commands(command_results):
@@ -1672,10 +1790,12 @@ class InventoryService:
                     command_results.append(await self.ssh_probe.run_command(command))
             outputs = {item.command: item.stdout for item in command_results if item.ok}
             failure_messages, status_message = self._summarize_ssh_failures(command_results, outputs)
+            failure_details = self._ssh_failure_details(command_results)
             return (
                 outputs,
                 True,
                 failure_messages,
+                failure_details,
                 SourceStatus(
                     enabled=True,
                     ok=not failure_messages,
@@ -1707,7 +1827,7 @@ class InventoryService:
 
         if ssh_task is not None:
             try:
-                ssh_outputs, ssh_collected, ssh_failures, ssh_status = await ssh_task
+                ssh_outputs, ssh_collected, ssh_failures, ssh_failure_details, ssh_status = await ssh_task
             except Exception as exc:
                 logger.exception("Failed to collect SSH diagnostics")
                 sources["ssh"] = SourceStatus(enabled=True, ok=False, message=str(exc))
@@ -1814,6 +1934,7 @@ class InventoryService:
             ssh_outputs=ssh_outputs,
             ssh_collected=ssh_collected,
             warnings=warnings,
+            ssh_failure_details=ssh_failure_details,
             sources=sources,
             scale_ses_data=scale_ses_data,
             quantastor_ses_data=quantastor_ses_data,

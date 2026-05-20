@@ -95,6 +95,10 @@ The goal is to make releases boring, repeatable, and easy to audit later.
     `kernel_diagnostics` payload on controller objects, not an older
     `diagnostics` field name, so event-table evidence is not accidentally
     reported as missing
+  - when a SAS Fabric SSH probe warning appears, capture the structured
+    `raw.command_failures` rows for command, canonical command, exit code,
+    stderr/stdout, controller, context, and criticality instead of relying on
+    the shortened UI warning text
   - run snapshot export estimate and download against the restored Linux QA UI,
     including at least one packaging change such as Auto to Force ZIP, and
     verify the exported offline artifact opens with `qa/offline-snapshot.spec.js`

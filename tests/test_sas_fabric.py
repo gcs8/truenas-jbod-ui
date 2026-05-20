@@ -869,6 +869,34 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertFalse(fabric.available)
         self.assertIn("TrueNAS CORE", fabric.warnings[0])
 
+    def test_core_snapshot_carries_structured_command_failures_for_debug_output(self) -> None:
+        failure_details = [
+            {
+                "command": "sudo -n /usr/sbin/mprutil -u 10 show iocfacts",
+                "canonical_command": "mprutil -u 10 show iocfacts",
+                "controller": "mpr10",
+                "context": "sas_fabric_mprutil_iocfacts",
+                "context_label": "IOC facts",
+                "criticality": "enrichment",
+                "exit_code": 1,
+                "stderr": "mprutil: Device not configured",
+                "stdout": "",
+            }
+        ]
+
+        fabric = build_sas_fabric_snapshot(
+            system=SystemConfig(id="archive-core", label="The Archive", truenas=TrueNASConfig(platform="core")),
+            snapshot=InventorySnapshot(slots=[], refresh_interval_seconds=30),
+            ssh_outputs={"sudo -n /usr/sbin/mprutil show adapters": "/dev/mpr10 SAS3816 Broadcom 9500-16e 28.00.00.00"},
+            warnings=["SAS Fabric enrichment probes had partial command failures."],
+            command_failures=failure_details,
+        )
+
+        self.assertTrue(fabric.available)
+        self.assertEqual(fabric.raw["command_failures"], failure_details)
+        self.assertEqual(fabric.raw["commands"], ["mprutil show adapters"])
+        self.assertEqual(fabric.controllers[0]["name"], "mpr10")
+
 
 class SasFabricInventoryProbeTests(unittest.TestCase):
     @staticmethod
