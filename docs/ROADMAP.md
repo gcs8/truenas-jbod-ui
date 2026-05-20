@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.19.0`.
+This file tracks the current intended release direction after `v0.20.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -17,22 +17,27 @@ Detailed execution plans live here:
 
 ## Current Snapshot
 
-`v0.19.0` just shipped the public demo and offline snapshot robustness release:
+`v0.20.0` just shipped the first read-only SAS Fabric/topology release for
+TrueNAS CORE:
 
-- selected saved/virtual storage views inside offline snapshot exports
-- optional whole-system live enclosure snapshots inside offline snapshot exports
-- a live-derived TN Core / Supermicro CSE-946 public demo artifact
-- GitHub Pages publication for the static `public-demo/` directory
-- faster heat-map timeline scrubbing in large offline/public-demo artifacts
+- normalized SAS Fabric graph and `/api/sas-fabric` payloads
+- main-page `Topology` panel plus dedicated `/sas-fabric` workspace
+- Disk Path branch views with path-leg-scoped recent fault evidence
+- timestamped CORE MPR/CAM event collection through a narrow optional tail
+  rule, with `dmesg` order fallback
+- source/confidence-labeled diagnostic decoding for common SCSI, CAM, sense,
+  retry, LOG SENSE, and attributed Broadcom/LSI `loginfo` evidence
+- HBA PCIe slot enrichment from CORE PCI/DMI/sysctl evidence
 
-The next cycle should stay practical and public-facing:
+The next cycle should stay practical and incremental:
 
-- keep the shipped `0.19.0` image stable unless a real runtime regression
+- keep the shipped `0.20.0` image stable unless a real runtime regression
   appears
-- treat the public demo as static, scrubbed sample data that runs on GitHub
-  Pages, not as a hosted FastAPI/Docker deployment
-- reuse the offline snapshot and demo-builder lessons where they help, while
-  keeping backup/restore and real admin maintenance flows separate
+- continue decoder growth where standards/vendor references are strong enough
+- keep any weaker SAS/backplane inferences visibly labeled instead of turning
+  them into fake certainty
+- add operator-pinned ordering or profile hints only if real hardware shows the
+  current inferred order is not stable enough
 
 ## Guiding Principle
 

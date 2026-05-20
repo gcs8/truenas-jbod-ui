@@ -2378,10 +2378,37 @@ def canonicalize_ssh_command(command: str) -> str:
         return "camcontrol devlist -v" if "-v" in args[1:] else "camcontrol devlist"
     if executable == "gmultipath" and args[:1] == ["list"]:
         return "gmultipath list"
+    if executable == "pciconf" and "-lv" in [arg.lower() for arg in args]:
+        return "pciconf -lv"
+    if executable == "dmidecode":
+        lowered_args = [arg.lower() for arg in args]
+        if ("-t" in lowered_args or "--type" in lowered_args) and any(token in lowered_args for token in {"slot", "9"}):
+            return "dmidecode slot"
+    unescaped_command = command.replace("\\.", ".")
+    if executable == "sysctl" and "dev.mpr" in unescaped_command and (
+        "%location" in command or "%parent" in command or "%(location|parent)" in command
+    ):
+        return "mpr sysctl pci locations"
+    if (
+        ("dmesg" in command.lower() or "/var/log/messages" in command.lower())
+        and re.search(r"\bmpr\d*\b", command, flags=re.IGNORECASE)
+    ):
+        return "dmesg mpr events"
     if executable == "sesutil" and args[:1] == ["map"]:
         return "sesutil map"
     if executable == "sesutil" and args[:1] == ["show"]:
         return "sesutil show"
+    if executable == "mprutil":
+        lowered_args = [arg.lower() for arg in args]
+        if len(lowered_args) >= 2 and lowered_args[0] == "show":
+            subcommand = lowered_args[1]
+            if subcommand in {"adapter", "adapters", "all", "devices", "enclosures", "expanders", "iocfacts"}:
+                return f"mprutil show {subcommand}"
+        if len(lowered_args) >= 4 and lowered_args[0] == "-u" and lowered_args[2] == "show":
+            unit = lowered_args[1]
+            subcommand = lowered_args[3]
+            if unit.isdigit() and subcommand in {"adapter", "all", "devices", "enclosures", "expanders", "iocfacts"}:
+                return f"mprutil -u {unit} show {subcommand}"
     if executable == "sg_ses":
         target_device = next((arg for arg in reversed(args) if arg.startswith("/dev/sg")), None)
         has_aes_page = False

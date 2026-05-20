@@ -22,6 +22,7 @@ from app.models.domain import (
     ManualMapping,
     MultipathMember,
     MultipathView,
+    SasFabricSnapshot,
     SmartBatchItem,
     SmartSummaryView,
     SlotState,
@@ -59,6 +60,16 @@ from app.services.storage_views import (
     storage_view_slot_label,
     storage_view_slot_size,
 )
+from app.services.sas_fabric import (
+    CORE_DMIDECODE_SLOT_OPTIONAL_COMMAND,
+    CORE_MPR_DMESG_EVENTS_COMMAND,
+    CORE_MPR_SYSCTL_LOCATION_COMMAND,
+    CORE_PCICONF_LV_COMMAND,
+    CORE_PCICONF_LV_OPTIONAL_COMMAND,
+    build_core_mprutil_unit_commands,
+    build_sas_fabric_snapshot,
+)
+from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.parsers import (
     ParsedSSHData,
@@ -86,7 +97,7 @@ from app.services.parsers import (
     parse_ssh_outputs,
     shift_hex_identifier,
 )
-from app.services.ssh_probe import SSHProbe
+from app.services.ssh_probe import SSHCommandResult, SSHProbe
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebsocketClient
@@ -304,6 +315,7 @@ class InventoryService:
         mapping_store: MappingStore,
         profile_registry: ProfileRegistry,
         slot_detail_store: SlotDetailStore | None = None,
+        sas_fabric_alias_store: SasFabricAliasStore | None = None,
     ) -> None:
         self.settings = settings
         self.system = system
@@ -311,6 +323,7 @@ class InventoryService:
         self.ssh_probe = ssh_probe
         self.bmc_service = bmc_service
         self.mapping_store = mapping_store
+        self.sas_fabric_alias_store = sas_fabric_alias_store
         self.profile_registry = profile_registry
         self.slot_detail_store = slot_detail_store
         self._cache: dict[str, InventorySnapshot] = {}
@@ -467,6 +480,80 @@ class InventoryService:
             self._observe_inventory_cache_metrics()
             self._observe_inventory_snapshot_request(refresh_trigger)
             return snapshot
+
+    async def get_sas_fabric_snapshot(
+        self,
+        *,
+        force_refresh: bool = False,
+        selected_enclosure_id: str | None = None,
+    ) -> SasFabricSnapshot:
+        snapshot = await self.get_snapshot(
+            force_refresh=force_refresh,
+            selected_enclosure_id=selected_enclosure_id,
+            allow_stale_cache=not force_refresh,
+        )
+        source_bundle = await self._get_inventory_source_bundle(
+            force_refresh=False,
+            allow_stale_cache=True,
+        )
+        aliases = (
+            self.sas_fabric_alias_store.list_aliases(
+                self.system.id,
+                snapshot.selected_enclosure_id or selected_enclosure_id,
+            )
+            if self.sas_fabric_alias_store is not None
+            else []
+        )
+        return build_sas_fabric_snapshot(
+            system=self.system,
+            snapshot=snapshot,
+            ssh_outputs=source_bundle.ssh_outputs,
+            sources=source_bundle.sources,
+            warnings=source_bundle.warnings,
+            aliases=aliases,
+        )
+
+    def save_sas_fabric_alias(
+        self,
+        *,
+        object_id: str,
+        label: str | None,
+        object_kind: str | None = None,
+        selected_enclosure_id: str | None = None,
+        scope: str = "auto",
+    ) -> dict[str, Any]:
+        if self.sas_fabric_alias_store is None:
+            return {"ok": False, "cleared": False, "alias": None}
+        from app.models.domain import SasFabricAlias
+
+        object_text = normalize_text(object_id)
+        if not object_text:
+            raise ValueError("A SAS Fabric alias object id is required.")
+
+        label_text = normalize_text(label)
+        kind_name = normalize_text(object_kind)
+        scope_name = str(scope or "auto").strip().lower()
+        enclosure_scoped_kinds = {"bay", "backplane", "ses-enclosure", "mpr-enclosure", "expander"}
+        enclosure_id = (
+            selected_enclosure_id
+            if scope_name == "enclosure" or (scope_name == "auto" and kind_name in enclosure_scoped_kinds)
+            else None
+        )
+
+        if not label_text:
+            cleared = self.sas_fabric_alias_store.clear_alias(self.system.id, enclosure_id, object_text)
+            return {"ok": cleared, "cleared": cleared, "alias": None}
+
+        alias = self.sas_fabric_alias_store.save_alias(
+            SasFabricAlias(
+                system_id=self.system.id,
+                enclosure_id=enclosure_id,
+                object_id=object_text,
+                object_kind=kind_name,
+                label=label_text,
+            )
+        )
+        return {"ok": True, "cleared": False, "alias": alias.model_dump(mode="json")}
 
     async def get_storage_view_candidates(
         self,
@@ -1457,6 +1544,53 @@ class InventoryService:
             missing_commands.append("lspci 2>&1 || true")
         return missing_commands
 
+    def _core_mprutil_seed_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
+        if self.system.truenas.platform != "core":
+            return []
+        seen_commands = {canonicalize_ssh_command(item.command) for item in command_results}
+        if "mprutil show adapters" in seen_commands:
+            return []
+        return ["sudo -n /usr/sbin/mprutil show adapters"]
+
+    def _core_mprutil_unit_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
+        if self.system.truenas.platform != "core":
+            return []
+        outputs = {
+            canonicalize_ssh_command(item.command): item.stdout
+            for item in command_results
+            if item.ok
+        }
+        adapter_summary = outputs.get("mprutil show adapters")
+        if not adapter_summary:
+            return []
+        seen_commands = {canonicalize_ssh_command(item.command) for item in command_results}
+        return build_core_mprutil_unit_commands(adapter_summary, seen_commands)
+
+    def _core_mpr_dmesg_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
+        if self.system.truenas.platform != "core":
+            return []
+        has_messages_probe = any(
+            canonicalize_ssh_command(item.command) == "dmesg mpr events"
+            and "/var/log/messages" in item.command.lower()
+            for item in command_results
+        )
+        if has_messages_probe:
+            return []
+        return [CORE_MPR_DMESG_EVENTS_COMMAND]
+
+    def _core_pci_slot_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
+        if self.system.truenas.platform != "core":
+            return []
+        seen_commands = {canonicalize_ssh_command(item.command) for item in command_results}
+        commands: list[str] = []
+        if "pciconf -lv" not in seen_commands:
+            commands.append(CORE_PCICONF_LV_OPTIONAL_COMMAND)
+        if "dmidecode slot" not in seen_commands:
+            commands.append(CORE_DMIDECODE_SLOT_OPTIONAL_COMMAND)
+        if "mpr sysctl pci locations" not in seen_commands:
+            commands.append(CORE_MPR_SYSCTL_LOCATION_COMMAND)
+        return commands
+
     async def _collect_inventory_source_bundle(self) -> InventorySourceBundle:
         warnings: list[str] = []
         api_enabled = self.system.truenas.platform not in {"linux", "esxi", "ipmi"}
@@ -1524,6 +1658,14 @@ class InventoryService:
         async def load_ssh_payload() -> tuple[dict[str, str], bool, list[str], SourceStatus]:
             with perf_stage("inventory.ssh.run_commands"):
                 command_results = await self.ssh_probe.run_commands()
+                for command in self._core_mprutil_seed_probe_commands(command_results):
+                    command_results.append(await self.ssh_probe.run_command(command))
+                for command in self._core_mprutil_unit_probe_commands(command_results):
+                    command_results.append(await self.ssh_probe.run_command(command))
+                for command in self._core_mpr_dmesg_probe_commands(command_results):
+                    command_results.append(await self.ssh_probe.run_command(command))
+                for command in self._core_pci_slot_probe_commands(command_results):
+                    command_results.append(await self.ssh_probe.run_command(command))
                 if self._should_probe_unifi_gpio_debug(command_results):
                     command_results.append(await self.ssh_probe.run_command("cat /sys/kernel/debug/gpio"))
                 for command in self._esxi_controller_diagnostic_commands(command_results):

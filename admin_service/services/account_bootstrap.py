@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from pathlib import Path
@@ -19,6 +20,37 @@ ESXI_BOOTSTRAP_UNSUPPORTED_DETAIL = (
     "VMware ESXi does not use the Linux one-time bootstrap or sudoers flow. "
     "Save the SSH host, root or key-based auth, and the read-only runtime commands directly instead."
 )
+CORE_MPRUTIL_SUDO_COMMANDS = (
+    "/usr/sbin/mprutil show adapter",
+    "/usr/sbin/mprutil show adapters",
+    "/usr/sbin/mprutil show all",
+    "/usr/sbin/mprutil show devices",
+    "/usr/sbin/mprutil show enclosures",
+    "/usr/sbin/mprutil show expanders",
+    "/usr/sbin/mprutil show iocfacts",
+    "/usr/sbin/mprutil -u * show adapter",
+    "/usr/sbin/mprutil -u * show all",
+    "/usr/sbin/mprutil -u * show devices",
+    "/usr/sbin/mprutil -u * show enclosures",
+    "/usr/sbin/mprutil -u * show expanders",
+    "/usr/sbin/mprutil -u * show iocfacts",
+)
+CORE_DMIDECODE_SUDO_COMMANDS = (
+    "/usr/local/sbin/dmidecode -t slot",
+)
+CORE_MESSAGES_SUDO_COMMANDS = (
+    "/usr/bin/tail -n 4000 /var/log/messages",
+)
+CORE_MPRUTIL_SHOW_COMMANDS = {
+    "adapter",
+    "adapters",
+    "all",
+    "devices",
+    "enclosures",
+    "expanders",
+    "iocfacts",
+}
+CORE_MPRUTIL_UNIT_SHOW_COMMANDS = CORE_MPRUTIL_SHOW_COMMANDS - {"adapters"}
 SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     "core": (
         "/usr/sbin/sesutil map",
@@ -30,6 +62,9 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/local/sbin/smartctl -x *",
         "/usr/sbin/smartctl -x -j *",
         "/usr/sbin/smartctl -x *",
+        *CORE_MPRUTIL_SUDO_COMMANDS,
+        *CORE_DMIDECODE_SUDO_COMMANDS,
+        *CORE_MESSAGES_SUDO_COMMANDS,
     ),
     "scale": (
         "/usr/bin/sg_ses -p aes /dev/sg*",
@@ -69,6 +104,9 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/local/sbin/smartctl -x *",
         "/usr/sbin/smartctl -x -j *",
         "/usr/sbin/smartctl -x *",
+        *CORE_MPRUTIL_SUDO_COMMANDS,
+        *CORE_DMIDECODE_SUDO_COMMANDS,
+        *CORE_MESSAGES_SUDO_COMMANDS,
     ),
     "scale": (
         "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
@@ -143,6 +181,7 @@ class ServiceAccountBootstrapService:
             "authorized_keys_path": details.get("authorized_keys_path"),
             "sudo_rules_installed": bool(payload.install_sudo_rules),
             "sudoers_path": details.get("sudoers_path"),
+            "permission_target": details.get("permission_target") or details.get("sudoers_path"),
             "key_source": key_source,
             "detail": (
                 f"Provisioned {payload.service_user} on {payload.host} using one-time setup credentials. "
@@ -211,9 +250,14 @@ class ServiceAccountBootstrapService:
         service_user = payload.service_user
         service_shell = payload.service_shell
         install_sudo = "1" if payload.install_sudo_rules else "0"
+        core_midclt_payload = (
+            self._build_core_midclt_user_update_payload(payload.sudo_commands)
+            if payload.install_sudo_rules and payload.platform == "core"
+            else ""
+        )
         sudoers_content = (
             self._build_sudoers_content(service_user, payload.platform, payload.sudo_commands)
-            if payload.install_sudo_rules
+            if payload.install_sudo_rules and payload.platform != "core"
             else ""
         )
         script_lines = [
@@ -248,7 +292,35 @@ class ServiceAccountBootstrapService:
             "primary_group=$(id -gn \"$svc_user\" 2>/dev/null || echo \"$svc_user\")",
             "chown -R \"$svc_user\":\"$primary_group\" \"$ssh_dir\" 2>/dev/null || chown -R \"$svc_user\" \"$ssh_dir\"",
             "sudoers_path=",
+            "permission_target=",
             "if [ \"$install_sudo\" = \"1\" ]; then",
+        ]
+        if payload.platform == "core":
+            script_lines.extend(
+                [
+                    "  if ! command -v midclt >/dev/null 2>&1; then",
+                    "    echo \"TrueNAS CORE midclt was not found on the remote host.\" >&2",
+                    "    exit 1",
+                    "  fi",
+                    f"  midclt_payload={shlex.quote(core_midclt_payload)}",
+                    "  svc_query=$(printf '[[\"username\",\"=\",\"%s\"]]' \"$svc_user\")",
+                    "  svc_user_json=$(midclt call user.query \"$svc_query\")",
+                    (
+                        "  svc_id=$(printf '%s\\n' \"$svc_user_json\" | "
+                        "sed -n 's/.*\"id\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' | head -n1)"
+                    ),
+                    "  if [ -z \"$svc_id\" ]; then",
+                    "    echo \"Unable to resolve the TrueNAS CORE middleware user id for $svc_user.\" >&2",
+                    "    exit 1",
+                    "  fi",
+                    "  midclt call user.update \"$svc_id\" \"$midclt_payload\" >/dev/null",
+                    "  sudoers_path=\"midclt:user.update:$svc_id\"",
+                    "  permission_target=\"$sudoers_path\"",
+                ]
+            )
+        else:
+            script_lines.extend(
+                [
             "  sudoers_dir=",
             f"  for candidate in {' '.join(SUDOERS_DIR_CANDIDATES)}; do",
             "    if [ -d \"$candidate\" ] || mkdir -p \"$candidate\" 2>/dev/null; then",
@@ -270,12 +342,19 @@ class ServiceAccountBootstrapService:
             "    visudo -cf \"$temp_sudoers_path\" >/dev/null",
             "  fi",
             "  mv \"$temp_sudoers_path\" \"$sudoers_path\"",
+            "  permission_target=\"$sudoers_path\"",
+                ]
+            )
+        script_lines.extend(
+            [
             "fi",
             "printf 'BOOTSTRAP_SERVICE_USER=%s\\n' \"$svc_user\"",
             "printf 'BOOTSTRAP_SERVICE_HOME=%s\\n' \"$home_dir\"",
             "printf 'BOOTSTRAP_AUTHORIZED_KEYS_PATH=%s\\n' \"$authorized_keys_path\"",
             "printf 'BOOTSTRAP_SUDOERS_PATH=%s\\n' \"$sudoers_path\"",
-        ]
+            "printf 'BOOTSTRAP_PERMISSION_TARGET=%s\\n' \"$permission_target\"",
+            ]
+        )
         return "\n".join(script_lines)
 
     @staticmethod
@@ -305,6 +384,17 @@ class ServiceAccountBootstrapService:
                 ),
             }
         if not install_sudo_rules:
+            if platform == "core":
+                return {
+                    "enabled": False,
+                    "filename": "midclt user.update USER_ID",
+                    "path_candidates": [],
+                    "detail": (
+                        "Command-limited sudo is currently off, so CORE bootstrap would skip running "
+                        "the middleware user.update permission command."
+                    ),
+                    "content": "# CORE midclt permission update disabled for this bootstrap run.\n",
+                }
             return {
                 "enabled": False,
                 "filename": filename,
@@ -314,6 +404,21 @@ class ServiceAccountBootstrapService:
                     "for the final service account."
                 ),
                 "content": "# Sudo rules disabled for this bootstrap run.\n",
+            }
+        if platform == "core":
+            return {
+                "enabled": True,
+                "filename": "midclt user.update USER_ID",
+                "path_candidates": [],
+                "detail": (
+                    "TrueNAS CORE bootstrap runs this same one-line middleware command after resolving "
+                    f"USER_ID for {service_user} on the host."
+                ),
+                "content": cls._build_core_midclt_user_update_command(
+                    "USER_ID",
+                    requested_commands=requested_commands,
+                )
+                + "\n",
             }
         return {
             "enabled": True,
@@ -348,6 +453,30 @@ class ServiceAccountBootstrapService:
         else:
             lines.append(f"{service_user} ALL=(root) NOPASSWD: ALL")
         return "\n".join(lines) + "\n"
+
+    @classmethod
+    def _build_core_midclt_user_update_payload(
+        cls,
+        requested_commands: list[str] | tuple[str, ...] | None = None,
+    ) -> str:
+        return json.dumps(
+            {
+                "sudo": True,
+                "sudo_nopasswd": True,
+                "sudo_commands": list(cls._resolve_sudo_commands("core", requested_commands)),
+            },
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _build_core_midclt_user_update_command(
+        cls,
+        user_id: str,
+        *,
+        requested_commands: list[str] | tuple[str, ...] | None = None,
+    ) -> str:
+        payload = cls._build_core_midclt_user_update_payload(requested_commands)
+        return f"midclt call user.update {shlex.quote(str(user_id))} {shlex.quote(payload)}"
 
     @classmethod
     def _resolve_sudo_commands(
@@ -421,6 +550,28 @@ class ServiceAccountBootstrapService:
             if args[2].startswith("/dev/ses") and state in {"on", "off"}:
                 return f"{executable} locate -u /dev/ses* * {state}"
 
+        if executable_name == "mprutil":
+            if len(args) >= 2 and args[0].lower() == "show":
+                subcommand = args[1].lower()
+                if subcommand in CORE_MPRUTIL_SHOW_COMMANDS:
+                    return f"{executable} show {subcommand}"
+            if len(args) >= 4 and args[0].lower() == "-u" and args[2].lower() == "show":
+                subcommand = args[3].lower()
+                if subcommand in CORE_MPRUTIL_UNIT_SHOW_COMMANDS:
+                    return f"{executable} -u * show {subcommand}"
+
+        if executable_name == "dmidecode":
+            lowered_args = [arg.lower() for arg in args]
+            if ("-t" in lowered_args or "--type" in lowered_args) and any(
+                token in lowered_args for token in {"slot", "9"}
+            ):
+                return f"{executable} -t slot"
+
+        if executable_name == "tail":
+            lowered_args = [arg.lower() for arg in args]
+            if "/var/log/messages" in args and "-n" in lowered_args:
+                return f"{executable} -n 4000 /var/log/messages"
+
         return shlex.join([executable, *args])
 
     @staticmethod
@@ -447,4 +598,6 @@ class ServiceAccountBootstrapService:
                 parsed["authorized_keys_path"] = line.split("=", 1)[1].strip()
             elif line.startswith("BOOTSTRAP_SUDOERS_PATH="):
                 parsed["sudoers_path"] = line.split("=", 1)[1].strip()
+            elif line.startswith("BOOTSTRAP_PERMISSION_TARGET="):
+                parsed["permission_target"] = line.split("=", 1)[1].strip()
         return parsed

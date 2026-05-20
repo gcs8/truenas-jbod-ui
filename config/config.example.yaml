@@ -62,20 +62,20 @@ ssh:
 # Optional v0.2+ multi-system shape. When present, the app builds one inventory
 # client per system and shows a picker in the header.
 #
-# default_system_id: archive-core
+# default_system_id: truenas-core-a
 # systems:
-#   - id: archive-core
-#     label: Archive CORE
+#   - id: truenas-core-a
+#     label: TrueNAS CORE A
 #     default_profile_id: supermicro-cse-946-top-60
 #     truenas:
-#       host: https://10.13.37.10
+#       host: https://truenas-core-a.example.local
 #       api_key: ""
 #       platform: core
 #       verify_ssl: true
 #       enclosure_filter: ""
 #     ssh:
 #       enabled: true
-#       host: 10.13.37.10
+#       host: truenas-core-a.example.local
 #       user: jbodmap
 #       key_path: /run/ssh/id_truenas
 #       sudo_password: ""
@@ -221,6 +221,7 @@ layout:
 
 paths:
   mapping_file: /app/data/slot_mappings.json
+  sas_fabric_alias_file: /app/data/sas_fabric_aliases.json
   log_file: /app/logs/app.log
   # Optional custom profile file for profile-driven enclosure layouts.
   profile_file: /app/config/profiles.yaml

@@ -20,6 +20,12 @@ from app.config import (
     normalize_text,
 )
 from app.models.domain import SystemSetupRequest
+from app.services.sas_fabric import (
+    CORE_DMIDECODE_SLOT_COMMAND,
+    CORE_MPR_DMESG_EVENTS_COMMAND,
+    CORE_MPR_SYSCTL_LOCATION_COMMAND,
+    CORE_PCICONF_LV_COMMAND,
+)
 
 
 _CONFIG_WRITE_LOCK = threading.Lock()
@@ -27,6 +33,25 @@ _CONFIG_WRITE_LOCK = threading.Lock()
 
 def default_ssh_commands_for_platform(platform: str) -> list[str]:
     normalized = normalize_text(platform) or "core"
+    if normalized == "core":
+        return [
+            "/sbin/glabel status",
+            "/usr/local/sbin/zpool status -gP",
+            "gmultipath list",
+            "sudo -n /sbin/camcontrol devlist -v",
+            "sudo -n /usr/sbin/sesutil map",
+            "sudo -n /usr/sbin/sesutil show",
+            "sudo -n /usr/sbin/mprutil show adapters",
+            "sudo -n /usr/sbin/mprutil show adapter",
+            "sudo -n /usr/sbin/mprutil show devices",
+            "sudo -n /usr/sbin/mprutil show enclosures",
+            "sudo -n /usr/sbin/mprutil show expanders",
+            "sudo -n /usr/sbin/mprutil show iocfacts",
+            CORE_PCICONF_LV_COMMAND,
+            CORE_MPR_SYSCTL_LOCATION_COMMAND,
+            CORE_DMIDECODE_SLOT_COMMAND,
+            CORE_MPR_DMESG_EVENTS_COMMAND,
+        ]
     if normalized == "scale":
         return [
             "/usr/sbin/zpool status -gP",

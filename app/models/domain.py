@@ -59,6 +59,50 @@ class ManualMapping(BaseModel):
         return cleaned[:256] if cleaned else None
 
 
+class SasFabricAlias(BaseModel):
+    system_id: str | None = None
+    enclosure_id: str | None = None
+    object_id: str
+    object_kind: str | None = None
+    label: str
+    updated_at: datetime = Field(default_factory=utcnow)
+    source: str = "operator"
+
+    @field_validator("system_id", "enclosure_id", "object_id", "object_kind", "label", "source")
+    @classmethod
+    def trim_strings(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned[:256] if cleaned else None
+
+    @model_validator(mode="after")
+    def validate_alias(self) -> "SasFabricAlias":
+        if not self.object_id:
+            raise ValueError("A SAS Fabric alias object id is required.")
+        if not self.label:
+            raise ValueError("A SAS Fabric alias label is required.")
+        return self
+
+
+class SasFabricAliasRequest(BaseModel):
+    object_id: str
+    object_kind: str | None = None
+    label: str | None = None
+    scope: Literal["auto", "system", "enclosure"] = "auto"
+
+    @field_validator("object_id", "object_kind", "label")
+    @classmethod
+    def trim_strings(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_alias_request(self) -> "SasFabricAliasRequest":
+        if not self.object_id:
+            raise ValueError("A SAS Fabric alias object id is required.")
+        return self
+
+
 class MultipathMember(BaseModel):
     device_name: str
     state: str | None = None
@@ -279,6 +323,67 @@ class InventorySnapshot(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     sources: dict[str, SourceStatus] = Field(default_factory=dict)
     summary: InventorySummary = Field(default_factory=InventorySummary)
+
+
+class SasFabricNode(BaseModel):
+    id: str
+    kind: str
+    label: str
+    display_label: str | None = None
+    alias: str | None = None
+    raw_id: str | None = None
+    status: str | None = None
+    slot: int | None = None
+    controller_id: str | None = None
+    related_slots: list[int] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[str] = Field(default_factory=list)
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class SasFabricLink(BaseModel):
+    id: str
+    source: str
+    target: str
+    kind: str
+    status: str | None = None
+    slot: int | None = None
+    related_slots: list[int] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+
+
+class SasFabricTrace(BaseModel):
+    id: str
+    label: str
+    display_label: str | None = None
+    alias: str | None = None
+    kind: str
+    node_ids: list[str] = Field(default_factory=list)
+    link_ids: list[str] = Field(default_factory=list)
+    slots: list[int] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[str] = Field(default_factory=list)
+
+
+class SasFabricSnapshot(BaseModel):
+    available: bool = False
+    system_id: str | None = None
+    system_label: str | None = None
+    platform: str | None = None
+    selected_enclosure_id: str | None = None
+    selected_enclosure_label: str | None = None
+    generated_at: datetime = Field(default_factory=utcnow)
+    nodes: list[SasFabricNode] = Field(default_factory=list)
+    links: list[SasFabricLink] = Field(default_factory=list)
+    traces: list[SasFabricTrace] = Field(default_factory=list)
+    controllers: list[dict[str, Any]] = Field(default_factory=list)
+    expanders: list[dict[str, Any]] = Field(default_factory=list)
+    enclosures: list[dict[str, Any]] = Field(default_factory=list)
+    paths: list[dict[str, Any]] = Field(default_factory=list)
+    aliases: list[SasFabricAlias] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    sources: dict[str, SourceStatus] = Field(default_factory=dict)
+    raw: dict[str, Any] = Field(default_factory=dict)
 
 
 class LedRequest(BaseModel):

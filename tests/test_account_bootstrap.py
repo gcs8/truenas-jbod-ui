@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +32,7 @@ class FakeProbe:
                 "BOOTSTRAP_SERVICE_HOME=/home/jbodmap\n"
                 "BOOTSTRAP_AUTHORIZED_KEYS_PATH=/home/jbodmap/.ssh/authorized_keys\n"
                 "BOOTSTRAP_SUDOERS_PATH=/etc/sudoers.d/truenas-jbod-ui-jbodmap\n"
+                "BOOTSTRAP_PERMISSION_TARGET=/etc/sudoers.d/truenas-jbod-ui-jbodmap\n"
             ),
             stderr="",
             exit_code=0,
@@ -78,7 +81,9 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
             self.assertEqual(FakeProbe.last_config.user, "root")
             self.assertEqual(FakeProbe.last_config.password, "bootstrap-secret")
             self.assertTrue(str(FakeProbe.last_command).startswith("/bin/sh -lc "))
+            self.assertIn("midclt call user.update", str(FakeProbe.last_command))
             self.assertIn("not written to config.yaml", str(result["detail"]))
+            self.assertEqual(result["permission_target"], "/etc/sudoers.d/truenas-jbod-ui-jbodmap")
 
     def test_bootstrap_uses_sudo_and_private_key_path_for_non_root_user(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -111,8 +116,75 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
 
         self.assertIn("Cmnd_Alias JBODMAP_CORE_CMDS", content)
         self.assertIn("/usr/sbin/sesutil map", content)
+        self.assertIn("/usr/sbin/mprutil show adapters", content)
+        self.assertIn("/usr/sbin/mprutil -u * show expanders", content)
+        self.assertIn("/usr/local/sbin/dmidecode -t slot", content)
+        self.assertIn("/usr/bin/tail -n 4000 /var/log/messages", content)
         self.assertIn("jbodmap ALL=(root) NOPASSWD: JBODMAP_CORE_CMDS", content)
         self.assertNotIn("\n+  ", content)
+        self.assertNotIn("/usr/sbin/mprutil *", content)
+
+    def test_build_sudoers_content_normalizes_core_mprutil_unit_commands(self) -> None:
+        content = ServiceAccountBootstrapService._build_sudoers_content(
+            "jbodmap",
+            "core",
+            [
+                "sudo -n /usr/sbin/mprutil -u 1 show expanders",
+                "sudo -n /usr/sbin/mprutil -u 0 show iocfacts",
+            ],
+        )
+
+        self.assertIn("/usr/sbin/mprutil -u * show expanders", content)
+        self.assertIn("/usr/sbin/mprutil -u * show iocfacts", content)
+        self.assertIn("/usr/sbin/mprutil show adapters", content)
+        self.assertNotIn("/usr/sbin/mprutil -u 1 show expanders", content)
+        self.assertNotIn("/usr/sbin/mprutil *", content)
+
+    def test_build_sudoers_content_normalizes_core_dmidecode_slot_command(self) -> None:
+        content = ServiceAccountBootstrapService._build_sudoers_content(
+            "jbodmap",
+            "core",
+            [
+                "sudo -n /usr/local/sbin/dmidecode -t slot 2>/dev/null || true",
+            ],
+        )
+
+        self.assertIn("/usr/local/sbin/dmidecode -t slot", content)
+        self.assertNotIn("2>/dev/null", content)
+        self.assertNotIn("|| true", content)
+
+    def test_build_sudoers_content_normalizes_core_messages_tail_command(self) -> None:
+        content = ServiceAccountBootstrapService._build_sudoers_content(
+            "jbodmap",
+            "core",
+            [
+                "sudo -n /usr/bin/tail -n 4000 /var/log/messages 2>/dev/null || true",
+            ],
+        )
+
+        self.assertIn("/usr/bin/tail -n 4000 /var/log/messages", content)
+        self.assertNotIn("2>/dev/null", content)
+        self.assertNotIn("|| true", content)
+
+    def test_build_core_midclt_command_uses_same_normalized_commands(self) -> None:
+        command = ServiceAccountBootstrapService._build_core_midclt_user_update_command(
+            "USER_ID",
+            requested_commands=[
+                "sudo -n /usr/sbin/sesutil show",
+                "sudo -n /usr/sbin/mprutil -u 1 show expanders",
+            ],
+        )
+        tokens = shlex.split(command)
+        payload = json.loads(tokens[-1])
+
+        self.assertEqual(tokens[:4], ["midclt", "call", "user.update", "USER_ID"])
+        self.assertTrue(payload["sudo"])
+        self.assertTrue(payload["sudo_nopasswd"])
+        self.assertIn("/usr/sbin/mprutil -u * show expanders", payload["sudo_commands"])
+        self.assertIn("/usr/sbin/mprutil show adapters", payload["sudo_commands"])
+        self.assertIn("/usr/local/sbin/dmidecode -t slot", payload["sudo_commands"])
+        self.assertIn("/usr/bin/tail -n 4000 /var/log/messages", payload["sudo_commands"])
+        self.assertNotIn("/usr/sbin/mprutil -u 1 show expanders", payload["sudo_commands"])
 
     def test_build_sudoers_content_uses_bootstrap_seed_commands_for_scale(self) -> None:
         content = ServiceAccountBootstrapService._build_sudoers_content(

@@ -32,6 +32,7 @@ def _derive_runtime_layout_paths(config_path: str | Path) -> dict[str, str]:
         "runtime_overrides_file": str(config_root / "runtime-overrides.yaml"),
         "profile_file": str(config_root / "profiles.yaml"),
         "mapping_file": str(data_root / "slot_mappings.json"),
+        "sas_fabric_alias_file": str(data_root / "sas_fabric_aliases.json"),
         "slot_detail_cache_file": str(data_root / "slot_detail_cache.json"),
         "log_file": str(log_root / "app.log"),
         "known_hosts_path": str(data_root / "known_hosts"),
@@ -52,6 +53,10 @@ def _default_runtime_overrides_file() -> str:
 
 def _default_mapping_file() -> str:
     return _derive_runtime_layout_paths(_standard_runtime_config_path())["mapping_file"]
+
+
+def _default_sas_fabric_alias_file() -> str:
+    return _derive_runtime_layout_paths(_standard_runtime_config_path())["sas_fabric_alias_file"]
 
 
 def _default_slot_detail_cache_file() -> str:
@@ -358,6 +363,7 @@ class LayoutConfig(BaseModel):
 class PathConfig(BaseModel):
     runtime_overrides_file: str = Field(default_factory=_default_runtime_overrides_file)
     mapping_file: str = Field(default_factory=_default_mapping_file)
+    sas_fabric_alias_file: str = Field(default_factory=_default_sas_fabric_alias_file)
     log_file: str = Field(default_factory=_default_log_file)
     profile_file: str = Field(default_factory=_default_profile_file)
     slot_detail_cache_file: str = Field(default_factory=_default_slot_detail_cache_file)
@@ -468,6 +474,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "LAYOUT_SLOT_NUMBER_BASE": ("layout", "slot_number_base"),
     "LAYOUT_API_SLOT_NUMBER_BASE": ("layout", "api_slot_number_base"),
     "PATH_MAPPING_FILE": ("paths", "mapping_file"),
+    "PATH_SAS_FABRIC_ALIAS_FILE": ("paths", "sas_fabric_alias_file"),
     "PATH_LOG_FILE": ("paths", "log_file"),
     "PATH_PROFILE_FILE": ("paths", "profile_file"),
     "PATH_SLOT_DETAIL_CACHE_FILE": ("paths", "slot_detail_cache_file"),
@@ -784,7 +791,14 @@ def _apply_config_path_relative_defaults(
     merged["config_file"] = derived["config_file"]
 
     merged_paths = merged.setdefault("paths", {})
-    for key in ("mapping_file", "log_file", "profile_file", "slot_detail_cache_file", "runtime_overrides_file"):
+    for key in (
+        "mapping_file",
+        "sas_fabric_alias_file",
+        "log_file",
+        "profile_file",
+        "slot_detail_cache_file",
+        "runtime_overrides_file",
+    ):
         if key not in merged_paths or merged_paths.get(key) in {defaults["paths"][key], legacy[key]}:
             merged_paths[key] = derived[key]
 
@@ -956,6 +970,7 @@ def get_settings() -> Settings:
 
     settings = _normalize_systems(Settings.model_validate(merged))
     Path(settings.paths.mapping_file).parent.mkdir(parents=True, exist_ok=True)
+    Path(settings.paths.sas_fabric_alias_file).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.paths.log_file).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.paths.profile_file).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.paths.slot_detail_cache_file).parent.mkdir(parents=True, exist_ok=True)

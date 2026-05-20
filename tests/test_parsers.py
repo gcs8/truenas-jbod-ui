@@ -61,6 +61,19 @@ scbus13 on mpr1 bus 0:
         self.assertEqual(canonicalize_ssh_command("/usr/sbin/ubntstorage space inspect"), "ubntstorage space inspect")
         self.assertEqual(canonicalize_ssh_command("cat /sys/kernel/debug/gpio"), "gpio debug")
 
+    def test_canonicalize_core_pci_slot_commands(self) -> None:
+        self.assertEqual(canonicalize_ssh_command("/usr/sbin/pciconf -lv"), "pciconf -lv")
+        self.assertEqual(canonicalize_ssh_command("sudo -n /usr/local/sbin/dmidecode -t slot"), "dmidecode slot")
+        self.assertEqual(canonicalize_ssh_command("sudo -n /usr/local/sbin/dmidecode -t 9 || true"), "dmidecode slot")
+        self.assertEqual(
+            canonicalize_ssh_command("sysctl dev.mpr.0.%location dev.mpr.1.%parent"),
+            "mpr sysctl pci locations",
+        )
+        self.assertEqual(
+            canonicalize_ssh_command("sysctl -a | egrep '^dev\\.mpr\\.[0-9]+\\.%(location|parent):' || true"),
+            "mpr sysctl pci locations",
+        )
+
     def test_canonicalize_esxi_inventory_commands(self) -> None:
         self.assertEqual(canonicalize_ssh_command("esxcli storage core device list"), "esxcli storage core device list")
         self.assertEqual(canonicalize_ssh_command("esxcli storage vmfs extent list"), "esxcli storage vmfs extent list")

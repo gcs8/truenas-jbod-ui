@@ -16,28 +16,101 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   - `.\.venv\Scripts\python -m unittest tests.test_profiles tests.test_inventory tests.test_history_service tests.test_perf tests.test_perf_harness tests.test_snapshot_export tests.test_admin_service tests.test_release_status`
 - run the browser smoke suite against the live app:
   - `npx playwright test`
+- run hygiene checks before interpreting other diffs:
+  - `git diff --check`
+  - confirm this command emits no CRLF normalization warnings; `.gitattributes`
+    keeps repo text files LF-normalized on Windows and Linux
 - if the release includes recent Quantastor topology or cache work, sanity-check:
   - switch away from and back to the active Quantastor view
   - confirm mirrors do not briefly flatten into `disk > data`
   - confirm history does not log fake topology churn after middleware restarts or upgrades
-- if the branch is carrying perf work or suspected slowdown risk, run the
-  read-only harness against a local app build and save the output for
-  comparison:
+- run the release performance harnesses against the local release-candidate
+  stack and save the CSV-backed artifacts for comparison. If a harness is
+  intentionally skipped, record the reason in the release wrap:
   - `python scripts/run_perf_harness.py --base-url http://127.0.0.1:8080 --iterations 3 --format markdown --label release-candidate`
-  - compare the generated `data/perf/latest.md` and `data/perf/history.csv`
+  - `python scripts/run_history_perf_harness.py --base-url http://127.0.0.1:8081 --iterations 3 --format markdown --label release-candidate-history`
+  - compare the generated `data/perf/latest.md`, `data/perf/history.csv`,
+    `data/history-perf/latest.md`, and `data/history-perf/history.csv`
 - rebuild the Docker image from the current branch tip:
   - `docker compose -f docker-compose.dev.yml up -d --build`
 - confirm the app is healthy:
   - `curl http://localhost:8080/livez`
   - `curl http://localhost:8080/healthz`
-- validate the optional-sidecar runtime modes:
-  - stop `enclosure-admin` and `enclosure-history`, then confirm
-    `enclosure-ui` still works as a standalone deployment
-  - bring `enclosure-history` back while keeping `enclosure-admin` stopped, and
-    confirm the UI still works normally with history-enhanced paths available
-  - with the admin sidecar up, confirm the `Runtime Control` cards show
-    `Running` plus `Latest` versions and settle back to a clean aligned state
-    after startup or sidecar restarts
+- validate every optional-sidecar runtime mode from the same branch tip:
+  - **UI only:** stop `enclosure-history` and `enclosure-admin`, keep
+    `enclosure-ui` running, then confirm `:8080/livez`, `:8080/healthz`, and
+    the browser smoke path still work without either sidecar
+  - **UI + history:** run `enclosure-ui` plus `enclosure-history`, keep
+    `enclosure-admin` stopped, then confirm `:8080/livez`, `:8081/livez`,
+    `:8081/healthz`, `/api/history/status`, and history-enhanced UI paths
+  - **UI + admin:** run `enclosure-ui` plus `enclosure-admin`, keep
+    `enclosure-history` stopped, then confirm `:8080/livez`, `:8082/livez`,
+    `:8082/healthz`, admin setup/maintenance surfaces, and runtime cards for
+    the intentionally stopped history sidecar
+  - **UI + history + admin:** run all three services, then confirm UI,
+    history, and admin health plus `Runtime Control` cards showing aligned
+    running versions after startup or sidecar restarts
+- run the Linux QA Docker restore release gate before ship/no-ship:
+  - export a full backup from the long-running local Windows Docker admin API,
+    not by copying host folders. Use the default restore-grade path set:
+    `config_file`, `runtime_overrides_file`, `profile_file`, `mapping_file`,
+    `sas_fabric_alias_file`, `slot_detail_file`, and `history_db`
+  - example export request:
+    `POST http://127.0.0.1:8082/api/admin/backup/export?stop_services=false&restart_services=true`
+    with JSON body
+    `{"encrypt":false,"packaging":"tar.zst","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db"]}`
+  - copy that exported bundle to the Linux release target
+  - create a disposable QA Docker stack on the Linux target using the current
+    release-candidate source/image, a separate Compose project name, separate
+    runtime directories, and a different port range such as
+    `APP_PORT=18080`, `HISTORY_PORT=18081`, `ADMIN_PORT=18082`, and
+    `HISTORY_BIND_ADDRESS=0.0.0.0`
+  - import the backup through the disposable Linux admin API:
+    `POST http://127.0.0.1:18082/api/admin/backup/import?stop_services=true&restart_services=true`
+    with the exported bundle as `application/octet-stream`
+  - confirm the restored Linux QA stack has the expected systems, profiles,
+    storage views, runtime overrides, SAS Fabric aliases, slot-detail cache,
+    history DB counts, and healthy UI/history/admin `/livez` and `/healthz`
+  - if live validation requires local secret material such as SSH keys, TLS
+    trust, or known-hosts files, restore it through an encrypted backup or copy
+    it only into the isolated QA runtime directory. Do not bind-mount the
+    long-running deployment's config directories into the disposable stack
+  - run the browser smoke suite against the restored Linux QA stack, including
+    admin smoke where available:
+    `PLAYWRIGHT_BASE_URL=http://<linux-target>:18080`
+    and `PLAYWRIGHT_ADMIN_BASE_URL=http://<linux-target>:18082`
+  - after import, wait for any restored history/background collector pass to
+    finish before running perf. Check `:18081/healthz` and do not start the
+    main or history perf harness while `collection_running=true`
+  - run both perf harnesses against the restored Linux QA stack and record
+    Linux-specific labels in the local or target CSV trails:
+    `release-candidate-linux-qa-restore` and
+    `release-candidate-history-linux-qa-restore`
+  - avoid running the main and history perf harnesses in parallel against the
+    restored QA stack. The history sidecar may kick off forced inventory/SMART
+    work after restore, and that can make the main harness time out on forced
+    inventory. If this happens, wait for the collector to settle and rerun the
+    affected harness; record the collision in the release wrap
+  - when summarizing SAS Fabric diagnostics from API JSON, use the current
+    `kernel_diagnostics` payload on controller objects, not an older
+    `diagnostics` field name, so event-table evidence is not accidentally
+    reported as missing
+  - run snapshot export estimate and download against the restored Linux QA UI,
+    including at least one packaging change such as Auto to Force ZIP, and
+    verify the exported offline artifact opens with `qa/offline-snapshot.spec.js`
+    or an equivalent browser smoke
+  - run feature-specific release checks that are not covered by the generic
+    suites. For `0.20.0`, that includes restored `/api/sas-fabric`, dedicated
+    `/sas-fabric`, Disk Path fault evidence, decoded event-table pagination,
+    and SAS Fabric alias persistence
+  - save Linux QA evidence under a versioned artifact folder and keep the
+    disposable QA stack available until the post-publish deployment sniff test
+    passes
+  - do not keep raw admin import/export responses as evidence unless they are
+    scrubbed. Import responses can echo configured systems and secret-bearing
+    fields; keep summarized counts/status instead
+  - recheck the long-running Windows and Linux stacks were not disturbed by the
+    disposable restore work
 - sanity-check the validated platform views in the live UI:
   - CORE
   - SCALE
@@ -172,6 +245,13 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   - `ghcr.io/gcs8/truenas-jbod-ui:vX.Y.Z`
   - `ghcr.io/gcs8/truenas-jbod-ui:X.Y.Z`
   - `ghcr.io/gcs8/truenas-jbod-ui:latest`
+- after the new image is available, update the real long-running deployments
+  cleanly and record a final sniff test for each one:
+  - local Windows Docker stack
+  - Linux Docker stack
+  - production deployment
+  - confirm the expected tag/digest/version, service health, and the primary UI
+    smoke path on each instance
 - if the GitHub plugin is available in Codex, prefer it for GitHub-side actions
   like PRs, issues, or release-page prep
 
@@ -180,4 +260,7 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - confirm the pushed tag matches the intended commit
 - confirm the GitHub README renders the new screenshots correctly
 - confirm the wiki publish completed if applicable
+- after local, Linux, and production deployments are all current and healthy,
+  tear down only the temporary Linux QA restore containers, networks, and
+  scratch runtime directories
 - start a new `Unreleased` section in `CHANGELOG.md` for follow-up work

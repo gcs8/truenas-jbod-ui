@@ -5,6 +5,7 @@ from app.services.inventory import InventoryService
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import ProfileRegistry
 from app.services.quantastor_api import QuantastorRESTClient
+from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.ssh_probe import SSHProbe
 from app.services.slot_detail_store import SlotDetailStore
 from app.services.supermicro_bmc import SupermicroBMCService
@@ -17,6 +18,7 @@ class InventoryRegistry:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.mapping_store = MappingStore(settings.paths.mapping_file)
+        self.sas_fabric_alias_store = SasFabricAliasStore(settings.paths.sas_fabric_alias_file)
         self.profile_registry = ProfileRegistry(settings)
         self.slot_detail_store = SlotDetailStore(settings.paths.slot_detail_cache_file)
         self._services: dict[str, InventoryService] = {}
@@ -45,6 +47,7 @@ class InventoryRegistry:
                 mapping_store=self.mapping_store,
                 profile_registry=self.profile_registry,
                 slot_detail_store=self.slot_detail_store,
+                sas_fabric_alias_store=self.sas_fabric_alias_store,
             )
             self._services[system.id] = service
         return service

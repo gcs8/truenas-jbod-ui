@@ -85,6 +85,8 @@ It gives you:
 - profile-driven enclosure layouts
 - heat-map overlays for temperature, activity, endurance, risk, and other
   numeric metrics
+- read-only SAS Fabric topology and path diagnostics for validated TrueNAS CORE
+  MPR HBA systems
 - published-image Docker Compose install and update commands
 - optional history, admin, backup, restore, and debug workflows once the main
   read view is working
@@ -114,12 +116,13 @@ setup notes.
 
 ## Current Version
 
-`0.19.0` is the current stable release. Its headline feature is the static
-[[Public Demo Site|Public-Demo-Site]] plus more robust offline snapshot export
-for saved views and whole-system enclosure captures.
+`0.20.0` is the current stable release. Its headline feature is the first
+read-only SAS Fabric topology and diagnostics workspace for validated TrueNAS
+CORE MPR HBA systems.
 
-The public demo is a static GitHub Pages sample data experience, not a hosted
-copy of the live Docker app. Open https://gcs8.github.io/truenas-jbod-ui/.
+The public demo from `0.19.0` remains a static GitHub Pages sample data
+experience, not a hosted copy of the live Docker app. Open
+https://gcs8.github.io/truenas-jbod-ui/.
 
 For older release-by-release detail, use the project changelog and GitHub
 releases instead of treating the wiki home page as release notes.

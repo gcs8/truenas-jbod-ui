@@ -262,6 +262,12 @@
             <button class="button secondary small" id="heatmap-toggle-button" type="button" aria-pressed="false">
               Heat Map
             </button>
+            <button class="button secondary small" id="sas-fabric-toggle-button" type="button" aria-expanded="false">
+              Topology
+            </button>
+            <a class="button secondary small" id="sas-fabric-view-link" href="/sas-fabric">
+              SAS Fabric
+            </a>
             <div id="heatmap-controls" class="heatmap-controls hidden">
               <label class="field heatmap-control-field heatmap-metric-field" id="heatmap-metric-field">
                 <span>Metric</span>
@@ -333,6 +339,32 @@
               <span class="front-handle"></span>
             </div>
           </div>
+        </div>
+      </section>
+
+      <section id="sas-fabric-panel" class="panel sas-fabric-panel hidden" aria-live="polite">
+        <div class="panel-header compact">
+          <div>
+            <h2>SAS Fabric</h2>
+            <p id="sas-fabric-summary" class="subtle">Read-only HBA, path, SES, and bay topology.</p>
+          </div>
+          <div class="panel-header-actions">
+            <button class="button secondary small" id="sas-fabric-refresh-button" type="button">
+              Refresh Fabric
+            </button>
+          </div>
+        </div>
+        <div id="sas-fabric-status" class="warning-item muted compact">
+          Open topology to load the current SAS fabric.
+        </div>
+        <div class="sas-fabric-layout">
+          <div class="sas-fabric-map" id="sas-fabric-lanes"></div>
+          <aside class="sas-fabric-inspector">
+            <h3 id="sas-fabric-inspector-title">Fabric Inspector</h3>
+            <div id="sas-fabric-inspector-body" class="sas-fabric-inspector-body">
+              Select a controller, path, or bay to trace connectivity.
+            </div>
+          </aside>
         </div>
       </section>
 

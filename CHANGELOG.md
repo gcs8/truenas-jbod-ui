@@ -1,8 +1,65 @@
 # Changelog
 
-## Unreleased
+## v0.20.0 - 2026-05-20
 
-- next development slice starts here
+### Added
+
+- first read-only SAS Fabric API and UI foundation for TrueNAS CORE systems:
+  CORE `mprutil` parser helpers, automatic `mprutil show adapters` seed
+  probing, dynamic per-HBA `mprutil -u N show ...` discovery, normalized
+  host/controller/path/SES/bay graph models, and `/api/sas-fabric`.
+- main-page `Topology` panel and dedicated `/sas-fabric` workspace with
+  `Fabric Lanes`, `Impact Map`, `Physical Trace`, and `Disk Path` modes.
+- richer SAS Fabric trace correlation from CORE `mprutil show devices`,
+  `show enclosures`, and `show expanders`, threading selected bays and paths
+  through inferred MPR expander/enclosure hops.
+- persisted friendly aliases for SAS Fabric controllers, paths, expanders,
+  enclosures, backplanes, and traces, with an inline dedicated-view editor and
+  raw labels retained.
+- HBA PCIe slot enrichment from CORE `pciconf -lv`, `dmidecode -t slot`, and
+  `sysctl dev.mpr.N.%location/%parent` evidence.
+- SAS Fabric Disk Path diagnostics now collect a non-sudo CORE `dmesg` MPR/CAM
+  event slice or timestamped `/var/log/messages` rows through the narrow
+  optional tail rule, then surface recent IOC terminated, CAM error, retry,
+  NAK, timeout, and connection-loss evidence on the affected path.
+- source-scoped SAS diagnostic decoder modules for common SCSI CDB, CAM
+  status, SCSI status, sense ASC/ASCQ, retry, LOG SENSE, SAS PHY concepts, and
+  Broadcom/LSI `loginfo` evidence.
+- decoder source/confidence metadata for `standard`, `standard-partial`,
+  `vendor-reference`, `vendor-reference-partial`, `observed`, and
+  `unconfirmed` rows, plus a source inventory in
+  `docs/SAS_DIAGNOSTIC_DECODER_SOURCES.md`.
+- broader T10-backed decoder coverage for standard service-action opcodes,
+  12-byte service-action commands, third-party copy/attribute commands, and
+  peripheral write-fault ASC/ASCQ values.
+- `docs/RELEASE_NOTES_0.20.0.md` and `docs/RELEASE_WRAP_0.20.0.md` as the
+  draft closeout spine for the SAS Fabric release.
+
+### Changed
+
+- CORE admin setup defaults, permission preview, and one-time bootstrap push
+  now use a consistent TrueNAS CORE `midclt call user.update ...` payload for
+  read-only `mprutil` topology diagnostics, including wildcarded per-HBA
+  `mprutil -u * show ...` forms instead of a broad `mprutil *` rule.
+- the dedicated decoded event table now displays individual kernel events with
+  time/order, paging, number buttons, text filtering, and event-type filtering,
+  while grouped counts stay in the top finding chips.
+- Disk Path now renders all path branches first and scopes fault evidence to
+  the affected path leg, keeping healthy `mpr1 active` context separate from
+  `mpr0` fault evidence.
+- Fabric Lanes and Physical Trace related rows now use stable/natural ordering
+  for expanders, SES/MPR enclosure cards, and bay traces.
+
+### Fixed
+
+- Physical Trace controller selection no longer collapses the selected
+  component card into the trace-step index column.
+- Physical Trace breadcrumbs now rewind/de-duplicate instead of recursing into
+  repeated trace paths.
+- decoded `Full event table` open/closed state now survives unrelated
+  dedicated-view re-renders such as alias-editor open/cancel.
+- SCSI opcode labels now match the T10 numeric list for `B5` / `B6` instead of
+  mislabeling `SECURITY PROTOCOL OUT`.
 
 ## v0.19.0 - 2026-05-16
 

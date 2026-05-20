@@ -271,7 +271,7 @@ If you want the full current web UI feature set on this CORE box, use this
 combined allow-list:
 
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/usr/local/sbin/smartctl -x -j *","/usr/local/sbin/smartctl -x *"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/usr/local/sbin/smartctl -x -j *","/usr/local/sbin/smartctl -x *","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil -u * show adapter","/usr/sbin/mprutil -u * show all","/usr/sbin/mprutil -u * show devices","/usr/sbin/mprutil -u * show enclosures","/usr/sbin/mprutil -u * show expanders","/usr/sbin/mprutil -u * show iocfacts","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages"]}'
 ```
 
 That enables:
@@ -282,12 +282,26 @@ That enables:
 - multipath controller labels such as `mpr0` and `mpr1` through
   `camcontrol devlist -v`
 - on-demand per-slot SMART detail through `smartctl`
+- SAS fabric/topology diagnostics through read-only `mprutil` commands,
+  including wildcarded per-HBA `mprutil -u N show ...` reads
+- HBA PCIe slot labels through read-only `dmidecode -t slot` output joined to
+  `pciconf -lv` PCI addresses
+- MPR kernel PCI topology hints through filtered `sysctl dev.mpr.N.%location`
+  and `%parent` output
+- recent SAS/CAM kernel event evidence through a filtered `/var/log/messages`
+  read with `dmesg` fallback. If `/var/log/messages` is readable by the
+  service user, no sudo is used; if it is root-only, timestamped syslog rows
+  require the narrow `/usr/bin/tail -n 4000 /var/log/messages` permission.
+  Without that permission, the app still falls back to `dmesg -a` event order.
 
-On `The-Archive` as of April 19, 2026:
+On `The-Archive` as of May 19, 2026:
 
 - `midclt` rejects nonexistent command paths in `sudo_commands`
 - `/usr/local/sbin/smartctl` exists
 - `/usr/sbin/smartctl` does not exist
+- `/usr/sbin/mprutil` exists
+- `/var/log/messages` is `0600 root:wheel`, so wall-clock MPR/CAM timestamps
+  need the narrow `/usr/bin/tail -n 4000 /var/log/messages` sudo entry
 
 So the working host-specific allow-list above includes only the
 `/usr/local/sbin/smartctl` entries. On another CORE build, check the real path
@@ -304,21 +318,26 @@ broadly.
 
 On `The-Archive`, that wildcard-shaped `sesutil locate` allowance was manually
 validated on April 19, 2026 by toggling the slot identify LEDs successfully on
-slots `0` and `6`.
+slots `0` and `6`. The wildcard-shaped `mprutil -u * show ...` allowances were
+validated on May 19, 2026 against both `mpr0` and `mpr1` through the app's
+normal SSH path; parser coverage also pins multi-digit adapter units such as
+`mpr10` so the discovery path is not limited to two controllers.
 
 ## Important Behavior On This CORE Build
 
-On `The-Archive` as of April 19, 2026, the middleware accepts:
+On `The-Archive` as of May 19, 2026, the middleware accepts:
 
 - `sudo=true`
 - `sudo_nopasswd=true`
-- exact `sudo_commands` entries for `sesutil`, `camcontrol`, and
-  `/usr/local/sbin/smartctl`
+- exact `sudo_commands` entries for `sesutil`, `camcontrol`,
+  `/usr/local/sbin/smartctl`, and read-only `mprutil` diagnostics
 
 and the resulting SSH behavior now supports passwordless command-limited sudo:
 
 - `su - jbodmap -c 'sudo -n /usr/local/sbin/smartctl -x -j /dev/da95'`
   returns SMART JSON successfully
+- app-path probes such as `sudo -n /usr/sbin/mprutil -u 1 show expanders`
+  return SAS topology data successfully
 
 What still matters on this same system:
 
@@ -336,8 +355,8 @@ Because of that, the preferred least-privilege path on this system is:
 1. keep the dedicated non-root key-based SSH user
 2. set `sudo=true`
 3. set `sudo_nopasswd=true`
-4. keep `sudo_commands` restricted to the exact SES, `camcontrol`, and
-   `smartctl` commands needed
+4. keep `sudo_commands` restricted to the exact SES, `camcontrol`,
+   `smartctl`, and read-only `mprutil` commands needed
 5. use only command paths that actually exist on the host
 6. validate with `sudo -n` before relying on the app
 
@@ -366,7 +385,7 @@ Once manual SSH tests succeed, set:
 
 ```env
 SSH_ENABLED=true
-SSH_HOST=10.13.37.10
+SSH_HOST=truenas-core-a.example.local
 SSH_PORT=22
 SSH_USER=jbodmap
 SSH_KEY_PATH=/run/ssh/id_truenas
@@ -399,20 +418,40 @@ commands:
   - /sbin/glabel status
   - /usr/local/sbin/zpool status -gP
   - gmultipath list
+  - sudo -n /sbin/camcontrol devlist -v
   - sudo -n /usr/sbin/sesutil map
   - sudo -n /usr/sbin/sesutil show
+  - sudo -n /usr/sbin/mprutil show adapters
+  - sudo -n /usr/sbin/mprutil show adapter
+  - sudo -n /usr/sbin/mprutil show devices
+  - sudo -n /usr/sbin/mprutil show enclosures
+  - sudo -n /usr/sbin/mprutil show expanders
+  - sudo -n /usr/sbin/mprutil show iocfacts
+  - /usr/sbin/pciconf -lv
+  - sysctl -a 2>/dev/null | egrep '^dev\.mpr\.[0-9]+\.%(location|parent):' || true
+  - sudo -n /usr/local/sbin/dmidecode -t slot
+  - messages=$({ tail -n 4000 /var/log/messages 2>/dev/null || sudo -n /usr/bin/tail -n 4000 /var/log/messages 2>/dev/null || true; } | egrep '(mpr[0-9]+:|\(da[0-9]+:mpr[0-9]+:)' || true); if [ -n "$messages" ]; then printf '%s\n' "$messages" | tail -n 400; else dmesg -a | egrep '(mpr[0-9]+:|\(da[0-9]+:mpr[0-9]+:)' | tail -n 400; fi
 ```
 
 Optional:
 
 ```yaml
-  - sudo -n /sbin/camcontrol devlist -v
   - sudo -n /usr/sbin/sesutil locate -u /dev/ses4 16 on
   - sudo -n /usr/sbin/sesutil locate -u /dev/ses4 16 off
 ```
 
-`camcontrol devlist -v` is the safest optional add-on if you want the app to
-label multipath member paths with controller names such as `mpr0` and `mpr1`.
+`camcontrol devlist -v` labels multipath member paths with controller names
+such as `mpr0` and `mpr1`. `mprutil` adds the read-only controller, expander,
+enclosure, and per-HBA source material needed by the SAS fabric/topology view.
+`pciconf -lv` plus `dmidecode -t slot` labels HBAs with physical motherboard
+slots such as `CPU2 SLOT1 PCI-E 3.0 X8`. The filtered `sysctl` command adds
+kernel PCI topology hints like `dbsf=pci0:130:0:0`; its `slot=0` field is the
+PCI device slot/function address, not the motherboard slot label. The filtered
+`/var/log/messages` command adds timestamped recent kernel evidence such as
+IOC terminations, CAM errors, retries, NAKs, timeouts, and connection loss.
+When the file is root-only, the command uses the narrow
+`/usr/bin/tail -n 4000 /var/log/messages` sudo allow-list entry; when that is
+not available, the same command falls back to `dmesg -a` event order.
 
 If another TrueNAS CORE build requires passworded command-limited sudo instead
 of `nopasswd`, keep the same command list and also set:

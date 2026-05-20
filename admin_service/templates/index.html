@@ -356,7 +356,7 @@
               </p>
               <label class="field field-span">
                 <span>Custom TLS Trust Bundle Path</span>
-                <input id="setup-tls-ca-bundle-path" type="text" placeholder="Optional PEM bundle path, for example /app/config/tls/archive-core.pem">
+                <input id="setup-tls-ca-bundle-path" type="text" placeholder="Optional PEM bundle path, for example /app/config/tls/truenas-core.pem">
               </label>
               <label class="field field-span">
                 <span>TLS Verify Hostname</span>
@@ -401,7 +401,7 @@
               <div class="form-grid">
                 <label class="field field-span">
                   <span>BMC Host</span>
-                  <input id="setup-bmc-host" data-bmc-field type="text" placeholder="https://10.13.0.20 or 10.13.0.20">
+                  <input id="setup-bmc-host" data-bmc-field type="text" placeholder="https://bmc.example.local or 192.0.2.20">
                 </label>
                 <label class="field">
                   <span>BMC Username</span>
@@ -563,7 +563,7 @@
                 </label>
                 <label class="field field-span">
                   <span>Node 1 SSH Host</span>
-                  <input data-ha-node-host="0" type="text" placeholder="10.13.37.30">
+                  <input data-ha-node-host="0" type="text" placeholder="192.0.2.30">
                 </label>
 
                 <label class="field">
@@ -576,7 +576,7 @@
                 </label>
                 <label class="field field-span">
                   <span>Node 2 SSH Host</span>
-                  <input data-ha-node-host="1" type="text" placeholder="10.13.37.31">
+                  <input data-ha-node-host="1" type="text" placeholder="192.0.2.31">
                 </label>
 
                 <label class="field">
@@ -634,7 +634,8 @@
                   <h3>One-Time Bootstrap</h3>
                   <p id="setup-bootstrap-copy" class="subtle">
                     Use temporary root or installer credentials once to create the final service account,
-                    install the selected public key, and optionally write limited sudo rules.
+                    install the selected public key, and optionally apply the shown TrueNAS CORE
+                    <code>midclt</code> permission command.
                   </p>
                 </div>
               </div>
@@ -666,7 +667,7 @@
                 </label>
                 <label class="toggle">
                   <input id="setup-bootstrap-install-sudo" data-ssh-field data-bootstrap-field type="checkbox" checked>
-                  <span>Install command-limited sudo rules for the final service account</span>
+                  <span>Install command-limited permissions for the final service account</span>
                 </label>
               </div>
               <p class="subtle action-note">
@@ -681,11 +682,11 @@
               </p>
               <div class="sudoers-preview-panel">
                 <div class="preview-card-header">
-                  <h4>Proposed Sudoers File</h4>
+                  <h4>Proposed Permission Update</h4>
                   <span id="setup-bootstrap-sudoers-name" class="badge">truenas-jbod-ui-jbodmap</span>
                 </div>
                 <p id="setup-bootstrap-sudoers-detail" class="subtle action-note">
-                  This is the exact command-limited sudoers content bootstrap would write for the final service account.
+                  This is the exact command-limited permission update bootstrap would apply for the final service account.
                 </p>
                 <pre id="setup-bootstrap-sudoers-preview" class="sudoers-preview"># Building sudoers preview...</pre>
               </div>
@@ -734,9 +735,9 @@
             </label>
             <p id="setup-ssh-commands-note" class="subtle action-note">
               These are the exact SSH commands the app runs. When you use the one-time bootstrap, any
-              <code>sudo -n ...</code> lines here are also converted into <code>NOPASSWD</code> sudo rules
-              for the final service account, with the platform's on-demand smartctl and LED-control
-              extras kept in place.
+              <code>sudo -n ...</code> lines here are also converted into the CORE
+              <code>midclt user.update</code> permission payload, with on-demand SMART, LED-control,
+              and topology diagnostic extras kept in place.
             </p>
             <div class="button-row">
               <button id="setup-load-recommended-button" class="button secondary small" data-ssh-field type="button">Load Recommended Runtime Commands</button>

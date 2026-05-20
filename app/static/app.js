@@ -177,6 +177,18 @@
       pendingScopeKey: null,
       requestToken: 0,
     },
+    sasFabric: {
+      open: false,
+      loading: false,
+      error: null,
+      data: null,
+      scopeKey: null,
+      pendingScopeKey: null,
+      selectedTraceId: null,
+      selectedNodeId: null,
+      expandedSlotLists: {},
+      requestToken: 0,
+    },
   };
 
   const grid = document.getElementById("slot-grid");
@@ -207,6 +219,15 @@
   const heatmapLegendMin = document.getElementById("heatmap-legend-min");
   const heatmapLegendMax = document.getElementById("heatmap-legend-max");
   const heatmapLegendStatus = document.getElementById("heatmap-legend-status");
+  const sasFabricToggleButton = document.getElementById("sas-fabric-toggle-button");
+  const sasFabricViewLink = document.getElementById("sas-fabric-view-link");
+  const sasFabricPanel = document.getElementById("sas-fabric-panel");
+  const sasFabricRefreshButton = document.getElementById("sas-fabric-refresh-button");
+  const sasFabricSummary = document.getElementById("sas-fabric-summary");
+  const sasFabricStatus = document.getElementById("sas-fabric-status");
+  const sasFabricLanes = document.getElementById("sas-fabric-lanes");
+  const sasFabricInspectorTitle = document.getElementById("sas-fabric-inspector-title");
+  const sasFabricInspectorBody = document.getElementById("sas-fabric-inspector-body");
   const chassisShell = document.getElementById("chassis-shell");
   const slotTooltipEl = document.getElementById("slot-tooltip");
   const detailEmpty = document.getElementById("detail-empty");
@@ -1625,6 +1646,661 @@
   function buildScopedUrl(url) {
     const params = buildSelectionParams();
     return params.toString() ? `${url}?${params.toString()}` : url;
+  }
+
+  function updateSasFabricViewLink() {
+    if (!sasFabricViewLink) {
+      return;
+    }
+    sasFabricViewLink.href = buildScopedUrl("/sas-fabric");
+  }
+
+  function sasFabricList(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
+  function sasFabricClassToken(value) {
+    return String(value || "unknown").toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+  }
+
+  function sasFabricScopeKey() {
+    return buildSelectionParams().toString() || "default";
+  }
+
+  function resetSasFabricData() {
+    state.sasFabric.loading = false;
+    state.sasFabric.error = null;
+    state.sasFabric.data = null;
+    state.sasFabric.scopeKey = null;
+    state.sasFabric.pendingScopeKey = null;
+    state.sasFabric.selectedTraceId = null;
+    state.sasFabric.selectedNodeId = null;
+    state.sasFabric.expandedSlotLists = {};
+    state.sasFabric.requestToken += 1;
+  }
+
+  function sasFabricNodeMap(fabric = state.sasFabric.data) {
+    return new Map(sasFabricList(fabric?.nodes).map((node) => [node.id, node]));
+  }
+
+  function sasFabricTraceMap(fabric = state.sasFabric.data) {
+    return new Map(sasFabricList(fabric?.traces).map((trace) => [trace.id, trace]));
+  }
+
+  function sasFabricTraceById(traceId, fabric = state.sasFabric.data) {
+    if (!traceId) {
+      return null;
+    }
+    return sasFabricTraceMap(fabric).get(traceId) || null;
+  }
+
+  function sasFabricNodeById(nodeId, fabric = state.sasFabric.data) {
+    if (!nodeId) {
+      return null;
+    }
+    return sasFabricNodeMap(fabric).get(nodeId) || null;
+  }
+
+  function sasFabricDisplayLabel(item) {
+    return item?.display_label || item?.alias || item?.label || item?.name || item?.id || "";
+  }
+
+  function sasFabricSortedSlots(slots) {
+    return Array.from(new Set(sasFabricList(slots)
+      .map((slot) => Number(slot))
+      .filter((slot) => Number.isInteger(slot))))
+      .sort((left, right) => left - right);
+  }
+
+  function sasFabricSlotsOverlap(left, right) {
+    const rightSet = right instanceof Set ? right : new Set(sasFabricSortedSlots(right));
+    return sasFabricSortedSlots(left).some((slot) => rightSet.has(slot));
+  }
+
+  function defaultSasFabricTraceId(fabric = state.sasFabric.data) {
+    const traces = sasFabricList(fabric?.traces);
+    if (!traces.length) {
+      return null;
+    }
+    if (Number.isInteger(state.selectedSlot)) {
+      const bayTraceId = `bay:${state.selectedSlot}`;
+      if (traces.some((trace) => trace.id === bayTraceId)) {
+        return bayTraceId;
+      }
+    }
+    const degradedPath = traces.find((trace) => {
+      if (trace.kind !== "path") {
+        return false;
+      }
+      const stateName = sasFabricClassToken(trace.metrics?.state || trace.status || trace.label);
+      return !["active", "online", "passive", "standby"].includes(stateName);
+    });
+    if (degradedPath) {
+      return degradedPath.id;
+    }
+    const firstPath = traces.find((trace) => trace.kind === "path");
+    return (firstPath || traces[0]).id;
+  }
+
+  function resolveSasFabricTraceId(traceId, fabric = state.sasFabric.data) {
+    if (traceId && sasFabricTraceById(traceId, fabric)) {
+      return traceId;
+    }
+    return defaultSasFabricTraceId(fabric);
+  }
+
+  function selectedSasFabricTrace() {
+    return sasFabricTraceById(state.sasFabric.selectedTraceId);
+  }
+
+  function selectedSasFabricNode() {
+    return sasFabricNodeById(state.sasFabric.selectedNodeId);
+  }
+
+  function sasFabricSelectedSlotSet() {
+    if (!state.sasFabric.open) {
+      return new Set();
+    }
+    const trace = selectedSasFabricTrace();
+    if (trace) {
+      return new Set(sasFabricSortedSlots(trace.slots));
+    }
+    const node = selectedSasFabricNode();
+    if (node) {
+      return new Set(sasFabricSortedSlots(node.related_slots));
+    }
+    return new Set();
+  }
+
+  function syncSasFabricTraceToSlot(slotNumber) {
+    if (!Number.isInteger(slotNumber) || !state.sasFabric.data) {
+      return;
+    }
+    const traceId = `bay:${slotNumber}`;
+    if (sasFabricTraceById(traceId)) {
+      state.sasFabric.selectedTraceId = traceId;
+      state.sasFabric.selectedNodeId = null;
+    }
+  }
+
+  function clearSasFabricBaySelection() {
+    const trace = selectedSasFabricTrace();
+    if (trace?.kind === "bay") {
+      state.sasFabric.selectedTraceId = defaultSasFabricTraceId();
+    }
+  }
+
+  function selectSasFabricTrace(traceId, { syncSlot = true } = {}) {
+    const trace = sasFabricTraceById(traceId);
+    if (!trace) {
+      return;
+    }
+    state.sasFabric.selectedTraceId = trace.id;
+    state.sasFabric.selectedNodeId = null;
+    const slots = sasFabricSortedSlots(trace.slots);
+    if (syncSlot && trace.kind === "bay" && slots.length === 1) {
+      state.selectedSlot = slots[0];
+      state.history.panelError = null;
+    }
+    renderAll();
+  }
+
+  function selectSasFabricNode(nodeId) {
+    if (!sasFabricNodeById(nodeId)) {
+      return;
+    }
+    state.sasFabric.selectedNodeId = nodeId;
+    state.sasFabric.selectedTraceId = null;
+    renderAll();
+  }
+
+  function selectSasFabricSlot(slotNumber) {
+    if (!Number.isInteger(slotNumber)) {
+      return;
+    }
+    syncSasFabricTraceToSlot(slotNumber);
+    selectSlot(slotNumber);
+  }
+
+  function sasFabricSelectionTouchesNode(nodeId) {
+    const trace = selectedSasFabricTrace();
+    if (trace && sasFabricList(trace.node_ids).includes(nodeId)) {
+      return true;
+    }
+    return state.sasFabric.selectedNodeId === nodeId;
+  }
+
+  function sasFabricSelectionTouchesSlots(slots) {
+    const selectedSlots = sasFabricSelectedSlotSet();
+    return selectedSlots.size > 0 && sasFabricSlotsOverlap(slots, selectedSlots);
+  }
+
+  function formatSasFabricKind(kind) {
+    return String(kind || "item")
+      .replace(/-/g, " ")
+      .replace(/\b\w/g, (letter) => letter.toUpperCase())
+      .replace("Mpr", "MPR")
+      .replace("Ses", "SES");
+  }
+
+  function formatSasFabricSlots(slots, limit = 24) {
+    const sorted = sasFabricSortedSlots(slots);
+    if (!sorted.length) {
+      return "n/a";
+    }
+    const visible = sorted.slice(0, limit).map(formatSlotLabel).join(", ");
+    return sorted.length > limit ? `${visible}, +${sorted.length - limit}` : visible;
+  }
+
+  function renderSasFabricSlotList(slots, { limit = 24, expandKey = null } = {}) {
+    const sorted = sasFabricSortedSlots(slots);
+    if (!sorted.length) {
+      return "n/a";
+    }
+    const expanded = expandKey && state.sasFabric.expandedSlotLists[expandKey];
+    const visible = expanded ? sorted : sorted.slice(0, limit);
+    const visibleText = escapeHtml(visible.map(formatSlotLabel).join(", "));
+    const overflow = sorted.length - visible.length;
+    if (!expandKey || overflow <= 0) {
+      return visibleText;
+    }
+    return `${visibleText}, <span class="sas-fabric-slot-overflow" role="button" tabindex="0" data-sas-fabric-expand-slots="${escapeHtml(expandKey)}">+${overflow}</span>`;
+  }
+
+  function toggleSasFabricSlotList(expandKey) {
+    if (!expandKey) {
+      return;
+    }
+    state.sasFabric.expandedSlotLists[expandKey] = !state.sasFabric.expandedSlotLists[expandKey];
+    renderAll();
+  }
+
+  function formatSasFabricValue(value) {
+    if (value === null || value === undefined || value === "") {
+      return "n/a";
+    }
+    if (typeof value === "boolean") {
+      return value ? "yes" : "no";
+    }
+    if (Array.isArray(value)) {
+      const values = value.filter((entry) => entry !== null && entry !== undefined && entry !== "");
+      if (!values.length) {
+        return "n/a";
+      }
+      if (values.every((entry) => typeof entry !== "object")) {
+        return values.join(", ");
+      }
+      return `${values.length} record${values.length === 1 ? "" : "s"}`;
+    }
+    if (typeof value === "object") {
+      const entries = Object.entries(value)
+        .filter(([key, entryValue]) => (
+          !["top_findings", "primary_fault", "recent_events", "decoded_records", "event_table"].includes(key)
+          && entryValue !== null
+          && entryValue !== undefined
+          && entryValue !== ""
+        ));
+      return entries.length
+        ? entries.map(([key, entryValue]) => `${key}: ${formatSasFabricValue(entryValue)}`).join(", ")
+        : "n/a";
+    }
+    return String(value);
+  }
+
+  function sasFabricMetricRows(metrics, labels = {}) {
+    return Object.entries(metrics || {})
+      .filter(([, value]) => value !== null && value !== undefined && value !== "" && !Array.isArray(value))
+      .slice(0, 8)
+      .map(([key, value]) => kvRow(labels[key] || key.replace(/_/g, " "), formatSasFabricValue(value)))
+      .join("");
+  }
+
+  function sasFabricNodeMeta(node, fallback = {}) {
+    const metrics = node?.metrics || {};
+    const parts = [
+      fallback.pcie_slot || metrics.pcie_slot || node?.raw?.pcie_slot,
+      fallback.board || metrics.board,
+      metrics.temperature ? `temp ${metrics.temperature}` : null,
+      metrics.firmware ? `fw ${metrics.firmware}` : null,
+      metrics.linked_phys ? `${metrics.linked_phys}/${metrics.num_phys || "?"} phys` : null,
+      fallback.count ? `${fallback.count} bays` : null,
+    ].filter(Boolean);
+    return parts.join(" / ");
+  }
+
+  function sasFabricItemClasses({ selected = false, related = false, status = "", extra = "" } = {}) {
+    return [
+      "sas-fabric-item",
+      status ? `status-${sasFabricClassToken(status)}` : "",
+      selected ? "is-selected" : "",
+      related ? "is-related" : "",
+      extra,
+    ].filter(Boolean).join(" ");
+  }
+
+  function renderSasFabricNodeButton(node, { label = null, meta = null, extra = "" } = {}) {
+    if (!node) {
+      return "";
+    }
+    const selected = state.sasFabric.selectedNodeId === node.id;
+    const related = sasFabricSelectionTouchesNode(node.id) || sasFabricSelectionTouchesSlots(node.related_slots);
+    const displayLabel = label || sasFabricDisplayLabel(node) || node.id;
+    const displayMeta = meta || sasFabricNodeMeta(node) || formatSasFabricKind(node.kind);
+    return `
+      <button type="button" class="${sasFabricItemClasses({ selected, related, status: node.status, extra })}" data-sas-fabric-node="${escapeHtml(node.id)}">
+        <span class="sas-fabric-item-label">${escapeHtml(displayLabel)}</span>
+        <span class="sas-fabric-item-meta">${escapeHtml(displayMeta)}</span>
+      </button>
+    `;
+  }
+
+  function renderSasFabricPathButton(path) {
+    const trace = sasFabricTraceById(path.id);
+    const selectedTrace = selectedSasFabricTrace();
+    const selected = selectedTrace?.id === path.id;
+    const related = Boolean(selectedTrace?.node_ids?.includes(path.id)) || sasFabricSelectionTouchesSlots(path.slots);
+    const stateName = path.state || trace?.metrics?.state || "unknown";
+    const slots = sasFabricSortedSlots(path.slots || trace?.slots);
+    return `
+      <button type="button" class="${sasFabricItemClasses({ selected, related, status: stateName, extra: "sas-fabric-path-card" })}" data-sas-fabric-trace="${escapeHtml(path.id)}">
+        <span class="sas-fabric-item-label">${escapeHtml(sasFabricDisplayLabel(path) || `${path.controller || "path"} ${stateName}`)}</span>
+        <span class="sas-fabric-item-meta">${escapeHtml(`${path.count || slots.length || 0} bay${(path.count || slots.length) === 1 ? "" : "s"} affected`)}</span>
+        <span class="sas-fabric-item-slots">${renderSasFabricSlotList(slots, { limit: 12, expandKey: `path:${path.id}` })}</span>
+      </button>
+    `;
+  }
+
+  function renderSasFabricBayChips(slots, limit = 60) {
+    const sorted = sasFabricSortedSlots(slots);
+    if (!sorted.length) {
+      return '<span class="sas-fabric-empty-note">No mapped bays</span>';
+    }
+    const selectedSlots = sasFabricSelectedSlotSet();
+    const chips = sorted.slice(0, limit).map((slotNumber) => {
+      const selected = selectedSlots.has(slotNumber) || state.selectedSlot === slotNumber;
+      return `
+        <button type="button" class="sas-fabric-bay-chip${selected ? " is-selected" : ""}" data-sas-fabric-slot="${slotNumber}">
+          ${escapeHtml(formatSlotLabel(slotNumber))}
+        </button>
+      `;
+    }).join("");
+    const overflow = sorted.length > limit ? `<span class="sas-fabric-bay-overflow">+${sorted.length - limit}</span>` : "";
+    return `${chips}${overflow}`;
+  }
+
+  function renderSasFabricCompactNodes(nodes, limit = 8) {
+    const visible = sasFabricList(nodes).slice(0, limit);
+    if (!visible.length) {
+      return '<span class="sas-fabric-empty-note">No objects reported</span>';
+    }
+    const overflow = nodes.length > limit ? `<span class="sas-fabric-bay-overflow">+${nodes.length - limit}</span>` : "";
+    return `${visible.map((node) => renderSasFabricNodeButton(node, { meta: sasFabricNodeMeta(node) || node.raw_id || formatSasFabricKind(node.kind), extra: "sas-fabric-compact-node" })).join("")}${overflow}`;
+  }
+
+  function renderSasFabricLane(controllerRecord, fabric, nodeMap) {
+    const controllerId = controllerRecord.id || `controller:${controllerRecord.name}`;
+    const controllerNode = nodeMap.get(controllerId) || {
+      id: controllerId,
+      kind: "controller",
+      label: controllerRecord.name || controllerId,
+      status: controllerRecord.path_counts?.fail ? "degraded" : "online",
+      related_slots: controllerRecord.related_slots || [],
+      metrics: {
+        temperature: controllerRecord.temperature,
+        firmware: controllerRecord.firmware,
+        path_counts: controllerRecord.path_counts,
+      },
+    };
+    const controllerName = controllerRecord.name || sasFabricDisplayLabel(controllerNode) || controllerId.replace(/^controller:/, "");
+    const paths = sasFabricList(fabric.paths)
+      .filter((path) => path.controller === controllerName || path.id?.startsWith(`${controllerId.replace(/^controller:/, "path:")}:`));
+    const expanders = sasFabricList(fabric.nodes)
+      .filter((node) => node.kind === "expander" && node.controller_id === controllerId)
+      .sort((left, right) => String(left.label).localeCompare(String(right.label)));
+    const enclosures = sasFabricList(fabric.nodes)
+      .filter((node) => node.kind === "mpr-enclosure" && node.controller_id === controllerId)
+      .sort((left, right) => String(left.label).localeCompare(String(right.label)));
+    const slotSet = new Set(sasFabricSortedSlots(controllerRecord.related_slots || controllerNode.related_slots));
+    paths.forEach((path) => sasFabricSortedSlots(path.slots).forEach((slot) => slotSet.add(slot)));
+    expanders.forEach((node) => sasFabricSortedSlots(node.related_slots).forEach((slot) => slotSet.add(slot)));
+    enclosures.forEach((node) => sasFabricSortedSlots(node.related_slots).forEach((slot) => slotSet.add(slot)));
+    const laneSlots = Array.from(slotSet).sort((left, right) => left - right);
+    const laneRelated = sasFabricSelectionTouchesNode(controllerId) || sasFabricSelectionTouchesSlots(laneSlots);
+    return `
+      <section class="sas-fabric-lane${laneRelated ? " is-related" : ""}">
+        <div class="sas-fabric-stage">
+          <div class="sas-fabric-stage-title">Controller</div>
+          ${renderSasFabricNodeButton(controllerNode, {
+            label: sasFabricDisplayLabel(controllerNode) || controllerName,
+            meta: sasFabricNodeMeta(controllerNode, controllerRecord) || controllerRecord.device || "HBA",
+            extra: "sas-fabric-controller-card",
+          })}
+        </div>
+        <div class="sas-fabric-stage">
+          <div class="sas-fabric-stage-title">Paths</div>
+          <div class="sas-fabric-path-list">
+            ${paths.length ? paths.map(renderSasFabricPathButton).join("") : '<span class="sas-fabric-empty-note">No multipath states reported</span>'}
+          </div>
+        </div>
+        <div class="sas-fabric-stage">
+          <div class="sas-fabric-stage-title">Expanders</div>
+          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(expanders, 6)}</div>
+        </div>
+        <div class="sas-fabric-stage">
+          <div class="sas-fabric-stage-title">SES / MPR Enclosures</div>
+          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(enclosures, 6)}</div>
+        </div>
+        <div class="sas-fabric-stage">
+          <div class="sas-fabric-stage-title">Impacted Bays</div>
+          <div class="sas-fabric-bay-list">${renderSasFabricBayChips(laneSlots, 72)}</div>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderSasFabricMap(fabric) {
+    const nodeMap = sasFabricNodeMap(fabric);
+    const hostNode = nodeMap.get("host") || {
+      id: "host",
+      kind: "host",
+      label: fabric.system_label || fabric.system_id || "Host",
+      metrics: { slot_count: sasFabricList(state.snapshot.slots).length },
+    };
+    const controllerRecords = sasFabricList(fabric.controllers).length
+      ? sasFabricList(fabric.controllers)
+      : sasFabricList(fabric.nodes).filter((node) => node.kind === "controller").map((node) => ({
+        id: node.id,
+        name: node.label,
+        display_label: sasFabricDisplayLabel(node),
+        alias: node.alias,
+        related_slots: node.related_slots,
+      }));
+    if (!controllerRecords.length) {
+      return `
+        <div class="sas-fabric-host-row">${renderSasFabricNodeButton(hostNode, { meta: "No HBA controllers reported" })}</div>
+        <div class="warning-item muted compact">No controller rows are available yet. Check CORE SSH and mprutil permissions.</div>
+      `;
+    }
+    return `
+      <div class="sas-fabric-host-row">
+        ${renderSasFabricNodeButton(hostNode, {
+          label: sasFabricDisplayLabel(hostNode) || "Host",
+          meta: `${controllerRecords.length} controller${controllerRecords.length === 1 ? "" : "s"} / ${sasFabricList(fabric.nodes).length} nodes`,
+          extra: "sas-fabric-host-card",
+        })}
+      </div>
+      <div class="sas-fabric-lane-grid">
+        ${controllerRecords.map((controller) => renderSasFabricLane(controller, fabric, nodeMap)).join("")}
+      </div>
+    `;
+  }
+
+  function renderSasFabricTraceInspector(trace) {
+    const nodeMap = sasFabricNodeMap();
+    const pathStates = sasFabricList(trace.metrics?.path_states);
+    const pathStateMarkup = pathStates.length
+      ? `
+        <div class="sas-fabric-inspector-section">
+          <h4>Path Members</h4>
+          <div class="sas-fabric-state-list">
+            ${pathStates.map((pathState) => `
+              <div class="sas-fabric-state-row status-${sasFabricClassToken(pathState.state)}">
+                <span>${escapeHtml(pathState.controller || "path")}</span>
+                <strong>${escapeHtml(pathState.state || "unknown")}</strong>
+                <small>${escapeHtml(pathState.device_name || "")}</small>
+              </div>
+            `).join("")}
+          </div>
+        </div>
+      `
+      : "";
+    const nodes = sasFabricList(trace.node_ids).map((nodeId) => nodeMap.get(nodeId)).filter(Boolean);
+    return `
+      <div class="kv-grid">
+        ${kvRow("Trace", sasFabricDisplayLabel(trace) || trace.id)}
+        ${kvRow("Type", formatSasFabricKind(trace.kind))}
+        ${kvRow("Slots", formatSasFabricSlots(trace.slots, 999))}
+        ${sasFabricMetricRows(trace.metrics, { state: "State", count: "Affected bays", device_name: "Device", pool_name: "Pool", vdev_name: "Vdev" })}
+        ${kvRow("Evidence", formatSasFabricValue(trace.evidence))}
+      </div>
+      ${pathStateMarkup}
+      <div class="sas-fabric-inspector-section">
+        <h4>Trace Nodes</h4>
+        <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(nodes, 12)}</div>
+      </div>
+    `;
+  }
+
+  function renderSasFabricNodeInspector(node) {
+    return `
+      <div class="kv-grid">
+        ${kvRow("Object", sasFabricDisplayLabel(node) || node.id)}
+        ${kvRow("Type", formatSasFabricKind(node.kind))}
+        ${kvRow("Status", node.status || "n/a")}
+        ${kvRow("Raw ID", node.raw_id || "n/a", Boolean(node.raw_id))}
+        ${kvRow("Slots", formatSasFabricSlots(node.related_slots, 999))}
+        ${sasFabricMetricRows(node.metrics, { pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts" })}
+        ${kvRow("Evidence", formatSasFabricValue(node.evidence))}
+      </div>
+      ${node.kind === "controller" && node.raw?.iocfacts ? `
+        <div class="sas-fabric-inspector-section">
+          <h4>IOC Facts</h4>
+          <div class="kv-grid">
+            ${kvRow("Max targets", node.raw.iocfacts.maxtargets)}
+            ${kvRow("Max expanders", node.raw.iocfacts.maxsasexpanders)}
+            ${kvRow("Max enclosures", node.raw.iocfacts.maxenclosures)}
+            ${kvRow("Protocol flags", node.raw.iocfacts.protocolflags)}
+          </div>
+        </div>
+      ` : ""}
+    `;
+  }
+
+  function renderSasFabricInspector(fabric) {
+    if (!sasFabricInspectorTitle || !sasFabricInspectorBody) {
+      return;
+    }
+    if (!fabric) {
+      sasFabricInspectorTitle.textContent = "Fabric Inspector";
+      sasFabricInspectorBody.innerHTML = "Open topology to load the current SAS fabric.";
+      return;
+    }
+    const trace = selectedSasFabricTrace();
+    const node = selectedSasFabricNode();
+    if (trace) {
+      sasFabricInspectorTitle.textContent = `Selected ${formatSasFabricKind(trace.kind)}`;
+      sasFabricInspectorBody.innerHTML = renderSasFabricTraceInspector(trace);
+      return;
+    }
+    if (node) {
+      sasFabricInspectorTitle.textContent = `Selected ${formatSasFabricKind(node.kind)}`;
+      sasFabricInspectorBody.innerHTML = renderSasFabricNodeInspector(node);
+      return;
+    }
+    sasFabricInspectorTitle.textContent = "Fabric Inspector";
+    sasFabricInspectorBody.innerHTML = "Select a controller, path, expander, SES enclosure, or bay to inspect the trace chain.";
+  }
+
+  function renderSasFabric() {
+    if (!sasFabricPanel) {
+      return;
+    }
+    sasFabricPanel.classList.toggle("hidden", !state.sasFabric.open);
+    if (sasFabricToggleButton) {
+      sasFabricToggleButton.classList.toggle("active", state.sasFabric.open);
+      sasFabricToggleButton.setAttribute("aria-expanded", state.sasFabric.open ? "true" : "false");
+    }
+    if (sasFabricRefreshButton) {
+      sasFabricRefreshButton.disabled = state.snapshotMode || state.sasFabric.loading;
+    }
+    if (!state.sasFabric.open) {
+      return;
+    }
+    const fabric = state.sasFabric.data;
+    if (fabric && !sasFabricTraceById(state.sasFabric.selectedTraceId, fabric) && !state.sasFabric.selectedNodeId) {
+      state.sasFabric.selectedTraceId = resolveSasFabricTraceId(state.sasFabric.selectedTraceId, fabric);
+    }
+    if (sasFabricSummary) {
+      if (fabric) {
+        sasFabricSummary.textContent = [
+          `${sasFabricList(fabric.controllers).length} controllers`,
+          `${sasFabricList(fabric.paths).length} paths`,
+          `${sasFabricList(fabric.expanders).length} expanders`,
+          `${sasFabricList(fabric.enclosures).length} enclosures`,
+          `${sasFabricList(fabric.traces).length} traces`,
+        ].join(" / ");
+      } else {
+        sasFabricSummary.textContent = state.sasFabric.loading
+          ? "Loading read-only SAS fabric."
+          : "Read-only HBA, path, SES, and bay topology.";
+      }
+    }
+    if (sasFabricStatus) {
+      if (state.snapshotMode) {
+        sasFabricStatus.className = "warning-item muted compact";
+        sasFabricStatus.textContent = "Offline snapshots do not include live SAS fabric refresh yet.";
+      } else if (state.sasFabric.error) {
+        sasFabricStatus.className = "warning-item compact";
+        sasFabricStatus.textContent = `SAS fabric load failed: ${state.sasFabric.error}`;
+      } else if (state.sasFabric.loading) {
+        sasFabricStatus.className = "warning-item muted compact";
+        sasFabricStatus.textContent = fabric ? "Refreshing SAS fabric in the background." : "Loading read-only CORE SAS fabric.";
+      } else if (fabric?.available === false) {
+        sasFabricStatus.className = "warning-item compact";
+        sasFabricStatus.textContent = sasFabricList(fabric.warnings)[0] || "SAS fabric is not available for this system.";
+      } else if (sasFabricList(fabric?.warnings).length) {
+        sasFabricStatus.className = "warning-item compact";
+        sasFabricStatus.textContent = sasFabricList(fabric.warnings).join(" ");
+      } else if (fabric) {
+        sasFabricStatus.className = "warning-item muted compact";
+        sasFabricStatus.textContent = `Fabric data loaded for ${fabric.selected_enclosure_label || fabric.system_label || "current selection"}.`;
+      } else {
+        sasFabricStatus.className = "warning-item muted compact";
+        sasFabricStatus.textContent = "Open topology to load the current SAS fabric.";
+      }
+    }
+    if (sasFabricLanes) {
+      if (!fabric) {
+        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No SAS fabric payload has been loaded yet.</div>';
+      } else if (fabric.available === false) {
+        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No topology map is available for this platform yet.</div>';
+      } else {
+        sasFabricLanes.innerHTML = renderSasFabricMap(fabric);
+      }
+    }
+    renderSasFabricInspector(fabric);
+  }
+
+  async function fetchSasFabric(force = false, quiet = true) {
+    if (state.snapshotMode || !sasFabricPanel) {
+      return;
+    }
+    const scopeKey = sasFabricScopeKey();
+    if (!force && state.sasFabric.data && state.sasFabric.scopeKey === scopeKey) {
+      renderSasFabric();
+      return;
+    }
+    if (!force && state.sasFabric.loading && state.sasFabric.pendingScopeKey === scopeKey) {
+      return;
+    }
+    const requestToken = state.sasFabric.requestToken + 1;
+    state.sasFabric.requestToken = requestToken;
+    state.sasFabric.loading = true;
+    state.sasFabric.pendingScopeKey = scopeKey;
+    state.sasFabric.error = null;
+    renderSasFabric();
+    try {
+      const params = buildSelectionParams();
+      params.set("force", force ? "true" : "false");
+      const payload = await fetchJson(`/api/sas-fabric?${params.toString()}`);
+      if (requestToken !== state.sasFabric.requestToken) {
+        return;
+      }
+      state.sasFabric.data = payload;
+      state.sasFabric.scopeKey = scopeKey;
+      state.sasFabric.error = null;
+      state.sasFabric.selectedTraceId = resolveSasFabricTraceId(state.sasFabric.selectedTraceId, payload);
+      if (state.sasFabric.selectedNodeId && !sasFabricNodeById(state.sasFabric.selectedNodeId, payload)) {
+        state.sasFabric.selectedNodeId = null;
+      }
+      if (!quiet) {
+        setStatus("SAS fabric refreshed.");
+      }
+    } catch (error) {
+      if (requestToken !== state.sasFabric.requestToken) {
+        return;
+      }
+      state.sasFabric.error = error.message || String(error);
+      if (!quiet) {
+        setStatus(`SAS fabric refresh failed: ${state.sasFabric.error}`, "error");
+      }
+    } finally {
+      if (requestToken === state.sasFabric.requestToken) {
+        state.sasFabric.loading = false;
+        state.sasFabric.pendingScopeKey = null;
+        renderAll();
+      }
+    }
   }
 
   function platformSetupCopy(platform) {
@@ -5157,6 +5833,7 @@
     const layoutRows = activeLayoutRows();
     const geometry = buildChassisGeometry(buildViewProfile(), layoutRows);
     const heatmapContext = buildHeatmapContext();
+    const fabricSlots = sasFabricSelectedSlotSet();
     renderHeatmapControls(heatmapContext);
     const appendTile = (container, slotNumber, tileIndex = null, breakpoints = []) => {
       if (!Number.isInteger(slotNumber)) {
@@ -5186,6 +5863,14 @@
         tile.classList.add("peer-highlight");
       } else if (peerContext.active) {
         tile.classList.add("peer-dimmed");
+      }
+      if (fabricSlots.size) {
+        if (fabricSlots.has(slot.slot)) {
+          tile.classList.add("fabric-highlight");
+          tile.classList.remove("peer-dimmed");
+        } else {
+          tile.classList.add("fabric-dimmed");
+        }
       }
       if (tileIndex !== null && breakpoints.includes(tileIndex + 1)) {
         tile.classList.add("group-divider-after");
@@ -7939,11 +8624,13 @@
       }
       enclosureSelect.disabled = (state.snapshotMode && !snapshotNavigationAvailable) || (visibleEnclosures.length + storageViews.length) <= 1;
     }
+    updateSasFabricViewLink();
   }
 
   function renderAll() {
     renderViewChrome();
     renderPlatformDetails();
+    renderSasFabric();
     renderGrid();
     renderDetail();
     renderStorageViewsRuntime();
@@ -7957,12 +8644,14 @@
   function selectSlot(slotNumber) {
     state.selectedSlot = slotNumber;
     state.history.panelError = null;
+    syncSasFabricTraceToSlot(slotNumber);
     renderAll();
   }
 
   function clearSelectedSlot() {
     state.selectedSlot = null;
     state.history.panelError = null;
+    clearSasFabricBaySelection();
     renderAll();
   }
 
@@ -8115,6 +8804,9 @@
       applySnapshot(snapshot);
       renderAll();
       void fetchStorageViewRuntime(force, true);
+      if (state.sasFabric.open) {
+        void fetchSasFabric(force, true);
+      }
       await waitForNextPaint();
       if (refreshToken !== state.latestRefreshToken) {
         if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
@@ -8495,6 +9187,7 @@
       state.storageViewsRuntimeLoading = true;
       state.selectedStorageViewRuntimeId = "";
       resetHeatmapHistoryCache();
+      resetSasFabricData();
       clearSelectedSlot();
       applyReusableSnapshot(state.selectedSystemId, null);
       await refreshSnapshot(false, "system-switch");
@@ -8530,6 +9223,7 @@
       state.selectedStorageViewRuntimeId = "";
       state.selectedEnclosureId = rawValue.startsWith("enclosure:") ? rawValue.slice("enclosure:".length) : (rawValue || null);
       state.storageViewsRuntimeLoading = true;
+      resetSasFabricData();
       applyReusableSnapshot(state.selectedSystemId, state.selectedEnclosureId);
       await refreshSnapshot(false, "enclosure-switch");
       queueIdentifyVerify("enclosure-switch");
@@ -8836,6 +9530,64 @@
       renderGrid();
       renderHeatmapControls();
       ensureHeatmapData();
+    });
+  }
+  if (sasFabricToggleButton) {
+    sasFabricToggleButton.addEventListener("click", () => {
+      state.sasFabric.open = !state.sasFabric.open;
+      renderAll();
+      if (state.sasFabric.open) {
+        if (sasFabricPanel) {
+          sasFabricPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+        void fetchSasFabric(false, true);
+      }
+    });
+  }
+  if (sasFabricRefreshButton) {
+    sasFabricRefreshButton.addEventListener("click", () => {
+      state.sasFabric.open = true;
+      renderAll();
+      void fetchSasFabric(true, false);
+    });
+  }
+  if (sasFabricPanel) {
+    sasFabricPanel.addEventListener("click", (event) => {
+      const expandButton = event.target.closest("[data-sas-fabric-expand-slots]");
+      if (expandButton) {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleSasFabricSlotList(expandButton.dataset.sasFabricExpandSlots || "");
+        return;
+      }
+      const slotButton = event.target.closest("[data-sas-fabric-slot]");
+      if (slotButton) {
+        const slotNumber = Number(slotButton.dataset.sasFabricSlot);
+        if (Number.isInteger(slotNumber)) {
+          selectSasFabricSlot(slotNumber);
+        }
+        return;
+      }
+      const traceButton = event.target.closest("[data-sas-fabric-trace]");
+      if (traceButton) {
+        selectSasFabricTrace(traceButton.dataset.sasFabricTrace || "");
+        return;
+      }
+      const nodeButton = event.target.closest("[data-sas-fabric-node]");
+      if (nodeButton) {
+        selectSasFabricNode(nodeButton.dataset.sasFabricNode || "");
+      }
+    });
+    sasFabricPanel.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") {
+        return;
+      }
+      const expandButton = event.target.closest("[data-sas-fabric-expand-slots]");
+      if (!expandButton) {
+        return;
+      }
+      event.preventDefault();
+      toggleSasFabricSlotList(expandButton.dataset.sasFabricExpandSlots || "");
     });
   }
   if (heatmapMetricSelect) {

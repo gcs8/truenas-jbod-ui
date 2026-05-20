@@ -9,7 +9,10 @@ config/ssh/*
 !config/ssh/.gitkeep
 config/tls/*
 data/slot_mappings.json
+data/sas_fabric_aliases.json
 data/slot_detail_cache.json
+data/known_hosts
+data/*.tmp
 data/perf/*
 !data/perf/README.md
 data/history-perf/*
@@ -25,6 +28,8 @@ docker-compose.override.yml
 node_modules/
 playwright-report/
 test-results/
+artifacts/
+config/profiles.yaml
 
 # Editor and platform noise
 .DS_Store

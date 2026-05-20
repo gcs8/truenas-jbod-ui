@@ -36,6 +36,7 @@ CONFIG_FILE_KEY = "config_file"
 RUNTIME_OVERRIDES_FILE_KEY = "runtime_overrides_file"
 PROFILE_FILE_KEY = "profile_file"
 MAPPING_FILE_KEY = "mapping_file"
+SAS_FABRIC_ALIAS_FILE_KEY = "sas_fabric_alias_file"
 SLOT_DETAIL_FILE_KEY = "slot_detail_file"
 HISTORY_DB_KEY = "history_db"
 SSH_KEYS_KEY = "ssh_keys"
@@ -75,6 +76,15 @@ BACKUP_GROUP_METADATA: dict[str, dict[str, Any]] = {
     MAPPING_FILE_KEY: {
         "label": "Mappings",
         "archive_root": "data/slot_mappings.json",
+        "sensitive": False,
+        "bundle_types": ("backup", "debug"),
+        "default_backup": True,
+        "default_debug": True,
+        "restore_mode": "file",
+    },
+    SAS_FABRIC_ALIAS_FILE_KEY: {
+        "label": "SAS Fabric Aliases",
+        "archive_root": "data/sas_fabric_aliases.json",
         "sensitive": False,
         "bundle_types": ("backup", "debug"),
         "default_backup": True,
@@ -230,6 +240,7 @@ def describe_bundle_groups(
         RUNTIME_OVERRIDES_FILE_KEY: app_settings.paths.runtime_overrides_file,
         PROFILE_FILE_KEY: app_settings.paths.profile_file,
         MAPPING_FILE_KEY: app_settings.paths.mapping_file,
+        SAS_FABRIC_ALIAS_FILE_KEY: app_settings.paths.sas_fabric_alias_file,
         SLOT_DETAIL_FILE_KEY: app_settings.paths.slot_detail_cache_file,
         HISTORY_DB_KEY: history_settings.sqlite_path,
         SSH_KEYS_KEY: str(config_root / "ssh"),
@@ -277,6 +288,7 @@ class DebugScrubber:
         "runtime_overrides_file",
         "profile_file",
         "mapping_file",
+        "sas_fabric_alias_file",
         "slot_detail_cache_file",
         "log_file",
         "history_db",
@@ -593,6 +605,14 @@ class SystemBackupService:
             restored_paths,
         )
         self._restore_file_group(
+            SAS_FABRIC_ALIAS_FILE_KEY,
+            manifest,
+            group_entries,
+            extracted,
+            Path(imported_settings.paths.sas_fabric_alias_file),
+            restored_paths,
+        )
+        self._restore_file_group(
             SLOT_DETAIL_FILE_KEY,
             manifest,
             group_entries,
@@ -766,6 +786,12 @@ class SystemBackupService:
                     Path(app_settings.paths.mapping_file),
                     selected=selected,
                 )
+            elif group_key == SAS_FABRIC_ALIAS_FILE_KEY:
+                group, members = self._collect_file_group(
+                    group_key,
+                    Path(app_settings.paths.sas_fabric_alias_file),
+                    selected=selected,
+                )
             elif group_key == SLOT_DETAIL_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
@@ -856,6 +882,14 @@ class SystemBackupService:
                     content_bytes,
                     selected=selected,
                     source_path=app_settings.paths.mapping_file,
+                )
+            elif group_key == SAS_FABRIC_ALIAS_FILE_KEY:
+                content_bytes = self._read_scrubbed_json_file(Path(app_settings.paths.sas_fabric_alias_file), scrubber)
+                group, members = self._collect_generated_file_group(
+                    group_key,
+                    content_bytes,
+                    selected=selected,
+                    source_path=app_settings.paths.sas_fabric_alias_file,
                 )
             elif group_key == SLOT_DETAIL_FILE_KEY:
                 content_bytes = self._read_scrubbed_json_file(Path(app_settings.paths.slot_detail_cache_file), scrubber)

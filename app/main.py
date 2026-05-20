@@ -27,9 +27,11 @@ from app.models.domain import (
     LedRequest,
     MappingBundle,
     MappingRequest,
+    SasFabricAliasRequest,
     SnapshotExportRequest,
     SmartBatchRequest,
     SmartBatchResponse,
+    SasFabricSnapshot,
     SmartSummaryView,
     StorageViewRuntimePayload,
     SystemLocatorRequest,
@@ -406,6 +408,48 @@ def create_app() -> FastAPI:
             ),
         )
 
+    @app.get("/sas-fabric", response_class=HTMLResponse)
+    async def sas_fabric_view(
+        request: Request,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> HTMLResponse:
+        current_settings = get_settings()
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        add_perf_metadata(
+            system_id=service.system.id,
+            platform=service.system.truenas.platform,
+            enclosure_id=enclosure_id,
+            sas_fabric_view=True,
+        )
+        snapshot = await service.get_snapshot(
+            selected_enclosure_id=enclosure_id,
+            allow_stale_cache=True,
+        )
+        fabric = await service.get_sas_fabric_snapshot(
+            selected_enclosure_id=snapshot.selected_enclosure_id or enclosure_id,
+        )
+        bootstrap = {
+            "snapshot": snapshot.model_dump(mode="json"),
+            "fabric": fabric.model_dump(mode="json"),
+            "systemId": snapshot.selected_system_id or service.system.id,
+            "enclosureId": snapshot.selected_enclosure_id or enclosure_id,
+            "appVersion": __version__,
+        }
+        return templates.TemplateResponse(
+            request,
+            "sas_fabric.html",
+            {
+                "request": request,
+                "snapshot": snapshot,
+                "fabric": fabric,
+                "settings": current_settings,
+                "app_version": __version__,
+                "bootstrap_json": json.dumps(bootstrap),
+            },
+        )
+
     @app.get("/api/inventory", response_model=InventorySnapshot)
     async def get_inventory(
         force: bool = False,
@@ -425,6 +469,52 @@ def create_app() -> FastAPI:
             selected_enclosure_id=enclosure_id,
             allow_stale_cache=not force,
         )
+
+    @app.get("/api/sas-fabric", response_model=SasFabricSnapshot)
+    async def get_sas_fabric(
+        force: bool = False,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> SasFabricSnapshot:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        add_perf_metadata(
+            system_id=service.system.id,
+            platform=service.system.truenas.platform,
+            enclosure_id=enclosure_id,
+            force_refresh=force,
+            sas_fabric=True,
+        )
+        return await service.get_sas_fabric_snapshot(
+            force_refresh=force,
+            selected_enclosure_id=enclosure_id,
+        )
+
+    @app.post("/api/sas-fabric/aliases")
+    async def save_sas_fabric_alias(
+        payload: SasFabricAliasRequest,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> JSONResponse:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        add_perf_metadata(
+            system_id=service.system.id,
+            platform=service.system.truenas.platform,
+            enclosure_id=enclosure_id,
+            sas_fabric_alias=payload.object_id,
+        )
+        try:
+            result = service.save_sas_fabric_alias(
+                object_id=payload.object_id,
+                object_kind=payload.object_kind,
+                label=payload.label,
+                selected_enclosure_id=enclosure_id,
+                scope=payload.scope,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(result)
 
     @app.get("/api/storage-views", response_model=StorageViewRuntimePayload)
     async def get_storage_views(

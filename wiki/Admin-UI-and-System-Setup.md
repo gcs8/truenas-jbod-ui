@@ -148,7 +148,13 @@ Use the SSH section when you want to:
 - review the recommended runtime command list for the target host
 
 This is especially useful on CORE and SCALE systems where the app can stay
-read-only in the main UI but still use richer SSH detail and LED control.
+read-only in the main UI but still use richer SSH detail, LED control, and
+CORE SAS fabric/topology diagnostics.
+
+For TrueNAS CORE, the permission preview is the same one-line
+`midclt call user.update USER_ID '{...}'` payload the bootstrap action applies
+after resolving the service account's middleware user id. For Linux-like
+platforms, the preview remains the generated sudoers content.
 
 For VMware ESXi, the admin sidecar now keeps the setup intentionally narrower:
 

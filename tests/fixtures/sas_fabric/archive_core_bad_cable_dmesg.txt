@@ -1,0 +1,19 @@
+mpr0: Controller reported scsi ioc terminated tgt 180 SMID 501 loginfo 31120302
+(da44:mpr0:0:180:0): WRITE(16). CDB: 8a 00 00 00 00 01 74 34 b9 d0 00 00 00 80 00 00
+(da44:mpr0:0:180:0): CAM status: CCB request completed with an error
+(da44:mpr0:0:180:0): SCSI sense: ABORTED COMMAND asc:4b,4 (NAK received)
+(da44:mpr0:0:180:0): Field Replaceable Unit: 1
+(da44:mpr0:0:180:0): Retrying command (per sense data)
+mpr0: Controller reported scsi ioc terminated tgt 180 SMID 502 loginfo 3112010a
+(da44:mpr0:0:180:0): WRITE(10). CDB: 2a 00 00 4a 20 00 00 01 00 00
+(da44:mpr0:0:180:0): SCSI sense: ABORTED COMMAND asc:4b,7 (Connection lost)
+(da44:mpr0:0:180:0): Retrying command, 3 more tries remain
+mpr0: Controller reported scsi ioc terminated tgt 181 SMID 503 loginfo 3112010c
+(da45:mpr0:0:181:0): READ(16). CDB: 88 00 00 00 00 01 60 1d 56 58 00 00 00 08 00 00
+(da45:mpr0:0:181:0): CAM status: SCSI Status Error
+(da45:mpr0:0:181:0): SCSI sense: ABORTED COMMAND asc:4b,3 (ACK/NAK timeout)
+(da45:mpr0:0:181:0): Retrying command, 3 more tries remain
+mpr0: Controller reported scsi ioc terminated tgt 182 SMID 504 loginfo 31110e05
+(da46:mpr0:0:182:0): SYNCHRONIZE CACHE(10). CDB: 35 00 00 00 00 00 00 00 00 00
+(da46:mpr0:0:182:0): LOG SENSE. CDB: 4d 00 18 00 00 00 00 00 fc 00
+(da46:mpr0:0:182:0): SERVICE ACTION IN(16). CDB: 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00

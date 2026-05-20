@@ -52,7 +52,7 @@ For ESXi specifically, password-only auth is a normal supported case:
 ```yaml
 ssh:
   enabled: true
-  host: 10.13.37.121
+  host: truenas-core-a.example.local
   user: root
   key_path: ""
   password: "your-esxi-root-password"
@@ -71,7 +71,26 @@ gmultipath list
 sudo -n /usr/sbin/sesutil map
 sudo -n /usr/sbin/sesutil show
 sudo -n /sbin/camcontrol devlist -v
+sudo -n /usr/sbin/mprutil show adapters
+sudo -n /usr/sbin/mprutil show adapter
+sudo -n /usr/sbin/mprutil show devices
+sudo -n /usr/sbin/mprutil show enclosures
+sudo -n /usr/sbin/mprutil show expanders
+sudo -n /usr/sbin/mprutil show iocfacts
+/usr/sbin/pciconf -lv
+sysctl -a 2>/dev/null | egrep '^dev\.mpr\.[0-9]+\.%(location|parent):' || true
+sudo -n /usr/local/sbin/dmidecode -t slot
+messages=$({ tail -n 4000 /var/log/messages 2>/dev/null || sudo -n /usr/bin/tail -n 4000 /var/log/messages 2>/dev/null || true; } | egrep '(mpr[0-9]+:|\(da[0-9]+:mpr[0-9]+:)' || true); if [ -n "$messages" ]; then printf '%s\n' "$messages" | tail -n 400; else dmesg -a | egrep '(mpr[0-9]+:|\(da[0-9]+:mpr[0-9]+:)' | tail -n 400; fi
 ```
+
+The `pciconf` and `sysctl` lines are normal read-only user commands.
+`/var/log/messages` adds timestamped recent MPR/CAM kernel fault evidence when
+the file is readable or the user has the narrow
+`/usr/bin/tail -n 4000 /var/log/messages` sudo entry; otherwise the same probe
+falls back to `dmesg -a` event order. `pciconf` gives the HBA PCI bus address,
+filtered `sysctl` adds kernel PCI topology hints such as
+`dbsf=pci0:130:0:0`, and `dmidecode -t slot` needs sudo on CORE so the app can
+join that PCI address to the motherboard slot designation.
 
 ## SCALE Command Ideas
 
@@ -126,6 +145,7 @@ These do not have to live in the standing command list:
 - `nvme id-ctrl -o json`
 - `nvme id-ns -o json`
 - LED identify actions such as `sesutil locate` or `sg_ses --set=ident`
+- CORE SAS fabric probes such as `mprutil -u N show expanders`
 
 But the SSH user still needs sudo permission for them if the host requires root.
 
@@ -145,6 +165,21 @@ jbodmap ALL=(root) NOPASSWD: /usr/sbin/sesutil show
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/sesutil locate -u /dev/ses* * on
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/sesutil locate -u /dev/ses* * off
 jbodmap ALL=(root) NOPASSWD: /sbin/camcontrol devlist -v
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show adapter
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show adapters
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show all
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show devices
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show enclosures
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show expanders
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show iocfacts
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show adapter
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show all
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show devices
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show enclosures
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show expanders
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil -u * show iocfacts
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/dmidecode -t slot
+jbodmap ALL=(root) NOPASSWD: /usr/bin/tail -n 4000 /var/log/messages
 ```
 
 SCALE example:

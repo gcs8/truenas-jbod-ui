@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+# Binary assets and local database-style artifacts must never be normalized.
+*.7z binary
+*.db binary
+*.gif binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.png binary
+*.sqlite binary
+*.webp binary
+*.zip binary

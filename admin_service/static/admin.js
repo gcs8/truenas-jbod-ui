@@ -3440,14 +3440,18 @@
     }
     if (elements.setupBootstrapCopy) {
       elements.setupBootstrapCopy.textContent = bootstrapSupported
-        ? "Use temporary root or installer credentials once to create the final service account, install the selected public key, and optionally write limited sudo rules."
+        ? platform === "core"
+          ? "Use temporary root or installer credentials once to create the final service account, install the selected public key, and optionally apply the shown TrueNAS CORE midclt permission command."
+          : "Use temporary root or installer credentials once to create the final service account, install the selected public key, and optionally write limited sudo rules."
         : ipmiOnly
           ? "IPMI / BMC Only entries skip the Linux bootstrap and sudoers flow. Save the BMC credentials directly here, and add SSH later only when you want extra host-side enrichment."
           : "VMware ESXi stays on the saved SSH credentials or key directly. The Linux-style one-time service-account bootstrap and sudoers flow are intentionally disabled here.";
     }
     if (elements.setupSshCommandsNote) {
       elements.setupSshCommandsNote.innerHTML = bootstrapSupported
-        ? "These are the exact SSH commands the app runs. When you use the one-time bootstrap, any <code>sudo -n ...</code> lines here are also converted into <code>NOPASSWD</code> sudo rules for the final service account, with the platform's on-demand smartctl and LED-control extras kept in place."
+        ? platform === "core"
+          ? "These are the exact SSH commands the app runs. When you use the one-time bootstrap, any <code>sudo -n ...</code> lines here are also converted into the CORE <code>midclt user.update</code> permission payload, with on-demand SMART, LED-control, and topology diagnostic extras kept in place."
+          : "These are the exact SSH commands the app runs. When you use the one-time bootstrap, any <code>sudo -n ...</code> lines here are also converted into <code>NOPASSWD</code> sudo rules for the final service account, with the platform's on-demand SMART, LED-control, and topology diagnostic extras kept in place."
         : ipmiOnly
           ? "These are optional host-side SSH commands only. The primary inventory path for an IPMI / BMC Only system is the saved BMC access above, so leaving SSH off is a valid first pass."
           : "These are the exact SSH commands the app runs on the ESXi host. This path stays read-only and SSH-only, so no Linux sudoers/bootstrap conversion is used.";
@@ -3557,7 +3561,7 @@
     elements.setupBootstrapSudoersName.textContent = filename;
     elements.setupBootstrapSudoersDetail.textContent =
       detail
-      || "This is the exact command-limited sudoers content bootstrap would write for the final service account.";
+      || "This is the exact command-limited permission update bootstrap would apply for the final service account.";
     elements.setupBootstrapSudoersPreview.textContent =
       content || "# No sudoers preview available.\n";
   }
@@ -3590,10 +3594,16 @@
       return;
     }
     if (!bootstrapEnabledForSession()) {
+      const isCore = payload.platform === "core";
       renderSudoersPreview({
         service_user: payload.service_user,
-        detail: "Enable One-Time Bootstrap when you want to preview the exact sudoers file for a bootstrap run.",
-        content: "# One-Time Bootstrap is disabled for this edit session.\n# Enable it to preview the command-limited sudoers file.\n",
+        filename: isCore ? "midclt user.update USER_ID" : undefined,
+        detail: isCore
+          ? "Enable One-Time Bootstrap when you want to preview the exact CORE midclt permission command for a bootstrap run."
+          : "Enable One-Time Bootstrap when you want to preview the exact sudoers file for a bootstrap run.",
+        content: isCore
+          ? "# One-Time Bootstrap is disabled for this edit session.\n# Enable it to preview the CORE midclt permission command.\n"
+          : "# One-Time Bootstrap is disabled for this edit session.\n# Enable it to preview the command-limited sudoers file.\n",
       });
       return;
     }
@@ -5568,7 +5578,9 @@
       maybeLoadRecommendedCommands();
       scheduleSudoersPreviewRefresh(0);
       if (elements.setupBootstrapResult) {
-        const sudoState = result.sudo_rules_installed ? `Sudoers: ${result.sudoers_path || "installed"}.` : "Sudo rules skipped.";
+        const sudoState = result.sudo_rules_installed
+          ? `Permissions: ${result.permission_target || result.sudoers_path || "installed"}.`
+          : "Permission update skipped.";
         elements.setupBootstrapResult.textContent = `${result.detail || `Provisioned ${result.service_user || payload.service_user}.`} ${sudoState}`;
       }
       if (elements.setupResult) {

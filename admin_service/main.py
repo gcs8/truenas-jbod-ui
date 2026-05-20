@@ -1014,6 +1014,7 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
             "runtime_overrides_file": settings.paths.runtime_overrides_file,
             "profile_file": settings.paths.profile_file,
             "mapping_file": settings.paths.mapping_file,
+            "sas_fabric_alias_file": settings.paths.sas_fabric_alias_file,
             "slot_detail_cache_file": settings.paths.slot_detail_cache_file,
             "history_db": history_settings.sqlite_path,
             "tls_dir": str(Path(settings.config_file).parent / "tls"),

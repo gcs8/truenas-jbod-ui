@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 import urllib.error
 import unittest
 from datetime import datetime, timezone
@@ -106,7 +107,10 @@ class MainAppBoundaryTests(unittest.TestCase):
     def test_main_app_exposes_storage_view_runtime_route(self) -> None:
         paths = {route.path for route in main_app.routes}
 
+        self.assertIn("/sas-fabric", paths)
         self.assertIn("/api/storage-views", paths)
+        self.assertIn("/api/sas-fabric", paths)
+        self.assertIn("/api/sas-fabric/aliases", paths)
         self.assertIn("/api/storage-views/{view_id}/slots/{slot_index}/history", paths)
         self.assertIn("/api/system-locator", paths)
         self.assertIn("/livez", paths)
@@ -132,6 +136,31 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertIn('id="app-version-value"', template_text)
         self.assertIn('id="app-version-note"', template_text)
+
+    def test_main_ui_template_exposes_sas_fabric_panel(self) -> None:
+        template_path = Path(__file__).resolve().parents[1] / "app" / "templates" / "index.html"
+        template_text = template_path.read_text(encoding="utf-8")
+
+        self.assertIn('id="sas-fabric-toggle-button"', template_text)
+        self.assertIn('id="sas-fabric-view-link"', template_text)
+        self.assertIn('id="sas-fabric-panel"', template_text)
+        self.assertIn("Fabric Inspector", template_text)
+
+    def test_main_templates_allow_dedicated_sas_fabric_script(self) -> None:
+        template_dir = Path(__file__).resolve().parents[1] / "app" / "templates"
+        base_text = (template_dir / "base.html").read_text(encoding="utf-8")
+        fabric_text = (template_dir / "sas_fabric.html").read_text(encoding="utf-8")
+
+        self.assertIn("{% block scripts %}", base_text)
+        self.assertIn("window.SAS_FABRIC_BOOTSTRAP", fabric_text)
+        self.assertIn("sas_fabric_view.js", fabric_text)
+        self.assertIn('data-fabric-mode="lanes"', fabric_text)
+        self.assertIn('data-fabric-mode="impact"', fabric_text)
+        self.assertIn('data-fabric-mode="trace"', fabric_text)
+        self.assertIn('data-fabric-mode="disk"', fabric_text)
+        self.assertIn('id="fabric-focus-strip"', fabric_text)
+        self.assertIn('id="fabric-back-button"', fabric_text)
+        self.assertNotIn('id="fabric-back-link"', fabric_text)
 
     def test_main_ui_template_exposes_refresh_timing_bootstrap(self) -> None:
         template_path = Path(__file__).resolve().parents[1] / "app" / "templates" / "index.html"
@@ -184,6 +213,63 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("data-cache-timing-key", script_text)
         self.assertNotIn("const SMART_SUMMARY_CACHE_TTL_MS = 5 * 60 * 1000;", script_text)
 
+    def test_main_ui_script_wires_sas_fabric_render_surface(self) -> None:
+        script_path = Path(__file__).resolve().parents[1] / "app" / "static" / "app.js"
+        script_text = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("/api/sas-fabric", script_text)
+        self.assertIn("updateSasFabricViewLink", script_text)
+        self.assertIn("renderSasFabric", script_text)
+        self.assertIn("sasFabricSelectedSlotSet", script_text)
+        self.assertIn("fabric-highlight", script_text)
+        self.assertIn("data-sas-fabric-expand-slots", script_text)
+
+    def test_dedicated_sas_fabric_script_wires_map_modes(self) -> None:
+        script_path = Path(__file__).resolve().parents[1] / "app" / "static" / "sas_fabric_view.js"
+        script_text = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("/api/inventory", script_text)
+        self.assertIn("/api/sas-fabric", script_text)
+        self.assertIn("renderLanesMode", script_text)
+        self.assertIn("renderImpactMode", script_text)
+        self.assertIn("renderTraceMode", script_text)
+        self.assertIn("renderDiskPathMode", script_text)
+        self.assertIn("sortFabricNodesForLane", script_text)
+        self.assertIn("compareFabricTraceFlow", script_text)
+        self.assertIn("numeric: true", script_text)
+        self.assertIn("slotLayoutRows", script_text)
+        self.assertIn("bestDiagnosticNode", script_text)
+        self.assertIn("defaultSelectionRef", script_text)
+        self.assertIn("data-fabric-mode-target", script_text)
+        self.assertIn("Backplane Zone", script_text)
+        self.assertIn("disk-path-board", script_text)
+        self.assertIn("disk-path-bay-layout", script_text)
+        self.assertIn("tooltipText", script_text)
+        self.assertIn("expanderPhyForDevice", script_text)
+        self.assertIn("IOC exceptions", script_text)
+        self.assertIn("renderTraceBreadcrumbs", script_text)
+        self.assertIn("relatedTracesForNode", script_text)
+        self.assertIn("traceIsInSelectionTrail", script_text)
+        self.assertIn("data-fabric-breadcrumb", script_text)
+        self.assertIn("data-fabric-trace-disabled", script_text)
+        self.assertIn("data-fabric-trace-home", script_text)
+        self.assertIn('<span class="fabric-trace-index">1</span>', script_text)
+        self.assertIn("renderDiagnosticTableControls", script_text)
+        self.assertIn("data-fabric-diagnostic-page", script_text)
+        self.assertIn("data-fabric-diagnostic-filter-key", script_text)
+        self.assertIn("data-fabric-alias-form", script_text)
+        self.assertIn("data-fabric-alias-edit", script_text)
+        self.assertIn("/api/sas-fabric/aliases", script_text)
+        self.assertIn("Time / Order", script_text)
+        self.assertIn("Rows are not deduped", script_text)
+        self.assertIn("Previous event page", script_text)
+        self.assertIn("PCI address", script_text)
+        self.assertIn("PCIe slot", script_text)
+        self.assertIn("Disk slot", script_text)
+        self.assertIn('"decoded_records"', script_text)
+        self.assertIn('`${values.length} record${values.length === 1 ? "" : "s"}`', script_text)
+        self.assertIn("Fabric Inspector", script_text)
+
     def test_admin_script_disables_linux_bootstrap_flow_for_esxi(self) -> None:
         script_path = Path(__file__).resolve().parents[1] / "admin_service" / "static" / "admin.js"
         script_text = script_path.read_text(encoding="utf-8")
@@ -196,6 +282,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("VMware ESXi does not use the one-time Linux service-account bootstrap.", script_text)
         self.assertIn("VMware ESXi does not use the Linux sudoers/bootstrap path.", script_text)
         self.assertIn("Password-only mode does not provide a service key for bootstrap.", script_text)
+        self.assertIn("midclt user.update", script_text)
         self.assertIn("platformSupportsEsxiHostPrep", script_text)
         self.assertIn("/api/admin/esxi-host-prep/upload", script_text)
         self.assertIn("/api/admin/esxi-host-prep/install", script_text)
@@ -589,6 +676,22 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertTrue(custom_profile["is_custom"])
         self.assertEqual(custom_profile["reference_count"], 2)
         self.assertIn("core", payload["setup_platform_defaults"])
+        self.assertIn(
+            "sudo -n /usr/sbin/mprutil show adapters",
+            payload["setup_platform_defaults"]["core"]["ssh_commands"],
+        )
+        self.assertIn("/usr/sbin/pciconf -lv", payload["setup_platform_defaults"]["core"]["ssh_commands"])
+        self.assertIn(
+            "sysctl -a 2>/dev/null | egrep '^dev\\.mpr\\.[0-9]+\\.%(location|parent):' || true",
+            payload["setup_platform_defaults"]["core"]["ssh_commands"],
+        )
+        self.assertIn(
+            "sudo -n /usr/local/sbin/dmidecode -t slot",
+            payload["setup_platform_defaults"]["core"]["ssh_commands"],
+        )
+        self.assertTrue(
+            any("/var/log/messages" in command for command in payload["setup_platform_defaults"]["core"]["ssh_commands"])
+        )
         self.assertIn("esxi", payload["setup_platform_defaults"])
         self.assertIn("ipmi", payload["setup_platform_defaults"])
         self.assertEqual(payload["ssh_keys"][0]["name"], "id_truenas")
@@ -1621,6 +1724,40 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertIn("/usr/bin/sg_ses -p ec /dev/sg*", payload["content"])
         self.assertNotIn("/usr/sbin/zpool status -gP", payload["content"])
 
+    def test_sudoers_preview_route_includes_core_mprutil_topology_rules(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
+
+        response = asyncio.run(
+            route.endpoint(
+                SystemSetupSudoPreviewRequest(
+                    platform="core",
+                    service_user="jbodmap",
+                    install_sudo_rules=True,
+                    sudo_commands=[
+                        "sudo -n /usr/sbin/sesutil show",
+                        "sudo -n /usr/sbin/mprutil -u 1 show expanders",
+                    ],
+                )
+            )
+        )
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["filename"], "midclt user.update USER_ID")
+        self.assertEqual(payload["path_candidates"], [])
+        self.assertIn("TrueNAS CORE bootstrap runs this same one-line middleware command", payload["detail"])
+        self.assertIn("midclt call user.update USER_ID", payload["content"])
+        self.assertNotIn("Cmnd_Alias", payload["content"])
+        command_tokens = shlex.split(payload["content"].strip())
+        command_payload = json.loads(command_tokens[-1])
+        self.assertIn("/usr/sbin/mprutil show adapters", command_payload["sudo_commands"])
+        self.assertIn("/usr/sbin/mprutil -u * show expanders", command_payload["sudo_commands"])
+        self.assertIn("/usr/local/sbin/dmidecode -t slot", command_payload["sudo_commands"])
+        self.assertIn("/usr/bin/tail -n 4000 /var/log/messages", command_payload["sudo_commands"])
+        self.assertNotIn("/usr/sbin/mprutil -u 1 show expanders", command_payload["sudo_commands"])
+        self.assertNotIn("/usr/sbin/mprutil *", command_payload["sudo_commands"])
+
     def test_sudoers_preview_route_handles_disabled_rules(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
 
@@ -1639,9 +1776,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["ok"])
         self.assertFalse(payload["enabled"])
-        self.assertEqual(payload["filename"], "truenas-jbod-ui-readonly")
-        self.assertIn("skip writing a sudoers file", payload["detail"])
-        self.assertIn("# Sudo rules disabled", payload["content"])
+        self.assertEqual(payload["filename"], "midclt user.update USER_ID")
+        self.assertIn("skip running", payload["detail"])
+        self.assertIn("# CORE midclt permission update disabled", payload["content"])
 
     def test_sudoers_preview_route_disables_esxi_bootstrap_flow(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
