@@ -1059,6 +1059,12 @@
         Number.isFinite(Number(event?.transfer_blocks ?? decoded.transfer_blocks))
           ? `${event?.transfer_blocks ?? decoded.transfer_blocks} blocks`
           : null,
+        Number.isFinite(Number(event?.allocation_length ?? decoded.allocation_length))
+          ? `alloc ${event?.allocation_length ?? decoded.allocation_length} bytes`
+          : null,
+        Number.isFinite(Number(event?.parameter_list_length ?? decoded.parameter_list_length))
+          ? `params ${event?.parameter_list_length ?? decoded.parameter_list_length} bytes`
+          : null,
       ].filter(Boolean).join(" / ");
       return details ? `${operation} (${details})` : operation;
     }
@@ -1109,6 +1115,8 @@
       event?.target ? `target ${event.target}` : null,
       event?.loginfo ? `loginfo ${event.loginfo}` : null,
       event?.opcode || decoded.opcode,
+      (event?.service_action || decoded.service_action) ? `SA ${event?.service_action || decoded.service_action}` : null,
+      event?.log_page || decoded.log_page,
       (event?.asc || decoded.asc) ? `ASC ${event?.asc || decoded.asc}` : null,
       diagnosticConfidenceLabel(event),
     ].filter(Boolean).join(" / ");
@@ -1119,6 +1127,13 @@
       Number.isFinite(Number(event?.transfer_blocks ?? decoded.transfer_blocks))
         ? `${event?.transfer_blocks ?? decoded.transfer_blocks} blocks`
         : null,
+      Number.isFinite(Number(event?.allocation_length ?? decoded.allocation_length))
+        ? `allocation ${event?.allocation_length ?? decoded.allocation_length} bytes`
+        : null,
+      Number.isFinite(Number(event?.parameter_list_length ?? decoded.parameter_list_length))
+        ? `parameter list ${event?.parameter_list_length ?? decoded.parameter_list_length} bytes`
+        : null,
+      event?.log_page_control_label || decoded.log_page_control_label,
     ].filter(Boolean).join(" / ");
     return `
       <li class="fabric-diagnostic-event severity-${classToken(event?.severity || "info")}">
@@ -1204,6 +1219,10 @@
       event?.loginfo,
       event?.asc,
       event?.opcode,
+      event?.service_action,
+      event?.service_action_label,
+      event?.log_page,
+      event?.log_page_control_label,
       event?.decode_confidence,
       event?.message,
       event?.likely_layer,
@@ -1320,7 +1339,13 @@
     const scope = [event?.controller, event?.device, event?.target ? `target ${event.target}` : null]
       .filter(Boolean)
       .join(" / ");
-    const code = [event?.loginfo ? `loginfo ${event.loginfo}` : null, event?.asc ? `ASC ${event.asc}` : null, event?.opcode]
+    const code = [
+      event?.loginfo ? `loginfo ${event.loginfo}` : null,
+      event?.asc ? `ASC ${event.asc}` : null,
+      event?.opcode,
+      event?.service_action ? `SA ${event.service_action}` : null,
+      event?.log_page,
+    ]
       .filter(Boolean)
       .join(" / ");
     const confidence = diagnosticConfidenceLabel(event);

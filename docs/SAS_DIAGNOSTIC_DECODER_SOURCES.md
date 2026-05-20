@@ -10,9 +10,9 @@ are not checked into the repository.
 | --- | --- | --- |
 | INCITS T10 SCSI Operation Codes list | Standards-backed CDB opcode names | Public numeric list at <https://www.t10.org/lists/op-num.htm>. Use for high-confidence generic SCSI operation names such as RECEIVE DIAGNOSTIC RESULTS, LOG SENSE, WRITE(16), READ CAPACITY(10), and command-size families. |
 | INCITS T10 ASC/ASCQ list | Standards-backed SCSI sense reason names | Public numeric list at <https://www.t10.org/lists/asc-num.htm>. Use for high-confidence ASC/ASCQ labels and fault families such as logical-unit communication, write/read errors, protocol CRC/parity errors, ACK/NAK timeout, NAK received, connection lost, data-buffer errors, and PCIe fabric errors. |
-| `SCSI Commands oct 2016 rev J.pdf` | Generic SCSI command, sense, LOG SENSE, and SAS PHY log decoding | Strongest immediate decoder reference. It covers common CDBs, status/sense/ASC/ASCQ language, error counter log pages, and the Protocol-Specific Port log page fields for SAS PHY evidence such as invalid dwords, running disparity errors, loss of dword sync, and PHY reset problems. |
-| `baruch/lsi_decode_loginfo` | Broadcom/LSI MPI/MPR `loginfo` decoding | MIT-licensed reference at <https://github.com/baruch/lsi_decode_loginfo>. Useful for breaking values such as `31120302` into Type `SAS`, Origin `PL`, Code `Abort`, and sub-code `Wrong relative offset or frame length`. The current app ports attributed SAS IOP/PL/IR tables without vendoring the whole script. |
-| `08-309r1.pdf` | Standards anchor for generic SCSI Primary Commands behavior | SPC-3 draft text is useful for CDB structure, operation code framing, sense data, CHECK CONDITION behavior, LOG SENSE shape, and ASC/ASCQ concepts. Use it to keep parser categories generic and standards-shaped. |
+| `SCSI Commands oct 2016 rev J.pdf` | Generic SCSI command, sense, LOG SENSE, and SAS PHY log decoding | Strongest immediate decoder reference. It covers common CDBs, status/sense/ASC/ASCQ language, error counter log pages, and the Protocol-Specific Port log page fields for SAS PHY evidence such as invalid dwords, running disparity errors, loss of dword sync, and PHY reset problems. It also anchors CDB allocation/parameter-list length fields such as LOG SENSE, PERSISTENT RESERVE IN/OUT, RECEIVE COPY RESULTS, READ CAPACITY(16), and UNMAP. |
+| `baruch/lsi_decode_loginfo` | Broadcom/LSI MPI/MPR `loginfo` decoding | MIT-licensed reference at <https://github.com/baruch/lsi_decode_loginfo>. Useful for breaking values such as `31120302` into Type `SAS`, Origin `PL`, Code `Abort`, and sub-code `Wrong relative offset or frame length`. The current app ports attributed SAS IOP boot/config/enclosure/target, PL open/discovery/enclosure, and IR compatibility/firmware tables without vendoring the whole script. |
+| `08-309r1.pdf` | Standards anchor for generic SCSI Primary Commands behavior | SPC-3 draft text is useful for CDB structure, operation code framing, sense data, CHECK CONDITION behavior, LOG SENSE shape, ASC/ASCQ concepts, and service-action codes for MAINTENANCE IN/OUT, PERSISTENT RESERVE IN/OUT, and RECEIVE COPY RESULTS. Use it to keep parser categories generic and standards-shaped. |
 | `services-specification-ultrastar-data102.pdf` | SES/enclosure diagnostic page and element mapping reference | Useful for SES model, Configuration page `01h`, Enclosure Control/Status `02h`, Element Descriptor `07h`, Additional Element Status `0Ah`, array-slot descriptors, SAS expander/connector elements, and SG3-style index semantics. Treat it as an SES/enclosure-profile reference, not as direct Archive CORE/Supermicro bay-zone truth. |
 | `D:\BPN-SAS-F424-A6.pdf` and `D:\BPN-SAS3-F424-A2N2A.pdf` | Supermicro backplane connector and port-label context | Local operator-supplied PDFs. Use for physical connector/backplane language only, such as SAS Mini HD, SAS/SATA/NVMe port labeling, and "do not mix SAS3/SATA in the same port" style constraints. These do not provide MPR `loginfo`, ASC/ASCQ, or persistent PHY counter decoding. |
 | `product-manual-ultrastar-dc-hc310-sata-oem-spec.pdf` | SATA disk command and SMART enrichment | Useful for SATA/ATA, NCQ, SMART attribute/error-log/self-test, SCT, IDENTIFY DEVICE, temperature, power-on-hours, reallocation, and read/write error context. It does not describe SAS fabric topology. |
@@ -36,8 +36,9 @@ are not checked into the repository.
 ## Implementation Guidance
 
 - Keep the current MPR/CAM evidence decoder centered on generic facts first:
-  CDB operation, direction, LBA, transfer blocks, CAM status, retry markers,
-  sense key, ASC/ASCQ, and plain-language fault family.
+  CDB operation, direction, LBA, transfer blocks, allocation length, parameter
+  list length, CAM status, retry markers, sense key, ASC/ASCQ, and
+  plain-language fault family.
 - Treat the currently displayed event list as a compact summary, not the whole
   evidence set. Group decoded events by stable fingerprint, sort by severity
   plus occurrence count, and provide a paged or expandable full-event view.
@@ -61,12 +62,17 @@ are not checked into the repository.
 
 ## Still Missing
 
-- Full Broadcom/LSI MPI/MPR `loginfo` coverage. The app now carries a useful
-  attributed SAS IOP/PL/IR subset, but it is not a complete MPI decoder.
+- Full Broadcom/LSI MPI/MPR `loginfo` coverage. The app now carries a broader
+  attributed SAS IOP/PL/IR subset, including IOP firmware/upload, enclosure,
+  and target-mode details plus more PL enclosure/discovery and IR
+  compatibility/firmware entries, but it is still not a complete MPI decoder
+  and non-SAS FC/iSCSI tables remain intentionally unexpanded.
 - Full SCSI/SAS lookup coverage. Current code carries broader common CDB
-  opcodes, selected 16-byte and 12-byte service actions, useful ASC/ASCQ
-  labels, LOG SENSE page names, SAS PHY concepts, and SES/AES concepts; it is
-  still curated rather than exhaustive.
+  opcodes, selected 16-byte and 12-byte service actions, standards-backed
+  MAINTENANCE IN/OUT and PERSISTENT RESERVE IN/OUT service actions,
+  RECEIVE COPY RESULTS service actions, useful ASC/ASCQ labels, LOG SENSE
+  page names/page-control fields, SAS PHY concepts, and SES/AES concepts; it
+  is still curated rather than exhaustive.
 - A proven TrueNAS CORE-safe source for persistent SAS PHY hardware counters.
   `mprutil show all` did not expose those counters on the current Archive CORE
   host; the current production collector therefore uses filtered non-sudo

@@ -514,6 +514,88 @@ mpr0: Controller reported scsi ioc terminated tgt 182 SMID 142 loginfo 30030200
         self.assertEqual(decoded_by_loginfo["30030200"]["family"], "controller_configuration")
         self.assertIn("Invalid Page Number", decoded_by_loginfo["30030200"]["description"])
 
+    def test_parse_mpr_dmesg_events_decodes_deeper_scsi_service_actions_and_lengths(self) -> None:
+        events = parse_mpr_dmesg_events(
+            """
+(da70:mpr0:0:200:0): MAINTENANCE IN. CDB: a3 0a 00 00 00 00 00 00 20 00 00 00
+(da71:mpr0:0:201:0): MAINTENANCE IN. CDB: a3 0c 00 00 00 00 00 00 10 00 00 00
+(da72:mpr0:0:202:0): PERSISTENT RESERVE IN. CDB: 5e 03 00 00 00 00 00 00 20 00
+(da73:mpr0:0:203:0): PERSISTENT RESERVE OUT. CDB: 5f 05 00 00 00 00 00 00 18 00
+(da74:mpr0:0:204:0): UNMAP. CDB: 42 00 00 00 00 00 00 00 18 00
+(da75:mpr0:0:205:0): LOG SENSE. CDB: 4d 01 58 00 00 00 00 00 40 00
+(da76:mpr0:0:206:0): THIRD-PARTY COPY IN. CDB: 84 04 07 00 00 00 00 00 00 00 00 00 00 40 00 00
+""".strip()
+        )
+
+        rows = events["by_controller"]["mpr0"]["event_table"]["rows"]
+        target_port_groups = next(record for record in rows if record.get("target") == "200")
+        supported_ops = next(record for record in rows if record.get("target") == "201")
+        persistent_reserve_in = next(record for record in rows if record.get("target") == "202")
+        persistent_reserve_out = next(record for record in rows if record.get("target") == "203")
+        unmap = next(record for record in rows if record.get("target") == "204")
+        log_sense = next(record for record in rows if record.get("target") == "205")
+        receive_copy_results = next(record for record in rows if record.get("target") == "206")
+
+        self.assertEqual(target_port_groups["operation"], "REPORT TARGET PORT GROUPS")
+        self.assertEqual(target_port_groups["service_action"], "0x0a")
+        self.assertEqual(target_port_groups["allocation_length"], 8192)
+        self.assertEqual(target_port_groups["decode_confidence"], "standard")
+        self.assertEqual(supported_ops["operation"], "REPORT SUPPORTED OPERATION CODES")
+        self.assertEqual(supported_ops["service_action"], "0x0c")
+        self.assertEqual(persistent_reserve_in["operation"], "READ FULL STATUS")
+        self.assertEqual(persistent_reserve_in["allocation_length"], 32)
+        self.assertEqual(persistent_reserve_out["operation"], "PREEMPT AND ABORT")
+        self.assertEqual(persistent_reserve_out["parameter_list_length"], 24)
+        self.assertEqual(unmap["operation"], "UNMAP")
+        self.assertNotIn("lba", unmap)
+        self.assertNotIn("transfer_blocks", unmap)
+        self.assertEqual(unmap["parameter_list_length"], 24)
+        self.assertEqual(log_sense["log_page"], "Protocol-Specific Port")
+        self.assertEqual(log_sense["log_page_control"], "0x1")
+        self.assertEqual(log_sense["log_page_control_label"], "Current threshold values")
+        self.assertTrue(log_sense["log_save_parameters"])
+        self.assertEqual(log_sense["allocation_length"], 64)
+        self.assertEqual(receive_copy_results["operation"], "FAILED SEGMENT DETAILS")
+        self.assertEqual(receive_copy_results["service_action"], "0x04")
+        self.assertEqual(receive_copy_results["allocation_length"], 64)
+
+    def test_parse_mpr_dmesg_events_decodes_deeper_lsi_reference_tables(self) -> None:
+        events = parse_mpr_dmesg_events(
+            """
+mpr0: Controller reported scsi ioc terminated tgt 180 SMID 140 loginfo 3003e000
+mpr0: Controller reported scsi ioc terminated tgt 181 SMID 141 loginfo 30010102
+mpr0: Controller reported scsi ioc terminated tgt 182 SMID 142 loginfo 30060002
+mpr0: Controller reported scsi ioc terminated tgt 183 SMID 143 loginfo 30070005
+mpr0: Controller reported scsi ioc terminated tgt 184 SMID 144 loginfo 31110118
+mpr0: Controller reported scsi ioc terminated tgt 185 SMID 145 loginfo 31110e01
+mpr0: Controller reported scsi ioc terminated tgt 186 SMID 146 loginfo 31200102
+mpr0: Controller reported scsi ioc terminated tgt 187 SMID 147 loginfo 32010035
+""".strip()
+        )
+
+        decoded_by_loginfo = {
+            record["loginfo"]: record
+            for record in events["by_controller"]["mpr0"]["decoded_records"]
+            if record.get("loginfo")
+        }
+
+        self.assertIn("Firmware upload, no flash available", decoded_by_loginfo["3003e000"]["label"])
+        self.assertEqual(decoded_by_loginfo["3003e000"]["decode_confidence"], "vendor-reference")
+        self.assertIn("Flash erase failed", decoded_by_loginfo["30010102"]["label"])
+        self.assertEqual(decoded_by_loginfo["30010102"]["family"], "controller_configuration")
+        self.assertIn("Invalid bus/id", decoded_by_loginfo["30060002"]["label"])
+        self.assertEqual(decoded_by_loginfo["30060002"]["family"], "ses_enclosure")
+        self.assertIn("Target mode abort exact IO request", decoded_by_loginfo["30070005"]["label"])
+        self.assertEqual(decoded_by_loginfo["30070005"]["family"], "aborted_command")
+        self.assertIn("STP resources busy", decoded_by_loginfo["31110118"]["label"])
+        self.assertEqual(decoded_by_loginfo["31110118"]["decode_confidence"], "vendor-reference")
+        self.assertIn("Discovery remote SEP reset", decoded_by_loginfo["31110e01"]["label"])
+        self.assertEqual(decoded_by_loginfo["31110e01"]["family"], "ses_enclosure")
+        self.assertIn("ISTWI interrupt received while idle", decoded_by_loginfo["31200102"]["label"])
+        self.assertEqual(decoded_by_loginfo["31200102"]["family"], "ses_enclosure")
+        self.assertIn("SATA 48-bit LBA not supported", decoded_by_loginfo["32010035"]["label"])
+        self.assertEqual(decoded_by_loginfo["32010035"]["decode_confidence"], "vendor-reference")
+
 
 class SasFabricAliasStoreTests(unittest.TestCase):
     def test_enclosure_alias_overrides_system_alias_for_same_object(self) -> None:

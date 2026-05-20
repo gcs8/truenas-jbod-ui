@@ -13,6 +13,11 @@
 - ZFS spare disks now group as pool-level `spares` peers in parsed topology
   and in the live slot peer-highlighting UI instead of being split by
   individual `spare-N` labels.
+- SAS diagnostic decoding now corrects MAINTENANCE IN service-action labels,
+  adds standards-backed persistent-reserve / receive-copy service actions and
+  CDB length fields, avoids false LBA decoding for `UNMAP`, expands LOG SENSE
+  page-control context, and ports more attributed Broadcom/LSI IOP/PL/IR
+  `loginfo` tables.
 
 ## v0.20.0 - 2026-05-20
 

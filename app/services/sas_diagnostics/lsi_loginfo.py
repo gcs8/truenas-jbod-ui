@@ -41,6 +41,7 @@ LSI_SAS_IOP_CODES = {
 }
 
 LSI_SAS_IOP_INVALID_PAGE_DETAILS = {
+    0x00000000: ("IOP_LOGINFO_CODE_CONFIG_INVALID_PAGE", "Config invalid page", "controller_configuration"),
     0x00000100: ("IOP_LOGINFO_CODE_CONFIG_INVALID_PAGE_RT", "Route Table Entry not found", "controller_configuration"),
     0x00000200: ("IOP_LOGINFO_CODE_CONFIG_INVALID_PAGE_PN", "Invalid Page Number", "controller_configuration"),
     0x00000300: ("IOP_LOGINFO_CODE_CONFIG_INVALID_PAGE_FORM", "Invalid FORM", "controller_configuration"),
@@ -48,6 +49,37 @@ LSI_SAS_IOP_INVALID_PAGE_DETAILS = {
     0x00000500: ("IOP_LOGINFO_CODE_CONFIG_INVALID_PAGE_DNM", "Device Not Mapped", "controller_configuration"),
     0x00000600: ("IOP_LOGINFO_CODE_CONFIG_INVALID_PAGE_PERSIST", "Persistent Page not found", "controller_configuration"),
     0x00000700: ("IOP_LOGINFO_CODE_CONFIG_INVALID_PAGE_DEFAULT", "Default Page not found", "controller_configuration"),
+    0x0000E000: ("IOP_LOGINFO_CODE_FWUPLOAD_NO_FLASH_AVAILABLE", "Firmware upload, no flash available", "controller_configuration"),
+    0x0000E001: ("IOP_LOGINFO_CODE_FWUPLOAD_UNKNOWN_IMAGE_TYPE", "Firmware upload, unknown image type", "controller_configuration"),
+    0x0000E002: ("IOP_LOGINFO_CODE_FWUPLOAD_WRONG_IMAGE_SIZE", "Firmware upload, wrong image size", "controller_configuration"),
+    0x0000E003: ("IOP_LOGINFO_CODE_FWUPLOAD_ENTIRE_FLASH_UPLOAD_FAILED", "Firmware upload, entire flash upload failed", "controller_configuration"),
+    0x0000E004: ("IOP_LOGINFO_CODE_FWUPLOAD_REGION_UPLOAD_FAILED", "Firmware upload, region upload failed", "controller_configuration"),
+    0x0000E005: ("IOP_LOGINFO_CODE_FWUPLOAD_DMA_FAILURE", "Firmware upload DMA failure", "controller_configuration"),
+}
+
+LSI_SAS_IOP_BOOT_DETAILS = {
+    0x00000000: ("IOP_LOGINFO_CODE_INVALID_SAS_ADDRESS", "Invalid SAS address", "controller_configuration"),
+    0x00000101: ("IOP_LOGINFO_CODE_FLASH_NOT_PRESENT", "Flash not present", "controller_configuration"),
+    0x00000102: ("IOP_LOGINFO_CODE_FLASH_ERASE_FAILED", "Flash erase failed", "controller_configuration"),
+    0x00000103: ("IOP_LOGINFO_CODE_FLASH_WRITE_FAILED", "Flash write failed", "controller_configuration"),
+    0x00000401: ("IOP_LOGINFO_CODE_IMAGE_BOOTLOADER_NOT_PRESENT", "Bootloader image not present", "controller_configuration"),
+    0x00000402: ("IOP_LOGINFO_CODE_IMAGE_MAIN_CHECKSUM_FAILURE", "Main image checksum failure", "controller_configuration"),
+    0x00000403: ("IOP_LOGINFO_CODE_IMAGE_EXT_CHECKSUM_FAILURE", "Extended image checksum failure", "controller_configuration"),
+    0x00000404: ("IOP_LOGINFO_CODE_IMAGE_INIT_NOT_PRESENT", "Init image not present", "controller_configuration"),
+    0x00000405: ("IOP_LOGINFO_CODE_IMAGE_INIT_ADDRESS_ERROR", "Init image address error", "controller_configuration"),
+}
+
+LSI_SAS_IOP_ENCLOSURE_MGMT_DETAILS = {
+    0x00000001: ("IOP_LOGINFO_CODE_ENCL_MGMT_READ_ACTION_ERROR", "Read action not supported for SEP message", "ses_enclosure"),
+    0x00000002: ("IOP_LOGINFO_CODE_ENCL_MGMT_INVALID_BUS_ID_ERROR", "Invalid bus/id in SEP message", "ses_enclosure"),
+}
+
+LSI_SAS_IOP_TARGET_DETAILS = {
+    0x00000001: ("IOP_LOGINFO_CODE_TARGET_ASSIST_TERMINATED", "Target assist terminated", "controller_terminated_io"),
+    0x00000002: ("IOP_LOGINFO_CODE_TARGET_STATUS_SEND_TERMINATED", "Target status send terminated", "controller_terminated_io"),
+    0x00000003: ("IOP_LOGINFO_CODE_TARGET_MODE_ABORT_ALL_IO", "Target mode abort all IO", "aborted_command"),
+    0x00000004: ("IOP_LOGINFO_CODE_TARGET_MODE_ABORT_EXACT_IO", "Target mode abort exact IO", "aborted_command"),
+    0x00000005: ("IOP_LOGINFO_CODE_TARGET_MODE_ABORT_EXACT_IO_REQ", "Target mode abort exact IO request", "aborted_command"),
 }
 
 LSI_SAS_IR_CODES = {
@@ -55,11 +87,43 @@ LSI_SAS_IR_CODES = {
     0x00010001: ("IR_LOGINFO_VOLUME_CREATE_INVALID_LENGTH", "Volume create invalid length", "device_path_exception"),
     0x00010002: ("IR_LOGINFO_VOLUME_CREATE_DUPLICATE", "Volume create duplicate", "device_path_exception"),
     0x00010003: ("IR_LOGINFO_VOLUME_CREATE_NO_SLOTS", "Volume create no slots", "device_path_exception"),
+    0x00010004: ("IR_LOGINFO_VOLUME_CREATE_DMA_ERROR", "Volume create DMA error", "controller_terminated_io"),
+    0x00010005: ("IR_LOGINFO_VOLUME_CREATE_INVALID_VOLUME_TYPE", "Volume create invalid volume type", "device_path_exception"),
+    0x00010006: ("IR_LOGINFO_VOLUME_MFG_PAGE4_ERROR", "Volume manufacturing page 4 error", "controller_configuration"),
+    0x00010007: ("IR_LOGINFO_VOLUME_INTERNAL_CONFIG_STRUCTURE_ERROR", "Volume internal config structure error", "controller_configuration"),
+    0x00010010: ("IR_LOGINFO_VOLUME_ACTIVATING_AN_ACTIVE_VOLUME", "Activating an active volume", "device_path_exception"),
+    0x00010011: ("IR_LOGINFO_VOLUME_ACTIVATING_INVALID_VOLUME_TYPE", "Activating invalid volume type", "device_path_exception"),
+    0x00010012: ("IR_LOGINFO_VOLUME_ACTIVATING_TOO_MANY_VOLUMES", "Activating too many volumes", "device_path_exception"),
+    0x00010013: ("IR_LOGINFO_VOLUME_ACTIVATING_VOLUME_ID_IN_USE", "Activating volume id in use", "device_path_exception"),
+    0x00010014: ("IR_LOGINFO_VOLUME_ACTIVATE_VOLUME_FAILED", "Activate volume failed", "device_path_exception"),
+    0x00010015: ("IR_LOGINFO_VOLUME_ACTIVATING_IMPORT_VOLUME_FAILED", "Activating import volume failed", "device_path_exception"),
+    0x00010016: ("IR_LOGINFO_VOLUME_ACTIVATING_TOO_MANY_PHYS_DISKS", "Activating too many physical disks", "device_path_exception"),
     0x00010020: ("IR_LOGINFO_PHYSDISK_CREATE_TOO_MANY_DISKS", "Physical disk create too many disks", "device_path_exception"),
+    0x00010021: ("IR_LOGINFO_PHYSDISK_CREATE_INVALID_LENGTH", "Physical disk create invalid length", "device_path_exception"),
+    0x00010022: ("IR_LOGINFO_PHYSDISK_CREATE_DMA_ERROR", "Physical disk create DMA error", "controller_terminated_io"),
     0x00010023: ("IR_LOGINFO_PHYSDISK_CREATE_BUS_TID_INVALID", "Physical disk bus/target invalid", "device_path_exception"),
+    0x00010024: ("IR_LOGINFO_PHYSDISK_CREATE_CONFIG_PAGE_ERROR", "Physical disk create config page error", "controller_configuration"),
     0x00010030: ("IR_LOGINFO_COMPAT_ERROR_RAID_DISABLED", "Compatibility error, RAID disabled", "device_path_exception"),
     0x00010031: ("IR_LOGINFO_COMPAT_ERROR_INQUIRY_FAILED", "Compatibility error, inquiry failed", "device_path_exception"),
+    0x00010032: ("IR_LOGINFO_COMPAT_ERROR_NOT_DIRECT_ACCESS", "Compatibility error, not direct access", "device_path_exception"),
+    0x00010033: ("IR_LOGINFO_COMPAT_ERROR_REMOVABLE_FOUND", "Compatibility error, removable device found", "device_path_exception"),
+    0x00010034: ("IR_LOGINFO_COMPAT_ERROR_NEED_SCSI_2_OR_HIGHER", "Compatibility error, needs SCSI-2 or higher", "device_path_exception"),
+    0x00010035: ("IR_LOGINFO_COMPAT_ERROR_SATA_48BIT_LBA_NOT_SUPPORTED", "Compatibility error, SATA 48-bit LBA not supported", "device_path_exception"),
+    0x00010036: ("IR_LOGINFO_COMPAT_ERROR_DEVICE_NOT_512_BYTE_BLOCK", "Compatibility error, device not 512-byte block", "device_path_exception"),
+    0x00010037: ("IR_LOGINFO_COMPAT_ERROR_VOLUME_TYPE_CHECK_FAILED", "Compatibility error, volume type check failed", "device_path_exception"),
+    0x00010038: ("IR_LOGINFO_COMPAT_ERROR_UNSUPPORTED_VOLUME_TYPE", "Compatibility error, unsupported volume type", "device_path_exception"),
+    0x00010039: ("IR_LOGINFO_COMPAT_ERROR_DISK_TOO_SMALL", "Compatibility error, disk too small", "device_path_exception"),
     0x0001003A: ("IR_LOGINFO_COMPAT_ERROR_PHYS_DISK_NOT_FOUND", "Physical disk not found", "link_loss"),
+    0x0001003B: ("IR_LOGINFO_COMPAT_ERROR_MEMBERSHIP_COUNT", "Compatibility error, membership count", "device_path_exception"),
+    0x0001003C: ("IR_LOGINFO_COMPAT_ERROR_NON_64K_STRIPE_SIZE", "Compatibility error, non-64K stripe size", "device_path_exception"),
+    0x0001003D: ("IR_LOGINFO_COMPAT_ERROR_IME_VOL_NOT_CURRENTLY_SUPPORTED", "Compatibility error, IME volume not currently supported", "device_path_exception"),
+    0x00010050: ("IR_LOGINFO_DEV_FW_UPDATE_ERR_DFU_IN_PROGRESS", "Device firmware update error, update in progress", "controller_configuration"),
+    0x00010051: ("IR_LOGINFO_DEV_FW_UPDATE_ERR_DEVICE_IN_INVALID_STATE", "Device firmware update error, device in invalid state", "device_path_exception"),
+    0x00010052: ("IR_LOGINFO_DEV_FW_UPDATE_ERR_INVALID_TIMEOUT", "Device firmware update error, invalid timeout", "controller_configuration"),
+    0x00010053: ("IR_LOGINFO_DEV_FW_UPDATE_ERR_NO_TIMERS", "Device firmware update error, no timers", "controller_configuration"),
+    0x00010054: ("IR_LOGINFO_DEV_FW_UPDATE_ERR_READING_CFG_PAGE", "Device firmware update error, reading config page", "controller_configuration"),
+    0x00010055: ("IR_LOGINFO_DEV_FW_UPDATE_ERR_PORT_IO_TIMEOUTS_REQUIRED", "Device firmware update error, port IO timeouts required", "timeout"),
+    0x00010056: ("IR_LOGINFO_DEV_FW_UPDATE_ERR_ALLOC_CFG_PAGE", "Device firmware update error, allocate config page", "controller_configuration"),
     0x00020000: ("IR_LOGINFO_CODE_UNUSED2", "Unused IR code", "device_path_exception"),
 }
 
@@ -130,18 +194,30 @@ LSI_SAS_PL_OPEN_FAILURE_DETAILS = {
     0x00000008: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_RES_STOP1", "Resource stop failure 1", "device_path_exception"),
     0x00000009: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_RETRY", "Open fail retry", "retry"),
     0x0000000A: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_BREAK", "Open fail break", "sas_transport"),
+    0x0000000B: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_UNUSED_0B", "Open fail unused 0B", "sas_transport"),
     0x0000000C: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_OPEN_TIMEOUT_EXP", "Open fail timeout waiting for expander", "timeout"),
+    0x0000000D: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_UNUSED_0D", "Open fail unused 0D", "sas_transport"),
     0x0000000E: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_DVTBLE_ACCSS_FAIL", "Device table access failure", "device_path_exception"),
     0x00000011: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_BAD_DEST", "Bad destination", "device_path_exception"),
     0x00000012: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_RATE_NOT_SUPP", "Rate not supported", "device_path_exception"),
     0x00000013: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_PROT_NOT_SUPP", "Protocol not supported", "device_path_exception"),
     0x00000014: ("PL_LOGINFO_SUB_CODE_OPEN_FAILURE_ABANDON0", "Open reject zone violation", "device_path_exception"),
+    0x00000015: ("PL_LOGINFO_SUB_CODE_OPEN_FAILURE_ABANDON1", "Open failure abandon 1", "sas_transport"),
+    0x00000016: ("PL_LOGINFO_SUB_CODE_OPEN_FAILURE_ABANDON2", "Open failure abandon 2", "sas_transport"),
+    0x00000017: ("PL_LOGINFO_SUB_CODE_OPEN_FAILURE_ABANDON3", "Open failure abandon 3", "sas_transport"),
+    0x00000018: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_STP_RESOURCES_BSY", "STP resources busy", "device_path_exception"),
+    0x00000019: ("PL_LOGINFO_SUB_CODE_OPEN_FAIL_WRONG_DESTINATION", "Wrong destination", "device_path_exception"),
     0x0000001A: ("PL_LOGINFO_SUB_CODE_OPEN_FAILURE_ORR_TIMEOUT", "Open reject retry timeout", "timeout"),
     0x0000001B: ("PL_LOGINFO_SUB_CODE_OPEN_FAILURE_PATH_BLOCKED", "Path blocked", "link_loss"),
     0x0000001C: ("PL_LOGINFO_SUB_CODE_OPEN_FAILURE_AWT_MAXED", "Arbitration wait timer maxed", "timeout"),
     0x00000020: ("PL_LOGINFO_SUB_CODE_TARGET_BUS_RESET", "Target bus reset", "bus_reset"),
     0x00000030: ("PL_LOGINFO_SUB_CODE_TRANSPORT_LAYER", "Transport layer", "sas_transport"),
     0x00000040: ("PL_LOGINFO_SUB_CODE_PORT_LAYER", "Port layer", "sas_transport"),
+}
+
+LSI_SAS_PL_DISCOVERY_SATA_DETAILS = {
+    0x00000000: ("PL_LOGINFO_SUB_CODE_DISCOVERY_SATA_INIT_W_IOS", "Discovery SATA init with IOs", "device_path_exception"),
+    0x00000001: ("PL_LOGINFO_SUB_CODE_DISCOVERY_REMOTE_SEP_RESET", "Discovery remote SEP reset", "ses_enclosure"),
 }
 
 LSI_SAS_PL_CONFIG_ERRORS = {
@@ -172,13 +248,19 @@ LSI_SAS_PL_ENCLOSURE_MGMT_ERRORS = {
     0x000000E0: ("PL_LOGINFO_CODE_ENCL_MGMT_SMP_FRAME_ALLOC_ERROR", "Can't get frame for SMP command", "ses_enclosure"),
     0x00000100: ("PL_LOGINFO_DA_SEP_NOT_PRESENT", "SEP not present when message received", "ses_enclosure"),
     0x00000101: ("PL_LOGINFO_DA_SEP_SINGLE_THREAD_ERROR", "SEP can only accept one message at a time", "ses_enclosure"),
+    0x00000102: ("PL_LOGINFO_DA_SEP_ISTWI_INTR_IN_IDLE_STATE", "ISTWI interrupt received while idle", "ses_enclosure"),
     0x00000103: ("PL_LOGINFO_DA_SEP_RECEIVED_NACK_FROM_SLAVE", "SEP NACKed, it is busy", "ses_enclosure"),
     0x00000104: ("PL_LOGINFO_DA_SEP_DID_NOT_RECEIVE_ACK", "SEP did not receive ACK", "ses_enclosure"),
     0x00000105: ("PL_LOGINFO_DA_SEP_BAD_STATUS_HDR_CHKSUM", "SEP sent bad status header checksum", "ses_enclosure"),
     0x00000106: ("PL_LOGINFO_DA_SEP_STOP_ON_DATA", "SEP stopped while transferring data", "ses_enclosure"),
     0x00000107: ("PL_LOGINFO_DA_SEP_STOP_ON_SENSE_DATA", "SEP stopped while transferring sense data", "ses_enclosure"),
+    0x00000108: ("PL_LOGINFO_DA_SEP_UNSUPPORTED_SCSI_STATUS_1", "SEP returned unknown SCSI status", "ses_enclosure"),
+    0x00000109: ("PL_LOGINFO_DA_SEP_UNSUPPORTED_SCSI_STATUS_2", "SEP returned unknown SCSI status", "ses_enclosure"),
     0x0000010A: ("PL_LOGINFO_DA_SEP_CHKSUM_ERROR_AFTER_STOP", "SEP returned bad checksum after STOP", "ses_enclosure"),
+    0x0000010B: ("PL_LOGINFO_DA_SEP_CHKSUM_ERROR_AFTER_STOP_GETDATA", "SEP returned bad checksum after STOP while getting data", "ses_enclosure"),
     0x0000010C: ("PL_LOGINFO_DA_SEP_UNSUPPORTED_COMMAND", "SEP does not support CDB opcode", "ses_enclosure"),
+    0x0000010D: ("PL_LOGINFO_DA_SEP_UNSUPPORTED_COMMAND_2", "SEP does not support CDB opcode, firmware location 2", "ses_enclosure"),
+    0x0000010E: ("PL_LOGINFO_DA_SEP_UNSUPPORTED_COMMAND_3", "SEP does not support CDB opcode, firmware location 3", "ses_enclosure"),
 }
 
 
@@ -231,6 +313,13 @@ def decode_lsi_loginfo(loginfo: str) -> dict[str, Any] | None:
                 )
                 if detail_symbol:
                     unparsed &= ~0x000000FF
+            elif sub_code_bits == 0x00000E00:
+                detail_symbol, detail_label, detail_family = LSI_SAS_PL_DISCOVERY_SATA_DETAILS.get(
+                    sub_detail_bits,
+                    (None, None, None),
+                )
+                if detail_symbol:
+                    unparsed &= ~0x000000FF
         elif code_bits == 0x000F0000:
             detail_symbol, detail_label, detail_family = LSI_SAS_PL_CONFIG_ERRORS.get(
                 low_16_bits,
@@ -252,8 +341,29 @@ def decode_lsi_loginfo(loginfo: str) -> dict[str, Any] | None:
             (None, "Unknown SAS IOP code", "controller_terminated_io", ""),
         )
         unparsed &= ~0x00FF0000
-        if code_bits == 0x00030000:
+        if code_bits == 0x00010000:
+            detail_symbol, detail_label, detail_family = LSI_SAS_IOP_BOOT_DETAILS.get(
+                low_16_bits,
+                (None, None, None),
+            )
+            if detail_symbol:
+                unparsed &= ~0x0000FFFF
+        elif code_bits == 0x00030000:
             detail_symbol, detail_label, detail_family = LSI_SAS_IOP_INVALID_PAGE_DETAILS.get(
+                low_16_bits,
+                (None, None, None),
+            )
+            if detail_symbol:
+                unparsed &= ~0x0000FFFF
+        elif code_bits == 0x00060000:
+            detail_symbol, detail_label, detail_family = LSI_SAS_IOP_ENCLOSURE_MGMT_DETAILS.get(
+                low_16_bits,
+                (None, None, None),
+            )
+            if detail_symbol:
+                unparsed &= ~0x0000FFFF
+        elif code_bits == 0x00070000:
+            detail_symbol, detail_label, detail_family = LSI_SAS_IOP_TARGET_DETAILS.get(
                 low_16_bits,
                 (None, None, None),
             )

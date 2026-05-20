@@ -105,21 +105,48 @@ SCSI_CDB_OPCODE_NAMES = {
 }
 
 SCSI_SERVICE_ACTION_NAMES = {
+    (0x5E, 0x00): "READ KEYS",
+    (0x5E, 0x01): "READ RESERVATION",
+    (0x5E, 0x02): "REPORT CAPABILITIES",
+    (0x5E, 0x03): "READ FULL STATUS",
+    (0x5F, 0x00): "REGISTER",
+    (0x5F, 0x01): "RESERVE",
+    (0x5F, 0x02): "RELEASE",
+    (0x5F, 0x03): "CLEAR",
+    (0x5F, 0x04): "PREEMPT",
+    (0x5F, 0x05): "PREEMPT AND ABORT",
+    (0x5F, 0x06): "REGISTER AND IGNORE EXISTING KEY",
+    (0x5F, 0x07): "REGISTER AND MOVE",
+    (0x84, 0x00): "COPY STATUS",
+    (0x84, 0x01): "RECEIVE DATA",
+    (0x84, 0x03): "OPERATING PARAMETERS",
+    (0x84, 0x04): "FAILED SEGMENT DETAILS",
     (0x9E, 0x10): "READ CAPACITY(16)",
     (0x9E, 0x11): "READ LONG(16)",
     (0x9E, 0x12): "GET LBA STATUS",
     (0x9F, 0x11): "WRITE LONG(16)",
-    (0xA3, 0x0C): "REPORT TARGET PORT GROUPS",
-    (0xA3, 0x0D): "REPORT ALIASES",
-    (0xA3, 0x0E): "REPORT SUPPORTED OPERATION CODES",
-    (0xA3, 0x0F): "REPORT SUPPORTED TASK MANAGEMENT FUNCTIONS",
-    (0xA3, 0x10): "REPORT PRIORITY",
-    (0xA3, 0x11): "REPORT TIMESTAMP",
-    (0xA3, 0x12): "MANAGEMENT PROTOCOL IN",
+    (0xA3, 0x05): "REPORT DEVICE IDENTIFIER",
+    (0xA3, 0x0A): "REPORT TARGET PORT GROUPS",
+    (0xA3, 0x0B): "REPORT ALIASES",
+    (0xA3, 0x0C): "REPORT SUPPORTED OPERATION CODES",
+    (0xA3, 0x0D): "REPORT SUPPORTED TASK MANAGEMENT FUNCTIONS",
+    (0xA3, 0x0E): "REPORT PRIORITY",
+    (0xA3, 0x0F): "REPORT TIMESTAMP",
+    (0xA4, 0x06): "SET DEVICE IDENTIFIER",
     (0xA4, 0x0A): "SET TARGET PORT GROUPS",
+    (0xA4, 0x0B): "CHANGE ALIASES",
     (0xA4, 0x0E): "SET PRIORITY",
     (0xA4, 0x0F): "SET TIMESTAMP",
-    (0xA4, 0x10): "MANAGEMENT PROTOCOL OUT",
+}
+
+SCSI_SERVICE_ACTION_OPCODES = {opcode for opcode, _ in SCSI_SERVICE_ACTION_NAMES} | {
+    0x9D,
+    0x9E,
+    0x9F,
+    0xA3,
+    0xA4,
+    0xA9,
+    0xAB,
 }
 
 SCSI_SENSE_KEY_LABELS = {
@@ -245,6 +272,13 @@ LOG_SENSE_PAGE_NAMES = {
     0x3F: "All Log Pages",
 }
 
+LOG_SENSE_PAGE_CONTROL_LABELS = {
+    0x00: "Current cumulative values",
+    0x01: "Current threshold values",
+    0x02: "Default cumulative values",
+    0x03: "Default threshold values",
+}
+
 SAS_PHY_LOG_PARAMETERS = [
     {"code": "0x0001", "name": "Invalid dword count"},
     {"code": "0x0002", "name": "Running disparity error count"},
@@ -301,7 +335,7 @@ def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
     operation = SCSI_CDB_OPCODE_NAMES.get(opcode, reported_operation) if opcode is not None else reported_operation
     service_action = None
     service_action_known = False
-    if opcode in {0x9D, 0x9E, 0x9F, 0xA3, 0xA4, 0xA9, 0xAB} and len(cdb_bytes) > 1:
+    if opcode in SCSI_SERVICE_ACTION_OPCODES and len(cdb_bytes) > 1:
         service_action = cdb_bytes[1] & 0x1F
         service_action_operation = SCSI_SERVICE_ACTION_NAMES.get((opcode, service_action))
         if service_action_operation:
@@ -311,7 +345,7 @@ def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
     family = _cdb_fault_family(operation)
     confidence = "standard" if operation_from_table else "observed"
     decoder_note = None
-    if opcode in {0x9D, 0x9E, 0x9F, 0xA3, 0xA4, 0xA9, 0xAB} and service_action is not None and not service_action_known:
+    if opcode in SCSI_SERVICE_ACTION_OPCODES and service_action is not None and not service_action_known:
         confidence = "standard-partial"
         decoder_note = "Opcode is standard, but this service action is not in the current local lookup table."
     elif not operation_from_table:
@@ -342,6 +376,9 @@ def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
     address = _decode_cdb_address(cdb_bytes)
     if address:
         decoded.update(address)
+    lengths = _decode_cdb_lengths(cdb_bytes)
+    if lengths:
+        decoded.update(lengths)
     if opcode == 0x4D:
         decoded.update(_decode_log_sense_cdb(cdb_bytes))
     return decoded
@@ -401,6 +438,21 @@ def _cdb_fault_family(operation: str) -> str:
         return "capacity_query"
     if upper == "LOG SENSE":
         return "log_sense"
+    if "PERSISTENT RESERVE" in upper or upper in {
+        "READ KEYS",
+        "READ RESERVATION",
+        "REPORT CAPABILITIES",
+        "READ FULL STATUS",
+        "REGISTER",
+        "RESERVE",
+        "RELEASE",
+        "CLEAR",
+        "PREEMPT",
+        "PREEMPT AND ABORT",
+        "REGISTER AND IGNORE EXISTING KEY",
+        "REGISTER AND MOVE",
+    }:
+        return "maintenance"
     if "DIAGNOSTIC" in upper or "ENCLOSURE" in upper:
         return "ses_enclosure"
     if "MAINTENANCE" in upper:
@@ -428,7 +480,7 @@ def _decode_cdb_address(cdb_bytes: list[int]) -> dict[str, Any]:
             "lba": _int_from_bytes(cdb_bytes[2:6]),
             "transfer_blocks": _int_from_bytes(cdb_bytes[6:10]),
         }
-    if len(cdb_bytes) >= 10 and cdb_bytes[0] in {0x28, 0x2A, 0x2E, 0x2F, 0x35, 0x41, 0x42}:
+    if len(cdb_bytes) >= 10 and cdb_bytes[0] in {0x28, 0x2A, 0x2E, 0x2F, 0x35, 0x41}:
         return {
             "lba": _int_from_bytes(cdb_bytes[2:6]),
             "transfer_blocks": _int_from_bytes(cdb_bytes[7:9]),
@@ -442,13 +494,44 @@ def _decode_cdb_address(cdb_bytes: list[int]) -> dict[str, Any]:
     return {}
 
 
+def _decode_cdb_lengths(cdb_bytes: list[int]) -> dict[str, Any]:
+    if not cdb_bytes:
+        return {}
+    opcode = cdb_bytes[0]
+    if opcode in {0x03, 0x12, 0x1A} and len(cdb_bytes) >= 5:
+        return {"allocation_length": cdb_bytes[4]}
+    if opcode in {0x15} and len(cdb_bytes) >= 5:
+        return {"parameter_list_length": cdb_bytes[4]}
+    if opcode in {0x4C, 0x55, 0x5F} and len(cdb_bytes) >= 9:
+        return {"parameter_list_length": _int_from_bytes(cdb_bytes[7:9])}
+    if opcode in {0x42} and len(cdb_bytes) >= 9:
+        return {"parameter_list_length": _int_from_bytes(cdb_bytes[7:9])}
+    if opcode in {0x4D, 0x5A, 0x5E, 0xA0} and len(cdb_bytes) >= 9:
+        return {"allocation_length": _int_from_bytes(cdb_bytes[7:9])}
+    if opcode in {0x84} and len(cdb_bytes) >= 14:
+        return {"allocation_length": _int_from_bytes(cdb_bytes[10:14])}
+    if opcode == 0xA3 and len(cdb_bytes) >= 10:
+        return {"allocation_length": _int_from_bytes(cdb_bytes[6:10])}
+    if opcode == 0xA4 and len(cdb_bytes) >= 10:
+        return {"parameter_list_length": _int_from_bytes(cdb_bytes[6:10])}
+    if opcode == 0x9E and len(cdb_bytes) >= 14:
+        service_action = cdb_bytes[1] & 0x1F
+        if service_action in {0x10, 0x12}:
+            return {"allocation_length": _int_from_bytes(cdb_bytes[10:14])}
+    return {}
+
+
 def _decode_log_sense_cdb(cdb_bytes: list[int]) -> dict[str, Any]:
     if len(cdb_bytes) < 3:
         return {}
     page_code = cdb_bytes[2] & 0x3F
+    page_control = (cdb_bytes[2] >> 6) & 0x03
     decoded: dict[str, Any] = {
         "log_page_code": f"0x{page_code:02x}",
         "log_page": LOG_SENSE_PAGE_NAMES.get(page_code, "Unknown log page"),
+        "log_page_control": f"0x{page_control:x}",
+        "log_page_control_label": LOG_SENSE_PAGE_CONTROL_LABELS[page_control],
+        "log_save_parameters": bool(cdb_bytes[1] & 0x01),
         "log_page_source": dict(T10_LOG_SENSE_SOURCE),
     }
     if len(cdb_bytes) > 3:
