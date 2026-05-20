@@ -495,6 +495,8 @@ def _mpr_dmesg_event_type(message: str) -> str:
         return "ioc_terminated"
     if lowered.startswith("cam status:"):
         return "cam_status"
+    if re.match(r"error\s+\d+\s*,", lowered):
+        return "cam_error"
     if lowered.startswith("scsi sense:"):
         return "scsi_sense"
     if lowered.startswith("scsi status:"):

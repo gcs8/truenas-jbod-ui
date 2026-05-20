@@ -21,6 +21,11 @@ T10_LOG_SENSE_SOURCE = {
     "url": "https://www.t10.org/lists/1spc-lst.htm",
 }
 
+T10_STATUS_SOURCE = {
+    "name": "INCITS T10 SCSI status codes list",
+    "url": "https://www.t10.org/lists/2status.htm",
+}
+
 KERNEL_MESSAGE_SOURCE = {
     "name": "FreeBSD CAM/MPR kernel message",
     "url": None,
@@ -43,23 +48,30 @@ SCSI_CDB_OPCODE_NAMES = {
     0x1C: "RECEIVE DIAGNOSTIC RESULTS",
     0x1D: "SEND DIAGNOSTIC",
     0x1E: "PREVENT ALLOW MEDIUM REMOVAL",
+    0x23: "READ FORMAT CAPACITIES",
     0x25: "READ CAPACITY(10)",
     0x28: "READ(10)",
     0x2A: "WRITE(10)",
+    0x2B: "SEEK(10)",
     0x2E: "WRITE AND VERIFY(10)",
     0x2F: "VERIFY(10)",
     0x34: "PRE-FETCH(10)",
     0x35: "SYNCHRONIZE CACHE(10)",
+    0x36: "LOCK UNLOCK CACHE(10)",
     0x37: "READ DEFECT DATA(10)",
+    0x38: "MEDIUM SCAN",
     0x3B: "WRITE BUFFER",
     0x3C: "READ BUFFER",
     0x3E: "READ LONG(10)",
     0x3F: "WRITE LONG(10)",
     0x41: "WRITE SAME(10)",
     0x42: "UNMAP",
+    0x48: "SANITIZE",
     0x4C: "LOG SELECT",
     0x4D: "LOG SENSE",
     0x55: "MODE SELECT(10)",
+    0x56: "RESERVE(10)",
+    0x57: "RELEASE(10)",
     0x5A: "MODE SENSE(10)",
     0x5E: "PERSISTENT RESERVE IN",
     0x5F: "PERSISTENT RESERVE OUT",
@@ -93,6 +105,7 @@ SCSI_CDB_OPCODE_NAMES = {
     0xA3: "MAINTENANCE IN",
     0xA4: "MAINTENANCE OUT",
     0xA5: "MOVE MEDIUM",
+    0xA7: "MOVE MEDIUM ATTACHED",
     0xA8: "READ(12)",
     0xA9: "SERVICE ACTION OUT(12)",
     0xAA: "WRITE(12)",
@@ -102,6 +115,13 @@ SCSI_CDB_OPCODE_NAMES = {
     0xB5: "SECURITY PROTOCOL OUT",
     0xB6: "SEND VOLUME TAG",
     0xB7: "READ DEFECT DATA(12)",
+    0xB8: "READ ELEMENT STATUS",
+    0xBA: "REDUNDANCY GROUP (IN)",
+    0xBB: "REDUNDANCY GROUP (OUT)",
+    0xBC: "SPARE (IN)",
+    0xBD: "SPARE (OUT)",
+    0xBE: "VOLUME SET (IN)",
+    0xBF: "VOLUME SET (OUT)",
 }
 
 SCSI_SERVICE_ACTION_NAMES = {
@@ -177,6 +197,18 @@ SCSI_ASC_ASCQ_LABELS = {
     (0x04, 0x01): "Logical unit is becoming ready",
     (0x04, 0x02): "Logical unit not ready, initializing command required",
     (0x04, 0x03): "Logical unit not ready, manual intervention required",
+    (0x04, 0x05): "Logical unit not ready, rebuild in progress",
+    (0x04, 0x06): "Logical unit not ready, recalculation in progress",
+    (0x04, 0x07): "Logical unit not ready, operation in progress",
+    (0x04, 0x09): "Logical unit not ready, self-test in progress",
+    (0x04, 0x0A): "Logical unit not accessible, asymmetric access state transition",
+    (0x04, 0x0B): "Logical unit not accessible, target port in standby state",
+    (0x04, 0x0C): "Logical unit not accessible, target port in unavailable state",
+    (0x04, 0x1A): "Logical unit not ready, START STOP UNIT command in progress",
+    (0x04, 0x1B): "Logical unit not ready, sanitize in progress",
+    (0x04, 0x20): "Logical unit not ready, logical unit reset required",
+    (0x04, 0x21): "Logical unit not ready, hard reset required",
+    (0x04, 0x22): "Logical unit not ready, power cycle required",
     (0x05, 0x00): "Logical unit does not respond to selection",
     (0x08, 0x00): "Logical unit communication failure",
     (0x08, 0x01): "Logical unit communication timeout",
@@ -248,8 +280,25 @@ SCSI_ASC_ASCQ_LABELS = {
     (0x27, 0x02): "Logical unit software write protected",
     (0x27, 0x07): "Space allocation failed write protect",
     (0x28, 0x00): "Not ready to ready change, medium may have changed",
+    (0x28, 0x01): "Import or export element accessed",
     (0x29, 0x00): "Power on, reset, or bus device reset occurred",
+    (0x29, 0x01): "Power on occurred",
+    (0x29, 0x02): "SCSI bus reset occurred",
+    (0x29, 0x03): "Bus device reset function occurred",
+    (0x29, 0x04): "Device internal reset",
+    (0x29, 0x05): "Transceiver mode changed to single-ended",
+    (0x29, 0x06): "Transceiver mode changed to LVD",
+    (0x29, 0x07): "I_T nexus loss occurred",
     (0x2A, 0x01): "Mode parameters changed",
+    (0x2A, 0x02): "Log parameters changed",
+    (0x2A, 0x03): "Reservations preempted",
+    (0x2A, 0x04): "Reservations released",
+    (0x2A, 0x05): "Registrations preempted",
+    (0x2A, 0x06): "Asymmetric access state changed",
+    (0x2A, 0x07): "Implicit asymmetric access state transition failed",
+    (0x2A, 0x09): "Capacity data has changed",
+    (0x2A, 0x0A): "Error history I_T nexus cleared",
+    (0x2A, 0x0B): "Error history snapshot released",
     (0x2C, 0x00): "Command sequence error",
     (0x2F, 0x00): "Commands cleared by another initiator",
     (0x31, 0x00): "Medium format corrupted",
@@ -263,6 +312,20 @@ SCSI_ASC_ASCQ_LABELS = {
     (0x3E, 0x02): "Timeout on logical unit",
     (0x3E, 0x03): "Logical unit failed self-test",
     (0x3E, 0x04): "Logical unit unable to update self-test log",
+    (0x3F, 0x00): "Target operating conditions have changed",
+    (0x3F, 0x01): "Microcode has been changed",
+    (0x3F, 0x03): "Inquiry data has changed",
+    (0x3F, 0x04): "Component device attached",
+    (0x3F, 0x05): "Device identifier changed",
+    (0x3F, 0x06): "Redundancy group created or modified",
+    (0x3F, 0x07): "Redundancy group deleted",
+    (0x3F, 0x08): "Spare created or modified",
+    (0x3F, 0x09): "Spare deleted",
+    (0x3F, 0x0A): "Volume set created or modified",
+    (0x3F, 0x0B): "Volume set deleted",
+    (0x3F, 0x0E): "Reported LUNs data has changed",
+    (0x3F, 0x0F): "Echo buffer overwritten",
+    (0x3F, 0x16): "Microcode has been changed without reset",
     (0x34, 0x00): "Enclosure failure",
     (0x35, 0x00): "Enclosure services failure",
     (0x35, 0x01): "Unsupported enclosure function",
@@ -315,6 +378,11 @@ SCSI_ASC_ASCQ_LABELS = {
     (0x5B, 0x01): "Threshold condition met",
     (0x5B, 0x02): "Log counter at maximum",
     (0x5B, 0x03): "Log list codes exhausted",
+    (0x5E, 0x00): "Low power condition on",
+    (0x5E, 0x01): "Idle condition activated by timer",
+    (0x5E, 0x02): "Standby condition activated by timer",
+    (0x5E, 0x03): "Idle condition activated by command",
+    (0x5E, 0x04): "Standby condition activated by command",
     (0x5D, 0x00): "Failure prediction threshold exceeded",
     (0x5D, 0x01): "Media failure prediction threshold exceeded",
     (0x5D, 0x02): "Logical unit failure prediction threshold exceeded",
@@ -340,6 +408,28 @@ SCSI_ASC_ASCQ_LABELS = {
     (0x6B, 0x02): "A redundancy level got worse",
     (0x6C, 0x00): "Rebuild failure occurred",
     (0x6D, 0x00): "Recalculate failure occurred",
+}
+
+SCSI_STATUS_LABELS = {
+    "GOOD": "GOOD",
+    "CHECK CONDITION": "CHECK CONDITION",
+    "CONDITION MET": "CONDITION MET",
+    "BUSY": "BUSY",
+    "RESERVATION CONFLICT": "RESERVATION CONFLICT",
+    "TASK SET FULL": "TASK SET FULL",
+    "ACA ACTIVE": "ACA ACTIVE",
+    "TASK ABORTED": "TASK ABORTED",
+}
+
+SCSI_STATUS_CODES = {
+    0x00: "GOOD",
+    0x02: "CHECK CONDITION",
+    0x04: "CONDITION MET",
+    0x08: "BUSY",
+    0x18: "RESERVATION CONFLICT",
+    0x28: "TASK SET FULL",
+    0x30: "ACA ACTIVE",
+    0x40: "TASK ABORTED",
 }
 
 LOG_SENSE_PAGE_NAMES = {
@@ -409,7 +499,7 @@ AES_CONCEPTS = {
 
 def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
     match = re.search(
-        r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\(\d+\))?)\.\s+CDB:\s+(?P<cdb>[0-9a-fA-F ]+)",
+        r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>[0-9a-fA-F ]+)",
         message,
     )
     if not match:
@@ -511,6 +601,66 @@ def parse_asc_ascq(value: str) -> tuple[int, int] | None:
         return int(parts[0], 16), int(parts[1], 16)
     except ValueError:
         return None
+
+
+def decode_scsi_status_value(value: str) -> dict[str, Any]:
+    raw_status = str(value or "").strip()
+    if not raw_status:
+        return {
+            "label": "SCSI status event",
+            "family": "scsi_status",
+            "likely_layer": "SCSI target status",
+            "description": "The target returned a SCSI status response for this command.",
+        }
+
+    status_code = None
+    normalized = raw_status.upper().replace("_", " ").replace("-", " ")
+    numeric_match = re.fullmatch(r"(?:0x)?(?P<value>[0-9a-fA-F]{1,2})h?", raw_status)
+    if numeric_match:
+        status_code = int(numeric_match.group("value"), 16)
+        normalized = SCSI_STATUS_CODES.get(status_code, normalized)
+    label = SCSI_STATUS_LABELS.get(normalized)
+    if label:
+        family = "aborted_command" if label == "TASK ABORTED" else "scsi_status"
+        description = "The target returned a standard SCSI status response for this command."
+        if label == "CHECK CONDITION":
+            description = "The target returned Check Condition; following sense data should explain the failure."
+        elif label in {"BUSY", "TASK SET FULL"}:
+            description = "The target or command queue could not accept the command at that moment."
+        elif label == "RESERVATION CONFLICT":
+            description = "The command conflicted with a SCSI reservation or persistent reservation state."
+        elif label == "TASK ABORTED":
+            description = "The target reported that the task was aborted."
+        display_label = _display_scsi_status_label(label)
+        decoded: dict[str, Any] = {
+            "label": f"SCSI status: {display_label}",
+            "family": family,
+            "likely_layer": fault_family_likely_layer(family) if family != "scsi_status" else "SCSI target status",
+            "description": description,
+            "scsi_status": display_label,
+            "decode_confidence": "standard",
+            "decode_source": "t10_scsi_status",
+            "source_attribution": dict(T10_STATUS_SOURCE),
+        }
+        if status_code is not None:
+            decoded["scsi_status_code"] = f"0x{status_code:02x}"
+        return decoded
+
+    return {
+        "label": f"SCSI status: {raw_status}",
+        "family": "scsi_status",
+        "likely_layer": "SCSI target status",
+        "description": "The target returned a SCSI status response that is not in the current local status-code table.",
+        "scsi_status": raw_status,
+        "decode_confidence": "observed",
+        "decode_source": "kernel_message",
+        "source_attribution": dict(KERNEL_MESSAGE_SOURCE),
+        "decoder_note": "Kernel message supplied the SCSI status text; value is not in the current local status-code table.",
+    }
+
+
+def _display_scsi_status_label(label: str) -> str:
+    return " ".join("ACA" if token == "ACA" else token.title() for token in label.split())
 
 
 def _cdb_fault_family(operation: str) -> str:
@@ -640,6 +790,12 @@ def _sense_fault_family(reason: str, sense_key: str, asc: tuple[int, int] | None
         asc_code, ascq = asc
         if asc_code == 0x03:
             return "write_error"
+        if asc_code == 0x04:
+            if ascq in {0x0A, 0x0B, 0x0C}:
+                return "device_path_exception"
+            if ascq in {0x20, 0x21, 0x22}:
+                return "target_failure"
+            return "target_failure"
         if asc_code == 0x08:
             return "logical_unit_communication"
         if asc_code == 0x09:
@@ -667,6 +823,15 @@ def _sense_fault_family(reason: str, sense_key: str, asc: tuple[int, int] | None
         if asc_code == 0x27:
             return "write_protect"
         if asc_code in {0x28, 0x29, 0x2A, 0x2F, 0x6B}:
+            if asc_code == 0x29:
+                if ascq == 0x07:
+                    return "link_loss"
+                if ascq in {0x02, 0x03, 0x04}:
+                    return "bus_reset"
+                if ascq in {0x05, 0x06}:
+                    return "sas_protocol"
+            if asc_code == 0x2A and ascq == 0x07:
+                return "device_path_exception"
             return "unit_attention"
         if asc_code in {0x31, 0x32}:
             return "medium_format"
@@ -676,6 +841,8 @@ def _sense_fault_family(reason: str, sense_key: str, asc: tuple[int, int] | None
             if ascq == 0x02:
                 return "timeout"
             return "target_failure"
+        if asc_code == 0x3F:
+            return "unit_attention"
         if asc_code in {0x40, 0x41, 0x42, 0x44}:
             return "target_failure"
         if asc_code in {0x45, 0x46, 0x47, 0x48, 0x49, 0x4A}:
@@ -698,6 +865,8 @@ def _sense_fault_family(reason: str, sense_key: str, asc: tuple[int, int] | None
             return "log_exception"
         if asc_code == 0x5D:
             return "failure_prediction"
+        if asc_code == 0x5E:
+            return "power_condition"
         if asc_code in {0x67, 0x68, 0x69, 0x6C, 0x6D}:
             return "target_failure"
     if asc == (0x4B, 0x03):
@@ -740,6 +909,8 @@ def _sense_likely_layer(family: str) -> str:
         return "Target write protection"
     if family == "log_exception":
         return "SCSI diagnostic log"
+    if family == "power_condition":
+        return "SCSI target power condition"
     if family == "unit_attention":
         return "SCSI target state change"
     if family == "enclosure_warning":
@@ -780,6 +951,8 @@ def _sense_description(label: str, family: str) -> str:
         return f"{label} means the target refused the command because write protection is active."
     if family == "log_exception":
         return f"{label} points at a SCSI diagnostic log threshold or counter condition."
+    if family == "power_condition":
+        return f"{label} reports a target power-condition transition."
     if family == "unit_attention":
         return f"{label} is a SCSI target state-change notification."
     if family == "enclosure_warning":

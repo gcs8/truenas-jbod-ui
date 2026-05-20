@@ -23,6 +23,7 @@ FAULT_FAMILY_LABELS = {
     "write_protect": "Write protection",
     "failure_prediction": "Failure prediction",
     "log_exception": "SCSI log exception",
+    "power_condition": "SCSI power condition",
     "unit_attention": "Device state change",
     "medium_format": "Medium format/defect error",
     "enclosure_warning": "SES/enclosure warning",
@@ -68,6 +69,7 @@ def fault_family_priority(family: str) -> int:
         "recovered_data": 24,
         "write_protect": 25,
         "log_exception": 26,
+        "power_condition": 26,
         "unit_attention": 27,
         "write_io": 30,
         "read_io": 31,
@@ -108,6 +110,7 @@ def fault_family_severity(family: str) -> str:
         "write_protect",
         "failure_prediction",
         "log_exception",
+        "power_condition",
         "unit_attention",
         "enclosure_warning",
     }:
@@ -144,6 +147,8 @@ def fault_family_likely_layer(family: str) -> str:
         return "Target write protection"
     if family == "log_exception":
         return "SCSI diagnostic log"
+    if family == "power_condition":
+        return "SCSI target power condition"
     if family == "unit_attention":
         return "SCSI target state change"
     if family == "pcie_fabric":

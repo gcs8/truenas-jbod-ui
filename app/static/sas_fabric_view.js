@@ -1016,6 +1016,62 @@
     return entries.length ? entries.map(([key, count]) => `${key}: ${count}`).join(", ") : null;
   }
 
+  const DIAGNOSTIC_IMPACT_META = {
+    error: {
+      label: "Fault",
+      glyph: "!",
+      title: "Path-impacting fault or failed command",
+    },
+    warning: {
+      label: "Warning",
+      glyph: "~",
+      title: "Warning, recovery, or non-critical condition",
+    },
+    info: {
+      label: "Context",
+      glyph: "i",
+      title: "Supporting command or diagnostic context",
+    },
+  };
+
+  const DIAGNOSTIC_CONFIDENCE_LABELS = {
+    standard: "T10 standard",
+    "standard-partial": "T10 partial",
+    "vendor-reference": "Vendor ref",
+    "vendor-reference-partial": "Vendor partial",
+    observed: "Observed",
+    unconfirmed: "Unconfirmed",
+    none: "No decode",
+  };
+
+  function diagnosticSeverity(value) {
+    const severity = classToken(value?.severity || value || "info");
+    return DIAGNOSTIC_IMPACT_META[severity] ? severity : "info";
+  }
+
+  function diagnosticSeverityLabel(value) {
+    const severity = diagnosticSeverity(value);
+    return DIAGNOSTIC_IMPACT_META[severity].label;
+  }
+
+  function diagnosticImpactBadge(value) {
+    const severity = diagnosticSeverity(value);
+    const meta = DIAGNOSTIC_IMPACT_META[severity];
+    return `
+      <span class="fabric-diagnostic-impact severity-${escapeHtml(severity)}" title="${escapeHtml(meta.title)}">
+        <b aria-hidden="true">${escapeHtml(meta.glyph)}</b>
+        <span>${escapeHtml(meta.label)}</span>
+      </span>
+    `;
+  }
+
+  function diagnosticConfidenceValue(eventOrValue) {
+    const confidence = typeof eventOrValue === "string"
+      ? eventOrValue
+      : eventOrValue?.decode_confidence || eventOrValue?.decoded?.decode_confidence;
+    return confidence ? classToken(confidence) : "none";
+  }
+
   function diagnosticSummary(value) {
     if (!value || typeof value !== "object") {
       return null;
@@ -1072,26 +1128,68 @@
   }
 
   function diagnosticConfidenceLabel(event) {
-    const confidence = event?.decode_confidence || event?.decoded?.decode_confidence;
-    if (!confidence) {
-      return null;
+    const confidence = diagnosticConfidenceValue(event);
+    return DIAGNOSTIC_CONFIDENCE_LABELS[confidence] || confidence.replace(/[-_]/g, " ");
+  }
+
+  function diagnosticImpactCounts(rows) {
+    const counts = { error: 0, warning: 0, info: 0 };
+    rows.forEach((event) => {
+      counts[diagnosticSeverity(event)] += 1;
+    });
+    return counts;
+  }
+
+  function diagnosticPanelImpact(rows) {
+    const counts = diagnosticImpactCounts(rows);
+    if (counts.error) {
+      return "error";
     }
-    return String(confidence).replace(/_/g, " ");
+    if (counts.warning) {
+      return "warning";
+    }
+    return "info";
+  }
+
+  function renderDiagnosticImpactSummary(rows) {
+    const counts = diagnosticImpactCounts(rows);
+    const total = counts.error + counts.warning + counts.info;
+    if (!total) {
+      return "";
+    }
+    return `
+      <div class="fabric-diagnostic-impact-strip" aria-label="Diagnostic event impact summary">
+        ${["error", "warning", "info"].map((severity) => {
+          const meta = DIAGNOSTIC_IMPACT_META[severity];
+          return `
+            <span class="fabric-diagnostic-impact-count severity-${escapeHtml(severity)}" title="${escapeHtml(meta.title)}">
+              ${diagnosticImpactBadge(severity)}
+              <em>${escapeHtml(formatValue(counts[severity]))}</em>
+            </span>
+          `;
+        }).join("")}
+      </div>
+    `;
   }
 
   function diagnosticFindingChips(value) {
     const findings = list(value?.top_findings).slice(0, 4);
     if (findings.length) {
-      return findings.map((finding) => `
-        <span class="fabric-diagnostic-chip severity-${classToken(finding.severity || "info")}">
+      return findings.map((finding) => {
+        const severity = diagnosticSeverity(finding);
+        return `
+        <span class="fabric-diagnostic-chip severity-${severity}">
+          ${diagnosticImpactBadge(severity)}
           <strong>${escapeHtml(finding.label || finding.family || "Finding")}</strong>
           <em>${escapeHtml(formatValue(finding.count || 0))}</em>
         </span>
-      `).join("");
+      `;
+      }).join("");
     }
     const families = value?.fault_family_counts || {};
     return Object.entries(families).slice(0, 4).map(([family, count]) => `
       <span class="fabric-diagnostic-chip">
+        ${diagnosticImpactBadge("info")}
         <strong>${escapeHtml(family.replace(/_/g, " "))}</strong>
         <em>${escapeHtml(formatValue(count))}</em>
       </span>
@@ -1109,6 +1207,8 @@
 
   function renderDiagnosticEvent(event) {
     const decoded = event?.decoded || {};
+    const severity = diagnosticSeverity(event);
+    const confidence = diagnosticConfidenceValue(event);
     const meta = [
       event?.event_type,
       event?.device,
@@ -1118,7 +1218,6 @@
       (event?.service_action || decoded.service_action) ? `SA ${event?.service_action || decoded.service_action}` : null,
       event?.log_page || decoded.log_page,
       (event?.asc || decoded.asc) ? `ASC ${event?.asc || decoded.asc}` : null,
-      diagnosticConfidenceLabel(event),
     ].filter(Boolean).join(" / ");
     const details = [
       event?.likely_layer || decoded.likely_layer,
@@ -1136,8 +1235,12 @@
       event?.log_page_control_label || decoded.log_page_control_label,
     ].filter(Boolean).join(" / ");
     return `
-      <li class="fabric-diagnostic-event severity-${classToken(event?.severity || "info")}">
-        <strong>${escapeHtml(diagnosticEventLabel(event))}</strong>
+      <li class="fabric-diagnostic-event severity-${severity}">
+        <div class="fabric-diagnostic-event-title">
+          ${diagnosticImpactBadge(severity)}
+          <strong>${escapeHtml(diagnosticEventLabel(event))}</strong>
+          ${confidence === "none" ? "" : `<span class="fabric-diagnostic-confidence confidence-${escapeHtml(confidence)}">${escapeHtml(diagnosticConfidenceLabel(event))}</span>`}
+        </div>
         ${meta ? `<span>${escapeHtml(meta)}</span>` : ""}
         ${details ? `<small>${escapeHtml(details)}</small>` : ""}
         ${(event?.description || decoded.description) ? `<small>${escapeHtml(event?.description || decoded.description)}</small>` : ""}
@@ -1178,6 +1281,8 @@
         page: 1,
         filter: "",
         type: "all",
+        severity: "all",
+        confidence: "all",
         open: false,
       };
     }
@@ -1213,6 +1318,8 @@
       diagnosticEventTime(event),
       event?.event_type,
       diagnosticEventLabel(event),
+      diagnosticSeverityLabel(event),
+      diagnosticConfidenceLabel(event),
       event?.controller,
       event?.device,
       event?.target,
@@ -1234,8 +1341,16 @@
   function filteredDiagnosticEventRows(rows, tableState) {
     const filter = String(tableState.filter || "").trim().toLowerCase();
     const type = String(tableState.type || "all");
+    const severity = String(tableState.severity || "all");
+    const confidence = String(tableState.confidence || "all");
     return rows.filter((event) => {
       if (type !== "all" && String(event?.event_type || "event") !== type) {
+        return false;
+      }
+      if (severity !== "all" && diagnosticSeverity(event) !== severity) {
+        return false;
+      }
+      if (confidence !== "all" && diagnosticConfidenceValue(event) !== confidence) {
         return false;
       }
       return !filter || diagnosticRowSearchText(event).includes(filter);
@@ -1249,6 +1364,28 @@
       counts.set(type, (counts.get(type) || 0) + 1);
     });
     return Array.from(counts.entries()).sort(([left], [right]) => left.localeCompare(right));
+  }
+
+  function diagnosticSeverityOptions(rows) {
+    const counts = diagnosticImpactCounts(rows);
+    return ["error", "warning", "info"].map((severity) => [severity, counts[severity] || 0]);
+  }
+
+  function diagnosticConfidenceOptions(rows) {
+    const counts = new Map();
+    rows.forEach((event) => {
+      const confidence = diagnosticConfidenceValue(event);
+      counts.set(confidence, (counts.get(confidence) || 0) + 1);
+    });
+    const order = ["standard", "standard-partial", "vendor-reference", "vendor-reference-partial", "observed", "unconfirmed", "none"];
+    return Array.from(counts.entries()).sort(([left], [right]) => {
+      const leftIndex = order.indexOf(left);
+      const rightIndex = order.indexOf(right);
+      if (leftIndex !== -1 || rightIndex !== -1) {
+        return (leftIndex === -1 ? order.length : leftIndex) - (rightIndex === -1 ? order.length : rightIndex);
+      }
+      return left.localeCompare(right);
+    });
   }
 
   function diagnosticPageNumbers(page, pageCount) {
@@ -1300,14 +1437,30 @@
     filteredTotal,
     filter,
     type,
+    severity,
+    confidence,
     typeOptions,
+    severityOptions,
+    confidenceOptions,
     hasSourceTimestamps,
   }) {
-    const hasFilter = String(filter || "").trim() || type !== "all";
+    const hasFilter = String(filter || "").trim() || type !== "all" || severity !== "all" || confidence !== "all";
     const typeSelectOptions = [
       `<option value="all"${type === "all" ? " selected" : ""}>All types</option>`,
       ...typeOptions.map(([eventType, count]) => `
         <option value="${escapeHtml(eventType)}"${type === eventType ? " selected" : ""}>${escapeHtml(diagnosticEventTypeLabel(eventType))} (${escapeHtml(formatValue(count))})</option>
+      `),
+    ].join("");
+    const severitySelectOptions = [
+      `<option value="all"${severity === "all" ? " selected" : ""}>All impacts</option>`,
+      ...severityOptions.map(([optionSeverity, count]) => `
+        <option value="${escapeHtml(optionSeverity)}"${severity === optionSeverity ? " selected" : ""}>${escapeHtml(diagnosticSeverityLabel(optionSeverity))} (${escapeHtml(formatValue(count))})</option>
+      `),
+    ].join("");
+    const confidenceSelectOptions = [
+      `<option value="all"${confidence === "all" ? " selected" : ""}>All evidence</option>`,
+      ...confidenceOptions.map(([optionConfidence, count]) => `
+        <option value="${escapeHtml(optionConfidence)}"${confidence === optionConfidence ? " selected" : ""}>${escapeHtml(diagnosticConfidenceLabel(optionConfidence))} (${escapeHtml(formatValue(count))})</option>
       `),
     ].join("");
     return `
@@ -1325,6 +1478,14 @@
           <span>Type</span>
           <select data-fabric-diagnostic-type-key="${escapeHtml(key)}">${typeSelectOptions}</select>
         </label>
+        <label>
+          <span>Impact</span>
+          <select data-fabric-diagnostic-severity-key="${escapeHtml(key)}">${severitySelectOptions}</select>
+        </label>
+        <label>
+          <span>Evidence</span>
+          <select data-fabric-diagnostic-confidence-key="${escapeHtml(key)}">${confidenceSelectOptions}</select>
+        </label>
         <div class="fabric-diagnostic-pagination" aria-label="Diagnostic event pages">
           <button type="button" data-fabric-diagnostic-page="prev" data-fabric-diagnostic-key="${escapeHtml(key)}" aria-label="Previous event page" title="Previous event page"${page <= 1 ? " disabled" : ""}>&lt;</button>
           ${renderDiagnosticPageButtons(key, page, pageCount)}
@@ -1336,6 +1497,8 @@
   }
 
   function renderDiagnosticTableRow(event) {
+    const severity = diagnosticSeverity(event);
+    const confidence = diagnosticConfidenceValue(event);
     const scope = [event?.controller, event?.device, event?.target ? `target ${event.target}` : null]
       .filter(Boolean)
       .join(" / ");
@@ -1348,14 +1511,15 @@
     ]
       .filter(Boolean)
       .join(" / ");
-    const confidence = diagnosticConfidenceLabel(event);
     return `
-      <tr class="severity-${classToken(event?.severity || "info")}">
+      <tr class="severity-${severity}">
         <td title="${escapeHtml(diagnosticEventTimeTitle(event))}">${escapeHtml(diagnosticEventTime(event))}</td>
+        <td>${diagnosticImpactBadge(severity)}</td>
         <td>${escapeHtml(event?.event_type || "event")}</td>
         <td>${escapeHtml(diagnosticEventLabel(event))}</td>
         <td>${escapeHtml(scope || "-")}</td>
-        <td>${escapeHtml([code || "-", confidence].filter(Boolean).join(" / "))}</td>
+        <td>${escapeHtml(code || "-")}</td>
+        <td><span class="fabric-diagnostic-confidence confidence-${escapeHtml(confidence)}">${escapeHtml(diagnosticConfidenceLabel(event))}</span></td>
       </tr>
     `;
   }
@@ -1382,6 +1546,7 @@
     const hasSourceTimestamps = eventRows.some((event) => event?.timestamp || event?.timestamp_raw);
     const layers = diagnosticLikelyLayers(diagnostics);
     const summary = diagnostics.operator_summary || diagnosticSummary(diagnostics);
+    const panelImpact = diagnosticPanelImpact(eventRows);
     const rawRows = [
       ["Targets", formatSlots(diagnostics.targets, 999)],
       ["Devices", list(diagnostics.devices).join(", ")],
@@ -1390,13 +1555,14 @@
       ["Operations", formatCountMap(diagnostics.operation_counts)],
     ].filter(([, value]) => value);
     return `
-      <div class="fabric-diagnostic-evidence">
+      <div class="fabric-diagnostic-evidence impact-${escapeHtml(panelImpact)}">
         <div class="fabric-diagnostic-evidence-head">
           <span class="fabric-stage-title">Fault Evidence</span>
           <strong>${escapeHtml(summary || `${diagnostics.event_count} kernel events`)}</strong>
           ${scopeLabel ? `<small>Path leg: ${escapeHtml(scopeLabel)}</small>` : ""}
           ${layers ? `<small>Likely layer: ${escapeHtml(layers)}</small>` : ""}
         </div>
+        ${renderDiagnosticImpactSummary(eventRows)}
         <div class="fabric-diagnostic-chips">
           ${diagnosticFindingChips(diagnostics)}
         </div>
@@ -1423,15 +1589,19 @@
               filteredTotal: filteredTableRows.length,
               filter: tableState.filter,
               type: tableState.type,
+              severity: tableState.severity,
+              confidence: tableState.confidence,
               typeOptions: diagnosticEventTypeOptions(eventRows),
+              severityOptions: diagnosticSeverityOptions(eventRows),
+              confidenceOptions: diagnosticConfidenceOptions(eventRows),
               hasSourceTimestamps,
             })}
             <div class="fabric-diagnostic-table-wrap">
               <table class="fabric-diagnostic-table">
                 <thead>
-                  <tr><th>Time / Order</th><th>Type</th><th>Finding</th><th>Scope</th><th>Code</th></tr>
+                  <tr><th>Time / Order</th><th>Impact</th><th>Type</th><th>Finding</th><th>Scope</th><th>Code</th><th>Evidence</th></tr>
                 </thead>
-                <tbody>${tableRows.length ? tableRows.map(renderDiagnosticTableRow).join("") : '<tr><td colspan="5">No events match the current filter.</td></tr>'}</tbody>
+                <tbody>${tableRows.length ? tableRows.map(renderDiagnosticTableRow).join("") : '<tr><td colspan="7">No events match the current filter.</td></tr>'}</tbody>
               </table>
             </div>
           </details>
@@ -2578,12 +2748,21 @@
 
   document.addEventListener("change", (event) => {
     const target = event.target instanceof HTMLSelectElement ? event.target : null;
-    if (!target?.matches("[data-fabric-diagnostic-type-key]")) {
+    if (!target?.matches("[data-fabric-diagnostic-type-key], [data-fabric-diagnostic-severity-key], [data-fabric-diagnostic-confidence-key]")) {
       return;
     }
-    const key = target.dataset.fabricDiagnosticTypeKey || "";
+    const key = target.dataset.fabricDiagnosticTypeKey
+      || target.dataset.fabricDiagnosticSeverityKey
+      || target.dataset.fabricDiagnosticConfidenceKey
+      || "";
     const tableState = diagnosticTableState(key);
-    tableState.type = target.value || "all";
+    if (target.matches("[data-fabric-diagnostic-type-key]")) {
+      tableState.type = target.value || "all";
+    } else if (target.matches("[data-fabric-diagnostic-severity-key]")) {
+      tableState.severity = target.value || "all";
+    } else {
+      tableState.confidence = target.value || "all";
+    }
     tableState.page = 1;
     tableState.open = true;
     render();

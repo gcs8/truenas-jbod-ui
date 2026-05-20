@@ -387,6 +387,7 @@ May 19 21:16:03 The-Archive (da44:mpr0:0:180:0): CAM status: CCB request complet
 (da44:mpr0:0:180:0): CAM status: CCB request completed with an error
 (da46:mpr0:0:182:0): CAM status: SCSI Status Error
 (da46:mpr0:0:182:0): SCSI status: Check Condition
+(da47:mpr0:0:183:0): SCSI status: 0x40
 """.strip()
         )
 
@@ -394,6 +395,7 @@ May 19 21:16:03 The-Archive (da44:mpr0:0:180:0): CAM status: CCB request complet
         ccb_status = rows[0]
         cam_scsi_status = rows[1]
         scsi_status = rows[2]
+        task_aborted = rows[3]
 
         self.assertEqual(ccb_status["label"], "CAM completed command with an error")
         self.assertEqual(ccb_status["cam_status"], "CCB request completed with an error")
@@ -402,7 +404,40 @@ May 19 21:16:03 The-Archive (da44:mpr0:0:180:0): CAM status: CCB request complet
         self.assertEqual(scsi_status["family"], "scsi_status")
         self.assertEqual(scsi_status["label"], "SCSI status: Check Condition")
         self.assertEqual(scsi_status["scsi_status"], "Check Condition")
+        self.assertEqual(scsi_status["decode_confidence"], "standard")
+        self.assertEqual(scsi_status["decode_source"], "t10_scsi_status")
+        self.assertEqual(scsi_status["source_attribution"]["url"], "https://www.t10.org/lists/2status.htm")
         self.assertEqual(scsi_status["severity"], "warning")
+        self.assertEqual(task_aborted["label"], "SCSI status: Task Aborted")
+        self.assertEqual(task_aborted["family"], "aborted_command")
+        self.assertEqual(task_aborted["scsi_status_code"], "0x40")
+
+    def test_parse_mpr_dmesg_events_decodes_cam_errno_retry_exhaustion(self) -> None:
+        events = parse_mpr_dmesg_events(
+            """
+Jun  7 10:39:04 truenas (da1:mpr0:0:9:0): WRITE(10). CDB: 2a 00 00 40 00 80 00 08 00 00
+Jun  7 10:39:04 truenas (da1:mpr0:0:9:0): CAM status: CCB request completed with an error
+Jun  7 10:39:04 truenas (da1:mpr0:0:9:0): Error 5, Retries exhausted
+Jun  7 10:39:04 truenas mpr0: Controller reported scsi ioc terminated tgt 9 SMID 439 loginfo 3112010c
+Jun  7 10:39:05 truenas mpr0: Controller reported scsi ioc terminated tgt 12 SMID 510 loginfo 31120302
+""".strip()
+        )
+
+        da1 = events["by_device"]["da1"]
+        rows = da1["event_table"]["rows"]
+        cam_error = next(record for record in rows if record["event_type"] == "cam_error")
+
+        self.assertEqual(events["event_count"], 5)
+        self.assertEqual(cam_error["label"], "CAM EIO: Retries exhausted")
+        self.assertEqual(cam_error["family"], "cam_error")
+        self.assertEqual(cam_error["cam_error_code"], 5)
+        self.assertEqual(cam_error["errno_name"], "EIO")
+        self.assertEqual(cam_error["errno_label"], "Input/output error")
+        self.assertEqual(cam_error["decode_confidence"], "observed")
+        self.assertEqual(cam_error["decode_source"], "freebsd_cam_errno")
+        self.assertEqual(cam_error["source_attribution"]["url"], "https://man.freebsd.org/cgi/man.cgi?apropos=0&manpath=freebsd&query=intro&sektion=2")
+        self.assertEqual(da1["operation_counts"]["WRITE(10)"], 1)
+        self.assertEqual(events["by_controller"]["mpr0"]["loginfo_counts"]["31120302"], 1)
 
     def test_archive_core_bad_cable_fixture_builds_normalized_event_table(self) -> None:
         events = parse_mpr_dmesg_events(ARCHIVE_CORE_BAD_CABLE_DMESG)
@@ -503,6 +538,10 @@ mpr0: Controller reported scsi ioc terminated tgt 194 SMID 143 loginfo 39999999
 (da75:mpr0:0:205:0): SCSI sense: HARDWARE ERROR asc:3e,2 (Timeout on logical unit)
 (da76:mpr0:0:206:0): SCSI sense: MEDIUM ERROR asc:31,0 (Medium format corrupted)
 (da77:mpr0:0:207:0): SCSI sense: HARDWARE ERROR asc:5b,1 (Threshold condition met)
+(da78:mpr0:0:208:0): SCSI sense: UNIT ATTENTION asc:29,7 (I_T nexus loss occurred)
+(da79:mpr0:0:209:0): SCSI sense: NOT READY asc:4,0b (Logical unit not accessible, target port in standby state)
+(da80:mpr0:0:210:0): SCSI sense: UNIT ATTENTION asc:3f,8 (Spare created or modified)
+(da81:mpr0:0:211:0): SCSI sense: NO SENSE asc:5e,2 (Standby condition activated by timer)
 """.strip()
         )
 
@@ -521,6 +560,12 @@ mpr0: Controller reported scsi ioc terminated tgt 194 SMID 143 loginfo 39999999
         self.assertEqual(rows_by_asc["3e,2"]["severity"], "error")
         self.assertEqual(rows_by_asc["31,0"]["family"], "medium_format")
         self.assertEqual(rows_by_asc["5b,1"]["family"], "log_exception")
+        self.assertEqual(rows_by_asc["29,7"]["family"], "link_loss")
+        self.assertEqual(rows_by_asc["29,7"]["severity"], "error")
+        self.assertEqual(rows_by_asc["4,0b"]["asc_label"], "Logical unit not accessible, target port in standby state")
+        self.assertEqual(rows_by_asc["4,0b"]["family"], "device_path_exception")
+        self.assertEqual(rows_by_asc["3f,8"]["family"], "unit_attention")
+        self.assertEqual(rows_by_asc["5e,2"]["family"], "power_condition")
         self.assertTrue(all(row["decode_confidence"] == "standard" for row in rows_by_asc.values()))
         self.assertTrue(all(row["source_attribution"]["url"] == "https://www.t10.org/lists/asc-num.htm" for row in rows_by_asc.values()))
 
@@ -556,6 +601,9 @@ mpr0: Controller reported scsi ioc terminated tgt 182 SMID 142 loginfo 30030200
 (da74:mpr0:0:204:0): UNMAP. CDB: 42 00 00 00 00 00 00 00 18 00
 (da75:mpr0:0:205:0): LOG SENSE. CDB: 4d 01 58 00 00 00 00 00 40 00
 (da76:mpr0:0:206:0): THIRD-PARTY COPY IN. CDB: 84 04 07 00 00 00 00 00 00 00 00 00 00 40 00 00
+(da77:mpr0:0:207:0): SANITIZE. CDB: 48 01 00 00 00 00 00 00 18 00
+(da78:mpr0:0:208:0): READ ELEMENT STATUS. CDB: b8 00 00 00 00 00 00 00 20 00 00 00
+(da79:mpr0:0:209:0): SPARE (IN). CDB: bc 00 00 00 00 00 00 00 20 00 00 00
 """.strip()
         )
 
@@ -567,6 +615,9 @@ mpr0: Controller reported scsi ioc terminated tgt 182 SMID 142 loginfo 30030200
         unmap = next(record for record in rows if record.get("target") == "204")
         log_sense = next(record for record in rows if record.get("target") == "205")
         receive_copy_results = next(record for record in rows if record.get("target") == "206")
+        sanitize = next(record for record in rows if record.get("target") == "207")
+        read_element_status = next(record for record in rows if record.get("target") == "208")
+        spare_in = next(record for record in rows if record.get("target") == "209")
 
         self.assertEqual(target_port_groups["operation"], "REPORT TARGET PORT GROUPS")
         self.assertEqual(target_port_groups["service_action"], "0x0a")
@@ -590,6 +641,12 @@ mpr0: Controller reported scsi ioc terminated tgt 182 SMID 142 loginfo 30030200
         self.assertEqual(receive_copy_results["operation"], "FAILED SEGMENT DETAILS")
         self.assertEqual(receive_copy_results["service_action"], "0x04")
         self.assertEqual(receive_copy_results["allocation_length"], 64)
+        self.assertEqual(sanitize["operation"], "SANITIZE")
+        self.assertEqual(sanitize["decode_confidence"], "standard")
+        self.assertEqual(read_element_status["operation"], "READ ELEMENT STATUS")
+        self.assertEqual(read_element_status["decode_source"], "t10_scsi_operation_codes")
+        self.assertEqual(spare_in["operation"], "SPARE (IN)")
+        self.assertEqual(spare_in["decode_confidence"], "standard")
 
     def test_parse_mpr_dmesg_events_decodes_deeper_lsi_reference_tables(self) -> None:
         events = parse_mpr_dmesg_events(

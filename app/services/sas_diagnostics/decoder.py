@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 from typing import Any
 
@@ -11,10 +12,23 @@ from app.services.sas_diagnostics.common import (
     severity_rank,
 )
 from app.services.sas_diagnostics.lsi_loginfo import decode_lsi_loginfo
-from app.services.sas_diagnostics.scsi import decode_scsi_cdb_message, decode_scsi_sense_event
+from app.services.sas_diagnostics.scsi import (
+    decode_scsi_cdb_message,
+    decode_scsi_sense_event,
+    decode_scsi_status_value,
+)
 
 
 DEFAULT_EVENT_TABLE_PAGE_SIZE = 25
+
+FREEBSD_ERRNO_SOURCE = {
+    "name": "FreeBSD intro(2) errno list",
+    "url": "https://man.freebsd.org/cgi/man.cgi?apropos=0&manpath=freebsd&query=intro&sektion=2",
+}
+
+FREEBSD_ERRNO_LABELS = {
+    5: ("EIO", "Input/output error"),
+}
 
 
 def new_mpr_event_summary() -> dict[str, Any]:
@@ -46,6 +60,8 @@ def decode_mpr_dmesg_event(event: dict[str, Any]) -> dict[str, Any]:
         return decode_scsi_sense_event(event)
     if event_type == "cam_status":
         return _decode_cam_status_event(message)
+    if event_type == "cam_error":
+        return _decode_cam_error_event(message)
     if event_type == "scsi_status":
         return _decode_scsi_status_event(message)
     if event_type == "retry":
@@ -123,6 +139,11 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
         "reported_operation",
         "cam_status",
         "scsi_status",
+        "scsi_status_code",
+        "cam_error_code",
+        "cam_retry_state",
+        "errno_name",
+        "errno_label",
         "service_action_label",
     ):
         if decoded.get(key) is not None:
@@ -281,23 +302,42 @@ def _decode_cam_status_event(message: str) -> dict[str, Any]:
 
 def _decode_scsi_status_event(message: str) -> dict[str, Any]:
     status = _message_value_after_colon(message)
-    lowered = status.lower()
-    if lowered == "check condition":
-        label = "SCSI status: Check Condition"
-        description = "The target returned Check Condition; the following sense data should explain the failure."
-    elif status:
-        label = f"SCSI status: {status}"
-        description = "The target returned a SCSI status response for this command."
-    else:
-        label = "SCSI status event"
-        description = "The target returned a SCSI status response for this command."
-    return {
-        "label": label,
-        "family": "scsi_status",
-        "likely_layer": "SCSI target status",
-        "description": description,
-        "scsi_status": status or None,
+    return decode_scsi_status_value(status)
+
+
+def _decode_cam_error_event(message: str) -> dict[str, Any]:
+    match = re.search(r"Error\s+(?P<code>\d+)\s*,\s*(?P<state>.+)$", message, re.IGNORECASE)
+    if not match:
+        return {
+            "label": f"CAM error: {message.strip()}" if message.strip() else "CAM error",
+            "family": "cam_error",
+            "likely_layer": "FreeBSD CAM transport layer",
+            "description": "The FreeBSD CAM layer reported a command error.",
+        }
+    code = int(match.group("code"))
+    state = match.group("state").strip()
+    errno_name, errno_label = FREEBSD_ERRNO_LABELS.get(code, (None, None))
+    label_head = f"CAM {errno_name}" if errno_name else f"CAM error {code}"
+    decoded: dict[str, Any] = {
+        "label": f"{label_head}: {state}",
+        "family": "cam_error",
+        "likely_layer": "FreeBSD CAM transport layer",
+        "description": "The FreeBSD CAM layer reported an OS-level command failure for this disk/path.",
+        "cam_error_code": code,
+        "cam_retry_state": state,
+        "decode_confidence": "observed",
+        "decode_source": "freebsd_cam_errno",
+        "source_attribution": dict(FREEBSD_ERRNO_SOURCE),
     }
+    if errno_name:
+        decoded["errno_name"] = errno_name
+        decoded["errno_label"] = errno_label
+        decoded["description"] = (
+            f"The FreeBSD CAM layer reported {errno_name} ({errno_label}) and {state.lower()} for this disk/path."
+        )
+    else:
+        decoded["decoder_note"] = "CAM reported a numeric error code that is not in the current local errno table."
+    return decoded
 
 
 def _message_value_after_colon(message: str) -> str:

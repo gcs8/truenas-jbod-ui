@@ -23,6 +23,14 @@
   logical-unit timeout/failure, log exceptions, redundancy state changes, and
   failure-prediction indicators, with warning-level severity for non-fatal
   standard warning/recovery families.
+- SAS diagnostic decoding now also handles T10 SCSI status codes, additional
+  standards-listed opcodes such as `SANITIZE`, `READ ELEMENT STATUS`, and
+  storage-array spare/redundancy commands, path/state-change ASC/ASCQ values
+  such as I_T nexus loss and target-port standby/unavailable, plus FreeBSD
+  CAM `Error 5, Retries exhausted` rows as observed `EIO` evidence.
+- SAS Fabric diagnostic evidence now labels Fault/Warning/Context impact
+  explicitly, colors evidence panels by the highest event impact, and lets the
+  full event table filter by event type, impact, and decode confidence.
 
 ## v0.20.0 - 2026-05-20
 
