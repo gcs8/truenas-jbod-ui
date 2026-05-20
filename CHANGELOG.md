@@ -10,6 +10,9 @@
   original command, canonical command, exit code, stderr/stdout snippets, and
   probe context. Transient enrichment failures collapse to calmer UI copy when
   topology data still loaded.
+- ZFS spare disks now group as pool-level `spares` peers in parsed topology
+  and in the live slot peer-highlighting UI instead of being split by
+  individual `spare-N` labels.
 
 ## v0.20.0 - 2026-05-20
 

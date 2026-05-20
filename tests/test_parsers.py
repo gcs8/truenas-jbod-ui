@@ -11,6 +11,7 @@ from app.services.parsers import (
     parse_nvme_id_ns_summary,
     parse_nvme_list_subsys_json,
     parse_nvme_smart_log_summary,
+    parse_pool_query_topology,
     parse_ssh_outputs,
     parse_sesutil_show_enclosures,
     parse_ubntstorage_json,
@@ -20,6 +21,7 @@ from app.services.parsers import (
     parse_smartctl_text_enrichment,
     parse_smartctl_summary,
     parse_unifi_gpio_debug,
+    parse_zpool_status,
 )
 
 
@@ -42,6 +44,64 @@ scbus13 on mpr1 bus 0:
         self.assertEqual(parsed.controllers["da71"], "mpr1")
         self.assertEqual(parsed.peer_devices["da24"], ["da71"])
         self.assertEqual(parsed.peer_devices["da77"], ["da30"])
+
+    def test_parse_pool_query_topology_groups_spares_by_pool(self) -> None:
+        parsed = parse_pool_query_topology(
+            [
+                {
+                    "name": "tank",
+                    "topology": {
+                        "data": [
+                            {
+                                "type": "RAIDZ2",
+                                "children": [
+                                    {"type": "DISK", "path": "/dev/gptid/data-a", "status": "ONLINE"},
+                                ],
+                            },
+                        ],
+                        "spare": [
+                            {"type": "DISK", "path": "/dev/gptid/spare-a", "status": "ONLINE"},
+                            {"type": "DISK", "path": "/dev/gptid/spare-b", "status": "ONLINE"},
+                        ],
+                    },
+                }
+            ]
+        )
+
+        for key in ("gptid/spare-a", "gptid/spare-b"):
+            with self.subTest(key=key):
+                self.assertEqual(parsed[key].pool_name, "tank")
+                self.assertEqual(parsed[key].vdev_class, "spare")
+                self.assertEqual(parsed[key].vdev_name, "spares")
+                self.assertEqual(parsed[key].topology_label, "tank > spares > spare")
+        self.assertEqual(parsed["gptid/data-a"].vdev_name, "raidz2-0")
+
+    def test_parse_zpool_status_groups_spares_by_pool(self) -> None:
+        output = """
+  pool: tank
+ state: ONLINE
+config:
+
+        NAME                 STATE     READ WRITE CKSUM
+        tank                 ONLINE       0     0     0
+          raidz2-0           ONLINE       0     0     0
+            gptid/data-a     ONLINE       0     0     0
+        spares
+          gptid/spare-a      AVAIL
+          gptid/spare-b      AVAIL
+
+errors: No known data errors
+""".strip()
+
+        parsed = parse_zpool_status(output)
+
+        for key in ("gptid/spare-a", "gptid/spare-b"):
+            with self.subTest(key=key):
+                self.assertEqual(parsed[key].pool_name, "tank")
+                self.assertEqual(parsed[key].vdev_class, "spare")
+                self.assertEqual(parsed[key].vdev_name, "spares")
+                self.assertEqual(parsed[key].topology_label, "tank > spares > spare")
+        self.assertEqual(parsed["gptid/data-a"].vdev_name, "raidz2-0")
 
     def test_canonicalize_sg_ses_command_preserves_target_device(self) -> None:
         command = "sudo -n /usr/bin/sg_ses -p aes /dev/sg27"

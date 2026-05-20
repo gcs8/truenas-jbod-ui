@@ -1594,8 +1594,9 @@ def parse_zpool_status(output: str) -> dict[str, ZpoolMember]:
             for entry in stack[:-1]
             if entry["kind"] == "node" and entry["name"] not in class_names and entry["name"] != current_pool
         ]
-        vdev_name = ancestors[0] if ancestors else None
-        topology_label = _compose_topology_label(current_pool, ancestors, current_class)
+        group_path = _normalize_vdev_path_for_grouping(current_class, ancestors)
+        vdev_name = group_path[0] if group_path else None
+        topology_label = _compose_topology_label(current_pool, group_path, current_class)
         member = ZpoolMember(
             pool_name=current_pool,
             vdev_class=current_class,
@@ -1651,8 +1652,9 @@ def parse_pool_query_topology(pools: list[dict[str, Any]]) -> dict[str, ZpoolMem
             current_path.append(current_label)
 
         if node_type == "DISK" or (not children and any((path, device, disk, guid))):
-            vdev_name = current_path[0] if current_path else None
-            topology_label = _compose_topology_label(pool_name, current_path, vdev_class)
+            group_path = _normalize_vdev_path_for_grouping(vdev_class, current_path)
+            vdev_name = group_path[0] if group_path else None
+            topology_label = _compose_topology_label(pool_name, group_path, vdev_class)
             member = ZpoolMember(
                 pool_name=pool_name,
                 vdev_class=vdev_class,
@@ -2302,6 +2304,12 @@ def _compose_topology_label(pool_name: str, vdev_path: list[str], vdev_class: st
     if vdev_class:
         parts.append(vdev_class)
     return " > ".join(parts) if parts else None
+
+
+def _normalize_vdev_path_for_grouping(vdev_class: str | None, vdev_path: list[str]) -> list[str]:
+    if vdev_class == "spare":
+        return ["spares"]
+    return [item for item in vdev_path if item]
 
 
 def _derive_top_level_vdev_label(

@@ -5767,6 +5767,23 @@
     }
   }
 
+  function hasStoragePeerGroup(slot) {
+    return Boolean(slot && slot.pool_name && (slot.vdev_name || slot.vdev_class === "spare"));
+  }
+
+  function sameStoragePeerGroup(left, right) {
+    if (!left || !right || !left.pool_name || !right.pool_name) {
+      return false;
+    }
+    if (left.pool_name !== right.pool_name || left.vdev_class !== right.vdev_class) {
+      return false;
+    }
+    if (left.vdev_class === "spare") {
+      return Boolean(left.device_name && right.device_name);
+    }
+    return Boolean(left.vdev_name && right.vdev_name && left.vdev_name === right.vdev_name);
+  }
+
   function getSelectedPeerContext() {
     const selectedStorageView = getSelectedStorageViewRuntime();
     if (selectedStorageView) {
@@ -5775,7 +5792,7 @@
       }
       const selectedStorageViewSlot = getSelectedStorageViewRuntimeSlot(state.selectedSlot);
       const selectedLiveSlot = getLiveBackedStorageViewSlot(selectedStorageView, selectedStorageViewSlot);
-      if (!selectedLiveSlot || !selectedLiveSlot.pool_name || !selectedLiveSlot.vdev_name) {
+      if (!hasStoragePeerGroup(selectedLiveSlot)) {
         return { active: false, peerSlots: new Set() };
       }
 
@@ -5785,9 +5802,7 @@
             const candidateLiveSlot = getLiveBackedStorageViewSlot(selectedStorageView, candidate);
             return Boolean(
               candidateLiveSlot &&
-              candidateLiveSlot.pool_name === selectedLiveSlot.pool_name &&
-              candidateLiveSlot.vdev_name === selectedLiveSlot.vdev_name &&
-              candidateLiveSlot.vdev_class === selectedLiveSlot.vdev_class &&
+              sameStoragePeerGroup(candidateLiveSlot, selectedLiveSlot) &&
               candidateLiveSlot.device_name
             );
           })
@@ -5800,16 +5815,14 @@
       };
     }
     const slot = getSlotById(state.selectedSlot);
-    if (!slot || !slot.pool_name || !slot.vdev_name) {
+    if (!hasStoragePeerGroup(slot)) {
       return { active: false, peerSlots: new Set() };
     }
 
     const peerSlots = new Set(
       state.snapshot.slots
         .filter((candidate) =>
-          candidate.pool_name === slot.pool_name &&
-          candidate.vdev_name === slot.vdev_name &&
-          candidate.vdev_class === slot.vdev_class &&
+          sameStoragePeerGroup(candidate, slot) &&
           candidate.device_name
         )
         .map((candidate) => candidate.slot)
@@ -7896,7 +7909,7 @@
       return;
     }
 
-    if (!slot.pool_name || !slot.vdev_name) {
+    if (!hasStoragePeerGroup(slot)) {
       topologyContext.innerHTML = currentPlatform() === "linux"
         ? '<div class="warning-item muted">This slot is not currently tied to a mapped mdadm stack.</div>'
         : '<div class="warning-item muted">This slot is not currently tied to a pool vdev.</div>';
@@ -7905,14 +7918,14 @@
 
     const vdevMembers = state.snapshot.slots
       .filter((candidate) =>
-        candidate.pool_name === slot.pool_name &&
-        candidate.vdev_name === slot.vdev_name &&
-        candidate.vdev_class === slot.vdev_class &&
+        sameStoragePeerGroup(candidate, slot) &&
         candidate.device_name
       )
       .sort((left, right) => left.slot - right.slot);
 
-    const ancestry = escapeHtml(slot.topology_label || `${slot.pool_name} > ${slot.vdev_name}`);
+    const fallbackVdevName = slot.vdev_class === "spare" ? "spares" : slot.vdev_name;
+    const ancestry = escapeHtml(slot.topology_label || `${slot.pool_name} > ${fallbackVdevName}`);
+    const peerLabel = slot.vdev_class === "spare" ? "Peer Slots In This Spare Group" : "Peer Slots In This Vdev";
     const pills = vdevMembers
       .map((member) => {
         const selected = member.slot === slot.slot ? " selected" : "";
@@ -7931,7 +7944,7 @@
         <div class="topology-path">${ancestry}</div>
       </div>
       <div class="topology-summary">
-        <div class="topology-label">Peer Slots In This Vdev</div>
+        <div class="topology-label">${peerLabel}</div>
         <div class="topology-pill-row">${pills}</div>
       </div>
     `;
