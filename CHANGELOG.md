@@ -34,6 +34,10 @@
 - Added a `0.20.1-dev` platform parity plan for TrueNAS SCALE, Quantastor,
   generic Linux, and ESXi, centered on capability/status contracts, setup
   requirements, fixture breadth, and small platform-specific follow-up bites.
+- Inventory snapshots now expose a typed platform capability contract covering
+  inventory, physical slots, SMART detail, history, identify LEDs, platform
+  details, and diagnostics so UI/admin/debug surfaces can explain supported,
+  partial, unavailable, and intentionally unsupported features consistently.
 
 ## v0.20.0 - 2026-05-20
 

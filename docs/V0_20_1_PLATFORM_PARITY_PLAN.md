@@ -255,6 +255,11 @@ Requirements to document/check:
      collection behavior.
    - Add tests for current CORE, SCALE, Quantastor, Linux, and ESXi capability
      summaries.
+   - First pass completed on 2026-05-20: inventory snapshots now include a
+     typed `capabilities` payload for inventory, physical slots, SMART detail,
+     history, identify LEDs, platform details, and diagnostics. Tests pin the
+     current CORE, SCALE, Quantastor, generic Linux, and ESXi contract without
+     changing collection behavior.
 
 2. Admin/setup clarity bite
    - Update admin copy and docs so each platform says which sources are

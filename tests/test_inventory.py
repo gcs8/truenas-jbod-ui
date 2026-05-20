@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config import BMCConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
+    EnclosureOption,
+    InventorySummary,
     InventorySnapshot,
     LedAction,
     ManualMapping,
@@ -18,6 +20,7 @@ from app.models.domain import (
     SlotState,
     SlotView,
     SmartSummaryView,
+    SourceStatus,
     StorageViewRuntimePayload,
     StorageViewRuntimeSlot,
     StorageViewRuntimeView,
@@ -109,6 +112,124 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertIn("5002538b103e5ee0", aliases)
         self.assertIn("5002538b103e5ee1", aliases)
         self.assertIn("5002538b103e5ee2", aliases)
+
+    @staticmethod
+    def _capability_service(platform: str, *, ssh_enabled: bool = True, bmc_enabled: bool = False) -> InventoryService:
+        service = object.__new__(InventoryService)
+        service.system = SystemConfig(
+            id=f"{platform}-system",
+            truenas=TrueNASConfig(platform=platform),
+            ssh=SSHConfig(enabled=ssh_enabled),
+            bmc=BMCConfig(enabled=bmc_enabled),
+        )
+        return service
+
+    @staticmethod
+    def _capability_slot(*, led_supported: bool = False, device_name: str = "da0") -> SlotView:
+        return SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            device_name=device_name,
+            led_supported=led_supported,
+        )
+
+    def test_platform_capabilities_core_exposes_deep_diagnostics_and_identify(self) -> None:
+        service = self._capability_service("core", ssh_enabled=True)
+        caps = service._build_platform_capabilities(
+            slots=[self._capability_slot(led_supported=True, device_name="da0")],
+            available_enclosures=[EnclosureOption(id="enc0", label="Front")],
+            summary=InventorySummary(disk_count=1, enclosure_count=1, mapped_slot_count=1),
+            sources={
+                "api": SourceStatus(enabled=True, ok=True),
+                "ssh": SourceStatus(enabled=True, ok=True),
+            },
+            platform_context={},
+            selected_profile=object(),
+        )
+
+        self.assertEqual(caps["inventory"].status, "available")
+        self.assertEqual(caps["physical_slots"].status, "available")
+        self.assertEqual(caps["identify"].status, "available")
+        self.assertEqual(caps["diagnostics"].status, "available")
+        self.assertIn("mprutil", caps["diagnostics"].sources)
+
+    def test_platform_capabilities_scale_reports_linux_ses_without_sas_fabric(self) -> None:
+        service = self._capability_service("scale", ssh_enabled=True)
+        caps = service._build_platform_capabilities(
+            slots=[self._capability_slot(led_supported=True, device_name="sdc")],
+            available_enclosures=[EnclosureOption(id="sg27", label="Front 24")],
+            summary=InventorySummary(disk_count=1, pool_count=1, enclosure_count=1, mapped_slot_count=1),
+            sources={
+                "api": SourceStatus(enabled=True, ok=True),
+                "ssh": SourceStatus(enabled=True, ok=True),
+            },
+            platform_context={},
+            selected_profile=object(),
+        )
+
+        self.assertEqual(caps["physical_slots"].status, "available")
+        self.assertEqual(caps["smart_detail"].status, "available")
+        self.assertEqual(caps["identify"].status, "available")
+        self.assertEqual(caps["diagnostics"].status, "unsupported")
+        self.assertIn("smartmontools", caps["smart_detail"].requirements)
+
+    def test_platform_capabilities_quantastor_keeps_ha_context_and_ses_identify(self) -> None:
+        service = self._capability_service("quantastor", ssh_enabled=True)
+        caps = service._build_platform_capabilities(
+            slots=[self._capability_slot(led_supported=True, device_name="sda")],
+            available_enclosures=[EnclosureOption(id="node-a", label="Node A")],
+            summary=InventorySummary(disk_count=1, pool_count=1, enclosure_count=1, mapped_slot_count=1),
+            sources={
+                "api": SourceStatus(enabled=True, ok=True),
+                "ssh": SourceStatus(enabled=True, ok=True),
+            },
+            platform_context={"selected_view_label": "Node A", "master_label": "Node B"},
+            selected_profile=object(),
+        )
+
+        self.assertEqual(caps["inventory"].status, "available")
+        self.assertIn("Quantastor REST", caps["inventory"].sources)
+        self.assertEqual(caps["platform_details"].status, "available")
+        self.assertEqual(caps["identify"].status, "available")
+        self.assertEqual(caps["diagnostics"].status, "unsupported")
+
+    def test_platform_capabilities_linux_marks_profile_dependent_storage_as_available(self) -> None:
+        service = self._capability_service("linux", ssh_enabled=True)
+        caps = service._build_platform_capabilities(
+            slots=[self._capability_slot(device_name="nvme0n1")],
+            available_enclosures=[],
+            summary=InventorySummary(disk_count=1, mapped_slot_count=1),
+            sources={"ssh": SourceStatus(enabled=True, ok=True)},
+            platform_context={},
+            selected_profile=object(),
+        )
+
+        self.assertEqual(caps["inventory"].status, "available")
+        self.assertEqual(caps["physical_slots"].status, "available")
+        self.assertEqual(caps["smart_detail"].status, "available")
+        self.assertEqual(caps["identify"].status, "partial")
+        self.assertEqual(caps["diagnostics"].status, "unsupported")
+
+    def test_platform_capabilities_esxi_keeps_identify_unsupported(self) -> None:
+        service = self._capability_service("esxi", ssh_enabled=True)
+        caps = service._build_platform_capabilities(
+            slots=[self._capability_slot(device_name="13:0")],
+            available_enclosures=[],
+            summary=InventorySummary(disk_count=1, mapped_slot_count=1),
+            sources={"ssh": SourceStatus(enabled=True, ok=True)},
+            platform_context={"sections": [{"title": "Controller"}]},
+            selected_profile=object(),
+        )
+
+        self.assertEqual(caps["inventory"].status, "available")
+        self.assertEqual(caps["physical_slots"].status, "available")
+        self.assertEqual(caps["smart_detail"].status, "available")
+        self.assertIn("ESXCLI", caps["smart_detail"].sources)
+        self.assertEqual(caps["identify"].status, "unsupported")
+        self.assertEqual(caps["platform_details"].status, "available")
+        self.assertEqual(caps["diagnostics"].status, "unsupported")
 
     def test_smart_candidate_devices_ignores_placeholder_hctl_labels(self) -> None:
         slot = SlotView(

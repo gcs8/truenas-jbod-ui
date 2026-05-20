@@ -302,6 +302,14 @@ class InventorySummary(BaseModel):
     ssh_slot_hint_count: int = 0
 
 
+class PlatformCapability(BaseModel):
+    label: str
+    status: Literal["available", "partial", "unavailable", "unsupported"] = "unavailable"
+    summary: str
+    sources: list[str] = Field(default_factory=list)
+    requirements: list[str] = Field(default_factory=list)
+
+
 class InventorySnapshot(BaseModel):
     slots: list[SlotView]
     layout_rows: list[list[int | None]] = Field(default_factory=list)
@@ -322,6 +330,7 @@ class InventorySnapshot(BaseModel):
     platform_context: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     sources: dict[str, SourceStatus] = Field(default_factory=dict)
+    capabilities: dict[str, PlatformCapability] = Field(default_factory=dict)
     summary: InventorySummary = Field(default_factory=InventorySummary)
 
 
