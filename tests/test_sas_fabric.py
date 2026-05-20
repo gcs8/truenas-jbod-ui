@@ -1030,15 +1030,21 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertIn(mpr1_selected_enclosure, traces["bay:0"].node_ids)
         self.assertIn("controller:mpr0", traces["bay:0"].node_ids)
 
-    def test_non_core_snapshot_reports_unavailable_boundary(self) -> None:
-        fabric = build_sas_fabric_snapshot(
-            system=SystemConfig(id="scale", label="SCALE", truenas=TrueNASConfig(platform="scale")),
-            snapshot=InventorySnapshot(slots=[], refresh_interval_seconds=30),
-            ssh_outputs={},
-        )
+    def test_non_core_snapshots_report_unavailable_boundary(self) -> None:
+        for platform in ("scale", "linux", "quantastor", "esxi", "ipmi"):
+            with self.subTest(platform=platform):
+                fabric = build_sas_fabric_snapshot(
+                    system=SystemConfig(id=platform, label=platform.upper(), truenas=TrueNASConfig(platform=platform)),
+                    snapshot=InventorySnapshot(slots=[], refresh_interval_seconds=30),
+                    ssh_outputs={},
+                )
 
-        self.assertFalse(fabric.available)
-        self.assertIn("TrueNAS CORE", fabric.warnings[0])
+                self.assertFalse(fabric.available)
+                self.assertEqual(fabric.platform, platform)
+                self.assertEqual(fabric.nodes, [])
+                self.assertEqual(fabric.links, [])
+                self.assertEqual(fabric.traces, [])
+                self.assertIn("TrueNAS CORE", fabric.warnings[0])
 
     def test_core_snapshot_carries_structured_command_failures_for_debug_output(self) -> None:
         failure_details = [
