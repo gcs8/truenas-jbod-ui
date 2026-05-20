@@ -31,6 +31,9 @@
 - SAS Fabric diagnostic evidence now labels Fault/Warning/Context impact
   explicitly, colors evidence panels by the highest event impact, and lets the
   full event table filter by event type, impact, and decode confidence.
+- Added a `0.20.1-dev` platform parity plan for TrueNAS SCALE, Quantastor,
+  generic Linux, and ESXi, centered on capability/status contracts, setup
+  requirements, fixture breadth, and small platform-specific follow-up bites.
 
 ## v0.20.0 - 2026-05-20
 
