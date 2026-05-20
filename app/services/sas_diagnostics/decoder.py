@@ -129,6 +129,8 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
             record[key] = decoded.get(key)
     if not record.get("label"):
         record["label"] = event.get("reason") or event.get("message") or "Kernel event"
+    if record.get("event_type") == "scsi_sense" and record.get("family"):
+        record["severity"] = fault_family_severity(str(record["family"]))
     if not record.get("likely_layer") and record.get("family"):
         record["likely_layer"] = fault_family_likely_layer(str(record["family"]))
     fingerprint = _finding_fingerprint(record)
@@ -139,7 +141,7 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
 
 def record_mpr_event_summary(summary: dict[str, Any], event: dict[str, Any], record: dict[str, Any]) -> None:
     summary["event_count"] += 1
-    if event.get("severity") == "error":
+    if record.get("severity") == "error":
         summary["error_count"] += 1
     event_type = str(event.get("event_type") or "message")
     if event_type == "retry":

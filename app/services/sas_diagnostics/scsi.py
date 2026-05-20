@@ -166,6 +166,10 @@ SCSI_SENSE_KEY_LABELS = {
 }
 
 SCSI_ASC_ASCQ_LABELS = {
+    (0x00, 0x00): "No additional sense information",
+    (0x00, 0x06): "I/O process terminated",
+    (0x00, 0x16): "Operation in progress",
+    (0x00, 0x1D): "ATA pass through information available",
     (0x03, 0x00): "Peripheral device write fault",
     (0x03, 0x01): "No write current",
     (0x03, 0x02): "Excessive write errors",
@@ -179,6 +183,18 @@ SCSI_ASC_ASCQ_LABELS = {
     (0x08, 0x02): "Logical unit communication parity error",
     (0x08, 0x03): "Logical unit communication CRC error",
     (0x08, 0x04): "Unreachable copy target",
+    (0x09, 0x00): "Track following error",
+    (0x09, 0x01): "Tracking servo failure",
+    (0x09, 0x02): "Focus servo failure",
+    (0x09, 0x03): "Spindle servo failure",
+    (0x09, 0x04): "Head select fault",
+    (0x0B, 0x00): "Warning",
+    (0x0B, 0x01): "Warning - specified temperature exceeded",
+    (0x0B, 0x02): "Warning - enclosure degraded",
+    (0x0B, 0x03): "Warning - background self-test failed",
+    (0x0B, 0x04): "Warning - background pre-scan detected medium error",
+    (0x0B, 0x05): "Warning - background medium scan detected medium error",
+    (0x0B, 0x06): "Warning - non-volatile cache now volatile",
     (0x0C, 0x00): "Write error",
     (0x0C, 0x01): "Write error, recovered with auto reallocation",
     (0x0C, 0x02): "Write error, auto reallocation failed",
@@ -197,15 +213,56 @@ SCSI_ASC_ASCQ_LABELS = {
     (0x10, 0x02): "Logical block application tag check failed",
     (0x10, 0x03): "Logical block reference tag check failed",
     (0x11, 0x00): "Unrecovered read error",
+    (0x14, 0x00): "Recorded entity not found",
+    (0x14, 0x01): "Record not found",
+    (0x14, 0x05): "Record not found, recommend reassignment",
+    (0x15, 0x00): "Random positioning error",
+    (0x15, 0x01): "Mechanical positioning error",
+    (0x15, 0x02): "Positioning error detected by read of medium",
+    (0x16, 0x00): "Data synchronization mark error",
+    (0x17, 0x00): "Recovered data with no error correction applied",
+    (0x17, 0x01): "Recovered data with retries",
+    (0x17, 0x02): "Recovered data with positive head offset",
+    (0x17, 0x03): "Recovered data with negative head offset",
+    (0x17, 0x05): "Recovered data using previous sector id",
+    (0x17, 0x06): "Recovered data without ECC, data auto-reallocated",
+    (0x17, 0x07): "Recovered data without ECC, recommend reassignment",
+    (0x17, 0x08): "Recovered data without ECC, recommend rewrite",
+    (0x18, 0x00): "Recovered data with error correction applied",
+    (0x18, 0x01): "Recovered data with error correction and retries applied",
+    (0x18, 0x02): "Recovered data, data auto-reallocated",
+    (0x18, 0x05): "Recovered data, recommend reassignment",
+    (0x18, 0x06): "Recovered data, recommend rewrite",
+    (0x19, 0x00): "Defect list error",
+    (0x19, 0x01): "Defect list not available",
+    (0x19, 0x02): "Defect list error in primary list",
+    (0x19, 0x03): "Defect list error in grown list",
     (0x1A, 0x00): "Parameter list length error",
+    (0x1B, 0x00): "Synchronous data transfer error",
     (0x20, 0x00): "Invalid command operation code",
     (0x21, 0x00): "Logical block address out of range",
     (0x24, 0x00): "Invalid field in CDB",
     (0x25, 0x00): "Logical unit not supported",
+    (0x27, 0x00): "Write protected",
+    (0x27, 0x01): "Hardware write protected",
+    (0x27, 0x02): "Logical unit software write protected",
+    (0x27, 0x07): "Space allocation failed write protect",
+    (0x28, 0x00): "Not ready to ready change, medium may have changed",
     (0x29, 0x00): "Power on, reset, or bus device reset occurred",
     (0x2A, 0x01): "Mode parameters changed",
     (0x2C, 0x00): "Command sequence error",
+    (0x2F, 0x00): "Commands cleared by another initiator",
+    (0x31, 0x00): "Medium format corrupted",
+    (0x31, 0x01): "Format command failed",
+    (0x31, 0x02): "Zoned formatting failed due to spare linking",
+    (0x32, 0x00): "No defect spare location available",
+    (0x32, 0x01): "Defect list update failure",
     (0x3A, 0x00): "Medium not present",
+    (0x3E, 0x00): "Logical unit has not self-configured yet",
+    (0x3E, 0x01): "Logical unit failure",
+    (0x3E, 0x02): "Timeout on logical unit",
+    (0x3E, 0x03): "Logical unit failed self-test",
+    (0x3E, 0x04): "Logical unit unable to update self-test log",
     (0x34, 0x00): "Enclosure failure",
     (0x35, 0x00): "Enclosure services failure",
     (0x35, 0x01): "Unsupported enclosure function",
@@ -249,11 +306,40 @@ SCSI_ASC_ASCQ_LABELS = {
     (0x4B, 0x13): "PCIe unsupported request",
     (0x4B, 0x14): "PCIe ACS violation",
     (0x4B, 0x15): "PCIe TLP prefix blocked",
+    (0x4C, 0x00): "Logical unit failed self-configuration",
     (0x55, 0x00): "System resource failure",
     (0x55, 0x01): "System buffer full",
     (0x55, 0x03): "Insufficient resources",
     (0x55, 0x0B): "Insufficient power for operation",
+    (0x5B, 0x00): "Log exception",
+    (0x5B, 0x01): "Threshold condition met",
+    (0x5B, 0x02): "Log counter at maximum",
+    (0x5B, 0x03): "Log list codes exhausted",
     (0x5D, 0x00): "Failure prediction threshold exceeded",
+    (0x5D, 0x01): "Media failure prediction threshold exceeded",
+    (0x5D, 0x02): "Logical unit failure prediction threshold exceeded",
+    (0x5D, 0x03): "Spare area exhaustion prediction threshold exceeded",
+    (0x5D, 0x10): "Hardware impending failure, general hard drive failure",
+    (0x5D, 0x11): "Hardware impending failure, drive error rate too high",
+    (0x5D, 0x12): "Hardware impending failure, data error rate too high",
+    (0x5D, 0x13): "Hardware impending failure, seek error rate too high",
+    (0x5D, 0x14): "Hardware impending failure, too many block reassigns",
+    (0x5D, 0x15): "Hardware impending failure, access times too high",
+    (0x5D, 0x16): "Hardware impending failure, start unit times too high",
+    (0x5D, 0x17): "Hardware impending failure, channel parametrics",
+    (0x5D, 0x18): "Hardware impending failure, controller detected",
+    (0x5D, 0x19): "Hardware impending failure, throughput performance",
+    (0x5D, 0x1A): "Hardware impending failure, seek time performance",
+    (0x5D, 0x1B): "Hardware impending failure, spin-up retry count",
+    (0x5D, 0x1C): "Hardware impending failure, drive calibration retry count",
+    (0x67, 0x00): "Configuration failure",
+    (0x68, 0x00): "Logical unit not configured",
+    (0x69, 0x00): "Data loss on logical unit",
+    (0x6B, 0x00): "State change has occurred",
+    (0x6B, 0x01): "A redundancy level got better",
+    (0x6B, 0x02): "A redundancy level got worse",
+    (0x6C, 0x00): "Rebuild failure occurred",
+    (0x6D, 0x00): "Recalculate failure occurred",
 }
 
 LOG_SENSE_PAGE_NAMES = {
@@ -556,14 +642,40 @@ def _sense_fault_family(reason: str, sense_key: str, asc: tuple[int, int] | None
             return "write_error"
         if asc_code == 0x08:
             return "logical_unit_communication"
+        if asc_code == 0x09:
+            return "target_failure"
+        if asc_code == 0x0B:
+            if ascq == 0x02:
+                return "enclosure_warning"
+            return "device_path_exception"
         if asc_code == 0x0C:
             return "write_error"
         if asc_code == 0x10:
             return "protection_error"
         if asc_code == 0x11:
             return "read_error"
+        if asc_code == 0x14:
+            return "device_path_exception"
+        if asc_code in {0x15, 0x16}:
+            return "target_failure"
+        if asc_code in {0x17, 0x18}:
+            return "recovered_data"
+        if asc_code == 0x19:
+            return "medium_format"
+        if asc_code == 0x1B:
+            return "sas_protocol"
+        if asc_code == 0x27:
+            return "write_protect"
+        if asc_code in {0x28, 0x29, 0x2A, 0x2F, 0x6B}:
+            return "unit_attention"
+        if asc_code in {0x31, 0x32}:
+            return "medium_format"
         if asc_code in {0x34, 0x35}:
             return "ses_enclosure"
+        if asc_code == 0x3E:
+            if ascq == 0x02:
+                return "timeout"
+            return "target_failure"
         if asc_code in {0x40, 0x41, 0x42, 0x44}:
             return "target_failure"
         if asc_code in {0x45, 0x46, 0x47, 0x48, 0x49, 0x4A}:
@@ -578,8 +690,16 @@ def _sense_fault_family(reason: str, sense_key: str, asc: tuple[int, int] | None
             if 0x0E <= ascq <= 0x15:
                 return "pcie_fabric"
             return "sas_protocol"
+        if asc_code == 0x4C:
+            return "target_failure"
         if asc_code == 0x55:
             return "device_path_exception"
+        if asc_code == 0x5B:
+            return "log_exception"
+        if asc_code == 0x5D:
+            return "failure_prediction"
+        if asc_code in {0x67, 0x68, 0x69, 0x6C, 0x6D}:
+            return "target_failure"
     if asc == (0x4B, 0x03):
         return "timeout"
     if asc == (0x4B, 0x04):
@@ -610,6 +730,20 @@ def _sense_likely_layer(family: str) -> str:
         return "Target communication path"
     if family == "target_failure":
         return "SCSI target/device"
+    if family == "medium_format":
+        return "Target medium/defect management"
+    if family == "failure_prediction":
+        return "Target health prediction"
+    if family == "recovered_data":
+        return "Target media recovery"
+    if family == "write_protect":
+        return "Target write protection"
+    if family == "log_exception":
+        return "SCSI diagnostic log"
+    if family == "unit_attention":
+        return "SCSI target state change"
+    if family == "enclosure_warning":
+        return "SES/enclosure health"
     if family == "pcie_fabric":
         return "Host PCIe fabric or endpoint"
     if family == "data_buffer_error":
@@ -636,6 +770,20 @@ def _sense_description(label: str, family: str) -> str:
         return f"{label} indicates the target stopped responding cleanly on the communication path."
     if family == "target_failure":
         return f"{label} points at a target/device-side failure reported through SCSI sense data."
+    if family == "medium_format":
+        return f"{label} points at target medium formatting or defect-list management."
+    if family == "failure_prediction":
+        return f"{label} is a target-reported health prediction condition."
+    if family == "recovered_data":
+        return f"{label} means the target recovered data after media or correction work."
+    if family == "write_protect":
+        return f"{label} means the target refused the command because write protection is active."
+    if family == "log_exception":
+        return f"{label} points at a SCSI diagnostic log threshold or counter condition."
+    if family == "unit_attention":
+        return f"{label} is a SCSI target state-change notification."
+    if family == "enclosure_warning":
+        return f"{label} is an enclosure/SES health warning reported through SCSI sense data."
     if family == "pcie_fabric":
         return f"{label} is a host PCIe fabric or endpoint error surfaced through SCSI sense data."
     if family == "data_buffer_error":

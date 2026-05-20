@@ -492,6 +492,38 @@ mpr0: Controller reported scsi ioc terminated tgt 194 SMID 143 loginfo 39999999
         self.assertEqual(unknown_loginfo["decode_source"], "baruch_lsi_decode_loginfo")
         self.assertIn("not in the current local LSI lookup table", unknown_loginfo["decoder_note"])
 
+    def test_parse_mpr_dmesg_events_decodes_broader_standard_asc_ascq_families(self) -> None:
+        events = parse_mpr_dmesg_events(
+            """
+(da70:mpr0:0:200:0): SCSI sense: RECOVERED ERROR asc:18,5 (Recovered data, recommend reassignment)
+(da71:mpr0:0:201:0): SCSI sense: HARDWARE ERROR asc:0b,2 (Warning - enclosure degraded)
+(da72:mpr0:0:202:0): SCSI sense: DATA PROTECT asc:27,7 (Space allocation failed write protect)
+(da73:mpr0:0:203:0): SCSI sense: UNIT ATTENTION asc:2f,0 (Commands cleared by another initiator)
+(da74:mpr0:0:204:0): SCSI sense: HARDWARE ERROR asc:5d,3 (Spare area exhaustion prediction threshold exceeded)
+(da75:mpr0:0:205:0): SCSI sense: HARDWARE ERROR asc:3e,2 (Timeout on logical unit)
+(da76:mpr0:0:206:0): SCSI sense: MEDIUM ERROR asc:31,0 (Medium format corrupted)
+(da77:mpr0:0:207:0): SCSI sense: HARDWARE ERROR asc:5b,1 (Threshold condition met)
+""".strip()
+        )
+
+        rows = events["by_controller"]["mpr0"]["event_table"]["rows"]
+        rows_by_asc = {row["asc"]: row for row in rows}
+
+        self.assertEqual(rows_by_asc["18,5"]["asc_label"], "Recovered data, recommend reassignment")
+        self.assertEqual(rows_by_asc["18,5"]["family"], "recovered_data")
+        self.assertEqual(rows_by_asc["18,5"]["severity"], "warning")
+        self.assertEqual(rows_by_asc["0b,2"]["family"], "enclosure_warning")
+        self.assertEqual(rows_by_asc["0b,2"]["severity"], "warning")
+        self.assertEqual(rows_by_asc["27,7"]["family"], "write_protect")
+        self.assertEqual(rows_by_asc["2f,0"]["family"], "unit_attention")
+        self.assertEqual(rows_by_asc["5d,3"]["family"], "failure_prediction")
+        self.assertEqual(rows_by_asc["3e,2"]["family"], "timeout")
+        self.assertEqual(rows_by_asc["3e,2"]["severity"], "error")
+        self.assertEqual(rows_by_asc["31,0"]["family"], "medium_format")
+        self.assertEqual(rows_by_asc["5b,1"]["family"], "log_exception")
+        self.assertTrue(all(row["decode_confidence"] == "standard" for row in rows_by_asc.values()))
+        self.assertTrue(all(row["source_attribution"]["url"] == "https://www.t10.org/lists/asc-num.htm" for row in rows_by_asc.values()))
+
     def test_parse_mpr_dmesg_events_decodes_broader_lsi_loginfo_tables(self) -> None:
         events = parse_mpr_dmesg_events(
             """

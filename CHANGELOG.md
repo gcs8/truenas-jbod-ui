@@ -18,6 +18,11 @@
   CDB length fields, avoids false LBA decoding for `UNMAP`, expands LOG SENSE
   page-control context, and ports more attributed Broadcom/LSI IOP/PL/IR
   `loginfo` tables.
+- SAS diagnostic sense decoding now covers more T10 ASC/ASCQ conditions for
+  warnings, recovered data, write protection, medium/defect-list errors,
+  logical-unit timeout/failure, log exceptions, redundancy state changes, and
+  failure-prediction indicators, with warning-level severity for non-fatal
+  standard warning/recovery families.
 
 ## v0.20.0 - 2026-05-20
 

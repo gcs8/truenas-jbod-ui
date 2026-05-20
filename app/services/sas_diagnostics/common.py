@@ -19,6 +19,13 @@ FAULT_FAMILY_LABELS = {
     "cam_error": "CAM transport error",
     "scsi_status": "SCSI status",
     "retry": "Command retry",
+    "recovered_data": "Recovered data/media error",
+    "write_protect": "Write protection",
+    "failure_prediction": "Failure prediction",
+    "log_exception": "SCSI log exception",
+    "unit_attention": "Device state change",
+    "medium_format": "Medium format/defect error",
+    "enclosure_warning": "SES/enclosure warning",
     "write_error": "Write error",
     "read_error": "Read error",
     "write_io": "Write IO affected",
@@ -53,8 +60,15 @@ def fault_family_priority(family: str) -> int:
         "scsi_sense": 16,
         "scsi_status": 17,
         "retry": 18,
-        "write_error": 19,
-        "read_error": 20,
+        "failure_prediction": 19,
+        "medium_format": 20,
+        "write_error": 21,
+        "read_error": 22,
+        "enclosure_warning": 23,
+        "recovered_data": 24,
+        "write_protect": 25,
+        "log_exception": 26,
+        "unit_attention": 27,
         "write_io": 30,
         "read_io": 31,
         "log_sense": 32,
@@ -90,6 +104,12 @@ def fault_family_severity(family: str) -> str:
         "aborted_command",
         "device_path_exception",
         "protection_error",
+        "recovered_data",
+        "write_protect",
+        "failure_prediction",
+        "log_exception",
+        "unit_attention",
+        "enclosure_warning",
     }:
         return "warning"
     return "info"
@@ -108,10 +128,24 @@ def fault_family_likely_layer(family: str) -> str:
         return "HBA firmware/configuration"
     if family == "ses_enclosure":
         return "SES/enclosure management path"
+    if family == "enclosure_warning":
+        return "SES/enclosure health"
     if family == "logical_unit_communication":
         return "Target communication path"
     if family == "target_failure":
         return "SCSI target/device"
+    if family == "medium_format":
+        return "Target medium/defect management"
+    if family == "failure_prediction":
+        return "Target health prediction"
+    if family == "recovered_data":
+        return "Target media recovery"
+    if family == "write_protect":
+        return "Target write protection"
+    if family == "log_exception":
+        return "SCSI diagnostic log"
+    if family == "unit_attention":
+        return "SCSI target state change"
     if family == "pcie_fabric":
         return "Host PCIe fabric or endpoint"
     if family == "data_buffer_error":
