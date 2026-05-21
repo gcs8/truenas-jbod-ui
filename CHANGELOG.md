@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-No unreleased changes yet.
+### Changed
+
+- Reopened the post-`v0.20.1` development line as `0.21.0-dev` for a
+  code-quality, coverage, and release-automation pitstop before the next
+  Storage Fabric enrichment cycle.
 
 ## v0.20.1 - 2026-05-21
 
