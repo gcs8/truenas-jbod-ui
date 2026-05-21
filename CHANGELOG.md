@@ -2,7 +2,10 @@
 
 ## Unreleased
 
-No unreleased changes yet.
+### Changed
+
+- Reopened development as `0.21.0-dev` for the code-quality pitstop after the
+  `v0.20.2` corrective public release.
 
 ## v0.20.2 - 2026-05-21
 
