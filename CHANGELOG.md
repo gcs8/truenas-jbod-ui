@@ -13,6 +13,15 @@ No unreleased changes yet.
   unit, browser, Docker, optional-sidecar, perf, Linux restore, public demo,
   GHCR, deployment, and post-release gates, with a validator script to catch
   missing wrap evidence before tagging.
+- Documented the `v0.20.1` post-publish checklist audit and public-artifact
+  correction policy, keeping `v0.20.1` intact and shipping remediation as a
+  SemVer patch release.
+
+### Fixed
+
+- Corrects the release process gap where `v0.20.1` shipped from a
+  release-specific QA document without an item-by-item global
+  `docs/RELEASE_CHECKLIST.md` evidence table.
 
 ## v0.20.1 - 2026-05-21
 
