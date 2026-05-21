@@ -59,6 +59,9 @@ Validated against `docs/RELEASE_CHECKLIST.md`.
 - External wiki sync: not required; checked-in `wiki/` source was unchanged.
 - Post-release development branch:
   `codex/v0.21.0-kickoff-2026-05-21-post-0.20.2` at `dbec45e`
+- Temporary Linux QA restore stack
+  `/docker-local/truenas-jbod-ui-qa/v0.20.2-20260521T0418` was torn down
+  after the post-publish sniff passed.
 
 ## Notes
 
