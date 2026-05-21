@@ -23,6 +23,12 @@ REQUIRED_GATES = (
     "Post-release reopen",
 )
 
+POST_PUBLISH_GATES = {
+    "ghcr publish verification",
+    "deployment refresh/sniff tests",
+    "post-release reopen",
+}
+
 VALID_RESULTS = {"pass", "blocked", "n/a"}
 
 
@@ -73,8 +79,16 @@ def parse_checklist_evidence_table(text: str) -> dict[str, list[str]]:
     return rows
 
 
-def validate_release_wrap_text(text: str, *, allow_blocked: bool = False) -> list[ValidationIssue]:
+def validate_release_wrap_text(
+    text: str,
+    *,
+    allow_blocked: bool = False,
+    phase: str = "final",
+) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
+    normalized_phase = phase.lower()
+    if normalized_phase not in {"pre-tag", "final"}:
+        issues.append(ValidationIssue("phase must be pre-tag or final"))
 
     if "docs/RELEASE_CHECKLIST.md" not in text:
         issues.append(ValidationIssue("release wrap must reference docs/RELEASE_CHECKLIST.md"))
@@ -102,7 +116,9 @@ def validate_release_wrap_text(text: str, *, allow_blocked: bool = False) -> lis
         if normalized_result == "pass" and not evidence:
             issues.append(ValidationIssue(f"{gate}: Pass requires evidence"))
         if normalized_result == "blocked" and not allow_blocked:
-            issues.append(ValidationIssue(f"{gate}: Blocked gates cannot ship"))
+            pre_tag_post_publish = normalized_phase == "pre-tag" and gate.lower() in POST_PUBLISH_GATES
+            if not pre_tag_post_publish:
+                issues.append(ValidationIssue(f"{gate}: Blocked gates cannot ship"))
         if normalized_result == "blocked" and not evidence:
             issues.append(ValidationIssue(f"{gate}: Blocked requires evidence"))
         if normalized_result == "n/a" and reason.lower() in {"", "-", "n/a", "none", "reason"}:
@@ -111,10 +127,19 @@ def validate_release_wrap_text(text: str, *, allow_blocked: bool = False) -> lis
     return issues
 
 
-def validate_release_wrap_path(path: Path, *, allow_blocked: bool = False) -> list[ValidationIssue]:
+def validate_release_wrap_path(
+    path: Path,
+    *,
+    allow_blocked: bool = False,
+    phase: str = "final",
+) -> list[ValidationIssue]:
     if not path.exists():
         return [ValidationIssue(f"release wrap not found: {path}")]
-    return validate_release_wrap_text(path.read_text(encoding="utf-8"), allow_blocked=allow_blocked)
+    return validate_release_wrap_text(
+        path.read_text(encoding="utf-8"),
+        allow_blocked=allow_blocked,
+        phase=phase,
+    )
 
 
 def main() -> int:
@@ -125,11 +150,20 @@ def main() -> int:
         action="store_true",
         help="Report missing/invalid evidence but do not fail solely because a row is Blocked.",
     )
+    parser.add_argument(
+        "--phase",
+        choices=("pre-tag", "final"),
+        default="final",
+        help=(
+            "Use pre-tag to allow only inherently post-publish rows to remain Blocked. "
+            "Use final after GHCR, deployment sniff tests, and reopen work are recorded."
+        ),
+    )
     args = parser.parse_args()
 
     version = args.version.removeprefix("v")
     path = Path("docs") / f"RELEASE_WRAP_{version}.md"
-    issues = validate_release_wrap_path(path, allow_blocked=args.allow_blocked)
+    issues = validate_release_wrap_path(path, allow_blocked=args.allow_blocked, phase=args.phase)
     if issues:
         for issue in issues:
             print(f"- {issue.message}")

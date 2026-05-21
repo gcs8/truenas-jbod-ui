@@ -15,9 +15,13 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - Every applicable checklist item must be recorded as `Pass`, `Blocked`, or
   `N/A` in the release wrap. `N/A` requires a concrete reason. "Not enough
   time" is not a valid reason; stop the release instead.
-- Do not push the release tag, publish the GitHub release, trigger GHCR
-  publishing, sync the external wiki, or refresh public deployments until the
-  release wrap proves every required gate is `Pass` or justified `N/A`.
+- Do not push the release tag until the pre-tag release wrap proves every
+  pre-publish gate is `Pass` or justified `N/A`. Only inherently post-publish
+  gates may remain `Blocked` at this point: GHCR publish verification,
+  deployment refresh/sniff tests, and post-release reopen.
+- Do not call the release complete until the final release wrap proves every
+  required gate is `Pass` or justified `N/A`, including GHCR, deployment sniff
+  tests, and the next development reopen.
 - If a release is accidentally published without a complete checklist evidence
   table, do not delete, overwrite, or retag public artifacts unless the artifact
   is malicious or catastrophically unsafe. Prefer a SemVer patch correction
@@ -53,7 +57,13 @@ release URL when published, GHCR digest when published, public demo workflow or
 Pages URL when applicable, external wiki commit when applicable, and any known
 deviations from the checklist.
 
-Before tagging, run the release-wrap validator against the target version:
+Before tagging, run the pre-tag release-wrap validator against the target
+version:
+
+- `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --phase pre-tag`
+
+After GHCR publish, deployment sniff tests, and reopen work are recorded, run
+the final release-wrap validator:
 
 - `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version>`
 
@@ -66,15 +76,16 @@ Before tagging, run the release-wrap validator against the target version:
 4. Run local unit, syntax, hygiene, Docker health, optional-sidecar, browser,
    feature-specific, public-demo, and perf gates.
 5. Run the Linux QA Docker restore gate and restored-stack perf/browser gates.
-6. Fill in the release wrap checklist evidence table.
-7. Only after the table is complete, merge/cut the release commit, tag it, push
-   it, publish the GitHub release, and verify GHCR digest convergence.
+6. Fill in the release wrap checklist evidence table and pass the pre-tag
+   validator.
+7. Only after the pre-tag table is complete, merge/cut the release commit, tag
+   it, push it, publish the GitHub release, and verify GHCR digest convergence.
 8. Refresh and sniff-test local, Linux, and production deployments after GHCR
    is available.
 9. Sync the external wiki and public demo deployment when those artifacts
    changed, and record workflow URLs or commit hashes.
 10. Reopen the next development branch only after post-publish deployment
-    evidence is recorded.
+    evidence is recorded, then rerun the final release-wrap validator.
 
 ## Scope
 

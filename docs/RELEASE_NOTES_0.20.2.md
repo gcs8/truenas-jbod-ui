@@ -15,10 +15,12 @@ hardening needed before the next normal feature or maintenance release.
 - Release-specific QA documents are now addenda only; they cannot replace the
   global release checklist.
 - Every future release wrap must include an item-by-item checklist evidence
-  table before the tag, GitHub release, GHCR publish, wiki sync, public demo
-  refresh, or deployment refresh.
+  table, with a pre-tag validation phase for pre-publish gates and a final
+  validation phase after GHCR, deployment sniff tests, and reopen work are
+  recorded.
 - `scripts/validate_release_wrap.py` now checks the required release-wrap
-  evidence rows before a release can ship.
+  evidence rows before a release can ship, including a guarded pre-tag phase
+  that only allows inherently post-publish rows to remain blocked.
 - `docs/RELEASE_WRAP_0.20.1.md` now records the post-publish audit of the
   `v0.20.1` process gap and the decision not to delete, overwrite, or retag
   public artifacts for a process-only remediation.

@@ -67,6 +67,47 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
             [issue.message for issue in issues],
         )
 
+    def test_pre_tag_validation_allows_only_post_publish_blockers(self) -> None:
+        text = _wrap_with_rows(
+            {
+                "GHCR publish verification": ("yes", "awaiting public tag workflow", "Blocked", ""),
+                "Deployment refresh/sniff tests": ("yes", "awaiting GHCR image", "Blocked", ""),
+                "Post-release reopen": ("yes", "awaiting release cut", "Blocked", ""),
+            }
+        )
+
+        issues = validate_release_wrap_text(text, phase="pre-tag")
+
+        self.assertEqual(issues, [])
+
+    def test_pre_tag_validation_still_rejects_pre_publish_blockers(self) -> None:
+        text = _wrap_with_rows(
+            {
+                "Linux QA restore gate": ("yes", "restore failed", "Blocked", ""),
+            }
+        )
+
+        issues = validate_release_wrap_text(text, phase="pre-tag")
+
+        self.assertIn(
+            "Linux QA restore gate: Blocked gates cannot ship",
+            [issue.message for issue in issues],
+        )
+
+    def test_final_validation_rejects_post_publish_blockers(self) -> None:
+        text = _wrap_with_rows(
+            {
+                "GHCR publish verification": ("yes", "workflow pending", "Blocked", ""),
+            }
+        )
+
+        issues = validate_release_wrap_text(text)
+
+        self.assertIn(
+            "GHCR publish verification: Blocked gates cannot ship",
+            [issue.message for issue in issues],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
