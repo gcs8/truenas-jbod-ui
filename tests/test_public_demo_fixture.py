@@ -123,7 +123,8 @@ class PublicDemoFixtureTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(slots[slot_number].vdev_name, vdev_name)
                     self.assertEqual(slots[slot_number].vdev_class, "data")
 
-        self.assertEqual(slots[42].vdev_name, "spare-1")
+        self.assertEqual(slots[42].pool_name, "The-Repository")
+        self.assertEqual(slots[42].vdev_name, "spares")
         self.assertEqual(slots[42].vdev_class, "spare")
         self.assertIsNone(slots[43].pool_name)
         self.assertIsNone(slots[43].vdev_name)

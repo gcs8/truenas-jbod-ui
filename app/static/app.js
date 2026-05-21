@@ -1843,6 +1843,14 @@
       .replace("Ses", "SES");
   }
 
+  function isStorageFabricPayload(fabric = state.sasFabric.data) {
+    const kind = String(fabric?.raw?.fabric_kind || "");
+    return fabric?.raw?.fabric_domain === "storage_fabric"
+      || kind === "linux_ses"
+      || kind.startsWith("storage_")
+      || (fabric?.platform && fabric.platform !== "core");
+  }
+
   function formatSasFabricSlots(slots, limit = 24) {
     const sorted = sasFabricSortedSlots(slots);
     if (!sorted.length) {
@@ -1998,6 +2006,7 @@
   }
 
   function renderSasFabricLane(controllerRecord, fabric, nodeMap) {
+    const storagePayload = isStorageFabricPayload(fabric);
     const controllerId = controllerRecord.id || `controller:${controllerRecord.name}`;
     const controllerNode = nodeMap.get(controllerId) || {
       id: controllerId,
@@ -2018,7 +2027,7 @@
       .filter((node) => node.kind === "expander" && node.controller_id === controllerId)
       .sort((left, right) => String(left.label).localeCompare(String(right.label)));
     const enclosures = sasFabricList(fabric.nodes)
-      .filter((node) => node.kind === "mpr-enclosure" && node.controller_id === controllerId)
+      .filter((node) => ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node.kind) && node.controller_id === controllerId)
       .sort((left, right) => String(left.label).localeCompare(String(right.label)));
     const slotSet = new Set(sasFabricSortedSlots(controllerRecord.related_slots || controllerNode.related_slots));
     paths.forEach((path) => sasFabricSortedSlots(path.slots).forEach((slot) => slotSet.add(slot)));
@@ -2029,29 +2038,29 @@
     return `
       <section class="sas-fabric-lane${laneRelated ? " is-related" : ""}">
         <div class="sas-fabric-stage">
-          <div class="sas-fabric-stage-title">Controller</div>
+          <div class="sas-fabric-stage-title">${storagePayload ? "Source" : "Controller"}</div>
           ${renderSasFabricNodeButton(controllerNode, {
             label: sasFabricDisplayLabel(controllerNode) || controllerName,
-            meta: sasFabricNodeMeta(controllerNode, controllerRecord) || controllerRecord.device || "HBA",
+            meta: sasFabricNodeMeta(controllerNode, controllerRecord) || controllerRecord.device || (storagePayload ? "storage source" : "HBA"),
             extra: "sas-fabric-controller-card",
           })}
         </div>
         <div class="sas-fabric-stage">
-          <div class="sas-fabric-stage-title">Paths</div>
+          <div class="sas-fabric-stage-title">${storagePayload ? "Storage Paths" : "Paths"}</div>
           <div class="sas-fabric-path-list">
-            ${paths.length ? paths.map(renderSasFabricPathButton).join("") : '<span class="sas-fabric-empty-note">No multipath states reported</span>'}
+            ${paths.length ? paths.map(renderSasFabricPathButton).join("") : `<span class="sas-fabric-empty-note">${storagePayload ? "No storage paths reported" : "No multipath states reported"}</span>`}
           </div>
         </div>
         <div class="sas-fabric-stage">
-          <div class="sas-fabric-stage-title">Expanders</div>
+          <div class="sas-fabric-stage-title">${storagePayload ? "Transport Detail" : "Expanders"}</div>
           <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(expanders, 6)}</div>
         </div>
         <div class="sas-fabric-stage">
-          <div class="sas-fabric-stage-title">SES / MPR Enclosures</div>
+          <div class="sas-fabric-stage-title">${storagePayload ? "Enclosures / Views" : "SES / MPR Enclosures"}</div>
           <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(enclosures, 6)}</div>
         </div>
         <div class="sas-fabric-stage">
-          <div class="sas-fabric-stage-title">Impacted Bays</div>
+          <div class="sas-fabric-stage-title">${storagePayload ? "Mapped Bays" : "Impacted Bays"}</div>
           <div class="sas-fabric-bay-list">${renderSasFabricBayChips(laneSlots, 72)}</div>
         </div>
       </section>
@@ -2059,6 +2068,7 @@
   }
 
   function renderSasFabricMap(fabric) {
+    const storagePayload = isStorageFabricPayload(fabric);
     const nodeMap = sasFabricNodeMap(fabric);
     const hostNode = nodeMap.get("host") || {
       id: "host",
@@ -2077,15 +2087,15 @@
       }));
     if (!controllerRecords.length) {
       return `
-        <div class="sas-fabric-host-row">${renderSasFabricNodeButton(hostNode, { meta: "No HBA controllers reported" })}</div>
-        <div class="warning-item muted compact">No controller rows are available yet. Check CORE SSH and mprutil permissions.</div>
+        <div class="sas-fabric-host-row">${renderSasFabricNodeButton(hostNode, { meta: storagePayload ? "No storage sources reported" : "No HBA controllers reported" })}</div>
+        <div class="warning-item muted compact">${storagePayload ? "No storage source rows are available yet." : "No controller rows are available yet. Check CORE SSH and mprutil permissions."}</div>
       `;
     }
     return `
       <div class="sas-fabric-host-row">
         ${renderSasFabricNodeButton(hostNode, {
           label: sasFabricDisplayLabel(hostNode) || "Host",
-          meta: `${controllerRecords.length} controller${controllerRecords.length === 1 ? "" : "s"} / ${sasFabricList(fabric.nodes).length} nodes`,
+          meta: `${controllerRecords.length} ${storagePayload ? "source" : "controller"}${controllerRecords.length === 1 ? "" : "s"} / ${sasFabricList(fabric.nodes).length} nodes`,
           extra: "sas-fabric-host-card",
         })}
       </div>
@@ -2162,7 +2172,7 @@
     }
     if (!fabric) {
       sasFabricInspectorTitle.textContent = "Fabric Inspector";
-      sasFabricInspectorBody.innerHTML = "Open topology to load the current SAS fabric.";
+      sasFabricInspectorBody.innerHTML = "Open topology to load the current Storage Fabric.";
       return;
     }
     const trace = selectedSasFabricTrace();
@@ -2203,7 +2213,7 @@
     if (sasFabricSummary) {
       if (fabric) {
         sasFabricSummary.textContent = [
-          `${sasFabricList(fabric.controllers).length} controllers`,
+          `${sasFabricList(fabric.controllers).length} sources`,
           `${sasFabricList(fabric.paths).length} paths`,
           `${sasFabricList(fabric.expanders).length} expanders`,
           `${sasFabricList(fabric.enclosures).length} enclosures`,
@@ -2211,23 +2221,23 @@
         ].join(" / ");
       } else {
         sasFabricSummary.textContent = state.sasFabric.loading
-          ? "Loading read-only SAS fabric."
-          : "Read-only HBA, path, SES, and bay topology.";
+          ? "Loading read-only Storage Fabric."
+          : "Read-only storage source, path, enclosure, and bay topology.";
       }
     }
     if (sasFabricStatus) {
       if (state.snapshotMode) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = "Offline snapshots do not include live SAS fabric refresh yet.";
+        sasFabricStatus.textContent = "Offline snapshots do not include live Storage Fabric refresh yet.";
       } else if (state.sasFabric.error) {
         sasFabricStatus.className = "warning-item compact";
-        sasFabricStatus.textContent = `SAS fabric load failed: ${state.sasFabric.error}`;
+        sasFabricStatus.textContent = `Storage Fabric load failed: ${state.sasFabric.error}`;
       } else if (state.sasFabric.loading) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = fabric ? "Refreshing SAS fabric in the background." : "Loading read-only CORE SAS fabric.";
+        sasFabricStatus.textContent = fabric ? "Refreshing Storage Fabric in the background." : "Loading read-only Storage Fabric.";
       } else if (fabric?.available === false) {
         sasFabricStatus.className = "warning-item compact";
-        sasFabricStatus.textContent = sasFabricList(fabric.warnings)[0] || "SAS fabric is not available for this system.";
+        sasFabricStatus.textContent = sasFabricList(fabric.warnings)[0] || "Storage Fabric is not available for this system.";
       } else if (sasFabricList(fabric?.warnings).length) {
         const fabricWarnings = sasFabricList(fabric.warnings);
         const enrichmentOnly = fabricWarnings.every(isSasFabricEnrichmentWarning);
@@ -2235,17 +2245,17 @@
         sasFabricStatus.textContent = fabricWarnings.join(" ");
       } else if (fabric) {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = `Fabric data loaded for ${fabric.selected_enclosure_label || fabric.system_label || "current selection"}.`;
+        sasFabricStatus.textContent = `Storage Fabric data loaded for ${fabric.selected_enclosure_label || fabric.system_label || "current selection"}.`;
       } else {
         sasFabricStatus.className = "warning-item muted compact";
-        sasFabricStatus.textContent = "Open topology to load the current SAS fabric.";
+        sasFabricStatus.textContent = "Open topology to load the current Storage Fabric.";
       }
     }
     if (sasFabricLanes) {
       if (!fabric) {
-        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No SAS fabric payload has been loaded yet.</div>';
+        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
       } else if (fabric.available === false) {
-        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No topology map is available for this platform yet.</div>';
+        sasFabricLanes.innerHTML = '<div class="warning-item muted compact">No Storage Fabric map is available for this platform yet.</div>';
       } else {
         sasFabricLanes.innerHTML = renderSasFabricMap(fabric);
       }
@@ -2286,7 +2296,7 @@
         state.sasFabric.selectedNodeId = null;
       }
       if (!quiet) {
-        setStatus("SAS fabric refreshed.");
+        setStatus("Storage Fabric refreshed.");
       }
     } catch (error) {
       if (requestToken !== state.sasFabric.requestToken) {
@@ -2294,7 +2304,7 @@
       }
       state.sasFabric.error = error.message || String(error);
       if (!quiet) {
-        setStatus(`SAS fabric refresh failed: ${state.sasFabric.error}`, "error");
+        setStatus(`Storage Fabric refresh failed: ${state.sasFabric.error}`, "error");
       }
     } finally {
       if (requestToken === state.sasFabric.requestToken) {

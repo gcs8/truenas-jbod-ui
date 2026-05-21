@@ -73,7 +73,7 @@ It includes:
 - live-derived `TN Core` data shaped like the Supermicro CSE-946 top-loader
 - one 60-bay live enclosure snapshot
 - saved/virtual `4x NVMe Carrier Card` and `Boot SATADOMs` storage views
-- CORE-shaped pool topology with data `raidz2` groups, `spare-1`, `mirror-8`
+- CORE-shaped pool topology with data `raidz2` groups, pool-level `spares`, `mirror-8`
   special members, and matching empty bays
 - scrubbed SMART summaries and a 7-day real-history window
 - no bay selected on first load, so visitors start from the whole enclosure

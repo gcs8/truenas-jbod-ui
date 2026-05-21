@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any
+from typing import Any, Iterator
 
 from starlette.datastructures import URLPath
 from starlette.requests import Request
@@ -260,7 +261,8 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _connect_history_db() -> sqlite3.Connection:
+@contextmanager
+def _connect_history_db() -> Iterator[sqlite3.Connection]:
     db_path = _repo_root() / "history" / "history.db"
     if not db_path.exists():
         raise RuntimeError(
@@ -268,7 +270,10 @@ def _connect_history_db() -> sqlite3.Connection:
         )
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
-    return connection
+    try:
+        yield connection
+    finally:
+        connection.close()
 
 
 def _load_live_demo_source(settings: Settings, *, connection: sqlite3.Connection) -> LiveDemoSource:

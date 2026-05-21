@@ -1,0 +1,48 @@
+{
+  "Controllers": [
+    {
+      "Command Status": {
+        "Status": "Success",
+        "Description": "None"
+      },
+      "Response Data": {
+        "Drive Information": [
+          {
+            "Ctl": "c0",
+            "EID:Slt": "252:7",
+            "DID": 27,
+            "State": "JBOD",
+            "Size": "3.638 TB",
+            "Intf": "SAS",
+            "Med": "HDD",
+            "SeSz": "512B",
+            "Model": "H7240AS60SUN4.0T"
+          },
+          {
+            "Ctl": "c1",
+            "EID:Slt": "252:7",
+            "DID": 41,
+            "State": "Onln",
+            "Size": "7.276 TB",
+            "Intf": "SAS",
+            "Med": "HDD",
+            "SeSz": "512B",
+            "Model": "ST8000NM000A"
+          }
+        ],
+        "Drive /c0/e252/s7": {
+          "Device attributes": {
+            "SN": "ZC0PARITY",
+            "Firmware Revision": "A3A0"
+          }
+        },
+        "Drive /c1/e252/s7": {
+          "Device attributes": {
+            "SN": "ZC1PARITY",
+            "Firmware Revision": "SN03"
+          }
+        }
+      }
+    }
+  ]
+}

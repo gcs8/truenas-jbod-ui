@@ -29,11 +29,13 @@ from app.models.domain import (
 from app.services.inventory import DiskRecord, InventoryService, InventorySourceBundle, build_lunid_aliases, infer_slot_count_from_layout, resolve_persistent_id
 from app.services.mapping_store import MappingStore
 from app.services.parsers import (
+    LinuxScsiDevice,
     ParsedSSHData,
     SESMapEnclosure,
     SESMapSlot,
     ZpoolMember,
     build_slot_candidates_from_ses_enclosures,
+    canonicalize_ssh_command,
     parse_ssh_outputs,
 )
 from app.services.profile_registry import ProfileRegistry
@@ -155,10 +157,13 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(caps["diagnostics"].status, "available")
         self.assertIn("mprutil", caps["diagnostics"].sources)
 
-    def test_platform_capabilities_scale_reports_linux_ses_without_sas_fabric(self) -> None:
+    def test_platform_capabilities_scale_reports_linux_ses_fabric_as_partial_diagnostics(self) -> None:
         service = self._capability_service("scale", ssh_enabled=True)
+        slot = self._capability_slot(led_supported=True, device_name="sdc")
+        slot.ssh_ses_device = "/dev/sg27"
+        slot.ssh_ses_targets = [{"ses_device": "/dev/sg27", "ses_element_id": 0}]
         caps = service._build_platform_capabilities(
-            slots=[self._capability_slot(led_supported=True, device_name="sdc")],
+            slots=[slot],
             available_enclosures=[EnclosureOption(id="sg27", label="Front 24")],
             summary=InventorySummary(disk_count=1, pool_count=1, enclosure_count=1, mapped_slot_count=1),
             sources={
@@ -172,7 +177,8 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(caps["physical_slots"].status, "available")
         self.assertEqual(caps["smart_detail"].status, "available")
         self.assertEqual(caps["identify"].status, "available")
-        self.assertEqual(caps["diagnostics"].status, "unsupported")
+        self.assertEqual(caps["diagnostics"].status, "partial")
+        self.assertIn("sg_ses AES/EC", caps["diagnostics"].sources)
         self.assertIn("smartmontools", caps["smart_detail"].requirements)
 
     def test_platform_capabilities_quantastor_keeps_ha_context_and_ses_identify(self) -> None:
@@ -396,17 +402,66 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(
             warnings,
             [
-                "SAS Fabric enrichment probes had partial command failures; topology can still render, "
+                "Storage Fabric enrichment probes had partial command failures; topology can still render, "
                 "but IOC facts may be incomplete. Debug output keeps the command, exit code, and stderr details."
             ],
         )
-        self.assertEqual(status_message, "SAS Fabric enrichment completed with partial command failures.")
+        self.assertEqual(status_message, "Storage Fabric enrichment completed with partial command failures.")
         self.assertEqual(details[0]["canonical_command"], "mprutil -u 10 show iocfacts")
         self.assertEqual(details[0]["controller"], "mpr10")
         self.assertEqual(details[0]["context"], "sas_fabric_mprutil_iocfacts")
+
+    def test_linux_storage_enrichment_probe_adds_guarded_nvme_subsystem_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="offsite-scale",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            command_results = [
+                SSHCommandResult(command="/usr/bin/lsblk -OJ", ok=True, stdout='{"blockdevices": []}'),
+                SSHCommandResult(command="/usr/bin/lsscsi -g -t", ok=True, stdout=""),
+            ]
+
+            commands = service._linux_storage_enrichment_probe_commands(command_results)
+
+            self.assertEqual(len(commands), 1)
+            self.assertIn("nvme list-subsys -o json", commands[0])
+            self.assertIn("|| true", commands[0])
+            self.assertEqual(canonicalize_ssh_command(commands[0]), "nvme list-subsys -o json")
+
+    def test_linux_nvme_subsystem_failure_is_classified_as_enrichment(self) -> None:
+        command_results = [
+            SSHCommandResult(command="/usr/bin/lsblk -OJ", ok=True, stdout='{"blockdevices": []}'),
+            SSHCommandResult(
+                command="/usr/sbin/nvme list-subsys -o json",
+                ok=False,
+                stderr="nvme: command not found",
+                exit_code=127,
+            ),
+        ]
+
+        warnings, status_message = InventoryService._summarize_ssh_failures(
+            command_results,
+            {"/usr/bin/lsblk -OJ": command_results[0].stdout},
+        )
+        details = InventoryService._ssh_failure_details(command_results)
+
+        self.assertEqual(
+            warnings,
+            [
+                "Storage Fabric enrichment probes had partial command failures; topology can still render, "
+                "but Linux NVMe subsystem detail may be incomplete. Debug output keeps the command, exit code, and stderr details."
+            ],
+        )
+        self.assertEqual(status_message, "Storage Fabric enrichment completed with partial command failures.")
+        self.assertEqual(details[0]["canonical_command"], "nvme list-subsys -o json")
+        self.assertEqual(details[0]["context"], "storage_fabric_linux_nvme_subsystems")
         self.assertEqual(details[0]["criticality"], "enrichment")
-        self.assertEqual(details[0]["exit_code"], 1)
-        self.assertIn("Device not configured", details[0]["stderr"])
+        self.assertEqual(details[0]["exit_code"], 127)
+        self.assertIn("command not found", details[0]["stderr"])
 
     def test_suppress_scale_configured_sg_ses_failures_keeps_other_ssh_warnings(self) -> None:
         sg_ses_failure = "SSH command failed: sudo -n /usr/bin/sg_ses -p aes /dev/sg27 (exit 5)"
@@ -3046,6 +3101,67 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
 
             self.assertEqual(len(records), 1)
             self.assertIn("da45", records[0].lookup_keys)
+
+    def test_build_disk_records_merges_linux_block_and_scsi_transport_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="offsite-scale",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {
+                        "name": "sdc",
+                        "path": "/dev/sdc",
+                        "type": "disk",
+                        "size": 12000138625024,
+                        "model": "WUH721414AL4204",
+                        "serial": "9RWSZVKC",
+                        "tran": "sas",
+                        "hctl": "1:0:1:0",
+                        "log-sec": "512",
+                        "phy-sec": "4096",
+                    }
+                ],
+                linux_scsi_devices=[
+                    LinuxScsiDevice(
+                        hctl="1:0:1:0",
+                        device_type="disk",
+                        block_device="/dev/sdc",
+                        sg_device="/dev/sg2",
+                        transport="sas",
+                        transport_address="0x5000cca264d473d5",
+                    )
+                ],
+            )
+
+            disk = service._build_disk_records(
+                [{"name": "sdc", "devname": "sdc", "status": "ONLINE"}],
+                ssh_data,
+                {},
+                {},
+            )[0]
+
+            self.assertEqual(disk.serial, "9RWSZVKC")
+            self.assertEqual(disk.model, "WUH721414AL4204")
+            self.assertEqual(disk.size_bytes, 12000138625024)
+            self.assertEqual(disk.bus, "sas")
+            self.assertEqual(disk.logical_block_size, 512)
+            self.assertEqual(disk.physical_block_size, 4096)
+            self.assertIn("sdc", disk.smart_devices)
+            self.assertEqual(disk.raw["sg_device"], "/dev/sg2")
+            self.assertEqual(disk.raw["transport_address"], "0x5000cca264d473d5")
+            self.assertEqual(disk.raw["linux_blockdevice"]["hctl"], "1:0:1:0")
+            self.assertEqual(disk.raw["linux_scsi_device"]["sg_device"], "/dev/sg2")
 
     def test_lookup_zpool_member_matches_peer_alias_from_disk_lookup_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7117,6 +7233,8 @@ Enclosure Status diagnostic page:
                     return SSHCommandResult(command=command, ok=True, stdout=ec_off_output, stderr="", exit_code=0)
                 if "sg_ses -p ec /dev/sg27" in command:
                     return SSHCommandResult(command=command, ok=True, stdout=ec_on_output, stderr="", exit_code=0)
+                if "sg_ses --join --filter" in command:
+                    return SSHCommandResult(command=command, ok=False, stdout="", stderr="join unsupported", exit_code=1)
                 raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
 
             service._run_ssh_command = AsyncMock(side_effect=run_command)
@@ -7193,6 +7311,8 @@ Enclosure Status diagnostic page:
                     return SSHCommandResult(command=command, ok=True, stdout=aes_output, stderr="", exit_code=0)
                 if "sg_ses -p ec /dev/sg26" in command:
                     return SSHCommandResult(command=command, ok=True, stdout=ec_output, stderr="", exit_code=0)
+                if "sg_ses --join --filter /dev/sg26" in command:
+                    return SSHCommandResult(command=command, ok=False, stdout="", stderr="join unsupported", exit_code=1)
                 raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
 
             service._run_ssh_command = AsyncMock(side_effect=run_command)
@@ -7262,6 +7382,8 @@ Enclosure Status diagnostic page:
                     return SSHCommandResult(command=command, ok=True, stdout=aes_output, stderr="", exit_code=0)
                 if "sg_ses -p ec /dev/sg26" in command:
                     return SSHCommandResult(command=command, ok=True, stdout=ec_output, stderr="", exit_code=0)
+                if "sg_ses --join --filter /dev/sg26" in command:
+                    return SSHCommandResult(command=command, ok=False, stdout="", stderr="join unsupported", exit_code=1)
                 raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
 
             service._run_ssh_command = AsyncMock(side_effect=run_command)

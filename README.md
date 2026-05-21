@@ -40,6 +40,7 @@ Public demo:
 ## Features
 
 - Physical slot-map UI with profile-driven chassis rendering
+- Read-only Storage Fabric topology and path context where evidence exists
 - Per-slot detail for serial, model, size, temperature, topology, and health
 - Live enclosure switching plus saved chassis views and virtual storage views
 - Manual slot calibration and persistent slot mappings

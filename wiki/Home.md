@@ -85,8 +85,8 @@ It gives you:
 - profile-driven enclosure layouts
 - heat-map overlays for temperature, activity, endurance, risk, and other
   numeric metrics
-- read-only SAS Fabric topology and path diagnostics for validated TrueNAS CORE
-  MPR HBA systems
+- read-only Storage Fabric topology and path diagnostics, with deep SAS detail
+  on validated TrueNAS CORE MPR HBA systems
 - published-image Docker Compose install and update commands
 - optional history, admin, backup, restore, and debug workflows once the main
   read view is working
@@ -116,9 +116,10 @@ setup notes.
 
 ## Current Version
 
-`0.20.0` is the current stable release. Its headline feature is the first
-read-only SAS Fabric topology and diagnostics workspace for validated TrueNAS
-CORE MPR HBA systems.
+`0.20.1` is the current stable release. It polishes the Storage Fabric surface
+after the first `0.20.0` SAS Fabric release: CORE keeps the deep HBA/SAS
+diagnostic path, while SCALE/Linux, Quantastor, ESXi, and BMC-backed systems
+now get clearer read-only, source-labeled maps where evidence exists.
 
 The public demo from `0.19.0` remains a static GitHub Pages sample data
 experience, not a hosted copy of the live Docker app. Open

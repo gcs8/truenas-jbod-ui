@@ -719,6 +719,9 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(saved["systems"][0]["truenas"]["platform"], "scale")
         self.assertTrue(saved["systems"][0]["ssh"]["enabled"])
         self.assertIn("/usr/bin/lsscsi -g", saved["systems"][0]["ssh"]["commands"])
+        self.assertIn("/usr/bin/lsscsi -g -t", saved["systems"][0]["ssh"]["commands"])
+        self.assertTrue(any("lsblk --json --bytes --output" in command for command in saved["systems"][0]["ssh"]["commands"]))
+        self.assertTrue(any("nvme list-subsys -o json" in command for command in saved["systems"][0]["ssh"]["commands"]))
 
     def test_create_system_uses_ssh_host_as_primary_host_for_esxi(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

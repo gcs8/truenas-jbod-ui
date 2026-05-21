@@ -192,14 +192,16 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
             "scale",
             [
                 "/usr/sbin/zpool status -gP",
-                "sudo -n /usr/bin/sg_ses -p aes /dev/sg27",
-                "sudo -n /usr/bin/sg_ses -p ec /dev/sg38",
+                "sudo -n /usr/bin/sg_ses -p aes /dev/sg26",
+                "sudo -n /usr/bin/sg_ses -p ec /dev/sg37",
+                "sudo -n /usr/bin/sg_ses --join --filter /dev/sg26",
             ],
         )
 
         self.assertNotIn("/usr/sbin/zpool status -gP", content)
         self.assertIn("/usr/bin/sg_ses -p aes /dev/sg*", content)
         self.assertIn("/usr/bin/sg_ses -p ec /dev/sg*", content)
+        self.assertIn("/usr/bin/sg_ses --join --filter /dev/sg*", content)
         self.assertIn("/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*", content)
         self.assertIn("/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*", content)
         self.assertIn("/usr/sbin/smartctl -x -j *", content)

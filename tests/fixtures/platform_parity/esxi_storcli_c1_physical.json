@@ -1,0 +1,47 @@
+{
+  "Controllers": [
+    {
+      "Command Status": {
+        "Status": "Success",
+        "Description": "None"
+      },
+      "Response Data": {
+        "Drive Information": [
+          {
+            "Ctl": "c1",
+            "EID:Slt": "252:7",
+            "DID": 41,
+            "State": "Onln",
+            "DG": "0",
+            "Size": "7.276 TB",
+            "Intf": "SAS",
+            "Med": "HDD",
+            "SeSz": "512B",
+            "Model": "ST8000NM000A",
+            "SN": "ZPARITY0001"
+          }
+        ],
+        "Drive /c1/e252/s7": {
+          "Device attributes": {
+            "SN": "ZPARITY0001",
+            "Firmware Revision": "SN03",
+            "Model Number": "ST8000NM000A"
+          },
+          "State": {
+            "Media Error Count": 0,
+            "Other Error Count": 0,
+            "Predictive Failure Count": 0,
+            "S.M.A.R.T alert flagged by drive": "No"
+          },
+          "Inquiry Data": {
+            "Drive Temperature": "31C",
+            "Raw Size": "7.276 TB [0x3a3812ab0 Sectors]",
+            "Link Speed": "12.0Gb/s",
+            "Connector Name": "Port 4 - 7 x1",
+            "Connected Port Number(path)": "4(path0)"
+          }
+        }
+      }
+    }
+  ]
+}

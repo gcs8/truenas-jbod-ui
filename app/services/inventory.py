@@ -119,6 +119,10 @@ UNIFI_BOOT_MEDIA_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 }
+LINUX_NVME_LIST_SUBSYS_COMMAND = (
+    "/usr/sbin/nvme list-subsys -o json 2>/dev/null || "
+    "/usr/bin/nvme list-subsys -o json 2>/dev/null || true"
+)
 STABLE_SLOT_DETAIL_FIELDS = (
     "device_name",
     "smart_device_names",
@@ -1399,12 +1403,11 @@ class InventoryService:
             detail
             for detail in failure_details
             if detail.get("criticality") == "enrichment"
-            and str(detail.get("context") or "").startswith("sas_fabric")
         ]
         if outputs and enrichment_failures and len(enrichment_failures) == len(failures):
             affected_contexts = sorted(
                 {
-                    str(detail.get("context_label") or "SAS Fabric enrichment")
+                    str(detail.get("context_label") or "Storage Fabric enrichment")
                     for detail in enrichment_failures
                 }
             )
@@ -1413,11 +1416,11 @@ class InventoryService:
                 context_text = f"{context_text}, +{len(affected_contexts) - 3} more"
             return (
                 [
-                    "SAS Fabric enrichment probes had partial command failures; "
+                    "Storage Fabric enrichment probes had partial command failures; "
                     f"topology can still render, but {context_text} may be incomplete. "
                     "Debug output keeps the command, exit code, and stderr details."
                 ],
-                "SAS Fabric enrichment completed with partial command failures.",
+                "Storage Fabric enrichment completed with partial command failures.",
             )
 
         return (
@@ -1479,6 +1482,36 @@ class InventoryService:
             return {
                 "context": "sas_fabric_pci_location",
                 "context_label": "HBA PCI location corroboration",
+                "criticality": "enrichment",
+            }
+        if canonical_command == "lsscsi -g -t":
+            return {
+                "context": "storage_fabric_linux_scsi_transport",
+                "context_label": "Linux SCSI transport detail",
+                "criticality": "enrichment",
+            }
+        if canonical_command == "lsscsi -g":
+            return {
+                "context": "storage_fabric_linux_scsi_sg",
+                "context_label": "Linux SG device discovery",
+                "criticality": "enrichment",
+            }
+        if canonical_command == "lsblk -OJ":
+            return {
+                "context": "linux_block_inventory",
+                "context_label": "Linux block inventory",
+                "criticality": "inventory",
+            }
+        if canonical_command == "nvme list-subsys -o json":
+            return {
+                "context": "storage_fabric_linux_nvme_subsystems",
+                "context_label": "Linux NVMe subsystem detail",
+                "criticality": "enrichment",
+            }
+        if canonical_command.startswith("sg_ses join "):
+            return {
+                "context": "storage_fabric_sg_ses_join",
+                "context_label": "joined SG SES slot evidence",
                 "criticality": "enrichment",
             }
         unit_match = re.match(r"^mprutil -u (?P<unit>\d+) show (?P<subcommand>[a-z]+)$", canonical_command)
@@ -1648,6 +1681,22 @@ class InventoryService:
                 addresses.append(address)
         return addresses
 
+    def _linux_storage_enrichment_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
+        if self.system.truenas.platform not in {"scale", "linux"}:
+            return []
+        seen_commands = {canonicalize_ssh_command(item.command) for item in command_results}
+        commands: list[str] = []
+        if "lsblk -OJ" not in seen_commands:
+            commands.append(
+                "/usr/bin/lsblk --json --bytes --output "
+                "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,TRAN,HCTL,PKNAME,MOUNTPOINTS,FSTYPE,UUID,PARTUUID,LOG-SEC,PHY-SEC"
+            )
+        if "lsscsi -g -t" not in seen_commands:
+            commands.append("/usr/bin/lsscsi -g -t")
+        if "nvme list-subsys -o json" not in seen_commands:
+            commands.append(LINUX_NVME_LIST_SUBSYS_COMMAND)
+        return commands
+
     def _esxi_controller_diagnostic_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
         if self.system.truenas.platform != "esxi":
             return []
@@ -1789,6 +1838,9 @@ class InventoryService:
                     command_results.append(await self.ssh_probe.run_command("cat /sys/kernel/debug/gpio"))
                 for command in self._esxi_controller_diagnostic_commands(command_results):
                     command_results.append(await self.ssh_probe.run_command(command))
+                if any(result.ok for result in command_results):
+                    for command in self._linux_storage_enrichment_probe_commands(command_results):
+                        command_results.append(await self.ssh_probe.run_command(command))
             outputs = {item.command: item.stdout for item in command_results if item.ok}
             failure_messages, status_message = self._summarize_ssh_failures(command_results, outputs)
             failure_details = self._ssh_failure_details(command_results)
@@ -2941,6 +2993,15 @@ class InventoryService:
         has_profile = selected_profile is not None
         has_led_slots = any(slot.led_supported for slot in slots)
         has_platform_context = bool(platform_context)
+        has_linux_ses_slots = any(
+            slot.ssh_ses_device
+            or slot.ssh_ses_targets
+            or (
+                isinstance(slot.raw_status, dict)
+                and (slot.raw_status.get("ses_device") or slot.raw_status.get("ssh_ses_device"))
+            )
+            for slot in slots
+        )
 
         def cap(
             label: str,
@@ -3095,6 +3156,21 @@ class InventoryService:
                 diagnostics_summary = "CORE SAS Fabric diagnostics require SSH mprutil evidence."
             diagnostics_sources = ["mprutil", "pciconf", "dmidecode", "kernel events"]
             diagnostics_requirements = ["CORE SSH commands for read-only SAS Fabric evidence"]
+        elif platform in {"scale", "linux"} and has_linux_ses_slots:
+            diagnostics_status = "partial"
+            diagnostics_summary = (
+                "Linux SES fabric mapping can show SG enclosure paths and bay mapping; "
+                "HBA, expander, and kernel-event diagnostics remain CORE-specific."
+            )
+            diagnostics_sources = [
+                "lsblk --json",
+                "lsscsi -g -t",
+                "nvme list-subsys",
+                "sg_ses AES/EC",
+                "sg_ses --join --filter",
+                "inventory slot metadata",
+            ]
+            diagnostics_requirements = ["sg3_utils / sg_ses access for observed SG enclosure devices"]
         else:
             diagnostics_status = "unsupported"
             diagnostics_summary = "Deep SAS Fabric diagnostics are currently CORE-specific; this platform keeps transport clues in platform details and debug evidence."
@@ -5945,6 +6021,10 @@ class InventoryService:
             ec_result = await self._run_ssh_command(ec_command, host)
             if ec_result.ok:
                 outputs[ec_command] = ec_result.stdout
+            join_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "--join", "--filter", device])
+            join_result = await self._run_ssh_command(join_command, host)
+            if join_result.ok:
+                outputs[join_command] = join_result.stdout
 
             parsed = parse_ssh_outputs(outputs, self.settings.layout.slot_count, None, None)
             if not parsed.ses_enclosures:
@@ -6103,6 +6183,12 @@ class InventoryService:
             target["sas_device_type"] = ses_candidate.get("sas_device_type")
         if ses_candidate.get("attached_sas_address"):
             target["attached_sas_address"] = ses_candidate.get("attached_sas_address")
+        if ses_candidate.get("transport_protocol"):
+            target["transport_protocol"] = ses_candidate.get("transport_protocol")
+        if ses_candidate.get("phy_identifier"):
+            target["phy_identifier"] = ses_candidate.get("phy_identifier")
+        if ses_candidate.get("target_port_protocol"):
+            target["target_port_protocol"] = ses_candidate.get("target_port_protocol")
         for field in (
             "ses_predicted_failure",
             "ses_disabled",
@@ -6195,6 +6281,7 @@ class InventoryService:
             ses_selected_meta=InventoryService._merge_enclosure_meta(base.ses_selected_meta, overlay.ses_selected_meta),
             ses_enclosures=_merge_ses_enclosures([*base.ses_enclosures, *overlay.ses_enclosures]),
             linux_blockdevices=list(base.linux_blockdevices),
+            linux_scsi_devices=list(base.linux_scsi_devices) + list(overlay.linux_scsi_devices),
             linux_mdadm_arrays=dict(base.linux_mdadm_arrays),
             linux_nvme_subsystems=dict(base.linux_nvme_subsystems),
             ubntstorage_disks=list(base.ubntstorage_disks),
@@ -7097,6 +7184,97 @@ class InventoryService:
             )
         return records
 
+    @staticmethod
+    def _iter_linux_blockdevices(blockdevices: list[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+        for blockdevice in blockdevices:
+            if not isinstance(blockdevice, dict):
+                continue
+            yield blockdevice
+            children = blockdevice.get("children") if isinstance(blockdevice.get("children"), list) else []
+            yield from InventoryService._iter_linux_blockdevices(children)
+
+    @staticmethod
+    def _linux_blockdevice_summary(blockdevice: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(blockdevice, dict):
+            return None
+        fields = (
+            "name",
+            "kname",
+            "path",
+            "type",
+            "size",
+            "model",
+            "serial",
+            "wwn",
+            "tran",
+            "hctl",
+            "pkname",
+            "fstype",
+            "uuid",
+            "partuuid",
+            "log-sec",
+            "phy-sec",
+        )
+        return {field: blockdevice.get(field) for field in fields if blockdevice.get(field) not in (None, "", [])}
+
+    @staticmethod
+    def _linux_scsi_device_summary(device: Any | None) -> dict[str, Any] | None:
+        if device is None:
+            return None
+        fields = (
+            "hctl",
+            "device_type",
+            "vendor",
+            "model",
+            "revision",
+            "block_device",
+            "sg_device",
+            "transport",
+            "transport_address",
+        )
+        return {field: getattr(device, field, None) for field in fields if getattr(device, field, None) not in (None, "", [])}
+
+    @staticmethod
+    def _index_linux_blockdevices(ssh_data: ParsedSSHData) -> dict[str, dict[str, Any]]:
+        indexed: dict[str, dict[str, Any]] = {}
+        for blockdevice in InventoryService._iter_linux_blockdevices(ssh_data.linux_blockdevices):
+            for value in (
+                blockdevice.get("name"),
+                blockdevice.get("kname"),
+                blockdevice.get("path"),
+                blockdevice.get("hctl"),
+                blockdevice.get("serial"),
+                blockdevice.get("wwn"),
+                blockdevice.get("uuid"),
+                blockdevice.get("partuuid"),
+            ):
+                for key in normalize_lookup_keys(str(value) if value is not None else None):
+                    indexed.setdefault(key, blockdevice)
+        return indexed
+
+    @staticmethod
+    def _index_linux_scsi_devices(ssh_data: ParsedSSHData) -> dict[str, Any]:
+        indexed: dict[str, Any] = {}
+        for device in ssh_data.linux_scsi_devices:
+            for value in (
+                getattr(device, "hctl", None),
+                getattr(device, "block_device", None),
+                getattr(device, "sg_device", None),
+                getattr(device, "transport_address", None),
+                normalize_hex_identifier(getattr(device, "transport_address", None)),
+            ):
+                for key in normalize_lookup_keys(str(value) if value is not None else None):
+                    indexed.setdefault(key, device)
+        return indexed
+
+    @staticmethod
+    def _lookup_index_by_keys(indexed: dict[str, Any], keys: Iterable[str]) -> Any | None:
+        for key in keys:
+            match = indexed.get(key.lower())
+            if match is not None:
+                return match
+        return None
+
     def _build_linux_disk_records(self, ssh_data: ParsedSSHData) -> list[DiskRecord]:
         controllers: dict[str, dict[str, Any]] = {}
         ubntstorage_by_node: dict[str, dict[str, Any]] = {}
@@ -7620,6 +7798,8 @@ class InventoryService:
         smart_tests: dict[str, dict[str, Any]],
     ) -> list[DiskRecord]:
         records: list[DiskRecord] = []
+        linux_block_index = self._index_linux_blockdevices(ssh_data)
+        linux_scsi_index = self._index_linux_scsi_devices(ssh_data)
         for disk in disks:
             device_name = normalize_device_name(
                 disk.get("devname") or disk.get("name") or disk.get("device") or disk.get("disk")
@@ -7673,9 +7853,81 @@ class InventoryService:
 
             lookup_keys.update(build_lunid_aliases(disk.get("lunid"), self.system.truenas.platform))
 
+            linux_blockdevice = self._lookup_index_by_keys(linux_block_index, lookup_keys)
+            if linux_blockdevice is not None:
+                for value in (
+                    linux_blockdevice.get("name"),
+                    linux_blockdevice.get("kname"),
+                    linux_blockdevice.get("path"),
+                    linux_blockdevice.get("hctl"),
+                    linux_blockdevice.get("serial"),
+                    linux_blockdevice.get("wwn"),
+                ):
+                    lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+
+            linux_scsi_device = self._lookup_index_by_keys(linux_scsi_index, lookup_keys)
+            if linux_scsi_device is None and linux_blockdevice is not None:
+                linux_scsi_device = self._lookup_index_by_keys(
+                    linux_scsi_index,
+                    normalize_lookup_keys(str(linux_blockdevice.get("hctl")) if linux_blockdevice.get("hctl") is not None else None),
+                )
+            if linux_scsi_device is not None:
+                for value in (
+                    getattr(linux_scsi_device, "hctl", None),
+                    getattr(linux_scsi_device, "block_device", None),
+                    getattr(linux_scsi_device, "sg_device", None),
+                    getattr(linux_scsi_device, "transport_address", None),
+                    normalize_hex_identifier(getattr(linux_scsi_device, "transport_address", None)),
+                ):
+                    lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+
+            linux_block_summary = self._linux_blockdevice_summary(linux_blockdevice)
+            linux_scsi_summary = self._linux_scsi_device_summary(linux_scsi_device)
+            disk_raw = dict(disk)
+            if linux_block_summary:
+                disk_raw["linux_blockdevice"] = linux_block_summary
+            if linux_scsi_summary:
+                disk_raw["linux_scsi_device"] = linux_scsi_summary
+                disk_raw["sg_device"] = linux_scsi_summary.get("sg_device")
+                disk_raw["transport_protocol"] = linux_scsi_summary.get("transport")
+                disk_raw["transport_address"] = linux_scsi_summary.get("transport_address")
+            if linux_block_summary:
+                disk_raw["linux_transport"] = linux_block_summary.get("tran")
+                disk_raw["linux_hctl"] = linux_block_summary.get("hctl")
+
+            serial = serial or normalize_text((linux_block_summary or {}).get("serial"))
+            model = model or normalize_text((linux_block_summary or {}).get("model")) or normalize_text(
+                (linux_scsi_summary or {}).get("model")
+            )
+            if size_bytes is None and linux_block_summary:
+                size_bytes = parse_size_to_bytes(linux_block_summary.get("size"))
+            logical_block_size = logical_block_size or parse_size_to_bytes((linux_block_summary or {}).get("log-sec"))
+            physical_block_size = physical_block_size or parse_size_to_bytes((linux_block_summary or {}).get("phy-sec"))
+            bus = (
+                normalize_text(disk.get("bus"))
+                or normalize_text((linux_block_summary or {}).get("tran"))
+                or normalize_text((linux_scsi_summary or {}).get("transport"))
+            )
+            smart_devices = [
+                candidate
+                for candidate in dict.fromkeys(
+                    filter(
+                        None,
+                        [
+                            path_device_name,
+                            multipath_member,
+                            device_name,
+                            normalize_device_name((linux_block_summary or {}).get("path")),
+                            normalize_device_name((linux_block_summary or {}).get("name")),
+                            normalize_device_name((linux_scsi_summary or {}).get("block_device")),
+                        ],
+                    )
+                )
+            ]
+
             records.append(
                 DiskRecord(
-                    raw=disk,
+                    raw=disk_raw,
                     device_name=device_name,
                     path_device_name=path_device_name,
                     multipath_name=multipath_name,
@@ -7687,7 +7939,7 @@ class InventoryService:
                     health=health,
                     pool_name=pool_name,
                     lunid=normalize_text(disk.get("lunid")),
-                    bus=normalize_text(disk.get("bus")),
+                    bus=bus,
                     temperature_c=temperature_c,
                     last_smart_test_type=normalize_text(latest_test.get("description")) if latest_test else None,
                     last_smart_test_status=normalize_text(latest_test.get("status_verbose") or latest_test.get("status")) if latest_test else None,
@@ -7696,12 +7948,7 @@ class InventoryService:
                     physical_block_size=physical_block_size,
                     enclosure_id=enclosure_id,
                     slot=slot,
-                    smart_devices=[
-                        candidate
-                        for candidate in dict.fromkeys(
-                            filter(None, [path_device_name, multipath_member, device_name])
-                        )
-                    ],
+                    smart_devices=smart_devices,
                     lookup_keys=lookup_keys,
                 )
             )
@@ -8020,6 +8267,30 @@ class InventoryService:
             else:
                 led_reason = "LED control unavailable because this slot is missing SES controller metadata."
 
+        linux_block_summary = (
+            disk.raw.get("linux_blockdevice")
+            if disk and isinstance(disk.raw.get("linux_blockdevice"), dict)
+            else None
+        )
+        linux_scsi_summary = (
+            disk.raw.get("linux_scsi_device")
+            if disk and isinstance(disk.raw.get("linux_scsi_device"), dict)
+            else None
+        )
+        enriched_raw_status = dict(raw_slot_status)
+        if linux_block_summary:
+            enriched_raw_status["linux_blockdevice"] = linux_block_summary
+            enriched_raw_status["linux_transport"] = linux_block_summary.get("tran")
+            enriched_raw_status["linux_hctl"] = linux_block_summary.get("hctl")
+        if linux_scsi_summary:
+            enriched_raw_status["linux_scsi_device"] = linux_scsi_summary
+            enriched_raw_status["sg_device"] = linux_scsi_summary.get("sg_device")
+            enriched_raw_status["transport_protocol"] = (
+                normalize_text(enriched_raw_status.get("transport_protocol"))
+                or normalize_text(linux_scsi_summary.get("transport"))
+            )
+            enriched_raw_status["transport_address"] = linux_scsi_summary.get("transport_address")
+
         return SlotView(
             slot=slot,
             slot_label=f"{slot + self.settings.layout.slot_number_base:02d}",
@@ -8057,6 +8328,16 @@ class InventoryService:
             physical_block_size=disk.physical_block_size if disk else None,
             logical_unit_id=disk.lunid if disk else None,
             sas_address=normalize_text(raw_slot_status.get("sas_address_hint")),
+            attached_sas_address=normalize_text(raw_slot_status.get("attached_sas_address")),
+            transport_protocol=(
+                normalize_text(raw_slot_status.get("transport_protocol"))
+                or normalize_text((linux_scsi_summary or {}).get("transport"))
+                or normalize_text((linux_block_summary or {}).get("tran"))
+            ),
+            sg_device=normalize_text((linux_scsi_summary or {}).get("sg_device")) or ses_device,
+            scsi_hctl=normalize_text((linux_scsi_summary or {}).get("hctl")) or normalize_text((linux_block_summary or {}).get("hctl")),
+            phy_identifier=normalize_text(raw_slot_status.get("phy_identifier")),
+            target_port_protocol=normalize_text(raw_slot_status.get("target_port_protocol")),
             enclosure_identifier=normalize_text(raw_slot_status.get("descriptor")),
             led_supported=led_supported,
             led_backend=led_backend,
@@ -8100,7 +8381,7 @@ class InventoryService:
                     ],
                 )
             ).lower(),
-            raw_status=raw_slot_status,
+            raw_status=enriched_raw_status,
         )
 
     def _should_probe_unifi_gpio_debug(self, command_results: list[Any]) -> bool:

@@ -140,6 +140,7 @@
     setupProfile: document.getElementById("setup-profile"),
     setupMakeDefault: document.getElementById("setup-make-default"),
     setupPlatformHelp: document.getElementById("setup-platform-help"),
+    setupPlatformRequirements: document.getElementById("setup-platform-requirements"),
     setupTruenasHost: document.getElementById("setup-truenas-host"),
     setupVerifySsl: document.getElementById("setup-verify-ssl"),
     setupVerifySslHelp: document.getElementById("setup-verify-ssl-help"),
@@ -925,6 +926,12 @@
 
   function setupPlatformUsesBmcOnlyHost(platform = currentSetupPlatform()) {
     return String(platform || "").toLowerCase() === "ipmi";
+  }
+
+  function platformRequirements(platform = currentSetupPlatform()) {
+    const key = String(platform || "core").toLowerCase();
+    const requirements = state.platformDefaults?.[key]?.requirements;
+    return requirements && typeof requirements === "object" ? requirements : null;
   }
 
   function normalizeHaNode(rawNode) {
@@ -3362,6 +3369,10 @@
   }
 
   function platformSetupCopy(platform) {
+    const requirements = platformRequirements(platform);
+    if (requirements?.summary) {
+      return String(requirements.summary);
+    }
     switch (String(platform || "core").toLowerCase()) {
       case "scale":
         return "TrueNAS SCALE usually combines the middleware websocket path with Linux-side SSH enrichment for SMART detail, SES, and slot actions.";
@@ -3376,6 +3387,44 @@
       default:
         return "TrueNAS CORE usually wants an API key, with SSH as the optional fallback for enclosure mapping and LED control.";
     }
+  }
+
+  function renderSetupRequirementList(title, items, className) {
+    const rows = Array.isArray(items) ? items.filter(Boolean) : [];
+    if (!rows.length) {
+      return "";
+    }
+    return `
+      <section class="setup-requirement-group ${className}">
+        <h4>${escapeHtml(title)}</h4>
+        <ul>
+          ${rows.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+        </ul>
+      </section>
+    `;
+  }
+
+  function renderSetupPlatformRequirements() {
+    if (!elements.setupPlatformRequirements) {
+      return;
+    }
+    const requirements = platformRequirements();
+    if (!requirements) {
+      elements.setupPlatformRequirements.innerHTML = "";
+      return;
+    }
+    const groups = [
+      renderSetupRequirementList("Required", requirements.required, "is-required"),
+      renderSetupRequirementList("Optional", requirements.optional, "is-optional"),
+      renderSetupRequirementList("Unsupported", requirements.unsupported, "is-unsupported"),
+    ].filter(Boolean);
+    const guidance = String(requirements.guidance || "").trim();
+    elements.setupPlatformRequirements.innerHTML = `
+      <div class="setup-requirements-grid">
+        ${groups.join("")}
+      </div>
+      ${guidance ? `<p class="subtle action-note setup-requirements-guidance">${escapeHtml(guidance)}</p>` : ""}
+    `;
   }
 
   function recommendedSshUserForPlatform(platform = currentSetupPlatform()) {
@@ -3422,6 +3471,7 @@
       return;
     }
     elements.setupPlatformHelp.textContent = platformSetupCopy(elements.setupPlatform.value);
+    renderSetupPlatformRequirements();
   }
 
   function syncPlatformSpecificSetupFields() {

@@ -575,19 +575,28 @@ def build_sas_fabric_snapshot(
     fabric_warnings = list(warnings or [])
     alias_map = _sas_fabric_alias_map(aliases or [])
     selected_enclosure_keys = _selected_enclosure_keys(snapshot)
-    if system.truenas.platform != "core":
-        fabric_warnings.append("SAS Fabric topology is currently implemented for TrueNAS CORE source data only.")
-        return SasFabricSnapshot(
-            available=False,
-            system_id=system.id,
-            system_label=system.label,
-            platform=system.truenas.platform,
-            selected_enclosure_id=snapshot.selected_enclosure_id,
-            selected_enclosure_label=snapshot.selected_enclosure_label,
+    has_linux_ses_evidence = _snapshot_has_linux_ses_evidence(snapshot)
+    if (system.truenas.platform == "scale" and has_linux_ses_evidence) or (
+        system.truenas.platform == "linux" and has_linux_ses_evidence
+    ):
+        return _build_linux_ses_fabric_snapshot(
+            system=system,
+            snapshot=snapshot,
+            sources=sources,
             warnings=fabric_warnings,
-            sources=sources or {},
-            aliases=list(aliases or []),
-            raw={"command_failures": list(command_failures or [])},
+            command_failures=command_failures,
+            aliases=aliases,
+            alias_map=alias_map,
+        )
+    if system.truenas.platform != "core":
+        return _build_platform_storage_fabric_snapshot(
+            system=system,
+            snapshot=snapshot,
+            sources=sources,
+            warnings=fabric_warnings,
+            command_failures=command_failures,
+            aliases=aliases,
+            alias_map=alias_map,
         )
 
     nodes: dict[str, SasFabricNode] = {}
@@ -980,6 +989,851 @@ def build_sas_fabric_snapshot(
     )
 
 
+def _slot_storage_identity(slot: SlotView) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "serial": slot.serial,
+        "model": slot.model,
+        "size_bytes": slot.size_bytes,
+        "size_human": slot.size_human,
+        "gptid": slot.gptid,
+        "persistent_id_label": slot.persistent_id_label,
+        "vdev_class": slot.vdev_class,
+        "topology_label": slot.topology_label,
+        "logical_block_size": slot.logical_block_size,
+        "physical_block_size": slot.physical_block_size,
+        "logical_unit_id": slot.logical_unit_id,
+        "sas_address": slot.sas_address,
+        "enclosure_id": slot.enclosure_id,
+        "enclosure_label": slot.enclosure_label,
+        "enclosure_name": slot.enclosure_name,
+        "enclosure_identifier": slot.enclosure_identifier,
+        "smart_device_type": slot.smart_device_type,
+    }
+    if slot.smart_device_names:
+        values["smart_device_names"] = list(slot.smart_device_names)
+    raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
+    for key in (
+        "sas_device_type",
+        "transport_address",
+        "linux_hctl",
+        "linux_transport",
+        "ses_slot_number",
+        "ses_disabled",
+        "ses_do_not_remove",
+        "ses_fault_requested",
+        "ses_fault_sensed",
+        "ses_predicted_failure",
+    ):
+        if key in raw_status:
+            values[key] = raw_status.get(key)
+    return {
+        key: value
+        for key, value in values.items()
+        if value is not None and value != "" and value != [] and value != {}
+    }
+
+
+def _build_linux_ses_fabric_snapshot(
+    *,
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    sources: dict[str, SourceStatus] | None = None,
+    warnings: list[str] | None = None,
+    command_failures: list[dict[str, Any]] | None = None,
+    aliases: list[SasFabricAlias] | None = None,
+    alias_map: dict[str, SasFabricAlias] | None = None,
+) -> SasFabricSnapshot:
+    fabric_warnings = list(warnings or [])
+    aliases_by_id = alias_map or _sas_fabric_alias_map(aliases or [])
+    slots_with_ses = [
+        slot
+        for slot in snapshot.slots
+        if _slot_ses_devices(slot)
+    ]
+    platform_label = "TrueNAS SCALE" if system.truenas.platform == "scale" else "Linux"
+    if not slots_with_ses:
+        fabric_warnings.append(
+            f"No {_linux_ses_platform_phrase(platform_label)} slot evidence is available for this selection. "
+            "Run stable lsblk --json, lsscsi -g -t, and sg_ses AES/EC/join probes before rendering a SCALE/Linux Storage Fabric map."
+        )
+        return SasFabricSnapshot(
+            available=False,
+            system_id=system.id,
+            system_label=system.label,
+            platform=system.truenas.platform,
+            selected_enclosure_id=snapshot.selected_enclosure_id,
+            selected_enclosure_label=snapshot.selected_enclosure_label,
+            warnings=fabric_warnings,
+            sources=sources or {},
+            aliases=list(aliases or []),
+            raw={
+                "fabric_domain": "storage_fabric",
+                "fabric_kind": "linux_ses",
+                "command_failures": list(command_failures or []),
+            },
+        )
+
+    nodes: dict[str, SasFabricNode] = {}
+    links: dict[str, SasFabricLink] = {}
+    traces: dict[str, SasFabricTrace] = {}
+    selected_slots = _snapshot_slot_numbers(snapshot.slots)
+    selected_disk_slots = _snapshot_disk_slot_numbers(snapshot.slots)
+    ses_slots: dict[str, list[SlotView]] = defaultdict(list)
+    for slot in slots_with_ses:
+        primary_ses = _slot_primary_ses_device(slot)
+        if primary_ses:
+            ses_slots[primary_ses].append(slot)
+
+    controller_id = "controller:linux-ses"
+    controller_name = "linux-ses"
+    ses_device_count = len(ses_slots)
+    add_node(
+        nodes,
+        SasFabricNode(
+            id="host",
+            kind="host",
+            label=system.label or system.id,
+            raw_id=system.id,
+            metrics={
+                "slot_count": len(snapshot.slots),
+                "selected_disk_count": len(selected_disk_slots),
+                "fabric_domain": "storage_fabric",
+                "fabric_kind": "linux_ses",
+            },
+            evidence=["inventory snapshot"],
+            raw={"platform": system.truenas.platform, "fabric_domain": "storage_fabric", "fabric_kind": "linux_ses"},
+        ),
+    )
+    add_node(
+        nodes,
+        SasFabricNode(
+            id=controller_id,
+            kind="controller",
+            label="Linux SES",
+            raw_id="lsscsi -g -t / sg_ses",
+            status="online",
+            related_slots=selected_slots,
+            metrics={
+                "path_counts": {"mapped": len(slots_with_ses)},
+                "ses_device_count": ses_device_count,
+                "selected_bay_count": len(selected_slots),
+                "selected_disk_count": len(selected_disk_slots),
+                "fabric_kind": "linux_ses",
+            },
+            evidence=["lsscsi -g", "lsscsi -g -t", "sg_ses AES/EC", "sg_ses --join --filter"],
+            raw={
+                "device": "lsscsi -g -t",
+                "board": f"{platform_label} Linux SES",
+                "path_counts": {"mapped": len(slots_with_ses)},
+                "source": "linux_ses",
+                "fabric_domain": "storage_fabric",
+                "fabric_kind": "linux_ses",
+            },
+        ),
+    )
+    add_link(
+        links,
+        "host",
+        controller_id,
+        "host-controller",
+        related_slots=selected_slots,
+        evidence=["inventory snapshot"],
+    )
+
+    paths: list[dict[str, Any]] = []
+    enclosures_by_ses: dict[str, str] = {}
+    for ses_device, slots in sorted(ses_slots.items(), key=lambda item: _linux_ses_sort_key(item[0])):
+        ses_token = _object_id_token(ses_device)
+        ses_slot_numbers = _dedupe_ints(slot.slot for slot in slots)
+        sample_slot = slots[0]
+        path_id = f"path:{controller_name}:{ses_token}"
+        ses_id = f"ses:{ses_token}"
+        enclosures_by_ses[ses_device] = ses_id
+        path = {
+            "id": path_id,
+            "controller": controller_name,
+            "state": "mapped",
+            "count": len(ses_slot_numbers),
+            "slots": ses_slot_numbers,
+            "label": f"{ses_device} mapped",
+            "ses_device": ses_device,
+            "source": "linux_ses",
+            "fabric_kind": "linux_ses",
+        }
+        paths.append(path)
+        add_node(
+            nodes,
+            SasFabricNode(
+                id=path_id,
+                kind="path",
+                label=f"{ses_device} mapped",
+                status="mapped",
+                controller_id=controller_id,
+                related_slots=ses_slot_numbers,
+                metrics={"count": len(ses_slot_numbers), "ses_device": ses_device},
+                evidence=["lsscsi -g", "lsscsi -g -t", "sg_ses AES/EC", "sg_ses --join --filter"],
+                raw={"ses_device": ses_device, "source": "linux_ses", "fabric_domain": "storage_fabric", "fabric_kind": "linux_ses"},
+            ),
+        )
+        add_node(
+            nodes,
+            SasFabricNode(
+                id=ses_id,
+                kind="ses-enclosure",
+                label=snapshot.selected_enclosure_label or sample_slot.enclosure_label or ses_device,
+                raw_id=ses_device,
+                controller_id=controller_id,
+                related_slots=ses_slot_numbers,
+                metrics={
+                    "slot_count": len(ses_slot_numbers),
+                    "ses_device": ses_device,
+                    "selected_enclosure": True,
+                    "selected_disk_count": len([slot for slot in slots if _slot_has_disk(slot)]),
+                },
+                evidence=["sg_ses AES/EC", "sg_ses --join --filter"],
+                raw={
+                    "id": ses_id,
+                    "ses_device": ses_device,
+                    "enclosure_id": sample_slot.enclosure_id or snapshot.selected_enclosure_id,
+                    "enclosure_label": sample_slot.enclosure_label or snapshot.selected_enclosure_label,
+                    "enclosure_name": sample_slot.enclosure_name or snapshot.selected_enclosure_name,
+                    "source": "linux_ses",
+                    "fabric_domain": "storage_fabric",
+                    "fabric_kind": "linux_ses",
+                },
+            ),
+        )
+        add_link(
+            links,
+            controller_id,
+            path_id,
+            "controller-path",
+            status="mapped",
+            related_slots=ses_slot_numbers,
+            evidence=["lsscsi -g", "lsscsi -g -t"],
+        )
+        add_link(
+            links,
+            path_id,
+            ses_id,
+            "path-ses-enclosure",
+            status="mapped",
+            related_slots=ses_slot_numbers,
+            evidence=["sg_ses AES/EC", "sg_ses --join --filter"],
+        )
+        traces[path_id] = SasFabricTrace(
+            id=path_id,
+            label=f"{ses_device} mapped",
+            kind="path",
+            node_ids=["host", controller_id, path_id, ses_id],
+            link_ids=[
+                _link_id("host", controller_id, "host-controller"),
+                _link_id(controller_id, path_id, "controller-path"),
+                _link_id(path_id, ses_id, "path-ses-enclosure"),
+            ],
+            slots=ses_slot_numbers,
+            metrics={"count": len(ses_slot_numbers), "state": "mapped", "ses_device": ses_device},
+            evidence=["lsscsi -g", "lsscsi -g -t", "sg_ses AES/EC", "sg_ses --join --filter"],
+        )
+
+    backplane_zones = _backplane_zones_for_slots(snapshot.slots)
+    for zone in backplane_zones.values():
+        add_node(
+            nodes,
+            SasFabricNode(
+                id=zone["id"],
+                kind="backplane",
+                label=zone["label"],
+                related_slots=zone["slots"],
+                metrics={
+                    "zone": zone["index"] + 1,
+                    "slot_range": zone["range"],
+                    "slot_count": len(zone["slots"]),
+                },
+                evidence=["profile slot layout"],
+                raw=zone,
+            ),
+        )
+
+    for slot in snapshot.slots:
+        slot_identity = _slot_storage_identity(slot)
+        bay_id = f"bay:{slot.slot}"
+        ses_device = _slot_primary_ses_device(slot)
+        ses_id = enclosures_by_ses.get(ses_device or "")
+        path_id = f"path:{controller_name}:{_object_id_token(ses_device)}" if ses_device else None
+        bay_related_nodes = _dedupe_strings(["host", controller_id, *( [path_id] if path_id else [] ), *( [ses_id] if ses_id else [] ), bay_id])
+        bay_related_links = [
+            _link_id("host", controller_id, "host-controller"),
+            *([_link_id(controller_id, path_id, "controller-path")] if path_id else []),
+            *([_link_id(path_id, ses_id, "path-ses-enclosure")] if path_id and ses_id else []),
+        ]
+        backplane_zone = backplane_zones.get(slot.slot)
+        add_node(
+            nodes,
+            SasFabricNode(
+                id=bay_id,
+                kind="bay",
+                label=f"Bay {slot.slot:02d}",
+                slot=slot.slot,
+                status=slot.state.value if hasattr(slot.state, "value") else str(slot.state),
+                related_slots=[slot.slot],
+                metrics={
+                    "present": slot.present,
+                    "pool_name": slot.pool_name,
+                    "vdev_name": slot.vdev_name,
+                    "device_name": slot.device_name,
+                    "health": slot.health,
+                    "sas_address": slot.sas_address,
+                    "attached_sas_address": getattr(slot, "attached_sas_address", None),
+                    "transport_protocol": getattr(slot, "transport_protocol", None),
+                    "sg_device": getattr(slot, "sg_device", None),
+                    "scsi_hctl": getattr(slot, "scsi_hctl", None),
+                    "phy_identifier": getattr(slot, "phy_identifier", None),
+                    "target_port_protocol": getattr(slot, "target_port_protocol", None),
+                    "ses_device": ses_device,
+                    "ses_element_id": slot.ssh_ses_element_id,
+                    **slot_identity,
+                },
+                evidence=["inventory snapshot", "lsblk --json", "lsscsi -g -t", "sg_ses AES/EC", "sg_ses --join --filter"],
+                raw={
+                    **slot_identity,
+                    "ses_device": ses_device,
+                    "ses_element_id": slot.ssh_ses_element_id,
+                    "ses_targets": list(slot.ssh_ses_targets),
+                    "sg_device": getattr(slot, "sg_device", None),
+                    "scsi_hctl": getattr(slot, "scsi_hctl", None),
+                    "transport_protocol": getattr(slot, "transport_protocol", None),
+                    "attached_sas_address": getattr(slot, "attached_sas_address", None),
+                    "phy_identifier": getattr(slot, "phy_identifier", None),
+                    "target_port_protocol": getattr(slot, "target_port_protocol", None),
+                    "linux_blockdevice": slot.raw_status.get("linux_blockdevice") if isinstance(slot.raw_status, dict) else None,
+                    "linux_scsi_device": slot.raw_status.get("linux_scsi_device") if isinstance(slot.raw_status, dict) else None,
+                    "mapping_source": slot.mapping_source,
+                    "source": "linux_ses",
+                    "fabric_domain": "storage_fabric",
+                    "fabric_kind": "linux_ses",
+                },
+            ),
+        )
+        if backplane_zone:
+            backplane_link = add_link(
+                links,
+                backplane_zone["id"],
+                bay_id,
+                "backplane-bay",
+                slot=slot.slot,
+                related_slots=[slot.slot],
+                evidence=["profile slot layout"],
+            )
+            bay_related_nodes.append(backplane_zone["id"])
+            bay_related_links.append(backplane_link.id)
+        if ses_id:
+            ses_link = add_link(
+                links,
+                ses_id,
+                bay_id,
+                "ses-bay",
+                slot=slot.slot,
+                related_slots=[slot.slot],
+                evidence=["sg_ses AES/EC"],
+            )
+            bay_related_links.append(ses_link.id)
+        if slot.pool_name:
+            pool_id = f"pool:{slot.pool_name}"
+            add_node(nodes, SasFabricNode(id=pool_id, kind="pool", label=slot.pool_name, related_slots=[slot.slot]))
+            link = add_link(links, bay_id, pool_id, "bay-pool", slot=slot.slot, related_slots=[slot.slot])
+            bay_related_nodes.append(pool_id)
+            bay_related_links.append(link.id)
+        if slot.vdev_name:
+            vdev_id = f"vdev:{slot.vdev_name}"
+            add_node(nodes, SasFabricNode(id=vdev_id, kind="vdev", label=slot.vdev_name, related_slots=[slot.slot]))
+            target_id = f"pool:{slot.pool_name}" if slot.pool_name else bay_id
+            link = add_link(links, target_id, vdev_id, "pool-vdev", slot=slot.slot, related_slots=[slot.slot])
+            bay_related_nodes.append(vdev_id)
+            bay_related_links.append(link.id)
+        traces[bay_id] = SasFabricTrace(
+            id=bay_id,
+            label=f"Bay {slot.slot:02d}",
+            kind="bay",
+            node_ids=_dedupe_strings(bay_related_nodes),
+            link_ids=_dedupe_strings(bay_related_links),
+            slots=[slot.slot],
+            metrics={
+                "device_name": slot.device_name,
+                "pool_name": slot.pool_name,
+                "vdev_name": slot.vdev_name,
+                "fabric_kind": "linux_ses",
+                **slot_identity,
+                "path_states": [
+                    {
+                        "controller": controller_name,
+                        "state": "mapped" if ses_device else "unmapped",
+                        "device_name": slot.device_name,
+                        "pool_name": slot.pool_name,
+                        "vdev_name": slot.vdev_name,
+                        "ses_device": ses_device,
+                        "sg_device": getattr(slot, "sg_device", None),
+                        "scsi_hctl": getattr(slot, "scsi_hctl", None),
+                        "transport_protocol": getattr(slot, "transport_protocol", None),
+                        "target_port_protocol": getattr(slot, "target_port_protocol", None),
+                        "attached_sas_address": getattr(slot, "attached_sas_address", None),
+                        "phy_identifier": getattr(slot, "phy_identifier", None),
+                        "path_id": path_id,
+                        **slot_identity,
+                    }
+                ],
+                "mpr_devices": [],
+                "ses_device": ses_device,
+                "ses_element_id": slot.ssh_ses_element_id,
+            },
+            evidence=["inventory snapshot", "lsblk --json", "lsscsi -g -t", "sg_ses AES/EC", "sg_ses --join --filter"],
+        )
+
+    controllers = [
+        {
+            "id": controller_id,
+            "name": controller_name,
+            "device": "lsscsi -g -t",
+            "board": f"{platform_label} Linux SES",
+            "path_counts": {"mapped": len(slots_with_ses)},
+            "related_slots": selected_slots,
+            "source": "linux_ses",
+            "fabric_kind": "linux_ses",
+        }
+    ]
+    _apply_sas_fabric_aliases(
+        nodes=nodes,
+        traces=traces,
+        controllers=controllers,
+        paths=paths,
+        aliases=aliases_by_id,
+    )
+    enclosures = [
+        _node_raw_for_payload(node)
+        for node in nodes.values()
+        if node.kind == "ses-enclosure"
+    ]
+    fabric_warnings.append(
+        f"{platform_label} Storage Fabric map is built from Linux block, SCSI transport, and SES slot evidence. "
+        "HBA and expander hop detail is not exposed by this Linux SES evidence."
+    )
+    return SasFabricSnapshot(
+        available=True,
+        system_id=system.id,
+        system_label=system.label,
+        platform=system.truenas.platform,
+        selected_enclosure_id=snapshot.selected_enclosure_id,
+        selected_enclosure_label=snapshot.selected_enclosure_label,
+        nodes=sorted(nodes.values(), key=lambda node: (node.kind, node.id)),
+        links=sorted(links.values(), key=lambda link: link.id),
+        traces=sorted(traces.values(), key=lambda trace: trace.id),
+        controllers=controllers,
+        expanders=[],
+        enclosures=sorted(enclosures, key=lambda item: str(item.get("id") or "")),
+        paths=paths,
+        aliases=list(aliases_by_id.values()),
+        warnings=fabric_warnings,
+        sources=sources or {},
+        raw={
+            "fabric_domain": "storage_fabric",
+            "fabric_kind": "linux_ses",
+            "ses_devices": sorted(ses_slots),
+            "selected_bay_slots": selected_slots,
+            "selected_disk_slots": selected_disk_slots,
+            "command_failures": list(command_failures or []),
+        },
+    )
+
+
+def _build_platform_storage_fabric_snapshot(
+    *,
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    sources: dict[str, SourceStatus] | None = None,
+    warnings: list[str] | None = None,
+    command_failures: list[dict[str, Any]] | None = None,
+    aliases: list[SasFabricAlias] | None = None,
+    alias_map: dict[str, SasFabricAlias] | None = None,
+) -> SasFabricSnapshot:
+    fabric_warnings = list(warnings or [])
+    aliases_by_id = alias_map or _sas_fabric_alias_map(aliases or [])
+    platform = normalize_text(system.truenas.platform).lower()
+    platform_label = _platform_label(platform)
+    fabric_kind = _storage_fabric_kind(platform)
+    evidence_slots = [slot for slot in snapshot.slots if _slot_has_storage_fabric_evidence(slot)]
+
+    if not evidence_slots:
+        fabric_warnings.append(
+            f"No Storage Fabric evidence is available for {platform_label}. "
+            "This selection needs platform inventory, slot, block-device, controller, or BMC evidence before a graph can render."
+        )
+        return SasFabricSnapshot(
+            available=False,
+            system_id=system.id,
+            system_label=system.label,
+            platform=system.truenas.platform,
+            selected_enclosure_id=snapshot.selected_enclosure_id,
+            selected_enclosure_label=snapshot.selected_enclosure_label,
+            warnings=fabric_warnings,
+            sources=sources or {},
+            aliases=list(aliases or []),
+            raw={
+                "fabric_domain": "storage_fabric",
+                "fabric_kind": fabric_kind,
+                "command_failures": list(command_failures or []),
+            },
+        )
+
+    nodes: dict[str, SasFabricNode] = {}
+    links: dict[str, SasFabricLink] = {}
+    traces: dict[str, SasFabricTrace] = {}
+    selected_slots = _snapshot_slot_numbers(snapshot.slots)
+    selected_disk_slots = _snapshot_disk_slot_numbers(snapshot.slots)
+    add_node(
+        nodes,
+        SasFabricNode(
+            id="host",
+            kind="host",
+            label=system.label or system.id,
+            raw_id=system.id,
+            metrics={
+                "slot_count": len(snapshot.slots),
+                "selected_disk_count": len(selected_disk_slots),
+                "fabric_domain": "storage_fabric",
+                "fabric_kind": fabric_kind,
+            },
+            evidence=["inventory snapshot"],
+            raw={"platform": system.truenas.platform, "fabric_kind": fabric_kind},
+        ),
+    )
+
+    controllers_by_name: dict[str, dict[str, Any]] = {}
+    paths_by_id: dict[str, dict[str, Any]] = {}
+    enclosure_nodes: dict[str, SasFabricNode] = {}
+    backplane_zones = _backplane_zones_for_slots(snapshot.slots)
+    for zone in backplane_zones.values():
+        add_node(
+            nodes,
+            SasFabricNode(
+                id=zone["id"],
+                kind="backplane",
+                label=zone["label"],
+                related_slots=zone["slots"],
+                metrics={
+                    "zone": zone["index"] + 1,
+                    "slot_range": zone["range"],
+                    "slot_count": len(zone["slots"]),
+                },
+                evidence=["profile slot layout"],
+                raw=zone,
+            ),
+        )
+
+    for slot in evidence_slots:
+        raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
+        route = _storage_fabric_route_for_slot(
+            system=system,
+            snapshot=snapshot,
+            slot=slot,
+            fabric_kind=fabric_kind,
+            platform_label=platform_label,
+        )
+        controller_id = route["controller_id"]
+        controller_name = route["controller_name"]
+        path_id = route["path_id"]
+        enclosure_id = route["enclosure_id"]
+        slot_numbers = [slot.slot]
+        controller_slots = controllers_by_name.setdefault(
+            controller_name,
+            {
+                "id": controller_id,
+                "name": controller_name,
+                "device": route.get("controller_device"),
+                "board": route.get("controller_label"),
+                "path_counts": Counter(),
+                "related_slots": [],
+                "source": route.get("source"),
+                "fabric_kind": fabric_kind,
+            },
+        )
+        controller_slots["path_counts"][route["path_state"]] += 1
+        controller_slots["related_slots"] = _dedupe_ints([*controller_slots["related_slots"], slot.slot])
+        add_node(
+            nodes,
+            SasFabricNode(
+                id=controller_id,
+                kind="controller",
+                label=route["controller_label"],
+                raw_id=route.get("controller_device"),
+                status=route["controller_status"],
+                related_slots=slot_numbers,
+                metrics={
+                    "path_counts": dict(controller_slots["path_counts"]),
+                    "fabric_kind": fabric_kind,
+                    "source": route.get("source"),
+                },
+                evidence=route["controller_evidence"],
+                raw={
+                    "device": route.get("controller_device"),
+                    "board": route["controller_label"],
+                    "source": route.get("source"),
+                    "fabric_kind": fabric_kind,
+                    **route.get("controller_raw", {}),
+                },
+            ),
+        )
+        add_link(
+            links,
+            "host",
+            controller_id,
+            "host-controller",
+            related_slots=slot_numbers,
+            evidence=["inventory snapshot"],
+        )
+
+        path = paths_by_id.setdefault(
+            path_id,
+            {
+                "id": path_id,
+                "controller": controller_name,
+                "state": route["path_state"],
+                "count": 0,
+                "slots": [],
+                "label": route["path_label"],
+                "source": route.get("source"),
+                "fabric_kind": fabric_kind,
+                "path_type": route.get("path_type"),
+            },
+        )
+        path["count"] += 1
+        path["slots"] = _dedupe_ints([*path["slots"], slot.slot])
+        add_node(
+            nodes,
+            SasFabricNode(
+                id=path_id,
+                kind="path",
+                label=route["path_label"],
+                status=route["path_state"],
+                controller_id=controller_id,
+                related_slots=slot_numbers,
+                metrics={
+                    "count": path["count"],
+                    "path_type": route.get("path_type"),
+                    "fabric_kind": fabric_kind,
+                },
+                evidence=route["path_evidence"],
+                raw=route["path_raw"],
+            ),
+        )
+        add_link(
+            links,
+            controller_id,
+            path_id,
+            "controller-path",
+            status=route["path_state"],
+            related_slots=slot_numbers,
+            evidence=route["path_evidence"],
+        )
+
+        enclosure_node = add_node(
+            nodes,
+            SasFabricNode(
+                id=enclosure_id,
+                kind=route["enclosure_kind"],
+                label=route["enclosure_label"],
+                raw_id=route.get("enclosure_raw_id"),
+                controller_id=controller_id,
+                related_slots=slot_numbers,
+                metrics={
+                    "slot_count": 1,
+                    "selected_enclosure": True,
+                    "fabric_kind": fabric_kind,
+                    "source": route.get("source"),
+                },
+                evidence=route["enclosure_evidence"],
+                raw=route["enclosure_raw"],
+            ),
+        )
+        enclosure_node.metrics["slot_count"] = len(enclosure_node.related_slots)
+        enclosure_nodes[enclosure_id] = enclosure_node
+        add_link(
+            links,
+            path_id,
+            enclosure_id,
+            "path-storage-enclosure",
+            status=route["path_state"],
+            related_slots=slot_numbers,
+            evidence=route["enclosure_evidence"],
+        )
+
+        bay_id = f"bay:{slot.slot}"
+        backplane_zone = backplane_zones.get(slot.slot)
+        bay_related_nodes = _dedupe_strings(
+            [
+                "host",
+                controller_id,
+                path_id,
+                enclosure_id,
+                *( [backplane_zone["id"]] if backplane_zone else [] ),
+                bay_id,
+            ]
+        )
+        bay_related_links = [
+            _link_id("host", controller_id, "host-controller"),
+            _link_id(controller_id, path_id, "controller-path"),
+            _link_id(path_id, enclosure_id, "path-storage-enclosure"),
+        ]
+        add_node(
+            nodes,
+            SasFabricNode(
+                id=bay_id,
+                kind="bay",
+                label=f"Bay {slot.slot:02d}",
+                slot=slot.slot,
+                status=_slot_state_text(slot),
+                related_slots=slot_numbers,
+                metrics={
+                    "present": slot.present,
+                    "pool_name": slot.pool_name,
+                    "vdev_name": slot.vdev_name,
+                    "device_name": slot.device_name,
+                    "health": slot.health,
+                    "transport_protocol": raw_status.get("transport_protocol") or raw_status.get("esxi_transport"),
+                    "fabric_kind": fabric_kind,
+                },
+                evidence=["inventory snapshot"],
+                raw={
+                    "source": route.get("source"),
+                    "fabric_kind": fabric_kind,
+                    "operator_context": dict(slot.operator_context or {}),
+                    **(slot.raw_status if isinstance(slot.raw_status, dict) else {}),
+                },
+            ),
+        )
+        if backplane_zone:
+            backplane_link = add_link(
+                links,
+                backplane_zone["id"],
+                bay_id,
+                "backplane-bay",
+                slot=slot.slot,
+                related_slots=slot_numbers,
+                evidence=["profile slot layout"],
+            )
+            bay_related_links.append(backplane_link.id)
+        enclosure_link = add_link(
+            links,
+            enclosure_id,
+            bay_id,
+            "storage-enclosure-bay",
+            slot=slot.slot,
+            related_slots=slot_numbers,
+            evidence=route["enclosure_evidence"],
+        )
+        bay_related_links.append(enclosure_link.id)
+
+        if slot.pool_name:
+            pool_id = f"pool:{_object_id_token(slot.pool_name)}"
+            add_node(nodes, SasFabricNode(id=pool_id, kind="pool", label=slot.pool_name, related_slots=slot_numbers))
+            link = add_link(links, bay_id, pool_id, "bay-pool", slot=slot.slot, related_slots=slot_numbers)
+            bay_related_nodes.append(pool_id)
+            bay_related_links.append(link.id)
+        if slot.vdev_name:
+            vdev_id = f"vdev:{_object_id_token(slot.vdev_name)}"
+            add_node(nodes, SasFabricNode(id=vdev_id, kind="vdev", label=slot.vdev_name, related_slots=slot_numbers))
+            target_id = f"pool:{_object_id_token(slot.pool_name)}" if slot.pool_name else bay_id
+            link = add_link(links, target_id, vdev_id, "pool-vdev", slot=slot.slot, related_slots=slot_numbers)
+            bay_related_nodes.append(vdev_id)
+            bay_related_links.append(link.id)
+
+        traces[bay_id] = SasFabricTrace(
+            id=bay_id,
+            label=f"Bay {slot.slot:02d}",
+            kind="bay",
+            node_ids=_dedupe_strings(bay_related_nodes),
+            link_ids=_dedupe_strings(bay_related_links),
+            slots=slot_numbers,
+            metrics={
+                "device_name": slot.device_name,
+                "pool_name": slot.pool_name,
+                "vdev_name": slot.vdev_name,
+                "path_states": [
+                    {
+                        "controller": controller_name,
+                        "state": route["path_state"],
+                        "device_name": slot.device_name,
+                        "path_id": path_id,
+                        "source": route.get("source"),
+                        "path_type": route.get("path_type"),
+                    }
+                ],
+                "mpr_devices": [],
+                "fabric_kind": fabric_kind,
+            },
+            evidence=route["path_evidence"],
+        )
+
+    for path in paths_by_id.values():
+        traces[path["id"]] = SasFabricTrace(
+            id=path["id"],
+            label=path["label"],
+            kind="path",
+            node_ids=_dedupe_strings(["host", f"controller:{path['controller']}", path["id"]]),
+            link_ids=[
+                _link_id("host", f"controller:{path['controller']}", "host-controller"),
+                _link_id(f"controller:{path['controller']}", path["id"], "controller-path"),
+            ],
+            slots=path["slots"],
+            metrics={
+                "count": path["count"],
+                "state": path["state"],
+                "source": path.get("source"),
+                "fabric_kind": fabric_kind,
+            },
+            evidence=["inventory snapshot"],
+        )
+
+    controllers = []
+    for controller in controllers_by_name.values():
+        controller["path_counts"] = dict(controller["path_counts"])
+        controllers.append(controller)
+    paths = sorted(paths_by_id.values(), key=lambda item: (str(item.get("controller") or ""), str(item.get("label") or "")))
+    _apply_sas_fabric_aliases(
+        nodes=nodes,
+        traces=traces,
+        controllers=controllers,
+        paths=paths,
+        aliases=aliases_by_id,
+    )
+    enclosures = [_node_raw_for_payload(node) for node in enclosure_nodes.values()]
+    fabric_warnings.append(_storage_fabric_scope_warning(platform_label, fabric_kind))
+    return SasFabricSnapshot(
+        available=True,
+        system_id=system.id,
+        system_label=system.label,
+        platform=system.truenas.platform,
+        selected_enclosure_id=snapshot.selected_enclosure_id,
+        selected_enclosure_label=snapshot.selected_enclosure_label,
+        nodes=sorted(nodes.values(), key=lambda node: (node.kind, node.id)),
+        links=sorted(links.values(), key=lambda link: link.id),
+        traces=sorted(traces.values(), key=lambda trace: trace.id),
+        controllers=sorted(controllers, key=lambda item: str(item.get("name") or "")),
+        expanders=[],
+        enclosures=sorted(enclosures, key=lambda item: str(item.get("id") or "")),
+        paths=paths,
+        aliases=list(aliases_by_id.values()),
+        warnings=fabric_warnings,
+        sources=sources or {},
+        raw={
+            "fabric_domain": "storage_fabric",
+            "fabric_kind": fabric_kind,
+            "selected_bay_slots": selected_slots,
+            "selected_disk_slots": selected_disk_slots,
+            "command_failures": list(command_failures or []),
+        },
+    )
+
+
 def normalize_path_state(value: str | None) -> str:
     state = (value or "unknown").strip().lower()
     if "active" in state:
@@ -1169,16 +2023,433 @@ def _path_counts_from_slots(slots: list[SlotView]) -> tuple[dict[str, Counter[st
 def _ses_devices_by_slot(slots: list[SlotView]) -> dict[int, list[str]]:
     devices: dict[int, list[str]] = {}
     for slot in slots:
-        candidates: list[str] = []
-        if slot.ssh_ses_device:
-            candidates.append(slot.ssh_ses_device)
-        for target in slot.ssh_ses_targets:
-            ses_device = target.get("ses_device") if isinstance(target, dict) else None
-            if isinstance(ses_device, str) and ses_device:
-                candidates.append(ses_device)
+        candidates = _slot_ses_devices(slot)
         if candidates:
-            devices[slot.slot] = _dedupe_strings(candidates)
+            devices[slot.slot] = candidates
     return devices
+
+
+def _slot_ses_devices(slot: SlotView) -> list[str]:
+    raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
+    candidates: list[str] = []
+    if slot.ssh_ses_device:
+        candidates.append(slot.ssh_ses_device)
+    for target in slot.ssh_ses_targets:
+        ses_device = target.get("ses_device") if isinstance(target, dict) else None
+        if isinstance(ses_device, str) and ses_device:
+            candidates.append(ses_device)
+    for key in ("ses_device", "ssh_ses_device"):
+        value = raw_status.get(key)
+        if isinstance(value, str) and value:
+            candidates.append(value)
+    return _dedupe_strings(candidates)
+
+
+def _slot_primary_ses_device(slot: SlotView) -> str | None:
+    devices = _slot_ses_devices(slot)
+    return devices[0] if devices else None
+
+
+def _snapshot_has_linux_ses_evidence(snapshot: InventorySnapshot) -> bool:
+    return any(_slot_ses_devices(slot) for slot in snapshot.slots)
+
+
+def _linux_ses_platform_phrase(platform_label: str) -> str:
+    return "Linux SES" if platform_label.strip().lower() == "linux" else f"{platform_label} Linux SES"
+
+
+def _platform_label(platform: str | None) -> str:
+    normalized = normalize_text(platform).lower()
+    return {
+        "core": "TrueNAS CORE",
+        "scale": "TrueNAS SCALE",
+        "quantastor": "Quantastor",
+        "linux": "Linux",
+        "esxi": "ESXi",
+        "ipmi": "BMC / IPMI",
+    }.get(normalized, normalized.upper() if normalized else "This platform")
+
+
+def _storage_fabric_kind(platform: str | None) -> str:
+    normalized = normalize_text(platform).lower()
+    return {
+        "scale": "storage_scale",
+        "linux": "storage_linux",
+        "quantastor": "storage_quantastor",
+        "esxi": "storage_esxi",
+        "ipmi": "storage_bmc",
+    }.get(normalized, "storage_generic")
+
+
+def _storage_fabric_scope_warning(platform_label: str, fabric_kind: str) -> str:
+    if fabric_kind == "storage_quantastor":
+        return (
+            f"{platform_label} Storage Fabric is built from Quantastor storage-system, "
+            "HA-node, pool, disk, and optional SES/qs evidence. Low-level controller, path, or expander hops are shown only when those sources prove them."
+        )
+    if fabric_kind == "storage_esxi":
+        return (
+            f"{platform_label} Storage Fabric is built from ESXCLI and vendor controller evidence. "
+            "It shows host/controller/member relationships without enabling RAID-management actions."
+        )
+    if fabric_kind in {"storage_linux", "storage_scale"}:
+        return (
+            f"{platform_label} Storage Fabric is built from Linux block, pool, profile, SMART, and optional SES evidence. "
+            "Unproven physical HBA or expander hops are kept out of the map."
+        )
+    if fabric_kind == "storage_bmc":
+        return (
+            f"{platform_label} Storage Fabric is limited to BMC slot/chassis evidence for this selection. "
+            "Host storage paths need OS or vendor storage data."
+        )
+    return (
+        f"{platform_label} Storage Fabric is built from the platform evidence available in this snapshot. "
+        "Unproven physical hops are labeled by omission rather than inferred."
+    )
+
+
+def _slot_has_storage_fabric_evidence(slot: SlotView) -> bool:
+    if _slot_has_disk(slot) or slot.present or slot.smart_device_names:
+        return True
+    if isinstance(slot.operator_context, dict) and any(_truthy_storage_value(value) for value in slot.operator_context.values()):
+        return True
+    if isinstance(slot.raw_status, dict) and any(_truthy_storage_value(value) for value in slot.raw_status.values()):
+        return True
+    return False
+
+
+def _truthy_storage_value(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if value == "" or value == [] or value == {}:
+        return False
+    return True
+
+
+def _slot_state_text(slot: SlotView) -> str:
+    if slot.health:
+        return normalize_text(slot.health).lower() or "unknown"
+    if hasattr(slot.state, "value"):
+        return normalize_text(slot.state.value).lower() or "unknown"
+    return normalize_text(str(slot.state)).lower() or "unknown"
+
+
+def _slot_device_candidates(slot: SlotView) -> list[str]:
+    raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
+    raw_device_names = raw_status.get("device_names") if isinstance(raw_status.get("device_names"), list) else []
+    return _dedupe_strings(
+        [
+            slot.device_name,
+            *slot.smart_device_names,
+            *raw_device_names,
+            raw_status.get("device_hint"),
+            slot.logical_unit_id,
+            slot.sas_address,
+            raw_status.get("esxi_device_id"),
+            raw_status.get("esxi_runtime_name"),
+            raw_status.get("storcli_slot"),
+        ]
+    )
+
+
+def _pool_vdev_label(slot: SlotView, fallback: str = "storage path") -> str:
+    if slot.topology_label:
+        return slot.topology_label
+    if slot.pool_name and slot.vdev_name:
+        return f"{slot.pool_name} / {slot.vdev_name}"
+    if slot.pool_name:
+        return slot.pool_name
+    if slot.vdev_name:
+        return slot.vdev_name
+    devices = _slot_device_candidates(slot)
+    return devices[0] if devices else fallback
+
+
+def _storage_fabric_route_for_slot(
+    *,
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    slot: SlotView,
+    fabric_kind: str,
+    platform_label: str,
+) -> dict[str, Any]:
+    platform = normalize_text(system.truenas.platform).lower()
+    raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
+    operator_context = slot.operator_context if isinstance(slot.operator_context, dict) else {}
+    if platform == "quantastor":
+        return _quantastor_storage_route(system, snapshot, slot, raw_status, operator_context, fabric_kind)
+    if platform == "esxi":
+        return _esxi_storage_route(system, snapshot, slot, raw_status, fabric_kind)
+    if platform == "ipmi":
+        return _bmc_storage_route(system, snapshot, slot, raw_status, fabric_kind)
+    return _linux_storage_route(system, snapshot, slot, raw_status, fabric_kind, platform_label)
+
+
+def _quantastor_storage_route(
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    slot: SlotView,
+    raw_status: dict[str, Any],
+    operator_context: dict[str, Any],
+    fabric_kind: str,
+) -> dict[str, Any]:
+    selected_label = (
+        normalize_text(operator_context.get("selected_view_label"))
+        or normalize_text(snapshot.selected_enclosure_label)
+        or normalize_text(system.label)
+        or system.id
+    )
+    controller_name = _object_id_token(f"quantastor-{selected_label}")
+    ses_device = _slot_primary_ses_device(slot) or normalize_text(raw_status.get("ses_device"))
+    owner_label = normalize_text(operator_context.get("pool_owner_label"))
+    fence_label = normalize_text(operator_context.get("fence_owner_label"))
+    path_anchor = ses_device or owner_label or _pool_vdev_label(slot, selected_label)
+    path_label = ses_device or _pool_vdev_label(slot, selected_label)
+    evidence = ["Quantastor REST", "inventory snapshot"]
+    if raw_status.get("quantastor_cli_disk"):
+        evidence.append("qs disk-list")
+    if raw_status.get("quantastor_hw_disk"):
+        evidence.append("qs hw-disk-list")
+    if ses_device:
+        evidence.append("sg_ses AES/EC")
+    enclosure_kind = "ses-enclosure" if ses_device else "storage-enclosure"
+    enclosure_token = _object_id_token(snapshot.selected_enclosure_id or selected_label)
+    return {
+        "source": "quantastor",
+        "controller_id": f"controller:{controller_name}",
+        "controller_name": controller_name,
+        "controller_label": selected_label,
+        "controller_device": operator_context.get("selected_view_label") or snapshot.selected_enclosure_id,
+        "controller_status": "online",
+        "controller_evidence": _dedupe_strings(evidence),
+        "controller_raw": {
+            "selected_view_label": selected_label,
+            "pool_owner_label": owner_label,
+            "fence_owner_label": fence_label,
+            "visible_on_labels": operator_context.get("visible_on_labels"),
+            "io_fencing_enabled": operator_context.get("io_fencing_enabled"),
+        },
+        "path_id": f"path:{controller_name}:{_object_id_token(path_anchor)}",
+        "path_label": path_label,
+        "path_state": _slot_state_text(slot),
+        "path_type": "quantastor-ha" if operator_context else "quantastor",
+        "path_evidence": _dedupe_strings(evidence),
+        "path_raw": {
+            "source": "quantastor",
+            "fabric_kind": fabric_kind,
+            "ses_device": ses_device,
+            "pool_owner_label": owner_label,
+            "fence_owner_label": fence_label,
+            "visible_on_labels": operator_context.get("visible_on_labels"),
+            "topology_label": slot.topology_label,
+        },
+        "enclosure_id": f"{enclosure_kind}:{controller_name}:{enclosure_token}",
+        "enclosure_kind": enclosure_kind,
+        "enclosure_label": snapshot.selected_enclosure_label or selected_label,
+        "enclosure_raw_id": ses_device or snapshot.selected_enclosure_id,
+        "enclosure_evidence": ["sg_ses AES/EC"] if ses_device else ["Quantastor REST"],
+        "enclosure_raw": {
+            "source": "quantastor",
+            "fabric_kind": fabric_kind,
+            "ses_device": ses_device,
+            "enclosure_id": snapshot.selected_enclosure_id,
+            "enclosure_label": snapshot.selected_enclosure_label,
+        },
+    }
+
+
+def _esxi_storage_route(
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    slot: SlotView,
+    raw_status: dict[str, Any],
+    fabric_kind: str,
+) -> dict[str, Any]:
+    drive = raw_status.get("storcli_physical_drive") if isinstance(raw_status.get("storcli_physical_drive"), dict) else {}
+    controller = normalize_text(drive.get("controller_id") or raw_status.get("controller_id") or "storage")
+    controller_name = _object_id_token(f"esxi-{controller}")
+    controller_label = f"StorCLI {controller}" if controller != "storage" else "ESXi storage"
+    connector = normalize_text(
+        drive.get("connector_name")
+        or drive.get("connected_port")
+        or raw_status.get("esxi_runtime_name")
+        or slot.vdev_name
+        or _pool_vdev_label(slot, "ESXi local storage")
+    )
+    path_label = connector or _pool_vdev_label(slot, "ESXi local storage")
+    evidence = ["ESXCLI storage", "inventory snapshot"]
+    if drive:
+        evidence.append("StorCLI physical drive")
+    if raw_status.get("esxi_smart"):
+        evidence.append("esxcli storage core device smart get")
+    enclosure_token = _object_id_token(
+        raw_status.get("storcli_enclosure_id")
+        or drive.get("enclosure_id")
+        or drive.get("eid")
+        or snapshot.selected_enclosure_id
+        or "esxi-local"
+    )
+    return {
+        "source": "esxi",
+        "controller_id": f"controller:{controller_name}",
+        "controller_name": controller_name,
+        "controller_label": controller_label,
+        "controller_device": drive.get("controller_id") or controller,
+        "controller_status": "online" if drive else "mapped",
+        "controller_evidence": _dedupe_strings(evidence),
+        "controller_raw": {
+            "controller_id": drive.get("controller_id") or controller,
+            "storcli_controller": drive.get("controller_id"),
+        },
+        "path_id": f"path:{controller_name}:{_object_id_token(path_label)}",
+        "path_label": path_label,
+        "path_state": (normalize_text(drive.get("state") or "") or "").lower() or _slot_state_text(slot),
+        "path_type": "storcli-member" if drive else "esxi-storage",
+        "path_evidence": _dedupe_strings(evidence),
+        "path_raw": {
+            "source": "esxi",
+            "fabric_kind": fabric_kind,
+            "connector_name": drive.get("connector_name"),
+            "connected_port": drive.get("connected_port"),
+            "esxi_runtime_name": raw_status.get("esxi_runtime_name"),
+            "esxi_device_id": raw_status.get("esxi_device_id"),
+            "storcli_slot": drive.get("slot_key") or raw_status.get("storcli_slot"),
+        },
+        "enclosure_id": f"storage-enclosure:{controller_name}:{enclosure_token}",
+        "enclosure_kind": "storage-enclosure",
+        "enclosure_label": snapshot.selected_enclosure_label or f"ESXi enclosure {enclosure_token}",
+        "enclosure_raw_id": raw_status.get("storcli_enclosure_id") or drive.get("enclosure_id"),
+        "enclosure_evidence": ["StorCLI physical drive"] if drive else ["ESXCLI storage"],
+        "enclosure_raw": {
+            "source": "esxi",
+            "fabric_kind": fabric_kind,
+            "enclosure_id": raw_status.get("storcli_enclosure_id") or drive.get("enclosure_id"),
+            "enclosure_label": snapshot.selected_enclosure_label,
+        },
+    }
+
+
+def _linux_storage_route(
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    slot: SlotView,
+    raw_status: dict[str, Any],
+    fabric_kind: str,
+    platform_label: str,
+) -> dict[str, Any]:
+    devices = _slot_device_candidates(slot)
+    device_text = " ".join(devices).lower()
+    topology_text = " ".join([slot.topology_label or "", slot.vdev_name or "", slot.pool_name or ""]).lower()
+    if "nvme" in device_text or "nvme" in topology_text:
+        source_name = "linux-nvme"
+        source_label = f"{platform_label} NVMe"
+        source = "linux_nvme"
+        evidence = ["lsblk", "smartctl", "nvme-cli"]
+        path_type = "nvme"
+    elif re.search(r"\bmd\d+\b", device_text) or "mdadm" in topology_text or re.search(r"\bmd\d+\b", topology_text):
+        source_name = "linux-mdadm"
+        source_label = f"{platform_label} mdadm"
+        source = "linux_mdadm"
+        evidence = ["lsblk", "mdadm", "smartctl"]
+        path_type = "mdadm"
+    elif fabric_kind == "storage_scale":
+        source_name = "scale-storage"
+        source_label = "TrueNAS SCALE storage"
+        source = "scale_storage"
+        evidence = ["TrueNAS SCALE API", "Linux storage"]
+        path_type = "scale-storage"
+    else:
+        source_name = "linux-block"
+        source_label = f"{platform_label} block"
+        source = "linux_block"
+        evidence = ["lsblk", "smartctl"]
+        path_type = "block"
+    controller_name = _object_id_token(source_name)
+    path_label = _pool_vdev_label(slot, devices[0] if devices else source_label)
+    enclosure_label = snapshot.selected_enclosure_label or snapshot.selected_enclosure_name or "Storage view"
+    return {
+        "source": source,
+        "controller_id": f"controller:{controller_name}",
+        "controller_name": controller_name,
+        "controller_label": source_label,
+        "controller_device": devices[0] if devices else source_name,
+        "controller_status": "online",
+        "controller_evidence": _dedupe_strings([*evidence, "inventory snapshot"]),
+        "controller_raw": {"devices": devices, "source": source},
+        "path_id": f"path:{controller_name}:{_object_id_token(path_label)}",
+        "path_label": path_label,
+        "path_state": _slot_state_text(slot),
+        "path_type": path_type,
+        "path_evidence": _dedupe_strings([*evidence, "inventory snapshot"]),
+        "path_raw": {
+            "source": source,
+            "fabric_kind": fabric_kind,
+            "devices": devices,
+            "topology_label": slot.topology_label,
+        },
+        "enclosure_id": f"storage-enclosure:{controller_name}:{_object_id_token(snapshot.selected_enclosure_id or enclosure_label)}",
+        "enclosure_kind": "storage-enclosure",
+        "enclosure_label": enclosure_label,
+        "enclosure_raw_id": snapshot.selected_enclosure_id,
+        "enclosure_evidence": ["profile/storage view"],
+        "enclosure_raw": {
+            "source": source,
+            "fabric_kind": fabric_kind,
+            "enclosure_id": snapshot.selected_enclosure_id,
+            "enclosure_label": enclosure_label,
+        },
+    }
+
+
+def _bmc_storage_route(
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    slot: SlotView,
+    raw_status: dict[str, Any],
+    fabric_kind: str,
+) -> dict[str, Any]:
+    controller_name = "bmc-ipmi"
+    chassis_label = snapshot.selected_enclosure_label or system.label or "BMC chassis"
+    path_label = raw_status.get("bmc_controller_id")
+    if path_label is not None:
+        path_label = f"BMC controller {path_label}"
+    else:
+        path_label = "BMC slot inventory"
+    return {
+        "source": "bmc",
+        "controller_id": f"controller:{controller_name}",
+        "controller_name": controller_name,
+        "controller_label": "BMC / IPMI",
+        "controller_device": raw_status.get("bmc_controller_id") or "ipmi",
+        "controller_status": "present" if slot.present else "mapped",
+        "controller_evidence": ["BMC inventory"],
+        "controller_raw": {
+            "bmc_controller_id": raw_status.get("bmc_controller_id"),
+            "bmc_physical_index": raw_status.get("bmc_physical_index"),
+        },
+        "path_id": f"path:{controller_name}:{_object_id_token(path_label)}",
+        "path_label": path_label,
+        "path_state": "present" if slot.present else "mapped",
+        "path_type": "bmc-slot",
+        "path_evidence": ["BMC inventory"],
+        "path_raw": {
+            "source": "bmc",
+            "fabric_kind": fabric_kind,
+            "bmc_slot_number": raw_status.get("bmc_slot_number"),
+            "bmc_physical_index": raw_status.get("bmc_physical_index"),
+        },
+        "enclosure_id": f"storage-enclosure:{controller_name}:{_object_id_token(snapshot.selected_enclosure_id or chassis_label)}",
+        "enclosure_kind": "storage-enclosure",
+        "enclosure_label": chassis_label,
+        "enclosure_raw_id": snapshot.selected_enclosure_id,
+        "enclosure_evidence": ["BMC inventory"],
+        "enclosure_raw": {
+            "source": "bmc",
+            "fabric_kind": fabric_kind,
+            "enclosure_id": snapshot.selected_enclosure_id,
+            "enclosure_label": chassis_label,
+        },
+    }
 
 
 def _build_mpr_trace_index(
@@ -1758,6 +3029,19 @@ def _snapshot_slot_numbers(slots: list[SlotView]) -> list[int]:
 
 def _snapshot_disk_slot_numbers(slots: list[SlotView]) -> list[int]:
     return _dedupe_ints(slot.slot for slot in slots if slot.slot is not None and _slot_has_disk(slot))
+
+
+def _object_id_token(value: Any) -> str:
+    text = normalize_text(str(value or ""))
+    if text.startswith("/dev/"):
+        text = text.removeprefix("/dev/")
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "-", text).strip("-").lower()
+    return token or "unknown"
+
+
+def _linux_ses_sort_key(value: str) -> tuple[int, str]:
+    match = re.search(r"(\d+)$", normalize_text(value))
+    return (int(match.group(1)) if match else 1_000_000, normalize_text(value))
 
 
 def _slot_has_disk(slot: SlotView) -> bool:

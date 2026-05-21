@@ -8,6 +8,7 @@ from app.models.domain import (
     MultipathMember,
     MultipathView,
     SasFabricAlias,
+    SourceStatus,
     SlotState,
     SlotView,
 )
@@ -1030,8 +1031,13 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertIn(mpr1_selected_enclosure, traces["bay:0"].node_ids)
         self.assertIn("controller:mpr0", traces["bay:0"].node_ids)
 
-    def test_non_core_snapshots_report_unavailable_boundary(self) -> None:
-        for platform in ("scale", "linux", "quantastor", "esxi", "ipmi"):
+    def test_empty_non_core_snapshots_report_storage_fabric_boundary(self) -> None:
+        platform_kinds = {
+            "quantastor": "storage_quantastor",
+            "esxi": "storage_esxi",
+            "ipmi": "storage_bmc",
+        }
+        for platform, fabric_kind in platform_kinds.items():
             with self.subTest(platform=platform):
                 fabric = build_sas_fabric_snapshot(
                     system=SystemConfig(id=platform, label=platform.upper(), truenas=TrueNASConfig(platform=platform)),
@@ -1044,7 +1050,281 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 self.assertEqual(fabric.nodes, [])
                 self.assertEqual(fabric.links, [])
                 self.assertEqual(fabric.traces, [])
-                self.assertIn("TrueNAS CORE", fabric.warnings[0])
+                self.assertEqual(fabric.raw["fabric_domain"], "storage_fabric")
+                self.assertEqual(fabric.raw["fabric_kind"], fabric_kind)
+                self.assertIn("Storage Fabric evidence", fabric.warnings[0])
+
+    def test_scale_snapshot_builds_linux_ses_graph(self) -> None:
+        slots = [
+            SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="5003048001c1043f",
+                enclosure_label="Front 24 Bay",
+                enclosure_name="Front 24 Bay",
+                present=True,
+                state=SlotState.healthy,
+                device_name="sda",
+                serial="SCALE0000",
+                model="WUH721414AL4204",
+                size_bytes=14_000_519_643_136,
+                size_human="12.7 TiB (14.0 TB)",
+                pool_name="tank",
+                vdev_name="raidz2-0",
+                vdev_class="data",
+                health="ONLINE",
+                smart_device_names=["sda"],
+                ssh_ses_device="/dev/sg26",
+                ssh_ses_element_id=0,
+                ssh_ses_targets=[{"ses_device": "/dev/sg26", "ses_element_id": 0}],
+                mapping_source="scale_sg_ses",
+                raw_status={"ses_device": "/dev/sg26", "enclosure_id": "5003048001c1043f", "sas_device_type": "end device"},
+                sg_device="/dev/sg2",
+                scsi_hctl="1:0:1:0",
+                transport_protocol="sas",
+                attached_sas_address="5003048001c1043f",
+                phy_identifier="0x0",
+                target_port_protocol="SSP",
+                logical_unit_id="5000cca264d473d4",
+                logical_block_size=512,
+                physical_block_size=4096,
+            ),
+            SlotView(
+                slot=1,
+                slot_label="01",
+                row_index=0,
+                column_index=1,
+                enclosure_id="5003048001c1043f",
+                enclosure_label="Front 24 Bay",
+                enclosure_name="Front 24 Bay",
+                present=True,
+                state=SlotState.healthy,
+                device_name="sdb",
+                serial="SCALE0001",
+                pool_name="tank",
+                vdev_name="raidz2-0",
+                health="ONLINE",
+                ssh_ses_device="/dev/sg26",
+                ssh_ses_element_id=1,
+                ssh_ses_targets=[{"ses_device": "/dev/sg26", "ses_element_id": 1}],
+                mapping_source="scale_sg_ses",
+            ),
+        ]
+        snapshot = InventorySnapshot(
+            slots=slots,
+            refresh_interval_seconds=30,
+            selected_system_id="offsite-scale",
+            selected_system_label="Offsite SCALE",
+            selected_system_platform="scale",
+            selected_enclosure_id="5003048001c1043f",
+            selected_enclosure_label="Front 24 Bay",
+            selected_enclosure_name="Front 24 Bay",
+        )
+        fabric = build_sas_fabric_snapshot(
+            system=SystemConfig(id="offsite-scale", label="Offsite SCALE", truenas=TrueNASConfig(platform="scale")),
+            snapshot=snapshot,
+            ssh_outputs={},
+            sources={"ssh": SourceStatus(enabled=True, ok=True, message="ok")},
+        )
+
+        nodes = {node.id: node for node in fabric.nodes}
+        traces = {trace.id: trace for trace in fabric.traces}
+        links = {link.id: link for link in fabric.links}
+
+        self.assertTrue(fabric.available)
+        self.assertEqual(fabric.platform, "scale")
+        self.assertEqual(fabric.raw["fabric_kind"], "linux_ses")
+        self.assertEqual(fabric.raw["ses_devices"], ["/dev/sg26"])
+        self.assertIn("controller:linux-ses", nodes)
+        self.assertIn("path:linux-ses:sg26", nodes)
+        self.assertIn("ses:sg26", nodes)
+        self.assertIn("bay:0", traces)
+        self.assertIn("ses:sg26", traces["bay:0"].node_ids)
+        self.assertEqual(traces["bay:0"].metrics["path_states"][0]["path_id"], "path:linux-ses:sg26")
+        self.assertEqual(traces["bay:0"].metrics["path_states"][0]["sg_device"], "/dev/sg2")
+        self.assertEqual(traces["bay:0"].metrics["path_states"][0]["scsi_hctl"], "1:0:1:0")
+        self.assertEqual(traces["bay:0"].metrics["path_states"][0]["transport_protocol"], "sas")
+        self.assertEqual(traces["bay:0"].metrics["model"], "WUH721414AL4204")
+        self.assertEqual(traces["bay:0"].metrics["serial"], "SCALE0000")
+        self.assertEqual(traces["bay:0"].metrics["size_human"], "12.7 TiB (14.0 TB)")
+        self.assertEqual(traces["bay:0"].metrics["logical_unit_id"], "5000cca264d473d4")
+        self.assertEqual(traces["bay:0"].metrics["vdev_class"], "data")
+        self.assertEqual(traces["bay:0"].metrics["path_states"][0]["logical_block_size"], 512)
+        self.assertEqual(traces["bay:0"].metrics["path_states"][0]["smart_device_names"], ["sda"])
+        self.assertEqual(nodes["bay:0"].metrics["attached_sas_address"], "5003048001c1043f")
+        self.assertEqual(nodes["bay:0"].metrics["phy_identifier"], "0x0")
+        self.assertEqual(nodes["bay:0"].metrics["logical_unit_id"], "5000cca264d473d4")
+        self.assertEqual(nodes["bay:0"].raw["sas_device_type"], "end device")
+        self.assertIn("path-ses-enclosure:path:linux-ses:sg26->ses:sg26", traces["bay:0"].link_ids)
+        self.assertIn("ses-bay:ses:sg26->bay:0:0", links)
+        self.assertEqual(fabric.controllers[0]["board"], "TrueNAS SCALE Linux SES")
+        self.assertEqual(fabric.paths[0]["slots"], [0, 1])
+        self.assertIn("SES slot evidence", fabric.warnings[0])
+        self.assertNotIn("TrueNAS CORE source data only", " ".join(fabric.warnings))
+
+    def test_scale_snapshot_without_ses_reports_linux_ses_boundary(self) -> None:
+        fabric = build_sas_fabric_snapshot(
+            system=SystemConfig(id="offsite-scale", label="Offsite SCALE", truenas=TrueNASConfig(platform="scale")),
+            snapshot=InventorySnapshot(slots=[], refresh_interval_seconds=30),
+            ssh_outputs={},
+        )
+
+        self.assertFalse(fabric.available)
+        self.assertEqual(fabric.raw["fabric_kind"], "storage_scale")
+        self.assertEqual(fabric.raw["fabric_domain"], "storage_fabric")
+        self.assertEqual(fabric.nodes, [])
+        self.assertIn("Storage Fabric evidence", fabric.warnings[0])
+
+    def test_linux_snapshot_without_ses_builds_storage_fabric_graph(self) -> None:
+        slot = SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            present=True,
+            state=SlotState.healthy,
+            device_name="nvme0n1",
+            smart_device_names=["/dev/nvme0n1"],
+            model="NVMe",
+            pool_name="/mnt/nvme_raid",
+            vdev_name="md5",
+            topology_label="/mnt/nvme_raid > md5 > data",
+            raw_status={"device_names": ["nvme0n1", "10000:01:00.0"]},
+        )
+
+        fabric = build_sas_fabric_snapshot(
+            system=SystemConfig(id="gpu-linux", label="GPU Server Linux", truenas=TrueNASConfig(platform="linux")),
+            snapshot=InventorySnapshot(
+                slots=[slot],
+                refresh_interval_seconds=30,
+                selected_system_id="gpu-linux",
+                selected_system_platform="linux",
+                selected_enclosure_id="right-nvme-2",
+                selected_enclosure_label="Right NVMe 2",
+            ),
+            ssh_outputs={},
+        )
+
+        nodes = {node.id: node for node in fabric.nodes}
+        traces = {trace.id: trace for trace in fabric.traces}
+
+        self.assertTrue(fabric.available)
+        self.assertEqual(fabric.platform, "linux")
+        self.assertEqual(fabric.raw["fabric_kind"], "storage_linux")
+        self.assertEqual(fabric.raw["fabric_domain"], "storage_fabric")
+        self.assertIn("controller:linux-nvme", nodes)
+        self.assertIn("storage-enclosure:linux-nvme:right-nvme-2", nodes)
+        self.assertIn("bay:0", traces)
+        self.assertEqual(traces["bay:0"].metrics["path_states"][0]["path_type"], "nvme")
+        self.assertNotIn("Linux Linux SES", fabric.warnings[0])
+
+    def test_quantastor_snapshot_builds_storage_fabric_graph(self) -> None:
+        slot = SlotView(
+            slot=12,
+            slot_label="12",
+            row_index=1,
+            column_index=0,
+            present=True,
+            state=SlotState.healthy,
+            device_name="sdam",
+            pool_name="HA-Pool-R10",
+            vdev_name="mirror-0",
+            topology_label="HA-Pool-R10 > mirror-0 > data (active on QSOSN-Right)",
+            ssh_ses_device="/dev/sg11",
+            ssh_ses_element_id=12,
+            ssh_ses_targets=[{"ses_device": "/dev/sg11", "ses_element_id": 12}],
+            operator_context={
+                "selected_view_label": "QSOSN-Right",
+                "pool_owner_label": "QSOSN-Right",
+                "fence_owner_label": "QSOSN-Right",
+                "visible_on_labels": ["QSOSN-Left", "QSOSN-Right"],
+                "io_fencing_enabled": True,
+            },
+            raw_status={
+                "ses_device": "/dev/sg11",
+                "quantastor_hw_disk": {"name": "disk12"},
+                "quantastor_cli_disk": {"name": "sdam"},
+            },
+        )
+
+        fabric = build_sas_fabric_snapshot(
+            system=SystemConfig(id="qsosn-ha", label="QSOSN HA", truenas=TrueNASConfig(platform="quantastor")),
+            snapshot=InventorySnapshot(
+                slots=[slot],
+                refresh_interval_seconds=30,
+                selected_system_id="qsosn-ha",
+                selected_system_platform="quantastor",
+                selected_enclosure_id="qsosn-right",
+                selected_enclosure_label="QSOSN-Right",
+            ),
+            ssh_outputs={},
+        )
+
+        nodes = {node.id: node for node in fabric.nodes}
+        traces = {trace.id: trace for trace in fabric.traces}
+
+        self.assertTrue(fabric.available)
+        self.assertEqual(fabric.raw["fabric_kind"], "storage_quantastor")
+        self.assertIn("controller:quantastor-qsosn-right", nodes)
+        self.assertIn("ses-enclosure:quantastor-qsosn-right:qsosn-right", nodes)
+        self.assertEqual(fabric.controllers[0]["board"], "QSOSN-Right")
+        self.assertIn("qs hw-disk-list", nodes["controller:quantastor-qsosn-right"].evidence)
+        self.assertEqual(traces["bay:12"].metrics["path_states"][0]["source"], "quantastor")
+        self.assertIn("Quantastor Storage Fabric", fabric.warnings[0])
+
+    def test_esxi_snapshot_builds_storage_fabric_graph(self) -> None:
+        slot = SlotView(
+            slot=2,
+            slot_label="02",
+            row_index=0,
+            column_index=2,
+            present=True,
+            state=SlotState.healthy,
+            device_name="252:2",
+            smart_device_names=["naa.5000cca07316765c"],
+            pool_name="ESXi local JBOD",
+            vdev_name="252:2",
+            topology_label="ESXi local Enc > slot 252:2 > direct disk",
+            temperature_c=34,
+            raw_status={
+                "storcli_physical_drive": {
+                    "controller_id": "c1",
+                    "slot_key": "252:2",
+                    "connector_name": "Port 0 - 3 x1",
+                    "connected_port": "0(path0)",
+                },
+                "storcli_enclosure_id": "252",
+                "esxi_device_id": "naa.5000cca07316765c",
+                "esxi_runtime_name": "vmhba2:C0:T27:L0",
+                "esxi_transport": "sas",
+            },
+        )
+
+        fabric = build_sas_fabric_snapshot(
+            system=SystemConfig(id="esxi-ft-node-2", label="ESXi FT Node 2", truenas=TrueNASConfig(platform="esxi")),
+            snapshot=InventorySnapshot(
+                slots=[slot],
+                refresh_interval_seconds=30,
+                selected_system_id="esxi-ft-node-2",
+                selected_system_platform="esxi",
+                selected_enclosure_id="supermicro-fat-twin-front-6",
+                selected_enclosure_label="Front 6",
+            ),
+            ssh_outputs={},
+        )
+
+        nodes = {node.id: node for node in fabric.nodes}
+        traces = {trace.id: trace for trace in fabric.traces}
+
+        self.assertTrue(fabric.available)
+        self.assertEqual(fabric.raw["fabric_kind"], "storage_esxi")
+        self.assertIn("controller:esxi-c1", nodes)
+        self.assertIn("storage-enclosure:esxi-c1:252", nodes)
+        self.assertEqual(fabric.controllers[0]["board"], "StorCLI c1")
+        self.assertIn("StorCLI physical drive", nodes["controller:esxi-c1"].evidence)
+        self.assertEqual(traces["bay:2"].metrics["path_states"][0]["path_type"], "storcli-member")
 
     def test_core_snapshot_carries_structured_command_failures_for_debug_output(self) -> None:
         failure_details = [
@@ -1065,7 +1345,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
             system=SystemConfig(id="archive-core", label="The Archive", truenas=TrueNASConfig(platform="core")),
             snapshot=InventorySnapshot(slots=[], refresh_interval_seconds=30),
             ssh_outputs={"sudo -n /usr/sbin/mprutil show adapters": "/dev/mpr10 SAS3816 Broadcom 9500-16e 28.00.00.00"},
-            warnings=["SAS Fabric enrichment probes had partial command failures."],
+            warnings=["Storage Fabric enrichment probes had partial command failures."],
             command_failures=failure_details,
         )
 

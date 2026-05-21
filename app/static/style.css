@@ -1821,13 +1821,15 @@ textarea {
 
 .disk-path-picker {
   display: grid;
-  grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+  grid-template-columns: minmax(180px, 300px) minmax(0, 1fr);
   gap: 12px;
   align-items: start;
-  padding: 10px;
+  padding: 12px;
   border: 1px solid rgba(122, 169, 255, 0.16);
   border-radius: 8px;
-  background: rgba(8, 12, 17, 0.5);
+  background:
+    linear-gradient(180deg, rgba(122, 169, 255, 0.045), rgba(255, 255, 255, 0.015)),
+    rgba(8, 12, 17, 0.58);
 }
 
 .disk-path-selected {
@@ -1841,12 +1843,10 @@ textarea {
 }
 
 .disk-path-selected small {
-  overflow: hidden;
   color: var(--muted);
   font-family: var(--mono);
   font-size: 0.68rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .disk-path-bay-grid {
@@ -1858,7 +1858,10 @@ textarea {
 
 .disk-path-bay-grid.is-layout {
   display: block;
-  overflow: auto;
+  max-height: none;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0 0 4px;
 }
 
 .disk-path-bay-layout {
@@ -1967,30 +1970,24 @@ textarea {
 
 .disk-path-branch-header small {
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .disk-path-flow {
-  display: flex;
-  align-items: stretch;
-  gap: 6px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  align-items: start;
+  gap: 10px;
   min-width: 0;
-  overflow-x: auto;
-  padding-bottom: 3px;
 }
 
 .disk-path-arrow {
-  flex: 0 0 16px;
-  align-self: center;
-  color: rgba(85, 214, 235, 0.72);
-  font-family: var(--mono);
-  font-size: 0.78rem;
-  text-align: center;
+  display: none;
 }
 
 .disk-path-card {
-  flex: 1 0 124px;
-  min-width: 124px;
-  max-width: 220px;
+  min-width: 0;
+  max-width: none;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -2047,9 +2044,7 @@ button.disk-path-card:hover,
 .disk-path-card strong,
 .disk-path-card small {
   max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .disk-path-card strong {
@@ -2059,9 +2054,13 @@ button.disk-path-card:hover,
 
 .disk-path-card small {
   color: var(--muted);
+  display: -webkit-box;
   font-family: var(--mono);
   font-size: 0.62rem;
   line-height: 1.35;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .disk-path-facts {
@@ -2080,6 +2079,7 @@ button.disk-path-card:hover,
   font-family: var(--mono);
   font-size: 0.61rem;
   line-height: 1.25;
+  overflow-wrap: anywhere;
 }
 
 .disk-path-facts em {
@@ -2153,7 +2153,8 @@ button.disk-path-card:hover,
 }
 
 .fabric-diagnostic-impact {
-  padding: 2px 5px;
+  gap: 8px;
+  padding: 2px 7px 2px 5px;
   border: 1px solid rgba(177, 190, 205, 0.18);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.035);
@@ -2346,6 +2347,19 @@ button.disk-path-card:hover,
   gap: 8px;
 }
 
+.fabric-diagnostic-raw .fabric-diagnostic-impact,
+.fabric-diagnostic-raw .fabric-diagnostic-impact-count,
+.fabric-diagnostic-raw .fabric-diagnostic-confidence {
+  display: inline-flex;
+  grid-template-columns: none;
+}
+
+.fabric-diagnostic-raw .fabric-diagnostic-impact span,
+.fabric-diagnostic-raw .fabric-diagnostic-confidence span {
+  display: inline;
+  grid-template-columns: none;
+}
+
 .fabric-diagnostic-raw em {
   color: #7890a7;
   font-style: normal;
@@ -2460,17 +2474,20 @@ button.disk-path-card:hover,
 
 .fabric-diagnostic-table {
   width: 100%;
-  min-width: 940px;
+  min-width: 1180px;
   border-collapse: collapse;
   color: #b9c9da;
   font-family: var(--mono);
   font-size: 0.6rem;
+  table-layout: fixed;
 }
 
 .fabric-diagnostic-table th,
 .fabric-diagnostic-table td {
+  min-width: 0;
   padding: 5px 6px;
   border-bottom: 1px solid rgba(177, 190, 205, 0.12);
+  overflow-wrap: anywhere;
   text-align: left;
   vertical-align: top;
 }
@@ -2482,15 +2499,52 @@ button.disk-path-card:hover,
 
 .fabric-diagnostic-table th:first-child,
 .fabric-diagnostic-table td:first-child {
-  width: 82px;
+  width: 104px;
   white-space: nowrap;
 }
 
 .fabric-diagnostic-table th:nth-child(2),
-.fabric-diagnostic-table td:nth-child(2),
+.fabric-diagnostic-table td:nth-child(2) {
+  width: 132px;
+}
+
+.fabric-diagnostic-table th:nth-child(3),
+.fabric-diagnostic-table td:nth-child(3) {
+  width: 116px;
+}
+
+.fabric-diagnostic-table th:nth-child(5),
+.fabric-diagnostic-table td:nth-child(5) {
+  width: 210px;
+}
+
+.fabric-diagnostic-table th:nth-child(6),
+.fabric-diagnostic-table td:nth-child(6) {
+  width: 126px;
+}
+
 .fabric-diagnostic-table th:nth-child(7),
 .fabric-diagnostic-table td:nth-child(7) {
-  width: 108px;
+  width: 132px;
+}
+
+.fabric-diagnostic-table td:nth-child(2) .fabric-diagnostic-impact,
+.fabric-diagnostic-table td:nth-child(7) .fabric-diagnostic-confidence {
+  box-sizing: border-box;
+  max-width: 100%;
+}
+
+.fabric-diagnostic-table td:nth-child(2) .fabric-diagnostic-impact {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.fabric-diagnostic-table td:nth-child(2) .fabric-diagnostic-impact span,
+.fabric-diagnostic-table td:nth-child(7) .fabric-diagnostic-confidence {
+  min-width: max-content;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .fabric-diagnostic-table tr.severity-error td {
@@ -2630,6 +2684,240 @@ button.fabric-trace-crumb:hover {
 .fabric-inspector-section h4 {
   color: #d8e7f5;
   font-size: 0.78rem;
+}
+
+.fabric-selected-bay {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.fabric-selected-bay-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(85, 214, 235, 0.24);
+  border-left: 4px solid rgba(76, 216, 164, 0.86);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(85, 214, 235, 0.075), rgba(255, 255, 255, 0.018)),
+    rgba(13, 19, 25, 0.94);
+}
+
+.fabric-selected-bay-hero.status-fail,
+.fabric-selected-bay-hero.status-failed,
+.fabric-selected-bay-hero.status-degraded,
+.fabric-selected-bay-hero.status-missing,
+.fabric-selected-bay-hero.status-offline {
+  border-left-color: rgba(232, 92, 92, 0.9);
+}
+
+.fabric-selected-bay-hero strong {
+  display: block;
+  margin-top: 3px;
+  color: #f1f8ff;
+  font-size: 1.15rem;
+}
+
+.fabric-selected-bay-hero small {
+  display: block;
+  margin-top: 5px;
+  color: #a9c0d6;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.fabric-selected-bay-state {
+  align-self: start;
+  padding: 5px 8px;
+  border: 1px solid rgba(76, 216, 164, 0.34);
+  border-radius: 999px;
+  background: rgba(76, 216, 164, 0.1);
+  color: #bdf7db;
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.fabric-inspector-fact-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.fabric-inspector-fact {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid rgba(177, 190, 205, 0.14);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.fabric-inspector-fact.is-wide {
+  grid-column: 1 / -1;
+}
+
+.fabric-inspector-fact span,
+.fabric-identity-card em,
+.fabric-path-member-card dt {
+  color: #8ea3b8;
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  font-style: normal;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.fabric-inspector-fact strong {
+  min-width: 0;
+  color: #eaf4ff;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.fabric-identity-card {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(177, 190, 205, 0.14);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.fabric-identity-card code {
+  color: #d8f3ff;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.fabric-identity-card div {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+}
+
+.fabric-identity-card span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  color: #dbe8f4;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  overflow-wrap: anywhere;
+}
+
+.fabric-evidence-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.fabric-evidence-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 4px 8px;
+  border: 1px solid rgba(85, 214, 235, 0.22);
+  border-radius: 999px;
+  background: rgba(85, 214, 235, 0.07);
+  color: #cfefff;
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  font-weight: 700;
+}
+
+.fabric-path-member-list {
+  display: grid;
+  gap: 8px;
+}
+
+.fabric-path-member-card {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(177, 190, 205, 0.14);
+  border-left: 3px solid rgba(76, 216, 164, 0.86);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.fabric-path-member-card.status-fail,
+.fabric-path-member-card.status-failed,
+.fabric-path-member-card.status-degraded,
+.fabric-path-member-card.status-missing,
+.fabric-path-member-card.status-offline {
+  border-left-color: rgba(232, 92, 92, 0.9);
+}
+
+.fabric-path-member-card > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.fabric-path-member-card strong {
+  min-width: 0;
+  color: #eef6ff;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.fabric-path-member-card > div span {
+  color: #bdf7db;
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.fabric-path-member-card small {
+  color: #a9c0d6;
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.fabric-path-member-card dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+  margin: 0;
+}
+
+.fabric-path-member-card dl span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.fabric-path-member-card dd {
+  margin: 0;
+  color: #dbe8f4;
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  overflow-wrap: anywhere;
+}
+
+.fabric-inspector-node-grid .fabric-node-card {
+  padding: 8px;
 }
 
 .fabric-alias-row {
@@ -5768,12 +6056,11 @@ button.fabric-trace-crumb:hover {
   }
 
   .disk-path-flow {
-    flex-direction: column;
-    overflow-x: visible;
+    grid-template-columns: 1fr;
   }
 
   .disk-path-arrow {
-    transform: rotate(90deg);
+    display: none;
   }
 
   .disk-path-card {

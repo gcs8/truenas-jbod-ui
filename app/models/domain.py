@@ -239,6 +239,12 @@ class SlotView(BaseModel):
     physical_block_size: int | None = None
     logical_unit_id: str | None = None
     sas_address: str | None = None
+    attached_sas_address: str | None = None
+    transport_protocol: str | None = None
+    sg_device: str | None = None
+    scsi_hctl: str | None = None
+    phy_identifier: str | None = None
+    target_port_protocol: str | None = None
     enclosure_identifier: str | None = None
     led_supported: bool = False
     led_backend: str | None = None

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+No unreleased changes yet.
+
+## v0.20.1 - 2026-05-21
+
 ### Changed
 
 - Reopened the post-`v0.20.0` development line as `0.20.1-dev` for focused
@@ -38,6 +42,39 @@
   inventory, physical slots, SMART detail, history, identify LEDs, platform
   details, and diagnostics so UI/admin/debug surfaces can explain supported,
   partial, unavailable, and intentionally unsupported features consistently.
+- Added platform parity fixture coverage for SCALE Linux SES, Quantastor
+  optional endpoint failures, generic Linux NVMe/mdadm, ESXi non-`c0`
+  StorCLI, and same-slot multi-controller ESXi member evidence.
+- Admin setup guidance now exposes platform-specific Required, Optional, and
+  Unsupported setup requirements, including SCALE/Linux `sg_ses` guidance and
+  ESXi StorCLI/PercCLI boundaries.
+- The dedicated fabric surface now presents as `Storage Fabric` while keeping
+  existing `/sas-fabric` route/API compatibility.
+- SCALE/Linux snapshots with SG enclosure evidence now render read-only
+  Linux SES Storage Fabric graphs, including Linux block, SCSI transport, SG,
+  HCTL, attached SAS, and optional NVMe subsystem evidence.
+- Quantastor, ESXi, generic Linux, and BMC/IPMI systems now get honest
+  best-effort read-only Storage Fabric maps when snapshot evidence exists,
+  with source-provenance copy instead of CORE-only SAS/HBA claims.
+- Disk Path copy, path chains, Selected Bay inspector, and path-member rows now
+  surface platform-native context and reuse more enclosure-view disk identity,
+  including model, serial, size, LUN/SAS, block size, SMART candidate device,
+  SG device, and HCTL where available.
+- The public demo fixture and docs now use the current pool-level `spares`
+  label instead of the pre-normalization `spare-1` label.
+
+### Fixed
+
+- Disk Path SAS/SES/Storage Path cards are clickable local inspector selectors
+  again without reintroducing the rejected reverse hop to Impact Map.
+- Disk Path now remembers the active bay separately from selected inspector
+  nodes/paths, so clicking local cards after a fresh page load no longer
+  reorders or jumps the selected bay.
+- SCALE Disk Path bay pickers no longer show a nested scrollbar for normal
+  physical slot layouts.
+- CORE diagnostic event-table Impact/Type columns no longer overlap.
+- Public demo regression coverage now matches the current spare-grouping
+  contract.
 
 ## v0.20.0 - 2026-05-20
 

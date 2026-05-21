@@ -1,0 +1,27 @@
+{
+  "Controllers": [
+    {
+      "Command Status": {
+        "Status": "Success",
+        "Description": "None"
+      },
+      "Response Data": {
+        "Basics": {
+          "Model": "MegaRAID 9560-16i",
+          "Controller": 1
+        },
+        "Version": {
+          "Firmware Package Build": "52.26.0-5150",
+          "Driver Name": "lsi_mr3"
+        },
+        "Status": {
+          "Controller Status": "Optimal"
+        },
+        "Bus": {
+          "Host Interface": "PCI-E",
+          "PCI Address": "0000:65:00.0"
+        }
+      }
+    }
+  ]
+}

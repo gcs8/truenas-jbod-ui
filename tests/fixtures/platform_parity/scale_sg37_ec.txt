@@ -1,0 +1,15 @@
+  SMCDRS2U  SAS3x28           0701
+  Primary enclosure logical identifier (hex): 5003048026b3000a
+Enclosure Status diagnostic page:
+  generation code: 0x0
+  status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Overall descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+      Element 0 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+      Element 11 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+        Ready to insert=0, RMV=0, Ident=0, Report=0

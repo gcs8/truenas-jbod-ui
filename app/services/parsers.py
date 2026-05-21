@@ -54,6 +54,7 @@ class ParsedSSHData:
     ses_selected_meta: dict[str, str | None] = field(default_factory=dict)
     ses_enclosures: list["SESMapEnclosure"] = field(default_factory=list)
     linux_blockdevices: list[dict[str, Any]] = field(default_factory=list)
+    linux_scsi_devices: list["LinuxScsiDevice"] = field(default_factory=list)
     linux_mdadm_arrays: dict[str, "LinuxMdArray"] = field(default_factory=dict)
     linux_nvme_subsystems: dict[str, dict[str, str | None]] = field(default_factory=dict)
     ubntstorage_disks: list[dict[str, Any]] = field(default_factory=list)
@@ -79,6 +80,19 @@ class LinuxMdArray:
 
 
 @dataclass(slots=True)
+class LinuxScsiDevice:
+    hctl: str
+    device_type: str | None = None
+    vendor: str | None = None
+    model: str | None = None
+    revision: str | None = None
+    block_device: str | None = None
+    sg_device: str | None = None
+    transport: str | None = None
+    transport_address: str | None = None
+
+
+@dataclass(slots=True)
 class SESMapSlot:
     slot_number: int
     element_id: int | None = None
@@ -95,6 +109,9 @@ class SESMapSlot:
     sas_address: str | None = None
     attached_sas_address: str | None = None
     sas_device_type: str | None = None
+    transport_protocol: str | None = None
+    phy_identifier: str | None = None
+    target_port_protocol: str | None = None
     predicted_failure: bool | None = None
     disabled: bool | None = None
     hot_spare: bool | None = None
@@ -845,6 +862,10 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
         if current_slot is None:
             continue
 
+        if stripped.startswith("Transport protocol:"):
+            current_slot.transport_protocol = normalize_text(stripped.split(":", 1)[1])
+            continue
+
         slot_match = re.search(r"device slot number:\s*(?P<slot>\d+)", stripped, re.IGNORECASE)
         if slot_match:
             current_slot.slot_number = int(slot_match.group("slot"))
@@ -879,6 +900,14 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
 
         if stripped.startswith("attached SAS address:"):
             current_slot.attached_sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
+            continue
+
+        if stripped.startswith("target port for:"):
+            current_slot.target_port_protocol = normalize_text(stripped.split(":", 1)[1])
+            continue
+
+        if stripped.startswith("phy identifier:"):
+            current_slot.phy_identifier = normalize_text(stripped.split(":", 1)[1])
             continue
 
     if not enclosure.slots:
@@ -987,6 +1016,136 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
     return enclosure
 
 
+def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapEnclosure | None:
+    """
+    Parse `sg_ses --join --filter /dev/sgN` output into slot metadata.
+
+    The joined text view is more stable than relying on separate page snippets
+    for operator-facing evidence: it carries status, AES detail, transport,
+    device slot number, and SAS addresses in one SG3 report. We still merge it
+    through the same SESMapEnclosure model so AES/EC-only hosts keep working.
+    """
+
+    ses_device = _extract_sg_ses_device(command)
+    enclosure = SESMapEnclosure(ses_device=ses_device)
+    current_slot: SESMapSlot | None = None
+
+    for raw_line in output.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        if enclosure.enclosure_name is None:
+            name = normalize_text(" ".join(stripped.split()))
+            if name:
+                enclosure.enclosure_name = name
+            continue
+
+        if stripped.startswith("Primary enclosure logical identifier"):
+            enclosure.enclosure_id = normalize_text(stripped.split(":", 1)[1])
+            continue
+
+        slot_match = re.match(
+            r"Slot(?P<slot>\d+)\s+\[(?P<subencl>-?\d+),(?P<element>-?\d+)\]\s+Element type:\s+Array device slot\b",
+            stripped,
+            re.IGNORECASE,
+        )
+        if slot_match:
+            slot_number = int(slot_match.group("slot"))
+            element_id = int(slot_match.group("element"))
+            current_slot = SESMapSlot(
+                slot_number=slot_number,
+                element_id=element_id if element_id >= 0 else slot_number,
+                ses_device=ses_device,
+                description=f"Slot {slot_number:02d}",
+            )
+            current_slot.control_targets = _merge_control_targets(
+                current_slot.control_targets,
+                [
+                    {
+                        "ses_device": ses_device,
+                        "ses_element_id": current_slot.element_id,
+                        "ses_slot_number": current_slot.slot_number,
+                    }
+                ],
+            )
+            enclosure.slots[slot_number] = current_slot
+            continue
+
+        if re.match(r"ArrayDevicesInSubEnclsr\d+\s+\[", stripped, re.IGNORECASE):
+            current_slot = None
+            continue
+
+        if current_slot is None:
+            continue
+
+        if stripped.startswith("Predicted failure=") and "status:" in stripped:
+            _apply_sg_ses_status_line(current_slot, stripped)
+            continue
+
+        ident_match = re.search(r"\bIdent=(?P<ident>[01])\b", stripped)
+        if ident_match:
+            current_slot.identify_active = ident_match.group("ident") == "1"
+            continue
+
+        if stripped.startswith("Transport protocol:"):
+            current_slot.transport_protocol = normalize_text(stripped.split(":", 1)[1])
+            continue
+
+        slot_number_match = re.search(r"device slot number:\s*(?P<slot>\d+)", stripped, re.IGNORECASE)
+        if slot_number_match:
+            current_slot.slot_number = int(slot_number_match.group("slot"))
+            current_slot.description = f"Slot {current_slot.slot_number:02d}"
+            enclosure.slots[current_slot.slot_number] = current_slot
+            continue
+
+        if stripped.startswith("SAS device type:"):
+            current_slot.sas_device_type = normalize_text(stripped.split(":", 1)[1])
+            if current_slot.sas_device_type:
+                current_slot.present = "no sas device attached" not in current_slot.sas_device_type.lower()
+            continue
+
+        if stripped.startswith("target port for:"):
+            current_slot.target_port_protocol = normalize_text(stripped.split(":", 1)[1])
+            continue
+
+        if stripped.startswith("attached SAS address:"):
+            current_slot.attached_sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
+            continue
+
+        if stripped.startswith("SAS address:"):
+            current_slot.sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
+            if current_slot.sas_address == "0":
+                current_slot.present = False
+            elif current_slot.sas_address:
+                current_slot.present = True
+            continue
+
+        if stripped.startswith("phy identifier:"):
+            current_slot.phy_identifier = normalize_text(stripped.split(":", 1)[1])
+            continue
+
+    if not enclosure.slots:
+        return None
+
+    _apply_inferred_ses_profile(enclosure)
+    return enclosure
+
+
+def _apply_sg_ses_status_line(slot: SESMapSlot, line: str) -> None:
+    slot.status = normalize_text(line.split("status:", 1)[1])
+    if slot.status:
+        slot.present = "not installed" not in slot.status.lower()
+    for field_name, attribute in (
+        ("Predicted failure", "predicted_failure"),
+        ("Disabled", "disabled"),
+        ("Hot spare", "hot_spare"),
+    ):
+        match = re.search(rf"{re.escape(field_name)}=(?P<value>[01])", line)
+        if match:
+            setattr(slot, attribute, match.group("value") == "1")
+
+
 def _extract_sg_ses_device(command: str | None) -> str | None:
     if not command:
         return None
@@ -1083,9 +1242,9 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
                 if candidate.ses_device == enclosure.ses_device:
                     key = candidate_key
                     break
-        if key is None and enclosure.enclosure_name:
+        if key is None and enclosure.enclosure_name and not enclosure.enclosure_id:
             for candidate_key, candidate in merged.items():
-                if candidate.enclosure_name == enclosure.enclosure_name:
+                if candidate.enclosure_name == enclosure.enclosure_name and not candidate.enclosure_id:
                     key = candidate_key
                     break
         if key is None:
@@ -1129,7 +1288,25 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
             existing.model = existing.model or slot.model
             existing.size_text = existing.size_text or slot.size_text
             existing.sas_address = existing.sas_address or slot.sas_address
+            existing.attached_sas_address = existing.attached_sas_address or slot.attached_sas_address
             existing.sas_device_type = existing.sas_device_type or slot.sas_device_type
+            existing.transport_protocol = existing.transport_protocol or slot.transport_protocol
+            existing.phy_identifier = existing.phy_identifier or slot.phy_identifier
+            existing.target_port_protocol = existing.target_port_protocol or slot.target_port_protocol
+            for attribute in (
+                "predicted_failure",
+                "disabled",
+                "hot_spare",
+                "do_not_remove",
+                "fault_sensed",
+                "fault_requested",
+            ):
+                existing_value = getattr(existing, attribute)
+                slot_value = getattr(slot, attribute)
+                if existing_value is None:
+                    setattr(existing, attribute, slot_value)
+                elif slot_value is not None:
+                    setattr(existing, attribute, bool(existing_value or slot_value))
             if existing.present is None:
                 existing.present = slot.present
             elif slot.present is not None:
@@ -1365,6 +1542,9 @@ def build_slot_candidates_from_ses_enclosures(
                 "sas_address_hint": slot.sas_address,
                 "attached_sas_address": slot.attached_sas_address,
                 "sas_device_type": slot.sas_device_type,
+                "transport_protocol": slot.transport_protocol,
+                "phy_identifier": slot.phy_identifier,
+                "target_port_protocol": slot.target_port_protocol,
                 "ses_predicted_failure": slot.predicted_failure,
                 "ses_disabled": slot.disabled,
                 "ses_hot_spare": slot.hot_spare,
@@ -2421,6 +2601,9 @@ def canonicalize_ssh_command(command: str) -> str:
         target_device = next((arg for arg in reversed(args) if arg.startswith("/dev/sg")), None)
         has_aes_page = False
         has_ec_page = False
+        lowered_args = [arg.lower() for arg in args]
+        if "--join" in lowered_args and "--filter" in lowered_args and target_device:
+            return f"sg_ses join {target_device}"
         for index, arg in enumerate(args):
             if arg == "-p" and index + 1 < len(args) and args[index + 1].lower() == "aes":
                 has_aes_page = True
@@ -2440,8 +2623,21 @@ def canonicalize_ssh_command(command: str) -> str:
             return f"sg_ses ec {target_device}"
     if executable == "lsblk":
         normalized_args = {arg.lower() for arg in args}
-        if "-oj" in normalized_args or "-jo" in normalized_args or ("-o" in normalized_args and "-j" in normalized_args):
+        if (
+            "-oj" in normalized_args
+            or "-jo" in normalized_args
+            or "--json" in normalized_args
+            or "-j" in normalized_args
+            or ("-o" in normalized_args and "-j" in normalized_args)
+            or ("--output" in normalized_args and "--json" in normalized_args)
+        ):
             return "lsblk -OJ"
+    if executable == "lsscsi":
+        normalized_args = {arg.lower() for arg in args}
+        if "-g" in normalized_args and ("-t" in normalized_args or "--transport" in normalized_args):
+            return "lsscsi -g -t"
+        if "-g" in normalized_args:
+            return "lsscsi -g"
     if executable == "mdadm" and args[:2] == ["--detail", "--scan"]:
         return "mdadm --detail --scan"
     if executable == "nvme" and args[:2] == ["list-subsys", "-o"] and len(args) >= 3 and args[2].lower() == "json":
@@ -2476,7 +2672,7 @@ def canonicalize_ssh_command(command: str) -> str:
         lowered_storcli_args = [arg.lower() for arg in normalized_args]
         if has_json and len(lowered_storcli_args) >= 4 and lowered_storcli_args[1:3] == ["show", "all"]:
             target = lowered_storcli_args[0]
-            if target in {"/c0", "/call", "/c0/vall", "/c0/eall/sall"}:
+            if re.match(r"^/(?:c\d+|call)(?:/(?:vall|eall/sall))?$", target):
                 return f"storcli {target} show all J"
     if "/sys/kernel/debug/gpio" in command:
         return "gpio debug"
@@ -2493,6 +2689,91 @@ def parse_lsblk_json(output: str) -> list[dict[str, Any]]:
     if not isinstance(blockdevices, list):
         return []
     return [item for item in blockdevices if isinstance(item, dict)]
+
+
+def parse_lsscsi_devices(output: str, *, transport: bool = False) -> list[LinuxScsiDevice]:
+    devices: list[LinuxScsiDevice] = []
+    line_pattern = re.compile(r"^\[(?P<hctl>[^\]]+)\]\s+(?P<type>\S+)\s+(?P<body>.*)$")
+    dev_pattern = re.compile(r"(?P<device>/dev/\S+)")
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = line_pattern.match(line)
+        if not match:
+            continue
+
+        hctl = normalize_text(match.group("hctl"))
+        if not hctl:
+            continue
+        device_type = normalize_text(match.group("type"))
+        body = match.group("body").strip()
+        device_paths = dev_pattern.findall(body)
+        block_device = next((path for path in device_paths if not re.match(r"^/dev/sg\d+$", path)), None)
+        sg_device = next((path for path in reversed(device_paths) if re.match(r"^/dev/sg\d+$", path)), None)
+        detail = re.sub(r"(?<!\S)-(?!\S)", " ", dev_pattern.sub("", body)).strip()
+
+        parsed = LinuxScsiDevice(
+            hctl=hctl,
+            device_type=device_type,
+            block_device=normalize_text(block_device),
+            sg_device=normalize_text(sg_device),
+        )
+
+        transport_match = re.search(r"\b(?P<transport>[A-Za-z0-9_+-]+):(?P<address>\S+)", detail)
+        if transport or transport_match:
+            if transport_match:
+                parsed.transport = normalize_text(transport_match.group("transport").lower())
+                parsed.transport_address = normalize_text(transport_match.group("address").rstrip(",;"))
+            devices.append(parsed)
+            continue
+
+        parts = detail.split()
+        if parts:
+            parsed.vendor = normalize_text(parts[0])
+        if len(parts) > 1:
+            parsed.revision = normalize_text(parts[-1])
+        if len(parts) > 2:
+            parsed.model = normalize_text(" ".join(parts[1:-1]))
+        devices.append(parsed)
+
+    return devices
+
+
+def merge_linux_scsi_devices(*device_lists: list[LinuxScsiDevice]) -> list[LinuxScsiDevice]:
+    merged: dict[str, LinuxScsiDevice] = {}
+    for devices in device_lists:
+        for device in devices:
+            key = (
+                normalize_text(device.hctl)
+                or normalize_text(device.block_device)
+                or normalize_text(device.sg_device)
+                or f"unknown-{len(merged)}"
+            )
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = LinuxScsiDevice(
+                    hctl=device.hctl,
+                    device_type=device.device_type,
+                    vendor=device.vendor,
+                    model=device.model,
+                    revision=device.revision,
+                    block_device=device.block_device,
+                    sg_device=device.sg_device,
+                    transport=device.transport,
+                    transport_address=device.transport_address,
+                )
+                continue
+            existing.device_type = existing.device_type or device.device_type
+            existing.vendor = existing.vendor or device.vendor
+            existing.model = existing.model or device.model
+            existing.revision = existing.revision or device.revision
+            existing.block_device = existing.block_device or device.block_device
+            existing.sg_device = existing.sg_device or device.sg_device
+            existing.transport = existing.transport or device.transport
+            existing.transport_address = existing.transport_address or device.transport_address
+    return list(merged.values())
 
 
 def parse_ubntstorage_json(output: str) -> list[dict[str, Any]]:
@@ -2752,6 +3033,8 @@ def _collect_storcli_drive_details(response_data: dict[str, Any]) -> dict[str, d
             flattened["enclosure_id"] = enclosure_id
         if slot is not None:
             flattened["slot"] = slot
+        if controller_id:
+            details.setdefault(f"{controller_id}:{slot_key}", {}).update(flattened)
         details.setdefault(slot_key, {}).update(flattened)
     return details
 
@@ -2783,7 +3066,12 @@ def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
         enclosure_id, slot, slot_key = _parse_storcli_eid_slot(row.get("EID:Slt") or row.get("EID:Slt "))
         if slot_key is None:
             continue
-        detail = details_by_slot.get(slot_key, {})
+        row_controller_id = normalize_text(str(row.get("Ctl") or row.get("Controller") or ""))
+        detail = (
+            details_by_slot.get(f"{row_controller_id.lower()}:{slot_key}", {})
+            if row_controller_id
+            else {}
+        ) or details_by_slot.get(slot_key, {})
         serial = normalize_text(
             str(
                 _first_detail_value(detail, "SN", "Serial Number", "Inquiry Data")
@@ -2828,7 +3116,7 @@ def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
                 "slot_key": slot_key,
                 "enclosure_id": enclosure_id,
                 "slot": slot,
-                "controller_id": normalize_text(str(detail.get("controller_id") or row.get("Ctl") or "c0")),
+                "controller_id": normalize_text(str(detail.get("controller_id") or row_controller_id or "c0")),
                 "device_id": normalize_text(str(row.get("DID") if row.get("DID") is not None else "")),
                 "state": normalize_text(str(row.get("State") or "")),
                 "drive_group": normalize_text(str(row.get("DG") if row.get("DG") is not None else "")),
@@ -3013,6 +3301,16 @@ def parse_ssh_outputs(
         parsed.zpool_members = parse_zpool_status(normalized_outputs["zpool status -gP"])
     if normalized_outputs.get("lsblk -OJ"):
         parsed.linux_blockdevices = parse_lsblk_json(normalized_outputs["lsblk -OJ"])
+    lsscsi_devices: list[LinuxScsiDevice] = []
+    if normalized_outputs.get("lsscsi -g"):
+        lsscsi_devices.extend(parse_lsscsi_devices(normalized_outputs["lsscsi -g"]))
+    if normalized_outputs.get("lsscsi -g -t"):
+        lsscsi_devices = merge_linux_scsi_devices(
+            lsscsi_devices,
+            parse_lsscsi_devices(normalized_outputs["lsscsi -g -t"], transport=True),
+        )
+    if lsscsi_devices:
+        parsed.linux_scsi_devices = lsscsi_devices
     if normalized_outputs.get("mdadm --detail --scan"):
         parsed.linux_mdadm_arrays = parse_mdadm_detail_scan(normalized_outputs["mdadm --detail --scan"])
     if normalized_outputs.get("nvme list-subsys -o json"):
@@ -3035,12 +3333,19 @@ def parse_ssh_outputs(
         parsed.esxi_vmfs_extents = parse_esxcli_table(normalized_outputs["esxcli storage vmfs extent list"])
     if normalized_outputs.get("esxcli storage san sas list"):
         parsed.esxi_sas_adapters = parse_esxcli_key_value_sections(normalized_outputs["esxcli storage san sas list"])
-    if normalized_outputs.get("storcli /c0 show all J"):
-        parsed.esxi_storcli_controller = parse_storcli_controller_info(normalized_outputs["storcli /c0 show all J"])
-    if normalized_outputs.get("storcli /c0/vall show all J"):
-        parsed.esxi_storcli_virtual_drives = parse_storcli_virtual_drives(normalized_outputs["storcli /c0/vall show all J"])
-    if normalized_outputs.get("storcli /c0/eall/sall show all J"):
-        parsed.esxi_storcli_physical_drives = parse_storcli_physical_drives(normalized_outputs["storcli /c0/eall/sall show all J"])
+    for command_key in sorted(normalized_outputs):
+        if re.match(r"^storcli /(?:c\d+|call) show all J$", command_key):
+            controller_info = parse_storcli_controller_info(normalized_outputs[command_key])
+            if controller_info and not parsed.esxi_storcli_controller:
+                parsed.esxi_storcli_controller = controller_info
+        elif re.match(r"^storcli /(?:c\d+|call)/vall show all J$", command_key):
+            parsed.esxi_storcli_virtual_drives.extend(
+                parse_storcli_virtual_drives(normalized_outputs[command_key])
+            )
+        elif re.match(r"^storcli /(?:c\d+|call)/eall/sall show all J$", command_key):
+            parsed.esxi_storcli_physical_drives.extend(
+                parse_storcli_physical_drives(normalized_outputs[command_key])
+            )
     if normalized_outputs.get("gmultipath list"):
         parsed.multipath_info = parse_gmultipath_list(normalized_outputs["gmultipath list"])
     if normalized_outputs.get("camcontrol devlist"):
@@ -3080,6 +3385,13 @@ def parse_ssh_outputs(
         if not command_key.startswith("sg_ses aes /dev/sg"):
             continue
         enclosure = parse_sg_ses_aes(output, command_key)
+        if enclosure:
+            parsed.ses_enclosures.append(enclosure)
+
+    for command_key, output in normalized_outputs.items():
+        if not command_key.startswith("sg_ses join /dev/sg"):
+            continue
+        enclosure = parse_sg_ses_join_filter(output, command_key)
         if enclosure:
             parsed.ses_enclosures.append(enclosure)
 

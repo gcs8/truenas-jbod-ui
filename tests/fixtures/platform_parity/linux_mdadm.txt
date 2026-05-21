@@ -1,0 +1,1 @@
+ARRAY /dev/md127 metadata=1.2 name=linux-parity:nvme-data UUID=3a6e3d7d:3f4247f1:bb4f7f16:f0f2d7f5

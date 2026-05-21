@@ -65,7 +65,7 @@ scrubbed demo fixtures.
     60-bay top-loader sample with real make/model/capacity texture, saved
     storage views, SMART summaries, and real history samples
   - current: the pool topology follows the validated CORE 60-bay vdev
-    membership pattern, including data `raidz2` groups, `spare-1`, `mirror-8`
+    membership pattern, including data `raidz2` groups, pool-level `spares`, `mirror-8`
     special members, and matching empty bays
   - current: the saved `4x NVMe Carrier Card` and `Boot SATADOMs` views are
     included by their real configured view names

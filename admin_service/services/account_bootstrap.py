@@ -69,6 +69,7 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     "scale": (
         "/usr/bin/sg_ses -p aes /dev/sg*",
         "/usr/bin/sg_ses -p ec /dev/sg*",
+        "/usr/bin/sg_ses --join --filter /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
         "/usr/sbin/smartctl -x -j *",
@@ -78,6 +79,9 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     ),
     "linux": (
         "/usr/sbin/mdadm --detail --scan",
+        "/usr/bin/sg_ses -p aes /dev/sg*",
+        "/usr/bin/sg_ses -p ec /dev/sg*",
+        "/usr/bin/sg_ses --join --filter /dev/sg*",
         "/usr/sbin/smartctl -x -j *",
         "/usr/sbin/smartctl -x *",
         "/usr/local/sbin/smartctl -x -j *",
@@ -86,6 +90,7 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     "quantastor": (
         "/usr/bin/sg_ses -p aes /dev/sg*",
         "/usr/bin/sg_ses -p ec /dev/sg*",
+        "/usr/bin/sg_ses --join --filter /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
         "/usr/sbin/smartctl -x -j *",
@@ -540,6 +545,8 @@ class ServiceAccountBootstrapService:
                     break
             if target_device and page_name:
                 return f"{executable} -p {page_name} /dev/sg*"
+            if target_device and "--join" in args and "--filter" in args:
+                return f"{executable} --join --filter /dev/sg*"
             if target_device and any(arg == "--set=ident" for arg in args):
                 return f"{executable} --dev-slot-num=* --set=ident /dev/sg*"
             if target_device and any(arg == "--clear=ident" for arg in args):

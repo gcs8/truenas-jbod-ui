@@ -1,0 +1,52 @@
+{
+  "storageSystemEnum": [
+    {
+      "id": "node-a",
+      "name": "QSOSN HA Node A",
+      "isMaster": true
+    },
+    {
+      "id": "node-b",
+      "name": "QSOSN HA Node B",
+      "isMaster": false
+    }
+  ],
+  "physicalDiskEnum": [
+    {
+      "id": "disk-a",
+      "name": "sdq",
+      "slot": "01",
+      "serial": "QSPARITY0001",
+      "model": "HGST HUH721212ALE604",
+      "status": "ONLINE",
+      "poolId": "pool-a"
+    }
+  ],
+  "storagePoolEnum": [
+    {
+      "id": "pool-a",
+      "name": "bulk",
+      "systemId": "node-a"
+    }
+  ],
+  "storagePoolDeviceEnum": {
+    "RestError": {
+      "message": "Optional storage pool device endpoint unavailable in this fixture"
+    }
+  },
+  "haGroupEnum": {
+    "status": "error",
+    "message": "Optional HA group endpoint unavailable in this fixture"
+  },
+  "hwDiskEnum": [
+    {
+      "id": "hw-disk-a",
+      "slot": "01",
+      "serial": "QSPARITY0001",
+      "systemId": "node-a"
+    }
+  ],
+  "hwEnclosureEnum": {
+    "error": "Optional enclosure endpoint unavailable in this fixture"
+  }
+}

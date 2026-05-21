@@ -159,6 +159,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn('data-fabric-mode="trace"', fabric_text)
         self.assertIn('data-fabric-mode="disk"', fabric_text)
         self.assertIn('id="fabric-focus-strip"', fabric_text)
+        self.assertIn('id="fabric-page-eyebrow"', fabric_text)
         self.assertIn('id="fabric-back-button"', fabric_text)
         self.assertNotIn('id="fabric-back-link"', fabric_text)
 
@@ -182,6 +183,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn('<option value="none">Password Only / No Key</option>', template_text)
         self.assertIn('id="setup-esxi-host-prep-panel"', template_text)
         self.assertIn('id="setup-esxi-host-prep-package-select"', template_text)
+        self.assertIn('id="setup-platform-requirements"', template_text)
 
     def test_main_ui_script_filters_admin_only_storage_views_from_selector(self) -> None:
         script_path = Path(__file__).resolve().parents[1] / "app" / "static" / "app.js"
@@ -236,6 +238,14 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("renderDiskPathMode", script_text)
         self.assertIn("sortFabricNodesForLane", script_text)
         self.assertIn("compareFabricTraceFlow", script_text)
+        self.assertIn("fabricViewCopy", script_text)
+        self.assertIn("linux_ses", script_text)
+        self.assertIn("storage_quantastor", script_text)
+        self.assertIn("storage_esxi", script_text)
+        self.assertIn("Storage Lanes", script_text)
+        self.assertIn("SES Link", script_text)
+        self.assertIn("Quantastor HA-node", script_text)
+        self.assertIn("Storage Fabric evidence", script_text)
         self.assertIn("numeric: true", script_text)
         self.assertIn("slotLayoutRows", script_text)
         self.assertIn("bestDiagnosticNode", script_text)
@@ -274,12 +284,47 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn('`${values.length} record${values.length === 1 ? "" : "s"}`', script_text)
         self.assertIn("Fabric Inspector", script_text)
 
+    def test_dedicated_sas_fabric_disk_path_link_card_stays_local(self) -> None:
+        script_path = Path(__file__).resolve().parents[1] / "app" / "static" / "sas_fabric_view.js"
+        script_text = script_path.read_text(encoding="utf-8")
+        start = script_text.index("function renderDiskPathBranch")
+        end = script_text.index("function renderDiskPathMode")
+        disk_path_branch = script_text[start:end]
+
+        self.assertIn("kind: labels.path", disk_path_branch)
+        self.assertIn("const pathNodeId =", disk_path_branch)
+        self.assertIn("const pathTraceId =", disk_path_branch)
+        self.assertIn("nodeId: pathNodeId", disk_path_branch)
+        self.assertIn('traceId: pathNodeId ? "" : pathTraceId', disk_path_branch)
+        self.assertNotIn('modeTarget: "impact"', disk_path_branch)
+
+    def test_dedicated_sas_fabric_disk_path_keeps_active_bay_during_node_clicks(self) -> None:
+        script_path = Path(__file__).resolve().parents[1] / "app" / "static" / "sas_fabric_view.js"
+        script_text = script_path.read_text(encoding="utf-8")
+        start = script_text.index("function selectedDiskTrace")
+        end = script_text.index("function layoutSlotCount")
+        selected_disk_trace = script_text[start:end]
+
+        self.assertIn("selectedDiskTraceId", script_text)
+        self.assertIn("function rememberDiskTrace", script_text)
+        self.assertIn("function rememberedDiskTrace", script_text)
+        self.assertIn("rememberDiskTrace(trace.id, fabric)", selected_disk_trace)
+        self.assertIn("const rememberedTrace = rememberedDiskTrace(fabric)", selected_disk_trace)
+        self.assertLess(
+            selected_disk_trace.index("const rememberedTrace = rememberedDiskTrace(fabric)"),
+            selected_disk_trace.index("const candidateSlots"),
+        )
+
     def test_admin_script_disables_linux_bootstrap_flow_for_esxi(self) -> None:
         script_path = Path(__file__).resolve().parents[1] / "admin_service" / "static" / "admin.js"
         script_text = script_path.read_text(encoding="utf-8")
 
         self.assertIn("platformSupportsBootstrap", script_text)
         self.assertIn("setupPlatformUsesSshOnlyHost", script_text)
+        self.assertIn("renderSetupPlatformRequirements", script_text)
+        self.assertIn("setupPlatformRequirements", script_text)
+        self.assertIn("Required", script_text)
+        self.assertIn("Unsupported", script_text)
         self.assertIn("truenas_host: primaryHost", script_text)
         self.assertIn('value === "generate" || value === "manual" || value === "none"', script_text)
         self.assertIn('setupSshSudoPasswordField.classList.toggle("hidden", !savedSudoSupported)', script_text)
@@ -696,6 +741,19 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertTrue(
             any("/var/log/messages" in command for command in payload["setup_platform_defaults"]["core"]["ssh_commands"])
         )
+        scale_requirements = payload["setup_platform_defaults"]["scale"]["requirements"]
+        self.assertIn("/usr/bin/lsscsi -g -t", scale_requirements["required"][1])
+        self.assertIn("/usr/bin/lsblk --json", scale_requirements["required"][1])
+        self.assertTrue(any("/dev/sgN" in item for item in scale_requirements["optional"]))
+        self.assertTrue(any("nvme-cli" in item for item in scale_requirements["optional"]))
+        self.assertTrue(any("sesutil" in item for item in scale_requirements["unsupported"]))
+        self.assertTrue(any("mprutil" in item for item in scale_requirements["unsupported"]))
+        linux_requirements = payload["setup_platform_defaults"]["linux"]["requirements"]
+        self.assertTrue(any("lsblk --json" in item for item in linux_requirements["required"]))
+        self.assertIn("lsscsi -g -t", linux_requirements["guidance"])
+        esxi_requirements = payload["setup_platform_defaults"]["esxi"]["requirements"]
+        self.assertTrue(any("Linux sudoers/bootstrap" in item for item in esxi_requirements["unsupported"]))
+        self.assertIn("/cN or /call", esxi_requirements["guidance"])
         self.assertIn("esxi", payload["setup_platform_defaults"])
         self.assertIn("ipmi", payload["setup_platform_defaults"])
         self.assertEqual(payload["ssh_keys"][0]["name"], "id_truenas")
@@ -1710,8 +1768,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                     install_sudo_rules=True,
                     sudo_commands=[
                         "/usr/sbin/zpool status -gP",
-                        "sudo -n /usr/bin/sg_ses -p aes /dev/sg27",
-                        "sudo -n /usr/bin/sg_ses -p ec /dev/sg38",
+                        "sudo -n /usr/bin/sg_ses -p aes /dev/sg26",
+                        "sudo -n /usr/bin/sg_ses -p ec /dev/sg37",
+                        "sudo -n /usr/bin/sg_ses --join --filter /dev/sg26",
                     ],
                 )
             )
@@ -1726,6 +1785,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertIn("Cmnd_Alias JBODMAP_SCALE_CMDS", payload["content"])
         self.assertIn("/usr/bin/sg_ses -p aes /dev/sg*", payload["content"])
         self.assertIn("/usr/bin/sg_ses -p ec /dev/sg*", payload["content"])
+        self.assertIn("/usr/bin/sg_ses --join --filter /dev/sg*", payload["content"])
         self.assertNotIn("/usr/sbin/zpool status -gP", payload["content"])
 
     def test_sudoers_preview_route_includes_core_mprutil_topology_rules(self) -> None:

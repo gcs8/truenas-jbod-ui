@@ -1,0 +1,31 @@
+{
+  "Controllers": [
+    {
+      "Command Status": {
+        "Status": "Success",
+        "Description": "None"
+      },
+      "Response Data": {
+        "VD LIST": [
+          {
+            "DG/VD": "0/0",
+            "TYPE": "RAID1",
+            "State": "Optl",
+            "Size": "7.276 TB",
+            "Name": "ESXi-Data"
+          }
+        ],
+        "/c1/v0": {
+          "Name": "ESXi-Data",
+          "SCSI NAA Id": "naa.600605b00abc00000000000000000041"
+        },
+        "PDs for VD 0": [
+          {
+            "EID:Slt": "252:7",
+            "State": "Onln"
+          }
+        ]
+      }
+    }
+  ]
+}

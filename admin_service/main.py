@@ -58,7 +58,11 @@ from app.services.release_status import ReleaseStatusService, describe_release_s
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.storage_view_templates import list_storage_view_templates
 from app.services.storage_views import resolve_system_storage_views
-from app.services.system_setup import SystemSetupService, default_ssh_commands_for_platform
+from app.services.system_setup import (
+    SystemSetupService,
+    default_ssh_commands_for_platform,
+    setup_requirements_for_platform,
+)
 from app.services.parsers import normalize_text
 from history_service.config import get_history_settings
 from history_service.store import HistoryStore
@@ -1274,6 +1278,7 @@ def serialize_platform_defaults() -> dict[str, dict[str, object]]:
     return {
         platform: {
             "ssh_commands": default_ssh_commands_for_platform(platform),
+            "requirements": setup_requirements_for_platform(platform),
         }
         for platform in ("core", "scale", "linux", "quantastor", "esxi", "ipmi")
     }

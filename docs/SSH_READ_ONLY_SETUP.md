@@ -501,10 +501,11 @@ command-limited sudo for the exact `sg_ses` probes the app needs.
 On the tested SCALE system:
 
 - SSH as `jbodmap` worked
-- `/usr/bin/lsscsi -g` identified two enclosure SG devices:
-  - `/dev/sg27`
-  - `/dev/sg38`
-- direct reads like `sg_ses -p aes /dev/sg27` failed with `Permission denied`
+- `/usr/bin/lsscsi -g -t` identified the live enclosure SG devices and their
+  SAS transport addresses:
+  - Front 24 Bay through `/dev/sg26`
+  - Rear 12 Bay through `/dev/sg37`
+- direct reads like `sg_ses -p aes /dev/sg26` failed with `Permission denied`
 - direct `smartctl` reads against disk devices also needed elevated access
 - the API key and the `jbodmap` shell account were able to read inventory but
   not modify user permissions directly
@@ -514,15 +515,17 @@ from a root shell on the appliance.
 
 ### Recommended SCALE Sudo Allow-List
 
-If you want first-pass Linux SES mapping support, grant `jbodmap` the AES and
-enclosure-status page reads for the known enclosure SG devices:
+If you want first-pass Linux SES mapping support, grant `jbodmap` the AES,
+enclosure-status, and joined-filter page reads for the known enclosure SG
+devices:
 
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/bin/sg_ses -p aes /dev/sg27","/usr/bin/sg_ses -p aes /dev/sg38","/usr/bin/sg_ses -p ec /dev/sg27","/usr/bin/sg_ses -p ec /dev/sg38"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/bin/sg_ses -p aes /dev/sg26","/usr/bin/sg_ses -p aes /dev/sg37","/usr/bin/sg_ses -p ec /dev/sg26","/usr/bin/sg_ses -p ec /dev/sg37","/usr/bin/sg_ses --join --filter /dev/sg26","/usr/bin/sg_ses --join --filter /dev/sg37"]}'
 ```
 
-That is the smallest current allow-list for read-only enclosure discovery plus
-live identify-state reads on this SCALE host.
+That is the smallest current allow-list for read-only enclosure discovery,
+live identify-state reads, and joined slot/transport metadata on this SCALE
+host.
 
 On the tested SCALE box, the web UI allow-list also worked when
 `/usr/bin/sg_ses` was added to both:
@@ -556,17 +559,17 @@ commands after validating the safe `sg_ses` syntax for the target backplanes.
 On this host the app was validated with:
 
 ```bash
-sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg27
-sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg27
-sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg38
-sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg38
+sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg26
+sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg26
+sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg37
+sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg37
 ```
 
 If your SCALE build accepts wildcard command arguments in sudo rules, a
 narrower exact-command shape would look like:
 
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/bin/sg_ses -p aes /dev/sg27","/usr/bin/sg_ses -p aes /dev/sg38","/usr/bin/sg_ses -p ec /dev/sg27","/usr/bin/sg_ses -p ec /dev/sg38","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg27","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg27","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg38","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg38"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/bin/sg_ses -p aes /dev/sg26","/usr/bin/sg_ses -p aes /dev/sg37","/usr/bin/sg_ses -p ec /dev/sg26","/usr/bin/sg_ses -p ec /dev/sg37","/usr/bin/sg_ses --join --filter /dev/sg26","/usr/bin/sg_ses --join --filter /dev/sg37","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg26","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg26","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg37","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg37"]}'
 ```
 
 The tested web UI path on this box was broader: add `/usr/bin/sg_ses` to both
@@ -581,12 +584,16 @@ SSH command list should look like:
 ```yaml
 commands:
   - /usr/sbin/zpool status -gP
-  - /usr/bin/lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,HCTL
+  - /usr/bin/lsblk --json --bytes --output NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,TRAN,HCTL,PKNAME,MOUNTPOINTS,FSTYPE,UUID,PARTUUID,LOG-SEC,PHY-SEC
   - /usr/bin/lsscsi -g
-  - sudo -n /usr/bin/sg_ses -p aes /dev/sg27
-  - sudo -n /usr/bin/sg_ses -p aes /dev/sg38
-  - sudo -n /usr/bin/sg_ses -p ec /dev/sg27
-  - sudo -n /usr/bin/sg_ses -p ec /dev/sg38
+  - /usr/bin/lsscsi -g -t
+  - /usr/sbin/nvme list-subsys -o json 2>/dev/null || /usr/bin/nvme list-subsys -o json 2>/dev/null || true
+  - sudo -n /usr/bin/sg_ses -p aes /dev/sg26
+  - sudo -n /usr/bin/sg_ses -p aes /dev/sg37
+  - sudo -n /usr/bin/sg_ses -p ec /dev/sg26
+  - sudo -n /usr/bin/sg_ses -p ec /dev/sg37
+  - sudo -n /usr/bin/sg_ses --join --filter /dev/sg26
+  - sudo -n /usr/bin/sg_ses --join --filter /dev/sg37
 ```
 
 `smartctl` does not need to be added to the standing SSH command list above.
@@ -618,15 +625,18 @@ jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/nvme*n*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*
-jbodmap ALL=(root) NOPASSWD: /usr/bin/lsblk -OJ
+jbodmap ALL=(root) NOPASSWD: /usr/bin/lsblk --json --bytes --output *
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail --scan
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail /dev/md*
 ```
 
 `nvme list-subsys -o json` may work without sudo and is useful for controller
-and PCIe-path discovery. The privileged `nvme` commands above are only needed
-for on-demand controller-native enrichment such as firmware revision, protocol
-version, namespace GUIDs, and warning/critical temperature thresholds.
+and PCIe-path discovery. The app treats the standing subsystem probe as an
+optional enrichment source, so the guarded command form above can safely return
+empty output on hosts without `nvme-cli` or NVMe media. The privileged `nvme`
+commands above are only needed for on-demand controller-native enrichment such
+as firmware revision, protocol version, namespace GUIDs, and warning/critical
+temperature thresholds.
 
 ## Quantastor HA SES Notes
 
@@ -645,6 +655,7 @@ The tested wildcard sudoers entries for `jbodmap` were:
 Defaults:jbodmap !requiretty
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p aes /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p ec /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --join --filter /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/sd*

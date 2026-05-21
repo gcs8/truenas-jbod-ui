@@ -1,13 +1,13 @@
 {% extends "base.html" %}
-{% block title %}SAS Fabric - TrueNAS JBOD Enclosure UI{% endblock %}
+{% block title %}Storage Fabric - TrueNAS JBOD Enclosure UI{% endblock %}
 {% block body %}
 <div class="app-shell fabric-page-shell">
   <header class="topbar fabric-page-topbar">
     <div>
-      <p class="eyebrow">TrueNAS CORE / SAS Fabric</p>
-      <h1>SAS Fabric</h1>
+      <p class="eyebrow" id="fabric-page-eyebrow">TrueNAS CORE / Storage Fabric</p>
+      <h1>Storage Fabric</h1>
       <p class="subtle" id="fabric-page-summary">
-        HBA, path, expander, SES, and affected-bay topology for the selected live enclosure.
+        Storage source, path, enclosure or view, pool, vdev, and bay evidence for the selected view.
       </p>
     </div>
     <div class="topbar-meta">
@@ -48,20 +48,20 @@
   </header>
 
   <section class="toolbar fabric-view-toolbar">
-    <div class="fabric-mode-tabs" role="tablist" aria-label="SAS fabric map mode">
-      <button class="button secondary small" id="fabric-mode-lanes" type="button" data-fabric-mode="lanes" aria-pressed="true">Fabric Lanes</button>
+    <div class="fabric-mode-tabs" role="tablist" aria-label="Storage Fabric map mode">
+      <button class="button secondary small" id="fabric-mode-lanes" type="button" data-fabric-mode="lanes" aria-pressed="true">Storage Lanes</button>
       <button class="button secondary small" id="fabric-mode-impact" type="button" data-fabric-mode="impact" aria-pressed="false">Impact Map</button>
       <button class="button secondary small" id="fabric-mode-trace" type="button" data-fabric-mode="trace" aria-pressed="false">Physical Trace</button>
       <button class="button secondary small" id="fabric-mode-disk" type="button" data-fabric-mode="disk" aria-pressed="false">Disk Path</button>
     </div>
     <div class="fabric-view-actions">
       <a class="button secondary" id="fabric-back-button" data-fabric-back-link href="/">Back to Enclosure</a>
-      <button class="button" id="fabric-refresh-button" type="button">Refresh Fabric</button>
+      <button class="button" id="fabric-refresh-button" type="button">Refresh Storage Fabric</button>
     </div>
   </section>
 
   <section class="status-strip fabric-status-strip" id="fabric-status-strip">
-    <div class="status-chip" id="fabric-api-chip">FABRIC</div>
+    <div class="status-chip" id="fabric-api-chip">STORAGE</div>
     <div class="status-text" id="fabric-status-text">Ready.</div>
   </section>
 
@@ -69,7 +69,7 @@
     <div class="summary-card">
       <span class="summary-label">Controllers</span>
       <span class="summary-value" id="fabric-summary-controllers">{{ fabric.controllers | length }}</span>
-      <span class="summary-note">HBAs reported</span>
+      <span class="summary-note">sources reported</span>
     </div>
     <div class="summary-card">
       <span class="summary-label">Paths</span>
@@ -79,7 +79,7 @@
     <div class="summary-card">
       <span class="summary-label">Expanders</span>
       <span class="summary-value" id="fabric-summary-expanders">{{ fabric.expanders | length }}</span>
-      <span class="summary-note">MPR expander rows</span>
+      <span class="summary-note">transport detail</span>
     </div>
     <div class="summary-card">
       <span class="summary-label">Enclosures</span>
@@ -101,8 +101,8 @@
   <section class="panel fabric-view-panel">
     <div class="panel-header compact">
       <div>
-        <h2 id="fabric-map-title">Fabric Lanes</h2>
-        <p id="fabric-map-subtitle" class="subtle">Top-down path lanes aligned by controller.</p>
+        <h2 id="fabric-map-title">Storage Lanes</h2>
+        <p id="fabric-map-subtitle" class="subtle">Top-down path lanes aligned by source.</p>
       </div>
     </div>
     <div id="fabric-warning-list" class="fabric-warning-list"></div>
@@ -112,7 +112,7 @@
       <aside class="fabric-inspector-panel">
         <h3 id="fabric-inspector-title">Fabric Inspector</h3>
         <div id="fabric-inspector-body" class="fabric-inspector-body">
-          Select a controller, path, expander, enclosure, or bay trace.
+          Select a source, path, enclosure, pool, vdev, or bay trace.
         </div>
       </aside>
     </div>

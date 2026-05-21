@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.20.0`.
+This file tracks the current intended release direction after `v0.20.1`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -12,32 +12,32 @@ Detailed execution plans live here:
 - [`docs/V0_5_QUANTASTOR_PLAN.md`](./V0_5_QUANTASTOR_PLAN.md)
 - [`docs/V0_8_HISTORY_PLAN.md`](./V0_8_HISTORY_PLAN.md)
 - [`docs/V0_9_0_PLAN.md`](./V0_9_0_PLAN.md)
-- [`docs/V0_11_0_PLAN.md`](./V0_11_0_PLAN.md)
 - [`docs/PROFILE_AUTHORING.md`](./PROFILE_AUTHORING.md)
+
+The old `docs/V0_11_0_PLAN.md` notes are preserved locally under
+`artifacts/deferred-docs/V0_11_0_PLAN.md` for later archaeology instead of
+remaining part of the active docs set.
 
 ## Current Snapshot
 
-`v0.20.0` just shipped the first read-only SAS Fabric/topology release for
-TrueNAS CORE:
+`v0.20.1` is a Storage Fabric polish and validation release on top of the
+`v0.20.0` SAS Fabric foundation:
 
-- normalized SAS Fabric graph and `/api/sas-fabric` payloads
-- main-page `Topology` panel plus dedicated `/sas-fabric` workspace
-- Disk Path branch views with path-leg-scoped recent fault evidence
-- timestamped CORE MPR/CAM event collection through a narrow optional tail
-  rule, with `dmesg` order fallback
-- source/confidence-labeled diagnostic decoding for common SCSI, CAM, sense,
-  retry, LOG SENSE, and attributed Broadcom/LSI `loginfo` evidence
-- HBA PCIe slot enrichment from CORE PCI/DMI/sysctl evidence
+- the dedicated fabric surface now presents as `Storage Fabric`
+- CORE keeps the deep SAS/HBA/expander diagnostic path
+- SCALE/Linux can render Linux SES-backed Storage Fabric maps when SG evidence
+  is present
+- Quantastor, ESXi, generic Linux, and BMC/IPMI maps stay read-only and
+  source-labeled instead of claiming CORE-equivalent SAS detail
+- Disk Path clickability, first-click stability, SCALE identity reuse, and
+  public-demo spare grouping are covered by the `0.20.1` validation gate
 
 The next cycle should stay practical and incremental:
 
-- keep the shipped `0.20.0` image stable unless a real runtime regression
-  appears
-- continue decoder growth where standards/vendor references are strong enough
-- keep any weaker SAS/backplane inferences visibly labeled instead of turning
-  them into fake certainty
-- add operator-pinned ordering or profile hints only if real hardware shows the
-  current inferred order is not stable enough
+- use `0.21.x` as a code-quality and test-confidence pitstop
+- defer richer platform-native Storage Fabric enrichment to `0.22.x`
+- keep weaker SAS/backplane/platform inferences visibly labeled instead of
+  turning them into fake certainty
 
 ## Guiding Principle
 

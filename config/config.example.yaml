@@ -107,14 +107,17 @@ ssh:
 #       strict_host_key_checking: true
 #       commands:
 #         - /usr/sbin/zpool status -gP
-#         - /usr/bin/lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,HCTL
+#         - /usr/bin/lsblk --json --bytes --output NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,TRAN,HCTL,PKNAME,MOUNTPOINTS,FSTYPE,UUID,PARTUUID,LOG-SEC,PHY-SEC
 #         - /usr/bin/lsscsi -g
+#         - /usr/bin/lsscsi -g -t
 #         # Optional if you allow limited Linux SES reads for enclosure discovery:
-#         - sudo -n /usr/bin/sg_ses -p aes /dev/sg27
-#         - sudo -n /usr/bin/sg_ses -p aes /dev/sg38
+#         - sudo -n /usr/bin/sg_ses -p aes /dev/sg26
+#         - sudo -n /usr/bin/sg_ses -p aes /dev/sg37
+#         - sudo -n /usr/bin/sg_ses --join --filter /dev/sg26
+#         - sudo -n /usr/bin/sg_ses --join --filter /dev/sg37
 #         # Optional if you also want the UI to refresh live identify LED state:
-#         - sudo -n /usr/bin/sg_ses -p ec /dev/sg27
-#         - sudo -n /usr/bin/sg_ses -p ec /dev/sg38
+#         - sudo -n /usr/bin/sg_ses -p ec /dev/sg26
+#         - sudo -n /usr/bin/sg_ses -p ec /dev/sg37
 #         # smartctl does not need to live in the standing command list; the app
 #         # runs it on demand for the selected slot, but the user still needs
 #         # sudo permission for /usr/sbin/smartctl on the SCALE host.
@@ -137,9 +140,10 @@ ssh:
 #       known_hosts_path: /app/data/known_hosts
 #       strict_host_key_checking: true
 #       commands:
-#         - /usr/bin/lsblk -OJ
+#         - /usr/bin/lsblk --json --bytes --output NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,TRAN,HCTL,PKNAME,MOUNTPOINTS,FSTYPE,UUID,PARTUUID,LOG-SEC,PHY-SEC
 #         - sudo -n /usr/sbin/mdadm --detail --scan
 #         - /usr/sbin/nvme list-subsys -o json
+#         - /usr/bin/lsscsi -g -t
 #   - id: unvr
 #     label: UniFi UNVR
 #     default_profile_id: ubiquiti-unvr-front-4

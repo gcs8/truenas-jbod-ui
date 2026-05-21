@@ -1,6 +1,7 @@
 # v0.20.1 Platform Parity Plan
 
-Status: planning slice started on 2026-05-20
+Status: planning slice started on 2026-05-20; first Storage Fabric
+implementation bite completed on 2026-05-20
 Branch: `codex/v0.20.1-kickoff-2026-05-20-post-0.20.0`
 
 This note defines what "functional parity" should mean across TrueNAS CORE,
@@ -40,13 +41,53 @@ Parity is not identical features. It is a predictable operator experience:
 - debug/export evidence preserves the raw source context needed to reproduce
   or support a problem
 
+## Storage Fabric Direction
+
+Operator direction changed after the first SCALE/Linux SES pass: the dedicated
+fabric surface should become **Storage Fabric**, not a CORE-only SAS Fabric
+page. CORE remains the gold-standard example for the kind of facts worth
+bubbling up, but every platform should render the best honest path graph it can
+from its own evidence. That means:
+
+- CORE continues to expose deep HBA, path, expander, SES, bay, pool/vdev, disk,
+  and decoded fault evidence.
+- SCALE/Linux SES can expose host/source, SG enclosure, SES slot, bay, disk,
+  pool/vdev, SMART, and identify evidence; future Linux SAS sysfs reads may add
+  controller/phy/domain context when present.
+- Quantastor can expose storage-system/HA-node, hardware-enclosure/SES host,
+  disk, pool, spare, owner/fence, SMART, and optional `qs`/`sg_ses` evidence.
+- ESXi can expose host, controller, virtual drive, physical member,
+  datastore/LUN, SMART, and StorCLI/PercCLI health evidence.
+- Generic Linux can expose host, block-device, NVMe, mdadm, filesystem,
+  storage-view/profile, SMART, and optional SES/BMC/vendor evidence.
+
+Research notes backing the next bites:
+
+- Linux kernel `libsas` documentation says the SAS sysfs tree shows the current
+  physical SAS domain layout and device parameters, which makes it a candidate
+  enrichment source where hosts expose `/sys/class/sas_*`.
+- `sg_ses` can join Element Descriptor, Enclosure Status, Additional Element
+  Status, and threshold pages, and can address elements by descriptor, device
+  slot number, or SAS address where the enclosure supports those fields.
+- `lsblk` reads sysfs and udev and has JSON output, making it a good low-risk
+  generic Linux/NVMe/SATA relationship source.
+- `smartctl -j` provides machine-readable SMART detail; `nvme smart-log`
+  exposes NVMe SMART log pages where `smartctl` is weak or unavailable.
+- ESXi `esxcli storage` exposes device SMART, RAID member, path stats, device
+  lists, and UID maps; vendor CLI output such as StorCLI can expose controller,
+  virtual-drive, physical-drive, drive-group, and boot-drive topology.
+- Quantastor `qs` CLI documents hardware disk list/search, hardware enclosure,
+  disk identify, pool add/read-cache/spare/log operations, and disk-list
+  filters spanning storage systems, pools, spares, vendor/product, and disk
+  type.
+
 ## Non-Goals
 
 - Do not rewrite the inventory architecture in one pass.
 - Do not make ESXi write or RAID-management actions part of this parity push.
 - Do not install packages on TrueNAS or Quantastor appliances from the app.
-- Do not turn the CORE SAS Fabric view into a generic feature name if the
-  other platforms only expose weaker transport evidence.
+- Do not claim unproven physical hops. Weak evidence is still useful when it is
+  labeled as logical, inferred, or platform-native.
 - Do not hardcode lab-only system ids, controller numbers, SAS addresses, or
   chassis assumptions.
 
@@ -89,18 +130,19 @@ The `v0.20.0` release already captured the expanded CORE `mprutil`,
 
 SCALE support is real but should be described as Linux-SES backed, not "CORE
 with a different API." The current adapter can use middleware disk/pool data,
-Linux `zpool`, `lsblk`, `lsscsi -g`, `sg_ses` AES/EC pages, SSH `smartctl`,
-and `sg_ses` identify commands where the operator has granted the needed
-permissions.
+Linux `zpool`, stable-column `lsblk --json`, `lsscsi -g` /
+`lsscsi -g -t`, `sg_ses` AES/EC/join pages, SSH `smartctl`, and `sg_ses`
+identify commands where the operator has granted the needed permissions.
 
 Gaps:
 
-- no generic discovery/remediation flow that turns `lsscsi -g` enclosure nodes
-  into exact recommended `sg_ses` sudo rules
+- no generic discovery/remediation flow that turns `lsscsi -g -t` enclosure
+  nodes into exact recommended `sg_ses` sudo rules
 - no first-class capability label for "middleware enclosure rows missing, but
   Linux SES mapping is available"
-- no SCALE-specific transport details from stable Linux SAS sources such as
-  `lsscsi -t`, `/sys/class/sas_*`, or sg device metadata
+- transport detail is still limited to what `lsscsi -g -t` and `sg_ses --join
+  --filter` prove; deeper `/sys/class/sas_*` correlation remains a future
+  enrichment path
 - SMART test-history/detail still relies on SSH `smartctl` rather than a rich
   SCALE API path
 - fixtures should pin the common SCALE case where API enclosure rows are empty
@@ -108,11 +150,13 @@ Gaps:
 
 Requirements to document/check:
 
-- `lsscsi`
+- stable-column `lsblk --json`
+- `lsscsi -g` and `lsscsi -g -t`
 - `sg3_utils` / `sg_ses`
 - `smartmontools`
-- command-limited sudo for exact `sg_ses -p aes`, `sg_ses -p ec`, optional
-  identify commands, and on-demand `smartctl`
+- command-limited sudo for exact `sg_ses -p aes`, `sg_ses -p ec`,
+  `sg_ses --join --filter`, optional identify commands, and on-demand
+  `smartctl`
 - optional `nvme-cli` if a SCALE system has internal NVMe media that should be
   represented through storage views
 
@@ -147,7 +191,7 @@ Requirements to document/check:
 ### Generic Linux
 
 Linux support is intentionally source/profile dependent. It works well for
-hosts that expose stable `lsblk -OJ`, mdadm/NVMe context, vendor-specific data
+hosts that expose stable-column `lsblk --json`, mdadm/NVMe context, vendor-specific data
 such as UniFi storage commands, or a configured profile/storage-view binding.
 
 Gaps:
@@ -165,8 +209,9 @@ Gaps:
 
 Requirements to document/check:
 
-- `lsblk -OJ`
+- stable-column `lsblk --json`
 - `smartmontools`
+- optional `lsscsi -g -t` for SCSI/SG transport detail
 - optional `nvme-cli`
 - optional `mdadm`
 - optional `sg3_utils` / `sg_ses` for SES-backed chassis
@@ -264,17 +309,62 @@ Requirements to document/check:
 2. Admin/setup clarity bite
    - Update admin copy and docs so each platform says which sources are
      required, optional, or unsupported.
-   - Add SCALE/Linux SES requirement detection from `lsscsi -g` and existing
+   - Add SCALE/Linux SES requirement detection from `lsscsi -g -t` and existing
      `sg_ses` outcomes.
+   - First pass completed on 2026-05-20: admin state now exposes a structured
+     setup `requirements` contract beside recommended SSH commands, and the
+     setup UI renders Required, Optional, and Unsupported guidance for every
+     platform. SCALE/Linux SES guidance calls out stable `lsblk --json`,
+     `lsscsi -g -t`, exact `sg_ses -p aes/ec` plus
+     `sg_ses --join --filter` rules for discovered SG devices, and
+     unsupported CORE/BSD tools; ESXi guidance stays read-only and notes
+     `/cN` or `/call` StorCLI edits for non-`c0` controllers.
 
 3. Fixture and parser breadth bite
    - Build the parity fixture pack before expanding behavior.
    - Include ESXi multi-controller / alternate vendor CLI samples and SCALE
      multi-SES samples.
+   - First pass completed on 2026-05-20: fixture coverage now includes SCALE
+     empty middleware enclosure rows plus Linux SES, Quantastor optional
+     endpoint failures, Linux NVMe/mdadm, and ESXi non-`c0` plus same-slot
+     multi-controller StorCLI samples.
 
 4. SCALE/Linux SES parity bite
    - Normalize shared Linux SES parsing, source status, slot options, SMART
      detail, and identify capability handling across SCALE and Linux.
+   - First SAS Fabric-adjacent pass completed on 2026-05-20: SCALE/Linux
+     snapshots with SG enclosure slot evidence now build a dedicated
+     `linux_ses` graph for `/api/sas-fabric`, and the dedicated view labels it
+     as Linux SES mapping instead of CORE SAS Fabric. This is intentionally
+     weaker than CORE: it shows host/source, SG enclosure path, bay, pool/vdev,
+     and disk relationships, while HBA and expander hop detail remain absent
+     unless a future Linux source proves them safely. Generic Linux selections
+     without SG enclosure slot evidence remain unavailable instead of entering
+     the Linux SES view.
+   - Follow-up unsupported-state polish completed on 2026-05-20: Quantastor,
+     ESXi, and IPMI keep the CORE SAS Fabric boundary, but API payloads now
+     report `fabric_kind=platform_unsupported` and the dedicated view labels
+     the selected platform instead of rendering CORE-specific page chrome.
+   - Storage Fabric reshape completed on 2026-05-20: the dedicated fabric
+     surface now presents as `Storage Fabric`, and `/api/sas-fabric` returns
+     `raw.fabric_domain=storage_fabric` with best-effort platform graph kinds
+     for Linux SES, generic Linux/NVMe/storage-view evidence, Quantastor HA/SES
+     and pool evidence, ESXi StorCLI/controller/member evidence, and BMC/IPMI
+     slot evidence. This supersedes the earlier non-CORE unavailable boundary
+     for platforms that have useful storage evidence, while still avoiding
+     unproven HBA/expander hop claims.
+   - SCALE/Linux enrichment follow-up completed on 2026-05-20: saved and live
+     SSH payloads now normalize stable-column `lsblk --json`,
+     `lsscsi -g` / `lsscsi -g -t`, and `sg_ses --join --filter` evidence.
+     SCALE/Linux Storage Fabric bay traces can now carry SG device, SCSI HCTL,
+     transport protocol/address, attached SAS address, phy id, Linux block
+     record, Linux SCSI row, and selected-disk SMART summary in the inspector.
+   - NVMe subsystem follow-up completed on 2026-05-20: SCALE/Linux refreshes
+     now add a guarded `nvme list-subsys -o json` probe when it is missing from
+     the saved SSH command list, classify direct NVMe probe failures as
+     optional Storage Fabric enrichment, and include that source in setup and
+     capability guidance so existing installs can pick up controller/PCIe-path
+     context without requiring a config rewrite.
 
 5. Quantastor HA clarity bite
    - Improve HA node/SES host selection evidence, optional endpoint warnings,

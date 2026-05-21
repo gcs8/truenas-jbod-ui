@@ -1,0 +1,67 @@
+{
+  "blockdevices": [
+    {
+      "name": "nvme0n1",
+      "type": "disk",
+      "path": "/dev/nvme0n1",
+      "serial": "NVME-PARITY-A",
+      "model": "Micron_9300",
+      "size": "238G",
+      "log-sec": 4096,
+      "phy-sec": 4096,
+      "tran": "nvme",
+      "wwn": "eui.000000000000000100a075012b91c7cf",
+      "children": [
+        {
+          "name": "nvme0n1p1",
+          "type": "part",
+          "path": "/dev/nvme0n1p1",
+          "size": "238G",
+          "mountpoint": "/"
+        }
+      ]
+    },
+    {
+      "name": "nvme0n2",
+      "type": "disk",
+      "path": "/dev/nvme0n2",
+      "serial": "NVME-PARITY-A",
+      "model": "Micron_9300",
+      "size": "1.7T",
+      "log-sec": 4096,
+      "phy-sec": 4096,
+      "tran": "nvme",
+      "wwn": "eui.000000000000001000a075012b91c7cf",
+      "children": [
+        {
+          "name": "md127",
+          "type": "raid10",
+          "path": "/dev/md127",
+          "size": "3.4T",
+          "mountpoint": "/srv/nvme-array"
+        }
+      ]
+    },
+    {
+      "name": "nvme1n1",
+      "type": "disk",
+      "path": "/dev/nvme1n1",
+      "serial": "NVME-PARITY-B",
+      "model": "Micron_9300",
+      "size": "1.7T",
+      "log-sec": 4096,
+      "phy-sec": 4096,
+      "tran": "nvme",
+      "wwn": "eui.000000000000002000a075012b91c7cf",
+      "children": [
+        {
+          "name": "md127",
+          "type": "raid10",
+          "path": "/dev/md127",
+          "size": "3.4T",
+          "mountpoint": "/srv/nvme-array"
+        }
+      ]
+    }
+  ]
+}

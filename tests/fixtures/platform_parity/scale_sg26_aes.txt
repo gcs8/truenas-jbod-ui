@@ -1,0 +1,21 @@
+  SMCDRS2U  SAS3x40           0701
+  Primary enclosure logical identifier (hex): 5003048026b2ff7f
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 0
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5003048026b2ff7f
+          SAS address: 0x5002538b496a5512
+          phy identifier: 0x0
+      Element index: 23  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 23
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5003048026b2ff7f
+          SAS address: 0x5002538b496a5529
+          phy identifier: 0x0

@@ -3,8 +3,26 @@
   const modeIds = new Set(["lanes", "impact", "trace", "disk"]);
   const modeCopy = {
     lanes: {
-      title: "Fabric Lanes",
-      subtitle: "Top-down controller lanes with paths, expanders, enclosures, and impacted bays aligned in each lane.",
+      title: "Storage Lanes",
+      subtitle: "Top-down source lanes with paths, transport details, enclosures, views, and mapped bays aligned in each lane.",
+    },
+    impact: {
+      title: "Impact Map",
+      subtitle: "Start from paths and degraded states, then show affected slots, pools, vdevs, and trace hops.",
+    },
+    trace: {
+      title: "Physical Trace",
+      subtitle: "Follow the selected component or bay through host, source, path, enclosure or view, pool, and disk layers.",
+    },
+    disk: {
+      title: "Disk Path",
+      subtitle: "Pick a bay and render the available path evidence from host to source, enclosure or view, pool, vdev, and disk.",
+    },
+  };
+  const coreModeCopy = {
+    lanes: {
+      title: "Storage Lanes",
+      subtitle: "Top-down HBA lanes with paths, expanders, enclosures, and impacted bays aligned in each lane.",
     },
     impact: {
       title: "Impact Map",
@@ -28,9 +46,12 @@
     selectedEnclosureId: bootstrap.enclosureId || bootstrap.snapshot?.selected_enclosure_id || null,
     selectedTraceId: null,
     selectedNodeId: null,
+    selectedDiskTraceId: null,
     selectionTrail: [],
     expandedSlotLists: {},
     diagnosticTables: {},
+    smartSummaries: {},
+    smartRequests: {},
     aliasEditObjectId: null,
     mode: modeIds.has(initialMode) ? initialMode : "lanes",
     loading: false,
@@ -41,6 +62,8 @@
     systemSelect: document.getElementById("fabric-system-select"),
     enclosureSelect: document.getElementById("fabric-enclosure-select"),
     refreshButton: document.getElementById("fabric-refresh-button"),
+    pageEyebrow: document.getElementById("fabric-page-eyebrow"),
+    pageSummary: document.getElementById("fabric-page-summary"),
     apiChip: document.getElementById("fabric-api-chip"),
     statusText: document.getElementById("fabric-status-text"),
     lastUpdated: document.getElementById("fabric-last-updated"),
@@ -108,6 +131,298 @@
     return Number.isFinite(numberValue) ? numberValue : null;
   }
 
+  function fabricKind(fabric = state.fabric) {
+    if (fabric?.raw?.fabric_kind) {
+      return fabric.raw.fabric_kind;
+    }
+    return fabric?.platform === "core" ? "core_sas" : "unknown";
+  }
+
+  function fabricPlatformLabel(fabric = state.fabric) {
+    const platform = String(fabric?.platform || state.snapshot?.selected_system_platform || "").toLowerCase();
+    if (platform === "scale") {
+      return "TrueNAS SCALE";
+    }
+    if (platform === "linux") {
+      return "Linux";
+    }
+    if (platform === "core") {
+      return "TrueNAS CORE";
+    }
+    if (platform === "quantastor") {
+      return "Quantastor";
+    }
+    if (platform === "esxi") {
+      return "ESXi";
+    }
+    if (platform === "ipmi") {
+      return "BMC / IPMI";
+    }
+    return platform ? formatKind(platform) : "System";
+  }
+
+  function fabricViewCopy(fabric = state.fabric) {
+    const platformLabel = fabricPlatformLabel(fabric);
+    const kind = fabricKind(fabric);
+    const linuxSes = kind === "linux_ses";
+    if (linuxSes) {
+      return {
+        kind: "linux_ses",
+        storageFabric: true,
+        eyebrow: `${platformLabel} / Storage Fabric`,
+        pageSummary: "Linux SES SG-device, enclosure, storage, and bay mapping for the selected live enclosure.",
+        refresh: "Refresh Storage Fabric",
+        statusBase: "STORAGE",
+        unavailableMap: "No Linux SES-backed Storage Fabric map is available for this selection yet.",
+        modeLabels: {
+          lanes: "Storage Lanes",
+          impact: "Impact Map",
+          trace: "Physical Trace",
+          disk: "Disk Path",
+        },
+        modes: {
+          lanes: {
+            title: "Storage Lanes",
+            subtitle: "Host, Linux SES source, SG enclosure devices, storage objects, and mapped bays aligned by enclosure path.",
+          },
+          impact: {
+            title: "Impact Map",
+            subtitle: "Show mapped SES device groups, affected slots, pools, vdevs, and trace hops.",
+          },
+          trace: {
+            title: "Physical Trace",
+            subtitle: "Follow the selected SG device or bay through host, Linux SES source, enclosure, backplane zone, and disk layers.",
+          },
+          disk: {
+            title: "Disk Path",
+            subtitle: "Pick a bay and render the read-only Linux SES path from host to SG enclosure, backplane zone, and disk.",
+          },
+        },
+        summary: {
+          controllers: ["Sources", "Linux SES source"],
+          paths: ["Storage Paths", "SG device groups"],
+          expanders: ["Transport Detail", "not exposed"],
+          enclosures: ["Enclosures", "SG enclosure objects"],
+        },
+        laneStages: {
+          controller: "Source",
+          paths: "SES Paths",
+          expanders: "Transport Detail",
+          enclosures: "SG Enclosures",
+          bays: "Mapped Bays",
+        },
+        hostControllerNoun: "source",
+      };
+    }
+    if (String(kind || "").startsWith("storage_") || fabric?.raw?.fabric_domain === "storage_fabric") {
+      const storageCopyByKind = {
+        storage_quantastor: {
+          pageSummary: "Quantastor HA-node, enclosure, pool, disk, and ownership/fence evidence for the selected storage view.",
+          unavailableMap: "No Quantastor Storage Fabric evidence is available for this selection yet.",
+          controllers: ["Sources", "storage system / HA node"],
+          paths: ["Storage Paths", "pool, SES, or owner groups"],
+          enclosures: ["Views", "Quantastor / SES objects"],
+          diskLabels: {
+            host: "Cluster",
+            source: "HA Node",
+            path: "SES / Pool Path",
+            enclosure: "Storage View",
+            backplane: "Bay Group",
+            disk: "Disk",
+          },
+          modes: {
+            ...modeCopy,
+            lanes: {
+              title: "Storage Lanes",
+              subtitle: "Quantastor HA nodes, SES paths, storage views, pool/vdev membership, and mapped bays grouped by source evidence.",
+            },
+            trace: {
+              title: "Physical Trace",
+              subtitle: "Follow the selected bay through HA ownership, SES path evidence, storage view, pool/vdev membership, and disk identity.",
+            },
+            disk: {
+              title: "Disk Path",
+              subtitle: "Pick a bay and show the Quantastor path evidence we can prove: HA node, SES device, view, pool, vdev, and disk.",
+            },
+          },
+        },
+        storage_esxi: {
+          pageSummary: "ESXi host, controller, member, datastore, LUN, and SMART evidence for the selected local storage view.",
+          unavailableMap: "No ESXi Storage Fabric evidence is available for this selection yet.",
+          controllers: ["Sources", "ESXi / vendor CLI"],
+          paths: ["Storage Paths", "controller/member groups"],
+          enclosures: ["Enclosures", "vendor/BMC/profile objects"],
+          diskLabels: {
+            host: "ESXi Host",
+            source: "Controller",
+            path: "Member Path",
+            enclosure: "View / Enclosure",
+            backplane: "Slot Group",
+            disk: "Disk",
+          },
+          modes: {
+            ...modeCopy,
+            disk: {
+              title: "Disk Path",
+              subtitle: "Pick a bay and show the ESXi evidence we can prove: host, controller, member path, enclosure/profile, datastore or vdev, and disk.",
+            },
+          },
+        },
+        storage_linux: {
+          pageSummary: "Linux block, NVMe, mdadm, profile, SMART, and optional SES evidence for the selected storage view.",
+          unavailableMap: "No Linux Storage Fabric evidence is available for this selection yet.",
+          controllers: ["Sources", "Linux storage source"],
+          paths: ["Storage Paths", "block, NVMe, or mdadm groups"],
+          enclosures: ["Views", "profile or enclosure objects"],
+          diskLabels: {
+            host: "Host",
+            source: "Storage Source",
+            path: "Block Path",
+            enclosure: "View",
+            backplane: "Slot Group",
+            disk: "Device",
+          },
+        },
+        storage_scale: {
+          pageSummary: "TrueNAS SCALE storage, pool, disk, Linux block, and optional SES evidence for the selected view.",
+          unavailableMap: "No SCALE Storage Fabric evidence is available for this selection yet.",
+          controllers: ["Sources", "SCALE / Linux storage"],
+          paths: ["Storage Paths", "pool, block, or SES groups"],
+          enclosures: ["Enclosures", "middleware/profile objects"],
+        },
+        storage_bmc: {
+          pageSummary: "BMC slot and chassis evidence for the selected platform view.",
+          unavailableMap: "No BMC Storage Fabric evidence is available for this selection yet.",
+          controllers: ["Sources", "BMC / IPMI"],
+          paths: ["Storage Paths", "slot inventory groups"],
+          enclosures: ["Enclosures", "BMC chassis objects"],
+        },
+      };
+      const details = storageCopyByKind[kind] || {
+        pageSummary: "Best-effort storage path evidence for the selected platform view.",
+        unavailableMap: `No Storage Fabric evidence is available for ${platformLabel}.`,
+        controllers: ["Sources", "platform evidence"],
+        paths: ["Storage Paths", "platform groups"],
+        enclosures: ["Enclosures", "platform objects"],
+      };
+      return {
+        kind,
+        storageFabric: true,
+        eyebrow: `${platformLabel} / Storage Fabric`,
+        pageSummary: details.pageSummary,
+        refresh: "Refresh Storage Fabric",
+        statusBase: "STORAGE",
+        unavailableMap: details.unavailableMap,
+        modeLabels: {
+          lanes: "Storage Lanes",
+          impact: "Impact Map",
+          trace: "Physical Trace",
+          disk: "Disk Path",
+        },
+        modes: details.modes || modeCopy,
+        diskLabels: details.diskLabels || null,
+        summary: {
+          controllers: details.controllers,
+          paths: details.paths,
+          expanders: ["Transport Detail", "platform-native evidence"],
+          enclosures: details.enclosures,
+        },
+        laneStages: {
+          controller: "Source",
+          paths: "Storage Paths",
+          expanders: "Transport Detail",
+          enclosures: "Enclosures / Views",
+          bays: "Mapped Bays",
+        },
+        hostControllerNoun: "source",
+      };
+    }
+    if (kind === "linux_no_ses" || kind === "platform_unsupported" || (fabric?.available === false && fabric?.platform && fabric.platform !== "core")) {
+      return {
+        kind: "storage_unavailable",
+        storageFabric: true,
+        eyebrow: `${platformLabel} / Storage Fabric`,
+        pageSummary: `Storage Fabric evidence is not available for ${platformLabel} in this snapshot.`,
+        refresh: "Refresh Storage Fabric",
+        statusBase: "STORAGE",
+        unavailableMap: `No Storage Fabric topology map is available for ${platformLabel}.`,
+        modeLabels: {
+          lanes: "Storage Lanes",
+          impact: "Impact Map",
+          trace: "Physical Trace",
+          disk: "Disk Path",
+        },
+        modes: modeCopy,
+        summary: {
+          controllers: ["Sources", "no graph evidence"],
+          paths: ["Storage Paths", "no graph evidence"],
+          expanders: ["Transport Detail", "not exposed"],
+          enclosures: ["Enclosures", "platform inventory only"],
+        },
+        laneStages: {
+          controller: "Source",
+          paths: "Storage Paths",
+          expanders: "Transport Detail",
+          enclosures: "Enclosures / Views",
+          bays: "Mapped Bays",
+        },
+        hostControllerNoun: "source",
+      };
+    }
+    return {
+      kind: "core_sas",
+      eyebrow: "TrueNAS CORE / Storage Fabric",
+      pageSummary: "HBA, path, expander, SES, and affected-bay topology for the selected live enclosure.",
+      refresh: "Refresh Storage Fabric",
+      statusBase: "STORAGE",
+      unavailableMap: "No topology map is available for this platform yet.",
+      modeLabels: {
+        lanes: "Storage Lanes",
+        impact: "Impact Map",
+        trace: "Physical Trace",
+        disk: "Disk Path",
+      },
+      modes: coreModeCopy,
+      diskLabels: {
+        host: "Host",
+        source: "HBA",
+        path: "SAS Link",
+        enclosure: "Expander / SES",
+        backplane: "Backplane",
+        disk: "Disk",
+      },
+      summary: {
+        controllers: ["Controllers", "HBAs reported"],
+        paths: ["Paths", "multipath states"],
+        expanders: ["Expanders", "MPR expander rows"],
+        enclosures: ["Enclosures", "MPR/SES objects"],
+      },
+      laneStages: {
+        controller: "Controller",
+        paths: "Paths",
+        expanders: "Expanders",
+        enclosures: "SES / MPR Enclosures",
+        bays: "Impacted Bays",
+      },
+      hostControllerNoun: "controller",
+    };
+  }
+
+  function setSummaryCardText(valueElement, label, note) {
+    const card = valueElement?.closest(".summary-card");
+    if (!card) {
+      return;
+    }
+    const labelElement = card.querySelector(".summary-label");
+    const noteElement = card.querySelector(".summary-note");
+    if (labelElement && label) {
+      labelElement.textContent = label;
+    }
+    if (noteElement && note) {
+      noteElement.textContent = note;
+    }
+  }
+
   function hexNumber(value) {
     const text = String(value ?? "").trim();
     if (!text) {
@@ -161,7 +476,8 @@
       expander: 3,
       "mpr-enclosure": 4,
       "ses-enclosure": 5,
-      backplane: 6,
+      "storage-enclosure": 6,
+      backplane: 7,
     };
     return rank[traceItem?.kind] ?? 99;
   }
@@ -313,6 +629,27 @@
         key === "kernel_diagnostics" ? diagnosticSummary(value) : value
       )))
       .join("");
+  }
+
+  function evidenceChips(values) {
+    const chips = list(values)
+      .filter(Boolean)
+      .map((value) => `<span class="fabric-evidence-chip">${escapeHtml(formatValue(value))}</span>`)
+      .join("");
+    return chips || '<span class="fabric-empty-note">No source evidence listed.</span>';
+  }
+
+  function inspectorFact(label, value, { tone = "", wide = false } = {}) {
+    const formatted = formatValue(value);
+    if (formatted === "n/a") {
+      return "";
+    }
+    return `
+      <div class="fabric-inspector-fact${tone ? ` tone-${classToken(tone)}` : ""}${wide ? " is-wide" : ""}">
+        <span>${escapeHtml(label)}</span>
+        <strong>${escapeHtml(formatted)}</strong>
+      </div>
+    `;
   }
 
   function selectedParams({ force = null, includeMode = false } = {}) {
@@ -557,6 +894,7 @@
     if (ref.kind === "trace") {
       state.selectedTraceId = ref.id;
       state.selectedNodeId = null;
+      rememberDiskTrace(ref.id);
       return true;
     }
     if (ref.kind === "node") {
@@ -590,6 +928,23 @@
       return traceId;
     }
     return defaultTraceId(fabric);
+  }
+
+  function rememberDiskTrace(traceId, fabric = state.fabric) {
+    const trace = traceById(traceId, fabric);
+    if (trace?.kind === "bay" && sortedSlots(trace.slots).length) {
+      state.selectedDiskTraceId = trace.id;
+      return trace;
+    }
+    return null;
+  }
+
+  function rememberedDiskTrace(fabric = state.fabric) {
+    const trace = rememberDiskTrace(state.selectedDiskTraceId, fabric);
+    if (!trace) {
+      state.selectedDiskTraceId = null;
+    }
+    return trace;
   }
 
   function defaultDiskTraceId(fabric = state.fabric) {
@@ -639,6 +994,7 @@
     if (ref.kind === "trace") {
       state.selectedTraceId = ref.id;
       state.selectedNodeId = null;
+      rememberDiskTrace(ref.id);
       return true;
     }
     if (ref.kind === "node") {
@@ -689,6 +1045,143 @@
 
   function slotByNumber(slotNumber) {
     return list(state.snapshot?.slots).find((slot) => Number(slot.slot) === Number(slotNumber)) || null;
+  }
+
+  function smartCacheKey(slotNumber) {
+    return [state.selectedSystemId || "", state.selectedEnclosureId || "", String(slotNumber)].join("|");
+  }
+
+  function smartSummaryForSlot(slotNumber) {
+    if (!Number.isInteger(Number(slotNumber))) {
+      return null;
+    }
+    return state.smartSummaries[smartCacheKey(slotNumber)] || null;
+  }
+
+  function selectedSmartSlotNumber() {
+    const trace = selectedDiskTrace(state.fabric);
+    const slotNumber = sortedSlots(trace?.slots)[0];
+    return Number.isInteger(slotNumber) ? slotNumber : null;
+  }
+
+  function formatInteger(value) {
+    const numberValue = Number(value);
+    return Number.isFinite(numberValue) ? numberValue.toLocaleString() : "";
+  }
+
+  function formatSmartBytes(value) {
+    const numberValue = Number(value);
+    if (!Number.isFinite(numberValue) || numberValue <= 0) {
+      return "";
+    }
+    const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let scaled = numberValue;
+    let unitIndex = 0;
+    while (scaled >= 1000 && unitIndex < units.length - 1) {
+      scaled /= 1000;
+      unitIndex += 1;
+    }
+    return `${scaled >= 10 ? scaled.toFixed(1) : scaled.toFixed(2)} ${units[unitIndex]}`;
+  }
+
+  function formatSmartPowerOn(summary) {
+    if (!summary) {
+      return "";
+    }
+    if (Number.isFinite(Number(summary.power_on_days))) {
+      return `${formatInteger(summary.power_on_days)} d`;
+    }
+    if (Number.isFinite(Number(summary.power_on_hours))) {
+      return `${formatInteger(summary.power_on_hours)} h`;
+    }
+    return "";
+  }
+
+  function smartSummaryLine(summary) {
+    if (!summary) {
+      return "";
+    }
+    if (summary.available === false) {
+      return summary.message || "SMART unavailable";
+    }
+    return [
+      summary.smart_health_status,
+      summary.temperature_c != null ? `${summary.temperature_c} C` : null,
+      formatSmartPowerOn(summary),
+    ].filter(Boolean).join(" / ");
+  }
+
+  function renderSmartSummaryCard(slotNumber, slot) {
+    const summary = smartSummaryForSlot(slotNumber);
+    const key = smartCacheKey(slotNumber);
+    const loading = state.smartRequests[key];
+    if (!summary && loading) {
+      return '<div class="fabric-identity-card"><span>Loading selected-disk SMART...</span></div>';
+    }
+    if (!summary) {
+      return '<div class="fabric-identity-card"><span class="fabric-empty-note">SMART detail has not loaded yet.</span></div>';
+    }
+    if (summary.available === false) {
+      return `<div class="fabric-identity-card"><span class="fabric-empty-note">${escapeHtml(summary.message || "SMART detail is unavailable for this disk.")}</span></div>`;
+    }
+    const lastTest = [summary.last_test_type, summary.last_test_status].filter(Boolean).join(" / ");
+    const ioTotals = [
+      formatSmartBytes(summary.bytes_read) ? `R ${formatSmartBytes(summary.bytes_read)}` : null,
+      formatSmartBytes(summary.bytes_written) ? `W ${formatSmartBytes(summary.bytes_written)}` : null,
+    ].filter(Boolean).join(" / ");
+    const errorCounts = [
+      summary.media_errors != null ? `media ${formatInteger(summary.media_errors)}` : null,
+      summary.non_medium_errors != null ? `non-medium ${formatInteger(summary.non_medium_errors)}` : null,
+      summary.interface_crc_errors != null ? `CRC ${formatInteger(summary.interface_crc_errors)}` : null,
+    ].filter(Boolean).join(" / ");
+    const transport = [
+      summary.transport_protocol || slot?.transport_protocol,
+      summary.negotiated_link_rate,
+      summary.sas_address || slot?.sas_address,
+    ].filter(Boolean).join(" / ");
+    return `
+      <div class="fabric-identity-card fabric-smart-card">
+        <div>
+          ${summary.smart_health_status ? `<span><em>Health</em>${escapeHtml(summary.smart_health_status)}</span>` : ""}
+          ${summary.temperature_c != null ? `<span><em>Temp</em>${escapeHtml(`${summary.temperature_c} C`)}</span>` : ""}
+          ${formatSmartPowerOn(summary) ? `<span><em>Power on</em>${escapeHtml(formatSmartPowerOn(summary))}</span>` : ""}
+          ${lastTest ? `<span><em>Last test</em>${escapeHtml(lastTest)}</span>` : ""}
+          ${ioTotals ? `<span><em>I/O totals</em>${escapeHtml(ioTotals)}</span>` : ""}
+          ${errorCounts ? `<span><em>Errors</em>${escapeHtml(errorCounts)}</span>` : ""}
+          ${transport ? `<span><em>Transport</em>${escapeHtml(transport)}</span>` : ""}
+          ${summary.firmware_version ? `<span><em>Firmware</em>${escapeHtml(summary.firmware_version)}</span>` : ""}
+        </div>
+      </div>
+    `;
+  }
+
+  function ensureSelectedSmartSummary() {
+    const slotNumber = selectedSmartSlotNumber();
+    if (!Number.isInteger(slotNumber) || !state.fabric || state.fabric.available === false) {
+      return;
+    }
+    const slot = slotByNumber(slotNumber);
+    if (!slot || (!slot.device_name && !list(slot.smart_device_names).length && !slot.serial)) {
+      return;
+    }
+    const key = smartCacheKey(slotNumber);
+    if (state.smartSummaries[key] || state.smartRequests[key]) {
+      return;
+    }
+    state.smartRequests[key] = true;
+    fetchJson(scopedUrl(`/api/slots/${slotNumber}/smart`))
+      .then((summary) => {
+        state.smartSummaries[key] = summary || { available: false, message: "SMART detail returned an empty payload." };
+      })
+      .catch((error) => {
+        state.smartSummaries[key] = { available: false, message: error.message || String(error) };
+      })
+      .finally(() => {
+        delete state.smartRequests[key];
+        if (smartCacheKey(selectedSmartSlotNumber()) === key) {
+          render();
+        }
+      });
   }
 
   function affectedSlotSummary(slots) {
@@ -765,7 +1258,7 @@
     return `${visible.map((node) => renderNodeButton(node, { extra: "compact" })).join("")}${overflow}`;
   }
 
-  function renderBayChips(slots, limit = 96) {
+  function renderBayChips(slots, limit = 96, { modeTarget = "" } = {}) {
     const sorted = sortedSlots(slots);
     if (!sorted.length) {
       return '<span class="fabric-empty-note">No mapped bays</span>';
@@ -775,8 +1268,11 @@
       const selected = activeSlots.has(slotNumber);
       const slot = slotByNumber(slotNumber);
       const title = [slot?.device_name, slot?.pool_name, slot?.vdev_name].filter(Boolean).join(" / ");
+      const modeTargetAttribute = modeIds.has(modeTarget)
+        ? ` data-fabric-mode-target="${escapeHtml(modeTarget)}"`
+        : "";
       return `
-        <button type="button" class="fabric-bay-chip${selected ? " is-selected" : ""}" data-fabric-trace="bay:${slotNumber}" title="${escapeHtml(title || `Bay ${formatSlotLabel(slotNumber)}`)}">
+        <button type="button" class="fabric-bay-chip${selected ? " is-selected" : ""}" data-fabric-trace="bay:${slotNumber}"${modeTargetAttribute} title="${escapeHtml(title || `Bay ${formatSlotLabel(slotNumber)}`)}">
           ${escapeHtml(formatSlotLabel(slotNumber))}
         </button>
       `;
@@ -786,6 +1282,7 @@
   }
 
   function renderLanesMode(fabric) {
+    const copy = fabricViewCopy(fabric);
     const nodes = nodeMap(fabric);
     const hostNode = nodes.get("host") || {
       id: "host",
@@ -808,7 +1305,9 @@
       const controllerName = controller.name || controllerNode?.label || controllerId.replace(/^controller:/, "");
       const paths = list(fabric.paths).filter((path) => path.controller === controllerName);
       const expanders = sortFabricNodesForLane(list(fabric.nodes).filter((node) => node.kind === "expander" && node.controller_id === controllerId));
-      const enclosures = sortFabricNodesForLane(list(fabric.nodes).filter((node) => node.kind === "mpr-enclosure" && node.controller_id === controllerId));
+      const enclosures = sortFabricNodesForLane(list(fabric.nodes).filter((node) => (
+        ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node.kind) && node.controller_id === controllerId
+      )));
       const laneSlots = new Set(sortedSlots(controller.related_slots || controllerNode?.related_slots));
       paths.forEach((path) => sortedSlots(path.slots).forEach((slot) => laneSlots.add(slot)));
       expanders.forEach((node) => sortedSlots(node.related_slots).forEach((slot) => laneSlots.add(slot)));
@@ -818,26 +1317,26 @@
       return `
         <section class="fabric-dedicated-lane${related ? " is-related" : ""}">
           <div class="fabric-stage controller">
-            <span class="fabric-stage-title">Controller</span>
+            <span class="fabric-stage-title">${escapeHtml(copy.laneStages.controller)}</span>
             ${renderNodeButton(controllerNode || { id: controllerId, kind: "controller", label: controllerName, related_slots: slots, status: "unknown", metrics: {} }, {
               label: controller.display_label || controller.alias || displayLabel(controllerNode) || controllerName,
-              meta: nodeMeta(controllerNode, controller) || controller.device || "HBA",
+              meta: nodeMeta(controllerNode, controller) || controller.device || copy.laneStages.controller,
             })}
           </div>
           <div class="fabric-stage">
-            <span class="fabric-stage-title">Paths</span>
+            <span class="fabric-stage-title">${escapeHtml(copy.laneStages.paths)}</span>
             <div class="fabric-path-grid">${paths.length ? paths.map((path) => renderPathButton(path, { compact: true })).join("") : '<span class="fabric-empty-note">No path states reported</span>'}</div>
           </div>
           <div class="fabric-stage">
-            <span class="fabric-stage-title">Expanders</span>
+            <span class="fabric-stage-title">${escapeHtml(copy.laneStages.expanders)}</span>
             <div class="fabric-node-grid">${renderNodeGrid(expanders, 8)}</div>
           </div>
           <div class="fabric-stage">
-            <span class="fabric-stage-title">SES / MPR Enclosures</span>
+            <span class="fabric-stage-title">${escapeHtml(copy.laneStages.enclosures)}</span>
             <div class="fabric-node-grid">${renderNodeGrid(enclosures, 8)}</div>
           </div>
           <div class="fabric-stage">
-            <span class="fabric-stage-title">Impacted Bays</span>
+            <span class="fabric-stage-title">${escapeHtml(copy.laneStages.bays)}</span>
             <div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div>
           </div>
         </section>
@@ -847,7 +1346,7 @@
       <div class="fabric-host-strip">
         ${renderNodeButton(hostNode, {
           label: displayLabel(hostNode) || "Host",
-          meta: `${controllerRecords.length} controllers / ${list(fabric.nodes).length} nodes / ${list(fabric.links).length} links`,
+          meta: `${controllerRecords.length} ${copy.hostControllerNoun}${controllerRecords.length === 1 ? "" : "s"} / ${list(fabric.nodes).length} nodes / ${list(fabric.links).length} links`,
           extra: "host",
         })}
       </div>
@@ -897,7 +1396,7 @@
                 <span>Vdevs: ${escapeHtml(summary.vdevs.join(", ") || "n/a")}</span>
                 <span>Devices: ${escapeHtml(summary.devices.slice(0, 8).join(", ") || "n/a")}${summary.devices.length > 8 ? `, +${summary.devices.length - 8}` : ""}</span>
               </div>
-              <div class="fabric-bay-grid compact">${renderBayChips(slots, 80)}</div>
+              <div class="fabric-bay-grid compact">${renderBayChips(slots, 80, { modeTarget: "disk" })}</div>
             </article>
           `;
         }).join("")}
@@ -932,6 +1431,7 @@
     const tracesById = traceMap(fabric);
     const trace = selectedTrace();
     if (trace?.kind === "bay" && sortedSlots(trace.slots).length) {
+      rememberDiskTrace(trace.id, fabric);
       return trace;
     }
     const node = selectedNode();
@@ -939,19 +1439,29 @@
       const baySlot = Number.isInteger(Number(node.slot)) ? Number(node.slot) : sortedSlots(node.related_slots)[0];
       const bayTrace = tracesById.get(`bay:${baySlot}`);
       if (bayTrace) {
+        rememberDiskTrace(bayTrace.id, fabric);
         return bayTrace;
       }
+    }
+    const rememberedTrace = rememberedDiskTrace(fabric);
+    if (rememberedTrace) {
+      return rememberedTrace;
     }
     const candidateSlots = sortedSlots(trace?.slots || node?.related_slots);
     for (const slotNumber of candidateSlots) {
       const bayTrace = tracesById.get(`bay:${slotNumber}`);
       if (bayTrace) {
+        rememberDiskTrace(bayTrace.id, fabric);
         return bayTrace;
       }
     }
-    return traces.find((traceItem) => traceItem.kind === "bay" && diskTraceHasDisk(traceItem))
+    const fallbackTrace = traces.find((traceItem) => traceItem.kind === "bay" && diskTraceHasDisk(traceItem))
       || traces.find((traceItem) => traceItem.kind === "bay")
       || null;
+    if (fallbackTrace) {
+      rememberDiskTrace(fallbackTrace.id, fabric);
+    }
+    return fallbackTrace;
   }
 
   function layoutSlotCount(fabric) {
@@ -1717,11 +2227,46 @@
     return list(trace.node_ids).map((nodeId) => nodes.get(nodeId)).find(predicate) || null;
   }
 
-  function renderDiskPathCard({ kind, title, subtitle = "", facts = [], hoverFacts = [], status = "", nodeId = "", traceId = "", extra = "" }) {
+  function compactDeviceLabel(value, limit = 38) {
+    const text = String(value || "").trim();
+    if (!text) {
+      return "";
+    }
+    const leaf = text
+      .replace(/^\/dev\//, "/dev/")
+      .replace(/^.*\/disk\/by-id\//, "")
+      .replace(/^disk\/by-id\//, "")
+      .replace(/^(scsi-|ata-|nvme-|wwn-)/i, "");
+    if (leaf.length <= limit) {
+      return leaf;
+    }
+    const head = Math.max(12, Math.floor((limit - 3) * 0.62));
+    const tail = Math.max(8, limit - head - 3);
+    return `${leaf.slice(0, head)}...${leaf.slice(-tail)}`;
+  }
+
+  function diskPathLabels(copy, linuxSes, storageFabric) {
+    return {
+      host: linuxSes ? "Host" : storageFabric ? "Host" : "Host",
+      source: linuxSes ? "SES Source" : storageFabric ? "Storage Source" : "HBA",
+      path: linuxSes ? "SES Link" : storageFabric ? "Storage Path" : "SAS Link",
+      enclosure: linuxSes ? "SES Enclosure" : storageFabric ? "View / Enclosure" : "Expander / SES",
+      backplane: "Backplane",
+      pool: "Pool",
+      vdev: "Vdev",
+      disk: "Disk",
+      ...(copy.diskLabels || {}),
+    };
+  }
+
+  function renderDiskPathCard({ kind, title, subtitle = "", facts = [], hoverFacts = [], status = "", nodeId = "", traceId = "", modeTarget = "", extra = "" }) {
     const selected = (nodeId && state.selectedNodeId === nodeId) || (traceId && state.selectedTraceId === traceId);
     const actionAttribute = nodeId
       ? `data-fabric-node="${escapeHtml(nodeId)}"`
       : (traceId ? `data-fabric-trace="${escapeHtml(traceId)}"` : "");
+    const modeTargetAttribute = actionAttribute && modeIds.has(modeTarget)
+      ? ` data-fabric-mode-target="${escapeHtml(modeTarget)}"`
+      : "";
     const tagName = actionAttribute ? "button" : "div";
     const typeAttribute = tagName === "button" ? ' type="button"' : "";
     const detailText = tooltipText([["Layer", kind], ["Name", title], ["Context", subtitle], ...facts, ...hoverFacts]);
@@ -1733,7 +2278,7 @@
         <span><em>${escapeHtml(label)}</em>${escapeHtml(formatValue(value))}</span>
       `).join("");
     return `
-      <${tagName}${typeAttribute} class="disk-path-card status-${classToken(status)}${selected ? " is-selected" : ""} ${extra}" ${actionAttribute}${titleAttribute}>
+      <${tagName}${typeAttribute} class="disk-path-card status-${classToken(status)}${selected ? " is-selected" : ""} ${extra}" ${actionAttribute}${modeTargetAttribute}${titleAttribute}>
         <span class="disk-path-kind">${escapeHtml(kind)}</span>
         <strong>${escapeHtml(title || "n/a")}</strong>
         ${subtitle ? `<small>${escapeHtml(subtitle)}</small>` : ""}
@@ -1802,12 +2347,17 @@
   }
 
   function renderDiskPathBranch(seed, trace, fabric, slotNumber, options = {}) {
+    const copy = fabricViewCopy(fabric);
+    const linuxSes = copy.kind === "linux_ses";
+    const storageFabric = copy.storageFabric && !linuxSes && copy.kind !== "core_sas";
+    const labels = diskPathLabels(copy, linuxSes, storageFabric);
     const nodes = nodeMap(fabric);
     const slot = slotByNumber(slotNumber);
+    const smartSummary = smartSummaryForSlot(slotNumber);
     const hostNode = nodes.get("host") || {
       id: "host",
       kind: "host",
-      label: fabric.system_label || fabric.system_id || "TrueNAS CORE Host",
+      label: fabric.system_label || fabric.system_id || "Host",
       metrics: {},
     };
     const mprDevice = branchMprDevice(seed, trace);
@@ -1815,37 +2365,68 @@
     const stateName = seed.state || seed.pathState?.state || seed.pathNode?.status || mprDevice?.state || "unknown";
     const controllerId = controllerName ? `controller:${controllerName}` : seed.controller_id;
     const controllerNode = nodes.get(controllerId) || seed.controllerNode || firstTraceNode(trace, fabric, (node) => node?.kind === "controller");
-    const pathId = controllerName && stateName ? `path:${controllerName}:${classToken(stateName)}` : seed.pathNode?.id;
+    const pathId = seed.pathState?.path_id || seed.pathNode?.id || (controllerName && stateName ? `path:${controllerName}:${classToken(stateName)}` : null);
     const pathNode = nodes.get(pathId) || seed.pathNode || firstTraceNode(trace, fabric, (node) => (
       node?.kind === "path" && (!controllerId || node.controller_id === controllerId)
     ));
+    const pathNodeId = pathNode?.id && nodes.has(pathNode.id) ? pathNode.id : "";
+    const pathTraceId = !pathNodeId && pathId && traceById(pathId, fabric) ? pathId : "";
     const expanderId = list(mprDevice?.expander_ids)[0];
     const expanderNode = nodes.get(expanderId) || seed.expanderNode || firstTraceNode(trace, fabric, (node) => (
       node?.kind === "expander" && (!controllerId || node.controller_id === controllerId)
     ));
     const enclosureNode = nodes.get(mprDevice?.enclosure_id) || firstTraceNode(trace, fabric, (node) => (
-      node?.kind === "mpr-enclosure" && (!controllerId || node.controller_id === controllerId)
+      ["mpr-enclosure", "ses-enclosure", "storage-enclosure"].includes(node?.kind) && (!controllerId || !node.controller_id || node.controller_id === controllerId)
     ));
     const expanderPhy = expanderPhyForDevice(expanderNode, mprDevice);
     const sesNodes = list(trace.node_ids)
       .map((nodeId) => nodes.get(nodeId))
       .filter((node) => node?.kind === "ses-enclosure" && selectionTouchesSlots([slotNumber]));
+    const poolNode = firstTraceNode(trace, fabric, (node) => node?.kind === "pool");
+    const vdevNode = firstTraceNode(trace, fabric, (node) => node?.kind === "vdev");
     const zone = backplaneZoneForSlot(slotNumber, fabric);
     const backplaneNode = zone.id ? nodes.get(zone.id) : null;
-    const diskTitle = trace.metrics?.device_name || slot?.device_name || `Bay ${formatSlotLabel(slotNumber)}`;
-    const diskSubtitle = [slot?.serial, slot?.model, slot?.size_human].filter(Boolean).join(" / ");
+    const fullDeviceName = trace.metrics?.device_name || slot?.device_name || "";
+    const compactDiskDevice = compactDeviceLabel(fullDeviceName, 40);
+    const diskModel = slot?.model || trace.metrics?.model || seed.pathState?.model;
+    const diskSerial = slot?.serial || trace.metrics?.serial || seed.pathState?.serial;
+    const diskSize = slot?.size_human || trace.metrics?.size_human || seed.pathState?.size_human;
+    const diskLun = slot?.logical_unit_id || trace.metrics?.logical_unit_id || seed.pathState?.logical_unit_id;
+    const diskSasAddress = slot?.sas_address || trace.metrics?.sas_address || seed.pathState?.sas_address;
+    const diskVdevClass = slot?.vdev_class || trace.metrics?.vdev_class || seed.pathState?.vdev_class;
+    const diskBlockSizes = [
+      slot?.logical_block_size || trace.metrics?.logical_block_size || seed.pathState?.logical_block_size,
+      slot?.physical_block_size || trace.metrics?.physical_block_size || seed.pathState?.physical_block_size,
+    ].filter(Boolean).join(" / ");
+    const diskSmartDevices = list(slot?.smart_device_names || trace.metrics?.smart_device_names || seed.pathState?.smart_device_names).join(", ");
+    const diskTitle = diskModel || compactDeviceLabel(fullDeviceName, 36) || `Bay ${formatSlotLabel(slotNumber)}`;
+    const serialAlreadyShown = diskSerial && compactDiskDevice.includes(diskSerial);
+    const diskSubtitle = [
+      compactDiskDevice,
+      serialAlreadyShown ? null : diskSerial,
+      diskSize,
+    ].filter(Boolean).join(" / ");
     const iocFacts = controllerNode?.raw?.iocfacts || {};
     const controllerDiagnostics = controllerNode?.metrics?.kernel_diagnostics || controllerNode?.raw?.kernel_diagnostics;
     const linkDiagnostics = mprDevice?.diagnostics;
     const branchDiagnostics = Number(linkDiagnostics?.event_count || 0) ? linkDiagnostics : controllerDiagnostics;
+    const poolTitle = displayLabel(poolNode) || slot?.pool_name || trace.metrics?.pool_name;
+    const vdevTitle = displayLabel(vdevNode) || slot?.vdev_name || trace.metrics?.vdev_name;
+    const sourceTitle = displayLabel(controllerNode) || controllerName;
+    const pathTitle = displayLabel(pathNode) || seed.pathState?.ses_device || controllerName;
+    const pathContext = compactDeviceLabel(mprDevice?.member_device_name || seed.device_name || fullDeviceName, 42);
+    const branchHeaderContext = [
+      pathTitle && pathTitle !== sourceTitle ? pathTitle : null,
+      pathContext,
+    ].filter(Boolean).join(" / ");
     const cards = [
       renderDiskPathCard({
-        kind: "Host",
-        title: displayLabel(hostNode) || "TrueNAS CORE Host",
+        kind: labels.host,
+        title: displayLabel(hostNode) || "Host",
         subtitle: fabric.selected_enclosure_label || fabric.system_id || "",
         facts: [
           ["Bay", `Bay ${formatSlotLabel(slotNumber)}`],
-          ["Controllers", list(fabric.controllers).length],
+          [linuxSes || storageFabric ? "Sources" : "Controllers", list(fabric.controllers).length],
         ],
         hoverFacts: [
           ["System ID", fabric.system_id],
@@ -1856,18 +2437,18 @@
         nodeId: hostNode.id,
       }),
       renderDiskPathCard({
-        kind: "HBA",
-        title: displayLabel(controllerNode) || controllerName,
+        kind: labels.source,
+        title: sourceTitle,
         subtitle: controllerNode?.raw?.board || controllerNode?.raw_id || "",
         facts: [
-          ["PCIe slot", controllerNode?.metrics?.pcie_slot || controllerNode?.raw?.pcie_slot],
-          ["FW", controllerNode?.metrics?.firmware || controllerNode?.raw?.firmware],
-          ["Temp", controllerNode?.metrics?.temperature],
-          ["PHY", controllerNode?.metrics?.linked_phy_count && controllerNode?.metrics?.phy_count
+          [linuxSes ? "SES devices" : storageFabric ? "Source" : "PCIe slot", linuxSes ? controllerNode?.metrics?.ses_device_count : storageFabric ? controllerNode?.raw?.source : controllerNode?.metrics?.pcie_slot || controllerNode?.raw?.pcie_slot],
+          ["FW", linuxSes || storageFabric ? null : controllerNode?.metrics?.firmware || controllerNode?.raw?.firmware],
+          ["Temp", linuxSes || storageFabric ? null : controllerNode?.metrics?.temperature],
+          ["PHY", linuxSes || storageFabric ? null : controllerNode?.metrics?.linked_phy_count && controllerNode?.metrics?.phy_count
             ? `${controllerNode.metrics.linked_phy_count}/${controllerNode.metrics.phy_count}`
             : controllerNode?.metrics?.linked_phys],
-          ["IOC", iocFacts.iocstatus],
-          ["Events", diagnosticSummary(controllerDiagnostics)],
+          ["IOC", linuxSes || storageFabric ? null : iocFacts.iocstatus],
+          ["Events", linuxSes || storageFabric ? null : diagnosticSummary(controllerDiagnostics)],
         ],
         hoverFacts: [
           ["Device", controllerNode?.raw?.device || controllerNode?.raw_id],
@@ -1896,21 +2477,27 @@
         nodeId: controllerNode?.id || controllerId,
       }),
       renderDiskPathCard({
-        kind: "SAS Link",
-        title: `${controllerName} ${stateName}`,
-        subtitle: mprDevice?.member_device_name || seed.device_name || displayLabel(pathNode) || "controller-level fabric",
+        kind: labels.path,
+        title: pathTitle,
+        subtitle: compactDeviceLabel(seed.pathState?.ses_device || pathNode?.raw?.ses_device || mprDevice?.member_device_name || seed.device_name || displayLabel(pathNode) || "controller-level fabric", 42),
         facts: [
-          ["Speed", formatLinkSpeed(mprDevice?.speed)],
-          ["PHY", expanderPhy?.phy],
-          ["Remote", expanderPhy?.remote_phy],
-          ["Handle", mprDevice?.handle],
-          ["Parent", mprDevice?.parent],
-          ["Disk slot", mprDevice?.mpr_slot],
-          ["Events", diagnosticSummary(linkDiagnostics)],
+          [linuxSes ? "SES device" : storageFabric ? "Path" : "Speed", linuxSes ? seed.pathState?.ses_device || pathNode?.raw?.ses_device : storageFabric ? pathNode?.raw?.path_type || pathNode?.raw?.source : formatLinkSpeed(mprDevice?.speed)],
+          [linuxSes ? "Block SG" : "PHY", linuxSes ? seed.pathState?.sg_device : storageFabric ? null : expanderPhy?.phy],
+          [linuxSes ? "HCTL" : "Remote", linuxSes ? seed.pathState?.scsi_hctl : storageFabric ? null : expanderPhy?.remote_phy],
+          [linuxSes ? "Transport" : "Handle", linuxSes ? [seed.pathState?.transport_protocol, seed.pathState?.target_port_protocol].filter(Boolean).join(" / ") : storageFabric ? null : mprDevice?.handle],
+          ["Parent", linuxSes || storageFabric ? null : mprDevice?.parent],
+          ["Disk slot", linuxSes || storageFabric ? null : mprDevice?.mpr_slot],
+          ["Events", linuxSes || storageFabric ? null : diagnosticSummary(linkDiagnostics)],
         ],
         hoverFacts: [
           ["Path state", stateName],
           ["Member device", mprDevice?.member_device_name || seed.device_name],
+          ["Disk identity", [seed.pathState?.model, seed.pathState?.serial, seed.pathState?.size_human].filter(Boolean).join(" / ")],
+          ["SAS / LUN", seed.pathState?.sas_address || seed.pathState?.logical_unit_id],
+          ["Attached SAS", seed.pathState?.attached_sas_address],
+          ["PHY", seed.pathState?.phy_identifier],
+          ["Block size", [seed.pathState?.logical_block_size, seed.pathState?.physical_block_size].filter(Boolean).join(" / ")],
+          ["SMART device", list(seed.pathState?.smart_device_names).join(", ")],
           ["MPR device", mprDevice?.mpr_device || expanderPhy?.device],
           ["SAS address", mprDevice?.sas_address],
           ["Enclosure handle", mprDevice?.enclosure_handle],
@@ -1923,22 +2510,24 @@
           ["Expander device", expanderPhy?.device],
         ],
         status: stateName,
-        traceId: traceById(pathNode?.id, fabric) ? pathNode.id : "",
+        nodeId: pathNodeId,
+        traceId: pathNodeId ? "" : pathTraceId,
       }),
       renderDiskPathCard({
-        kind: "Expander / SES",
-        title: displayLabel(expanderNode) || displayLabel(enclosureNode) || "Expander unknown",
+        kind: labels.enclosure,
+        title: displayLabel(expanderNode) || displayLabel(enclosureNode) || sesNodes.map(displayLabel).filter(Boolean).join(" + ") || (linuxSes ? "SES enclosure" : storageFabric ? "Storage view" : "Expander unknown"),
         subtitle: [
-          displayLabel(enclosureNode) && displayLabel(enclosureNode) !== displayLabel(expanderNode) ? `MPR ${displayLabel(enclosureNode)}` : null,
+          linuxSes ? seed.pathState?.ses_device || pathNode?.raw?.ses_device || enclosureNode?.raw_id : null,
+          !linuxSes && !storageFabric && displayLabel(enclosureNode) && displayLabel(enclosureNode) !== displayLabel(expanderNode) ? `MPR ${displayLabel(enclosureNode)}` : null,
           sesNodes.map(displayLabel).join(" + "),
         ].filter(Boolean).join(" / "),
         facts: [
-          ["WWN", expanderNode?.raw_id || enclosureNode?.raw_id],
-          ["PHY", expanderNode?.metrics?.linked_phys && expanderNode?.metrics?.num_phys
+          [linuxSes ? "SG device" : storageFabric ? "Evidence" : "WWN", linuxSes ? enclosureNode?.raw_id || seed.pathState?.ses_device : storageFabric ? enclosureNode?.raw?.source : expanderNode?.raw_id || enclosureNode?.raw_id],
+          ["PHY", linuxSes || storageFabric ? null : expanderNode?.metrics?.linked_phys && expanderNode?.metrics?.num_phys
             ? `${expanderNode.metrics.linked_phys}/${expanderNode.metrics.num_phys}`
             : expanderNode?.metrics?.linked_phys],
-          ["Enclosure", mprDevice?.enclosure_handle || enclosureNode?.raw?.enc_handle],
-          ["Devices", formatCountMap(expanderNode?.raw?.device_counts)],
+          ["Enclosure", linuxSes ? enclosureNode?.raw?.enclosure_label : mprDevice?.enclosure_handle || enclosureNode?.raw?.enc_handle],
+          ["Devices", linuxSes || storageFabric ? null : formatCountMap(expanderNode?.raw?.device_counts)],
         ],
         hoverFacts: [
           ["Dev handle", expanderNode?.raw?.dev_handle],
@@ -1953,7 +2542,7 @@
         nodeId: expanderNode?.id || enclosureNode?.id || "",
       }),
       renderDiskPathCard({
-        kind: "Backplane",
+        kind: labels.backplane,
         title: displayLabel(backplaneNode) || zone.label,
         subtitle: zone.range,
         facts: [
@@ -1972,28 +2561,59 @@
         status: slot?.state || trace.status || "online",
         nodeId: backplaneNode?.id || zone.id || "",
       }),
+      poolTitle && (storageFabric || linuxSes) ? renderDiskPathCard({
+        kind: labels.pool,
+        title: poolTitle,
+        subtitle: [
+          pathNode?.raw?.pool_owner_label ? `owner ${pathNode.raw.pool_owner_label}` : null,
+          pathNode?.raw?.fence_owner_label ? `fence ${pathNode.raw.fence_owner_label}` : null,
+        ].filter(Boolean).join(" / "),
+        facts: [
+          ["Visible on", list(pathNode?.raw?.visible_on_labels).join(", ")],
+          ["Slots", sortedSlots(poolNode?.slots).length || null],
+        ],
+        status: poolNode?.status || stateName,
+        nodeId: poolNode?.id || "",
+      }) : "",
+      vdevTitle && (storageFabric || linuxSes) ? renderDiskPathCard({
+        kind: labels.vdev,
+        title: vdevTitle,
+        subtitle: slot?.pool_name || trace.metrics?.pool_name || "",
+        facts: [
+          ["Slots", sortedSlots(vdevNode?.slots).length || null],
+          ["State", vdevNode?.status],
+        ],
+        status: vdevNode?.status || stateName,
+        nodeId: vdevNode?.id || "",
+      }) : "",
       renderDiskPathCard({
-        kind: "Disk",
+        kind: labels.disk,
         title: diskTitle,
         subtitle: diskSubtitle,
         facts: [
           ["Pool / vdev", [slot?.pool_name, slot?.vdev_name].filter(Boolean).join(" / ")],
-          ["Health", [slot?.health || slot?.state, slot?.temperature_c ? `${slot.temperature_c} C` : null].filter(Boolean).join(" / ")],
-          ["SAS / LUN", mprDevice?.sas_address || slot?.sas_address || slot?.logical_unit_id],
+          ["Health", [smartSummary?.smart_health_status || slot?.health || slot?.state, smartSummary?.temperature_c != null ? `${smartSummary.temperature_c} C` : slot?.temperature_c ? `${slot.temperature_c} C` : null].filter(Boolean).join(" / ")],
+          ["SAS / LUN", mprDevice?.sas_address || diskSasAddress || diskLun],
+          ["SMART", smartSummaryLine(smartSummary)],
           ["Member", mprDevice?.member_device_name || seed.device_name],
           ["Events", diagnosticSummary(linkDiagnostics)],
         ],
         hoverFacts: [
-          ["Serial", slot?.serial],
-          ["Model", slot?.model],
-          ["Size", slot?.size_human],
+          ["Serial", diskSerial],
+          ["Model", diskModel],
+          ["Size", diskSize],
+          ["Vdev class", diskVdevClass],
+          ["Block size", diskBlockSizes],
+          ["SMART device", diskSmartDevices],
           ["Kernel sense", diagnosticSenseSummary(linkDiagnostics)],
           ["Recent kernel events", diagnosticRecentSummary(linkDiagnostics)],
           ["GPTID", slot?.gptid],
           ["Multipath state", slot?.multipath?.state || slot?.multipath?.provider_state],
-          ["SMART", slot?.smart_status],
+          ["SMART", smartSummaryLine(smartSummary)],
+          ["Power on", formatSmartPowerOn(smartSummary)],
           ["Last SMART test", [slot?.last_smart_test_type, slot?.last_smart_test_status].filter(Boolean).join(" / ")],
-          ["Transport", slot?.transport_protocol],
+          ["Transport", [slot?.transport_protocol, slot?.scsi_hctl, slot?.sg_device].filter(Boolean).join(" / ")],
+          ["Attached SAS", slot?.attached_sas_address],
         ],
         status: slot?.health || slot?.state || stateName,
         traceId: trace.id,
@@ -2002,12 +2622,12 @@
     return `
       <section class="disk-path-branch status-${classToken(stateName)}">
         <div class="disk-path-branch-header">
-          <span>${escapeHtml(controllerName)}</span>
+          <span>${escapeHtml(sourceTitle)}</span>
           <strong>${escapeHtml(stateName)}</strong>
-          <small>${escapeHtml(mprDevice?.member_device_name || seed.device_name || "")}</small>
+          <small>${escapeHtml(branchHeaderContext)}</small>
         </div>
         <div class="disk-path-flow">
-          ${cards.map((card, index) => `${index ? '<span class="disk-path-arrow">-&gt;</span>' : ""}${card}`).join("")}
+          ${cards.filter(Boolean).map((card, index) => `${index ? '<span class="disk-path-arrow">-&gt;</span>' : ""}${card}`).join("")}
         </div>
         ${options.includeEvidence === false ? "" : renderDiagnosticEvidencePanel(branchDiagnostics)}
       </section>
@@ -2021,6 +2641,12 @@
     }
     const slotNumber = sortedSlots(trace.slots)[0];
     const slot = slotByNumber(slotNumber);
+    const selectedModel = slot?.model || trace.metrics?.model;
+    const selectedSerial = slot?.serial || trace.metrics?.serial;
+    const selectedSize = slot?.size_human || trace.metrics?.size_human;
+    const selectedPool = slot?.pool_name || trace.metrics?.pool_name;
+    const selectedVdev = slot?.vdev_name || trace.metrics?.vdev_name;
+    const selectedDevice = slot?.device_name || trace.metrics?.device_name;
     const branches = branchSeedsForDiskTrace(trace, fabric);
     const evidencePanels = branches
       .map((seed) => diskPathBranchEvidence(seed, trace, fabric))
@@ -2031,7 +2657,14 @@
           <div class="disk-path-selected">
             <span class="fabric-stage-title">Selected disk</span>
             <strong>Bay ${escapeHtml(formatSlotLabel(slotNumber))}</strong>
-            <small>${escapeHtml([slot?.device_name || trace.metrics?.device_name, slot?.serial, slot?.vdev_name].filter(Boolean).join(" / ") || "No disk metadata")}</small>
+            <small>${escapeHtml([
+              selectedModel,
+              compactDeviceLabel(selectedDevice, 44),
+              selectedSerial && !compactDeviceLabel(selectedDevice, 44).includes(selectedSerial) ? selectedSerial : null,
+              selectedSize,
+              selectedPool,
+              selectedVdev,
+            ].filter(Boolean).join(" / ") || "No disk metadata")}</small>
           </div>
           <div class="fabric-bay-grid disk-path-bay-grid is-layout">
             ${renderDiskPathBayPicker(fabric, slotNumber)}
@@ -2148,9 +2781,140 @@
     `;
   }
 
+  function renderBayPathMembers(pathStates) {
+    return list(pathStates).length ? `
+      <div class="fabric-path-member-list">
+        ${list(pathStates).map((pathState) => {
+          const stateName = pathState.state || "unknown";
+          const deviceName = pathState.device_name || pathState.member_device_name || "";
+          return `
+            <div class="fabric-path-member-card status-${classToken(stateName)}">
+              <div>
+                <strong>${escapeHtml(pathState.controller || pathState.path_id || "path")}</strong>
+                <span>${escapeHtml(stateName)}</span>
+              </div>
+              ${deviceName ? `<small title="${escapeHtml(deviceName)}">${escapeHtml(compactDeviceLabel(deviceName, 54))}</small>` : ""}
+              <dl>
+                ${pathState.source ? `<span><dt>Source</dt><dd>${escapeHtml(pathState.source)}</dd></span>` : ""}
+                ${pathState.path_type ? `<span><dt>Type</dt><dd>${escapeHtml(pathState.path_type)}</dd></span>` : ""}
+                ${pathState.ses_device ? `<span><dt>SES</dt><dd>${escapeHtml(pathState.ses_device)}</dd></span>` : ""}
+                ${pathState.sg_device ? `<span><dt>SG</dt><dd>${escapeHtml(pathState.sg_device)}</dd></span>` : ""}
+                ${pathState.scsi_hctl ? `<span><dt>HCTL</dt><dd>${escapeHtml(pathState.scsi_hctl)}</dd></span>` : ""}
+                ${pathState.transport_protocol ? `<span><dt>Transport</dt><dd>${escapeHtml([pathState.transport_protocol, pathState.target_port_protocol].filter(Boolean).join(" / "))}</dd></span>` : ""}
+                ${pathState.logical_unit_id || pathState.sas_address ? `<span><dt>SAS/LUN</dt><dd>${escapeHtml(pathState.sas_address || pathState.logical_unit_id)}</dd></span>` : ""}
+              </dl>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    ` : '<span class="fabric-empty-note">No path members reported.</span>';
+  }
+
+  function renderSelectedBayInspector(trace, fabric) {
+    const nodes = nodeMap(fabric);
+    const slotNumber = sortedSlots(trace.slots)[0];
+    const slot = slotByNumber(slotNumber);
+    const pathStates = list(trace.metrics?.path_states);
+    const sourceNode = firstTraceNode(trace, fabric, (node) => node?.kind === "controller");
+    const pathNode = firstTraceNode(trace, fabric, (node) => node?.kind === "path");
+    const enclosureNode = firstTraceNode(trace, fabric, (node) => ["ses-enclosure", "mpr-enclosure", "storage-enclosure"].includes(node?.kind));
+    const poolNode = firstTraceNode(trace, fabric, (node) => node?.kind === "pool");
+    const vdevNode = firstTraceNode(trace, fabric, (node) => node?.kind === "vdev");
+    const backplaneNode = firstTraceNode(trace, fabric, (node) => node?.kind === "backplane");
+    const deviceName = trace.metrics?.device_name || slot?.device_name || "";
+    const compactDevice = compactDeviceLabel(deviceName, 56);
+    const stateName = slot?.health || slot?.state || pathStates[0]?.state || trace.status || "unknown";
+    const bayLabel = `Bay ${formatSlotLabel(slotNumber)}`;
+    const bayModel = slot?.model || trace.metrics?.model;
+    const baySerial = slot?.serial || trace.metrics?.serial;
+    const baySize = slot?.size_human || trace.metrics?.size_human;
+    const bayLun = slot?.logical_unit_id || trace.metrics?.logical_unit_id;
+    const bayBlockSizes = [
+      slot?.logical_block_size || trace.metrics?.logical_block_size,
+      slot?.physical_block_size || trace.metrics?.physical_block_size,
+    ].filter(Boolean).join(" / ");
+    const baySmartDevices = list(slot?.smart_device_names || trace.metrics?.smart_device_names).join(", ");
+    const modelLine = [bayModel, baySize].filter(Boolean).join(" / ");
+    const sourceLabel = displayLabel(sourceNode) || pathStates[0]?.controller || fabric.system_label || "source";
+    const pathLabel = displayLabel(pathNode) || pathStates[0]?.ses_device || pathStates[0]?.path_id || pathStates[0]?.path_type;
+    const smartSummary = smartSummaryForSlot(slotNumber);
+    return `
+      <div class="fabric-selected-bay">
+        <section class="fabric-selected-bay-hero status-${classToken(stateName)}">
+          <div>
+            <span class="fabric-stage-title">Selected Bay</span>
+            <strong>${escapeHtml(bayLabel)}</strong>
+            <small>${escapeHtml(modelLine || compactDevice || "No disk metadata")}</small>
+          </div>
+          <span class="fabric-selected-bay-state">${escapeHtml(stateName)}</span>
+        </section>
+
+        <div class="fabric-inspector-fact-grid">
+          ${inspectorFact("Device", compactDevice || deviceName, { wide: true })}
+          ${inspectorFact("Model", bayModel)}
+          ${inspectorFact("Serial", baySerial)}
+          ${inspectorFact("Size", baySize)}
+          ${inspectorFact("Pool", displayLabel(poolNode) || trace.metrics?.pool_name || slot?.pool_name)}
+          ${inspectorFact("Vdev", displayLabel(vdevNode) || trace.metrics?.vdev_name || slot?.vdev_name)}
+          ${inspectorFact("Source", sourceLabel)}
+          ${inspectorFact("Path", pathLabel)}
+          ${inspectorFact("View", displayLabel(enclosureNode) || slot?.enclosure_name)}
+          ${inspectorFact("Bay Group", displayLabel(backplaneNode))}
+          ${inspectorFact("Fabric", trace.metrics?.fabric_kind)}
+        </div>
+
+        <section class="fabric-inspector-section">
+          <h4>Device Identity</h4>
+          <div class="fabric-identity-card">
+            ${deviceName ? `<code title="${escapeHtml(deviceName)}">${escapeHtml(deviceName)}</code>` : '<span class="fabric-empty-note">No device path reported.</span>'}
+            <div>
+              ${baySerial ? `<span><em>Serial</em>${escapeHtml(baySerial)}</span>` : ""}
+              ${bayModel ? `<span><em>Model</em>${escapeHtml(bayModel)}</span>` : ""}
+              ${baySize ? `<span><em>Size</em>${escapeHtml(baySize)}</span>` : ""}
+              ${bayLun ? `<span><em>LUN</em>${escapeHtml(bayLun)}</span>` : ""}
+              ${bayBlockSizes ? `<span><em>Block size</em>${escapeHtml(bayBlockSizes)}</span>` : ""}
+              ${baySmartDevices ? `<span><em>SMART device</em>${escapeHtml(baySmartDevices)}</span>` : ""}
+              ${smartSummaryLine(smartSummary) ? `<span><em>SMART</em>${escapeHtml(smartSummaryLine(smartSummary))}</span>` : ""}
+              ${slot?.transport_protocol ? `<span><em>Transport</em>${escapeHtml([slot.transport_protocol, slot.scsi_hctl].filter(Boolean).join(" / "))}</span>` : ""}
+              ${slot?.sg_device ? `<span><em>SG device</em>${escapeHtml(slot.sg_device)}</span>` : ""}
+              ${slot?.attached_sas_address ? `<span><em>Attached SAS</em>${escapeHtml(slot.attached_sas_address)}</span>` : ""}
+            </div>
+          </div>
+        </section>
+
+        <section class="fabric-inspector-section">
+          <h4>Selected Disk SMART</h4>
+          ${renderSmartSummaryCard(slotNumber, slot)}
+        </section>
+
+        <section class="fabric-inspector-section">
+          <h4>Source Evidence</h4>
+          <div class="fabric-evidence-chip-list">${evidenceChips(trace.evidence)}</div>
+        </section>
+
+        <section class="fabric-inspector-section">
+          <h4>Path Members</h4>
+          ${renderBayPathMembers(pathStates)}
+        </section>
+
+        <section class="fabric-inspector-section">
+          <h4>Friendly Label</h4>
+          <div class="kv-grid">
+            ${renderAliasRow("Bay", { objectId: trace.id, objectKind: trace.kind, item: trace })}
+          </div>
+        </section>
+
+        <section class="fabric-inspector-section">
+          <h4>Trace Nodes</h4>
+          <div class="fabric-node-grid fabric-inspector-node-grid">${renderNodeGrid(list(trace.node_ids).map((nodeId) => nodes.get(nodeId)).filter(Boolean), 18)}</div>
+        </section>
+      </div>
+    `;
+  }
+
   function aliasScopeLabel(kind) {
     const kindName = String(kind || "").toLowerCase();
-    if (["bay", "backplane", "ses-enclosure", "mpr-enclosure", "expander"].includes(kindName)) {
+    if (["bay", "backplane", "ses-enclosure", "mpr-enclosure", "storage-enclosure", "expander"].includes(kindName)) {
       return "Enclosure";
     }
     return "System";
@@ -2254,6 +3018,12 @@
     if (trace) {
       const nodes = nodeMap(fabric);
       const pathStates = list(trace.metrics?.path_states);
+      if (trace.kind === "bay") {
+        const slotNumber = sortedSlots(trace.slots)[0];
+        elements.inspectorTitle.textContent = `Selected Bay ${Number.isInteger(slotNumber) ? formatSlotLabel(slotNumber) : ""}`.trim();
+        elements.inspectorBody.innerHTML = renderSelectedBayInspector(trace, fabric);
+        return;
+      }
       elements.inspectorTitle.textContent = `Selected ${formatKind(trace.kind)}`;
       elements.inspectorBody.innerHTML = `
         <div class="kv-grid">
@@ -2330,6 +3100,11 @@
 
   function renderSummary() {
     const fabric = state.fabric || {};
+    const copy = fabricViewCopy(fabric);
+    setSummaryCardText(elements.summaryControllers, ...copy.summary.controllers);
+    setSummaryCardText(elements.summaryPaths, ...copy.summary.paths);
+    setSummaryCardText(elements.summaryExpanders, ...copy.summary.expanders);
+    setSummaryCardText(elements.summaryEnclosures, ...copy.summary.enclosures);
     elements.summaryControllers.textContent = String(list(fabric.controllers).length);
     elements.summaryPaths.textContent = String(list(fabric.paths).length);
     elements.summaryExpanders.textContent = String(list(fabric.expanders).length);
@@ -2341,26 +3116,27 @@
 
   function renderStatus() {
     const fabric = state.fabric;
+    const copy = fabricViewCopy(fabric);
     let className = "status-chip";
-    let text = "FABRIC";
+    let text = copy.statusBase;
     if (state.error) {
       className += " error";
-      text = "FABRIC ERR";
+      text = `${copy.statusBase} ERR`;
       elements.statusText.textContent = state.error;
       elements.statusText.dataset.tone = "error";
     } else if (state.loading) {
       className += " partial";
-      text = "FABRIC ...";
-      elements.statusText.textContent = fabric ? "Refreshing fabric data." : "Loading fabric data.";
+      text = `${copy.statusBase} ...`;
+      elements.statusText.textContent = fabric ? `Refreshing ${copy.statusBase.toLowerCase()} data.` : `Loading ${copy.statusBase.toLowerCase()} data.`;
       elements.statusText.dataset.tone = "info";
     } else if (fabric?.available === false) {
       className += " partial";
-      text = "FABRIC OFF";
-      elements.statusText.textContent = list(fabric.warnings)[0] || "SAS Fabric is not available for this system.";
+      text = `${copy.statusBase} OFF`;
+      elements.statusText.textContent = list(fabric.warnings)[0] || "Storage Fabric is not available for this system.";
       elements.statusText.dataset.tone = "error";
     } else if (fabric) {
       className += " ok";
-      text = "FABRIC OK";
+      text = `${copy.statusBase} OK`;
       elements.statusText.textContent = `Loaded ${list(fabric.traces).length} traces for ${fabric.selected_enclosure_label || fabric.system_label || "current selection"}.`;
       elements.statusText.dataset.tone = "info";
     } else {
@@ -2384,7 +3160,12 @@
   }
 
   function isSasFabricEnrichmentWarning(warning) {
-    return String(warning || "").toLowerCase().includes("sas fabric enrichment probes");
+    const text = String(warning || "").toLowerCase();
+    return text.includes("sas fabric enrichment probes")
+      || text.includes("storage fabric enrichment probes")
+      || text.includes("fabric map is built from linux ses slot evidence")
+      || text.includes("storage fabric is built from")
+      || text.includes("storage fabric map is built from");
   }
 
   function focusButton({ label, title, meta, ref, mode, tone = "" }) {
@@ -2460,11 +3241,25 @@
   }
 
   function renderModeChrome() {
-    const copy = modeCopy[state.mode] || modeCopy.lanes;
-    elements.mapTitle.textContent = copy.title;
-    elements.mapSubtitle.textContent = copy.subtitle;
+    const copy = fabricViewCopy(state.fabric);
+    const modeDetails = copy.modes[state.mode] || copy.modes.lanes;
+    if (elements.pageEyebrow) {
+      elements.pageEyebrow.textContent = copy.eyebrow;
+    }
+    if (elements.pageSummary) {
+      elements.pageSummary.textContent = copy.pageSummary;
+    }
+    if (elements.refreshButton) {
+      elements.refreshButton.textContent = copy.refresh;
+    }
+    elements.mapTitle.textContent = modeDetails.title;
+    elements.mapSubtitle.textContent = modeDetails.subtitle;
     elements.modeButtons.forEach((button) => {
       const active = button.dataset.fabricMode === state.mode;
+      const label = copy.modeLabels[button.dataset.fabricMode];
+      if (label) {
+        button.textContent = label;
+      }
       button.classList.toggle("active", active);
       button.setAttribute("aria-pressed", active ? "true" : "false");
     });
@@ -2473,13 +3268,14 @@
   function renderMap() {
     const fabric = state.fabric;
     if (!fabric) {
-      elements.mapPanel.innerHTML = '<div class="warning-item muted compact">No SAS fabric payload has been loaded yet.</div>';
+      elements.mapPanel.innerHTML = '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
       renderFocusStrip(null);
       renderInspector(null);
       return;
     }
     if (fabric.available === false) {
-      elements.mapPanel.innerHTML = '<div class="warning-item muted compact">No topology map is available for this platform yet.</div>';
+      const copy = fabricViewCopy(fabric);
+      elements.mapPanel.innerHTML = `<div class="warning-item muted compact">${escapeHtml(copy.unavailableMap)}</div>`;
       renderFocusStrip(fabric);
       renderInspector(fabric);
       return;
@@ -2490,6 +3286,7 @@
     if (state.selectedTraceId && !traceById(state.selectedTraceId, fabric)) {
       state.selectedTraceId = null;
     }
+    rememberedDiskTrace(fabric);
     ensureSelectionForMode(fabric);
     pruneSelectionTrail(fabric);
     renderFocusStrip(fabric);
@@ -2512,6 +3309,7 @@
     renderWarnings();
     renderModeChrome();
     renderMap();
+    ensureSelectedSmartSummary();
     syncLocation();
     elements.refreshButton.disabled = state.loading;
   }
@@ -2531,6 +3329,7 @@
     if (state.selectedTraceId && !traceById(state.selectedTraceId, fabric)) {
       state.selectedTraceId = null;
     }
+    rememberedDiskTrace(fabric);
     ensureSelectionForMode(fabric);
     pruneSelectionTrail(fabric);
   }
@@ -2578,6 +3377,7 @@
     state.selectedEnclosureId = null;
     state.selectedTraceId = null;
     state.selectedNodeId = null;
+    state.selectedDiskTraceId = null;
     state.selectionTrail = [];
     state.expandedSlotLists = {};
     state.diagnosticTables = {};
@@ -2589,6 +3389,7 @@
     state.selectedEnclosureId = elements.enclosureSelect.value || null;
     state.selectedTraceId = null;
     state.selectedNodeId = null;
+    state.selectedDiskTraceId = null;
     state.selectionTrail = [];
     state.expandedSlotLists = {};
     state.diagnosticTables = {};

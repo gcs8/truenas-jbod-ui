@@ -5,6 +5,7 @@ from app.services.parsers import (
     parse_camcontrol_devlist,
     parse_esxcli_smart_get,
     parse_gmultipath_list,
+    parse_lsscsi_devices,
     parse_lsblk_json,
     parse_mdadm_detail_scan,
     parse_nvme_id_ctrl_summary,
@@ -17,6 +18,7 @@ from app.services.parsers import (
     parse_ubntstorage_json,
     parse_sg_ses_aes,
     parse_sg_ses_enclosure_status,
+    parse_sg_ses_join_filter,
     parse_smart_test_results,
     parse_smartctl_text_enrichment,
     parse_smartctl_summary,
@@ -113,10 +115,29 @@ errors: No known data errors
 
         self.assertEqual(canonicalize_ssh_command(command), "sg_ses ec /dev/sg38")
 
+    def test_canonicalize_sg_ses_join_command_preserves_target_device(self) -> None:
+        command = "sudo -n /usr/bin/sg_ses --join --filter /dev/sg26"
+
+        self.assertEqual(canonicalize_ssh_command(command), "sg_ses join /dev/sg26")
+
     def test_canonicalize_linux_inventory_commands(self) -> None:
         self.assertEqual(canonicalize_ssh_command("/usr/bin/lsblk -OJ"), "lsblk -OJ")
+        self.assertEqual(
+            canonicalize_ssh_command(
+                "/usr/bin/lsblk --json --bytes --output NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,TRAN,HCTL"
+            ),
+            "lsblk -OJ",
+        )
+        self.assertEqual(canonicalize_ssh_command("/usr/bin/lsscsi -g"), "lsscsi -g")
+        self.assertEqual(canonicalize_ssh_command("/usr/bin/lsscsi -g -t"), "lsscsi -g -t")
         self.assertEqual(canonicalize_ssh_command("sudo -n /usr/sbin/mdadm --detail --scan"), "mdadm --detail --scan")
         self.assertEqual(canonicalize_ssh_command("/usr/bin/nvme list-subsys -o json"), "nvme list-subsys -o json")
+        self.assertEqual(
+            canonicalize_ssh_command(
+                "/usr/sbin/nvme list-subsys -o json 2>/dev/null || /usr/bin/nvme list-subsys -o json 2>/dev/null || true"
+            ),
+            "nvme list-subsys -o json",
+        )
         self.assertEqual(canonicalize_ssh_command("/usr/sbin/ubntstorage disk inspect"), "ubntstorage disk inspect")
         self.assertEqual(canonicalize_ssh_command("/usr/sbin/ubntstorage space inspect"), "ubntstorage space inspect")
         self.assertEqual(canonicalize_ssh_command("cat /sys/kernel/debug/gpio"), "gpio debug")
@@ -133,6 +154,56 @@ errors: No known data errors
             canonicalize_ssh_command("sysctl -a | egrep '^dev\\.mpr\\.[0-9]+\\.%(location|parent):' || true"),
             "mpr sysctl pci locations",
         )
+
+    def test_parse_lsscsi_g_t_extracts_transport_and_sg_devices(self) -> None:
+        output = """
+[1:0:1:0]    disk    sas:0x5000cca264d473d5          /dev/sdc   /dev/sg2
+[1:0:26:0]   enclosu sas:0x5003048001c1043f          -          /dev/sg26
+""".strip()
+
+        parsed = parse_lsscsi_devices(output, transport=True)
+
+        self.assertEqual(parsed[0].hctl, "1:0:1:0")
+        self.assertEqual(parsed[0].device_type, "disk")
+        self.assertEqual(parsed[0].block_device, "/dev/sdc")
+        self.assertEqual(parsed[0].sg_device, "/dev/sg2")
+        self.assertEqual(parsed[0].transport, "sas")
+        self.assertEqual(parsed[0].transport_address, "0x5000cca264d473d5")
+        self.assertEqual(parsed[1].device_type, "enclosu")
+        self.assertIsNone(parsed[1].block_device)
+        self.assertEqual(parsed[1].sg_device, "/dev/sg26")
+
+    def test_parse_sg_ses_join_filter_extracts_joined_slot_detail(self) -> None:
+        output = """
+LSI       SAS3x40           0601
+Primary enclosure logical identifier (hex): 5003048001c1043f
+Slot00 [0,0]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 0, device slot number: 0
+    phy index: 0
+      SAS device type: end device
+      target port for: SSP
+      attached SAS address: 0x5003048001c1043f
+      SAS address: 0x5000cca264d473d5
+      phy identifier: 0x0
+""".strip()
+
+        enclosure = parse_sg_ses_join_filter(output, "sg_ses join /dev/sg26")
+
+        self.assertIsNotNone(enclosure)
+        self.assertEqual(enclosure.ses_device, "/dev/sg26")
+        self.assertEqual(enclosure.enclosure_id, "5003048001c1043f")
+        slot = enclosure.slots[0]
+        self.assertEqual(slot.status, "OK")
+        self.assertEqual(slot.transport_protocol, "SAS")
+        self.assertEqual(slot.sas_device_type, "end device")
+        self.assertEqual(slot.target_port_protocol, "SSP")
+        self.assertEqual(slot.attached_sas_address, "5003048001c1043f")
+        self.assertEqual(slot.sas_address, "5000cca264d473d5")
+        self.assertEqual(slot.phy_identifier, "0x0")
 
     def test_canonicalize_esxi_inventory_commands(self) -> None:
         self.assertEqual(canonicalize_ssh_command("esxcli storage core device list"), "esxcli storage core device list")
