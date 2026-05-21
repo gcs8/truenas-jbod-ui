@@ -4,6 +4,16 @@
 
 No unreleased changes yet.
 
+## v0.20.2 - 2026-05-21
+
+### Changed
+
+- Hardened `docs/RELEASE_CHECKLIST.md` into the mandatory source of truth for
+  every tagged release, requiring release-wrap evidence for all applicable
+  unit, browser, Docker, optional-sidecar, perf, Linux restore, public demo,
+  GHCR, deployment, and post-release gates, with a validator script to catch
+  missing wrap evidence before tagging.
+
 ## v0.20.1 - 2026-05-21
 
 ### Changed
