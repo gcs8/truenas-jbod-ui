@@ -4,6 +4,89 @@ Use this checklist before cutting a tagged release.
 
 The goal is to make releases boring, repeatable, and easy to audit later.
 
+## Non-Negotiable Release Gate
+
+- `docs/RELEASE_CHECKLIST.md` is the mandatory release gate for every tagged
+  release. Version-specific QA docs can add release-specific checks, but they
+  cannot replace or narrow this checklist.
+- Every tagged release, including docs-only, patch, hotfix, runtime-only, and
+  metadata releases, must have a release wrap with a completed checklist
+  evidence table before the tag is pushed.
+- Every applicable checklist item must be recorded as `Pass`, `Blocked`, or
+  `N/A` in the release wrap. `N/A` requires a concrete reason. "Not enough
+  time" is not a valid reason; stop the release instead.
+- Do not push the release tag until the pre-tag release wrap proves every
+  pre-publish gate is `Pass` or justified `N/A`. Only inherently post-publish
+  gates may remain `Blocked` at this point: GHCR publish verification,
+  deployment refresh/sniff tests, and post-release reopen.
+- Do not call the release complete until the final release wrap proves every
+  required gate is `Pass` or justified `N/A`, including GHCR, deployment sniff
+  tests, and the next development reopen.
+- If a release is accidentally published without a complete checklist evidence
+  table, do not delete, overwrite, or retag public artifacts unless the artifact
+  is malicious or catastrophically unsafe. Prefer a SemVer patch correction
+  release that documents the gap, remediation, and full gate evidence.
+- If this checklist changes during release prep, rerun or re-evaluate the
+  affected gates and update the release wrap before cutting the tag.
+
+## Required Release Wrap Evidence
+
+Every `docs/RELEASE_WRAP_<version>.md` must include a checklist evidence table
+using this shape:
+
+| Gate | Required | Evidence | Result | N/A Reason |
+| --- | --- | --- | --- | --- |
+| Scope and branch | yes | command, commit, or URL | Pass/Blocked/N/A | reason |
+| Python unit and syntax gates | yes | command output summary | Pass/Blocked/N/A | reason |
+| JavaScript syntax gates | yes | command output summary | Pass/Blocked/N/A | reason |
+| Docker build and health gates | yes | command output summary | Pass/Blocked/N/A | reason |
+| Optional-sidecar runtime matrix | yes | command output summary | Pass/Blocked/N/A | reason |
+| Full Playwright/browser gates | yes | command output summary | Pass/Blocked/N/A | reason |
+| Feature-specific live API/UI gates | yes | API/browser evidence | Pass/Blocked/N/A | reason |
+| Local release perf harnesses | yes | artifact path and summary | Pass/Blocked/N/A | reason |
+| Linux QA restore gate | yes | target, counts, health, smoke evidence | Pass/Blocked/N/A | reason |
+| Restored Linux QA perf harnesses | yes | artifact path and summary | Pass/Blocked/N/A | reason |
+| Snapshot/export/offline artifact gate | yes | command and browser smoke | Pass/Blocked/N/A | reason |
+| Docs/wiki/public-demo gate | yes | changed files, URLs, workflow runs | Pass/Blocked/N/A | reason |
+| GHCR publish verification | yes | workflow URL and digest | Pass/Blocked/N/A | reason |
+| Deployment refresh/sniff tests | yes | local/Linux/prod URLs or commands | Pass/Blocked/N/A | reason |
+| Post-release reopen | yes | branch, commit, version | Pass/Blocked/N/A | reason |
+
+The wrap must also include the exact version, release commit, tag, GitHub
+release URL when published, GHCR digest when published, public demo workflow or
+Pages URL when applicable, external wiki commit when applicable, and any known
+deviations from the checklist.
+
+Before tagging, run the pre-tag release-wrap validator against the target
+version:
+
+- `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --phase pre-tag`
+
+After GHCR publish, deployment sniff tests, and reopen work are recorded, run
+the final release-wrap validator:
+
+- `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version>`
+
+## Release Gate Order
+
+1. Read this checklist and the current `HANDOFF.md` before doing release work.
+2. Confirm scope, release branch, version, and whether the release is a normal
+   feature release, patch, hotfix, docs-only correction, or process correction.
+3. Draft or update the release notes and release wrap before tagging.
+4. Run local unit, syntax, hygiene, Docker health, optional-sidecar, browser,
+   feature-specific, public-demo, and perf gates.
+5. Run the Linux QA Docker restore gate and restored-stack perf/browser gates.
+6. Fill in the release wrap checklist evidence table and pass the pre-tag
+   validator.
+7. Only after the pre-tag table is complete, merge/cut the release commit, tag
+   it, push it, publish the GitHub release, and verify GHCR digest convergence.
+8. Refresh and sniff-test local, Linux, and production deployments after GHCR
+   is available.
+9. Sync the external wiki and public demo deployment when those artifacts
+   changed, and record workflow URLs or commit hashes.
+10. Reopen the next development branch only after post-publish deployment
+    evidence is recorded, then rerun the final release-wrap validator.
+
 ## Scope
 
 - confirm the target version number
@@ -12,8 +95,29 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 
 ## Code And Runtime
 
-- run the targeted test suite:
-  - `.\.venv\Scripts\python -m unittest tests.test_profiles tests.test_inventory tests.test_history_service tests.test_perf tests.test_perf_harness tests.test_snapshot_export tests.test_admin_service tests.test_release_status`
+- run full Python unit discovery, not only a targeted subset:
+  - `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v`
+  - record the final test count in the release wrap
+- run targeted Python suites in addition to full discovery when the release
+  touches risky or recently changed surfaces:
+  - Storage Fabric and platform data:
+    `.\.venv\Scripts\python.exe -m unittest tests.test_sas_fabric tests.test_inventory tests.test_parsers tests.test_platform_parity_fixtures -v`
+  - admin/setup/runtime control:
+    `.\.venv\Scripts\python.exe -m unittest tests.test_admin_service tests.test_account_bootstrap tests.test_system_backup -v`
+  - history/performance/export:
+    `.\.venv\Scripts\python.exe -m unittest tests.test_history_service tests.test_perf tests.test_perf_harness tests.test_snapshot_export -v`
+  - release/version behavior:
+    `.\.venv\Scripts\python.exe -m unittest tests.test_release_status -v`
+- run Python syntax/compile coverage for changed Python plus shared app/test
+  packages:
+  - `.\.venv\Scripts\python.exe -m compileall app admin_service scripts tests`
+- validate the target release wrap before tagging:
+  - `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version>`
+- run JavaScript syntax gates for app, admin, QA, and changed JS files:
+  - `node --check app/static/app.js`
+  - `node --check app/static/sas_fabric_view.js`
+  - `node --check admin_service/static/admin.js`
+  - `node --check qa/public-demo.spec.js`
 - run the browser smoke suite against the live app:
   - `npx playwright test`
 - run hygiene checks before interpreting other diffs:
@@ -36,6 +140,7 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - confirm the app is healthy:
   - `curl http://localhost:8080/livez`
   - `curl http://localhost:8080/healthz`
+  - record the running version from `/livez` in the release wrap
 - validate every optional-sidecar runtime mode from the same branch tip:
   - **UI only:** stop `enclosure-history` and `enclosure-admin`, keep
     `enclosure-ui` running, then confirm `:8080/livez`, `:8080/healthz`, and
@@ -123,6 +228,18 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   - UniFi UNVR
   - UniFi UNVR Pro
   - Quantastor
+- run feature-specific live API and browser checks for the release's main
+  user-facing changes. The release-specific QA doc can define exact URLs and
+  observations, but the release wrap must record the final evidence. For
+  Storage Fabric releases, include at least:
+  - CORE dedicated Storage Fabric Disk Path and Impact Map
+  - SCALE/Linux SES-backed Disk Path
+  - Quantastor read-only Storage Fabric path
+  - ESXi read-only Storage Fabric path
+  - unsupported or weak-evidence platform state copy
+  - no browser console errors on release-facing paths
+  - no nested scroll/overflow, column overlap, or first-click selection
+    regression visible in screenshot-driven operator workflows
 - if the release includes recent ESXi work, sanity-check:
   - the saved FatTwin ESXi system renders the `supermicro-fat-twin-front-6`
     view with the validated `02 05 / 01 04 / 00 03` numbering and a matched
@@ -213,6 +330,14 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - review profile/config docs for dead or outdated comments, especially builder
   mode and custom-profile authoring guidance
 - review the repo `wiki/` pages for stale setup or release wording
+- add the completed checklist evidence table to the release wrap before the
+  tag is cut
+- if the release changes public-demo behavior or data, regenerate and verify
+  the checked-in artifact:
+  - `.\.venv\Scripts\python.exe scripts\build_public_demo.py --output public-demo\index.html --check`
+  - `.\.venv\Scripts\python.exe scripts\check_public_demo_artifact.py public-demo`
+  - `set PUBLIC_DEMO_ARTIFACT=public-demo/index.html`
+  - `npx playwright test qa/public-demo.spec.js`
 
 ## Config And Examples
 
@@ -236,9 +361,13 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   to use one for review
 - merge the release branch into `main` only when satisfied
 - create the annotated release tag after merge
+- before tagging, re-open the release wrap and verify every checklist evidence
+  row is complete
 
 ## Publish
 
+- confirm the release wrap checklist evidence table is complete before any
+  publish action
 - push `main`
 - push the release tag
 - publish the repo `wiki/` pages if they changed
@@ -268,3 +397,6 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   tear down only the temporary Linux QA restore containers, networks, and
   scratch runtime directories
 - start a new `Unreleased` section in `CHANGELOG.md` for follow-up work
+- update `HANDOFF.md` and `TODO.md` with the shipped release state, GHCR digest,
+  external wiki/public-demo state, deployment sniff results, and next branch
+  only after the post-publish gates above are recorded

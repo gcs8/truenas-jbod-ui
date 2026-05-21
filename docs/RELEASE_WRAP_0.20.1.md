@@ -106,8 +106,9 @@ The old `docs/V0_11_0_PLAN.md` draft was moved out of active docs to
 - Wiki Home now describes `0.20.1` as the current stable Storage Fabric polish
   release.
 
-External wiki sync is still a publish step. Do it with the normal wiki publish
-flow when the release commit is ready.
+External wiki sync completed at wiki commit `317b677` after the release cut.
+The public demo Pages workflow completed as run `26203479985`, and the live
+Pages artifact returned HTTP `200` with `0.20.1` and `Storage Fabric` present.
 
 ## Checkpoint Scope
 
@@ -130,11 +131,75 @@ promoted:
   owner/SES-host clarity, ESXi StorCLI/PercCLI breadth, BMC-only labeling, and
   further decoder-source growth.
 
-## Remaining Publish Gate
+## Publish Result
 
-- commit/tag `v0.20.1`
-- push and create the GitHub release
-- wait for GHCR publish and verify digest convergence
-- sync the external GitHub wiki if the release docs/wiki diff is accepted
-- refresh the public/demo deployment workflow or confirm the Pages workflow
-  published the checked-in `public-demo/` artifact
+- Release commit: `011bd1d`
+- Tag: `v0.20.1`
+- GitHub release:
+  `https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.20.1`
+- GHCR workflow run: `26203521398`
+- GHCR tags `v0.20.1`, `0.20.1`, and `latest` converged to digest
+  `sha256:e073f4e561c96379fe13b3064f24100781d69b39d48ed7ff5d31fde50f4163f3`
+- External wiki sync: `317b677`
+- Public demo workflow: `26203479985`
+
+## Post-Publish Checklist Audit
+
+After publication, the release process was audited against
+`docs/RELEASE_CHECKLIST.md`. The release validated a broad local
+release-candidate gate, but it used
+`docs/V0_20_1_RELEASE_CANDIDATE_QA.md` as the active checklist instead of
+recording a completed item-by-item evidence table from the global release
+checklist.
+
+| Gate | Required | Evidence | Result | N/A Reason |
+| --- | --- | --- | --- | --- |
+| Scope and branch | yes | `011bd1d` on `main`, tag `v0.20.1`, release branch reopened afterward as `0.21.0-dev` | Pass |  |
+| Python unit and syntax gates | yes | full unit discovery passed `459` tests; targeted Python syntax gates passed | Pass |  |
+| JavaScript syntax gates | yes | `node --check` passed for app, Storage Fabric view, admin, and public-demo QA files | Pass |  |
+| Docker build and health gates | yes | local UI/history/admin Docker rebuild and health checks passed with `/livez` reporting `0.20.1` | Pass |  |
+| Optional-sidecar runtime matrix | yes | not explicitly run and recorded before tag | Blocked |  |
+| Full Playwright/browser gates | yes | full Playwright passed `27` / `27` against the final local `0.20.1` stack | Pass |  |
+| Feature-specific live API/UI gates | yes | CORE, SCALE, Quantastor, ESXi, and admin Storage Fabric/API/browser RC smokes passed | Pass |  |
+| Local release perf harnesses | yes | not explicitly run and recorded before tag | Blocked |  |
+| Linux QA restore gate | yes | not explicitly run and recorded before tag | Blocked |  |
+| Restored Linux QA perf harnesses | yes | not explicitly run and recorded before tag | Blocked |  |
+| Snapshot/export/offline artifact gate | yes | restored-stack snapshot/offline smoke was not explicitly run and recorded before tag | Blocked |  |
+| Docs/wiki/public-demo gate | yes | release docs, checked-in wiki source, external wiki commit `317b677`, public demo workflow `26203479985` | Pass |  |
+| GHCR publish verification | yes | GHCR workflow `26203521398`; `v0.20.1`, `0.20.1`, and `latest` converged to digest `sha256:e073f4e561c96379fe13b3064f24100781d69b39d48ed7ff5d31fde50f4163f3` | Pass |  |
+| Deployment refresh/sniff tests | yes | post-GHCR local Windows, Linux Docker, and production deployment refresh/sniff evidence was not explicitly recorded | Blocked |  |
+| Post-release reopen | yes | branch `codex/v0.21.0-kickoff-2026-05-21-post-0.20.1`, commit `4d20569`, app/package metadata `0.21.0-dev` | Pass |  |
+
+Confirmed evidence from the shipped `0.20.1` gate:
+
+- full Python unit discovery passed with `459` tests
+- targeted Python and JavaScript syntax gates passed
+- local UI/history/admin Docker rebuild and health checks passed
+- full Playwright passed `27` / `27`
+- Storage Fabric API/browser smokes covered CORE, SCALE, Quantastor, ESXi, and
+  admin setup paths
+- public demo generation, static checks, and Playwright passed
+- GitHub release, GHCR digest convergence, external wiki sync, and Pages deploy
+  completed
+
+Release-checklist gaps that were not explicitly run and recorded before the
+tag:
+
+- optional-sidecar runtime matrix for UI-only, UI+history, UI+admin, and full
+  stack modes
+- release performance harnesses for both local and restored Linux QA stacks
+- Linux QA Docker restore/import gate from an exported admin backup
+- snapshot export/download and offline artifact smoke against the restored
+  Linux QA stack
+- post-publish local Windows, Linux Docker, and production deployment
+  refresh/sniff evidence after GHCR publish
+
+Process correction:
+
+- `docs/RELEASE_CHECKLIST.md` is now the mandatory release gate for every tag.
+  Release-specific QA docs are addenda only.
+- every future release wrap must include a completed checklist evidence table
+  with `Pass`, `Blocked`, or `N/A` plus concrete evidence or reasons.
+- already-published public artifacts should not be deleted, overwritten, or
+  retagged except for malicious or catastrophic artifacts; use a SemVer patch
+  correction release if a shipped release needs process remediation.
