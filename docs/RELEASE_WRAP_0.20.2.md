@@ -40,18 +40,25 @@ Validated against `docs/RELEASE_CHECKLIST.md`.
 | Restored Linux QA perf harnesses | yes | restored labels `release-candidate-0.20.2-linux-qa-restore` and `release-candidate-0.20.2-history-linux-qa-restore`; main averages included `health_cached 3.7 ms`, `storage_views_cached 26.9 ms`, `inventory_force 24346.1 ms`; history averages included `dashboard_html 7.8 ms`, `sidecar_healthz 15.4 ms`, `overview_estimated 19.9 ms`; restored worktree reported clean in both harnesses | Pass |  |
 | Snapshot/export/offline artifact gate | yes | restored Linux QA export estimate used Auto packaging and selected HTML at `6.2 MiB`; forced ZIP download from the same snapshot inputs produced `artifacts/release-0.20.2-linux-qa-offline-snapshot.zip` at `1064709` bytes and extracted `release-0.20.2-linux-qa-offline-snapshot.html`; Playwright opened the exported HTML from disk, found frozen offline snapshot copy, and saw no console/page errors | Pass |  |
 | Docs/wiki/public-demo gate | yes | `docs/RELEASE_CHECKLIST.md`, `scripts/validate_release_wrap.py`, validator tests, `docs/RELEASE_NOTES_0.20.2.md`, this wrap, changelog/version metadata, and `public-demo/index.html` refreshed; public demo freshness check passed, publishability checker passed, and `PUBLIC_DEMO_ARTIFACT=public-demo/index.html npx playwright test qa/public-demo.spec.js` passed; `wiki/` source unchanged, so no external wiki sync is required before tag | Pass |  |
-| GHCR publish verification | yes | post-publish gate pending the public tag and GitHub release; pre-tag validator allows only this inherently post-publish blocker | Blocked |  |
-| Deployment refresh/sniff tests | yes | post-publish gate pending the `v0.20.2` GHCR image; local, Linux, and production refresh/sniff tests will run after digest verification | Blocked |  |
-| Post-release reopen | yes | post-publish gate pending tag, GHCR verification, deployment sniff tests, and final wrap update | Blocked |  |
+| GHCR publish verification | yes | GitHub release `https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.20.2`; GHCR workflow run `26206000144` succeeded; tags `v0.20.2`, `0.20.2`, and `latest` converged to OCI index digest `sha256:b032de57f8e66ed13164ab6409933e401fbd78a921f69d5cd3eb0dad6bf6603f` | Pass |  |
+| Deployment refresh/sniff tests | yes | local Windows Docker recreated from GHCR `latest`, UI/history/admin livez `0.20.2`, health ok, digest `sha256:b032de57f8e66ed13164ab6409933e401fbd78a921f69d5cd3eb0dad6bf6603f`, primary UI smoke passed; Linux restored QA stack recreated from GHCR `latest` on `10.13.37.138:18080/18081/18082`, UI/history/admin livez `0.20.2`, health ok, digest matched, primary UI smoke passed; production `http://10.13.35.110:42069` and local history `42070` recreated from GHCR `latest`, UI/history livez `0.20.2`, digest matched, forced inventory warmed `60` slots, UI health ok, primary UI smoke passed | Pass |  |
+| Post-release reopen | yes | new branch `codex/v0.21.0-kickoff-2026-05-21-post-0.20.2` pushed at commit `dbec45e`; app/package metadata reports `0.21.0-dev`; changelog reopened for the `0.21.x` code-quality pitstop | Pass |  |
 
 ## Publish Result
 
-Pre-tag gate is ready once
-`.\.venv\Scripts\python.exe scripts\validate_release_wrap.py 0.20.2 --phase pre-tag`
-passes.
-
-Final publish result is pending the public tag, GitHub release, GHCR digest
-verification, deployment refresh/sniff tests, and development-branch reopen.
+- Release commit: `5378184`
+- Tag: `v0.20.2`
+- GitHub release:
+  `https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.20.2`
+- GHCR workflow run: `26206000144`
+- GHCR tags `v0.20.2`, `0.20.2`, and `latest` converged to digest
+  `sha256:b032de57f8e66ed13164ab6409933e401fbd78a921f69d5cd3eb0dad6bf6603f`
+- Public demo workflow: `26205990494`
+- Public demo URL: `https://gcs8.github.io/truenas-jbod-ui/` returned HTTP
+  `200` with `0.20.2`, `Storage Fabric`, and offline snapshot copy present.
+- External wiki sync: not required; checked-in `wiki/` source was unchanged.
+- Post-release development branch:
+  `codex/v0.21.0-kickoff-2026-05-21-post-0.20.2` at `dbec45e`
 
 ## Notes
 
