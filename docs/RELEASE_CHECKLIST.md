@@ -333,7 +333,11 @@ the final release-wrap validator:
 - add the completed checklist evidence table to the release wrap before the
   tag is cut
 - if the release changes public-demo behavior or data, regenerate and verify
-  the checked-in artifact:
+  the checked-in artifact from a release-maintainer checkout with ignored local
+  `history/history.db` input:
+  - `set PUBLIC_DEMO_LOCAL_HISTORY=1`
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_public_demo_fixture -v`
+  - `.\.venv\Scripts\python.exe scripts\build_public_demo.py --output public-demo\index.html`
   - `.\.venv\Scripts\python.exe scripts\build_public_demo.py --output public-demo\index.html --check`
   - `.\.venv\Scripts\python.exe scripts\check_public_demo_artifact.py public-demo`
   - `set PUBLIC_DEMO_ARTIFACT=public-demo/index.html`

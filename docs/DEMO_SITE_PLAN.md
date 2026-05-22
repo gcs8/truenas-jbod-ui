@@ -6,9 +6,14 @@ Status: first static publication path shipped in `v0.19.0`.
 
 Current code adds a deterministic, live-derived TN Core / Supermicro CSE-946
 public demo artifact at `public-demo/index.html`, plus tests proving the
-artifact is stable, scrubbed, and explorable without a live backend. The repo
-now also includes a GitHub Pages workflow that publishes the checked-in
-`public-demo/` directory after static artifact checks pass.
+checked-in artifact is publishable, scrubbed, and explorable without a live
+backend. The repo now also includes a GitHub Pages workflow that publishes the
+checked-in `public-demo/` directory after static artifact checks pass.
+
+The source history database is release input, not a repository fixture. Clean
+checkout / CI validation treats `public-demo/index.html` as the artifact under
+test. Regenerating it from ignored `history/history.db` is an explicit
+release-maintainer/local-data path.
 
 Public demo URL:
 
