@@ -1,6 +1,6 @@
 # v0.21.x Code Quality Pitstop Plan
 
-Status: deferred next-cycle direction after `0.20.1`.
+Status: release-prep summary for `v0.21.0`; near-term rails, CI, backup hardening, public-demo, and Storage Fabric seam work landed, with deeper module splits and enrichment deferred.
 
 `0.21.x` should be a maintenance and confidence cycle. Treat it as a deliberate
 pitstop after the Storage Fabric expansion, not a feature catch-all.
