@@ -11,7 +11,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -1388,8 +1388,8 @@ class SystemBackupService:
         for entry in self._manifest_file_entries(manifest):
             try:
                 extracted[entry["key"]] = archive.read(entry["archive_path"])
-            except KeyError:
-                extracted[entry["key"]] = b""
+            except KeyError as exc:
+                raise ValueError(f"Backup bundle is missing {entry['archive_path']}.") from exc
         return extracted
 
     def _extract_manifest_tar_members(
@@ -1399,10 +1399,7 @@ class SystemBackupService:
     ) -> dict[str, bytes]:
         extracted: dict[str, bytes] = {}
         for entry in self._manifest_file_entries(manifest):
-            try:
-                extracted[entry["key"]] = self._read_tar_member(archive, entry["archive_path"])
-            except ValueError:
-                extracted[entry["key"]] = b""
+            extracted[entry["key"]] = self._read_tar_member(archive, entry["archive_path"])
         return extracted
 
     def _extract_manifest_directory_members(
@@ -1412,18 +1409,52 @@ class SystemBackupService:
     ) -> dict[str, bytes]:
         extracted: dict[str, bytes] = {}
         for entry in self._manifest_file_entries(manifest):
-            member_path = extract_dir / Path(entry["archive_path"])
-            extracted[entry["key"]] = member_path.read_bytes() if member_path.exists() else b""
+            member_path = self._safe_child_path(
+                extract_dir,
+                Path(entry["archive_path"]),
+                entry["archive_path"],
+            )
+            if not member_path.exists():
+                raise ValueError(f"Backup bundle is missing {entry['archive_path']}.")
+            extracted[entry["key"]] = member_path.read_bytes()
         return extracted
+
+    @staticmethod
+    def _normalize_archive_member_path(archive_path: str) -> str:
+        raw_path = str(archive_path or "").strip()
+        normalized_path = raw_path.replace("\\", "/")
+        path_parts = normalized_path.split("/")
+        posix_path = PurePosixPath(normalized_path)
+        windows_path = PureWindowsPath(raw_path)
+        if (
+            not normalized_path
+            or posix_path.is_absolute()
+            or windows_path.is_absolute()
+            or bool(windows_path.drive)
+        ):
+            raise ValueError(f"Backup bundle archive member path is invalid: {archive_path}")
+        if any(part in {"", ".", ".."} or ":" in part for part in path_parts):
+            raise ValueError(f"Backup bundle archive member path is invalid: {archive_path}")
+        return normalized_path
+
+    @staticmethod
+    def _safe_child_path(root_dir: Path, relative_path: Path, archive_path: str) -> Path:
+        target_path = root_dir / relative_path
+        try:
+            target_path.resolve(strict=False).relative_to(root_dir.resolve(strict=False))
+        except ValueError as exc:
+            raise ValueError(f"Backup bundle archive member path is invalid: {archive_path}") from exc
+        return target_path
 
     def _manifest_file_entries(self, manifest: dict[str, Any]) -> list[dict[str, str]]:
         entries: list[dict[str, str]] = []
         for index, raw_entry in enumerate(manifest.get("files", [])):
             if not isinstance(raw_entry, dict):
                 continue
-            archive_path = str(raw_entry.get("archive_path") or "").strip()
-            if not archive_path:
+            raw_archive_path = str(raw_entry.get("archive_path") or "").strip()
+            if not raw_archive_path:
                 continue
+            archive_path = self._normalize_archive_member_path(raw_archive_path)
             key = str(raw_entry.get("key") or archive_path or f"member-{index}").strip()
             group_key = str(raw_entry.get("group_key") or raw_entry.get("key") or key).strip()
             entries.append(
@@ -1535,25 +1566,42 @@ class SystemBackupService:
             self._remove_tree_if_exists(target_dir)
             return
 
-        self._remove_tree_if_exists(target_dir)
+        restore_targets: list[tuple[str, Path]] = []
         for entry in member_entries:
             relative_path = self._directory_member_relative_path(group_key, entry["archive_path"])
-            target_path = target_dir / relative_path
+            target_path = self._safe_child_path(target_dir, relative_path, entry["archive_path"])
             member_key = entry["key"]
             if member_key not in extracted_members:
                 raise ValueError(f"Backup bundle is missing the selected {group_key} member {entry['archive_path']}.")
+            restore_targets.append((member_key, target_path))
+
+        self._remove_tree_if_exists(target_dir)
+        for member_key, target_path in restore_targets:
             self._write_bytes_atomic(target_path, extracted_members[member_key])
             restored_paths.append(str(target_path))
 
     @staticmethod
     def _directory_member_relative_path(group_key: str, archive_path: str) -> Path:
         archive_root = str(BACKUP_GROUP_METADATA[group_key]["archive_root"]).strip("/")
-        if archive_root and archive_path.startswith(f"{archive_root}/"):
-            relative_text = archive_path[len(archive_root) + 1 :]
+        try:
+            normalized_archive_path = SystemBackupService._normalize_archive_member_path(archive_path)
+            normalized_archive_root = (
+                SystemBackupService._normalize_archive_member_path(archive_root)
+                if archive_root
+                else ""
+            )
+        except ValueError as exc:
+            raise ValueError(f"Backup bundle directory member path is invalid: {archive_path}") from exc
+        if normalized_archive_root and normalized_archive_path.startswith(f"{normalized_archive_root}/"):
+            relative_text = normalized_archive_path[len(normalized_archive_root) + 1 :]
         else:
-            relative_text = archive_path
+            relative_text = normalized_archive_path
+        try:
+            relative_text = SystemBackupService._normalize_archive_member_path(relative_text)
+        except ValueError as exc:
+            raise ValueError(f"Backup bundle directory member path is invalid: {archive_path}") from exc
         relative_path = Path(relative_text)
-        if any(part in {"..", ""} for part in relative_path.parts):
+        if not relative_text or any(part in {"..", "", "."} for part in relative_path.parts):
             raise ValueError(f"Backup bundle directory member path is invalid: {archive_path}")
         return relative_path
 
