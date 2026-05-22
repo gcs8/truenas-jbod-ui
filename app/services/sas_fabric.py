@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 from app.config import SystemConfig
 from app.models.domain import (
@@ -570,6 +571,111 @@ def _select_sas_fabric_builder_key(system: SystemConfig, snapshot: InventorySnap
     return "core_mpr"
 
 
+@dataclass(frozen=True)
+class SasFabricBuildContext:
+    system: SystemConfig
+    snapshot: InventorySnapshot
+    normalized_outputs: dict[str, str]
+    sources: dict[str, SourceStatus] | None
+    warnings: list[str]
+    command_failures: list[dict[str, Any]] | None
+    aliases: list[SasFabricAlias] | None
+    alias_map: dict[str, SasFabricAlias]
+
+
+class SasFabricBuilder(Protocol):
+    key: str
+
+    def build(self, context: SasFabricBuildContext) -> SasFabricSnapshot:
+        ...
+
+
+class CoreMprFabricBuilder:
+    key = "core_mpr"
+
+    def build(self, context: SasFabricBuildContext) -> SasFabricSnapshot:
+        return _build_core_mpr_fabric_snapshot(
+            system=context.system,
+            snapshot=context.snapshot,
+            normalized_outputs=context.normalized_outputs,
+            sources=context.sources,
+            warnings=context.warnings,
+            command_failures=context.command_failures,
+            aliases=context.aliases,
+            alias_map=context.alias_map,
+        )
+
+
+class LinuxSesFabricBuilder:
+    key = "linux_ses"
+
+    def build(self, context: SasFabricBuildContext) -> SasFabricSnapshot:
+        return _build_linux_ses_fabric_snapshot(
+            system=context.system,
+            snapshot=context.snapshot,
+            sources=context.sources,
+            warnings=context.warnings,
+            command_failures=context.command_failures,
+            aliases=context.aliases,
+            alias_map=context.alias_map,
+        )
+
+
+class PlatformStorageFabricBuilder:
+    key = "platform_storage"
+
+    def build(self, context: SasFabricBuildContext) -> SasFabricSnapshot:
+        return _build_platform_storage_fabric_snapshot(
+            system=context.system,
+            snapshot=context.snapshot,
+            sources=context.sources,
+            warnings=context.warnings,
+            command_failures=context.command_failures,
+            aliases=context.aliases,
+            alias_map=context.alias_map,
+        )
+
+
+_SAS_FABRIC_BUILDERS: tuple[SasFabricBuilder, ...] = (
+    CoreMprFabricBuilder(),
+    LinuxSesFabricBuilder(),
+    PlatformStorageFabricBuilder(),
+)
+_SAS_FABRIC_BUILDER_REGISTRY: dict[str, SasFabricBuilder] = {
+    builder.key: builder for builder in _SAS_FABRIC_BUILDERS
+}
+
+
+def _build_sas_fabric_context(
+    *,
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    ssh_outputs: dict[str, str],
+    sources: dict[str, SourceStatus] | None = None,
+    warnings: list[str] | None = None,
+    command_failures: list[dict[str, Any]] | None = None,
+    aliases: list[SasFabricAlias] | None = None,
+) -> SasFabricBuildContext:
+    return SasFabricBuildContext(
+        system=system,
+        snapshot=snapshot,
+        normalized_outputs=_canonical_outputs(ssh_outputs),
+        sources=sources,
+        warnings=list(warnings or []),
+        command_failures=command_failures,
+        aliases=aliases,
+        alias_map=_sas_fabric_alias_map(aliases or []),
+    )
+
+
+def _select_sas_fabric_builder(context: SasFabricBuildContext) -> SasFabricBuilder:
+    builder_key = _select_sas_fabric_builder_key(context.system, context.snapshot)
+    try:
+        return _SAS_FABRIC_BUILDER_REGISTRY[builder_key]
+    except KeyError as exc:
+        raise RuntimeError(f"No SAS fabric builder registered for {builder_key!r}") from exc
+
+
 def build_sas_fabric_snapshot(
     *,
     system: SystemConfig,
@@ -580,31 +686,31 @@ def build_sas_fabric_snapshot(
     command_failures: list[dict[str, Any]] | None = None,
     aliases: list[SasFabricAlias] | None = None,
 ) -> SasFabricSnapshot:
-    normalized_outputs = _canonical_outputs(ssh_outputs)
-    fabric_warnings = list(warnings or [])
-    alias_map = _sas_fabric_alias_map(aliases or [])
-    builder_key = _select_sas_fabric_builder_key(system, snapshot)
-    if builder_key == "linux_ses":
-        return _build_linux_ses_fabric_snapshot(
-            system=system,
-            snapshot=snapshot,
-            sources=sources,
-            warnings=fabric_warnings,
-            command_failures=command_failures,
-            aliases=aliases,
-            alias_map=alias_map,
-        )
-    if builder_key == "platform_storage":
-        return _build_platform_storage_fabric_snapshot(
-            system=system,
-            snapshot=snapshot,
-            sources=sources,
-            warnings=fabric_warnings,
-            command_failures=command_failures,
-            aliases=aliases,
-            alias_map=alias_map,
-        )
+    context = _build_sas_fabric_context(
+        system=system,
+        snapshot=snapshot,
+        ssh_outputs=ssh_outputs,
+        sources=sources,
+        warnings=warnings,
+        command_failures=command_failures,
+        aliases=aliases,
+    )
+    return _select_sas_fabric_builder(context).build(context)
 
+
+def _build_core_mpr_fabric_snapshot(
+    *,
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    normalized_outputs: dict[str, str],
+    sources: dict[str, SourceStatus] | None = None,
+    warnings: list[str] | None = None,
+    command_failures: list[dict[str, Any]] | None = None,
+    aliases: list[SasFabricAlias] | None = None,
+    alias_map: dict[str, SasFabricAlias] | None = None,
+) -> SasFabricSnapshot:
+    fabric_warnings = list(warnings or [])
+    aliases_by_id = alias_map or _sas_fabric_alias_map(aliases or [])
     selected_enclosure_keys = _selected_enclosure_keys(snapshot)
     nodes: dict[str, SasFabricNode] = {}
     links: dict[str, SasFabricLink] = {}
@@ -941,7 +1047,7 @@ def build_sas_fabric_snapshot(
         traces=traces,
         controllers=controllers,
         paths=paths,
-        aliases=alias_map,
+        aliases=aliases_by_id,
     )
 
     expanders = [_node_raw_for_payload(node) for node in nodes.values() if node.kind == "expander"]
@@ -968,7 +1074,7 @@ def build_sas_fabric_snapshot(
         expanders=sorted(expanders, key=lambda item: str(item.get("id") or "")),
         enclosures=sorted(enclosures, key=lambda item: str(item.get("id") or "")),
         paths=paths,
-        aliases=list(alias_map.values()),
+        aliases=list(aliases_by_id.values()),
         warnings=fabric_warnings,
         sources=sources or {},
         raw={
