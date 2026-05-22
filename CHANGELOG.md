@@ -2,10 +2,36 @@
 
 ## Unreleased
 
+- No changes yet.
+
+## v0.21.0 - 2026-05-22
+
 ### Changed
 
-- Reopened development as `0.21.0-dev` for the code-quality pitstop after the
-  `v0.20.2` corrective public release.
+- Completed the v0.21 maintenance/confidence pitstop after the Storage Fabric
+  expansion, keeping richer platform-native Storage Fabric enrichment deferred
+  to v0.22.x.
+- Added contributor rails and safe validation guidance so agents and humans can
+  run source-only checks without secrets, live hardware, Docker, or public
+  admin sidecars by default.
+- Added a low-risk CI preflight workflow for pull requests and `main`/`codex/**`
+  pushes, covering diff hygiene, Python compile/unit discovery, JavaScript
+  syntax/npm lock checks, and the checked-in public-demo artifact gate.
+- Split public-demo validation into a clean checked-in artifact path and an
+  explicit release-maintainer local-history generation path behind
+  `PUBLIC_DEMO_LOCAL_HISTORY=1`, so clean checkouts no longer depend on ignored
+  `history/history.db` input.
+- Added internal Storage Fabric maintainability seams for v0.22 follow-up work:
+  builder selection helpers, builder wrapper classes, a shared build context,
+  and a platform route-provider registry while preserving the existing operator
+  payload and source-labeling contract.
+
+### Fixed
+
+- Hardened backup import archive path validation so malformed or missing archive
+  members cannot escape the restore area, rely on unsafe Windows/POSIX path
+  forms, or delete/replace a selected restore directory before all selected
+  members have been validated.
 
 ## v0.20.2 - 2026-05-21
 
