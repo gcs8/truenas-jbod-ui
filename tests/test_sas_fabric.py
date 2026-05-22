@@ -23,10 +23,13 @@ from app.services.sas_fabric import (
     CORE_MPR_SYSCTL_LOCATION_COMMAND,
     CORE_PCICONF_LV_COMMAND,
     CORE_PCICONF_LV_OPTIONAL_COMMAND,
+    _PLATFORM_STORAGE_ROUTE_PROVIDERS,
     _SAS_FABRIC_BUILDERS,
     _build_sas_fabric_context,
+    _build_storage_fabric_route_context,
     _select_sas_fabric_builder,
     _select_sas_fabric_builder_key,
+    _select_storage_fabric_route_provider,
     build_core_mprutil_unit_commands,
     build_sas_fabric_snapshot,
     discover_mpr_units_from_adapter_summary,
@@ -823,6 +826,52 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 self.assertEqual(context.warnings, ["seed warning"])
                 self.assertEqual(context.normalized_outputs.get("mprutil show adapters"), MPR_ADAPTERS)
                 self.assertEqual(context.alias_map["controller:mpr0"].label, "Archive left HBA")
+
+    def test_platform_storage_route_registry_keeps_provider_selection_explicit(self) -> None:
+        def system(platform: str) -> SystemConfig:
+            return SystemConfig(id=f"{platform}-system", label=platform.upper(), truenas=TrueNASConfig(platform=platform))
+
+        slot = SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            present=True,
+            state=SlotState.healthy,
+            device_name="sda",
+            raw_status={"bmc_controller_id": "0"},
+        )
+        snapshot = InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
+
+        self.assertEqual(
+            [provider.key for provider in _PLATFORM_STORAGE_ROUTE_PROVIDERS],
+            ["quantastor", "esxi", "bmc", "linux"],
+        )
+
+        cases = [
+            ("quantastor", "quantastor"),
+            ("esxi", "esxi"),
+            ("ipmi", "bmc"),
+            ("scale", "linux"),
+            ("linux", "linux"),
+        ]
+        for platform, expected in cases:
+            with self.subTest(platform=platform, expected=expected):
+                context = _build_storage_fabric_route_context(
+                    system=system(platform),
+                    snapshot=snapshot,
+                    slot=slot,
+                    fabric_kind=f"storage_{platform}",
+                    platform_label=platform.upper(),
+                )
+
+                provider = _select_storage_fabric_route_provider(context)
+                route = provider.route(context)
+
+                self.assertEqual(provider.key, expected)
+                self.assertIn("controller_id", route)
+                self.assertIn("path_id", route)
+                self.assertIn("enclosure_id", route)
 
     def test_core_snapshot_applies_aliases_without_rewriting_raw_labels(self) -> None:
         slot = SlotView(

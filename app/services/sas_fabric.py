@@ -2278,6 +2278,129 @@ def _pool_vdev_label(slot: SlotView, fallback: str = "storage path") -> str:
     return devices[0] if devices else fallback
 
 
+@dataclass(frozen=True)
+class StorageFabricRouteContext:
+    system: SystemConfig
+    snapshot: InventorySnapshot
+    slot: SlotView
+    raw_status: dict[str, Any]
+    operator_context: dict[str, Any]
+    fabric_kind: str
+    platform_label: str
+    platform: str
+
+
+class StorageFabricRouteProvider(Protocol):
+    key: str
+
+    def matches(self, context: StorageFabricRouteContext) -> bool:
+        ...
+
+    def route(self, context: StorageFabricRouteContext) -> dict[str, Any]:
+        ...
+
+
+class QuantastorStorageRouteProvider:
+    key = "quantastor"
+
+    def matches(self, context: StorageFabricRouteContext) -> bool:
+        return context.platform == "quantastor"
+
+    def route(self, context: StorageFabricRouteContext) -> dict[str, Any]:
+        return _quantastor_storage_route(
+            context.system,
+            context.snapshot,
+            context.slot,
+            context.raw_status,
+            context.operator_context,
+            context.fabric_kind,
+        )
+
+
+class EsxiStorageRouteProvider:
+    key = "esxi"
+
+    def matches(self, context: StorageFabricRouteContext) -> bool:
+        return context.platform == "esxi"
+
+    def route(self, context: StorageFabricRouteContext) -> dict[str, Any]:
+        return _esxi_storage_route(
+            context.system,
+            context.snapshot,
+            context.slot,
+            context.raw_status,
+            context.fabric_kind,
+        )
+
+
+class BmcStorageRouteProvider:
+    key = "bmc"
+
+    def matches(self, context: StorageFabricRouteContext) -> bool:
+        return context.platform == "ipmi"
+
+    def route(self, context: StorageFabricRouteContext) -> dict[str, Any]:
+        return _bmc_storage_route(
+            context.system,
+            context.snapshot,
+            context.slot,
+            context.raw_status,
+            context.fabric_kind,
+        )
+
+
+class LinuxStorageRouteProvider:
+    key = "linux"
+
+    def matches(self, context: StorageFabricRouteContext) -> bool:
+        return True
+
+    def route(self, context: StorageFabricRouteContext) -> dict[str, Any]:
+        return _linux_storage_route(
+            context.system,
+            context.snapshot,
+            context.slot,
+            context.raw_status,
+            context.fabric_kind,
+            context.platform_label,
+        )
+
+
+_PLATFORM_STORAGE_ROUTE_PROVIDERS: tuple[StorageFabricRouteProvider, ...] = (
+    QuantastorStorageRouteProvider(),
+    EsxiStorageRouteProvider(),
+    BmcStorageRouteProvider(),
+    LinuxStorageRouteProvider(),
+)
+
+
+def _build_storage_fabric_route_context(
+    *,
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    slot: SlotView,
+    fabric_kind: str,
+    platform_label: str,
+) -> StorageFabricRouteContext:
+    return StorageFabricRouteContext(
+        system=system,
+        snapshot=snapshot,
+        slot=slot,
+        raw_status=slot.raw_status if isinstance(slot.raw_status, dict) else {},
+        operator_context=slot.operator_context if isinstance(slot.operator_context, dict) else {},
+        fabric_kind=fabric_kind,
+        platform_label=platform_label,
+        platform=normalize_text(system.truenas.platform).lower(),
+    )
+
+
+def _select_storage_fabric_route_provider(context: StorageFabricRouteContext) -> StorageFabricRouteProvider:
+    for provider in _PLATFORM_STORAGE_ROUTE_PROVIDERS:
+        if provider.matches(context):
+            return provider
+    raise RuntimeError(f"No Storage Fabric route provider registered for {context.platform!r}")
+
+
 def _storage_fabric_route_for_slot(
     *,
     system: SystemConfig,
@@ -2286,16 +2409,14 @@ def _storage_fabric_route_for_slot(
     fabric_kind: str,
     platform_label: str,
 ) -> dict[str, Any]:
-    platform = normalize_text(system.truenas.platform).lower()
-    raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
-    operator_context = slot.operator_context if isinstance(slot.operator_context, dict) else {}
-    if platform == "quantastor":
-        return _quantastor_storage_route(system, snapshot, slot, raw_status, operator_context, fabric_kind)
-    if platform == "esxi":
-        return _esxi_storage_route(system, snapshot, slot, raw_status, fabric_kind)
-    if platform == "ipmi":
-        return _bmc_storage_route(system, snapshot, slot, raw_status, fabric_kind)
-    return _linux_storage_route(system, snapshot, slot, raw_status, fabric_kind, platform_label)
+    context = _build_storage_fabric_route_context(
+        system=system,
+        snapshot=snapshot,
+        slot=slot,
+        fabric_kind=fabric_kind,
+        platform_label=platform_label,
+    )
+    return _select_storage_fabric_route_provider(context).route(context)
 
 
 def _quantastor_storage_route(
