@@ -17,6 +17,11 @@ from app.services.public_demo_fixture import (  # noqa: E402
 
 
 DEFAULT_OUTPUT = ROOT / "public-demo" / "index.html"
+LOCAL_HISTORY_GUIDANCE = (
+    "Public demo release generation requires local ignored history/history.db "
+    "release input. Clean CI validates the checked-in public-demo/index.html "
+    "artifact with scripts/check_public_demo_artifact.py instead."
+)
 
 
 def normalize_artifact_html(html: str) -> str:
@@ -27,7 +32,15 @@ def normalize_artifact_html(html: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build the deterministic static public demo artifact.",
+        description=(
+            "Build the static public demo artifact from local ignored "
+            "history/history.db release input."
+        ),
+        epilog=(
+            "Clean checkout / CI validation should use "
+            "scripts/check_public_demo_artifact.py public-demo instead of "
+            "regenerating from local history."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -38,7 +51,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Verify the output file already matches the generated artifact.",
+        help=(
+            "Verify the output file already matches the generated artifact; "
+            "requires the same local ignored history/history.db release input."
+        ),
     )
     return parser.parse_args()
 
@@ -48,7 +64,13 @@ async def run() -> int:
     output_path = args.output
     if not output_path.is_absolute():
         output_path = ROOT / output_path
-    html = normalize_artifact_html(await build_public_demo_html())
+    try:
+        html = normalize_artifact_html(await build_public_demo_html())
+    except RuntimeError as exc:
+        print(f"Public demo generation failed: {exc}", file=sys.stderr)
+        if "history/history.db" in str(exc):
+            print(LOCAL_HISTORY_GUIDANCE, file=sys.stderr)
+        return 1
 
     if args.check:
         if not output_path.exists():

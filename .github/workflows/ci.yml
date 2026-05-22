@@ -1,0 +1,172 @@
+name: CI Preflight
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - "codex/**"
+      - "ci/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-preflight-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diff-hygiene:
+    name: Diff hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check patch whitespace
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ -n "${PR_BASE_SHA:-}" ]; then
+            git diff --check "${PR_BASE_SHA}...HEAD"
+          elif [ -n "${BEFORE_SHA:-}" ] && [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            git diff --check "${BEFORE_SHA}..HEAD"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            git diff --check "HEAD^..HEAD"
+          else
+            git diff --check
+          fi
+
+      - name: Confirm checkout stayed clean
+        run: |
+          set -euo pipefail
+          status="$(git status --short)"
+          if [ -n "$status" ]; then
+            printf '%s\n' "$status"
+            exit 1
+          fi
+
+  python-source:
+    name: Python compile and unittest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Compile Python source
+        run: python -m compileall app admin_service history_service scripts tests
+
+      - name: Run deterministic unittest suite
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  javascript-source:
+    name: JavaScript syntax and npm lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install locked Node dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Check JavaScript syntax
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          node --check app/static/app.js
+          node --check app/static/sas_fabric_view.js
+          node --check admin_service/static/admin.js
+          specs=(qa/*.spec.js)
+          if [ ${#specs[@]} -eq 0 ]; then
+            echo "No QA spec files found under qa/*.spec.js"
+            exit 1
+          fi
+          for spec in "${specs[@]}"; do
+            node --check "$spec"
+          done
+
+  public-demo-artifact:
+    name: Checked-in public demo artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - javascript-source
+      - python-source
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify checked-in public demo is publishable
+        run: python scripts/check_public_demo_artifact.py public-demo
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install browser QA dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Smoke test checked-in public demo artifact
+        env:
+          PUBLIC_DEMO_ARTIFACT: public-demo/index.html
+        run: npx playwright test qa/public-demo.spec.js
+
+      - name: Confirm public demo checks did not rewrite source
+        run: |
+          set -euo pipefail
+          status="$(git status --short)"
+          if [ -n "$status" ]; then
+            printf '%s\n' "$status"
+            exit 1
+          fi

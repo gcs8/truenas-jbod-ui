@@ -28,6 +28,8 @@ from history_service.config import HistorySettings
 from history_service.domain import MetricSample, SlotStateRecord
 from history_service.store import HistoryStore
 from history_service.system_backup import (
+    BUNDLE_FORMAT,
+    BUNDLE_SCHEMA_VERSION,
     DEBUG_BUNDLE_FORMAT,
     RUNTIME_OVERRIDES_FILE_KEY,
     SEVEN_ZIP_SIGNATURE,
@@ -250,6 +252,158 @@ class SystemBackupServiceTests(unittest.TestCase):
             },
         }
         return SEVEN_ZIP_SIGNATURE + json.dumps(payload, sort_keys=True).encode("utf-8")
+
+    @staticmethod
+    def _build_zip_bundle(manifest: dict[str, object], files: dict[str, bytes] | None = None) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("manifest.json", json.dumps(manifest, sort_keys=True).encode("utf-8"))
+            for archive_path, content in (files or {}).items():
+                archive.writestr(archive_path, content)
+        return buffer.getvalue()
+
+    def test_directory_member_paths_reject_absolute_and_traversal_entries(self) -> None:
+        invalid_paths = [
+            "/tmp/outside.key",
+            "C:/tmp/outside.key",
+            r"C:\\tmp\\outside.key",
+            r"\\\\backup-host\\share\\outside.key",
+            "config/ssh/../outside.key",
+            r"config\\ssh\\..\\outside.key",
+            "config/ssh/subdir/../../outside.key",
+            "config/ssh//outside.key",
+            "config/ssh/./outside.key",
+            "./outside.key",
+            "config/ssh/C:/outside.key",
+            "config/ssh/C:outside.key",
+            "config/ssh/id_truenas:ads",
+        ]
+
+        for archive_path in invalid_paths:
+            with self.subTest(archive_path=archive_path):
+                with self.assertRaisesRegex(ValueError, "directory member path is invalid"):
+                    SystemBackupService._directory_member_relative_path(SSH_KEYS_KEY, archive_path)
+
+    def test_import_rejects_unsafe_manifest_archive_path_before_member_read(self) -> None:
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "packaging": "zip",
+            "groups": [
+                {
+                    "key": SSH_KEYS_KEY,
+                    "label": "SSH Keys",
+                    "archive_root": "config/ssh",
+                    "selected": True,
+                    "present": True,
+                    "sensitive": True,
+                    "restore_mode": "directory",
+                }
+            ],
+            "files": [
+                {
+                    "key": "ssh-escape",
+                    "group_key": SSH_KEYS_KEY,
+                    "archive_path": "/tmp/outside.key",
+                    "size_bytes": 3,
+                }
+            ],
+        }
+        bundle = self._build_zip_bundle(manifest, {"/tmp/outside.key": b"pwn"})
+
+        with self.assertRaisesRegex(ValueError, "archive member path is invalid"):
+            self.backup_service.import_bundle(bundle)
+
+    def test_archive_reader_rejects_dot_and_duplicate_separator_manifest_paths(self) -> None:
+        for archive_path in (
+            "config/ssh//outside.key",
+            "config/ssh/./outside.key",
+            "./outside.key",
+            "config/ssh/C:/outside.key",
+            "config/ssh/C:outside.key",
+            "config/ssh/id_truenas:ads",
+        ):
+            with self.subTest(archive_path=archive_path):
+                manifest = {
+                    "schema_version": BUNDLE_SCHEMA_VERSION,
+                    "format": BUNDLE_FORMAT,
+                    "packaging": "zip",
+                    "files": [
+                        {
+                            "key": "config_file",
+                            "group_key": "config_file",
+                            "archive_path": archive_path,
+                            "size_bytes": 3,
+                        }
+                    ],
+                }
+                bundle = self._build_zip_bundle(manifest, {archive_path: b"pwn"})
+
+                with self.assertRaisesRegex(ValueError, "archive member path is invalid"):
+                    self.backup_service._read_archive(bundle)
+
+    def test_directory_restore_validates_missing_members_before_replacing_existing_dir(self) -> None:
+        target_dir = self.temp_dir / "existing-ssh"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        sentinel = target_dir / "id_existing"
+        sentinel.write_text("keep\n", encoding="utf-8")
+        manifest = {
+            "files": [
+                {
+                    "key": "missing-ssh-key",
+                    "group_key": SSH_KEYS_KEY,
+                    "archive_path": "config/ssh/missing.key",
+                }
+            ]
+        }
+        group_entries = {SSH_KEYS_KEY: {"selected": True, "present": True}}
+        restored_paths: list[str] = []
+
+        with self.assertRaisesRegex(ValueError, "missing the selected ssh_keys member"):
+            self.backup_service._restore_directory_group(
+                SSH_KEYS_KEY,
+                manifest,
+                group_entries,
+                {},
+                target_dir,
+                restored_paths,
+            )
+
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
+        self.assertEqual(restored_paths, [])
+
+    def test_import_rejects_missing_manifest_member_before_replacing_existing_dir(self) -> None:
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "packaging": "zip",
+            "groups": [
+                {
+                    "key": SSH_KEYS_KEY,
+                    "label": "SSH Keys",
+                    "archive_root": "config/ssh",
+                    "selected": True,
+                    "present": True,
+                    "sensitive": True,
+                    "restore_mode": "directory",
+                }
+            ],
+            "files": [
+                {
+                    "key": "missing-ssh-key",
+                    "group_key": SSH_KEYS_KEY,
+                    "archive_path": "config/ssh/missing.key",
+                    "size_bytes": 3,
+                }
+            ],
+        }
+        bundle = self._build_zip_bundle(manifest)
+        existing_key = self.ssh_dir / "id_truenas"
+
+        with self.assertRaisesRegex(ValueError, "missing config/ssh/missing.key"):
+            self.backup_service.import_bundle(bundle)
+
+        self.assertEqual(existing_key.read_text(encoding="utf-8"), "PRIVATE-KEY\n")
 
     @staticmethod
     def _decode_fake_7z_archive(archive_path: Path) -> dict[str, object]:

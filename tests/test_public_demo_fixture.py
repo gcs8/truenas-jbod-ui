@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import argparse
+import asyncio
+import contextlib
 import hashlib
+import io
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 import unittest
+from unittest import mock
 
 from app.services.public_demo_fixture import (
     PUBLIC_DEMO_GENERATED_AT,
@@ -21,6 +27,11 @@ from app.services.snapshot_export import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+LOCAL_HISTORY_ENV = "PUBLIC_DEMO_LOCAL_HISTORY"
+LOCAL_HISTORY_DB = ROOT / "history" / "history.db"
+LOCAL_HISTORY_SKIP_REASON = (
+    f"requires {LOCAL_HISTORY_ENV}=1 and local ignored history/history.db release input"
+)
 
 
 def clear_export_caches() -> None:
@@ -29,8 +40,83 @@ def clear_export_caches() -> None:
     EXPORT_ZIP_CACHE.clear()
 
 
+class PublicDemoArtifactTests(unittest.TestCase):
+    def test_checked_in_public_demo_artifact_is_publishable(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/check_public_demo_artifact.py", "public-demo"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Public demo artifact is publishable", result.stdout)
+
+    def test_checked_in_public_demo_artifact_has_operator_markers(self) -> None:
+        artifact_path = ROOT / "public-demo" / "index.html"
+        self.assertTrue(artifact_path.exists(), f"missing checked-in artifact: {artifact_path}")
+        html = artifact_path.read_text(encoding="utf-8")
+
+        for marker in (
+            "Frozen Offline Artifact",
+            "Live-derived CORE 60-bay sample",
+            "Scrambled IDs",
+            "4x NVMe Carrier Card",
+            "Boot SATADOMs",
+            "mirror-8",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, html)
+
+
+class PublicDemoBuildScriptTests(unittest.TestCase):
+    def test_build_script_help_marks_generation_as_local_history_path(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/build_public_demo.py", "--help"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("local ignored history/history.db", result.stdout)
+
+    def test_build_script_reports_local_history_errors_without_traceback(self) -> None:
+        from scripts import build_public_demo as build_script
+
+        async_build = mock.AsyncMock(
+            side_effect=RuntimeError(
+                "Public demo release generation requires local ignored history/history.db."
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = argparse.Namespace(output=Path(temp_dir) / "index.html", check=False)
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(build_script, "build_public_demo_html", new=async_build),
+                mock.patch.object(build_script, "parse_args", return_value=args),
+                contextlib.redirect_stderr(stderr),
+                contextlib.redirect_stdout(stdout),
+            ):
+                result = asyncio.run(build_script.run())
+
+        self.assertEqual(result, 1)
+        self.assertIn("history/history.db", stderr.getvalue())
+        self.assertIn("Clean CI validates", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+
+@unittest.skipUnless(os.environ.get(LOCAL_HISTORY_ENV) == "1", LOCAL_HISTORY_SKIP_REASON)
 class PublicDemoFixtureTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        if not LOCAL_HISTORY_DB.exists():
+            self.fail(
+                f"{LOCAL_HISTORY_ENV}=1 but local ignored release input is missing: "
+                f"{LOCAL_HISTORY_DB.relative_to(ROOT)}"
+            )
         clear_export_caches()
 
     async def test_public_demo_html_is_deterministic(self) -> None:

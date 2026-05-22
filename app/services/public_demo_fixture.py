@@ -266,7 +266,7 @@ def _connect_history_db() -> Iterator[sqlite3.Connection]:
     db_path = _repo_root() / "history" / "history.db"
     if not db_path.exists():
         raise RuntimeError(
-            "Public demo generation needs a local history/history.db source so the demo can mirror the live CORE system."
+            "Public demo release generation requires local ignored history/history.db so the demo can mirror the live CORE system."
         )
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row

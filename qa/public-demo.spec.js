@@ -7,18 +7,17 @@ const { pathToFileURL } = require("url");
 
 const repoRoot = path.resolve(__dirname, "..");
 
-function resolvePublicDemoArtifact() {
-  if (process.env.PUBLIC_DEMO_ARTIFACT) {
-    const requestedPath = process.env.PUBLIC_DEMO_ARTIFACT;
-    const artifactPath = path.isAbsolute(requestedPath)
-      ? requestedPath
-      : path.resolve(repoRoot, requestedPath);
-    if (!fs.existsSync(artifactPath)) {
-      throw new Error(`PUBLIC_DEMO_ARTIFACT does not exist: ${artifactPath}`);
-    }
-    return artifactPath;
+function resolveArtifactPath(requestedPath) {
+  const artifactPath = path.isAbsolute(requestedPath)
+    ? requestedPath
+    : path.resolve(repoRoot, requestedPath);
+  if (!fs.existsSync(artifactPath)) {
+    throw new Error(`Public demo artifact does not exist: ${artifactPath}`);
   }
+  return artifactPath;
+}
 
+function buildPublicDemoFromLocalHistory() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-public-demo-"));
   const outputPath = path.join(tempDir, "index.html");
   const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
@@ -30,6 +29,27 @@ function resolvePublicDemoArtifact() {
     throw new Error(`Public demo generation failed:\n${result.stdout}\n${result.stderr}`);
   }
   return outputPath;
+}
+
+function resolvePublicDemoArtifact() {
+  if (process.env.PUBLIC_DEMO_ARTIFACT) {
+    return resolveArtifactPath(process.env.PUBLIC_DEMO_ARTIFACT);
+  }
+
+  if (process.env.PUBLIC_DEMO_BUILD_FROM_HISTORY === "1") {
+    return buildPublicDemoFromLocalHistory();
+  }
+
+  const checkedInArtifact = path.join(repoRoot, "public-demo", "index.html");
+  if (fs.existsSync(checkedInArtifact)) {
+    return checkedInArtifact;
+  }
+
+  throw new Error(
+    "No checked-in public-demo/index.html artifact found. Set PUBLIC_DEMO_ARTIFACT "
+      + "to an existing artifact, or set PUBLIC_DEMO_BUILD_FROM_HISTORY=1 on a "
+      + "release-maintainer checkout with local ignored history/history.db."
+  );
 }
 
 test("public demo static artifact is explorable without a live backend", async ({ page }) => {
