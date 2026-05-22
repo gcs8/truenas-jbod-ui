@@ -561,6 +561,15 @@ def build_core_mprutil_unit_commands(adapter_summary_output: str, seen_commands:
     return commands
 
 
+def _select_sas_fabric_builder_key(system: SystemConfig, snapshot: InventorySnapshot) -> str:
+    platform = system.truenas.platform
+    if platform in {"scale", "linux"} and _snapshot_has_linux_ses_evidence(snapshot):
+        return "linux_ses"
+    if platform != "core":
+        return "platform_storage"
+    return "core_mpr"
+
+
 def build_sas_fabric_snapshot(
     *,
     system: SystemConfig,
@@ -574,11 +583,8 @@ def build_sas_fabric_snapshot(
     normalized_outputs = _canonical_outputs(ssh_outputs)
     fabric_warnings = list(warnings or [])
     alias_map = _sas_fabric_alias_map(aliases or [])
-    selected_enclosure_keys = _selected_enclosure_keys(snapshot)
-    has_linux_ses_evidence = _snapshot_has_linux_ses_evidence(snapshot)
-    if (system.truenas.platform == "scale" and has_linux_ses_evidence) or (
-        system.truenas.platform == "linux" and has_linux_ses_evidence
-    ):
+    builder_key = _select_sas_fabric_builder_key(system, snapshot)
+    if builder_key == "linux_ses":
         return _build_linux_ses_fabric_snapshot(
             system=system,
             snapshot=snapshot,
@@ -588,7 +594,7 @@ def build_sas_fabric_snapshot(
             aliases=aliases,
             alias_map=alias_map,
         )
-    if system.truenas.platform != "core":
+    if builder_key == "platform_storage":
         return _build_platform_storage_fabric_snapshot(
             system=system,
             snapshot=snapshot,
@@ -599,6 +605,7 @@ def build_sas_fabric_snapshot(
             alias_map=alias_map,
         )
 
+    selected_enclosure_keys = _selected_enclosure_keys(snapshot)
     nodes: dict[str, SasFabricNode] = {}
     links: dict[str, SasFabricLink] = {}
     traces: dict[str, SasFabricTrace] = {}

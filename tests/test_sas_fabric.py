@@ -23,6 +23,7 @@ from app.services.sas_fabric import (
     CORE_MPR_SYSCTL_LOCATION_COMMAND,
     CORE_PCICONF_LV_COMMAND,
     CORE_PCICONF_LV_OPTIONAL_COMMAND,
+    _select_sas_fabric_builder_key,
     build_core_mprutil_unit_commands,
     build_sas_fabric_snapshot,
     discover_mpr_units_from_adapter_summary,
@@ -728,6 +729,41 @@ class SasFabricAliasStoreTests(unittest.TestCase):
 
 
 class SasFabricSnapshotTests(unittest.TestCase):
+    def test_select_sas_fabric_builder_key_keeps_platform_selection_explicit(self) -> None:
+        def system(platform: str) -> SystemConfig:
+            return SystemConfig(id=f"{platform}-system", label=platform.upper(), truenas=TrueNASConfig(platform=platform))
+
+        empty_snapshot = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+        ses_snapshot = InventorySnapshot(
+            slots=[
+                SlotView(
+                    slot=0,
+                    slot_label="00",
+                    row_index=0,
+                    column_index=0,
+                    present=True,
+                    state=SlotState.healthy,
+                    ssh_ses_device="/dev/ses0",
+                )
+            ],
+            refresh_interval_seconds=30,
+        )
+
+        cases = [
+            ("core", empty_snapshot, "core_mpr"),
+            ("core", ses_snapshot, "core_mpr"),
+            ("scale", ses_snapshot, "linux_ses"),
+            ("scale", empty_snapshot, "platform_storage"),
+            ("linux", ses_snapshot, "linux_ses"),
+            ("linux", empty_snapshot, "platform_storage"),
+            ("quantastor", ses_snapshot, "platform_storage"),
+            ("esxi", ses_snapshot, "platform_storage"),
+            ("ipmi", ses_snapshot, "platform_storage"),
+        ]
+        for platform, snapshot, expected in cases:
+            with self.subTest(platform=platform, expected=expected):
+                self.assertEqual(_select_sas_fabric_builder_key(system(platform), snapshot), expected)
+
     def test_core_snapshot_applies_aliases_without_rewriting_raw_labels(self) -> None:
         slot = SlotView(
             slot=0,
