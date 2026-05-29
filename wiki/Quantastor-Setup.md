@@ -27,7 +27,7 @@ Validated target so far:
 - admin can discover node ids and labels from the Quantastor API
 - disk metrics and history work on both the shared face and storage views
 
-Here is the current QSOSN HA SATADOM view in the main UI:
+Here is an example Quantastor HA SATADOM view in the main UI:
 
 ![Quantastor HA SATADOM storage view](images/quantastor-satadoms-right-v0.18.0.png)
 
@@ -49,26 +49,28 @@ runtime service rather than a dev-only helper.
    ```
 
 2. Create one Quantastor system entry:
-   - system label: `QSOSN HA`
-   - system id: `qsosn-ha`
+   - system label: `ExampleQS HA`
+   - system id: `example-qs-ha`
    - platform: `Quantastor`
    - `truenas.host`: point this at the shared API or management VIP
 3. In SSH enrichment:
    - enable SSH if you want `qs`, `smartctl`, or `sg_ses` detail
    - turn on the Quantastor HA cluster checkbox
-   - use `Load Nodes from Quantastor API` to populate the node ids and labels
-   - keep the shared SSH host if the cluster VIP works for your CLI reads
-   - fill the per-node SSH host fields manually when you need node-targeted
-     SES or SATADOM access, because the current appliance may only return ids
-     and labels, not usable node hostnames
-4. Ignore replication-only or offsite helper VMs here. On the current install,
-   `qs-cryostorage` at `10.88.88.30` is not one of the shared-SES HA nodes and
-   should not be modeled as one.
+   - use `Load Nodes from Quantastor API` to populate the node ids, labels, and
+     any API-advertised node hostnames/IPs
+   - keep the shared API or grid-management VIP out of SSH targeting
+   - the app auto-adds HA node SSH candidates from API `hostname`, main IP,
+     management IP, or other node address fields when Quantastor exposes them
+   - if the appliance only returns ids and labels, fill the per-node SSH host
+     fields manually before expecting `qs`, `smartctl`, SES, or SATADOM access
+     to run
+4. Ignore management-only helper VMs here. If a helper VM is not one of the
+   shared-SES HA nodes, do not model it as one.
 5. Add only the saved views you actually need:
    - optional saved `Primary Chassis` if you want a pinned profile-backed
      shared-front layout
-   - `Boot SATADOMs Left` targeted at `QSOSN-Left`
-   - `Boot SATADOMs Right` targeted at `QSOSN-Right`
+   - `Boot SATADOMs Left` targeted at `ExampleQS-Left`
+   - `Boot SATADOMs Right` targeted at `ExampleQS-Right`
 6. Save, then verify in the main UI:
    - the shared front live enclosure should still auto-populate
    - SATADOM views should render as `Virtual Storage View` targets
@@ -80,11 +82,11 @@ If you prefer to understand the saved config shape directly, it now looks more
 like this:
 
 ```yaml
-- id: qsosn-ha
-  label: QSOSN HA
+- id: example-qs-ha
+  label: ExampleQS HA
   default_profile_id: supermicro-ssg-2028r-shared-front-24
   truenas:
-    host: https://qs.gcs8.io
+    host: https://quantastor.example.test
     api_user: jbodmap
     api_password: replace_me
     platform: quantastor
@@ -92,15 +94,15 @@ like this:
     timeout_seconds: 15
   ssh:
     enabled: true
-    host: qs.gcs8.io
+    host: 192.0.2.30  # optional legacy/default node fallback; not the API VIP
     ha_enabled: true
     ha_nodes:
-      - system_id: 886eeff0-4a0e-9895-6c06-e5bea12bf734
-        label: QSOSN-Left
-        host: 10.13.37.30  # optional but recommended for node-targeted SSH
-      - system_id: c2c0e209-e04c-adf6-0c35-d14e0181b4f7
-        label: QSOSN-Right
-        host: 10.13.37.31  # optional but recommended for node-targeted SSH
+      - system_id: 11111111-1111-4111-8111-111111111111
+        label: ExampleQS-Left
+        host: 192.0.2.30  # recommended for node-targeted SSH
+      - system_id: 22222222-2222-4222-8222-222222222222
+        label: ExampleQS-Right
+        host: 192.0.2.31  # recommended for node-targeted SSH
     port: 22
     user: jbodmap
     key_path: /run/ssh/id_jbodmap
@@ -122,7 +124,7 @@ like this:
       enabled: true
       binding:
         mode: hybrid
-        target_system_id: 886eeff0-4a0e-9895-6c06-e5bea12bf734
+        target_system_id: 11111111-1111-4111-8111-111111111111
         serials:
           - SMC0515D92721DUK2088
           - SMC0515D92721DUK4173
@@ -133,7 +135,7 @@ like this:
       enabled: true
       binding:
         mode: hybrid
-        target_system_id: c2c0e209-e04c-adf6-0c35-d14e0181b4f7
+        target_system_id: 22222222-2222-4222-8222-222222222222
         serials:
           - SMC0515D92721DUJ6071
           - SMC0515D92721DUK3185
@@ -142,9 +144,15 @@ like this:
 Notes:
 
 - `truenas.host` should point at the shared API or management VIP
-- `ssh.host` is the shared SSH entry point
-- `ssh.ha_nodes[*].host` is optional, but useful when a specific node must be
-  contacted directly for SES or other appliance-local CLI work
+- `ssh.host` is only a legacy/default node fallback; do not point it at the
+  shared API or grid-management VIP for HA systems
+- `ssh.ha_nodes[*].host` is an override/fallback SSH target list for HA systems
+  when the appliance does not expose usable node hostnames/IPs
+- Quantastor SSH enrichment auto-discovers all hardware-backed HA nodes with
+  usable API-advertised hostnames/IPs. Once one real node is reachable, it also
+  reads `qs network-port-list` and prefers the per-node interface with a
+  configured default gateway, filters out the shared API endpoint, and can
+  prefer the active pool-owner node for pool-related SMART/CLI follow-up
 - `ssh.commands` usually stays blank for Quantastor unless you have a custom
   reason to override the platform-owned defaults
 - `binding.target_system_id` is what pins a storage view to one HA node

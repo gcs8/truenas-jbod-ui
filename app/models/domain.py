@@ -1091,26 +1091,45 @@ class QuantastorNodeDiscoveryRequest(BaseModel):
     tls_ca_bundle_path: str | None = None
     tls_server_name: str | None = None
     timeout_seconds: int = 15
+    ssh_enabled: bool = False
+    ssh_host: str | None = None
+    ssh_port: int = 22
+    ssh_user: str | None = None
+    ssh_key_path: str | None = None
+    ssh_password: str | None = None
+    ssh_known_hosts_path: str | None = "/app/data/known_hosts"
+    ssh_strict_host_key_checking: bool = True
+    ssh_timeout_seconds: int = 15
+    ha_nodes: list[HANodeRequest] = Field(default_factory=list)
 
     @field_validator(
         "truenas_host",
         "api_user",
         "tls_ca_bundle_path",
         "tls_server_name",
+        "ssh_host",
+        "ssh_user",
+        "ssh_key_path",
+        "ssh_known_hosts_path",
     )
     @classmethod
     def sanitize_text_fields(cls, value: str | None) -> str | None:
         return trim_optional_text(value, max_length=1024)
 
-    @field_validator("api_password")
+    @field_validator("api_password", "ssh_password")
     @classmethod
     def sanitize_secret_fields(cls, value: str | None) -> str | None:
         return preserve_optional_secret(value, max_length=1024)
 
-    @field_validator("timeout_seconds")
+    @field_validator("timeout_seconds", "ssh_timeout_seconds")
     @classmethod
     def clamp_timeout(cls, value: int) -> int:
         return max(1, min(int(value), 300))
+
+    @field_validator("ssh_port")
+    @classmethod
+    def clamp_ssh_port(cls, value: int) -> int:
+        return max(1, min(int(value), 65535))
 
     @model_validator(mode="after")
     def validate_required_fields(self) -> "QuantastorNodeDiscoveryRequest":
