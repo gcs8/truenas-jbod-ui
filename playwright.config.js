@@ -1,6 +1,7 @@
 const { defineConfig } = require("@playwright/test");
 
 const baseURL = process.env.PLAYWRIGHT_BASE_URL || "http://127.0.0.1:8080";
+const browserChannel = process.env.PLAYWRIGHT_BROWSER_CHANNEL || undefined;
 
 module.exports = defineConfig({
   testDir: "./qa",
@@ -28,6 +29,7 @@ module.exports = defineConfig({
       name: "chromium",
       use: {
         browserName: "chromium",
+        channel: browserChannel,
       },
     },
   ],
