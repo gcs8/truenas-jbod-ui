@@ -12,9 +12,10 @@ This handoff is for a fresh session to continue the `gcs8/truenas-jbod-ui` `v0.2
 - Last committed release-prep commit: `c25a074 docs: update v0.21.0 release packet after SSH fanout merge`
 - Latest merged main work included in this branch: `6fe534b Reduce SSH fanout for inventory enrichment (#7)`
 - Public release/tag: **not cut**
-- Ship state: automated pre-tag gates are now complete after the continuation
-  update below, but the public tag/publish is still **not cut** and remains
-  held for gcs8 human QA/acceptance plus the publish sequence.
+- Ship state: **not tag-ready**. The first Linux QA restore candidate was
+  rejected by gcs8 because it contained sanitized/default data rather than real
+  deployment systems/data. Do not tag/publish until a real-data Linux restore is
+  completed and accepted.
 
 ## Continuation update - 2026-06-12T04:05Z
 
@@ -36,6 +37,30 @@ This handoff is for a fresh session to continue the `gcs8/truenas-jbod-ui` `v0.2
   available until post-publish deployment sniff tests pass.
 - Do **not** tag/publish until gcs8 accepts the running candidate and the final
   release mechanics are intentionally started.
+
+## Human QA failure update - 2026-06-12T04:18Z
+
+gcs8 rejected the Linux QA candidate at `10.13.37.138:18080` because the
+restored data looked sanitized/default rather than real deployment data. That
+invalidates the Linux QA restore, restored Linux QA perf, Linux QA
+snapshot/export/offline, and real-system feature validation evidence from the
+first disposable restore attempt.
+
+Corrective state:
+
+- `docs/RELEASE_WRAP_0.21.0.md` has been changed back to `Blocked` for the
+  real-data restore-dependent rows.
+- Strict pre-tag validation is expected to fail again until a real long-running
+  deployment backup is restored and accepted.
+- Do not reuse `artifacts/private-v0.21.0/windows-restore-default.tar.zst` as
+  release evidence unless its provenance is re-established and gcs8 accepts the
+  restored data.
+- Next QA attempt must first prove the restored candidate contains real systems
+  and real history/config data before recording functional/perf/browser results
+  as release evidence.
+- The invalid disposable QA stack was stopped with `docker compose down`; ports
+  `18080/18081/18082` are no longer listening. The runtime directory remains at
+  `/docker-local/truenas-jbod-ui-qa-0.21.0-20260612T034656Z` for evidence only.
 
 Current tracked files modified before this handoff file was added:
 
@@ -390,16 +415,20 @@ Follow `docs/RELEASE_CHECKLIST.md` lines 353-406. Summary:
 
 ## Release wrap rows still blocked now
 
-As of the continuation update, all automated pre-tag rows are `Pass`; these
-post-publish rows intentionally remain blocked in
+As of the human QA failure update, these rows intentionally remain blocked in
 `docs/RELEASE_WRAP_0.21.0.md`:
 
+- Feature-specific live API/UI gates
+- Linux QA restore gate
+- Restored Linux QA perf harnesses
+- Snapshot/export/offline artifact gate
 - GHCR publish verification
 - Deployment refresh/sniff tests
 - Post-release reopen
 
-Local and Linux QA snapshot/export and docs/wiki/public-demo rows are already
-`Pass`.
+Docs/wiki/public-demo and local mechanical gates remain useful, but no
+real-data restore-dependent evidence should be treated as release-valid until
+the next candidate is restored from real long-running deployment data.
 
 ## Do not redo unless source changes
 
@@ -428,7 +457,11 @@ If any code changes happen, rerun the relevant syntax/unit/browser subset plus `
 - [x] `scripts/validate_release_wrap.py 0.21.0 --phase pre-tag --allow-blocked`
 - [x] review/commit/push current local-gate changes
 - [x] run Linux QA restore on `10.13.37.138:18080/18081/18082`
-- [x] update `docs/RELEASE_WRAP_0.21.0.md` with Linux QA evidence
-- [x] run strict pre-tag validator without `--allow-blocked`
-- [ ] gcs8 human QA/acceptance of the running Linux candidate
+- [x] update `docs/RELEASE_WRAP_0.21.0.md` with first Linux QA evidence
+- [x] run strict pre-tag validator without `--allow-blocked` on the first attempt
+- [x] record gcs8 rejection of the sanitized/default Linux QA candidate
+- [ ] find/export a true real-data backup from a long-running deployment
+- [ ] rerun Linux QA restore on `10.13.37.138:18080/18081/18082`
+- [ ] rerun strict pre-tag validator without `--allow-blocked`
+- [ ] gcs8 human QA/acceptance of the real-data Linux candidate
 - [ ] only then merge/tag/publish and verify GHCR/deployments
