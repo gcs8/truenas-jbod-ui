@@ -4,7 +4,7 @@
 
 - No changes yet.
 
-## v0.21.0 - 2026-05-22
+## v0.21.0 - 2026-06-11
 
 ### Changed
 
@@ -25,6 +25,14 @@
   builder selection helpers, builder wrapper classes, a shared build context,
   and a platform route-provider registry while preserving the existing operator
   payload and source-labeling contract.
+- Reduced SSH fanout during inventory, SMART, and Quantastor enrichment by
+  batching dynamic follow-up commands through reusable short-lived SSH sessions.
+- Added clearer Quantastor HA SSH targeting for real node hosts, including
+  configured node hosts, API-published node addresses, and default-gateway
+  discovery from reachable nodes, while keeping shared API or management VIPs
+  out of SSH targeting.
+- Made the admin-side HA node SSH helper more explicit so operators can see and
+  correct the node-specific targets before relying on optional SSH enrichment.
 
 ### Fixed
 
@@ -32,6 +40,13 @@
   members cannot escape the restore area, rely on unsafe Windows/POSIX path
   forms, or delete/replace a selected restore directory before all selected
   members have been validated.
+- Added SSH startup backoff and command redaction so transient SSH enrichment
+  failures produce fewer repeated connection attempts and do not echo sensitive
+  inline command arguments in warnings or debug payloads.
+- Preserved partial SSH batch results when later commands or sessions fail, so
+  already-collected enrichment data remains usable and observable.
+- Hardened the public-demo browser-smoke CI path by making the Playwright
+  browser channel environment-driven and disabling video capture in CI.
 
 ## v0.20.2 - 2026-05-21
 

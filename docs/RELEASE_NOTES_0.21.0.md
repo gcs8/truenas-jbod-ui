@@ -1,6 +1,6 @@
 # Release Notes - v0.21.0
 
-Date: `2026-05-22`
+Date: `2026-06-11`
 
 `v0.21.0` is a maintenance and confidence pitstop after the Storage Fabric
 expansion. It improves release safety, clean-checkout validation, backup import
@@ -30,6 +30,13 @@ visibility across CORE, SCALE, Quantastor, Linux, ESXi, and BMC/IPMI paths.
   operator-facing payload stable.
 - Updated the v0.21 pitstop plan with the completed decisions and the remaining
   v0.22 direction.
+- Reduced SSH fanout during inventory, SMART, and Quantastor enrichment by
+  batching dynamic follow-up commands through reusable short-lived SSH sessions.
+- Clarified Quantastor HA SSH targeting so optional SSH enrichment targets real
+  node hosts from explicit config, API-published node addresses, or reachable
+  node default-gateway discovery rather than the shared API or management VIP.
+- Polished the admin-side HA node SSH helper so operators can review and correct
+  node-specific targets before relying on optional SSH enrichment.
 
 ## Fixed
 
@@ -40,12 +47,21 @@ visibility across CORE, SCALE, Quantastor, Linux, ESXi, and BMC/IPMI paths.
   members.
 - Selected directory restore now validates all selected archive members before
   deleting or replacing an existing target directory.
+- SSH startup backoff and command redaction now reduce repeated transient
+  connection attempts and keep sensitive inline command arguments out of
+  warnings and debug payloads.
+- SSH command batches now preserve results collected before a later command or
+  session failure, improving both runtime resilience and release evidence.
+- Public-demo browser-smoke CI no longer depends on CI video capture and can use
+  a hosted browser channel when provided by the runner.
 
 ## Runtime Impact
 
 - No new write-capable Storage Fabric or RAID-management action is introduced.
 - No intentional operator-facing Storage Fabric wording, route, or payload field
   rename is included in the maintainability seams.
+- Optional SSH enrichment should be quieter under transient failures and should
+  avoid shared Quantastor API/VIP endpoints when HA node targets are available.
 - Richer platform-native Storage Fabric enrichment remains deferred to v0.22.x
   unless a release gate uncovers an operator-correctness blocker.
 
