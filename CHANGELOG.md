@@ -4,6 +4,18 @@
 
 - No changes yet.
 
+## v0.21.1 - 2026-06-12
+
+### Fixed
+
+- Suppressed durable identity/topology history events when a slot briefly flips
+  between present and absent during a transient/incomplete inventory snapshot.
+  The state change remains visible, but `Identity Change` and `Topology Change`
+  rows are now reserved for stable present-to-present disk/topology changes.
+- Cleaned the post-`v0.21.0` source-stack UNVR Pro presence-flap history noise
+  after taking a SQLite backup and verified a subsequent refresh reintroduced no
+  same-day identity/topology rows.
+
 ## v0.21.0 - 2026-06-11
 
 ### Changed

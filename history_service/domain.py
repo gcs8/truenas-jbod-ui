@@ -449,6 +449,8 @@ def build_slot_events(
 
     events: list[SlotEvent] = []
     for event_type, field_names in EVENT_GROUPS.items():
+        if event_type != "slot_state_changed" and previous.present != current.present:
+            continue
         changes: dict[str, dict[str, Any]] = {}
         for field_name in field_names:
             old_value = getattr(previous, field_name)

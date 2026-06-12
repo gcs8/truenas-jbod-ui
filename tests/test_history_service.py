@@ -174,6 +174,48 @@ class HistoryDomainTests(unittest.TestCase):
 
         self.assertEqual(events, [])
 
+    def test_build_slot_events_treats_presence_flaps_as_state_only(self) -> None:
+        present = SlotStateRecord(
+            system_id="unvr-pro",
+            system_label="UniFi UNVR Pro",
+            enclosure_key="front-7",
+            enclosure_id="front-7",
+            enclosure_label="Front 7 Bay",
+            slot=0,
+            slot_label="00",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="sdb",
+            serial="Y5F2A056FJKH",
+            model="TOSHIBA_MG09ACA16TE",
+            gptid="0x5000039e68d25d38",
+            pool_name="/volume/7400794a-85c0-46e6-b7e1-3cb98dee6b2f",
+            vdev_name="md3",
+            health="good",
+            topology_label="/volume/7400794a-85c0-46e6-b7e1-3cb98dee6b2f > md3 > data",
+        )
+        missing = replace(
+            present,
+            present=False,
+            state="unknown",
+            device_name=None,
+            serial=None,
+            model=None,
+            gptid=None,
+            pool_name=None,
+            vdev_name=None,
+            health=None,
+            topology_label=None,
+            disk_identity_key=None,
+        )
+
+        missing_events = build_slot_events(present, missing, "2026-06-12T17:33:12+00:00")
+        restored_events = build_slot_events(missing, present, "2026-06-12T17:38:40+00:00")
+
+        self.assertEqual([event.event_type for event in missing_events], ["slot_state_changed"])
+        self.assertEqual([event.event_type for event in restored_events], ["slot_state_changed"])
+
     def test_build_slot_events_keeps_identity_event_when_serial_changes_with_sas(self) -> None:
         previous = SlotStateRecord(
             system_id="qsosn-ha",
