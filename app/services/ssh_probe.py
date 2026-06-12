@@ -198,10 +198,14 @@ class SSHProbe:
                 exc,
             )
             error_message = str(exc) or exc.__class__.__name__
-            return [self._failure_result(command, error_message) for command in command_list]
+            results.extend(
+                self._failure_result(command, error_message)
+                for command in command_list[len(results) :]
+            )
+            return results
 
         logger.info(
-            "SSH command batch completed for %s@%s: commands=%s failures=%s duration=%.3fs",
+            "SSH command batch completed for %s@%s: connections=1 commands=%s failures=%s duration=%.3fs",
             self.config.user,
             self.config.host,
             len(results),
@@ -238,15 +242,50 @@ class SSHProbe:
             results.extend(self._failure_result(command, error_message) for command in pending_commands)
             return results
 
-        with client:
-            while pending_commands:
-                batch_count += 1
-                for command in pending_commands:
-                    results.append(self._run_single_command(client, command))
-                pending_commands = self._new_commands(planner(list(results)), seen_commands)
+        session_error: Exception | None = None
+        failed_pending_commands: list[str] = []
+        try:
+            with client:
+                while pending_commands:
+                    batch_count += 1
+                    for index, command in enumerate(pending_commands):
+                        try:
+                            results.append(self._run_single_command(client, command))
+                        except Exception as exc:  # noqa: BLE001 - preserve partial batch results.
+                            session_error = exc
+                            failed_pending_commands = pending_commands[index:]
+                            pending_commands = []
+                            break
+                    else:
+                        pending_commands = self._new_commands(planner(list(results)), seen_commands)
+                        continue
+                    break
+        except Exception as exc:  # noqa: BLE001 - preserve partial session results.
+            if session_error is None:
+                session_error = exc
+
+        if session_error is not None:
+            logger.warning(
+                "SSH planned command session interrupted for %s@%s: %s",
+                self.config.user,
+                self.config.host,
+                session_error,
+            )
+            error_message = str(session_error) or session_error.__class__.__name__
+            results.extend(self._failure_result(command, error_message) for command in failed_pending_commands)
+            logger.info(
+                "SSH planned command session completed for %s@%s: connections=1 batches=%s commands=%s failures=%s duration=%.3fs",
+                self.config.user,
+                self.config.host,
+                batch_count,
+                len(results),
+                sum(1 for result in results if not result.ok),
+                time.perf_counter() - started,
+            )
+            return results
 
         logger.info(
-            "SSH planned command session completed for %s@%s: batches=%s commands=%s failures=%s duration=%.3fs",
+            "SSH planned command session completed for %s@%s: connections=1 batches=%s commands=%s failures=%s duration=%.3fs",
             self.config.user,
             self.config.host,
             batch_count,

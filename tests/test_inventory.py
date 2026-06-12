@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.config import BMCConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig
+from app.config import BMCConfig, HANodeConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
     EnclosureOption,
     InventorySummary,
@@ -7473,6 +7473,60 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any("lsblk --json" in command for command in planned_commands))
             self.assertTrue(any("lsscsi -g -t" in command for command in planned_commands))
             self.assertTrue(any("nvme list-subsys -o json" in command for command in planned_commands))
+
+    async def test_quantastor_ha_ssh_enrichment_warns_when_no_node_hosts_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="example-qs-ha",
+                label="ExampleQS HA",
+                truenas=TrueNASConfig(
+                    host="https://qs.example.test",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="qs.example.test",
+                    user="jbodmap",
+                    ha_enabled=True,
+                    ha_nodes=[
+                        HANodeConfig(system_id="node-a", label="ExampleQS Left"),
+                        HANodeConfig(system_id="node-b", label="ExampleQS Right"),
+                    ],
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service._run_ssh_commands = AsyncMock(side_effect=AssertionError("no host should be probed"))
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[
+                    {"id": "node-a", "name": "ExampleQS Left", "storageSystemClusterId": "cluster-a"},
+                    {"id": "node-b", "name": "ExampleQS Right", "storageSystemClusterId": "cluster-a"},
+                ],
+                disks=[],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[{"id": "enc-a", "storageSystemId": "node-a"}],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            _cli_overlay, cli_failures = await service._fetch_quantastor_cli_overlay(raw_data)
+            _ses_overlay, ses_failures = await service._fetch_quantastor_ses_overlay(raw_data)
+
+            self.assertIn("no node SSH host", " ".join(cli_failures))
+            self.assertIn("no node SSH host", " ".join(ses_failures))
+            service._run_ssh_commands.assert_not_called()
 
     async def test_force_source_bundle_refresh_clears_sg_ses_device_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

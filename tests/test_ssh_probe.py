@@ -274,6 +274,74 @@ class SSHProbeTests(unittest.TestCase):
         self.assertEqual(ssh_client.exec_command.call_count, 2)
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
+    def test_run_commands_sync_preserves_completed_results_when_batch_aborts(
+        self,
+        ssh_client_cls: MagicMock,
+    ) -> None:
+        ssh_client = MagicMock()
+        ssh_client.__enter__.return_value = ssh_client
+        ssh_client_cls.return_value = ssh_client
+        ssh_client.connect.return_value = None
+        probe = SSHProbe(
+            SSHConfig(
+                enabled=True,
+                host="archive-core.example.test",
+                user="jbodmap",
+                strict_host_key_checking=False,
+            )
+        )
+
+        with patch.object(
+            probe,
+            "_run_single_command",
+            side_effect=[
+                SSHCommandResult(command="first", ok=True, stdout="first output", exit_code=0),
+                RuntimeError("transport reset"),
+            ],
+        ):
+            results = probe._run_commands_sync(["first", "second"])
+
+        self.assertEqual([item.command for item in results], ["first", "second"])
+        self.assertTrue(results[0].ok)
+        self.assertEqual(results[0].stdout, "first output")
+        self.assertFalse(results[1].ok)
+        self.assertIn("transport reset", results[1].stderr)
+
+    @patch("app.services.ssh_probe.paramiko.SSHClient")
+    def test_run_commands_logs_connection_count_for_batch(
+        self,
+        ssh_client_cls: MagicMock,
+    ) -> None:
+        ssh_client = MagicMock()
+        ssh_client.__enter__.return_value = ssh_client
+        ssh_client_cls.return_value = ssh_client
+        ssh_client.connect.return_value = None
+
+        def exec_command(command: str, timeout: int):
+            stdin = MagicMock()
+            stdout = MagicMock()
+            stderr = MagicMock()
+            stdout.read.return_value = b"ok"
+            stderr.read.return_value = b""
+            stdout.channel.recv_exit_status.return_value = 0
+            return stdin, stdout, stderr
+
+        ssh_client.exec_command.side_effect = exec_command
+        probe = SSHProbe(
+            SSHConfig(
+                enabled=True,
+                host="archive-core.example.test",
+                user="jbodmap",
+                strict_host_key_checking=False,
+            )
+        )
+
+        with self.assertLogs("app.services.ssh_probe", level="INFO") as logs:
+            probe._run_commands_sync(["uptime"])
+
+        self.assertIn("connections=1", "\n".join(logs.output))
+
+    @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_run_planned_commands_reuses_one_connection_for_dynamic_batches(
         self,
         ssh_client_cls: MagicMock,
@@ -317,6 +385,43 @@ class SSHProbeTests(unittest.TestCase):
         self.assertTrue(all(item.ok for item in results))
         ssh_client.connect.assert_called_once()
         self.assertEqual(ssh_client.exec_command.call_count, 3)
+
+    @patch("app.services.ssh_probe.paramiko.SSHClient")
+    def test_run_planned_commands_preserves_completed_results_when_session_aborts(
+        self,
+        ssh_client_cls: MagicMock,
+    ) -> None:
+        ssh_client = MagicMock()
+        ssh_client.__enter__.return_value = ssh_client
+        ssh_client_cls.return_value = ssh_client
+        ssh_client.connect.return_value = None
+        probe = SSHProbe(
+            SSHConfig(
+                enabled=True,
+                host="archive-core.example.test",
+                user="jbodmap",
+                strict_host_key_checking=False,
+            )
+        )
+
+        with patch.object(
+            probe,
+            "_run_single_command",
+            side_effect=[
+                SSHCommandResult(command="seed", ok=True, stdout="seed output", exit_code=0),
+                RuntimeError("session closed"),
+            ],
+        ):
+            results = probe._run_planned_commands_sync(
+                lambda _results: [],
+                initial_commands=["seed", "dynamic"],
+            )
+
+        self.assertEqual([item.command for item in results], ["seed", "dynamic"])
+        self.assertTrue(results[0].ok)
+        self.assertEqual(results[0].stdout, "seed output")
+        self.assertFalse(results[1].ok)
+        self.assertIn("session closed", results[1].stderr)
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_run_planned_commands_returns_failure_for_planned_commands_when_connection_setup_fails(

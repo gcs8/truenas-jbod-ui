@@ -1880,9 +1880,11 @@ class InventoryService:
                         self._ssh_inventory_enrichment_probe_commands
                     )
                 logger.info(
-                    "Inventory SSH refresh completed for system=%s platform=%s: commands=%s failures=%s duration=%.3fs",
+                    "Inventory SSH refresh completed for system=%s platform=%s profile=%s: connections=%s commands=%s failures=%s duration=%.3fs",
                     self.system.id,
                     self.system.truenas.platform,
+                    self.system.default_profile_id or "auto",
+                    1 if command_results else 0,
                     len(command_results),
                     sum(1 for result in command_results if not result.ok),
                     time.perf_counter() - ssh_started,
@@ -5938,6 +5940,20 @@ class InventoryService:
     def _quantastor_hw_enclosure_rows(raw_data: TrueNASRawData) -> list[dict[str, Any]]:
         return raw_data.cli_hw_enclosures or raw_data.hw_enclosures
 
+    def _quantastor_no_node_ssh_host_failures(self, raw_data: TrueNASRawData | None = None) -> list[str]:
+        ha_context = bool(
+            self.system.ssh.ha_enabled
+            or self.system.ssh.ha_nodes
+            or (raw_data is not None and self._quantastor_has_cluster_peers(raw_data))
+        )
+        if not self.system.ssh.enabled or not ha_context:
+            return []
+        return [
+            "Quantastor SSH enrichment is enabled, but no node SSH host is configured "
+            "or discoverable for this HA system; configure HA node hosts or a non-shared SSH host. "
+            "REST data is still being used."
+        ]
+
     async def _fetch_quantastor_cli_overlay(
         self,
         raw_data: TrueNASRawData | None = None,
@@ -5958,8 +5974,11 @@ class InventoryService:
             ("hw-enclosure-list", "hardware enclosure inventory", "cli_hw_enclosures"),
             ("network-port-list", "network port inventory", "cli_network_ports"),
         )
+        hosts = self._build_quantastor_ssh_hosts(raw_data)
+        if not hosts:
+            return overlay, self._quantastor_no_node_ssh_host_failures(raw_data)
 
-        for host in self._build_quantastor_ssh_hosts(raw_data):
+        for host in hosts:
             host_overlay = {
                 "cli_disks": [],
                 "cli_hw_disks": [],
@@ -6006,8 +6025,11 @@ class InventoryService:
         self,
         raw_data: TrueNASRawData | None = None,
     ) -> tuple[ParsedSSHData, list[str]]:
+        hosts = self._build_quantastor_ssh_hosts(raw_data)
+        if not hosts:
+            return ParsedSSHData(), self._quantastor_no_node_ssh_host_failures(raw_data)
         overlay, failures, best_host = await self._fetch_sg_ses_overlay(
-            self._build_quantastor_ssh_hosts(raw_data),
+            hosts,
             failure_prefix="Quantastor SSH SES",
             merge_hosts=True,
         )
