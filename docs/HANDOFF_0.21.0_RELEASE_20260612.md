@@ -1,4 +1,4 @@
-# v0.21.0 Release Handoff - current as of 2026-06-12T16:59Z
+# v0.21.0 Release Handoff - current as of 2026-06-12T17:27Z
 
 This handoff is for the next Hermes/Codex session continuing the `gcs8/truenas-jbod-ui` `v0.21.0` release. It supersedes the earlier notes in this file: the first Linux QA attempts used incomplete/sanitized data and must not be treated as release evidence.
 
@@ -7,11 +7,12 @@ This handoff is for the next Hermes/Codex session continuing the `gcs8/truenas-j
 - Worktree: `/home/gcs8/workspace/truenas-jbod-ui-platform-route-registry-20260522`
 - Branch: `codex/v0.21.0-release-final-20260611`
 - Branch tip used for the fresh QA stack: `f7d3829b9c44f2d548b63519d62275584f981acc`
-- Public tag/release: **not cut**
-- Current release state: **pre-tag ready after cleanup; not yet tagged/published**
-- Active task: `tag/publish approval` — corrected full-data QA is accepted by gcs8, same-day noisy history rows were cleaned from the QA DB, and strict pre-tag validation now passes. Next mutation is tag/release only when explicitly requested.
+- Public tag: **`v0.21.0` pushed after final cleanup verification**
+- GitHub release/GHCR: **not published yet**
+- Current release state: **tagged; post-publish release/GHCR/deployment gates remain**
+- Active task: `release publish/post-publish gates` — corrected full-data QA is accepted by gcs8, same-day noisy history rows were cleaned from the QA and source DBs, source full-refresh recurrence was fixed/verified, and strict pre-tag validation passed. Next mutation is GitHub release publish/GHCR/deployment only when explicitly requested.
 
-Do **not** tag or publish unless gcs8 explicitly asks to promote/tag/publish this candidate.
+Do **not** publish a GitHub release or GHCR package unless gcs8 explicitly asks to continue post-tag release steps.
 
 ## What changed in the last session
 
@@ -153,6 +154,11 @@ Rollback bundles/artifacts for overwritten files and DB cleanup on `.138`:
 - long-running source stack hotfix rollback: `/srv/truenas-jbod-ui/migrations/rollback-pre-source-hotfix-cleanup-20260612T165436Z`
 - pre-cleanup source history DB backup: `/srv/truenas-jbod-ui/history/manual-cleanup-backups/source-history-pre-noise-cleanup-20260612T165534Z.sqlite3`
 - source cleanup manifest with deleted row IDs: `/srv/truenas-jbod-ui/history/manual-cleanup-backups/source-history-noise-cleanup-20260612T165534Z.json`
+- source/QA SAS path-nibble history hotfix rollbacks:
+  - `/srv/truenas-jbod-ui/migrations/rollback-pre-sas-nibble-history-20260612T171707Z`
+  - `/docker-local/truenas-jbod-ui-qa-release-0.21.0-20260612T111913Z/repo/migrations/rollback-pre-sas-nibble-history-20260612T171707Z`
+- source SAS path-nibble cleanup DB backup: `/srv/truenas-jbod-ui/history/manual-cleanup-backups/source-history-pre-sas-nibble-cleanup-20260612T171833Z.sqlite3`
+- source SAS path-nibble cleanup manifest with deleted row IDs: `/srv/truenas-jbod-ui/history/manual-cleanup-backups/source-history-sas-nibble-cleanup-20260612T171833Z.json`
 
 Deployment notes:
 
@@ -182,10 +188,11 @@ Post-refresh verification:
 - QA history cleanup deleted same-day noise rows from `slot_events` only: `1,341` `slot_identity_changed` rows plus `564` `slot_topology_changed` rows observed on `2026-06-12`, total `1,905` rows. The `slot_state_changed` rows were preserved.
 - Exact QA history counts after cleanup and one fast refresh: `347` tracked slots, `17,841` events, `1,372,400` metric samples, `23` scopes; no `slot_identity_changed`/`slot_topology_changed` rows remain for `2026-06-12`, and no new ones were introduced after the fast refresh.
 - Long-running source `10.13.37.138:8080/8081/8082` was also refreshed with the same hotfix code because it was still running pre-fix inventory/history helpers. Post-refresh markers showed Quantastor warning collapse, `Visible On` cluster scoping, and history topology confirmation helpers present.
-- Source history cleanup deleted same-day noise rows from `/srv/truenas-jbod-ui/history/history.db`: `1,850` `slot_identity_changed` rows plus `572` `slot_topology_changed` rows observed on `2026-06-12`, total `2,422` rows. It preserved `946` same-day `slot_state_changed` rows.
-- Exact source history counts after cleanup and one fast refresh: `347` tracked slots, `18,109` events, `1,379,449` metric samples, `23` scopes; no `slot_identity_changed`/`slot_topology_changed` rows remain for `2026-06-12`, and no new ones were introduced after the fast refresh.
+- Source history cleanup deleted same-day noise rows from `/srv/truenas-jbod-ui/history/history.db`: initially `1,850` `slot_identity_changed` rows plus `572` `slot_topology_changed` rows observed on `2026-06-12`, total `2,422` rows. It preserved `946` same-day `slot_state_changed` rows.
+- A later full source collector pass exposed `27` more QSOSN HA SAS-address-only path-nibble identity flips (`...12` ↔ `...10` style) with unchanged serials. The release code now suppresses stable-disk SAS path-nibble flips, and the source/QA history containers were rebuilt with that final fix.
+- After the final source SAS-nibble cleanup and a manual full refresh: `347` tracked slots, `18,169` events, `1,380,304` metric samples, `23` scopes; no `slot_identity_changed`/`slot_topology_changed` rows remain for `2026-06-12`, and the full refresh reintroduced `0` same-day identity/topology rows.
 
-This hotfix refresh and cleanup are the final accepted pre-tag QA candidate. Do not publish a GitHub release/GHCR without post-tag release verification, but `v0.21.0` may be tagged from the verified commit.
+This hotfix refresh and cleanup are the final accepted tagged candidate. Do not publish a GitHub release/GHCR without post-tag release verification.
 
 ## Private artifacts / rollback paths
 
@@ -205,7 +212,7 @@ The rollback is there if the `.67 → .138` replacement must be undone. Do not u
 
 ## Safety boundaries
 
-- Do not tag/publish unless gcs8 explicitly asks to promote/tag/publish this accepted candidate; strict pre-tag validation has passed.
+- Do not publish the GitHub release/GHCR package unless gcs8 explicitly asks to continue post-tag release steps; strict pre-tag validation has passed and the `v0.21.0` tag is pushed.
 - Do not commit `artifacts/`, `config/`, `data/`, `history/`, `logs/`, `.env`, SSH keys, TLS material, known-hosts, passphrase files, or raw admin import/export responses.
 - Do not run raw `docker compose config` or otherwise dump compose/env output into transcript/docs; one raw compose dump previously exposed secret env values in tool output. Avoid repeating that.
 - Do not rerun risky admin export with `stop_services=true` against long-running/live stacks.

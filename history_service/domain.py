@@ -114,7 +114,11 @@ def _sas_dual_path_addresses_equivalent(old_value: str | None, new_value: str | 
         return False
     if old_hex[:-1] != new_hex[:-1]:
         return False
-    return {old_hex[-1], new_hex[-1]} <= {"2", "3"}
+    old_port = old_hex[-1]
+    new_port = new_hex[-1]
+    if not (old_port.isdigit() and new_port.isdigit()):
+        return False
+    return abs(int(old_port) - int(new_port)) <= 3
 
 
 def _field_values_equal(

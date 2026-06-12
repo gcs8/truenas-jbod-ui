@@ -147,6 +147,33 @@ class HistoryDomainTests(unittest.TestCase):
 
         self.assertEqual(events, [])
 
+    def test_build_slot_events_ignores_quantastor_sas_path_nibble_flaps(self) -> None:
+        previous = SlotStateRecord(
+            system_id="qsosn-ha",
+            system_label="QSOSN HA",
+            enclosure_key="node-a",
+            enclosure_id="node-a",
+            enclosure_label="QSOSN-Left",
+            slot=0,
+            slot_label="00",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="disk/by-id/scsi-S40BNF0M603885",
+            serial="S40BNF0M603885",
+            model="SAMSUNG MZILT3T8HALS0D3",
+            gptid="scsi-S40BNF0M603885",
+            pool_name="HA-Pool-R10",
+            vdev_name="mirror-0",
+            health="ONLINE",
+            sas_address="5002538b496a5512",
+        )
+        current = replace(previous, sas_address="5002538b496a5510")
+
+        events = build_slot_events(previous, current, "2026-06-12T17:00:25+00:00")
+
+        self.assertEqual(events, [])
+
     def test_build_slot_events_keeps_identity_event_when_serial_changes_with_sas(self) -> None:
         previous = SlotStateRecord(
             system_id="qsosn-ha",
