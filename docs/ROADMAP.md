@@ -20,8 +20,9 @@ remaining part of the active docs set.
 
 ## Current Snapshot
 
-`v0.21.0` is the maintenance and confidence pitstop after the Storage Fabric
-expansion on top of the `v0.20.x` SAS/Storage Fabric foundation:
+`v0.21.1` is the maintenance and confidence pitstop after the Storage Fabric
+expansion on top of the `v0.20.x` SAS/Storage Fabric foundation, including the
+post-publish history-noise hotfix on top of `v0.21.0`:
 
 - the dedicated fabric surface now presents as `Storage Fabric`
 - CORE keeps the deep SAS/HBA/expander diagnostic path
@@ -30,8 +31,9 @@ expansion on top of the `v0.20.x` SAS/Storage Fabric foundation:
 - Quantastor, ESXi, generic Linux, and BMC/IPMI maps stay read-only and
   source-labeled instead of claiming CORE-equivalent SAS detail
 - Disk Path clickability, first-click stability, SCALE identity reuse,
-  public-demo spare grouping, SSH fanout controls, and restore-grade release
-  evidence are covered by the `0.21.0` validation gate
+  public-demo spare grouping, SSH fanout controls, restore-grade release
+  evidence, and the `v0.21.1` presence-flap history-noise fix are covered by
+  the `0.21.x` validation gate
 
 The next cycle should stay practical and incremental:
 

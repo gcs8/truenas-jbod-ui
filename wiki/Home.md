@@ -116,8 +116,9 @@ setup notes.
 
 ## Current Version
 
-`0.21.0` is the current stable release. It is the maintenance and confidence
-pitstop after the Storage Fabric expansion: CORE keeps the deep HBA/SAS
+`0.21.1` is the current stable release. It is the maintenance and confidence
+pitstop after the Storage Fabric expansion, with the post-publish history-noise
+hotfix on top of `0.21.0`: CORE keeps the deep HBA/SAS
 diagnostic path, SCALE/Linux, Quantastor, ESXi, and BMC-backed systems keep
 read-only source-labeled maps where evidence exists, and the release hardens
 SSH fanout, restore, browser-smoke, and release-gate evidence.

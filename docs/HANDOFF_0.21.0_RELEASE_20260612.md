@@ -1,4 +1,4 @@
-# v0.21.0 Release Handoff - current as of 2026-06-12T17:27Z
+# v0.21.x Release Handoff - final as of 2026-06-12T18:25Z
 
 This handoff is for the next Hermes/Codex session continuing the `gcs8/truenas-jbod-ui` `v0.21.0` release. It supersedes the earlier notes in this file: the first Linux QA attempts used incomplete/sanitized data and must not be treated as release evidence.
 
@@ -6,13 +6,11 @@ This handoff is for the next Hermes/Codex session continuing the `gcs8/truenas-j
 
 - Worktree: `/home/gcs8/workspace/truenas-jbod-ui-platform-route-registry-20260522`
 - Branch: `codex/v0.21.0-release-final-20260611`
-- Branch tip used for the fresh QA stack: `f7d3829b9c44f2d548b63519d62275584f981acc`
-- Public tag: **`v0.21.0` pushed after final cleanup verification**
-- GitHub release/GHCR: **not published yet**
-- Current release state: **tagged; post-publish release/GHCR/deployment gates remain**
-- Active task: `release publish/post-publish gates` — corrected full-data QA is accepted by gcs8, same-day noisy history rows were cleaned from the QA and source DBs, source full-refresh recurrence was fixed/verified, and strict pre-tag validation passed. Next mutation is GitHub release publish/GHCR/deployment only when explicitly requested.
-
-Do **not** publish a GitHub release or GHCR package unless gcs8 explicitly asks to continue post-tag release steps.
+- Final release tag: **`v0.21.1`** at `cfb92f2576f7c0d0d7fdd3b3ff58918897c0fe7c`
+- GitHub release: `https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.21.1`
+- GHCR digest: `sha256:28e38a92dd77b9526cf2367bf151b44fafa85a82e425434fdbdc95c56a6ac6d1`
+- Current release state: **published, GHCR verified, source and QA refreshed by digest, issue #6 closed, post-release development reopened as `0.21.2-dev`**.
+- `v0.21.0` remains public audit history but is superseded by `v0.21.1` for deployment.
 
 ## What changed in the last session
 
@@ -192,7 +190,16 @@ Post-refresh verification:
 - A later full source collector pass exposed `27` more QSOSN HA SAS-address-only path-nibble identity flips (`...12` ↔ `...10` style) with unchanged serials. The release code now suppresses stable-disk SAS path-nibble flips, and the source/QA history containers were rebuilt with that final fix.
 - After the final source SAS-nibble cleanup and a manual full refresh: `347` tracked slots, `18,169` events, `1,380,304` metric samples, `23` scopes; no `slot_identity_changed`/`slot_topology_changed` rows remain for `2026-06-12`, and the full refresh reintroduced `0` same-day identity/topology rows.
 
-This hotfix refresh and cleanup are the final accepted tagged candidate. Do not publish a GitHub release/GHCR without post-tag release verification.
+This hotfix refresh and cleanup became the final published `v0.21.1` release after `v0.21.0` post-publish verification exposed the presence-flap history-noise class.
+
+Final publish/deployment evidence:
+
+- GitHub Release `v0.21.1`: `https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.21.1`
+- GHCR workflow `27434127617`: `https://github.com/gcs8/truenas-jbod-ui/actions/runs/27434127617`
+- GHCR tags `v0.21.1`, `0.21.1`, and `latest` all converged to digest `sha256:28e38a92dd77b9526cf2367bf151b44fafa85a82e425434fdbdc95c56a6ac6d1` with OCI revision `cfb92f2576f7c0d0d7fdd3b3ff58918897c0fe7c`, version `0.21.1`.
+- Source stack `10.13.37.138:8080/8081/8082` now runs the published digest on all three containers; UI `/livez` reports `version=0.21.1`, history/admin health are `status=ok`, and same-day identity/topology rows remained `0` after refresh. Counts: `347` tracked slots, `18,243` events, `1,381,523` metric samples.
+- QA stack `10.13.37.138:18080/18081/18082` now runs the published digest on all three containers; UI `/livez` reports `version=0.21.1`, history/admin health are `status=ok`, and same-day identity/topology rows remained `0` after refresh. Counts: `347` tracked slots, `17,841` events, `1,372,400` metric samples.
+- GitHub issue #6 was commented and closed as completed: `https://github.com/gcs8/truenas-jbod-ui/issues/6`.
 
 ## Private artifacts / rollback paths
 
@@ -212,7 +219,7 @@ The rollback is there if the `.67 → .138` replacement must be undone. Do not u
 
 ## Safety boundaries
 
-- Do not publish the GitHub release/GHCR package unless gcs8 explicitly asks to continue post-tag release steps; strict pre-tag validation has passed and the `v0.21.0` tag is pushed.
+- Do not rewrite the published `v0.21.0` or `v0.21.1` tags/releases. Future fixes should ship as normal follow-up releases.
 - Do not commit `artifacts/`, `config/`, `data/`, `history/`, `logs/`, `.env`, SSH keys, TLS material, known-hosts, passphrase files, or raw admin import/export responses.
 - Do not run raw `docker compose config` or otherwise dump compose/env output into transcript/docs; one raw compose dump previously exposed secret env values in tool output. Avoid repeating that.
 - Do not rerun risky admin export with `stop_services=true` against long-running/live stacks.
@@ -298,29 +305,20 @@ Completed against `10.13.37.138:18080/18081/18082` and recorded in `docs/RELEASE
 - Feature/API/browser gate: `11` systems, `60` slots, `2` storage views, cached SAS fabric `799` links / `13` warnings, forced SAS fabric `799` links / `22` warnings, representative CORE/SCALE/Linux/Quantastor/ESXi/IPMI-BMC browser pages clean with no horizontal overflow and no browser error/warning console messages.
 - Snapshot/export/offline gate: artifact `artifacts/private-v0.21.0/linux-qa-fullsource-snapshot-export/linux-qa-fullsource-snapshot-export-20260612T114504Z.zip`, size `1,146,288`, SHA-256 `f62eac9d8b6fb3010b76c63b8718fc025f34d0595c49177a771412263516fefd`; offline HTML opened with `11` system options, `60` tiles, `2` storage-view options, `2` live-enclosure options, clean console, no horizontal overflow.
 - Restored Linux QA perf gates: `data/perf/latest.md` label `release-candidate-linux-qa-fullsource`; `data/history-perf/latest.md` label `release-candidate-history-linux-qa-fullsource`; collector was `collection_running=false` before the perf run.
-- Release wrap validation with `--allow-blocked` passed; strict pre-tag validation is still blocked only by the intentionally blocked `Linux QA restore gate` pending gcs8 acceptance.
+- This section records the pre-publish `v0.21.0` QA gate history. The final published release is `v0.21.1`; see `docs/RELEASE_WRAP_0.21.1.md` for post-publish GHCR/source/QA evidence.
 
-Do not tag until gcs8 accepts the full-data candidate and strict pre-tag validation passes.
+## Final closeout state
 
-## Publish sequence after strict pre-tag pass only
+Completed:
 
-Follow `docs/RELEASE_CHECKLIST.md`. High-level order:
-
-1. Review final `git status`, `git diff`, and release wrap.
-2. Commit corrected release evidence/docs.
-3. Merge release branch into `main` with the intended release commit.
-4. Tag the merged `main` commit as `v0.21.0`.
-5. Push `main` and the annotated tag.
-6. Publish GitHub release notes from final release notes/changelog.
-7. Wait for GHCR publish workflow.
-8. Verify GHCR tags/digest:
-   - `ghcr.io/gcs8/truenas-jbod-ui:v0.21.0`
-   - `ghcr.io/gcs8/truenas-jbod-ui:0.21.0`
-   - `ghcr.io/gcs8/truenas-jbod-ui:latest`
-9. Refresh/sniff local, Linux, and production deployments.
-10. Record post-publish evidence.
-11. Only after post-publish sniff passes, tear down the temporary QA stack.
-12. Reopen next development and run the final release-wrap validator.
+1. `v0.21.1` release commit/tag/release published.
+2. GitHub Actions CI and release-triggered GHCR workflow passed.
+3. Published GHCR digest pulled and sniffed locally.
+4. Long-running source stack refreshed by digest and verified clean.
+5. Full-data QA stack refreshed by digest and verified clean.
+6. Issue #6 closed as completed.
+7. Release wrap records post-publish evidence.
+8. Post-release development reopened as `0.21.2-dev` on `main`; the `v0.21.1` tag remains immutable.
 
 ## Known pitfalls from this run
 
@@ -334,9 +332,8 @@ Follow `docs/RELEASE_CHECKLIST.md`. High-level order:
 
 ## Minimal next-session checklist
 
-- [ ] Confirm this handoff is the current one.
-- [ ] Confirm `.138` source and QA health.
-- [ ] Confirm QA provenance still shows the 11-system full-data baseline.
-- [ ] Have gcs8 visually accept or reject the corrected full-data candidate at `http://10.13.37.138:18080/`.
-- [ ] If accepted, change the `Linux QA restore gate` row in `docs/RELEASE_WRAP_0.21.0.md` from `Blocked` to `Pass` and rerun `.venv/bin/python scripts/validate_release_wrap.py 0.21.0 --phase pre-tag`.
-- [ ] Only if strict pre-tag passes, proceed with commit/merge/tag/GitHub release/GHCR/deployment sniff/reopen.
+- [x] Confirm this handoff is the current final release closeout.
+- [x] Confirm `.138` source and QA health on published `v0.21.1` digest.
+- [x] Confirm QA provenance still shows the full-data baseline with `347` tracked slots and no same-day identity/topology noise rows.
+- [x] Confirm GitHub Release/GHCR publication and issue #6 closure.
+- [ ] Optional later cleanup only if gcs8 asks: decide whether/when to tear down the temporary QA stack on `18080/18081/18082`.
