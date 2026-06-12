@@ -2,6 +2,7 @@ const { defineConfig } = require("@playwright/test");
 
 const baseURL = process.env.PLAYWRIGHT_BASE_URL || "http://127.0.0.1:8080";
 const browserChannel = process.env.PLAYWRIGHT_BROWSER_CHANNEL || undefined;
+const videoMode = process.env.CI ? "off" : "retain-on-failure";
 
 module.exports = defineConfig({
   testDir: "./qa",
@@ -21,7 +22,7 @@ module.exports = defineConfig({
     baseURL,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
-    video: "retain-on-failure",
+    video: videoMode,
     headless: true,
   },
   projects: [
