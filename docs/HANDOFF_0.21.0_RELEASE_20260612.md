@@ -12,10 +12,9 @@ This handoff is for a fresh session to continue the `gcs8/truenas-jbod-ui` `v0.2
 - Last committed release-prep commit: `c25a074 docs: update v0.21.0 release packet after SSH fanout merge`
 - Latest merged main work included in this branch: `6fe534b Reduce SSH fanout for inventory enrichment (#7)`
 - Public release/tag: **not cut**
-- Ship state: **not tag-ready**. The first Linux QA restore candidate was
-  rejected by gcs8 because it contained sanitized/default data rather than real
-  deployment systems/data. Do not tag/publish until a real-data Linux restore is
-  completed and accepted.
+- Ship state: **not tag-ready**. A real-data Linux QA clone is now running on
+  `10.13.37.138:18080/18081/18082`, but the public tag/publish remains blocked
+  until gcs8 visually accepts that restored candidate.
 
 ## Continuation update - 2026-06-12T04:05Z
 
@@ -61,6 +60,58 @@ Corrective state:
 - The invalid disposable QA stack was stopped with `docker compose down`; ports
   `18080/18081/18082` are no longer listening. The runtime directory remains at
   `/docker-local/truenas-jbod-ui-qa-0.21.0-20260612T034656Z` for evidence only.
+
+## Real-data QA continuation update - 2026-06-12T04:58Z
+
+gcs8 identified `http://10.13.37.138:8080/` as the real-data source. The source
+is live on `0.21.0` and has `6` systems: `archive-core`, `offsite-scale`,
+`gpu-server`, `unvr`, `unvr-pro`, and `qsosn-ha`.
+
+Actions completed:
+
+- Exported the default source backup from `10.13.37.138:8082` to ignored
+  artifact
+  `artifacts/private-v0.21.0/real-data-source-10.13.37.138-8080/real-data-source-10.13.37.138-8080-20260612T041856Z.tar.zst`
+  (`49014931` bytes, SHA-256
+  `3cf6472393366e27ea9206e85e8c09627396e49954bf64b6cd6c6a17f840b3ce`).
+- The full encrypted backup including history plus sensitive transport material
+  hit the app's `Portable 7z backup operation timed out` guard, so the real-data
+  restore used a two-stage API-backed import: default config/history backup plus
+  a small encrypted sensitive-transport backup.
+- Exported/imported encrypted sensitive transport material from ignored artifact
+  `artifacts/private-v0.21.0/real-data-source-10.13.37.138-8080/real-data-source-10.13.37.138-8080-sensitive-transport-20260612T042947Z.7z`
+  (`6991` bytes, SHA-256
+  `ca24d3f927a240a62d8603fb31de0ddef481467968978d78efc47f8fc521693d`).
+  The passphrase file stays ignored/private in the same artifact directory and
+  must not be committed or printed.
+- Built a fresh disposable QA runtime at
+  `/docker-local/truenas-jbod-ui-qa-realdata-0.21.0-20260612T042014Z/repo` from
+  commit `0bd14dc`, with unique containers and ports `18080` UI, `18081`
+  history, and `18082` admin.
+- Provenance comparison now matches the source: system IDs, platform counts,
+  slot count, storage counts, and forced SAS counts all matched. Forced SAS
+  comparison matched `6` fabric-available systems, `689` links, and `17`
+  warnings. Cached release paths on the QA clone reported `686` links and `7`
+  warnings.
+- `PYTHON=.venv/bin/python PLAYWRIGHT_BASE_URL=http://10.13.37.138:18080
+  PLAYWRIGHT_ADMIN_BASE_URL=http://10.13.37.138:18082 npx playwright test`
+  passed `24` and skipped `3` expected data-dependent specs.
+- Real-data snapshot export/offline smoke passed with ignored artifact
+  `artifacts/private-v0.21.0/linux-qa-realdata-snapshot-export/linux-qa-realdata-snapshot-export-force-zip.zip`
+  (`1525602` bytes, SHA-256
+  `d5b7404f4b3511d7d35978603a3527464803cc0659f3a4e547ec56a7e648939c`);
+  extracted offline HTML opened with `6` systems, `60` tiles, and no console
+  messages.
+- Main/history real-data perf harnesses passed and updated `data/perf/latest.md`
+  plus `data/history-perf/latest.md`.
+
+Current hold:
+
+- `docs/RELEASE_WRAP_0.21.0.md` records the real-data evidence, but the Linux QA
+  restore row remains `Blocked` pending gcs8 visual acceptance at
+  `http://10.13.37.138:18080/`.
+- Do not tag/publish until gcs8 explicitly accepts this running real-data
+  candidate.
 
 Current tracked files modified before this handoff file was added:
 
@@ -415,20 +466,16 @@ Follow `docs/RELEASE_CHECKLIST.md` lines 353-406. Summary:
 
 ## Release wrap rows still blocked now
 
-As of the human QA failure update, these rows intentionally remain blocked in
-`docs/RELEASE_WRAP_0.21.0.md`:
+As of the real-data QA continuation update, these rows intentionally remain
+blocked in `docs/RELEASE_WRAP_0.21.0.md`:
 
-- Feature-specific live API/UI gates
-- Linux QA restore gate
-- Restored Linux QA perf harnesses
-- Snapshot/export/offline artifact gate
+- Linux QA restore gate (automated provenance/gates pass; awaiting gcs8 visual acceptance)
 - GHCR publish verification
 - Deployment refresh/sniff tests
 - Post-release reopen
 
-Docs/wiki/public-demo and local mechanical gates remain useful, but no
-real-data restore-dependent evidence should be treated as release-valid until
-the next candidate is restored from real long-running deployment data.
+Feature-specific live API/UI, restored Linux QA perf, and snapshot/export rows
+are back to `Pass` for the real-data clone.
 
 ## Do not redo unless source changes
 
@@ -460,8 +507,8 @@ If any code changes happen, rerun the relevant syntax/unit/browser subset plus `
 - [x] update `docs/RELEASE_WRAP_0.21.0.md` with first Linux QA evidence
 - [x] run strict pre-tag validator without `--allow-blocked` on the first attempt
 - [x] record gcs8 rejection of the sanitized/default Linux QA candidate
-- [ ] find/export a true real-data backup from a long-running deployment
-- [ ] rerun Linux QA restore on `10.13.37.138:18080/18081/18082`
+- [x] find/export a true real-data backup from a long-running deployment
+- [x] rerun Linux QA restore on `10.13.37.138:18080/18081/18082`
 - [ ] rerun strict pre-tag validator without `--allow-blocked`
 - [ ] gcs8 human QA/acceptance of the real-data Linux candidate
 - [ ] only then merge/tag/publish and verify GHCR/deployments
