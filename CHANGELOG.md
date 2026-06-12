@@ -33,6 +33,8 @@
   out of SSH targeting.
 - Made the admin-side HA node SSH helper more explicit so operators can see and
   correct the node-specific targets before relying on optional SSH enrichment.
+- Updated roadmap and wiki current-version wording for the `0.21.0` maintenance
+  release after the local docs/wiki gate found stale `0.20.1` copy.
 
 ### Fixed
 
@@ -47,6 +49,14 @@
   already-collected enrichment data remains usable and observable.
 - Hardened the public-demo browser-smoke CI path by making the Playwright
   browser channel environment-driven and disabling video capture in CI.
+- Kept opportunistic SMART prefetch aborts and automatic single-request fallback
+  failures out of the operator error console during rapid system or Storage
+  Fabric page switches; failed SMART summaries still degrade in the UI when
+  prefetch genuinely cannot complete.
+- Adjusted browser release-gate coverage to use occupied restored systems for
+  heat-map value assertions and to allow real restored ESXi/remote inventory
+  latency, avoiding false negatives from empty default views or 20-second
+  fixture-only assumptions.
 
 ## v0.20.2 - 2026-05-21
 

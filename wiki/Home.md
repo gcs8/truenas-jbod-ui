@@ -116,10 +116,11 @@ setup notes.
 
 ## Current Version
 
-`0.20.1` is the current stable release. It polishes the Storage Fabric surface
-after the first `0.20.0` SAS Fabric release: CORE keeps the deep HBA/SAS
-diagnostic path, while SCALE/Linux, Quantastor, ESXi, and BMC-backed systems
-now get clearer read-only, source-labeled maps where evidence exists.
+`0.21.0` is the current stable release. It is the maintenance and confidence
+pitstop after the Storage Fabric expansion: CORE keeps the deep HBA/SAS
+diagnostic path, SCALE/Linux, Quantastor, ESXi, and BMC-backed systems keep
+read-only source-labeled maps where evidence exists, and the release hardens
+SSH fanout, restore, browser-smoke, and release-gate evidence.
 
 The public demo from `0.19.0` remains a static GitHub Pages sample data
 experience, not a hosted copy of the live Docker app. Open

@@ -1,5 +1,10 @@
 const { test, expect } = require("@playwright/test");
 
+const SYSTEM_SETTLE_TIMEOUT_MS = Number.parseInt(
+  process.env.PLAYWRIGHT_SYSTEM_SETTLE_TIMEOUT_MS || "90000",
+  10
+);
+
 async function gotoApp(page) {
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await expect(page.locator("#system-select")).toBeVisible();
@@ -22,6 +27,16 @@ async function getSelectValues(page, selector) {
       .map((option) => option.value)
       .filter((value) => typeof value === "string" && value.length > 0)
   );
+}
+
+function orderedSystemCandidates(systems, preferred) {
+  const ordered = [];
+  for (const candidate of [...preferred, ...systems]) {
+    if (candidate && systems.includes(candidate) && !ordered.includes(candidate)) {
+      ordered.push(candidate);
+    }
+  }
+  return ordered;
 }
 
 async function latestUiPerfRun(page) {
@@ -54,7 +69,7 @@ async function waitForRefreshToSettle(page, reason, previousRunId = null) {
           );
         },
         [reason, previousRunId],
-        { timeout: 20_000 }
+        { timeout: SYSTEM_SETTLE_TIMEOUT_MS }
       );
     } catch (error) {
       // Fall back to the visible UI settled state when perf telemetry misses a run.
@@ -66,7 +81,7 @@ async function waitForSelectorScopeToSettle(page, selector, value) {
   await expect(page.locator(selector)).toHaveValue(value);
   await expect(page.locator("#slot-grid")).toBeVisible();
   await expect(page.locator("#status-text")).toHaveText(/Inventory updated\.|Ready\./, {
-    timeout: 20_000,
+    timeout: SYSTEM_SETTLE_TIMEOUT_MS,
   });
 }
 
@@ -92,7 +107,13 @@ async function switchEnclosure(page, value) {
 async function findSystemWithMultipleEnclosures(page) {
   const systems = await getSelectValues(page, "#system-select");
   const currentSystem = await page.locator("#system-select").inputValue();
-  const candidates = [currentSystem, ...systems.filter((value) => value !== currentSystem)];
+  const candidates = orderedSystemCandidates(systems, [
+    currentSystem,
+    "qsosn-ha",
+    "unvr",
+    "unvr-pro",
+    "demo-builder-lab",
+  ]);
   let fallback = null;
 
   for (const systemId of candidates) {
@@ -109,6 +130,32 @@ async function findSystemWithMultipleEnclosures(page) {
     }
   }
   return fallback;
+}
+
+async function selectSystemWithHeatmapValues(page) {
+  const systems = await getSelectValues(page, "#system-select");
+  const currentSystem = await page.locator("#system-select").inputValue();
+  const candidates = orderedSystemCandidates(systems, [
+    currentSystem,
+    "unvr",
+    "qsosn-ha",
+    "ipmi-ft-1",
+    "esxi-ft-node-2",
+    "esxi-ft-node-3",
+  ]);
+
+  for (const systemId of candidates) {
+    if ((await page.locator("#system-select").inputValue()) !== systemId) {
+      await switchSystem(page, systemId);
+    }
+    const occupiedTiles = await page
+      .locator("#slot-grid .slot-tile:not(.state-empty):not(.state-unknown)")
+      .count();
+    if (occupiedTiles > 0) {
+      return systemId;
+    }
+  }
+  return null;
 }
 
 async function fetchStorageViewsForSystem(page, systemId) {
@@ -254,6 +301,9 @@ test.describe("browser qa smoke", () => {
     });
 
     await gotoApp(page);
+    await setAutoRefresh(page, false);
+    const heatmapSystemId = await selectSystemWithHeatmapValues(page);
+    test.skip(!heatmapSystemId, "Need an occupied restored system for heatmap value coverage.");
     await page.locator("#heatmap-toggle-button").click();
     await expect(page.locator("#heatmap-toggle-button")).toHaveAttribute("aria-pressed", "true");
     await expect(page.locator("#heatmap-controls")).toBeVisible();
@@ -485,6 +535,8 @@ test.describe("browser qa smoke", () => {
   });
 
   test("enclosure switches complete without stale-scope bleed", async ({ page }) => {
+    test.setTimeout(180_000);
+
     await gotoApp(page);
     await setAutoRefresh(page, false);
 
@@ -552,7 +604,7 @@ test.describe("browser qa smoke", () => {
   });
 
   test("configured systems and enclosure views complete a release sweep cleanly", async ({ page }) => {
-    test.setTimeout(120_000);
+    test.setTimeout(300_000);
 
     await gotoApp(page);
     await setAutoRefresh(page, false);
@@ -574,7 +626,7 @@ test.describe("browser qa smoke", () => {
         await expect(page.locator("#enclosure-select")).toHaveValue(enclosureId);
         await expect(page.locator("#slot-grid")).toBeVisible();
         await expect(page.locator("#status-text")).toHaveText(/Inventory updated\.|Ready\./, {
-          timeout: 20_000,
+          timeout: SYSTEM_SETTLE_TIMEOUT_MS,
         });
       }
     }

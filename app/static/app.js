@@ -3810,6 +3810,20 @@
     });
   }
 
+  function logSmartPrefetchFailure(message, error, options = {}) {
+    const detail = error?.message || String(error);
+    const transientFetchFailure =
+      error?.name === "AbortError" ||
+      detail === "Failed to fetch" ||
+      detail === "Load failed" ||
+      detail.includes("NetworkError");
+    if (options.fallback || transientFetchFailure) {
+      console.debug(message, error);
+      return;
+    }
+    console.error(message, error);
+  }
+
   async function runSmartPrefetch(runToken, scopeKey) {
     if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
       return;
@@ -3856,7 +3870,10 @@
               }
               applySmartPrefetchPayload(chunk, payload);
             } catch (error) {
-              console.error("SMART prefetch failed", error);
+              if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
+                return;
+              }
+              logSmartPrefetchFailure("SMART prefetch failed", error);
               applySmartPrefetchError(chunk, error);
             }
             updateSmartPrefetchViews();
@@ -3877,11 +3894,17 @@
           applySmartPrefetchPayload(slots, payload);
           updateSmartPrefetchViews();
         } catch (error) {
-          console.error("SMART prefetch single-request path failed", error);
           if (SMART_PREFETCH_STRATEGY === "single") {
+            if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
+              return;
+            }
+            logSmartPrefetchFailure("SMART prefetch single-request path failed", error);
             applySmartPrefetchError(slots, error);
             updateSmartPrefetchViews();
           } else {
+            logSmartPrefetchFailure("SMART prefetch single-request path failed; retrying chunked path", error, {
+              fallback: true,
+            });
             await chunkedFetch();
           }
         }

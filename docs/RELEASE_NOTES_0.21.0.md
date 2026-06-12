@@ -37,6 +37,8 @@ visibility across CORE, SCALE, Quantastor, Linux, ESXi, and BMC/IPMI paths.
   node default-gateway discovery rather than the shared API or management VIP.
 - Polished the admin-side HA node SSH helper so operators can review and correct
   node-specific targets before relying on optional SSH enrichment.
+- Refreshed roadmap/wiki current-version wording for the `0.21.0` maintenance
+  release after the docs gate found stale `0.20.1` copy.
 
 ## Fixed
 
@@ -54,6 +56,12 @@ visibility across CORE, SCALE, Quantastor, Linux, ESXi, and BMC/IPMI paths.
   session failure, improving both runtime resilience and release evidence.
 - Public-demo browser-smoke CI no longer depends on CI video capture and can use
   a hosted browser channel when provided by the runner.
+- Rapid system or Storage Fabric page switches no longer leave opportunistic
+  SMART prefetch abort/fallback noise in the browser error console. Genuine
+  SMART prefetch misses still degrade through the slot SMART summary UI.
+- Browser release-gate coverage now selects occupied restored systems for
+  heat-map value assertions and tolerates real restored ESXi/remote inventory
+  latency instead of relying on fixture-only timing assumptions.
 
 ## Runtime Impact
 

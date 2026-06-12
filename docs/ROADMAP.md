@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.20.1`.
+This file tracks the current intended release direction after `v0.21.0`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -20,8 +20,8 @@ remaining part of the active docs set.
 
 ## Current Snapshot
 
-`v0.20.1` is a Storage Fabric polish and validation release on top of the
-`v0.20.0` SAS Fabric foundation:
+`v0.21.0` is the maintenance and confidence pitstop after the Storage Fabric
+expansion on top of the `v0.20.x` SAS/Storage Fabric foundation:
 
 - the dedicated fabric surface now presents as `Storage Fabric`
 - CORE keeps the deep SAS/HBA/expander diagnostic path
@@ -29,12 +29,12 @@ remaining part of the active docs set.
   is present
 - Quantastor, ESXi, generic Linux, and BMC/IPMI maps stay read-only and
   source-labeled instead of claiming CORE-equivalent SAS detail
-- Disk Path clickability, first-click stability, SCALE identity reuse, and
-  public-demo spare grouping are covered by the `0.20.1` validation gate
+- Disk Path clickability, first-click stability, SCALE identity reuse,
+  public-demo spare grouping, SSH fanout controls, and restore-grade release
+  evidence are covered by the `0.21.0` validation gate
 
 The next cycle should stay practical and incremental:
 
-- use `0.21.x` as a code-quality and test-confidence pitstop
 - defer richer platform-native Storage Fabric enrichment to `0.22.x`
 - keep weaker SAS/backplane/platform inferences visibly labeled instead of
   turning them into fake certainty
