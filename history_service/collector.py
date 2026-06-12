@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -56,6 +56,10 @@ EXTENDED_STATE_FIELDS = (
     "multipath_passive_controllers",
     "multipath_failed_controllers",
 )
+TOPOLOGY_FIELDS = ("pool_name", "vdev_name", "topology_label")
+TOPOLOGY_CHANGE_CONFIRMATION_COUNT = 2
+MASS_TOPOLOGY_DEGRADATION_MIN_SLOTS = 4
+MASS_TOPOLOGY_DEGRADATION_RATIO = 0.25
 
 
 @dataclass(slots=True, frozen=True)
@@ -96,6 +100,10 @@ class HistoryCollector:
         self.background_consecutive_failures: int = 0
         self.background_backoff_until: datetime | None = None
         self.next_collection_at: datetime | None = None
+        self._pending_topology_changes: dict[
+            tuple[str, str, int],
+            tuple[tuple[str | None, str | None, str | None], int],
+        ] = {}
         self._run_lock = threading.Lock()
         set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, False)
 
@@ -589,14 +597,129 @@ class HistoryCollector:
         return f"{system_label} / {enclosure_label}"
 
     def _record_slot_changes(self, slot_records: list[SlotStateRecord], observed_at: str) -> None:
+        suppressed_topology_degradations = 0
+        pending_topology_changes = 0
         for record in slot_records:
             previous = self.store.get_slot_state(record.system_id, record.enclosure_id, record.slot)
             if self._should_backfill_extended_state(previous, record):
                 self.store.upsert_slot_state(record, observed_at)
                 continue
+            record, topology_degraded, topology_pending = self._prepare_slot_record_for_history(
+                previous,
+                record,
+            )
+            if topology_degraded:
+                suppressed_topology_degradations += 1
+            if topology_pending:
+                pending_topology_changes += 1
             events = build_slot_events(previous, record, observed_at)
             self.store.insert_events(events)
             self.store.upsert_slot_state(record, observed_at)
+        if suppressed_topology_degradations:
+            if self._is_mass_topology_degradation(suppressed_topology_degradations, len(slot_records)):
+                logger.warning(
+                    "Suppressed mass topology-detail degradation for %s/%s slots; keeping last trusted topology until the source stabilizes.",
+                    suppressed_topology_degradations,
+                    len(slot_records),
+                )
+            else:
+                logger.info(
+                    "Suppressed topology-detail degradation for %s/%s slots; keeping last trusted topology.",
+                    suppressed_topology_degradations,
+                    len(slot_records),
+                )
+        if pending_topology_changes:
+            logger.info(
+                "Holding %s topology changes pending a second consecutive observation before writing durable history events.",
+                pending_topology_changes,
+            )
+
+    def _prepare_slot_record_for_history(
+        self,
+        previous: SlotStateRecord | None,
+        current: SlotStateRecord,
+    ) -> tuple[SlotStateRecord, bool, bool]:
+        if previous is None:
+            return current, False, False
+        key = self._slot_state_key(current)
+        if self._is_topology_degradation(previous, current):
+            self._pending_topology_changes.pop(key, None)
+            return self._with_previous_topology(previous, current), True, False
+        if not self._topology_changed(previous, current):
+            self._pending_topology_changes.pop(key, None)
+            return current, False, False
+        if not self._has_stable_disk_identity(previous, current):
+            self._pending_topology_changes.pop(key, None)
+            return current, False, False
+
+        signature = self._topology_signature(current)
+        pending_signature, pending_count = self._pending_topology_changes.get(key, ((None, None, None), 0))
+        pending_count = pending_count + 1 if pending_signature == signature else 1
+        if pending_count < TOPOLOGY_CHANGE_CONFIRMATION_COUNT:
+            self._pending_topology_changes[key] = (signature, pending_count)
+            return self._with_previous_topology(previous, current), False, True
+        self._pending_topology_changes.pop(key, None)
+        return current, False, False
+
+    @staticmethod
+    def _slot_state_key(record: SlotStateRecord) -> tuple[str, str, int]:
+        return (record.system_id, record.enclosure_id or "", record.slot)
+
+    @staticmethod
+    def _topology_signature(record: SlotStateRecord) -> tuple[str | None, str | None, str | None]:
+        return (record.pool_name, record.vdev_name, record.topology_label)
+
+    @staticmethod
+    def _topology_changed(previous: SlotStateRecord, current: SlotStateRecord) -> bool:
+        return any(getattr(previous, field_name) != getattr(current, field_name) for field_name in TOPOLOGY_FIELDS)
+
+    @staticmethod
+    def _topology_detail_score(record: SlotStateRecord) -> int:
+        score = 0
+        if record.pool_name:
+            score += 1
+        if record.vdev_name:
+            score += 4
+        if record.topology_label:
+            score += len([part for part in record.topology_label.split(">") if part.strip()])
+        return score
+
+    @staticmethod
+    def _has_stable_disk_identity(previous: SlotStateRecord, current: SlotStateRecord) -> bool:
+        if previous.present != current.present:
+            return False
+        for field_name in ("serial", "model", "gptid", "logical_unit_id", "disk_identity_key"):
+            if getattr(previous, field_name) != getattr(current, field_name):
+                return False
+        return True
+
+    @classmethod
+    def _is_topology_degradation(cls, previous: SlotStateRecord, current: SlotStateRecord) -> bool:
+        if not cls._topology_changed(previous, current):
+            return False
+        if not cls._has_stable_disk_identity(previous, current):
+            return False
+        if previous.pool_name != current.pool_name:
+            return False
+        return cls._topology_detail_score(current) < cls._topology_detail_score(previous)
+
+    @staticmethod
+    def _with_previous_topology(previous: SlotStateRecord, current: SlotStateRecord) -> SlotStateRecord:
+        return replace(
+            current,
+            pool_name=previous.pool_name,
+            vdev_name=previous.vdev_name,
+            topology_label=previous.topology_label,
+        )
+
+    @staticmethod
+    def _is_mass_topology_degradation(degraded_slots: int, total_slots: int) -> bool:
+        if total_slots <= 0:
+            return False
+        return (
+            degraded_slots >= MASS_TOPOLOGY_DEGRADATION_MIN_SLOTS
+            and degraded_slots / total_slots >= MASS_TOPOLOGY_DEGRADATION_RATIO
+        )
 
     @staticmethod
     def _should_backfill_extended_state(

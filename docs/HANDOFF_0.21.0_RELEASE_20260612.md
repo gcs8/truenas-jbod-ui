@@ -1,514 +1,335 @@
-# v0.21.0 Release Handoff - 2026-06-12
+# v0.21.0 Release Handoff - current as of 2026-06-12T16:59Z
 
-Status timestamp: `2026-06-12T03:35:10Z`
+This handoff is for the next Hermes/Codex session continuing the `gcs8/truenas-jbod-ui` `v0.21.0` release. It supersedes the earlier notes in this file: the first Linux QA attempts used incomplete/sanitized data and must not be treated as release evidence.
 
-This handoff is for a fresh session to continue the `gcs8/truenas-jbod-ui` `v0.21.0` release from the current release-final worktree. Treat `docs/RELEASE_CHECKLIST.md` and `docs/RELEASE_WRAP_0.21.0.md` as the source of truth; this file is a practical pickup note.
+## Non-negotiable state
 
-## Current state
+- Worktree: `/home/gcs8/workspace/truenas-jbod-ui-platform-route-registry-20260522`
+- Branch: `codex/v0.21.0-release-final-20260611`
+- Branch tip used for the fresh QA stack: `f7d3829b9c44f2d548b63519d62275584f981acc`
+- Public tag/release: **not cut**
+- Current release state: **pre-tag ready after cleanup; not yet tagged/published**
+- Active task: `tag/publish approval` — corrected full-data QA is accepted by gcs8, same-day noisy history rows were cleaned from the QA DB, and strict pre-tag validation now passes. Next mutation is tag/release only when explicitly requested.
 
-- Worktree path: `/home/gcs8/workspace/truenas-jbod-ui-platform-route-registry-20260522`
-- Active branch: `codex/v0.21.0-release-final-20260611`
-- Upstream branch: `origin/codex/v0.21.0-release-final-20260611`
-- Last committed release-prep commit: `c25a074 docs: update v0.21.0 release packet after SSH fanout merge`
-- Latest merged main work included in this branch: `6fe534b Reduce SSH fanout for inventory enrichment (#7)`
-- Public release/tag: **not cut**
-- Ship state: **not tag-ready**. A real-data Linux QA clone is now running on
-  `10.13.37.138:18080/18081/18082`, but the public tag/publish remains blocked
-  until gcs8 visually accepts that restored candidate.
+Do **not** tag or publish unless gcs8 explicitly asks to promote/tag/publish this candidate.
 
-## Continuation update - 2026-06-12T04:05Z
+## What changed in the last session
 
-- Reviewed, secret-scanned, committed, and pushed the local release-gate changes
-  as `535c61a chore: record v0.21.0 local release gates`.
-- Ran the disposable Linux QA restore gate on `10.13.37.138` using
-  `/docker-local/truenas-jbod-ui-qa-0.21.0-20260612T034656Z/repo` and ports
-  `18080` UI, `18081` history, and `18082` admin.
-- Restored the ignored Windows backup bundle through the disposable admin API,
-  verified `11` restored systems, health on all three services, remote
-  Playwright `26` passed / `1` intentional skip, feature API/UI checks,
-  snapshot export/offline smoke, and serial main/history perf harnesses after
-  waiting for the restored history collector to settle.
-- Updated `docs/RELEASE_WRAP_0.21.0.md`: Linux QA restore, restored Linux QA
-  perf, and Linux QA snapshot/export/offline evidence are now `Pass`.
-- Strict pre-tag validation now passes:
-  `.venv/bin/python scripts/validate_release_wrap.py 0.21.0 --phase pre-tag`.
-- The disposable Linux QA stack is intentionally still running and should stay
-  available until post-publish deployment sniff tests pass.
-- Do **not** tag/publish until gcs8 accepts the running candidate and the final
-  release mechanics are intentionally started.
+### Corrected the real source of truth
 
-## Human QA failure update - 2026-06-12T04:18Z
+The original real source was `10.13.37.67:8080/8081/8082`, not the partial long-running `.138` dataset.
 
-gcs8 rejected the Linux QA candidate at `10.13.37.138:18080` because the
-restored data looked sanitized/default rather than real deployment data. That
-invalidates the Linux QA restore, restored Linux QA perf, Linux QA
-snapshot/export/offline, and real-system feature validation evidence from the
-first disposable restore attempt.
+Root cause found:
 
-Corrective state:
+- Admin backup/export requests with `stop_services=true&restart_services=true` stopped `.67` UI/history.
+- Docker then killed the UI after its 30-second stop timeout while background work was still running.
+- The admin export path also builds a history snapshot in memory, so it is risky for this large history DB.
 
-- `docs/RELEASE_WRAP_0.21.0.md` has been changed back to `Blocked` for the
-  real-data restore-dependent rows.
-- Strict pre-tag validation is expected to fail again until a real long-running
-  deployment backup is restored and accepted.
-- Do not reuse `artifacts/private-v0.21.0/windows-restore-default.tar.zst` as
-  release evidence unless its provenance is re-established and gcs8 accepts the
-  restored data.
-- Next QA attempt must first prove the restored candidate contains real systems
-  and real history/config data before recording functional/perf/browser results
-  as release evidence.
-- The invalid disposable QA stack was stopped with `docker compose down`; ports
-  `18080/18081/18082` are no longer listening. The runtime directory remains at
-  `/docker-local/truenas-jbod-ui-qa-0.21.0-20260612T034656Z` for evidence only.
+Avoid this path for this release gate:
 
-## Real-data QA continuation update - 2026-06-12T04:58Z
+```text
+/api/admin/backup/export?stop_services=true&restart_services=true
+```
 
-gcs8 identified `http://10.13.37.138:8080/` as the real-data source. The source
-is live on `0.21.0` and has `6` systems: `archive-core`, `offsite-scale`,
-`gpu-server`, `unvr`, `unvr-pro`, and `qsosn-ha`.
+Use the already-staged frozen copy instead of rerunning export from `.67`.
 
-Actions completed:
+### Migrated `.67` into long-running `.138`
 
-- Exported the default source backup from `10.13.37.138:8082` to ignored
-  artifact
-  `artifacts/private-v0.21.0/real-data-source-10.13.37.138-8080/real-data-source-10.13.37.138-8080-20260612T041856Z.tar.zst`
-  (`49014931` bytes, SHA-256
-  `3cf6472393366e27ea9206e85e8c09627396e49954bf64b6cd6c6a17f840b3ce`).
-- The full encrypted backup including history plus sensitive transport material
-  hit the app's `Portable 7z backup operation timed out` guard, so the real-data
-  restore used a two-stage API-backed import: default config/history backup plus
-  a small encrypted sensitive-transport backup.
-- Exported/imported encrypted sensitive transport material from ignored artifact
-  `artifacts/private-v0.21.0/real-data-source-10.13.37.138-8080/real-data-source-10.13.37.138-8080-sensitive-transport-20260612T042947Z.7z`
-  (`6991` bytes, SHA-256
-  `ca24d3f927a240a62d8603fb31de0ddef481467968978d78efc47f8fc521693d`).
-  The passphrase file stays ignored/private in the same artifact directory and
-  must not be committed or printed.
-- Built a fresh disposable QA runtime at
-  `/docker-local/truenas-jbod-ui-qa-realdata-0.21.0-20260612T042014Z/repo` from
-  commit `0bd14dc`, with unique containers and ports `18080` UI, `18081`
-  history, and `18082` admin.
-- Provenance comparison now matches the source: system IDs, platform counts,
-  slot count, storage counts, and forced SAS counts all matched. Forced SAS
-  comparison matched `6` fabric-available systems, `689` links, and `17`
-  warnings. Cached release paths on the QA clone reported `686` links and `7`
-  warnings.
-- `PYTHON=.venv/bin/python PLAYWRIGHT_BASE_URL=http://10.13.37.138:18080
-  PLAYWRIGHT_ADMIN_BASE_URL=http://10.13.37.138:18082 npx playwright test`
-  passed `24` and skipped `3` expected data-dependent specs.
-- Real-data snapshot export/offline smoke passed with ignored artifact
-  `artifacts/private-v0.21.0/linux-qa-realdata-snapshot-export/linux-qa-realdata-snapshot-export-force-zip.zip`
-  (`1525602` bytes, SHA-256
-  `d5b7404f4b3511d7d35978603a3527464803cc0659f3a4e547ec56a7e648939c`);
-  extracted offline HTML opened with `6` systems, `60` tiles, and no console
-  messages.
-- Main/history real-data perf harnesses passed and updated `data/perf/latest.md`
-  plus `data/history-perf/latest.md`.
+A point-in-time file-level migration was completed after freezing `.67` UI/history.
 
-Current hold:
+Copied from `.67`:
 
-- `docs/RELEASE_WRAP_0.21.0.md` records the real-data evidence, but the Linux QA
-  restore row remains `Blocked` pending gcs8 visual acceptance at
-  `http://10.13.37.138:18080/`.
-- Do not tag/publish until gcs8 explicitly accepts this running real-data
-  candidate.
+- `config/`
+- `data/`
+- `history/history.db`
 
-Current tracked files modified before this handoff file was added:
+Restored into live `.138` at `/srv/truenas-jbod-ui`, then restarted `.138` UI/history/admin.
 
-- `CHANGELOG.md`
-- `app/static/app.js`
-- `docs/RELEASE_NOTES_0.21.0.md`
-- `docs/RELEASE_WRAP_0.21.0.md`
-- `docs/ROADMAP.md`
-- `qa/ui-switching.spec.js`
-- `wiki/Home.md`
+Final restored/frozen state:
 
-This handoff file itself is also a new tracked-doc candidate: `docs/HANDOFF_0.21.0_RELEASE_20260612.md`.
+- History DB SHA256: `45d222d11906f8c48a8db3c6ee467483038487240666e7f64fa43e34e45e20b1`
+- Systems: `11`
+  - `archive-core`
+  - `offsite-scale`
+  - `gpu-server`
+  - `unvr`
+  - `unvr-pro`
+  - `qsosn-ha`
+  - `demo-builder-lab`
+  - `cryostorage-esxi`
+  - `ipmi-ft-1`
+  - `esxi-ft-node-2`
+  - `esxi-ft-node-3`
+- Platform counts:
+  - `core: 1`
+  - `scale: 1`
+  - `linux: 4`
+  - `quantastor: 1`
+  - `esxi: 3`
+  - `ipmi: 1`
+- Slots: `60`
+- Storage views: `2`
+- History:
+  - tracked slots: `347`
+  - events: `19,746`
+  - metric samples: `1,372,353`
+  - history scopes: `23`
+
+After restore:
+
+- Long-running `.138` is healthy on `8080/8081/8082`.
+- `.67` TrueNAS JBOD UI stack was stopped completely; `8080/8081/8082` on `.67` were closed.
+
+At `2026-06-12T11:49Z`, quick health showed:
+
+- `http://10.13.37.138:8080/livez`: `status=ok`, `version=0.21.0`
+- `http://10.13.37.138:8081/healthz`: `status=ok`, `collection_running=false`, `last_error=null`
+- `http://10.13.37.138:8082/healthz`: `status=ok`
+
+The long-running source may continue collecting history. Treat the frozen QA seed below as the release QA baseline.
+
+### Created fresh full-data disposable QA stack
+
+Fresh QA stack was built from the release branch and seeded from the frozen `.67` payload staged on `.138`.
+
+- Host: `10.13.37.138`
+- Runtime: `/docker-local/truenas-jbod-ui-qa-release-0.21.0-20260612T111913Z/repo`
+- Compose project: `truenas_jbod_ui_qa_release_0210`
+- Containers:
+  - `truenas-jbod-ui-qa-release-0210`
+  - `truenas-jbod-history-qa-release-0210`
+  - `truenas-jbod-admin-qa-release-0210`
+- Ports:
+  - UI: `http://10.13.37.138:18080/`
+  - History: `http://10.13.37.138:18081/`
+  - Admin: `http://10.13.37.138:18082/`
+
+At `2026-06-12T11:27Z`, QA health showed:
+
+- `http://10.13.37.138:18080/livez`: `status=ok`, `version=0.21.0`
+- `http://10.13.37.138:18081/healthz`: `status=ok`, `collection_running=false`, `last_error=null`
+- `http://10.13.37.138:18082/healthz`: `status=ok`
+
+The QA stack was seeded with this exact frozen state:
+
+- History DB SHA256: `45d222d11906f8c48a8db3c6ee467483038487240666e7f64fa43e34e45e20b1`
+- tracked slots: `347`
+- events: `19,746`
+- metric samples: `1,372,353`
+- systems/platforms/slots/storage/history scopes matched the restored `.138` source at the time of seeding.
+
+## Release wrap refreshed after corrected QA rerun
+
+`docs/RELEASE_WRAP_0.21.0.md` now records the corrected 11-system full-data QA evidence and no longer uses the old 6-system `.138`/`0bd14dc` runtime as release evidence.
+
+Rows refreshed in this continuation:
+
+- `Full Playwright/browser gates`
+- `Feature-specific live API/UI gates`
+- `Linux QA restore gate`
+- `Restored Linux QA perf harnesses`
+- `Snapshot/export/offline artifact gate`
+
+Validation state as of `2026-06-12T16:50Z`:
+
+- `.venv/bin/python scripts/validate_release_wrap.py 0.21.0 --phase pre-tag --allow-blocked` passed earlier: `docs/RELEASE_WRAP_0.21.0.md checklist evidence is complete.`
+- After gcs8 visual acceptance and QA DB noise cleanup, `.venv/bin/python scripts/validate_release_wrap.py 0.21.0 --phase pre-tag` passed without `--allow-blocked`: `docs/RELEASE_WRAP_0.21.0.md checklist evidence is complete.`
+
+## QA stack hotfix refresh after Quantastor SSH-warning fan-out
+
+At `2026-06-12T15:05Z`, the existing full-data QA stack at `10.13.37.138:18080/18081/18082` was updated in place from the current dirty worktree to include the Quantastor optional-SSH warning collapse and the history-noise fixes.
+
+Runtime path stayed the same:
+
+- `/docker-local/truenas-jbod-ui-qa-release-0.21.0-20260612T111913Z/repo`
+
+Rollback bundles/artifacts for overwritten files and DB cleanup on `.138`:
+
+- first hotfix refresh: `/docker-local/truenas-jbod-ui-qa-release-0.21.0-20260612T111913Z/rollback-pre-hotfix-20260612T145745Z`
+- follow-up warning-collapse tweak: `/docker-local/truenas-jbod-ui-qa-release-0.21.0-20260612T111913Z/rollback-pre-warning-collapse-20260612T151257Z`
+- Quantastor `Visible On` cluster-scope tweak: `/docker-local/truenas-jbod-ui-qa-release-0.21.0-20260612T111913Z/rollback-pre-visible-on-scope-20260612T153228Z`
+- pre-cleanup QA history DB backup: `/docker-local/truenas-jbod-ui-qa-release-0.21.0-20260612T111913Z/repo/history/manual-cleanup-backups/history-pre-noise-cleanup-20260612T164034Z.sqlite3`
+- QA cleanup manifest with deleted row IDs: `/docker-local/truenas-jbod-ui-qa-release-0.21.0-20260612T111913Z/repo/history/manual-cleanup-backups/history-noise-cleanup-20260612T164034Z.json`
+- long-running source stack hotfix rollback: `/srv/truenas-jbod-ui/migrations/rollback-pre-source-hotfix-cleanup-20260612T165436Z`
+- pre-cleanup source history DB backup: `/srv/truenas-jbod-ui/history/manual-cleanup-backups/source-history-pre-noise-cleanup-20260612T165534Z.sqlite3`
+- source cleanup manifest with deleted row IDs: `/srv/truenas-jbod-ui/history/manual-cleanup-backups/source-history-noise-cleanup-20260612T165534Z.json`
+
+Deployment notes:
+
+- Copied the current local versions of:
+  - `app/services/inventory.py`
+  - `history_service/collector.py`
+  - `history_service/domain.py`
+  - `tests/test_inventory.py`
+  - `tests/test_history_service.py`
+  - this handoff and `docs/RELEASE_WRAP_0.21.0.md`
+- Rebuilt `enclosure-ui`, `enclosure-history`, and `enclosure-admin` from `docker-compose.dev.yml` + `docker-compose.qa.yml`.
+- Recreated only the QA containers using `COMPOSE_PROJECT_NAME=truenas_jbod_ui_qa_release_0210` and explicit QA port variables: `APP_PORT=18080`, `HISTORY_PORT=18081`, `ADMIN_PORT=18082`, `HISTORY_BIND_ADDRESS=0.0.0.0`, `ADMIN_BIND_ADDRESS=0.0.0.0`.
+- Do not omit those port variables on future `docker compose up` calls; the base compose file otherwise attempts to bind the long-running `8080/8081/8082` ports.
+
+Post-refresh verification:
+
+- `http://10.13.37.138:18080/livez`: `status=ok`, `version=0.21.0`
+- `http://10.13.37.138:18081/healthz`: `status=ok`, `collection_running=false`, `last_error=null`
+- `http://10.13.37.138:18082/healthz`: `status=ok`
+- Running UI container confirmed the new `InventoryService._optional_ssh_transport_failure_detail`, `_run_optional_ssh_command`, and `_collapse_quantastor_optional_ssh_backoff_warnings` helpers are present.
+- The Quantastor `Visible On` path now scopes presence hints to the selected HA cluster's node IDs so remote QuantaStor systems returned by the same API do not appear as local/shared disk visibility.
+- Focused Playwright smoke against the refreshed stack passed:
+  - `page loads and exposes the main switching chrome`
+  - `configured systems and enclosure views complete a release sweep cleanly`
+- After the follow-up warning-collapse tweak, fresh forced `qsosn-ha` inventory returned only the HA context warning: `Quantastor HA detected. Cluster master is QSOSN-Left.` No optional SSH CLI/SES backoff warnings were user-visible in that run.
+- After the `Visible On` tweak, fresh forced `qsosn-ha` inventory had no `QS-CryoStorage` entries in any `visible_on_labels`; slot 0 reported `QSOSN-Left, QSOSN-Right` only.
+- QA history cleanup deleted same-day noise rows from `slot_events` only: `1,341` `slot_identity_changed` rows plus `564` `slot_topology_changed` rows observed on `2026-06-12`, total `1,905` rows. The `slot_state_changed` rows were preserved.
+- Exact QA history counts after cleanup and one fast refresh: `347` tracked slots, `17,841` events, `1,372,400` metric samples, `23` scopes; no `slot_identity_changed`/`slot_topology_changed` rows remain for `2026-06-12`, and no new ones were introduced after the fast refresh.
+- Long-running source `10.13.37.138:8080/8081/8082` was also refreshed with the same hotfix code because it was still running pre-fix inventory/history helpers. Post-refresh markers showed Quantastor warning collapse, `Visible On` cluster scoping, and history topology confirmation helpers present.
+- Source history cleanup deleted same-day noise rows from `/srv/truenas-jbod-ui/history/history.db`: `1,850` `slot_identity_changed` rows plus `572` `slot_topology_changed` rows observed on `2026-06-12`, total `2,422` rows. It preserved `946` same-day `slot_state_changed` rows.
+- Exact source history counts after cleanup and one fast refresh: `347` tracked slots, `18,109` events, `1,379,449` metric samples, `23` scopes; no `slot_identity_changed`/`slot_topology_changed` rows remain for `2026-06-12`, and no new ones were introduced after the fast refresh.
+
+This hotfix refresh and cleanup are the final accepted pre-tag QA candidate. Do not publish a GitHub release/GHCR without post-tag release verification, but `v0.21.0` may be tagged from the verified commit.
+
+## Private artifacts / rollback paths
+
+Do not commit or print contents from these paths.
+
+Local ignored artifacts:
+
+- `artifacts/private-v0.21.0/migrate-67-to-138/final-freeze-20260612T111257Z`
+- `artifacts/private-v0.21.0/migrate-67-to-138/latest-final-stage.txt`
+
+Remote `.138` staging/rollback:
+
+- frozen source staging: `/srv/truenas-jbod-ui/migrations/67-to-138-final-freeze-20260612T111257Z/source`
+- rollback of previous `.138` state: `/srv/truenas-jbod-ui/migrations/rollback-pre-67-restore-20260612T110819Z`
+
+The rollback is there if the `.67 → .138` replacement must be undone. Do not use it unless gcs8 explicitly asks or `.138` is proven bad.
 
 ## Safety boundaries
 
-- Do **not** push a release tag until `scripts/validate_release_wrap.py 0.21.0 --phase pre-tag` passes **without** `--allow-blocked`.
-- Do **not** commit ignored/private artifacts under `artifacts/`, `config/`, `data/`, `history/`, `logs/`, or SSH/credential material.
-- Do **not** keep raw admin backup import/export responses as public evidence. They can echo configured systems and secret-bearing fields. Keep scrubbed summaries only.
-- Linux QA restore must use a disposable stack on non-default ports `18080` / `18081` / `18082`; do not disturb long-running Windows/Linux deployments.
-- Admin sidecar may need temporary remote binding for QA; do not leave it public-facing or long-running after validation.
-- If live validation needs SSH keys/known-hosts/trust material, copy only into the isolated QA runtime directory. Never bind-mount a long-running deployment's config directories into the disposable stack.
+- Do not tag/publish unless gcs8 explicitly asks to promote/tag/publish this accepted candidate; strict pre-tag validation has passed.
+- Do not commit `artifacts/`, `config/`, `data/`, `history/`, `logs/`, `.env`, SSH keys, TLS material, known-hosts, passphrase files, or raw admin import/export responses.
+- Do not run raw `docker compose config` or otherwise dump compose/env output into transcript/docs; one raw compose dump previously exposed secret env values in tool output. Avoid repeating that.
+- Do not rerun risky admin export with `stop_services=true` against long-running/live stacks.
+- Keep the disposable QA stack isolated on `18080/18081/18082`; do not disturb long-running `.138` on `8080/8081/8082` except for read-only checks.
+- The QA history collector is healthy after one fast refresh; check `collection_running=false` before perf gates.
+- Do not tear down the QA stack until post-publish deployment sniff tests are complete, unless gcs8 asks to stop it.
 
-## Local gates already completed
-
-The local gates were rerun on the rebuilt release-candidate image after final local fixes. `docs/RELEASE_WRAP_0.21.0.md` rows 47-58 have been updated with evidence.
-
-### Source / syntax / unit
-
-Passed:
-
-```bash
-.venv/bin/python -m compileall -q app admin_service history_service scripts tests
-.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -q
-node --check app/static/app.js
-node --check app/static/sas_fabric_view.js
-node --check admin_service/static/admin.js
-node --check qa/public-demo.spec.js
-node --check qa/ui-switching.spec.js
-git diff --check
-```
-
-Evidence summary:
-
-- Python unit discovery: `503` tests passed, `4` skipped.
-- JS syntax checks passed.
-- Diff whitespace check passed.
-
-### Docker / health / optional sidecars
-
-Passed on local rebuilt stack from `docker-compose.dev.yml`:
-
-```bash
-docker compose -f docker-compose.dev.yml --profile history --profile admin up -d --build
-```
-
-Evidence summary:
-
-- UI `/livez` and `/healthz` on `8080`: `status=ok`, version `0.21.0`.
-- History `/livez` and `/healthz` on `8081`: `status=ok`, version `0.21.0`.
-- Admin `/livez` and `/healthz` on `8082`: `status=ok`, version `0.21.0`.
-- UI-only, UI+history, UI+admin, and full-stack optional-sidecar matrix all passed.
-
-### Browser / Playwright
-
-Passed against local restored stack:
-
-```bash
-PYTHON=.venv/bin/python \
-PLAYWRIGHT_BASE_URL=http://127.0.0.1:8080 \
-PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 \
-npx playwright test
-```
-
-Evidence summary:
-
-- `26` passed.
-- `1` skipped: intentionally skipped perf-only auto-refresh test.
-- `qa/public-demo.spec.js` passed as part of the full run.
-
-### Feature-specific local API/UI checks
-
-Passed against the restored local full stack, covering:
-
-- CORE
-- SCALE
-- GPU/Linux
-- UniFi UNVR
-- UniFi UNVR Pro
-- Quantastor HA
-- ESXi
-- BMC/IPMI
-
-API/browser surfaces checked:
-
-- `/api/inventory`
-- `/api/storage-views`
-- `/api/sas-fabric`
-- dedicated `/sas-fabric` pages
-- first-click slot selection
-- horizontal overflow
-- admin ESXi/runtime surfaces
-- browser console errors/warnings
-
-Final browser console/layout probe passed with no `error`/`warning` console messages. It recorded `3` SMART fallback debug messages, which are expected after the local fix below.
-
-### Local issue found and fixed
-
-During release-facing browser probing, rapid system/page switches exposed noisy opportunistic SMART prefetch failures:
-
-- symptom: `SMART prefetch single-request path failed TypeError: Failed to fetch` appeared as browser `console.error`
-- fix: `app/static/app.js` now routes transient abort/fallback SMART prefetch failures to `console.debug`, while genuine SMART prefetch failures still degrade through slot SMART summary UI state
-- validation: rebuilt image, reran console/layout probe, and reran full source/browser gates
-
-`qa/ui-switching.spec.js` was also adjusted so restored-data browser coverage:
-
-- selects occupied restored systems for heat-map value assertions
-- allows real restored ESXi/remote inventory latency rather than fixture-only timeout assumptions
-
-### Snapshot/export/offline local gate
-
-Passed against local restored stack:
-
-- export estimate: Auto -> HTML allowed; HTML `3.5 MiB`; ZIP `948.1 KiB`
-- forced ZIP artifact: `artifacts/private-v0.21.0/local-snapshot-export-force-zip.zip`
-- forced ZIP size: `970822` bytes
-- forced ZIP SHA-256: `3067e0e04d91a6b729c88accf4f6658f38bea8ccf2ec925a3b09441ba8f5a8be`
-- extracted offline HTML opened in Playwright with `11` systems, `60` tiles, and no console messages
-
-### Local perf harnesses
-
-Passed on final rebuilt stack:
-
-```bash
-.venv/bin/python scripts/run_perf_harness.py \
-  --base-url http://127.0.0.1:8080 \
-  --iterations 3 \
-  --format markdown \
-  --label release-candidate
-
-.venv/bin/python scripts/run_history_perf_harness.py \
-  --base-url http://127.0.0.1:8081 \
-  --iterations 3 \
-  --format markdown \
-  --label release-candidate-history
-```
-
-Evidence summary:
-
-- Main latest artifact: `data/perf/latest.md`
-  - `inventory_cached` avg `3.8 ms`
-  - `inventory_force` avg `21569.8 ms`
-- History latest artifact: `data/history-perf/latest.md`
-  - `overview_estimated` avg `3.7 ms`
-  - DB `989.4 MiB`
-  - metric samples `1,362,917`
-
-### Docs/wiki/public-demo local gate
-
-Passed:
-
-- `CHANGELOG.md`, `docs/RELEASE_NOTES_0.21.0.md`, `docs/ROADMAP.md`, and `wiki/Home.md` updated for PR #7 plus local-gate hardening/current-version wording.
-- stale current-version scan found no `0.21.0-dev` or old-current wording in README, roadmap, public-demo README, or wiki home.
-- checked-in public-demo artifact passed:
-
-```bash
-.venv/bin/python scripts/check_public_demo_artifact.py public-demo
-```
-
-Evidence summary:
-
-- `public-demo/index.html`: `7178450` bytes
-
-## Private restore bundle currently available locally
-
-Ignored/private local artifact:
-
-- `artifacts/private-v0.21.0/windows-restore-default.tar.zst`
-- source: Windows admin API export from the running Windows Codex stack, used only as restore-grade data evidence
-- size: `34,089,681` bytes
-- SHA-256: `0a6980f2e6da37fbe8763dd5a3cce744f234fae89d35bd4620dfffb6826aeb25`
-
-Do not commit this bundle. Copy it only to the disposable Linux QA target if reusing it for the restore gate. Re-export through the admin API if you suspect it has gone stale.
-
-## Immediate next steps for the new session
-
-### 1. Rehydrate repo state and validate blocked-wrap shape
+## Immediate pickup commands
 
 ```bash
 cd /home/gcs8/workspace/truenas-jbod-ui-platform-route-registry-20260522
 git status --short --branch
 git diff --stat
-.venv/bin/python scripts/validate_release_wrap.py 0.21.0 --phase pre-tag --allow-blocked
 ```
 
-Expected: validator should pass only with `--allow-blocked` while Linux QA and post-publish rows remain blocked. If it fails, fix the wrap shape before doing Linux QA.
-
-### 2. Review and commit the current local-gate changes
-
-Do a real diff review first:
+Confirm source and QA are still up:
 
 ```bash
-git diff -- CHANGELOG.md app/static/app.js docs/RELEASE_NOTES_0.21.0.md docs/RELEASE_WRAP_0.21.0.md docs/ROADMAP.md qa/ui-switching.spec.js wiki/Home.md docs/HANDOFF_0.21.0_RELEASE_20260612.md
+python - <<'PY'
+import json, urllib.request
+out = {}
+for base in [
+    '10.13.37.138:8080', '10.13.37.138:8081', '10.13.37.138:8082',
+    '10.13.37.138:18080', '10.13.37.138:18081', '10.13.37.138:18082',
+]:
+    path = '/livez' if base.endswith(('8080', '18080')) else '/healthz'
+    url = 'http://' + base + path
+    try:
+        with urllib.request.urlopen(url, timeout=8) as r:
+            data = json.load(r)
+        out[url] = {k: data.get(k) for k in ['status', 'version', 'last_error', 'collection_running'] if k in data}
+    except Exception as exc:
+        out[url] = {'error': type(exc).__name__ + ': ' + str(exc)[:160]}
+print(json.dumps(out, sort_keys=True, indent=2))
+PY
 ```
 
-Suggested commit after review:
+Confirm QA provenance before spending time on gates:
 
 ```bash
-git add CHANGELOG.md app/static/app.js docs/RELEASE_NOTES_0.21.0.md docs/RELEASE_WRAP_0.21.0.md docs/ROADMAP.md qa/ui-switching.spec.js wiki/Home.md docs/HANDOFF_0.21.0_RELEASE_20260612.md
-git commit -m "chore: record v0.21.0 local release gates"
-git push origin codex/v0.21.0-release-final-20260611
+python - <<'PY'
+import collections, json, urllib.request
+for label, ui, hist in [
+    ('source', 'http://10.13.37.138:8080', 'http://10.13.37.138:8081'),
+    ('qa', 'http://10.13.37.138:18080', 'http://10.13.37.138:18081'),
+]:
+    with urllib.request.urlopen(ui + '/api/inventory', timeout=90) as r:
+        inv = json.load(r)
+    with urllib.request.urlopen(ui + '/api/storage-views', timeout=90) as r:
+        storage = json.load(r)
+    with urllib.request.urlopen(hist + '/api/history/overview?exact_counts=true', timeout=90) as r:
+        overview = json.load(r)
+    systems = inv.get('systems') or []
+    print(json.dumps({
+        'label': label,
+        'default': inv.get('selected_system_id'),
+        'system_ids': [s.get('id') for s in systems],
+        'platform_counts': dict(sorted(collections.Counter(s.get('platform') or 'unknown' for s in systems).items())),
+        'slot_count': len(inv.get('slots') or []),
+        'storage_views': len(storage.get('views') or storage.get('storage_views') or []),
+        'history_counts': overview.get('counts'),
+        'history_scope_count': len(overview.get('scopes') or []),
+        'collector': {k: (overview.get('collector') or {}).get(k) for k in ['collection_running', 'collection_kind', 'last_error']},
+    }, sort_keys=True))
+PY
 ```
 
-Commit before Linux QA unless there is a reason to run QA from a local uncommitted rsync. A pushed branch makes the disposable target reproducible.
+Expected QA baseline:
 
-### 3. Run disposable Linux QA restore gate
+- 11 systems
+- platform counts `core=1`, `scale=1`, `linux=4`, `quantastor=1`, `esxi=3`, `ipmi=1`
+- 60 slots
+- 2 storage views
+- history counts: tracked slots `347`, events `19746`, metric samples `1372353`
+- 23 history scopes
+- QA collector `collection_running=false`
 
-Target from prior release process:
+## Corrected QA gates rerun from this stack
 
-- host: `codex-dev-test-target` / `10.13.37.138`
-- required ports: `18080` UI, `18081` history, `18082` admin
-- use an isolated runtime such as `/docker-local/truenas-jbod-ui-qa-0.21.0-<UTC>`
+Completed against `10.13.37.138:18080/18081/18082` and recorded in `docs/RELEASE_WRAP_0.21.0.md`:
 
-Checklist source: `docs/RELEASE_CHECKLIST.md` lines 158-222.
+- Full Playwright/browser gate: `27`/`27` passed against `18080/18082`.
+- Feature/API/browser gate: `11` systems, `60` slots, `2` storage views, cached SAS fabric `799` links / `13` warnings, forced SAS fabric `799` links / `22` warnings, representative CORE/SCALE/Linux/Quantastor/ESXi/IPMI-BMC browser pages clean with no horizontal overflow and no browser error/warning console messages.
+- Snapshot/export/offline gate: artifact `artifacts/private-v0.21.0/linux-qa-fullsource-snapshot-export/linux-qa-fullsource-snapshot-export-20260612T114504Z.zip`, size `1,146,288`, SHA-256 `f62eac9d8b6fb3010b76c63b8718fc025f34d0595c49177a771412263516fefd`; offline HTML opened with `11` system options, `60` tiles, `2` storage-view options, `2` live-enclosure options, clean console, no horizontal overflow.
+- Restored Linux QA perf gates: `data/perf/latest.md` label `release-candidate-linux-qa-fullsource`; `data/history-perf/latest.md` label `release-candidate-history-linux-qa-fullsource`; collector was `collection_running=false` before the perf run.
+- Release wrap validation with `--allow-blocked` passed; strict pre-tag validation is still blocked only by the intentionally blocked `Linux QA restore gate` pending gcs8 acceptance.
 
-High-level procedure:
+Do not tag until gcs8 accepts the full-data candidate and strict pre-tag validation passes.
 
-1. On the QA target, create a fresh disposable runtime directory.
-2. Clone or fetch the pushed release branch into that directory.
-3. Create a QA-only compose override because `docker-compose.dev.yml` has fixed `container_name` values. Avoid collisions with long-running containers.
-4. Set non-default ports and temporary bind addresses.
-5. Build and start the full stack from current release-candidate source.
-6. Import the restore-grade bundle through the disposable admin API.
-7. Summarize restored counts/status only; do not retain raw import response as evidence.
-8. Run health, browser, feature-specific, snapshot/offline, and perf gates against `18080`/`18081`/`18082`.
-9. Update `docs/RELEASE_WRAP_0.21.0.md` rows for Linux QA restore and restored Linux QA perf.
-10. Keep the disposable QA stack available until post-publish deployment sniff tests pass.
+## Publish sequence after strict pre-tag pass only
 
-Suggested QA compose override shape, written inside the disposable QA checkout as `docker-compose.qa.yml`:
+Follow `docs/RELEASE_CHECKLIST.md`. High-level order:
 
-```yaml
-services:
-  enclosure-ui:
-    container_name: truenas-jbod-ui-qa-0210
-  enclosure-history:
-    container_name: truenas-jbod-history-qa-0210
-  enclosure-admin:
-    container_name: truenas-jbod-admin-qa-0210
-    environment:
-      ADMIN_CONTAINER_UI_NAME: truenas-jbod-ui-qa-0210
-      ADMIN_CONTAINER_HISTORY_NAME: truenas-jbod-history-qa-0210
-      ADMIN_CONTAINER_ADMIN_NAME: truenas-jbod-admin-qa-0210
-```
-
-Suggested env for the disposable QA stack:
-
-```bash
-export APP_PORT=18080
-export HISTORY_PORT=18081
-export ADMIN_PORT=18082
-export HISTORY_BIND_ADDRESS=0.0.0.0
-export ADMIN_BIND_ADDRESS=0.0.0.0
-export ADMIN_AUTO_STOP_SECONDS=3600
-```
-
-Suggested start command on the QA target:
-
-```bash
-docker compose -f docker-compose.dev.yml -f docker-compose.qa.yml --profile history --profile admin up -d --build
-```
-
-Suggested health checks from the QA target:
-
-```bash
-curl -fsS http://127.0.0.1:18080/livez
-curl -fsS http://127.0.0.1:18080/healthz
-curl -fsS http://127.0.0.1:18081/livez
-curl -fsS http://127.0.0.1:18081/healthz
-curl -fsS http://127.0.0.1:18082/livez
-curl -fsS http://127.0.0.1:18082/healthz
-```
-
-Suggested restore import endpoint on the QA target:
-
-```bash
-curl -fsS \
-  -X POST \
-  -H 'Content-Type: application/octet-stream' \
-  --data-binary @/path/to/windows-restore-default.tar.zst \
-  'http://127.0.0.1:18082/api/admin/backup/import?stop_services=true&restart_services=true'
-```
-
-Do not paste the raw response into docs. Parse/summarize only safe counts, e.g. systems, profiles, storage views, history scopes, and service health.
-
-Suggested browser gate from the local release checkout, targeting the QA host:
-
-```bash
-PYTHON=.venv/bin/python \
-PLAYWRIGHT_BASE_URL=http://10.13.37.138:18080 \
-PLAYWRIGHT_ADMIN_BASE_URL=http://10.13.37.138:18082 \
-npx playwright test
-```
-
-Before perf, wait for history collection to settle. Check `http://10.13.37.138:18081/healthz`; do not run perf while `collection_running=true`. Do not run main/history perf in parallel.
-
-Suggested restored Linux QA perf commands:
-
-```bash
-.venv/bin/python scripts/run_perf_harness.py \
-  --base-url http://10.13.37.138:18080 \
-  --iterations 3 \
-  --format markdown \
-  --label release-candidate-linux-qa-restore
-
-.venv/bin/python scripts/run_history_perf_harness.py \
-  --base-url http://10.13.37.138:18081 \
-  --iterations 3 \
-  --format markdown \
-  --label release-candidate-history-linux-qa-restore
-```
-
-Also run restored Linux snapshot export estimate/download/offline smoke equivalent to the local one, but save evidence under a versioned ignored artifact folder and record only safe summary/hash in the release wrap.
-
-### 4. Strict pre-tag validation
-
-After Linux QA rows are updated and all pre-publish blocked rows are cleared:
-
-```bash
-.venv/bin/python scripts/validate_release_wrap.py 0.21.0 --phase pre-tag
-```
-
-Expected: pass without `--allow-blocked`. If it does not pass, do not tag.
-
-### 5. Publish sequence only after strict pre-tag pass
-
-Follow `docs/RELEASE_CHECKLIST.md` lines 353-406. Summary:
-
-1. Inspect final status/log.
-2. Commit final release-prep evidence if needed.
-3. Merge the release branch into `main` locally with a release commit.
-4. Tag the merged `main` commit, not the side-branch tip.
+1. Review final `git status`, `git diff`, and release wrap.
+2. Commit corrected release evidence/docs.
+3. Merge release branch into `main` with the intended release commit.
+4. Tag the merged `main` commit as `v0.21.0`.
 5. Push `main` and the annotated tag.
-6. Publish GitHub release notes from the final changelog section.
-7. Wait for the GHCR publish workflow.
+6. Publish GitHub release notes from final release notes/changelog.
+7. Wait for GHCR publish workflow.
 8. Verify GHCR tags/digest:
    - `ghcr.io/gcs8/truenas-jbod-ui:v0.21.0`
    - `ghcr.io/gcs8/truenas-jbod-ui:0.21.0`
    - `ghcr.io/gcs8/truenas-jbod-ui:latest`
-9. Update local Windows, Linux, and production deployments cleanly.
-10. Record health/version/UI sniff tests for each deployment.
-11. Only after post-publish sniff passes, tear down the temporary Linux QA stack.
-12. Reopen next development (`Unreleased`, next dev version/branch), then update `HANDOFF.md`/`TODO.md` if appropriate.
+9. Refresh/sniff local, Linux, and production deployments.
+10. Record post-publish evidence.
+11. Only after post-publish sniff passes, tear down the temporary QA stack.
+12. Reopen next development and run the final release-wrap validator.
 
-## Release wrap rows still blocked now
+## Known pitfalls from this run
 
-As of the real-data QA continuation update, these rows intentionally remain
-blocked in `docs/RELEASE_WRAP_0.21.0.md`:
+- The previous 6-system `.138` evidence is invalid for final release because `.67` had the fuller real deployment data.
+- Admin backup/export with `stop_services=true` can stop/kill UI/history on busy stacks; do not use it casually.
+- Raw compose/config/environment dumps may expose secrets; do not print or commit them.
+- The base dev compose has fixed `container_name` values; disposable QA must use an override with unique container names.
+- History collection can mutate counts after startup. Use frozen QA baseline counts for release evidence and wait for `collection_running=false` before perf.
+- Restored ESXi/remote paths may be slower than fixture-only browser assumptions. Do not reduce timeouts based on fixture expectations.
+- SMART prefetch abort/fallback noise was demoted to debug in `app/static/app.js`; verify genuine degradation still surfaces through UI state, not browser console spam.
 
-- Linux QA restore gate (automated provenance/gates pass; awaiting gcs8 visual acceptance)
-- GHCR publish verification
-- Deployment refresh/sniff tests
-- Post-release reopen
+## Minimal next-session checklist
 
-Feature-specific live API/UI, restored Linux QA perf, and snapshot/export rows
-are back to `Pass` for the real-data clone.
-
-## Do not redo unless source changes
-
-Do not spend time rerunning all local gates unless one of these files changes again:
-
-- `app/static/app.js`
-- `qa/ui-switching.spec.js`
-- release docs/wrap files that need validator coverage
-- Docker/runtime config files
-- code touched during Linux QA fixes
-
-If any code changes happen, rerun the relevant syntax/unit/browser subset plus `git diff --check`, then update the release wrap.
-
-## Known pitfalls from this release run
-
-- Windows Codex checkout was useful as a restore data source only. Its code/docs were stale/dirty; do not merge code from it.
-- Restored ESXi paths can take around a minute to settle. The browser suite now allows that; avoid reverting to fixture-only `20s` assumptions.
-- Heat-map value assertions must target occupied restored systems, not default empty/unknown systems.
-- SMART prefetch single-request failures during rapid navigation may be expected fallback/abort noise; the current code demotes those to debug. Do not hide real UI degradation; verify slot SMART summary state still degrades when prefetch truly fails.
-- After restore, history sidecar may perform forced collection. Wait for `collection_running=false` before perf.
-- The base dev compose uses fixed `container_name`; use a QA override with unique names on shared targets.
-
-## Minimal pickup checklist
-
-- [x] `git status --short --branch`
-- [x] `scripts/validate_release_wrap.py 0.21.0 --phase pre-tag --allow-blocked`
-- [x] review/commit/push current local-gate changes
-- [x] run Linux QA restore on `10.13.37.138:18080/18081/18082`
-- [x] update `docs/RELEASE_WRAP_0.21.0.md` with first Linux QA evidence
-- [x] run strict pre-tag validator without `--allow-blocked` on the first attempt
-- [x] record gcs8 rejection of the sanitized/default Linux QA candidate
-- [x] find/export a true real-data backup from a long-running deployment
-- [x] rerun Linux QA restore on `10.13.37.138:18080/18081/18082`
-- [ ] rerun strict pre-tag validator without `--allow-blocked`
-- [ ] gcs8 human QA/acceptance of the real-data Linux candidate
-- [ ] only then merge/tag/publish and verify GHCR/deployments
+- [ ] Confirm this handoff is the current one.
+- [ ] Confirm `.138` source and QA health.
+- [ ] Confirm QA provenance still shows the 11-system full-data baseline.
+- [ ] Have gcs8 visually accept or reject the corrected full-data candidate at `http://10.13.37.138:18080/`.
+- [ ] If accepted, change the `Linux QA restore gate` row in `docs/RELEASE_WRAP_0.21.0.md` from `Blocked` to `Pass` and rerun `.venv/bin/python scripts/validate_release_wrap.py 0.21.0 --phase pre-tag`.
+- [ ] Only if strict pre-tag passes, proceed with commit/merge/tag/GitHub release/GHCR/deployment sniff/reopen.

@@ -113,6 +113,11 @@ SERIAL_LUNID_IDENTIFIER_REGEX = re.compile(r"^\{\$?serial_lunid\}\$?(?P<identifi
 SCALE_CONFIGURED_SG_SES_FAILURE_REGEX = re.compile(
     r"^SSH command failed: .*\bsg_ses\b\s+-p\s+(?:aes|ec)\s+/dev/sg\d+\s+\(exit\s+\d+\)$"
 )
+QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
+    r"^Quantastor SSH (?:CLI enrichment|SES discovery) failed on (?P<host>[^:]+): "
+    r"Skipping optional SSH command batch after a recent connection startup failure; "
+    r"retry after (?P<retry_at>\S+)"
+)
 UNIFI_GPIO_LED_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
@@ -2036,7 +2041,7 @@ class InventoryService:
             raw_data=raw_data,
             ssh_outputs=ssh_outputs,
             ssh_collected=ssh_collected,
-            warnings=warnings,
+            warnings=self._collapse_quantastor_optional_ssh_backoff_warnings(warnings),
             ssh_failure_details=ssh_failure_details,
             sources=sources,
             scale_ses_data=scale_ses_data,
@@ -5012,6 +5017,14 @@ class InventoryService:
                 )
                 if system_id
             ],
+            "cluster_node_ids": [
+                system_id
+                for system_id in (
+                    normalize_text(str(row.get("id")) if row.get("id") is not None else None)
+                    for row in node_rows
+                )
+                if system_id
+            ],
             "peer_labels": peer_labels,
             "master_system_id": master_id,
             "master_label": system_labels.get(master_id) or master_id,
@@ -5040,7 +5053,11 @@ class InventoryService:
             )
         return labels
 
-    def _build_quantastor_presence_hints(self, raw_data: TrueNASRawData) -> dict[str, set[str]]:
+    def _build_quantastor_presence_hints(
+        self,
+        raw_data: TrueNASRawData,
+        allowed_system_ids: set[str] | None = None,
+    ) -> dict[str, set[str]]:
         hints: dict[str, set[str]] = {}
         rows = [*raw_data.disks, *raw_data.cli_disks, *self._quantastor_hw_disk_rows(raw_data)]
         for row in rows:
@@ -5050,6 +5067,8 @@ class InventoryService:
                 else None
             )
             if not owner_id:
+                continue
+            if allowed_system_ids is not None and owner_id not in allowed_system_ids:
                 continue
             for key in self._collect_quantastor_lookup_keys(row):
                 hints.setdefault(key, set()).add(owner_id)
@@ -5098,7 +5117,20 @@ class InventoryService:
             for host in [self._auto_quantastor_host_for_system(system_id, raw_data)]
             if host
         }
-        presence_hints = self._build_quantastor_presence_hints(raw_data)
+        allowed_presence_system_ids = {
+            system_id
+            for system_id in (
+                normalize_text(str(item) if item is not None else None)
+                for item in (platform_context.get("cluster_node_ids") or [])
+            )
+            if system_id
+        }
+        if not allowed_presence_system_ids and selected_system_id:
+            allowed_presence_system_ids.add(selected_system_id)
+        presence_hints = self._build_quantastor_presence_hints(
+            raw_data,
+            allowed_presence_system_ids or None,
+        )
         pool_index = {
             normalize_text(str(pool.get("id")) if pool.get("id") is not None else None): pool
             for pool in raw_data.pools
@@ -5989,6 +6021,14 @@ class InventoryService:
             commands = [self._build_quantastor_cli_command(subcommand) for subcommand, _label, _target in target_specs]
             command_results = await self._run_ssh_commands(commands, host)
 
+            transport_detail = self._optional_ssh_transport_failure_detail(command_results)
+            if transport_detail is not None:
+                failures.append(
+                    f"Quantastor SSH CLI enrichment failed on {host}: {transport_detail}. "
+                    "REST data is still being used."
+                )
+                continue
+
             for (_subcommand, label, target), result in zip(target_specs, command_results):
                 if not result.ok:
                     detail = normalize_text(result.stderr) or normalize_text(result.stdout) or f"exit {result.exit_code}"
@@ -6095,7 +6135,7 @@ class InventoryService:
         return sum(len(enclosure.slots) for enclosure in overlay.ses_enclosures)
 
     async def _discover_sg_ses_devices(self, host: str, *, failure_prefix: str) -> tuple[list[str], list[str]]:
-        device_discovery = await self._run_ssh_command(self._build_sg_ses_discovery_command(), host)
+        device_discovery = await self._run_optional_ssh_command(self._build_sg_ses_discovery_command(), host)
         if not device_discovery.ok:
             detail = normalize_text(device_discovery.stderr) or normalize_text(device_discovery.stdout) or (
                 f"exit {device_discovery.exit_code}"
@@ -6126,6 +6166,9 @@ class InventoryService:
             commands.extend([aes_command, ec_command, join_command])
 
         command_results = {result.command: result for result in await self._run_ssh_commands(commands, host)}
+        transport_detail = self._optional_ssh_transport_failure_detail(command_results.values())
+        if transport_detail is not None:
+            return host_overlay, [f"{failure_prefix} page probes failed on {host}: {transport_detail}."]
         for device, (aes_command, ec_command, join_command) in device_commands.items():
             aes_result = command_results.get(
                 aes_command,
@@ -9047,6 +9090,56 @@ class InventoryService:
             key,
             OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS,
         )
+
+    @staticmethod
+    def _collapse_quantastor_optional_ssh_backoff_warnings(warnings: Iterable[str]) -> list[str]:
+        collapsed: list[str] = []
+        backoff_by_host: dict[str, str] = {}
+        insertion_index: int | None = None
+        for warning in warnings:
+            match = QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX.match(warning)
+            if match:
+                if insertion_index is None:
+                    insertion_index = len(collapsed)
+                retry_at = match.group("retry_at").rstrip(".")
+                backoff_by_host[match.group("host")] = retry_at
+                continue
+            collapsed.append(warning)
+
+        if not backoff_by_host:
+            return collapsed
+
+        hosts = ", ".join(
+            f"{host} (retry after {retry_at})"
+            for host, retry_at in sorted(backoff_by_host.items())
+        )
+        collapsed.insert(
+            insertion_index or 0,
+            "Quantastor optional SSH enrichment is paused for "
+            f"{hosts} after recent connection startup failures. REST data is still being used.",
+        )
+        return collapsed
+
+    @staticmethod
+    def _optional_ssh_transport_failure_detail(results: Iterable[SSHCommandResult]) -> str | None:
+        result_list = list(results)
+        if not result_list:
+            return None
+        if not all((not result.ok and result.exit_code == 255) for result in result_list):
+            return None
+        details = {
+            normalize_text(result.stderr) or normalize_text(result.stdout) or f"exit {result.exit_code}"
+            for result in result_list
+        }
+        if len(details) != 1:
+            return None
+        return next(iter(details)).rstrip(".")
+
+    async def _run_optional_ssh_command(self, command: str, host: str | None = None) -> SSHCommandResult:
+        results = await self._run_ssh_commands([command], host)
+        if results:
+            return results[0]
+        return SSHCommandResult(command=command, ok=False, stderr="SSH command result missing.", exit_code=255)
 
     @staticmethod
     def _is_ssh_connection_startup_failure(results: list[SSHCommandResult]) -> bool:

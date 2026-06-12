@@ -80,6 +80,61 @@ def normalize_text(value: Any) -> str | None:
     return text or None
 
 
+def normalize_sas_address(value: Any) -> str | None:
+    text = normalize_text(value)
+    if not text:
+        return None
+    normalized = text.casefold()
+    hex_digits = normalized[2:] if normalized.startswith("0x") else normalized
+    if hex_digits and all(character == "0" for character in hex_digits):
+        return None
+    return normalized
+
+
+def _stable_disk_identity(previous: "SlotStateRecord", current: "SlotStateRecord") -> bool:
+    matched_stable_field = False
+    for field_name in ("serial", "gptid", "logical_unit_id"):
+        previous_value = getattr(previous, field_name)
+        current_value = getattr(current, field_name)
+        if previous_value != current_value:
+            return False
+        if previous_value:
+            matched_stable_field = True
+    if matched_stable_field:
+        return True
+    return bool(previous.disk_identity_key and previous.disk_identity_key == current.disk_identity_key)
+
+
+def _sas_dual_path_addresses_equivalent(old_value: str | None, new_value: str | None) -> bool:
+    if not old_value or not new_value:
+        return False
+    old_hex = old_value[2:] if old_value.startswith("0x") else old_value
+    new_hex = new_value[2:] if new_value.startswith("0x") else new_value
+    if len(old_hex) != len(new_hex) or len(old_hex) < 2:
+        return False
+    if old_hex[:-1] != new_hex[:-1]:
+        return False
+    return {old_hex[-1], new_hex[-1]} <= {"2", "3"}
+
+
+def _field_values_equal(
+    previous: "SlotStateRecord",
+    current: "SlotStateRecord",
+    field_name: str,
+) -> bool:
+    if field_name != "sas_address":
+        return getattr(previous, field_name) == getattr(current, field_name)
+
+    old_value = normalize_sas_address(previous.sas_address)
+    new_value = normalize_sas_address(current.sas_address)
+    if old_value == new_value:
+        return True
+    return _stable_disk_identity(previous, current) and _sas_dual_path_addresses_equivalent(
+        old_value,
+        new_value,
+    )
+
+
 def as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -248,7 +303,7 @@ class SlotStateRecord:
             or normalize_text(
                 multipath_payload.get("lunid") if isinstance(multipath_payload, dict) else None
             ),
-            sas_address=normalize_text(slot_payload.get("sas_address")),
+            sas_address=normalize_sas_address(slot_payload.get("sas_address")),
             topology_label=normalize_text(slot_payload.get("topology_label")),
             multipath_device=normalize_text(
                 multipath_payload.get("device_name") if isinstance(multipath_payload, dict) else None
@@ -394,7 +449,7 @@ def build_slot_events(
         for field_name in field_names:
             old_value = getattr(previous, field_name)
             new_value = getattr(current, field_name)
-            if old_value == new_value:
+            if _field_values_equal(previous, current, field_name):
                 continue
             changes[field_name] = {
                 "label": FIELD_LABELS.get(field_name, field_name),

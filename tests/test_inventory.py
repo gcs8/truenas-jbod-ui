@@ -115,6 +115,26 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertIn("5002538b103e5ee1", aliases)
         self.assertIn("5002538b103e5ee2", aliases)
 
+    def test_quantastor_backoff_warnings_are_collapsed_across_cli_and_ses(self) -> None:
+        warnings = [
+            "Quantastor SSH CLI enrichment failed on 10.13.37.31: Skipping optional SSH command batch after a recent connection startup failure; retry after 2026-06-12T15:07:44.593780+00:00. REST data is still being used.",
+            "Quantastor SSH CLI enrichment failed on 10.13.37.30: Skipping optional SSH command batch after a recent connection startup failure; retry after 2026-06-12T15:07:41.513217+00:00. REST data is still being used.",
+            "Quantastor SSH SES discovery failed on 10.13.37.31: Skipping optional SSH command batch after a recent connection startup failure; retry after 2026-06-12T15:07:44.593780+00:00.",
+            "Quantastor SSH SES discovery failed on 10.13.37.30: Skipping optional SSH command batch after a recent connection startup failure; retry after 2026-06-12T15:07:41.513217+00:00.",
+            "Quantastor HA detected. Cluster master is QSOSN-Left.",
+        ]
+
+        collapsed = InventoryService._collapse_quantastor_optional_ssh_backoff_warnings(warnings)
+
+        self.assertEqual(len(collapsed), 2)
+        self.assertEqual(collapsed[1], "Quantastor HA detected. Cluster master is QSOSN-Left.")
+        self.assertIn("Quantastor optional SSH enrichment is paused", collapsed[0])
+        self.assertIn("10.13.37.30", collapsed[0])
+        self.assertIn("10.13.37.31", collapsed[0])
+        self.assertIn("REST data is still being used", collapsed[0])
+        self.assertNotIn("SES discovery", "\n".join(collapsed))
+        self.assertNotIn("disk inventory", "\n".join(collapsed))
+
     @staticmethod
     def _capability_service(platform: str, *, ssh_enabled: bool = True, bmc_enabled: bool = False) -> InventoryService:
         service = object.__new__(InventoryService)
@@ -4724,6 +4744,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                 systems = [
                     {"id": "node-a", "name": "Node A", "storageSystemClusterId": "cluster-a"},
                     {"id": "node-b", "name": "Node B", "storageSystemClusterId": "cluster-a", "isMaster": True},
+                    {"id": "remote-node", "name": "QS-CryoStorage", "storageSystemClusterId": "cluster-b"},
                 ]
                 return TrueNASRawData(
                     enclosures=systems,
@@ -4754,6 +4775,16 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                             "size": 14000000000000,
                             "healthStatus": "ONLINE",
                             "slotNumber": 9,
+                        },
+                        {
+                            "id": "remote-pdisk-12",
+                            "storageSystemId": "remote-node",
+                            "devicePath": "/dev/sdz",
+                            "serialNumber": "QS999",
+                            "vendorId": "WDC",
+                            "productId": "Remote Ultrastar",
+                            "healthStatus": "ONLINE",
+                            "slotNumber": 1,
                         },
                     ],
                     pools=[{"id": "pool-1", "name": "archive", "primaryStorageSystemId": "node-b"}],
@@ -4899,6 +4930,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(slot12.operator_context["pool_owner_label"], "Node B")
             self.assertEqual(slot12.operator_context["fence_owner_label"], "Node B")
             self.assertEqual(slot12.operator_context["visible_on_labels"], ["Node A", "Node B"])
+            self.assertNotIn("QS-CryoStorage", slot12.operator_context["visible_on_labels"])
             slot8 = next(slot for slot in snapshot.slots if slot.slot == 8)
             self.assertEqual(slot8.state.value, "empty")
 
@@ -5272,6 +5304,49 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(overlay["cli_hw_disks"])
             self.assertTrue(overlay["cli_hw_enclosures"])
             self.assertTrue(overlay["cli_network_ports"])
+
+    async def test_fetch_quantastor_cli_overlay_collapses_transport_failures_per_host(self) -> None:
+        class FailingSSHProbe(SSHProbe):
+            def __init__(self) -> None:
+                super().__init__(SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]))
+                self.batches: list[list[str]] = []
+
+            async def run_commands(self, commands=None):  # type: ignore[override]
+                command_list = list(commands or [])
+                self.batches.append(command_list)
+                return [
+                    SSHCommandResult(
+                        command=command,
+                        ok=False,
+                        stderr="Error reading SSH protocol banner",
+                        exit_code=255,
+                    )
+                    for command in command_list
+                ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(platform="quantastor", api_user="jbodmap", api_password="secret"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                FailingSSHProbe(),
+                temp_dir,
+            )
+
+            overlay, failures = await service._fetch_quantastor_cli_overlay()
+
+            self.assertFalse(any(overlay.values()))
+            self.assertEqual(len(failures), 1)
+            self.assertIn("Quantastor SSH CLI enrichment failed on 10.0.0.10", failures[0])
+            self.assertIn("Error reading SSH protocol banner", failures[0])
+            self.assertNotIn("disk inventory", failures[0])
 
     async def test_fetch_quantastor_cli_overlay_falls_back_to_extra_host_and_caches_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6113,6 +6188,49 @@ Enclosure Status diagnostic page:
             self.assertIn("Error reading SSH protocol banner", first[0].stderr)
             self.assertIn("recent connection startup failure", second[0].stderr)
             self.assertEqual(second[0].exit_code, 255)
+
+    async def test_sg_ses_discovery_respects_optional_ssh_backoff_after_startup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            probe = SSHProbe(system.ssh)
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                probe,
+                temp_dir,
+            )
+
+            async def run_commands(commands: list[str]) -> list[SSHCommandResult]:
+                return [
+                    SSHCommandResult(
+                        command=command,
+                        ok=False,
+                        stderr="Error reading SSH protocol banner",
+                        exit_code=255,
+                    )
+                    for command in commands
+                ]
+
+            probe.run_commands = AsyncMock(side_effect=run_commands)  # type: ignore[method-assign]
+
+            first = await service._run_ssh_commands(["first"], "10.0.0.10")
+            devices, failures = await service._discover_sg_ses_devices(
+                "10.0.0.10",
+                failure_prefix="Quantastor SSH SES",
+            )
+
+            self.assertEqual(probe.run_commands.await_count, 1)
+            self.assertIn("Error reading SSH protocol banner", first[0].stderr)
+            self.assertEqual(devices, [])
+            self.assertEqual(len(failures), 1)
+            self.assertIn("recent connection startup failure", failures[0])
 
     def test_build_quantastor_smart_devices_prefers_by_id_and_sd_paths_over_by_path(self) -> None:
         settings = Settings()

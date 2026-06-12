@@ -93,6 +93,93 @@ class HistoryDomainTests(unittest.TestCase):
         self.assertEqual(identity_event.logical_unit_id, "0x5000cca27c7f2229")
         self.assertEqual(identity_event.sas_address, "0x5000cca27c7f2229")
 
+    def test_build_slot_events_ignores_empty_sas_address_flaps(self) -> None:
+        previous = SlotStateRecord(
+            system_id="qsosn-ha",
+            system_label="QSOSN HA",
+            enclosure_key="node-a",
+            enclosure_id="node-a",
+            enclosure_label="QSOSN-Left",
+            slot=17,
+            slot_label="17",
+            present=False,
+            state="empty",
+            identify_active=False,
+            device_name=None,
+            serial=None,
+            model=None,
+            gptid=None,
+            pool_name=None,
+            vdev_name=None,
+            health=None,
+            sas_address=None,
+        )
+        current = replace(previous, sas_address="0")
+
+        events = build_slot_events(previous, current, "2026-06-12T12:00:00+00:00")
+
+        self.assertEqual(events, [])
+
+    def test_build_slot_events_ignores_dual_path_sas_address_flaps(self) -> None:
+        previous = SlotStateRecord(
+            system_id="qsosn-ha",
+            system_label="QSOSN HA",
+            enclosure_key="node-a",
+            enclosure_id="node-a",
+            enclosure_label="QSOSN-Left",
+            slot=3,
+            slot_label="03",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="disk/by-id/scsi-SAMSUNG_SERIAL-3",
+            serial="SERIAL-3",
+            model="SAMSUNG MZILT3T8HALS0D3",
+            gptid="scsi-SAMSUNG_SERIAL-3",
+            pool_name="HA-Pool-R10",
+            vdev_name="mirror-0",
+            health="ONLINE",
+            sas_address="0x5000c500abcdef02",
+        )
+        current = replace(previous, sas_address="0x5000c500abcdef03")
+
+        events = build_slot_events(previous, current, "2026-06-12T12:00:00+00:00")
+
+        self.assertEqual(events, [])
+
+    def test_build_slot_events_keeps_identity_event_when_serial_changes_with_sas(self) -> None:
+        previous = SlotStateRecord(
+            system_id="qsosn-ha",
+            system_label="QSOSN HA",
+            enclosure_key="node-a",
+            enclosure_id="node-a",
+            enclosure_label="QSOSN-Left",
+            slot=3,
+            slot_label="03",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="disk/by-id/scsi-SAMSUNG_SERIAL-3",
+            serial="SERIAL-3",
+            model="SAMSUNG MZILT3T8HALS0D3",
+            gptid="scsi-SAMSUNG_SERIAL-3",
+            pool_name="HA-Pool-R10",
+            vdev_name="mirror-0",
+            health="ONLINE",
+            sas_address="0x5000c500abcdef02",
+        )
+        current = replace(
+            previous,
+            device_name="disk/by-id/scsi-SAMSUNG_SERIAL-4",
+            serial="SERIAL-4",
+            gptid="scsi-SAMSUNG_SERIAL-4",
+            sas_address="0x5000c500abcdef03",
+        )
+
+        events = build_slot_events(previous, current, "2026-06-12T12:00:00+00:00")
+
+        self.assertEqual({event.event_type for event in events}, {"slot_identity_changed"})
+
 
 class HistoryConfigTests(unittest.TestCase):
     def test_history_settings_default_request_timeout_allows_slow_live_inventory(self) -> None:
@@ -2136,6 +2223,112 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.topology_label, "tank > raidz2-0 > data")
         self.assertEqual(loaded.multipath_state, "OPTIMAL")
+
+    def test_record_slot_changes_preserves_topology_detail_during_degradation(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        baseline = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=30,
+            slot_label="30",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="multipath/disk36",
+            serial="3FJ0NN6T",
+            model="WDC WUH721818AL5204",
+            gptid="gptid/8fadc7eb-fe53-11ec-b425-0cc47a8ff400",
+            pool_name="The-Repository",
+            vdev_name="raidz2-2",
+            health="ONLINE",
+            topology_label="The-Repository > raidz2-2 > data",
+        )
+        degraded = replace(
+            baseline,
+            vdev_name=None,
+            topology_label="The-Repository > data",
+        )
+
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+        collector._record_slot_changes([degraded], "2026-06-12T09:54:00+00:00")
+
+        events = store.list_slot_events("archive-core", "enc-a", 30)
+        loaded = store.get_slot_state("archive-core", "enc-a", 30)
+
+        self.assertEqual(events, [])
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.vdev_name, "raidz2-2")
+        self.assertEqual(loaded.topology_label, "The-Repository > raidz2-2 > data")
+
+    def test_record_slot_changes_confirms_real_topology_change_before_event(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        baseline = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=30,
+            slot_label="30",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="multipath/disk36",
+            serial="3FJ0NN6T",
+            model="WDC WUH721818AL5204",
+            gptid="gptid/8fadc7eb-fe53-11ec-b425-0cc47a8ff400",
+            pool_name="The-Repository",
+            vdev_name="raidz2-2",
+            health="ONLINE",
+            topology_label="The-Repository > raidz2-2 > data",
+        )
+        moved = replace(
+            baseline,
+            vdev_name="raidz2-3",
+            topology_label="The-Repository > raidz2-3 > data",
+        )
+
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+        collector._record_slot_changes([moved], "2026-06-12T09:54:00+00:00")
+
+        self.assertEqual(store.list_slot_events("archive-core", "enc-a", 30), [])
+        loaded = store.get_slot_state("archive-core", "enc-a", 30)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.vdev_name, "raidz2-2")
+
+        collector._record_slot_changes([moved], "2026-06-12T09:59:00+00:00")
+
+        events = store.list_slot_events("archive-core", "enc-a", 30)
+        loaded = store.get_slot_state("archive-core", "enc-a", 30)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "slot_topology_changed")
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.vdev_name, "raidz2-3")
 
     def test_enumerate_scopes_includes_inventory_bound_storage_views(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
