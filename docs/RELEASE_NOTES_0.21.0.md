@@ -62,6 +62,18 @@ visibility across CORE, SCALE, Quantastor, Linux, ESXi, and BMC/IPMI paths.
 - Browser release-gate coverage now selects occupied restored systems for
   heat-map value assertions and tolerates real restored ESXi/remote inventory
   latency instead of relying on fixture-only timing assumptions.
+- History collection now suppresses false durable `Topology Change` events when
+  a transient inventory snapshot loses topology detail, and requires repeated
+  confirmation before recording real topology movement.
+- History identity tracking now treats empty/all-zero SAS addresses and stable
+  dual-path/path-nibble SAS address flips as non-durable noise when the disk's
+  stable identity fields did not change.
+- Quantastor optional SSH enrichment warnings are collapsed across CLI and SES
+  paths after a shared startup/backoff failure, while REST inventory remains
+  usable and source-labeled.
+- Quantastor `Visible On` disk labels are scoped to the selected HA cluster's
+  node IDs before disk identity correlation, preventing remote grid/site peers
+  from appearing as local shared visibility.
 
 ## Runtime Impact
 
@@ -70,13 +82,15 @@ visibility across CORE, SCALE, Quantastor, Linux, ESXi, and BMC/IPMI paths.
   rename is included in the maintainability seams.
 - Optional SSH enrichment should be quieter under transient failures and should
   avoid shared Quantastor API/VIP endpoints when HA node targets are available.
+- Existing history databases may still contain pre-upgrade false topology or
+  identity rows; release QA cleaned the known same-day noise from the accepted
+  source and disposable QA databases after taking SQLite backups.
 - Richer platform-native Storage Fabric enrichment remains deferred to v0.22.x
   unless a release gate uncovers an operator-correctness blocker.
 
 ## Release Discipline
 
-This release remains subject to the full `docs/RELEASE_CHECKLIST.md` gate before
-tagging. The initial release wrap records source-only evidence already gathered
-and keeps runtime, Docker, restore, perf, snapshot/export,
-docs/wiki/public-demo, GHCR, deployment, and post-release rows blocked until
-those gates are actually run and recorded.
+This release was tagged only after the strict pre-tag release wrap passed against
+the accepted full-data Linux QA candidate. `docs/RELEASE_WRAP_0.21.0.md` records
+the detailed source/QA provenance, cleanup backups, and remaining post-publish
+GHCR/deployment/reopen evidence.
