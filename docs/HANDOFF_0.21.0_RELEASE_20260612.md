@@ -12,7 +12,30 @@ This handoff is for a fresh session to continue the `gcs8/truenas-jbod-ui` `v0.2
 - Last committed release-prep commit: `c25a074 docs: update v0.21.0 release packet after SSH fanout merge`
 - Latest merged main work included in this branch: `6fe534b Reduce SSH fanout for inventory enrichment (#7)`
 - Public release/tag: **not cut**
-- Ship state: **not tag-ready yet** because Linux QA restore and strict pre-tag validation remain incomplete.
+- Ship state: automated pre-tag gates are now complete after the continuation
+  update below, but the public tag/publish is still **not cut** and remains
+  held for gcs8 human QA/acceptance plus the publish sequence.
+
+## Continuation update - 2026-06-12T04:05Z
+
+- Reviewed, secret-scanned, committed, and pushed the local release-gate changes
+  as `535c61a chore: record v0.21.0 local release gates`.
+- Ran the disposable Linux QA restore gate on `10.13.37.138` using
+  `/docker-local/truenas-jbod-ui-qa-0.21.0-20260612T034656Z/repo` and ports
+  `18080` UI, `18081` history, and `18082` admin.
+- Restored the ignored Windows backup bundle through the disposable admin API,
+  verified `11` restored systems, health on all three services, remote
+  Playwright `26` passed / `1` intentional skip, feature API/UI checks,
+  snapshot export/offline smoke, and serial main/history perf harnesses after
+  waiting for the restored history collector to settle.
+- Updated `docs/RELEASE_WRAP_0.21.0.md`: Linux QA restore, restored Linux QA
+  perf, and Linux QA snapshot/export/offline evidence are now `Pass`.
+- Strict pre-tag validation now passes:
+  `.venv/bin/python scripts/validate_release_wrap.py 0.21.0 --phase pre-tag`.
+- The disposable Linux QA stack is intentionally still running and should stay
+  available until post-publish deployment sniff tests pass.
+- Do **not** tag/publish until gcs8 accepts the running candidate and the final
+  release mechanics are intentionally started.
 
 Current tracked files modified before this handoff file was added:
 
@@ -367,15 +390,16 @@ Follow `docs/RELEASE_CHECKLIST.md` lines 353-406. Summary:
 
 ## Release wrap rows still blocked now
 
-As of this handoff, these rows intentionally remain blocked in `docs/RELEASE_WRAP_0.21.0.md`:
+As of the continuation update, all automated pre-tag rows are `Pass`; these
+post-publish rows intentionally remain blocked in
+`docs/RELEASE_WRAP_0.21.0.md`:
 
-- Linux QA restore gate
-- Restored Linux QA perf harnesses
 - GHCR publish verification
 - Deployment refresh/sniff tests
 - Post-release reopen
 
-Local snapshot/export and docs/wiki/public-demo rows are already `Pass`; Linux QA should still run its own restored-stack snapshot/export smoke and capture it under the Linux QA evidence summary.
+Local and Linux QA snapshot/export and docs/wiki/public-demo rows are already
+`Pass`.
 
 ## Do not redo unless source changes
 
@@ -400,10 +424,11 @@ If any code changes happen, rerun the relevant syntax/unit/browser subset plus `
 
 ## Minimal pickup checklist
 
-- [ ] `git status --short --branch`
-- [ ] `scripts/validate_release_wrap.py 0.21.0 --phase pre-tag --allow-blocked`
-- [ ] review/commit/push current local-gate changes
-- [ ] run Linux QA restore on `10.13.37.138:18080/18081/18082`
-- [ ] update `docs/RELEASE_WRAP_0.21.0.md` with Linux QA evidence
-- [ ] run strict pre-tag validator without `--allow-blocked`
+- [x] `git status --short --branch`
+- [x] `scripts/validate_release_wrap.py 0.21.0 --phase pre-tag --allow-blocked`
+- [x] review/commit/push current local-gate changes
+- [x] run Linux QA restore on `10.13.37.138:18080/18081/18082`
+- [x] update `docs/RELEASE_WRAP_0.21.0.md` with Linux QA evidence
+- [x] run strict pre-tag validator without `--allow-blocked`
+- [ ] gcs8 human QA/acceptance of the running Linux candidate
 - [ ] only then merge/tag/publish and verify GHCR/deployments
