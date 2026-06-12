@@ -199,9 +199,20 @@ ssh:
 #       verify_ssl: true
 #     ssh:
 #       enabled: true
+#       # For Quantastor HA, keep the shared API / grid-management VIP in
+#       # truenas.host. SSH enrichment targets real node hosts instead; the app
+#       # auto-discovers HA node hostnames/IPs from Quantastor API rows and,
+#       # after one node is reachable, from the `qs network-port-list` row whose
+#       # interface carries the default gateway.
 #       host: 10.0.0.30
-#       extra_hosts:
-#         - 10.0.0.31
+#       ha_enabled: true
+#       ha_nodes:
+#         - system_id: left-node-id-from-api
+#           label: Quantastor Left
+#           host: 10.0.0.30  # optional fallback if the API does not expose it
+#         - system_id: right-node-id-from-api
+#           label: Quantastor Right
+#           host: 10.0.0.31  # optional fallback if the API does not expose it
 #       port: 22
 #       user: jbodmap
 #       key_path: /run/ssh/id_truenas
@@ -209,10 +220,12 @@ ssh:
 #       strict_host_key_checking: true
 #       commands: []
 #     # Quantastor can supplement the REST view with `qs disk-list`,
-#     # `qs hw-disk-list`, and `qs hw-enclosure-list` over SSH when the
-#     # appliance API is missing slot/controller detail. If only one HA node
-#     # exposes a working SES path, `extra_hosts` lets the app fall through to
-#     # the usable controller host for `sg_ses` identify and slot-state reads.
+#     # `qs hw-disk-list`, `qs hw-enclosure-list`, and `qs network-port-list`
+#     # over SSH when the
+#     # appliance API is missing slot/controller detail. For HA systems, the
+#     # app avoids SSHing to the shared API endpoint and uses node hosts so
+#     # pool-owned follow-up probes land on the node that can actually see
+#     # the local SES, CLI, and smartctl context.
 
 layout:
   slot_count: 60

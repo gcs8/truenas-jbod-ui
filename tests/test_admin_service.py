@@ -40,6 +40,7 @@ from app.models.domain import SnapshotExportRequest
 from app.models.domain import SystemSetupBootstrapRequest
 from app.models.domain import SystemSetupSudoPreviewRequest
 from app.services.profile_registry import UNIFI_UNVR_FRONT_4_PROFILE_ID
+from app.services.ssh_probe import SSHCommandResult
 from app.services.snapshot_export import PackagedSnapshotExport
 from history_service.config import HistorySettings
 from history_service.main import app as history_app
@@ -808,13 +809,13 @@ class AdminStatePayloadTests(unittest.TestCase):
                     id="esxi-ft-node-2",
                     label="esxi-ft-node-2",
                     truenas=TrueNASConfig(
-                        host="10.13.37.121",
+                        host="192.0.2.121",
                         platform="esxi",
                         verify_ssl=False,
                     ),
                     ssh=SSHConfig(
                         enabled=True,
-                        host="10.13.37.121",
+                        host="192.0.2.121",
                         user="root",
                         key_path="",
                         password="#EDC2wsx!QAZ",
@@ -841,8 +842,8 @@ class AdminStatePayloadTests(unittest.TestCase):
                             payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
 
         saved_system = payload["systems"][0]
-        self.assertEqual(saved_system["truenas_host"], "10.13.37.121")
-        self.assertEqual(saved_system["ssh_host"], "10.13.37.121")
+        self.assertEqual(saved_system["truenas_host"], "192.0.2.121")
+        self.assertEqual(saved_system["ssh_host"], "192.0.2.121")
         self.assertEqual(saved_system["ssh_key_path"], "")
         self.assertEqual(saved_system["ssh_password"], "#EDC2wsx!QAZ")
 
@@ -903,8 +904,8 @@ class AdminStatePayloadTests(unittest.TestCase):
         settings = Settings(
             systems=[
                 SystemConfig(
-                    id="qsosn-ha",
-                    label="QSOSN HA",
+                    id="example-qs-ha",
+                    label="ExampleQS HA",
                     truenas=TrueNASConfig(
                         host="https://10.13.37.40",
                         api_user="jbodmap",
@@ -914,19 +915,19 @@ class AdminStatePayloadTests(unittest.TestCase):
                     ),
                     ssh=SSHConfig(
                         enabled=True,
-                        host="10.13.37.30",
-                        extra_hosts=["10.13.37.31"],
+                        host="192.0.2.30",
+                        extra_hosts=["192.0.2.31"],
                         ha_enabled=True,
                         ha_nodes=[
                             {
                                 "system_id": "node-a",
-                                "label": "QSOSN Left",
-                                "host": "10.13.37.30",
+                                "label": "ExampleQS Left",
+                                "host": "192.0.2.30",
                             },
                             {
                                 "system_id": "node-b",
-                                "label": "QSOSN Right",
-                                "host": "10.13.37.31",
+                                "label": "ExampleQS Right",
+                                "host": "192.0.2.31",
                             },
                         ],
                         user="jbodmap",
@@ -949,7 +950,7 @@ class AdminStatePayloadTests(unittest.TestCase):
                                 "mode": "hybrid",
                                 "target_system_id": "node-b",
                                 "enclosure_ids": [],
-                                "pool_names": ["QSOSN-BOOT-B"],
+                                "pool_names": ["ExampleQS-BOOT-B"],
                                 "serials": [],
                                 "pcie_addresses": [],
                                 "device_names": ["sda", "sdb"],
@@ -958,7 +959,7 @@ class AdminStatePayloadTests(unittest.TestCase):
                     ],
                 )
             ],
-            default_system_id="qsosn-ha",
+            default_system_id="example-qs-ha",
         )
         runtime_service = MagicMock()
         runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
@@ -977,7 +978,7 @@ class AdminStatePayloadTests(unittest.TestCase):
 
         self.assertTrue(payload["systems"][0]["ha_enabled"])
         self.assertEqual(payload["systems"][0]["ha_nodes"][0]["system_id"], "node-a")
-        self.assertEqual(payload["systems"][0]["ha_nodes"][1]["host"], "10.13.37.31")
+        self.assertEqual(payload["systems"][0]["ha_nodes"][1]["host"], "192.0.2.31")
         self.assertEqual(
             payload["systems"][0]["storage_views"][0]["binding"]["target_system_id"],
             "node-b",
@@ -1428,15 +1429,15 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         settings = Settings(
             systems=[
                 SystemConfig(
-                    id="qsosn-ha",
-                    label="QSOSN HA",
+                    id="example-qs-ha",
+                    label="ExampleQS HA",
                     truenas=TrueNASConfig(
                         host="https://10.13.37.40",
                         platform="quantastor",
                     ),
                 )
             ],
-            default_system_id="qsosn-ha",
+            default_system_id="example-qs-ha",
         )
         history_store = MagicMock()
         history_store.list_history_system_summaries.side_effect = [
@@ -1454,8 +1455,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         ]
         history_store.adopt_system_history.return_value = {
             "source_system_id": "qs-cryostorage",
-            "target_system_id": "qsosn-ha",
-            "target_system_label": "QSOSN HA",
+            "target_system_id": "example-qs-ha",
+            "target_system_label": "ExampleQS HA",
             "tracked_slots": 2,
             "event_count": 3,
             "metric_sample_count": 4,
@@ -1469,7 +1470,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                     route.endpoint(
                         payload=HistoryAdoptRequest(
                             source_system_id="qs-cryostorage",
-                            target_system_id="qsosn-ha",
+                            target_system_id="example-qs-ha",
                         )
                     )
                 )
@@ -1479,12 +1480,12 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["summary"]["total_rows"], 9)
-        self.assertEqual(payload["target_system_id"], "qsosn-ha")
+        self.assertEqual(payload["target_system_id"], "example-qs-ha")
         self.assertEqual(payload["orphaned_systems"], [])
         history_store.adopt_system_history.assert_called_once_with(
             "qs-cryostorage",
-            "qsosn-ha",
-            target_system_label="QSOSN HA",
+            "example-qs-ha",
+            target_system_label="ExampleQS HA",
         )
 
     def test_storage_view_candidate_route_returns_unmapped_inventory_candidates(self) -> None:
@@ -1542,8 +1543,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             enclosures=[],
             systems=[
                 {"id": "cluster", "name": "Cluster View", "storageSystemClusterId": "cluster-a"},
-                {"id": "node-a", "name": "QSOSN Left", "hostname": "10.13.37.30", "storageSystemClusterId": "cluster-a"},
-                {"id": "node-b", "name": "QSOSN Right", "hostname": "10.13.37.31", "storageSystemClusterId": "cluster-a", "isMaster": True},
+                {"id": "node-a", "name": "ExampleQS Left", "mainIpAddress": "192.0.2.30", "storageSystemClusterId": "cluster-a"},
+                {"id": "node-b", "name": "ExampleQS Right", "managementIpAddress": "192.0.2.31", "storageSystemClusterId": "cluster-a", "isMaster": True},
                 {"id": "qs-cryostorage", "name": "QS CryoStorage", "hostname": "10.88.88.30", "storageSystemClusterId": "cluster-a"},
             ],
             disks=[],
@@ -1576,7 +1577,86 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual([node["system_id"] for node in payload["nodes"]], ["node-a", "node-b"])
-        self.assertEqual(payload["nodes"][1]["host"], "10.13.37.31")
+        self.assertEqual(payload["nodes"][1]["host"], "192.0.2.31")
+
+    def test_quantastor_node_discovery_route_fills_hosts_from_ssh_gateway_ports(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/quantastor-nodes")
+        client = AsyncMock()
+        client.fetch_all.return_value = TrueNASRawData(
+            enclosures=[],
+            systems=[
+                {"id": "node-a", "name": "ExampleQS Left", "storageSystemClusterId": "cluster-a"},
+                {"id": "node-b", "name": "ExampleQS Right", "storageSystemClusterId": "cluster-a"},
+            ],
+            disks=[],
+            pools=[],
+            pool_devices=[],
+            ha_groups=[],
+            hw_disks=[],
+            hw_enclosures=[
+                {"id": "enc-a", "storageSystemId": "node-a"},
+                {"id": "enc-b", "storageSystemId": "node-b"},
+            ],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+        network_ports = json.dumps(
+            [
+                {
+                    "name": "eno1",
+                    "storageSystemId": "node-a",
+                    "ipAddress": "192.0.2.30",
+                    "gateway": "192.0.2.1",
+                },
+                {
+                    "name": "eno1",
+                    "storageSystemId": "node-b",
+                    "ipAddress": "192.0.2.31",
+                    "gateway": "192.0.2.1",
+                },
+            ]
+        )
+        probe = MagicMock()
+        probe.run_commands = AsyncMock(
+            return_value=[
+                SSHCommandResult(
+                    command="/usr/bin/qs network-port-list --json",
+                    ok=True,
+                    stdout=network_ports,
+                    exit_code=0,
+                )
+            ]
+        )
+
+        with patch("admin_service.main.QuantastorRESTClient", return_value=client):
+            with patch("admin_service.main.SSHProbe", return_value=probe):
+                response = asyncio.run(
+                    route.endpoint(
+                        QuantastorNodeDiscoveryRequest(
+                            truenas_host="https://quantastor.example.test",
+                            api_user="jbodmap",
+                            api_password="secret",
+                            verify_ssl=False,
+                            ssh_enabled=True,
+                            ssh_host="quantastor.example.test",
+                            ssh_user="jbodmap",
+                            ssh_key_path="/run/ssh/id_jbodmap",
+                            ssh_known_hosts_path="/app/data/known_hosts",
+                            ha_nodes=[
+                                {"system_id": "node-a", "label": "ExampleQS Left", "host": "192.0.2.30"},
+                                {"system_id": "node-b", "label": "ExampleQS Right"},
+                            ],
+                        )
+                    )
+                )
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([node["host"] for node in payload["nodes"]], ["192.0.2.30", "192.0.2.31"])
+        self.assertTrue(payload["host_discovery"]["ok"])
+        self.assertEqual(payload["host_discovery"]["filled_hosts"], 1)
+        probe.run_commands.assert_awaited_once()
 
     def test_live_enclosures_route_returns_resolved_profile_info(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/storage-views/live-enclosures")
@@ -1931,7 +2011,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             response = asyncio.run(
                 route.endpoint(
                     payload=ESXiHostPrepInstallRequest(
-                        host="10.13.37.121",
+                        host="192.0.2.121",
                         user="root",
                         password="secret",
                         upload_token="storcli-1",

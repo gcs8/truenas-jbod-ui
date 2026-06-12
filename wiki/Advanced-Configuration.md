@@ -80,14 +80,30 @@ Useful app-level settings:
 app:
   port: 8080
   refresh_interval_seconds: 30
-  cache_ttl_seconds: 10
+  snapshot_cache_ttl_seconds: 10
+  source_bundle_cache_ttl_seconds: 60
+  smart_cache_ttl_seconds: 300
+  sg_ses_device_cache_ttl_seconds: 300
   log_level: INFO
   debug: false
 ```
 
 ## What The Cache TTL Really Means
 
-`cache_ttl_seconds` controls how long inventory snapshots stay warm.
+`snapshot_cache_ttl_seconds` controls how long rendered inventory snapshots
+stay warm.
+
+`source_bundle_cache_ttl_seconds` controls how long the heavier API/SSH source
+payload stays warm. Leave this at least as high as the snapshot cache on
+appliances with low SSH `MaxStartups` limits.
+
+`smart_cache_ttl_seconds` controls selected-slot SMART detail reuse.
+
+`sg_ses_device_cache_ttl_seconds` controls how long discovered Linux/SCALE/SES
+device paths stay warm before rediscovery.
+
+Older configs can still use `cache_ttl_seconds`; when the newer split fields
+are not set, that legacy value feeds the snapshot and source-bundle caches.
 
 Smaller:
 
@@ -118,6 +134,26 @@ Examples:
 - LED identify actions
 
 That split helps keep the standing SSH probe lighter.
+
+## SSH Refresh Load
+
+Inventory refreshes batch configured commands and dynamic enrichment through one
+SSH session per target where possible, but operators should still keep refreshes
+friendly to storage appliances:
+
+- keep `refresh_interval_seconds` at `30` or higher unless you are actively
+  debugging
+- prefer `source_bundle_cache_ttl_seconds` of `60` or higher for appliances with
+  low SSH startup limits
+- keep optional SMART and LED actions on demand instead of adding every possible
+  per-disk command to the standing `ssh.commands` list
+- SMART detail probes batch JSON plus text enrichment per device and serialize
+  SSH sessions per saved system; after a connection startup failure, optional
+  SSH batches pause briefly before retrying
+- use `ssh.extra_hosts` only for real HA/peer fallback paths; stale or duplicate
+  hosts can still add avoidable connection attempts
+- watch app logs for SSH refresh command counts, failure counts, and duration
+  after changing cache or command settings
 
 ## Persistent Mapping Storage
 

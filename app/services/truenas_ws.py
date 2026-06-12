@@ -117,6 +117,7 @@ class TrueNASRawData:
     cli_disks: list[dict[str, Any]] = field(default_factory=list)
     cli_hw_disks: list[dict[str, Any]] = field(default_factory=list)
     cli_hw_enclosures: list[dict[str, Any]] = field(default_factory=list)
+    cli_network_ports: list[dict[str, Any]] = field(default_factory=list)
 
 
 class TrueNASWebsocketClient:

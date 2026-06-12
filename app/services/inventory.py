@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import re
@@ -10,6 +11,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Literal
+from urllib.parse import urlsplit
 
 from app import __version__
 from app.config import Settings, StorageViewConfig, SystemConfig
@@ -98,7 +100,7 @@ from app.services.parsers import (
     parse_ssh_outputs,
     shift_hex_identifier,
 )
-from app.services.ssh_probe import SSHCommandResult, SSHProbe
+from app.services.ssh_probe import SSHCommandResult, SSHProbe, redact_ssh_command
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebsocketClient
@@ -163,6 +165,16 @@ STABLE_SMART_DETAIL_FIELDS = (
     "sas_address",
     "attached_sas_address",
     "negotiated_link_rate",
+)
+OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
+SSH_CONNECTION_FAILURE_MARKERS = (
+    "error reading ssh protocol banner",
+    "no existing session",
+    "timed out",
+    "unable to connect",
+    "connection refused",
+    "connection reset",
+    "maxstartups",
 )
 
 
@@ -340,6 +352,8 @@ class InventoryService:
         self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
         self._source_bundle_lock = asyncio.Lock()
+        self._ssh_session_lock = asyncio.Lock()
+        self._optional_ssh_backoff_until: dict[str, datetime] = {}
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[None] | None = None
         self._smart_refresh_tasks: dict[str, asyncio.Task[None]] = {}
@@ -1425,7 +1439,7 @@ class InventoryService:
 
         return (
             [
-                f"SSH command failed: {failure.command} (exit {failure.exit_code})"
+                f"SSH command failed: {redact_ssh_command(failure.command)} (exit {failure.exit_code})"
                 for failure in failures
             ],
             "Some SSH commands failed.",
@@ -1441,8 +1455,8 @@ class InventoryService:
             context = cls._ssh_command_failure_context(canonical)
             details.append(
                 {
-                    "command": result.command,
-                    "canonical_command": canonical,
+                    "command": redact_ssh_command(result.command),
+                    "canonical_command": redact_ssh_command(canonical),
                     "exit_code": result.exit_code,
                     "stderr": cls._trim_command_failure_text(result.stderr),
                     "stdout": cls._trim_command_failure_text(result.stdout),
@@ -1697,6 +1711,41 @@ class InventoryService:
             commands.append(LINUX_NVME_LIST_SUBSYS_COMMAND)
         return commands
 
+    def _ssh_inventory_enrichment_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
+        seed_commands = self._core_mprutil_seed_probe_commands(command_results)
+        if seed_commands:
+            return seed_commands
+
+        unit_commands = self._core_mprutil_unit_probe_commands(command_results)
+        if unit_commands:
+            return unit_commands
+
+        commands: list[str] = []
+        commands.extend(self._core_mpr_dmesg_probe_commands(command_results))
+        commands.extend(self._core_pci_slot_probe_commands(command_results))
+        if self._should_probe_unifi_gpio_debug(command_results):
+            commands.append("cat /sys/kernel/debug/gpio")
+        commands.extend(self._esxi_controller_diagnostic_commands(command_results))
+        if any(result.ok for result in command_results):
+            commands.extend(self._linux_storage_enrichment_probe_commands(command_results))
+        return self._dedupe_unseen_ssh_commands(commands, command_results)
+
+    @staticmethod
+    def _dedupe_unseen_ssh_commands(
+        commands: Iterable[str],
+        command_results: list[SSHCommandResult],
+    ) -> list[str]:
+        seen_canonical = {canonicalize_ssh_command(item.command) for item in command_results}
+        selected: list[str] = []
+        selected_canonical: set[str] = set()
+        for command in commands:
+            canonical = canonicalize_ssh_command(command)
+            if canonical in seen_canonical or canonical in selected_canonical:
+                continue
+            selected.append(command)
+            selected_canonical.add(canonical)
+        return selected
+
     def _esxi_controller_diagnostic_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
         if self.system.truenas.platform != "esxi":
             return []
@@ -1825,22 +1874,21 @@ class InventoryService:
 
         async def load_ssh_payload() -> tuple[dict[str, str], bool, list[str], list[dict[str, Any]], SourceStatus]:
             with perf_stage("inventory.ssh.run_commands"):
-                command_results = await self.ssh_probe.run_commands()
-                for command in self._core_mprutil_seed_probe_commands(command_results):
-                    command_results.append(await self.ssh_probe.run_command(command))
-                for command in self._core_mprutil_unit_probe_commands(command_results):
-                    command_results.append(await self.ssh_probe.run_command(command))
-                for command in self._core_mpr_dmesg_probe_commands(command_results):
-                    command_results.append(await self.ssh_probe.run_command(command))
-                for command in self._core_pci_slot_probe_commands(command_results):
-                    command_results.append(await self.ssh_probe.run_command(command))
-                if self._should_probe_unifi_gpio_debug(command_results):
-                    command_results.append(await self.ssh_probe.run_command("cat /sys/kernel/debug/gpio"))
-                for command in self._esxi_controller_diagnostic_commands(command_results):
-                    command_results.append(await self.ssh_probe.run_command(command))
-                if any(result.ok for result in command_results):
-                    for command in self._linux_storage_enrichment_probe_commands(command_results):
-                        command_results.append(await self.ssh_probe.run_command(command))
+                ssh_started = time.perf_counter()
+                async with self._ssh_session_lock:
+                    command_results = await self.ssh_probe.run_planned_commands(
+                        self._ssh_inventory_enrichment_probe_commands
+                    )
+                logger.info(
+                    "Inventory SSH refresh completed for system=%s platform=%s profile=%s: connections=%s commands=%s failures=%s duration=%.3fs",
+                    self.system.id,
+                    self.system.truenas.platform,
+                    self.system.default_profile_id or "auto",
+                    1 if command_results else 0,
+                    len(command_results),
+                    sum(1 for result in command_results if not result.ok),
+                    time.perf_counter() - ssh_started,
+                )
             outputs = {item.command: item.stdout for item in command_results if item.ok}
             failure_messages, status_message = self._summarize_ssh_failures(command_results, outputs)
             failure_details = self._ssh_failure_details(command_results)
@@ -1927,20 +1975,8 @@ class InventoryService:
 
         if self.system.truenas.platform == "quantastor" and ssh_collected:
             try:
-                with perf_stage("inventory.quantastor.fetch_ses_overlay"):
-                    quantastor_ses_data, quantastor_ses_failures = await self._fetch_quantastor_ses_overlay()
-            except Exception:
-                logger.exception("Failed to collect Quantastor SES diagnostics")
-                quantastor_ses_failures.append(
-                    "Quantastor SSH SES enrichment failed unexpectedly. REST and CLI slot truth is still being used."
-                )
-            else:
-                quantastor_ses_loaded = bool(quantastor_ses_data.ses_enclosures)
-                warnings.extend(quantastor_ses_failures)
-
-            try:
                 with perf_stage("inventory.quantastor.fetch_cli_overlay"):
-                    quantastor_cli_overlay, quantastor_cli_failures = await self._fetch_quantastor_cli_overlay()
+                    quantastor_cli_overlay, quantastor_cli_failures = await self._fetch_quantastor_cli_overlay(raw_data)
             except Exception:
                 logger.exception("Failed to collect Quantastor CLI diagnostics")
                 quantastor_cli_failures.append(
@@ -1950,14 +1986,28 @@ class InventoryService:
                 raw_data.cli_disks = quantastor_cli_overlay.get("cli_disks", [])
                 raw_data.cli_hw_disks = quantastor_cli_overlay.get("cli_hw_disks", [])
                 raw_data.cli_hw_enclosures = quantastor_cli_overlay.get("cli_hw_enclosures", [])
+                raw_data.cli_network_ports = quantastor_cli_overlay.get("cli_network_ports", [])
                 quantastor_cli_loaded = any(
                     (
                         raw_data.cli_disks,
                         raw_data.cli_hw_disks,
                         raw_data.cli_hw_enclosures,
+                        raw_data.cli_network_ports,
                     )
                 )
                 warnings.extend(quantastor_cli_failures)
+
+            try:
+                with perf_stage("inventory.quantastor.fetch_ses_overlay"):
+                    quantastor_ses_data, quantastor_ses_failures = await self._fetch_quantastor_ses_overlay(raw_data)
+            except Exception:
+                logger.exception("Failed to collect Quantastor SES diagnostics")
+                quantastor_ses_failures.append(
+                    "Quantastor SSH SES enrichment failed unexpectedly. REST and CLI slot truth is still being used."
+                )
+            else:
+                quantastor_ses_loaded = bool(quantastor_ses_data.ses_enclosures)
+                warnings.extend(quantastor_ses_failures)
 
             if quantastor_cli_loaded:
                 sources["ssh"] = SourceStatus(
@@ -2635,7 +2685,24 @@ class InventoryService:
                             command_parts.extend(["-d", device_type])
                         command_parts.extend(["-x", "-j", device_path])
                         command = shlex.join(command_parts)
-                        result = await self._run_ssh_command(command, target_host)
+                        text_command_parts = ["sudo", "-n", smartctl_binary]
+                        if device_type:
+                            text_command_parts.extend(["-d", device_type])
+                        text_command_parts.extend(["-x", device_path])
+                        text_command = shlex.join(text_command_parts)
+                        command_results = {
+                            result.command: result
+                            for result in await self._run_ssh_commands([command, text_command], target_host)
+                        }
+                        result = command_results.get(
+                            command,
+                            SSHCommandResult(
+                                command=command,
+                                ok=False,
+                                stderr="SSH command result missing.",
+                                exit_code=255,
+                            ),
+                        )
                         summary = None
                         if result.stdout.strip():
                             parsed = parse_smartctl_summary(result.stdout)
@@ -2656,13 +2723,8 @@ class InventoryService:
                                 continue
                             break
 
-                        text_command_parts = ["sudo", "-n", smartctl_binary]
-                        if device_type:
-                            text_command_parts.extend(["-d", device_type])
-                        text_command_parts.extend(["-x", device_path])
-                        text_command = shlex.join(text_command_parts)
-                        text_result = await self._run_ssh_command(text_command, target_host)
-                        if text_result.stdout.strip():
+                        text_result = command_results.get(text_command)
+                        if text_result is not None and text_result.stdout.strip():
                             summary = self._merge_missing_smart_fields(
                                 summary,
                                 SmartSummaryView.model_validate(
@@ -5026,6 +5088,16 @@ class InventoryService:
         platform_context: dict[str, Any],
     ) -> None:
         system_labels = self._quantastor_system_label_index(raw_data)
+        hosts_by_system = {
+            system_id: host
+            for system_id in (
+                normalize_text(str(row.get("id")) if row.get("id") is not None else None)
+                for row in self._quantastor_cluster_node_rows(raw_data)
+            )
+            if system_id
+            for host in [self._auto_quantastor_host_for_system(system_id, raw_data)]
+            if host
+        }
         presence_hints = self._build_quantastor_presence_hints(raw_data)
         pool_index = {
             normalize_text(str(pool.get("id")) if pool.get("id") is not None else None): pool
@@ -5130,6 +5202,15 @@ class InventoryService:
                 "ownership_revision": raw_disk.get("ownershipRevision"),
                 "notes": notes,
             }
+            slot_view.raw_status.update(
+                {
+                    "quantastor_pool_owner_system_id": pool_owner_id,
+                    "quantastor_fence_owner_system_id": fence_owner_id,
+                    "quantastor_presented_by_system_id": presented_by_id,
+                    "quantastor_pool_device_system_id": pool_device_node_id,
+                    "quantastor_ssh_hosts_by_system_id": hosts_by_system,
+                }
+            )
 
     @staticmethod
     def _quantastor_bool(value: Any) -> bool:
@@ -5859,11 +5940,29 @@ class InventoryService:
     def _quantastor_hw_enclosure_rows(raw_data: TrueNASRawData) -> list[dict[str, Any]]:
         return raw_data.cli_hw_enclosures or raw_data.hw_enclosures
 
-    async def _fetch_quantastor_cli_overlay(self) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    def _quantastor_no_node_ssh_host_failures(self, raw_data: TrueNASRawData | None = None) -> list[str]:
+        ha_context = bool(
+            self.system.ssh.ha_enabled
+            or self.system.ssh.ha_nodes
+            or (raw_data is not None and self._quantastor_has_cluster_peers(raw_data))
+        )
+        if not self.system.ssh.enabled or not ha_context:
+            return []
+        return [
+            "Quantastor SSH enrichment is enabled, but no node SSH host is configured "
+            "or discoverable for this HA system; configure HA node hosts or a non-shared SSH host. "
+            "REST data is still being used."
+        ]
+
+    async def _fetch_quantastor_cli_overlay(
+        self,
+        raw_data: TrueNASRawData | None = None,
+    ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
         overlay = {
             "cli_disks": [],
             "cli_hw_disks": [],
             "cli_hw_enclosures": [],
+            "cli_network_ports": [],
         }
         best_overlay = dict(overlay)
         best_score = 0
@@ -5873,25 +5972,30 @@ class InventoryService:
             ("disk-list", "disk inventory", "cli_disks"),
             ("hw-disk-list", "hardware disk inventory", "cli_hw_disks"),
             ("hw-enclosure-list", "hardware enclosure inventory", "cli_hw_enclosures"),
+            ("network-port-list", "network port inventory", "cli_network_ports"),
         )
+        hosts = self._build_quantastor_ssh_hosts(raw_data)
+        if not hosts:
+            return overlay, self._quantastor_no_node_ssh_host_failures(raw_data)
 
-        for host in self._build_quantastor_ssh_hosts():
+        for host in hosts:
             host_overlay = {
                 "cli_disks": [],
                 "cli_hw_disks": [],
                 "cli_hw_enclosures": [],
+                "cli_network_ports": [],
             }
             host_failures: list[str] = []
+            commands = [self._build_quantastor_cli_command(subcommand) for subcommand, _label, _target in target_specs]
+            command_results = await self._run_ssh_commands(commands, host)
 
-            for subcommand, label, target in target_specs:
-                result = await self._run_ssh_command(self._build_quantastor_cli_command(subcommand), host)
+            for (_subcommand, label, target), result in zip(target_specs, command_results):
                 if not result.ok:
                     detail = normalize_text(result.stderr) or normalize_text(result.stdout) or f"exit {result.exit_code}"
                     host_failures.append(f"Quantastor SSH CLI {label} failed on {host}: {detail}")
                     continue
-                try:
-                    payload = json.loads(result.stdout)
-                except json.JSONDecodeError:
+                payload = self._parse_quantastor_cli_json(result.stdout)
+                if payload is None:
                     host_failures.append(f"Quantastor SSH CLI {label} returned invalid JSON on {host}.")
                     continue
                 rows = QuantastorRESTClient._ensure_list(payload)
@@ -5917,9 +6021,15 @@ class InventoryService:
         self._quantastor_preferred_ses_host = best_host
         return best_overlay, []
 
-    async def _fetch_quantastor_ses_overlay(self) -> tuple[ParsedSSHData, list[str]]:
+    async def _fetch_quantastor_ses_overlay(
+        self,
+        raw_data: TrueNASRawData | None = None,
+    ) -> tuple[ParsedSSHData, list[str]]:
+        hosts = self._build_quantastor_ssh_hosts(raw_data)
+        if not hosts:
+            return ParsedSSHData(), self._quantastor_no_node_ssh_host_failures(raw_data)
         overlay, failures, best_host = await self._fetch_sg_ses_overlay(
-            self._build_quantastor_ssh_hosts(),
+            hosts,
             failure_prefix="Quantastor SSH SES",
             merge_hosts=True,
         )
@@ -6006,9 +6116,21 @@ class InventoryService:
     ) -> tuple[ParsedSSHData, list[str]]:
         host_overlay = ParsedSSHData()
         host_failures: list[str] = []
+        device_commands: dict[str, tuple[str, str, str]] = {}
+        commands: list[str] = []
         for device in devices:
             aes_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "aes", device])
-            aes_result = await self._run_ssh_command(aes_command, host)
+            ec_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "ec", device])
+            join_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "--join", "--filter", device])
+            device_commands[device] = (aes_command, ec_command, join_command)
+            commands.extend([aes_command, ec_command, join_command])
+
+        command_results = {result.command: result for result in await self._run_ssh_commands(commands, host)}
+        for device, (aes_command, ec_command, join_command) in device_commands.items():
+            aes_result = command_results.get(
+                aes_command,
+                SSHCommandResult(command=aes_command, ok=False, stderr="SSH command result missing.", exit_code=255),
+            )
             if not aes_result.ok:
                 detail = normalize_text(aes_result.stderr) or normalize_text(aes_result.stdout) or (
                     f"exit {aes_result.exit_code}"
@@ -6017,13 +6139,11 @@ class InventoryService:
                 continue
 
             outputs = {aes_command: aes_result.stdout}
-            ec_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "ec", device])
-            ec_result = await self._run_ssh_command(ec_command, host)
-            if ec_result.ok:
+            ec_result = command_results.get(ec_command)
+            if ec_result is not None and ec_result.ok:
                 outputs[ec_command] = ec_result.stdout
-            join_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "--join", "--filter", device])
-            join_result = await self._run_ssh_command(join_command, host)
-            if join_result.ok:
+            join_result = command_results.get(join_command)
+            if join_result is not None and join_result.ok:
                 outputs[join_command] = join_result.stdout
 
             parsed = parse_ssh_outputs(outputs, self.settings.layout.slot_count, None, None)
@@ -6105,16 +6225,34 @@ class InventoryService:
                 hosts.append(host)
         return hosts
 
-    def _build_quantastor_ssh_hosts(self) -> list[str]:
-        return self._build_configured_quantastor_hosts()
+    def _build_quantastor_ssh_hosts(self, raw_data: TrueNASRawData | None = None) -> list[str]:
+        return self._build_configured_quantastor_hosts(raw_data=raw_data)
 
-    def _build_quantastor_preferred_hosts(self, slot_view: SlotView | None = None) -> list[str]:
+    def _build_quantastor_preferred_hosts(
+        self,
+        slot_view: SlotView | None = None,
+        raw_data: TrueNASRawData | None = None,
+    ) -> list[str]:
         hosts: list[str] = []
-        target_system_id = normalize_text(
-            slot_view.raw_status.get("target_system_id")
-            if slot_view and isinstance(slot_view.raw_status, dict)
-            else None
-        )
+        preferred_system_ids: list[str] = []
+        if slot_view and isinstance(slot_view.raw_status, dict):
+            for key in (
+                "quantastor_pool_owner_system_id",
+                "target_system_id",
+                "quantastor_pool_device_system_id",
+                "quantastor_presented_by_system_id",
+                "quantastor_fence_owner_system_id",
+            ):
+                raw_system_id = slot_view.raw_status.get(key)
+                system_id = normalize_text(str(raw_system_id) if raw_system_id is not None else None)
+                if system_id and system_id not in preferred_system_ids:
+                    preferred_system_ids.append(system_id)
+        for system_id in preferred_system_ids:
+            host = self._configured_quantastor_host_for_system(system_id, raw_data=raw_data)
+            if not host:
+                host = self._quantastor_slot_host_for_system(slot_view, system_id)
+            if host and host not in hosts:
+                hosts.append(host)
         if slot_view:
             for target in slot_view.ssh_ses_targets:
                 if not isinstance(target, dict):
@@ -6122,13 +6260,18 @@ class InventoryService:
                 host = normalize_text(target.get("ssh_host"))
                 if host and host not in hosts:
                     hosts.append(host)
-        for value in self._build_configured_quantastor_hosts(preferred_system_id=target_system_id):
+        for value in self._build_configured_quantastor_hosts(raw_data=raw_data):
             host = normalize_text(value)
             if host and host not in hosts:
                 hosts.append(host)
         return hosts
 
-    def _configured_quantastor_host_for_system(self, system_id: str | None) -> str | None:
+    def _configured_quantastor_host_for_system(
+        self,
+        system_id: str | None,
+        *,
+        raw_data: TrueNASRawData | None = None,
+    ) -> str | None:
         normalized_system_id = normalize_text(system_id)
         if not normalized_system_id:
             return None
@@ -6137,31 +6280,336 @@ class InventoryService:
             node_host = normalize_text(node.host)
             if node_system_id == normalized_system_id and node_host:
                 return node_host
-        return None
+        return self._auto_quantastor_host_for_system(normalized_system_id, raw_data)
 
     def _build_configured_quantastor_hosts(
         self,
         *,
         preferred_system_id: str | None = None,
+        raw_data: TrueNASRawData | None = None,
     ) -> list[str]:
         hosts: list[str] = []
-        preferred_host = self._configured_quantastor_host_for_system(preferred_system_id)
+        preferred_host = self._configured_quantastor_host_for_system(preferred_system_id, raw_data=raw_data)
         explicit_hosts = [
             normalize_text(node.host)
             for node in (self.system.ssh.ha_nodes or [])
             if normalize_text(node.host)
         ]
-        for value in [
-            self._quantastor_preferred_ses_host,
-            preferred_host,
-            self.system.ssh.host,
-            *explicit_hosts,
-            *(self.system.ssh.extra_hosts or []),
-        ]:
+        auto_hosts = self._auto_quantastor_ssh_hosts(raw_data)
+        api_host = self._quantastor_api_endpoint_host()
+        skip_api_host = bool(
+            self.system.ssh.ha_enabled
+            or self.system.ssh.ha_nodes
+            or (raw_data is not None and self._quantastor_has_cluster_peers(raw_data))
+        )
+        ordered_hosts = (
+            [
+                self._quantastor_preferred_ses_host,
+                preferred_host,
+                *explicit_hosts,
+                *auto_hosts,
+                *(self.system.ssh.extra_hosts or []),
+                self.system.ssh.host,
+            ]
+            if skip_api_host
+            else [
+                self._quantastor_preferred_ses_host,
+                preferred_host,
+                self.system.ssh.host,
+                *explicit_hosts,
+                *auto_hosts,
+                *(self.system.ssh.extra_hosts or []),
+            ]
+        )
+        for value in ordered_hosts:
             host = normalize_text(value)
+            if host and skip_api_host and self._quantastor_hosts_match(host, api_host):
+                continue
             if host and host not in hosts:
                 hosts.append(host)
         return hosts
+
+    def _auto_quantastor_ssh_hosts(self, raw_data: TrueNASRawData | None = None) -> list[str]:
+        hosts: list[str] = []
+        api_host = self._quantastor_api_endpoint_host()
+        for system_hosts in self._quantastor_gateway_hosts_by_system(raw_data).values():
+            for host in system_hosts:
+                if self._quantastor_hosts_match(host, api_host):
+                    continue
+                if host not in hosts:
+                    hosts.append(host)
+        for system_row in self._quantastor_cluster_node_rows(raw_data):
+            for host in self._extract_quantastor_system_hosts(system_row):
+                if self._quantastor_hosts_match(host, api_host):
+                    continue
+                if host not in hosts:
+                    hosts.append(host)
+        return hosts
+
+    def _auto_quantastor_host_for_system(
+        self,
+        system_id: str | None,
+        raw_data: TrueNASRawData | None = None,
+    ) -> str | None:
+        normalized_system_id = normalize_text(system_id)
+        if not normalized_system_id:
+            return None
+        api_host = self._quantastor_api_endpoint_host()
+        for host in self._quantastor_gateway_hosts_by_system(raw_data).get(normalized_system_id, []):
+            if self._quantastor_hosts_match(host, api_host):
+                continue
+            return host
+        for system_row in self._quantastor_cluster_node_rows(raw_data):
+            row_system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
+            if row_system_id != normalized_system_id:
+                continue
+            for host in self._extract_quantastor_system_hosts(system_row):
+                if self._quantastor_hosts_match(host, api_host):
+                    continue
+                return host
+        return None
+
+    def _quantastor_slot_host_for_system(self, slot_view: SlotView | None, system_id: str | None) -> str | None:
+        normalized_system_id = normalize_text(system_id)
+        if not normalized_system_id or not slot_view or not isinstance(slot_view.raw_status, dict):
+            return None
+        hosts_by_system = slot_view.raw_status.get("quantastor_ssh_hosts_by_system_id")
+        if not isinstance(hosts_by_system, dict):
+            return None
+        host = hosts_by_system.get(normalized_system_id)
+        return normalize_text(str(host) if host is not None else None)
+
+    def _quantastor_cluster_node_rows(self, raw_data: TrueNASRawData | None = None) -> list[dict[str, Any]]:
+        return self._quantastor_cluster_node_rows_from_raw(raw_data)
+
+    @classmethod
+    def _quantastor_gateway_hosts_by_system(
+        cls,
+        raw_data: TrueNASRawData | None = None,
+    ) -> dict[str, list[str]]:
+        if raw_data is None:
+            return {}
+        result: dict[str, list[str]] = {}
+        cluster_node_ids = {
+            normalize_text(str(row.get("id")) if row.get("id") is not None else None)
+            for row in cls._quantastor_cluster_node_rows_from_raw(raw_data)
+        }
+        for row in getattr(raw_data, "cli_network_ports", []) or []:
+            if not isinstance(row, dict):
+                continue
+            system_id = normalize_text(
+                str(
+                    row.get("storageSystemId")
+                    or row.get("storage_system_id")
+                    or row.get("systemId")
+                    or row.get("system_id")
+                )
+                if (
+                    row.get("storageSystemId")
+                    or row.get("storage_system_id")
+                    or row.get("systemId")
+                    or row.get("system_id")
+                )
+                is not None
+                else None
+            )
+            if not system_id or (cluster_node_ids and system_id not in cluster_node_ids):
+                continue
+            host = cls._extract_quantastor_gateway_port_host(row)
+            if not host:
+                continue
+            result.setdefault(system_id, [])
+            if host not in result[system_id]:
+                result[system_id].append(host)
+        return result
+
+    @classmethod
+    def _quantastor_cluster_node_rows_from_raw(cls, raw_data: TrueNASRawData | None = None) -> list[dict[str, Any]]:
+        if raw_data is None:
+            return []
+        system_rows = [row for row in raw_data.systems if isinstance(row, dict)]
+        if not system_rows:
+            return []
+
+        hardware_system_ids = {
+            system_id
+            for system_id in (
+                normalize_text(str(item.get("storageSystemId")) if item.get("storageSystemId") is not None else None)
+                for item in [*(raw_data.cli_hw_disks or raw_data.hw_disks), *(raw_data.cli_hw_enclosures or raw_data.hw_enclosures)]
+                if isinstance(item, dict)
+            )
+            if system_id
+        }
+        hardware_cluster_ids = {
+            normalize_text(str(row.get("storageSystemClusterId")) if row.get("storageSystemClusterId") is not None else None)
+            for row in system_rows
+            if normalize_text(str(row.get("id")) if row.get("id") is not None else None) in hardware_system_ids
+        }
+        hardware_cluster_ids.discard(None)
+
+        if hardware_cluster_ids:
+            cluster_rows = [
+                row
+                for row in system_rows
+                if normalize_text(str(row.get("storageSystemClusterId")) if row.get("storageSystemClusterId") is not None else None)
+                in hardware_cluster_ids
+            ]
+            node_rows = [
+                row
+                for row in cluster_rows
+                if normalize_text(str(row.get("id")) if row.get("id") is not None else None) in hardware_system_ids
+            ]
+            return node_rows or cluster_rows
+
+        cluster_members: dict[str, list[dict[str, Any]]] = {}
+        for row in system_rows:
+            cluster_id = normalize_text(
+                str(row.get("storageSystemClusterId")) if row.get("storageSystemClusterId") is not None else None
+            )
+            if cluster_id:
+                cluster_members.setdefault(cluster_id, []).append(row)
+        return [
+            row
+            for rows in cluster_members.values()
+            if len(rows) > 1
+            for row in rows
+        ]
+
+    @classmethod
+    def _extract_quantastor_gateway_port_host(cls, row: dict[str, Any]) -> str | None:
+        if not cls._quantastor_network_port_has_default_gateway(row):
+            return None
+        for key in ("ipAddress", "ipAddr", "ip", "address", "hostAddress"):
+            host = cls._normalize_host_identity(str(row.get(key)) if row.get(key) is not None else None)
+            if not host or cls._quantastor_unusable_auto_host(host):
+                continue
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                continue
+            return host
+        return None
+
+    @staticmethod
+    def _quantastor_network_port_has_default_gateway(row: dict[str, Any]) -> bool:
+        for key in (
+            "gateway",
+            "defaultGateway",
+            "defaultGatewayIp",
+            "defaultGatewayIPAddress",
+            "gatewayAddress",
+            "gatewayIpAddress",
+            "gatewayIPAddress",
+        ):
+            value = normalize_text(str(row.get(key)) if row.get(key) is not None else None)
+            if value and value not in {"0.0.0.0", "::"}:
+                return True
+        for key in ("isDefaultGateway", "defaultRoute", "isDefaultRoute", "isGateway"):
+            value = row.get(key)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return value != 0
+            text = normalize_text(str(value) if value is not None else None)
+            if text and text.lower() in {"1", "true", "yes", "y", "default"}:
+                return True
+        return False
+
+    @classmethod
+    def _extract_quantastor_system_hosts(cls, system_row: dict[str, Any]) -> list[str]:
+        host_keys = (
+            "sshHost",
+            "sshHostname",
+            "sshIpAddress",
+            "sshIPAddress",
+            "sshIp",
+            "mainIpAddress",
+            "mainIPAddress",
+            "mainIp",
+            "managementIpAddress",
+            "managementIPAddress",
+            "managementIp",
+            "mgmtIpAddress",
+            "mgmtIPAddress",
+            "mgmtIp",
+            "ipAddress",
+            "ipAddr",
+            "ip",
+            "hostAddress",
+            "hostIpAddress",
+            "hostIPAddress",
+            "hostname",
+            "hostName",
+            "externalHostName",
+        )
+        nested_keys = (
+            "ipAddresses",
+            "ipAddressList",
+            "managementIpAddresses",
+            "managementAddresses",
+            "networkInterfaces",
+            "interfaces",
+            "nics",
+            "networks",
+            "addresses",
+        )
+        hosts: list[str] = []
+
+        def add_host(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, dict):
+                for key in (*host_keys, "address", "addr"):
+                    if key in value:
+                        add_host(value.get(key))
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add_host(item)
+                return
+            text = normalize_text(str(value))
+            if not text:
+                return
+            normalized = cls._normalize_host_identity(text)
+            if not normalized or cls._quantastor_unusable_auto_host(normalized):
+                return
+            if normalized not in hosts:
+                hosts.append(normalized)
+
+        for key in host_keys:
+            add_host(system_row.get(key))
+        for key in nested_keys:
+            add_host(system_row.get(key))
+        return hosts
+
+    @staticmethod
+    def _quantastor_unusable_auto_host(host: str | None) -> bool:
+        normalized = normalize_text(host)
+        if not normalized:
+            return True
+        lowered = normalized.lower()
+        return lowered in {"localhost", "localhost.localdomain", "127.0.0.1", "::1", "0.0.0.0", "::", "*"}
+
+    def _quantastor_api_endpoint_host(self) -> str | None:
+        return self._normalize_host_identity(self.system.truenas.host)
+
+    @classmethod
+    def _quantastor_hosts_match(cls, left: str | None, right: str | None) -> bool:
+        left_identity = cls._normalize_host_identity(left)
+        right_identity = cls._normalize_host_identity(right)
+        return bool(left_identity and right_identity and left_identity == right_identity)
+
+    @staticmethod
+    def _normalize_host_identity(value: str | None) -> str | None:
+        host = normalize_text(value)
+        if not host:
+            return None
+        target = host if "://" in host else f"//{host}"
+        parsed = urlsplit(target)
+        identity = parsed.hostname
+        if not identity and parsed.path and "/" not in parsed.path:
+            identity = parsed.path
+        return identity.lower() if identity else None
 
     @staticmethod
     def _merge_quantastor_ses_candidate(target: dict[str, Any], ses_candidate: Any) -> None:
@@ -6296,6 +6744,63 @@ class InventoryService:
         if server_spec:
             args.append(f"--server={server_spec}")
         return shlex.join(args)
+
+    @staticmethod
+    def _parse_quantastor_cli_json(stdout: str) -> Any | None:
+        try:
+            return json.loads(stdout)
+        except json.JSONDecodeError:
+            pass
+        # Some qs commands, notably network-port-list on some appliances, emit
+        # otherwise valid JSON with trailing commas. Keep the compatibility
+        # shim narrow so normal parser failures still surface as failures.
+        sanitized = re.sub(r",(\s*[\]}])", r"\1", stdout)
+        if sanitized != stdout:
+            try:
+                return json.loads(sanitized)
+            except json.JSONDecodeError:
+                pass
+        loose_rows = InventoryService._parse_quantastor_cli_loose_object_list(stdout)
+        return loose_rows or None
+
+    @staticmethod
+    def _parse_quantastor_cli_loose_object_list(stdout: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = None
+
+        def flush_current() -> None:
+            nonlocal current
+            if current:
+                rows.append(current)
+            current = None
+
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            if stripped in {"[", "]", ""}:
+                continue
+            if stripped.startswith("{"):
+                if current:
+                    flush_current()
+                current = {}
+                continue
+            if stripped.startswith("}"):
+                flush_current()
+                continue
+            if current is None:
+                continue
+            match = re.match(r'"([^"]+)"\s*:\s*(.*?)(?:,)?$', stripped)
+            if not match:
+                continue
+            key = match.group(1)
+            raw_value = match.group(2).strip()
+            try:
+                value = json.loads(raw_value)
+            except json.JSONDecodeError:
+                value = raw_value.strip('"')
+            current[key] = value
+
+        flush_current()
+        return rows
 
     def _build_quantastor_cli_server_spec(self) -> str | None:
         api_user = normalize_text(self.system.truenas.api_user)
@@ -8498,12 +9003,85 @@ class InventoryService:
             raise TrueNASAPIError("SSH LED action failed: " + detail)
 
     async def _run_ssh_command(self, command: str, host: str | None = None) -> Any:
-        target_host = normalize_text(host)
-        if not target_host or target_host == normalize_text(self.system.ssh.host):
-            return await self.ssh_probe.run_command(command)
+        if isinstance(self.ssh_probe, SSHProbe):
+            async with self._ssh_session_lock:
+                target_host = normalize_text(host)
+                if not target_host or target_host == normalize_text(self.system.ssh.host):
+                    return await self.ssh_probe.run_command(command)
 
-        probe = SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
-        return await probe.run_command(command)
+                probe = SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
+                return await probe.run_command(command)
+
+        return await self.ssh_probe.run_command(command)
+
+    def _optional_ssh_backoff_key(self, host: str | None = None) -> str:
+        return normalize_text(host) or normalize_text(self.system.ssh.host) or "__default__"
+
+    def _optional_ssh_backoff_failure_results(
+        self,
+        commands: Iterable[str],
+        host: str | None = None,
+    ) -> list[SSHCommandResult] | None:
+        key = self._optional_ssh_backoff_key(host)
+        backoff_until = self._optional_ssh_backoff_until.get(key)
+        if backoff_until is None or utcnow() >= backoff_until:
+            return None
+        message = (
+            "Skipping optional SSH command batch after a recent connection startup failure; "
+            f"retry after {backoff_until.isoformat()}."
+        )
+        return [
+            SSHCommandResult(command=command, ok=False, stderr=message, exit_code=255)
+            for command in commands
+        ]
+
+    def _record_optional_ssh_batch_failure(self, results: list[SSHCommandResult], host: str | None = None) -> None:
+        if not self._is_ssh_connection_startup_failure(results):
+            return
+        key = self._optional_ssh_backoff_key(host)
+        self._optional_ssh_backoff_until[key] = utcnow() + timedelta(
+            seconds=OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS
+        )
+        logger.warning(
+            "Optional SSH command batches for %s are paused for %ss after a connection startup failure.",
+            key,
+            OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS,
+        )
+
+    @staticmethod
+    def _is_ssh_connection_startup_failure(results: list[SSHCommandResult]) -> bool:
+        if not results:
+            return False
+        if not all((not result.ok and result.exit_code == 255) for result in results):
+            return False
+        details = " ".join(
+            f"{normalize_text(result.stderr)} {normalize_text(result.stdout)}".lower()
+            for result in results
+        )
+        return any(marker in details for marker in SSH_CONNECTION_FAILURE_MARKERS)
+
+    async def _run_ssh_commands(self, commands: Iterable[str], host: str | None = None) -> list[SSHCommandResult]:
+        command_list = list(commands)
+        if not command_list:
+            return []
+
+        backoff_results = self._optional_ssh_backoff_failure_results(command_list, host)
+        if backoff_results is not None:
+            return backoff_results
+
+        if isinstance(self.ssh_probe, SSHProbe):
+            async with self._ssh_session_lock:
+                target_host = normalize_text(host)
+                if not target_host or target_host == normalize_text(self.system.ssh.host):
+                    results = await self.ssh_probe.run_commands(command_list)
+                else:
+                    probe = SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
+                    results = await probe.run_commands(command_list)
+            self._record_optional_ssh_batch_failure(results, host)
+            if results:
+                return results
+
+        return [await self._run_ssh_command(command, host) for command in command_list]
 
     @staticmethod
     def _merge_enclosure_meta(

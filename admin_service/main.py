@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import shlex
 import signal
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,7 @@ from admin_service.services.runtime_control import DockerRuntimeError, DockerRun
 from admin_service.services.tls_trust import TLSTrustStoreService
 from app import __version__
 from app.config import (
+    SSHConfig,
     Settings,
     TrueNASConfig,
     get_settings,
@@ -51,11 +53,13 @@ from app.models.domain import (
 )
 from app.services.profile_builder import ProfileBuilderService, collect_profile_references
 from app.services.demo_system_factory import DemoSystemFactory
+from app.services.inventory import InventoryService
 from app.services.profile_registry import ProfileRegistry
 from app.services.inventory_registry import InventoryRegistry
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.release_status import ReleaseStatusService, describe_release_status
 from app.services.ssh_key_manager import SSHKeyManager
+from app.services.ssh_probe import SSHProbe
 from app.services.storage_view_templates import list_storage_view_templates
 from app.services.storage_views import resolve_system_storage_views
 from app.services.system_setup import (
@@ -530,7 +534,9 @@ def create_app() -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - surface discovery failures directly in setup.
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         nodes = serialize_quantastor_nodes(raw_data)
-        return JSONResponse({"ok": True, "nodes": nodes})
+        merge_quantastor_node_hosts(nodes, quantastor_request_node_host_map(payload))
+        host_discovery = await enrich_quantastor_nodes_from_ssh(payload, raw_data, nodes)
+        return JSONResponse({"ok": True, "nodes": nodes, "host_discovery": host_discovery})
 
     @app.post("/api/admin/system-setup")
     async def create_system(payload: SystemSetupRequest) -> JSONResponse:
@@ -1246,6 +1252,7 @@ def serialize_quantastor_nodes(raw_data: Any) -> list[dict[str, Any]]:
         )
         if system_id
     }
+    gateway_hosts_by_system = InventoryService._quantastor_gateway_hosts_by_system(raw_data)
     nodes: list[dict[str, Any]] = []
     for system_row in getattr(raw_data, "systems", []) or []:
         system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
@@ -1253,6 +1260,10 @@ def serialize_quantastor_nodes(raw_data: Any) -> list[dict[str, Any]]:
             continue
         if hardware_system_ids and system_id not in hardware_system_ids:
             continue
+        hosts = [
+            *gateway_hosts_by_system.get(system_id, []),
+            *InventoryService._extract_quantastor_system_hosts(system_row),
+        ]
         nodes.append(
             {
                 "system_id": system_id,
@@ -1262,7 +1273,7 @@ def serialize_quantastor_nodes(raw_data: Any) -> list[dict[str, Any]]:
                     )
                     or system_id
                 ),
-                "host": normalize_text(system_row.get("hostname") or system_row.get("ipAddress")),
+                "host": next((host for index, host in enumerate(hosts) if host and host not in hosts[:index]), None),
                 "cluster_id": normalize_text(
                     str(system_row.get("storageSystemClusterId"))
                     if system_row.get("storageSystemClusterId") is not None
@@ -1272,6 +1283,168 @@ def serialize_quantastor_nodes(raw_data: Any) -> list[dict[str, Any]]:
             }
         )
     return nodes
+
+
+async def enrich_quantastor_nodes_from_ssh(
+    payload: QuantastorNodeDiscoveryRequest,
+    raw_data: Any,
+    nodes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    missing_hosts = [node for node in nodes if not normalize_text(node.get("host"))]
+    if not missing_hosts:
+        return {"attempted": False, "ok": True, "message": "All discovered Quantastor nodes already include SSH hosts."}
+    if not payload.ssh_enabled:
+        return {
+            "attempted": False,
+            "ok": False,
+            "message": "Quantastor REST did not publish node SSH hosts; enable SSH enrichment to try node interface discovery.",
+        }
+    if not payload.ssh_user:
+        return {
+            "attempted": False,
+            "ok": False,
+            "message": "Quantastor REST did not publish node SSH hosts; enter an SSH user to try node interface discovery.",
+        }
+    if not payload.ssh_key_path and not payload.ssh_password:
+        return {
+            "attempted": False,
+            "ok": False,
+            "message": "Quantastor REST did not publish node SSH hosts; select an SSH key or password to try node interface discovery.",
+        }
+
+    seed_hosts = quantastor_node_discovery_seed_hosts(payload)
+    if not seed_hosts:
+        return {
+            "attempted": False,
+            "ok": False,
+            "message": (
+                "Quantastor REST did not publish node SSH hosts and no safe node SSH seed is filled. "
+                "Enter at least one HA node SSH host, then load nodes again."
+            ),
+        }
+
+    command = build_quantastor_network_port_list_command(payload)
+    failures: list[str] = []
+    for seed_host in seed_hosts:
+        ssh_config = SSHConfig(
+            enabled=True,
+            host=seed_host,
+            port=payload.ssh_port,
+            user=payload.ssh_user or "",
+            key_path=payload.ssh_key_path or "",
+            password=payload.ssh_password or "",
+            known_hosts_path=payload.ssh_known_hosts_path,
+            strict_host_key_checking=payload.ssh_strict_host_key_checking,
+            timeout_seconds=payload.ssh_timeout_seconds,
+            commands=[],
+        )
+        try:
+            results = await SSHProbe(ssh_config).run_commands([command])
+        except Exception as exc:  # noqa: BLE001 - keep discovery helper best-effort.
+            logger.warning("Quantastor HA node host discovery failed on %s: %s", seed_host, exc)
+            failures.append(f"{seed_host}: {exc}")
+            continue
+        result = results[0] if results else None
+        if result is None or not result.ok:
+            detail = normalize_text(getattr(result, "stderr", None)) or normalize_text(getattr(result, "stdout", None))
+            failures.append(f"{seed_host}: {detail or 'network-port-list failed'}")
+            continue
+        parsed = InventoryService._parse_quantastor_cli_json(result.stdout)
+        rows = ensure_quantastor_rows(parsed)
+        if not rows:
+            failures.append(f"{seed_host}: network-port-list returned no usable rows")
+            continue
+        raw_data.cli_network_ports = rows
+        host_map = InventoryService._quantastor_gateway_hosts_by_system(raw_data)
+        filled = merge_quantastor_node_hosts(nodes, host_map)
+        if filled:
+            return {
+                "attempted": True,
+                "ok": True,
+                "seed_host": seed_host,
+                "filled_hosts": filled,
+                "message": (
+                    f"Filled {filled} Quantastor HA node SSH host"
+                    f"{'' if filled == 1 else 's'} from default-gateway interface data."
+                ),
+            }
+        failures.append(f"{seed_host}: no default-gateway node IPs matched discovered HA nodes")
+
+    return {
+        "attempted": True,
+        "ok": False,
+        "seed_hosts": seed_hosts,
+        "message": "Quantastor REST did not publish node SSH hosts and SSH interface discovery did not fill them.",
+        "failures": failures[:3],
+    }
+
+
+def quantastor_node_discovery_seed_hosts(payload: QuantastorNodeDiscoveryRequest) -> list[str]:
+    api_host = InventoryService._normalize_host_identity(payload.truenas_host)
+    hosts: list[str] = []
+    for node in payload.ha_nodes or []:
+        host = InventoryService._normalize_host_identity(node.host)
+        if host and not InventoryService._quantastor_hosts_match(host, api_host) and host not in hosts:
+            hosts.append(host)
+    ssh_host = InventoryService._normalize_host_identity(payload.ssh_host)
+    if ssh_host and not InventoryService._quantastor_hosts_match(ssh_host, api_host) and ssh_host not in hosts:
+        hosts.append(ssh_host)
+    return hosts
+
+
+def quantastor_request_node_host_map(payload: QuantastorNodeDiscoveryRequest) -> dict[str, list[str]]:
+    host_map: dict[str, list[str]] = {}
+    api_host = InventoryService._normalize_host_identity(payload.truenas_host)
+    for node in payload.ha_nodes or []:
+        system_id = normalize_text(node.system_id)
+        host = InventoryService._normalize_host_identity(node.host)
+        if not system_id or not host or InventoryService._quantastor_hosts_match(host, api_host):
+            continue
+        host_map.setdefault(system_id, [])
+        if host not in host_map[system_id]:
+            host_map[system_id].append(host)
+    return host_map
+
+
+def build_quantastor_network_port_list_command(payload: QuantastorNodeDiscoveryRequest) -> str:
+    args = ["/usr/bin/qs", "network-port-list", "--json"]
+    if payload.api_user and payload.api_password:
+        args.append(f"--server=localhost,{payload.api_user},{payload.api_password}")
+    return shlex.join(args)
+
+
+def ensure_quantastor_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("result", "list", "items", "objects", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        if all(isinstance(value, dict) for value in payload.values()):
+            return [value for value in payload.values() if isinstance(value, dict)]
+        if payload:
+            return [payload]
+    return []
+
+
+def merge_quantastor_node_hosts(nodes: list[dict[str, Any]], host_map: dict[str, list[str]]) -> int:
+    by_system_id = {
+        normalize_text(node.get("system_id")): node
+        for node in nodes
+        if normalize_text(node.get("system_id"))
+    }
+    filled = 0
+    for system_id, hosts in host_map.items():
+        node = by_system_id.get(system_id)
+        if not node or normalize_text(node.get("host")):
+            continue
+        host = next((normalize_text(item) for item in hosts if normalize_text(item)), None)
+        if not host:
+            continue
+        node["host"] = host
+        filled += 1
+    return filled
 
 
 def serialize_platform_defaults() -> dict[str, dict[str, object]]:

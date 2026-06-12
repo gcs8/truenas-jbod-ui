@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.config import BMCConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig
+from app.config import BMCConfig, HANodeConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
     EnclosureOption,
     InventorySummary,
@@ -47,7 +47,7 @@ from app.services.profile_registry import (
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 )
-from app.services.ssh_probe import SSHCommandResult
+from app.services.ssh_probe import SSHCommandResult, SSHProbe
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.storage_views import resolve_system_storage_views
 from app.services.storage_view_templates import get_storage_view_template
@@ -463,6 +463,28 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(details[0]["exit_code"], 127)
         self.assertIn("command not found", details[0]["stderr"])
 
+    def test_ssh_failure_warnings_and_details_redact_inline_command_secrets(self) -> None:
+        command_results = [
+            SSHCommandResult(
+                command="/usr/bin/qs disk-list --json '--server=localhost,jbodmap,super-secret'",
+                ok=False,
+                stderr="permission denied",
+                exit_code=27,
+            )
+        ]
+
+        warnings, status_message = InventoryService._summarize_ssh_failures(command_results, {})
+        details = InventoryService._ssh_failure_details(command_results)
+
+        warning_text = "\n".join(warnings)
+        self.assertEqual(status_message, "Some SSH commands failed.")
+        self.assertIn("--server=localhost,jbodmap,***", warning_text)
+        self.assertNotIn("super-secret", warning_text)
+        self.assertIn("--server=localhost,jbodmap,***", details[0]["command"])
+        self.assertIn("--server=localhost,jbodmap,***", details[0]["canonical_command"])
+        self.assertNotIn("super-secret", details[0]["command"])
+        self.assertNotIn("super-secret", details[0]["canonical_command"])
+
     def test_suppress_scale_configured_sg_ses_failures_keeps_other_ssh_warnings(self) -> None:
         sg_ses_failure = "SSH command failed: sudo -n /usr/bin/sg_ses -p aes /dev/sg27 (exit 5)"
         smart_failure = "SSH command failed: smartctl -x -j /dev/sda (exit 2)"
@@ -687,7 +709,7 @@ class InventoryHelpersTests(unittest.TestCase):
                 id="esxi-ft-node-2",
                 label="esxi-ft-node-2",
                 truenas=TrueNASConfig(platform="esxi"),
-                ssh=SSHConfig(enabled=True, host="10.13.37.121", user="root"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.121", user="root"),
             )
             settings = Settings(systems=[system])
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
@@ -728,7 +750,7 @@ class InventoryHelpersTests(unittest.TestCase):
                 label="generic-esxi-nvme",
                 truenas=TrueNASConfig(platform="esxi"),
                 default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
-                ssh=SSHConfig(enabled=True, host="10.13.37.122", user="root"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.122", user="root"),
             )
             settings = Settings(systems=[system])
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
@@ -767,7 +789,7 @@ class InventoryHelpersTests(unittest.TestCase):
                 id="esxi-ft-node-2",
                 label="esxi-ft-node-2",
                 truenas=TrueNASConfig(platform="esxi"),
-                ssh=SSHConfig(enabled=True, host="10.13.37.121", user="root"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.121", user="root"),
             )
             settings = Settings(systems=[system])
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
@@ -865,7 +887,7 @@ class InventoryHelpersTests(unittest.TestCase):
                 id="esxi-ft-node-2",
                 label="esxi-ft-node-2",
                 truenas=TrueNASConfig(platform="esxi"),
-                ssh=SSHConfig(enabled=True, host="10.13.37.121", user="root"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.121", user="root"),
             )
             settings = Settings(systems=[system])
             probe = DummySSHProbe()
@@ -1111,7 +1133,7 @@ class InventoryHelpersTests(unittest.TestCase):
                 id="esxi-ft-node-2",
                 label="esxi-ft-node-2",
                 truenas=TrueNASConfig(platform="esxi"),
-                ssh=SSHConfig(enabled=True, host="10.13.37.121", user="root"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.121", user="root"),
             )
             settings = Settings(systems=[system])
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
@@ -1715,25 +1737,25 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 return InventorySnapshot(
                     slots=[],
                     refresh_interval_seconds=30,
-                    selected_system_id="qsosn-ha",
-                    selected_system_label="QSOSN HA",
+                    selected_system_id="example-qs-ha",
+                    selected_system_label="ExampleQS HA",
                     selected_enclosure_id="node-b",
-                    selected_enclosure_label="QSOSN Right",
+                    selected_enclosure_label="ExampleQS Right",
                 )
             return InventorySnapshot(
                 slots=[],
                 refresh_interval_seconds=30,
-                selected_system_id="qsosn-ha",
-                selected_system_label="QSOSN HA",
+                selected_system_id="example-qs-ha",
+                selected_system_label="ExampleQS HA",
                 selected_enclosure_id="node-a",
-                selected_enclosure_label="QSOSN Left",
+                selected_enclosure_label="ExampleQS Left",
             )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
             system = SystemConfig(
-                id="qsosn-ha",
-                label="QSOSN HA",
+                id="example-qs-ha",
+                label="ExampleQS HA",
                 storage_views=[
                     {
                         "id": "boot-doms-node-b",
@@ -1766,19 +1788,19 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 ),
                 ssh=SSHConfig(
                     enabled=True,
-                    host="10.13.37.30",
+                    host="192.0.2.30",
                     user="jbodmap",
                     ha_enabled=True,
                     ha_nodes=[
                         {
                             "system_id": "node-a",
-                            "label": "QSOSN Left",
-                            "host": "10.13.37.30",
+                            "label": "ExampleQS Left",
+                            "host": "192.0.2.30",
                         },
                         {
                             "system_id": "node-b",
-                            "label": "QSOSN Right",
-                            "host": "10.13.37.31",
+                            "label": "ExampleQS Right",
+                            "host": "192.0.2.31",
                         },
                     ],
                 ),
@@ -1796,8 +1818,8 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                     raw_data=TrueNASRawData(
                         enclosures=[],
                         systems=[
-                            {"id": "node-a", "name": "QSOSN Left", "storageSystemClusterId": "cluster-a"},
-                            {"id": "node-b", "name": "QSOSN Right", "storageSystemClusterId": "cluster-a", "isMaster": True},
+                            {"id": "node-a", "name": "ExampleQS Left", "storageSystemClusterId": "cluster-a"},
+                            {"id": "node-b", "name": "ExampleQS Right", "storageSystemClusterId": "cluster-a", "isMaster": True},
                         ],
                         disks=[
                             {
@@ -1840,10 +1862,10 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
 
         view = next(view for view in runtime.views if view.id == "boot-doms-node-b")
         self.assertEqual(view.backing_enclosure_id, "node-b")
-        self.assertEqual(view.backing_enclosure_label, "QSOSN Right")
+        self.assertEqual(view.backing_enclosure_label, "ExampleQS Right")
         self.assertEqual(view.slots[0].device_name, "sdb")
         self.assertEqual(view.slots[0].target_system_id, "node-b")
-        self.assertEqual(view.slots[0].target_system_label, "QSOSN Right")
+        self.assertEqual(view.slots[0].target_system_label, "ExampleQS Right")
         self.assertEqual(view.slots[0].candidate_id, "SER-B")
 
     def test_quantastor_storage_view_runtime_uses_stale_source_bundle_during_background_refresh(self) -> None:
@@ -1856,25 +1878,25 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 return InventorySnapshot(
                     slots=[],
                     refresh_interval_seconds=30,
-                    selected_system_id="qsosn-ha",
-                    selected_system_label="QSOSN HA",
+                    selected_system_id="example-qs-ha",
+                    selected_system_label="ExampleQS HA",
                     selected_enclosure_id="node-b",
-                    selected_enclosure_label="QSOSN Right",
+                    selected_enclosure_label="ExampleQS Right",
                 )
             return InventorySnapshot(
                 slots=[],
                 refresh_interval_seconds=30,
-                selected_system_id="qsosn-ha",
-                selected_system_label="QSOSN HA",
+                selected_system_id="example-qs-ha",
+                selected_system_label="ExampleQS HA",
                 selected_enclosure_id="node-a",
-                selected_enclosure_label="QSOSN Left",
+                selected_enclosure_label="ExampleQS Left",
             )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
             system = SystemConfig(
-                id="qsosn-ha",
-                label="QSOSN HA",
+                id="example-qs-ha",
+                label="ExampleQS HA",
                 storage_views=[
                     {
                         "id": "boot-doms-node-b",
@@ -1907,19 +1929,19 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 ),
                 ssh=SSHConfig(
                     enabled=True,
-                    host="10.13.37.30",
+                    host="192.0.2.30",
                     user="jbodmap",
                     ha_enabled=True,
                     ha_nodes=[
                         {
                             "system_id": "node-a",
-                            "label": "QSOSN Left",
-                            "host": "10.13.37.30",
+                            "label": "ExampleQS Left",
+                            "host": "192.0.2.30",
                         },
                         {
                             "system_id": "node-b",
-                            "label": "QSOSN Right",
-                            "host": "10.13.37.31",
+                            "label": "ExampleQS Right",
+                            "host": "192.0.2.31",
                         },
                     ],
                 ),
@@ -1936,8 +1958,8 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 raw_data=TrueNASRawData(
                     enclosures=[],
                     systems=[
-                        {"id": "node-a", "name": "QSOSN Left", "storageSystemClusterId": "cluster-a"},
-                        {"id": "node-b", "name": "QSOSN Right", "storageSystemClusterId": "cluster-a", "isMaster": True},
+                        {"id": "node-a", "name": "ExampleQS Left", "storageSystemClusterId": "cluster-a"},
+                        {"id": "node-b", "name": "ExampleQS Right", "storageSystemClusterId": "cluster-a", "isMaster": True},
                     ],
                     disks=[
                         {
@@ -2003,8 +2025,8 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
             system = SystemConfig(
-                id="qsosn-ha",
-                label="QSOSN HA",
+                id="example-qs-ha",
+                label="ExampleQS HA",
                 truenas=TrueNASConfig(
                     host="https://10.13.37.40",
                     api_user="jbodmap",
@@ -2013,19 +2035,19 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 ),
                 ssh=SSHConfig(
                     enabled=True,
-                    host="10.13.37.30",
+                    host="192.0.2.30",
                     user="jbodmap",
                     ha_enabled=True,
                     ha_nodes=[
                         {
                             "system_id": "node-a",
-                            "label": "QSOSN Left",
-                            "host": "10.13.37.30",
+                            "label": "ExampleQS Left",
+                            "host": "192.0.2.30",
                         },
                         {
                             "system_id": "node-b",
-                            "label": "QSOSN Right",
-                            "host": "10.13.37.31",
+                            "label": "ExampleQS Right",
+                            "host": "192.0.2.31",
                         },
                     ],
                 ),
@@ -2048,7 +2070,434 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(hosts, ["10.13.37.31", "10.13.37.30"])
+        self.assertEqual(hosts, ["192.0.2.31", "192.0.2.30"])
+
+    def test_quantastor_ha_ssh_hosts_skip_shared_api_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="example-qs-ha",
+                label="ExampleQS HA",
+                truenas=TrueNASConfig(
+                    host="https://qs.example.test",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="qs.example.test",
+                    user="jbodmap",
+                    ha_enabled=True,
+                    ha_nodes=[
+                        {
+                            "system_id": "node-a",
+                            "label": "ExampleQS Left",
+                            "host": "192.0.2.30",
+                        },
+                        {
+                            "system_id": "node-b",
+                            "label": "ExampleQS Right",
+                            "host": "192.0.2.31",
+                        },
+                    ],
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            hosts = service._build_quantastor_ssh_hosts()
+
+        self.assertEqual(hosts, ["192.0.2.30", "192.0.2.31"])
+
+    def test_quantastor_ha_ssh_hosts_auto_discover_api_node_hosts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="example-qs-ha",
+                label="ExampleQS HA",
+                truenas=TrueNASConfig(
+                    host="https://qs.example.test",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="qs.example.test",
+                    user="jbodmap",
+                    ha_enabled=True,
+                    ha_nodes=[
+                        {"system_id": "node-a", "label": "ExampleQS Left"},
+                        {"system_id": "node-b", "label": "ExampleQS Right"},
+                    ],
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[
+                    {
+                        "id": "cluster",
+                        "name": "Cluster View",
+                        "hostname": "qs.example.test",
+                        "storageSystemClusterId": "cluster-a",
+                    },
+                    {
+                        "id": "node-a",
+                        "name": "ExampleQS Left",
+                        "mainIpAddress": "192.0.2.30",
+                        "storageSystemClusterId": "cluster-a",
+                    },
+                    {
+                        "id": "node-b",
+                        "name": "ExampleQS Right",
+                        "ipAddress": "192.0.2.31",
+                        "storageSystemClusterId": "cluster-a",
+                    },
+                ],
+                disks=[],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[
+                    {"id": "enc-a", "storageSystemId": "node-a"},
+                    {"id": "enc-b", "storageSystemId": "node-b"},
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            hosts = service._build_quantastor_ssh_hosts(raw_data)
+
+        self.assertEqual(hosts, ["192.0.2.30", "192.0.2.31"])
+
+    def test_quantastor_ha_ssh_hosts_auto_discover_default_gateway_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="example-qs-ha",
+                label="ExampleQS HA",
+                truenas=TrueNASConfig(
+                    host="https://qs.example.test",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="qs.example.test",
+                    user="jbodmap",
+                    ha_enabled=True,
+                    ha_nodes=[
+                        {"system_id": "node-a", "label": "ExampleQS Left"},
+                        {"system_id": "node-b", "label": "ExampleQS Right"},
+                    ],
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[
+                    {"id": "node-a", "name": "ExampleQS Left", "storageSystemClusterId": "cluster-a"},
+                    {"id": "node-b", "name": "ExampleQS Right", "storageSystemClusterId": "cluster-a"},
+                ],
+                disks=[],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[
+                    {"id": "enc-a", "storageSystemId": "node-a"},
+                    {"id": "enc-b", "storageSystemId": "node-b"},
+                ],
+                cli_network_ports=[
+                    {
+                        "name": "bond0.1338",
+                        "storageSystemId": "node-a",
+                        "ipAddress": "192.0.2.20",
+                        "gateway": "",
+                    },
+                    {
+                        "name": "eno1",
+                        "storageSystemId": "node-a",
+                        "ipAddress": "192.0.2.30",
+                        "gateway": "192.0.2.1",
+                    },
+                    {
+                        "name": "eno1:gm",
+                        "storageSystemId": "node-a",
+                        "ipAddress": "qs.example.test",
+                        "gateway": "192.0.2.1",
+                    },
+                    {
+                        "name": "eno1",
+                        "storageSystemId": "node-b",
+                        "ipAddress": "192.0.2.31",
+                        "gateway": "192.0.2.1",
+                    },
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            hosts = service._build_quantastor_ssh_hosts(raw_data)
+
+        self.assertEqual(hosts, ["192.0.2.30", "192.0.2.31"])
+
+    def test_quantastor_pool_owner_host_precedes_selected_view_host_for_pool_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="example-qs-ha",
+                label="ExampleQS HA",
+                truenas=TrueNASConfig(
+                    host="https://qs.example.test",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="qs.example.test",
+                    user="jbodmap",
+                    ha_enabled=True,
+                    ha_nodes=[
+                        {
+                            "system_id": "node-a",
+                            "label": "ExampleQS Left",
+                            "host": "192.0.2.30",
+                        },
+                        {
+                            "system_id": "node-b",
+                            "label": "ExampleQS Right",
+                            "host": "192.0.2.31",
+                        },
+                    ],
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            hosts = service._build_quantastor_preferred_hosts(
+                SlotView(
+                    slot=0,
+                    slot_label="00",
+                    row_index=0,
+                    column_index=0,
+                    raw_status={
+                        "target_system_id": "node-a",
+                        "quantastor_pool_owner_system_id": "node-b",
+                    },
+                )
+            )
+
+        self.assertEqual(hosts, ["192.0.2.31", "192.0.2.30"])
+
+    def test_quantastor_pool_owner_host_uses_auto_discovered_api_node_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="example-qs-ha",
+                label="ExampleQS HA",
+                truenas=TrueNASConfig(
+                    host="https://qs.example.test",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="qs.example.test",
+                    user="jbodmap",
+                    ha_enabled=True,
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[
+                    {
+                        "id": "node-a",
+                        "name": "ExampleQS Left",
+                        "hostname": "192.0.2.30",
+                        "storageSystemClusterId": "cluster-a",
+                    },
+                    {
+                        "id": "node-b",
+                        "name": "ExampleQS Right",
+                        "managementIpAddress": "192.0.2.31",
+                        "storageSystemClusterId": "cluster-a",
+                    },
+                ],
+                disks=[],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[
+                    {"id": "enc-a", "storageSystemId": "node-a"},
+                    {"id": "enc-b", "storageSystemId": "node-b"},
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            hosts = service._build_quantastor_preferred_hosts(
+                SlotView(
+                    slot=0,
+                    slot_label="00",
+                    row_index=0,
+                    column_index=0,
+                    raw_status={
+                        "target_system_id": "node-a",
+                        "quantastor_pool_owner_system_id": "node-b",
+                    },
+                ),
+                raw_data=raw_data,
+            )
+
+        self.assertEqual(hosts, ["192.0.2.31", "192.0.2.30"])
+
+    def test_quantastor_pool_owner_host_uses_default_gateway_port_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="example-qs-ha",
+                label="ExampleQS HA",
+                truenas=TrueNASConfig(
+                    host="https://qs.example.test",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="qs.example.test",
+                    user="jbodmap",
+                    ha_enabled=True,
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[
+                    {"id": "node-a", "name": "ExampleQS Left", "storageSystemClusterId": "cluster-a"},
+                    {"id": "node-b", "name": "ExampleQS Right", "storageSystemClusterId": "cluster-a"},
+                ],
+                disks=[],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[
+                    {"id": "enc-a", "storageSystemId": "node-a"},
+                    {"id": "enc-b", "storageSystemId": "node-b"},
+                ],
+                cli_network_ports=[
+                    {"storageSystemId": "node-a", "ipAddress": "192.0.2.30", "gateway": "192.0.2.1"},
+                    {"storageSystemId": "node-b", "ipAddress": "192.0.2.31", "gateway": "192.0.2.1"},
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            hosts = service._build_quantastor_preferred_hosts(
+                SlotView(
+                    slot=0,
+                    slot_label="00",
+                    row_index=0,
+                    column_index=0,
+                    raw_status={
+                        "target_system_id": "node-a",
+                        "quantastor_pool_owner_system_id": "node-b",
+                    },
+                ),
+                raw_data=raw_data,
+            )
+
+        self.assertEqual(hosts, ["192.0.2.31", "192.0.2.30"])
+
+    def test_quantastor_preferred_hosts_use_slot_auto_host_map_without_raw_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="example-qs-ha",
+                label="ExampleQS HA",
+                truenas=TrueNASConfig(
+                    host="https://qs.example.test",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="qs.example.test",
+                    user="jbodmap",
+                    ha_enabled=True,
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            hosts = service._build_quantastor_preferred_hosts(
+                SlotView(
+                    slot=0,
+                    slot_label="00",
+                    row_index=0,
+                    column_index=0,
+                    raw_status={
+                        "target_system_id": "node-a",
+                        "quantastor_pool_owner_system_id": "node-b",
+                        "quantastor_ssh_hosts_by_system_id": {
+                            "node-a": "192.0.2.30",
+                            "node-b": "192.0.2.31",
+                        },
+                    },
+                )
+            )
+
+        self.assertEqual(hosts, ["192.0.2.31", "192.0.2.30"])
 
     def test_get_storage_view_runtime_uses_saved_ses_profile_instead_of_live_selected_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3652,7 +4101,7 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
             system = SystemConfig(
-                id="qsosn-ha",
+                id="example-qs-ha",
                 truenas=TrueNASConfig(platform="quantastor"),
                 bmc=BMCConfig(enabled=True, host="10.13.0.20", username="ADMIN", password="secret"),
             )
@@ -3666,7 +4115,7 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
             )
             raw_data = TrueNASRawData(
                 enclosures=[],
-                systems=[{"id": "node-a", "name": "QSOSN Left"}],
+                systems=[{"id": "node-a", "name": "ExampleQS Left"}],
                 disks=[
                     {
                         "id": "pdisk-1",
@@ -4642,7 +5091,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot.platform_context["selected_view_label"], "Node B")
             self.assertEqual(snapshot.platform_context["master_label"], "Node B")
 
-    async def test_quantastor_snapshot_fetches_ses_overlay_before_cli_overlay(self) -> None:
+    async def test_quantastor_snapshot_fetches_cli_overlay_before_ses_overlay(self) -> None:
         class DummyQuantastorClient:
             async def fetch_all(self) -> TrueNASRawData:
                 systems = [{"id": "node-a", "name": "Node A"}]
@@ -4682,21 +5131,21 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             )
             order: list[str] = []
 
-            async def fetch_ses():
+            async def fetch_ses(*_args, **_kwargs):
                 order.append("ses")
                 service._quantastor_preferred_ses_host = "10.0.0.20"
                 return ParsedSSHData(), []
 
-            async def fetch_cli():
+            async def fetch_cli(*_args, **_kwargs):
                 order.append("cli")
-                return {"cli_disks": [], "cli_hw_disks": [], "cli_hw_enclosures": []}, []
+                return {"cli_disks": [], "cli_hw_disks": [], "cli_hw_enclosures": [], "cli_network_ports": []}, []
 
             service._fetch_quantastor_ses_overlay = AsyncMock(side_effect=fetch_ses)
             service._fetch_quantastor_cli_overlay = AsyncMock(side_effect=fetch_cli)
 
             await service.get_snapshot(selected_enclosure_id="node-a")
 
-            self.assertEqual(order, ["ses", "cli"])
+            self.assertEqual(order, ["cli", "ses"])
 
     async def test_fetch_quantastor_cli_overlay_prefers_cached_working_host(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4733,8 +5182,96 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(overlay["cli_disks"][0]["id"], "10.0.0.20-row")
             self.assertEqual(overlay["cli_hw_disks"][0]["id"], "10.0.0.20-row")
             self.assertEqual(overlay["cli_hw_enclosures"][0]["id"], "10.0.0.20-row")
+            self.assertEqual(overlay["cli_network_ports"][0]["id"], "10.0.0.20-row")
             awaited_hosts = [call.args[1] for call in service._run_ssh_command.await_args_list]
-            self.assertEqual(awaited_hosts, ["10.0.0.20", "10.0.0.20", "10.0.0.20"])
+            self.assertEqual(awaited_hosts, ["10.0.0.20", "10.0.0.20", "10.0.0.20", "10.0.0.20"])
+
+    def test_quantastor_cli_json_parser_accepts_network_port_trailing_commas(self) -> None:
+        payload = '[{"id": "port-a", "ipAddress": "192.0.2.30",},]'
+
+        parsed = InventoryService._parse_quantastor_cli_json(payload)
+
+        self.assertEqual(parsed, [{"id": "port-a", "ipAddress": "192.0.2.30"}])
+
+    def test_quantastor_cli_json_parser_accepts_loose_network_port_objects(self) -> None:
+        payload = """[
+{
+    "id": "port-a",
+    "name": "eno1",
+    "ipAddress": "192.0.2.30",
+    "gateway": "192.0.2.1",
+    {
+        "id": "route-a",
+        "name": "192.0.2.30/255.255.255.255 via 192.0.2.1"
+    }
+},
+{
+    "id": "port-b",
+    "name": "eno1",
+    "ipAddress": "192.0.2.31",
+    "gateway": "192.0.2.1"
+}
+]"""
+
+        parsed = InventoryService._parse_quantastor_cli_json(payload)
+
+        self.assertEqual(
+            parsed,
+            [
+                {"id": "port-a", "name": "eno1", "ipAddress": "192.0.2.30", "gateway": "192.0.2.1"},
+                {"id": "route-a", "name": "192.0.2.30/255.255.255.255 via 192.0.2.1"},
+                {"id": "port-b", "name": "eno1", "ipAddress": "192.0.2.31", "gateway": "192.0.2.1"},
+            ],
+        )
+
+    async def test_fetch_quantastor_cli_overlay_batches_primary_host_commands(self) -> None:
+        class RecordingSSHProbe(SSHProbe):
+            def __init__(self) -> None:
+                super().__init__(SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]))
+                self.batches: list[list[str]] = []
+
+            async def run_commands(self, commands=None):  # type: ignore[override]
+                command_list = list(commands or [])
+                self.batches.append(command_list)
+                results: list[SSHCommandResult] = []
+                for command in command_list:
+                    payload = [{"id": command.split()[1]}]
+                    results.append(SSHCommandResult(command=command, ok=True, stdout=json.dumps(payload), exit_code=0))
+                return results
+
+            async def run_command(self, command: str) -> SSHCommandResult:  # type: ignore[override]
+                raise AssertionError("Quantastor CLI overlay should use batched SSH commands.")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="jbodmap",
+                    api_password="secret",
+                ),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            ssh_probe = RecordingSSHProbe()
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                ssh_probe,
+                temp_dir,
+            )
+
+            overlay, failures = await service._fetch_quantastor_cli_overlay()
+
+            self.assertEqual(failures, [])
+            self.assertEqual(len(ssh_probe.batches), 1)
+            self.assertEqual(len(ssh_probe.batches[0]), 4)
+            self.assertTrue(overlay["cli_disks"])
+            self.assertTrue(overlay["cli_hw_disks"])
+            self.assertTrue(overlay["cli_hw_enclosures"])
+            self.assertTrue(overlay["cli_network_ports"])
 
     async def test_fetch_quantastor_cli_overlay_falls_back_to_extra_host_and_caches_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4772,10 +5309,20 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(overlay["cli_disks"][0]["id"], "10.0.0.20-row")
             self.assertEqual(overlay["cli_hw_disks"][0]["id"], "10.0.0.20-row")
             self.assertEqual(overlay["cli_hw_enclosures"][0]["id"], "10.0.0.20-row")
+            self.assertEqual(overlay["cli_network_ports"][0]["id"], "10.0.0.20-row")
             awaited_hosts = [call.args[1] for call in service._run_ssh_command.await_args_list]
             self.assertEqual(
                 awaited_hosts,
-                ["10.0.0.10", "10.0.0.10", "10.0.0.10", "10.0.0.20", "10.0.0.20", "10.0.0.20"],
+                [
+                    "10.0.0.10",
+                    "10.0.0.10",
+                    "10.0.0.10",
+                    "10.0.0.10",
+                    "10.0.0.20",
+                    "10.0.0.20",
+                    "10.0.0.20",
+                    "10.0.0.20",
+                ],
             )
 
     async def test_get_slot_smart_summaries_deduplicates_and_filters_to_snapshot(self) -> None:
@@ -5424,6 +5971,149 @@ Enclosure Status diagnostic page:
             awaited = [call.args for call in service._run_ssh_command.await_args_list]
             self.assertEqual(awaited[0][1], "10.0.0.20")
 
+    async def test_smart_summary_over_ssh_batches_json_and_text_probe_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+
+            async def run_commands(commands: list[str], host: str | None = None) -> list[SSHCommandResult]:
+                self.assertEqual(host, "10.0.0.20")
+                self.assertEqual(len(commands), 2)
+                json_command, text_command = commands
+                return [
+                    SSHCommandResult(
+                        command=json_command,
+                        ok=True,
+                        stdout=(
+                            '{'
+                            '"power_on_time":{"hours":47003},'
+                            '"rotation_rate":0,'
+                            '"smart_status":{"passed":true}'
+                            '}'
+                        ),
+                        stderr="",
+                        exit_code=0,
+                    ),
+                    SSHCommandResult(
+                        command=text_command,
+                        ok=True,
+                        stdout=(
+                            "Read Cache is:        Enabled\n"
+                            "Writeback Cache is:   Enabled\n"
+                        ),
+                        stderr="",
+                        exit_code=0,
+                    ),
+                ]
+
+            service._run_ssh_commands = AsyncMock(side_effect=run_commands)
+
+            summary, error = await service._fetch_smart_summary_over_ssh(["sdb"], hosts=["10.0.0.20"])
+
+            self.assertIsNone(error)
+            self.assertIsNotNone(summary)
+            assert summary is not None
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.power_on_hours, 47003)
+            self.assertTrue(summary.read_cache_enabled)
+            self.assertTrue(summary.writeback_cache_enabled)
+            service._run_ssh_commands.assert_awaited_once()
+            batched_commands = service._run_ssh_commands.await_args.args[0]
+            self.assertIn("-x -j /dev/sdb", batched_commands[0])
+            self.assertIn("-x /dev/sdb", batched_commands[1])
+
+    async def test_real_ssh_probe_command_batches_are_serialized_per_inventory_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            probe = SSHProbe(system.ssh)
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                probe,
+                temp_dir,
+            )
+            active_batches = 0
+            peak_batches = 0
+
+            async def run_commands(commands: list[str]) -> list[SSHCommandResult]:
+                nonlocal active_batches, peak_batches
+                active_batches += 1
+                peak_batches = max(peak_batches, active_batches)
+                await asyncio.sleep(0.01)
+                active_batches -= 1
+                return [
+                    SSHCommandResult(command=command, ok=True, stdout="{}", stderr="", exit_code=0)
+                    for command in commands
+                ]
+
+            probe.run_commands = AsyncMock(side_effect=run_commands)  # type: ignore[method-assign]
+
+            await asyncio.gather(
+                service._run_ssh_commands(["first"]),
+                service._run_ssh_commands(["second"]),
+            )
+
+            self.assertEqual(probe.run_commands.await_count, 2)
+            self.assertEqual(peak_batches, 1)
+
+    async def test_optional_ssh_command_batches_back_off_after_startup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            probe = SSHProbe(system.ssh)
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                probe,
+                temp_dir,
+            )
+
+            async def run_commands(commands: list[str]) -> list[SSHCommandResult]:
+                return [
+                    SSHCommandResult(
+                        command=command,
+                        ok=False,
+                        stderr="Error reading SSH protocol banner",
+                        exit_code=255,
+                    )
+                    for command in commands
+                ]
+
+            probe.run_commands = AsyncMock(side_effect=run_commands)  # type: ignore[method-assign]
+
+            first = await service._run_ssh_commands(["first"])
+            second = await service._run_ssh_commands(["second"])
+
+            self.assertEqual(probe.run_commands.await_count, 1)
+            self.assertIn("Error reading SSH protocol banner", first[0].stderr)
+            self.assertIn("recent connection startup failure", second[0].stderr)
+            self.assertEqual(second[0].exit_code, 255)
+
     def test_build_quantastor_smart_devices_prefers_by_id_and_sd_paths_over_by_path(self) -> None:
         settings = Settings()
         system = SystemConfig(
@@ -5510,7 +6200,7 @@ Enclosure Status diagnostic page:
             pools=[{"id": "pool-1", "name": "HA-Pool-R10"}],
             disk_temperatures={},
             smart_test_results=[],
-            systems=[{"id": "node-a", "name": "QSOSN-Right"}],
+            systems=[{"id": "node-a", "name": "ExampleQS-Right"}],
             pool_devices=[],
         )
         disk = DiskRecord(
@@ -6719,6 +7409,125 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(truenas_client.fetch_all_calls, 1)
             self.assertIs(first, second)
 
+    async def test_inventory_ssh_payload_batches_dynamic_enrichment_without_single_command_calls(self) -> None:
+        class DummySSHProbe:
+            def __init__(self) -> None:
+                self.planned_batches: list[list[str]] = []
+                self.run_command_calls = 0
+
+            async def run_planned_commands(self, planner):
+                results = [
+                    SSHCommandResult(
+                        command="echo ready",
+                        ok=True,
+                        stdout="ready\n",
+                        stderr="",
+                        exit_code=0,
+                    )
+                ]
+                while True:
+                    batch = list(planner(results))
+                    if not batch:
+                        return results
+                    self.planned_batches.append(batch)
+                    results.extend(
+                        SSHCommandResult(
+                            command=command,
+                            ok=True,
+                            stdout="",
+                            stderr="",
+                            exit_code=0,
+                        )
+                        for command in batch
+                    )
+
+            async def run_commands(self):
+                raise AssertionError("inventory refresh should use the planned SSH session API")
+
+            async def run_command(self, command: str):
+                self.run_command_calls += 1
+                raise AssertionError(f"unexpected single SSH command {command!r}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="linux-lab",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=["echo ready"]),
+            )
+            ssh_probe = DummySSHProbe()
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                ssh_probe,
+                temp_dir,
+            )
+
+            bundle = await service._get_inventory_source_bundle(force_refresh=True)
+
+            self.assertTrue(bundle.ssh_collected)
+            self.assertEqual(ssh_probe.run_command_calls, 0)
+            self.assertEqual(len(ssh_probe.planned_batches), 1)
+            planned_commands = ssh_probe.planned_batches[0]
+            self.assertTrue(any("lsblk --json" in command for command in planned_commands))
+            self.assertTrue(any("lsscsi -g -t" in command for command in planned_commands))
+            self.assertTrue(any("nvme list-subsys -o json" in command for command in planned_commands))
+
+    async def test_quantastor_ha_ssh_enrichment_warns_when_no_node_hosts_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="example-qs-ha",
+                label="ExampleQS HA",
+                truenas=TrueNASConfig(
+                    host="https://qs.example.test",
+                    api_user="jbodmap",
+                    api_password="secret",
+                    platform="quantastor",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="qs.example.test",
+                    user="jbodmap",
+                    ha_enabled=True,
+                    ha_nodes=[
+                        HANodeConfig(system_id="node-a", label="ExampleQS Left"),
+                        HANodeConfig(system_id="node-b", label="ExampleQS Right"),
+                    ],
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service._run_ssh_commands = AsyncMock(side_effect=AssertionError("no host should be probed"))
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[
+                    {"id": "node-a", "name": "ExampleQS Left", "storageSystemClusterId": "cluster-a"},
+                    {"id": "node-b", "name": "ExampleQS Right", "storageSystemClusterId": "cluster-a"},
+                ],
+                disks=[],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[{"id": "enc-a", "storageSystemId": "node-a"}],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            _cli_overlay, cli_failures = await service._fetch_quantastor_cli_overlay(raw_data)
+            _ses_overlay, ses_failures = await service._fetch_quantastor_ses_overlay(raw_data)
+
+            self.assertIn("no node SSH host", " ".join(cli_failures))
+            self.assertIn("no node SSH host", " ".join(ses_failures))
+            service._run_ssh_commands.assert_not_called()
+
     async def test_force_source_bundle_refresh_clears_sg_ses_device_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -7377,6 +8186,8 @@ Enclosure Status diagnostic page:
                 if command == discovery_command:
                     return SSHCommandResult(command=command, ok=True, stdout="/dev/sg26\n", stderr="", exit_code=0)
                 if "sg_ses -p aes /dev/sg27" in command:
+                    return SSHCommandResult(command=command, ok=False, stdout="", stderr="not an enclosure", exit_code=5)
+                if " /dev/sg27" in command:
                     return SSHCommandResult(command=command, ok=False, stdout="", stderr="not an enclosure", exit_code=5)
                 if "sg_ses -p aes /dev/sg26" in command:
                     return SSHCommandResult(command=command, ok=True, stdout=aes_output, stderr="", exit_code=0)

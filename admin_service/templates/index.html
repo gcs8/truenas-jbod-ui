@@ -497,7 +497,7 @@
 
             <div class="form-grid">
               <label class="field">
-                <span>SSH Host</span>
+                <span id="setup-ssh-host-label">SSH Host</span>
                 <input id="setup-ssh-host" data-ssh-field type="text" placeholder="Defaults to the same host">
               </label>
               <label class="field">
@@ -537,6 +537,7 @@
                 <input id="setup-ssh-strict-host-key" data-ssh-field type="checkbox" checked>
                 <span>Strict host key checking</span>
               </label>
+              <p id="setup-ssh-host-help" class="subtle action-note field-span hidden"></p>
             </div>
 
             <div id="setup-ha-panel" class="key-mode-panel hidden">
@@ -545,8 +546,8 @@
                 <div>
                   <h3>Quantastor HA Nodes</h3>
                   <p class="subtle">
-                    Reuse the shared SSH auth above, then point each Quantastor HA node at its own host so
-                    internal views like SATADOMs can target the correct node cleanly.
+                    Reuse the shared SSH auth above. The app uses API-advertised node hosts when present,
+                    then default-gateway node interfaces once one node is reachable, with these rows as fallbacks.
                   </p>
                 </div>
               </div>
@@ -560,7 +561,7 @@
                 </label>
                 <label class="field">
                   <span>Node 1 Label</span>
-                  <input data-ha-node-label="0" type="text" placeholder="QSOSN Left">
+                  <input data-ha-node-label="0" type="text" placeholder="ExampleQS Left">
                 </label>
                 <label class="field field-span">
                   <span>Node 1 SSH Host</span>
@@ -573,7 +574,7 @@
                 </label>
                 <label class="field">
                   <span>Node 2 Label</span>
-                  <input data-ha-node-label="1" type="text" placeholder="QSOSN Right">
+                  <input data-ha-node-label="1" type="text" placeholder="ExampleQS Right">
                 </label>
                 <label class="field field-span">
                   <span>Node 2 SSH Host</span>

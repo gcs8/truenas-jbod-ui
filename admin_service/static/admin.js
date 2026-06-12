@@ -172,7 +172,9 @@
     setupTlsImportCaButton: document.getElementById("setup-tls-import-ca-button"),
     setupTlsImportResult: document.getElementById("setup-tls-import-result"),
     setupSshEnabled: document.getElementById("setup-ssh-enabled"),
+    setupSshHostLabel: document.getElementById("setup-ssh-host-label"),
     setupSshHost: document.getElementById("setup-ssh-host"),
+    setupSshHostHelp: document.getElementById("setup-ssh-host-help"),
     setupHaEnabled: document.getElementById("setup-ha-enabled"),
     setupHaPanel: document.getElementById("setup-ha-panel"),
     setupDiscoverHaNodesButton: document.getElementById("setup-discover-ha-nodes-button"),
@@ -999,6 +1001,7 @@
   function renderQuantastorHaSection() {
     const quantastor = currentSetupPlatform() === "quantastor";
     const haEnabled = quantastor && Boolean(elements.setupHaEnabled?.checked);
+    syncSshHostCopy({ quantastor, haEnabled });
     if (elements.setupHaEnabled) {
       elements.setupHaEnabled.disabled = !quantastor;
     }
@@ -1038,11 +1041,29 @@
       } else if (currentQuantastorHaNodes().length) {
         const nodesMissingHosts = currentQuantastorHaNodes().filter((node) => !node.host).length;
         elements.setupHaNodesResult.textContent = nodesMissingHosts
-          ? `Loaded ${currentQuantastorHaNodes().length} Quantastor HA node row${currentQuantastorHaNodes().length === 1 ? "" : "s"}. Quantastor did not publish ${nodesMissingHosts} SSH host${nodesMissingHosts === 1 ? "" : "s"}, so fill those node host fields manually when you want node-targeted SSH.`
-          : `Loaded ${currentQuantastorHaNodes().length} Quantastor HA node row${currentQuantastorHaNodes().length === 1 ? "" : "s"}. Shared SSH auth settings above are reused for every listed node host.`;
+          ? `Loaded ${currentQuantastorHaNodes().length} Quantastor HA node row${currentQuantastorHaNodes().length === 1 ? "" : "s"}. Quantastor did not publish ${nodesMissingHosts} SSH host${nodesMissingHosts === 1 ? "" : "s"} in the API response; runtime can still learn default-gateway node IPs after one real node is reachable.`
+          : `Loaded ${currentQuantastorHaNodes().length} Quantastor HA node row${currentQuantastorHaNodes().length === 1 ? "" : "s"}. API-published/default-gateway node hosts and shared SSH auth settings will be reused for node-targeted SSH.`;
       } else {
-        elements.setupHaNodesResult.textContent = "Use up to three HA node rows. Shared SSH auth settings above are reused for every listed node host.";
+        elements.setupHaNodesResult.textContent = "Use up to three HA node rows as fallbacks when the appliance does not publish node hosts.";
       }
+    }
+  }
+
+  function syncSshHostCopy({ quantastor = currentSetupPlatform() === "quantastor", haEnabled = Boolean(elements.setupHaEnabled?.checked) } = {}) {
+    const quantastorHa = quantastor && haEnabled;
+    if (elements.setupSshHostLabel) {
+      elements.setupSshHostLabel.textContent = quantastorHa ? "Fallback SSH Host" : "SSH Host";
+    }
+    if (elements.setupSshHost) {
+      elements.setupSshHost.placeholder = quantastorHa
+        ? "Optional fallback; HA node rows are preferred"
+        : "Defaults to the same host";
+    }
+    if (elements.setupSshHostHelp) {
+      elements.setupSshHostHelp.classList.toggle("hidden", !quantastorHa);
+      elements.setupSshHostHelp.textContent = quantastorHa
+        ? "For Quantastor HA, node rows below are the SSH targets. This field is only a fallback seed and is skipped when it matches the API host."
+        : "";
     }
   }
 
@@ -4587,6 +4608,8 @@
       return;
     }
     state.haNodesLoading = true;
+    syncHaNodesFromInputs();
+    const setupPayload = collectSetupPayload();
     renderQuantastorHaSection();
     renderStorageViews();
     try {
@@ -4600,14 +4623,25 @@
           verify_ssl: Boolean(elements.setupVerifySsl?.checked),
           tls_ca_bundle_path: elements.setupTlsCaBundlePath?.value?.trim() || null,
           tls_server_name: collectTlsServerName() || null,
+          ssh_enabled: setupPayload.ssh_enabled,
+          ssh_host: setupPayload.ssh_host,
+          ssh_port: setupPayload.ssh_port,
+          ssh_user: setupPayload.ssh_user,
+          ssh_key_path: setupPayload.ssh_key_path,
+          ssh_password: setupPayload.ssh_password,
+          ssh_known_hosts_path: setupPayload.ssh_known_hosts_path,
+          ssh_strict_host_key_checking: setupPayload.ssh_strict_host_key_checking,
+          ha_nodes: setupPayload.ha_nodes,
         }),
       });
       state.haNodes = normalizeHaNodes(payload.nodes || []);
       renderQuantastorHaSection();
       renderStorageViews();
+      const hostDiscovery = payload.host_discovery || {};
+      const hostNote = hostDiscovery.message ? ` ${hostDiscovery.message}` : "";
       setBanner(
-        `Loaded ${state.haNodes.length} Quantastor HA node row${state.haNodes.length === 1 ? "" : "s"} from the appliance API.`,
-        "success"
+        `Loaded ${state.haNodes.length} Quantastor HA node row${state.haNodes.length === 1 ? "" : "s"} from the appliance.${hostNote}`,
+        hostDiscovery.attempted && hostDiscovery.ok === false ? "info" : "success"
       );
     } catch (error) {
       setBanner(`Unable to load Quantastor HA nodes: ${error.message || error}`, "error");
