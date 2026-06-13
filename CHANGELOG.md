@@ -4,6 +4,24 @@
 
 - No changes yet.
 
+## v0.21.2 - 2026-06-13
+
+### Changed
+
+- Added report-only coverage, agent entrypoint guidance, CodeQL, and Dependabot
+  configuration so the maintenance branch has stronger automated repository
+  hygiene before the next development cycle.
+
+### Fixed
+
+- Hardened admin state serialization so saved API, SSH, sudo, and BMC credential
+  values are not returned to the browser or embedded in the admin bootstrap.
+- Added save-only preserve semantics for existing configured secrets, allowing
+  normal admin edits without echoing raw saved credentials back through the UI.
+- Switched the admin setup bootstrap to script-safe JSON escaping and added
+  regressions for redaction, preserve-on-edit behavior, and breakout-safe
+  rendering.
+
 ## v0.21.1 - 2026-06-12
 
 ### Fixed
