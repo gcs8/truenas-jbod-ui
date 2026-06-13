@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.21.0`.
+This file tracks the current intended release direction after `v0.21.2`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -20,9 +20,10 @@ remaining part of the active docs set.
 
 ## Current Snapshot
 
-`v0.21.1` is the maintenance and confidence pitstop after the Storage Fabric
-expansion on top of the `v0.20.x` SAS/Storage Fabric foundation, including the
-post-publish history-noise hotfix on top of `v0.21.0`:
+`v0.21.2` is the current release-candidate patch after the Storage Fabric
+expansion on top of the `v0.20.x` SAS/Storage Fabric foundation. It keeps the
+`v0.21.1` post-publish history-noise hotfix and adds admin-state credential
+redaction hardening before the next development cycle:
 
 - the dedicated fabric surface now presents as `Storage Fabric`
 - CORE keeps the deep SAS/HBA/expander diagnostic path
@@ -32,12 +33,13 @@ post-publish history-noise hotfix on top of `v0.21.0`:
   source-labeled instead of claiming CORE-equivalent SAS detail
 - Disk Path clickability, first-click stability, SCALE identity reuse,
   public-demo spare grouping, SSH fanout controls, restore-grade release
-  evidence, and the `v0.21.1` presence-flap history-noise fix are covered by
-  the `0.21.x` validation gate
+  evidence, the `v0.21.1` presence-flap history-noise fix, and the `v0.21.2`
+  admin-state redaction hardening are covered by the `0.21.x` validation gate
 
 The next cycle should stay practical and incremental:
 
-- defer richer platform-native Storage Fabric enrichment to `0.22.x`
+- defer richer platform-native Storage Fabric enrichment and performance
+  guardrails to `0.22.x`
 - keep weaker SAS/backplane/platform inferences visibly labeled instead of
   turning them into fake certainty
 
