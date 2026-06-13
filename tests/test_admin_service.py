@@ -19,8 +19,10 @@ from admin_service.main import app as admin_app
 from admin_service.main import annotate_runtime_versions
 from admin_service.main import build_admin_state_payload
 from admin_service.main import decode_optional_secret_header
+from admin_service.main import templates as admin_templates
 from app.config import (
     AdminSurfaceConfig,
+    BMCConfig,
     EnclosureProfileConfig,
     PathConfig,
     SSHConfig,
@@ -45,6 +47,13 @@ from app.services.snapshot_export import PackagedSnapshotExport
 from history_service.config import HistorySettings
 from history_service.main import app as history_app
 from app.services.truenas_ws import TrueNASRawData
+
+
+MARKER_ALPHA = "marker-alpha"
+MARKER_BRAVO = "marker-bravo"
+MARKER_CHARLIE = "marker-charlie"
+MARKER_DELTA = "marker-delta"
+MARKER_ECHO = "marker-echo"
 
 
 def make_request(host: str = "localhost", port: int = 8082) -> Request:
@@ -802,7 +811,7 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(payload["release_status"]["status"], "dev-build")
         self.assertEqual(payload["release_status"]["latest_tag"], "v0.14.1")
 
-    def test_build_admin_state_payload_preserves_password_only_ssh_details(self) -> None:
+    def test_build_admin_state_payload_redacts_saved_secret_fields(self) -> None:
         settings = Settings(
             systems=[
                 SystemConfig(
@@ -810,6 +819,9 @@ class AdminStatePayloadTests(unittest.TestCase):
                     label="esxi-ft-node-2",
                     truenas=TrueNASConfig(
                         host="192.0.2.121",
+                        api_key=MARKER_ALPHA,
+                        api_user="root",
+                        api_password=MARKER_BRAVO,
                         platform="esxi",
                         verify_ssl=False,
                     ),
@@ -818,9 +830,16 @@ class AdminStatePayloadTests(unittest.TestCase):
                         host="192.0.2.121",
                         user="root",
                         key_path="",
-                        password="#EDC2wsx!QAZ",
+                        password=MARKER_CHARLIE,
+                        sudo_password=MARKER_DELTA,
                         strict_host_key_checking=False,
                         commands=["vmware -v"],
+                    ),
+                    bmc=BMCConfig(
+                        enabled=True,
+                        host="192.0.2.200",
+                        username="ADMIN",
+                        password=MARKER_ECHO,
                     ),
                 )
             ],
@@ -845,7 +864,55 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(saved_system["truenas_host"], "192.0.2.121")
         self.assertEqual(saved_system["ssh_host"], "192.0.2.121")
         self.assertEqual(saved_system["ssh_key_path"], "")
-        self.assertEqual(saved_system["ssh_password"], "#EDC2wsx!QAZ")
+        self.assertEqual(saved_system["api_key"], "")
+        self.assertTrue(saved_system["api_key_configured"])
+        self.assertEqual(saved_system["api_password"], "")
+        self.assertTrue(saved_system["api_password_configured"])
+        self.assertEqual(saved_system["ssh_password"], "")
+        self.assertTrue(saved_system["ssh_password_configured"])
+        self.assertEqual(saved_system["ssh_sudo_password"], "")
+        self.assertTrue(saved_system["ssh_sudo_password_configured"])
+        self.assertEqual(saved_system["bmc_password"], "")
+        self.assertTrue(saved_system["bmc_password_configured"])
+        rendered_payload = json.dumps(payload)
+        self.assertNotIn(MARKER_ALPHA, rendered_payload)
+        self.assertNotIn(MARKER_BRAVO, rendered_payload)
+        self.assertNotIn(MARKER_CHARLIE, rendered_payload)
+        self.assertNotIn(MARKER_DELTA, rendered_payload)
+        self.assertNotIn(MARKER_ECHO, rendered_payload)
+
+    def test_admin_bootstrap_template_escapes_script_breakout(self) -> None:
+        request = make_request(port=8082)
+        request.scope["router"] = admin_app.router
+        rendered = admin_templates.get_template("index.html").render(
+            request=request,
+            admin_bootstrap={
+                "ok": True,
+                "systems": [
+                    {
+                        "id": "script-breakout",
+                        "label": "</script><script>window.__admin_xss = true;</script>",
+                    }
+                ],
+            },
+        )
+
+        self.assertIn("\\u003c/script\\u003e", rendered)
+        self.assertNotIn("</script><script>window.__admin_xss", rendered)
+
+    def test_admin_js_preserve_sentinel_is_save_only(self) -> None:
+        admin_js = (
+            Path(__file__).resolve().parents[1]
+            / "admin_service"
+            / "static"
+            / "admin.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(admin_js.count("preserveRedactedSecrets: true"), 1)
+        self.assertIn(
+            "const payload = collectSetupPayload({ preserveRedactedSecrets: true });",
+            admin_js,
+        )
 
     def test_annotate_runtime_versions_marks_out_of_sync_services(self) -> None:
         runtime_payload = {

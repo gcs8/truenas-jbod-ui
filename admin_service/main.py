@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import logging
 import os
 import shlex
@@ -223,7 +222,7 @@ def create_app() -> FastAPI:
             "index.html",
             {
                 "request": request,
-                "admin_bootstrap_json": json.dumps(bootstrap),
+                "admin_bootstrap": bootstrap,
             },
         )
 
@@ -1106,9 +1105,11 @@ def serialize_systems(settings: Settings) -> list[dict[str, Any]]:
             "default_profile_id": system.default_profile_id,
             "is_default": system.id == settings.default_system_id,
             "truenas_host": system.truenas.host,
-            "api_key": system.truenas.api_key,
+            "api_key": "",
+            "api_key_configured": bool(system.truenas.api_key),
             "api_user": system.truenas.api_user,
-            "api_password": system.truenas.api_password,
+            "api_password": "",
+            "api_password_configured": bool(system.truenas.api_password),
             "verify_ssl": bool(system.truenas.verify_ssl),
             "tls_ca_bundle_path": system.truenas.tls_ca_bundle_path,
             "tls_server_name": system.truenas.tls_server_name,
@@ -1128,8 +1129,10 @@ def serialize_systems(settings: Settings) -> list[dict[str, Any]]:
             "ssh_port": system.ssh.port,
             "ssh_user": system.ssh.user,
             "ssh_key_path": system.ssh.key_path,
-            "ssh_password": system.ssh.password,
-            "ssh_sudo_password": system.ssh.sudo_password,
+            "ssh_password": "",
+            "ssh_password_configured": bool(system.ssh.password),
+            "ssh_sudo_password": "",
+            "ssh_sudo_password_configured": bool(system.ssh.sudo_password),
             "ssh_known_hosts_path": system.ssh.known_hosts_path,
             "ssh_strict_host_key_checking": bool(system.ssh.strict_host_key_checking),
             "ssh_timeout_seconds": system.ssh.timeout_seconds,
@@ -1137,7 +1140,8 @@ def serialize_systems(settings: Settings) -> list[dict[str, Any]]:
             "bmc_enabled": bool(system.bmc.enabled),
             "bmc_host": system.bmc.host,
             "bmc_username": system.bmc.username,
-            "bmc_password": system.bmc.password,
+            "bmc_password": "",
+            "bmc_password_configured": bool(system.bmc.password),
             "bmc_verify_ssl": bool(system.bmc.verify_ssl),
             "bmc_timeout_seconds": system.bmc.timeout_seconds,
             "storage_views": serialize_storage_views(system, profile_registry),
