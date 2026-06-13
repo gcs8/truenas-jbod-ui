@@ -198,6 +198,7 @@ Common commands:
 
 ```bash
 python -m unittest discover -s tests -p "test_*.py" -v
+coverage run -m unittest discover -s tests -p "test_*.py" -v && coverage report
 python -m compileall app admin_service history_service scripts tests
 node --check app/static/app.js
 node --check app/static/sas_fabric_view.js
@@ -210,7 +211,15 @@ On Windows, use the project virtualenv interpreter when present, for example:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
+.\.venv\Scripts\coverage.exe run -m unittest discover -s tests -p "test_*.py" -v; .\.venv\Scripts\coverage.exe report
 .\.venv\Scripts\python.exe -m compileall app admin_service history_service scripts tests
+```
+
+Install dev-only validation tools before running the coverage command in a fresh
+environment:
+
+```bash
+python -m pip install -r requirements-dev.txt
 ```
 
 Targeted suites by risk area:
