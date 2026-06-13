@@ -23,7 +23,7 @@ from app.models.domain import (
 )
 from app.services.demo_system_factory import DemoSystemFactory
 from app.services.ssh_key_manager import SSHKeyManager
-from app.services.system_setup import SystemSetupService
+from app.services.system_setup import PRESERVE_SECRET_SENTINEL, SystemSetupService
 from history_service.config import HistorySettings
 from history_service.domain import MetricSample, SlotStateRecord
 from history_service.store import HistoryStore
@@ -38,6 +38,17 @@ from history_service.system_backup import (
     KNOWN_HOSTS_KEY,
     SystemBackupService,
 )
+
+
+MARKER_ALPHA = "marker-alpha"
+MARKER_BRAVO = "marker-bravo"
+MARKER_CHARLIE = "marker-charlie"
+MARKER_DELTA = "marker-delta"
+MARKER_ECHO = "marker-echo"
+MARKER_FOXTROT = "marker-foxtrot"
+MARKER_GOLF = "marker-golf"
+MARKER_HOTEL = "marker-hotel"
+MARKER_INDIA = "marker-india"
 
 
 def write_yaml(path: Path, payload: dict[str, object]) -> None:
@@ -995,7 +1006,8 @@ class SystemSetupServiceTests(unittest.TestCase):
                         ],
                         "truenas": {
                             "host": "https://archive-core.local",
-                            "api_key": "OLD-KEY",
+                            "api_key": MARKER_ALPHA,
+                            "api_password": MARKER_ECHO,
                             "platform": "core",
                             "verify_ssl": True,
                             "tls_ca_bundle_path": "/app/config/tls/archive-core.pem",
@@ -1010,12 +1022,18 @@ class SystemSetupServiceTests(unittest.TestCase):
                             "port": 22,
                             "user": "jbodmap",
                             "key_path": "/run/ssh/id_truenas",
-                            "password": "old ssh password",
-                            "sudo_password": "old sudo password",
+                            "password": MARKER_CHARLIE,
+                            "sudo_password": MARKER_DELTA,
                             "known_hosts_path": "/app/data/known_hosts",
                             "strict_host_key_checking": True,
                             "timeout_seconds": 45,
                             "commands": ["/sbin/glabel status"],
+                        },
+                        "bmc": {
+                            "enabled": True,
+                            "host": "192.0.2.200",
+                            "username": "ADMIN",
+                            "password": MARKER_ECHO,
                         },
                         "enclosure_profiles": {"enc-a": "lab-4x4"},
                     }
@@ -1030,18 +1048,23 @@ class SystemSetupServiceTests(unittest.TestCase):
                 label="Archive CORE Revised",
                 platform="core",
                 truenas_host="https://archive-core-new.local",
-                api_key="NEW-KEY",
+                api_key=MARKER_FOXTROT,
+                api_password=MARKER_INDIA,
                 verify_ssl=False,
                 enclosure_filter="rear",
                 ssh_enabled=True,
                 ssh_host="archive-core-new.local",
                 ssh_user="jbodmap",
                 ssh_key_path="/run/ssh/id_truenas_new",
-                ssh_password="new ssh password",
-                ssh_sudo_password="new sudo password",
+                ssh_password=MARKER_GOLF,
+                ssh_sudo_password=MARKER_HOTEL,
                 ssh_known_hosts_path="/app/data/known_hosts_alt",
                 ssh_strict_host_key_checking=False,
                 ssh_commands=["/usr/sbin/zpool status -gP"],
+                bmc_enabled=True,
+                bmc_host="192.0.2.201",
+                bmc_username="ADMIN",
+                bmc_password=MARKER_BRAVO,
                 default_profile_id="lab-2x8",
                 replace_existing=True,
             )
@@ -1055,6 +1078,8 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(len(saved["systems"]), 1)
         self.assertEqual(saved_system["label"], "Archive CORE Revised")
         self.assertEqual(saved_system["truenas"]["host"], "https://archive-core-new.local")
+        self.assertEqual(saved_system["truenas"]["api_key"], MARKER_FOXTROT)
+        self.assertEqual(saved_system["truenas"]["api_password"], MARKER_INDIA)
         self.assertFalse(saved_system["truenas"]["verify_ssl"])
         self.assertEqual(saved_system["truenas"]["tls_ca_bundle_path"], "/app/config/tls/archive-core.pem")
         self.assertEqual(saved_system["truenas"]["tls_server_name"], "TrueNAS.gcs8.io")
@@ -1062,9 +1087,85 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(saved_system["ssh"]["extra_hosts"], ["archive-core-backup.local"])
         self.assertEqual(saved_system["ssh"]["timeout_seconds"], 45)
         self.assertEqual(saved_system["ssh"]["key_path"], "/run/ssh/id_truenas_new")
+        self.assertEqual(saved_system["ssh"]["password"], MARKER_GOLF)
+        self.assertEqual(saved_system["ssh"]["sudo_password"], MARKER_HOTEL)
+        self.assertEqual(saved_system["bmc"]["password"], MARKER_BRAVO)
         self.assertEqual(saved_system["enclosure_profiles"], {"enc-a": "lab-4x4"})
         self.assertEqual(saved_system["storage_views"][0]["id"], "front-bays")
         self.assertEqual(saved_system["storage_views"][0]["binding"]["enclosure_ids"], ["enc-a"])
+
+    def test_save_system_preserves_redacted_existing_secrets(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(
+            config_path,
+            {
+                "systems": [
+                    {
+                        "id": "archive-core",
+                        "label": "Archive CORE",
+                        "truenas": {
+                            "host": "https://archive-core.local",
+                            "api_key": MARKER_ALPHA,
+                            "api_user": "root",
+                            "api_password": MARKER_BRAVO,
+                            "platform": "core",
+                            "verify_ssl": True,
+                        },
+                        "ssh": {
+                            "enabled": True,
+                            "host": "archive-core.local",
+                            "port": 22,
+                            "user": "jbodmap",
+                            "key_path": "/run/ssh/id_truenas",
+                            "password": MARKER_CHARLIE,
+                            "sudo_password": MARKER_DELTA,
+                            "strict_host_key_checking": True,
+                        },
+                        "bmc": {
+                            "enabled": True,
+                            "host": "192.0.2.200",
+                            "username": "ADMIN",
+                            "password": MARKER_ECHO,
+                        },
+                    }
+                ]
+            },
+        )
+
+        service = SystemSetupService(str(config_path))
+        service.save_system(
+            SystemSetupRequest(
+                system_id="archive-core",
+                label="Archive CORE Revised",
+                platform="core",
+                truenas_host="https://archive-core-new.local",
+                api_key=PRESERVE_SECRET_SENTINEL,
+                api_user="root",
+                api_password=PRESERVE_SECRET_SENTINEL,
+                verify_ssl=False,
+                ssh_enabled=True,
+                ssh_host="archive-core-new.local",
+                ssh_user="jbodmap",
+                ssh_key_path="/run/ssh/id_truenas_new",
+                ssh_password=PRESERVE_SECRET_SENTINEL,
+                ssh_sudo_password=PRESERVE_SECRET_SENTINEL,
+                bmc_enabled=True,
+                bmc_host="192.0.2.201",
+                bmc_username="ADMIN",
+                bmc_password=PRESERVE_SECRET_SENTINEL,
+                replace_existing=True,
+            )
+        )
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        saved_system = saved["systems"][0]
+        self.assertEqual(saved_system["truenas"]["api_key"], MARKER_ALPHA)
+        self.assertEqual(saved_system["truenas"]["api_password"], MARKER_BRAVO)
+        self.assertEqual(saved_system["ssh"]["password"], MARKER_CHARLIE)
+        self.assertEqual(saved_system["ssh"]["sudo_password"], MARKER_DELTA)
+        self.assertEqual(saved_system["bmc"]["password"], MARKER_ECHO)
+
     def test_save_system_persists_explicit_storage_views(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         config_path = temp_dir / "config.yaml"

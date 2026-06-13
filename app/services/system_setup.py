@@ -29,6 +29,7 @@ from app.services.sas_fabric import (
 
 
 _CONFIG_WRITE_LOCK = threading.Lock()
+PRESERVE_SECRET_SENTINEL = "__TRUENAS_JBOD_KEEP_EXISTING_VALUE__"
 LINUX_NVME_LIST_SUBSYS_COMMAND = (
     "/usr/sbin/nvme list-subsys -o json 2>/dev/null || "
     "/usr/bin/nvme list-subsys -o json 2>/dev/null || true"
@@ -282,6 +283,11 @@ class SystemSetupService:
             if existing_index is not None:
                 existing_system = SystemConfig.model_validate(raw_systems[existing_index])
 
+            def resolve_secret(incoming: str | None, existing: str | None = None) -> str:
+                if incoming == PRESERVE_SECRET_SENTINEL and existing_system is not None:
+                    return existing or ""
+                return incoming or ""
+
             ssh_enabled = bool(payload.ssh_enabled)
             existing_ssh_commands = list(existing_system.ssh.commands) if existing_system else []
             ssh_commands = (
@@ -335,9 +341,15 @@ class SystemSetupService:
                 storage_views=storage_views,
                 truenas=TrueNASConfig(
                     host=payload.truenas_host,
-                    api_key=payload.api_key or "",
+                    api_key=resolve_secret(
+                        payload.api_key,
+                        existing_system.truenas.api_key if existing_system is not None else None,
+                    ),
                     api_user=payload.api_user or "",
-                    api_password=payload.api_password or "",
+                    api_password=resolve_secret(
+                        payload.api_password,
+                        existing_system.truenas.api_password if existing_system is not None else None,
+                    ),
                     platform=payload.platform,
                     verify_ssl=payload.verify_ssl,
                     tls_ca_bundle_path=(
@@ -377,8 +389,14 @@ class SystemSetupService:
                     port=payload.ssh_port,
                     user=payload.ssh_user or "",
                     key_path=payload.ssh_key_path or "",
-                    password=payload.ssh_password or "",
-                    sudo_password=payload.ssh_sudo_password or "",
+                    password=resolve_secret(
+                        payload.ssh_password,
+                        existing_system.ssh.password if existing_system is not None else None,
+                    ),
+                    sudo_password=resolve_secret(
+                        payload.ssh_sudo_password,
+                        existing_system.ssh.sudo_password if existing_system is not None else None,
+                    ),
                     known_hosts_path=payload.ssh_known_hosts_path,
                     strict_host_key_checking=payload.ssh_strict_host_key_checking,
                     timeout_seconds=(
@@ -392,7 +410,10 @@ class SystemSetupService:
                     enabled=bool(payload.bmc_enabled),
                     host=payload.bmc_host or "",
                     username=payload.bmc_username or "",
-                    password=payload.bmc_password or "",
+                    password=resolve_secret(
+                        payload.bmc_password,
+                        existing_system.bmc.password if existing_system is not None else None,
+                    ),
                     verify_ssl=payload.bmc_verify_ssl,
                     timeout_seconds=payload.bmc_timeout_seconds,
                 ),

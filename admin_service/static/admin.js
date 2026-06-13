@@ -1,5 +1,6 @@
 (function () {
   const bootstrap = window.ADMIN_BOOTSTRAP || {};
+  const PRESERVE_SECRET_SENTINEL = "__TRUENAS_JBOD_KEEP_EXISTING_VALUE__";
   const state = {
     admin: bootstrap.admin || {},
     appVersion: bootstrap.app_version || "",
@@ -850,6 +851,29 @@
 
   function getSystemById(systemId) {
     return state.systems.find((system) => system.id === systemId) || null;
+  }
+
+  function savedSecretConfigured(system, configuredKey, legacyKey) {
+    return Boolean(system && (system[configuredKey] || system[legacyKey]));
+  }
+
+  function setRedactedSecretField(field, configured) {
+    if (!field) {
+      return;
+    }
+    field.value = "";
+    field.placeholder = configured ? "Saved value retained unless replaced" : "";
+  }
+
+  function collectSecretField(field, system, configuredKey, legacyKey, { preserve = false, trim = false } = {}) {
+    let value = field?.value || "";
+    if (trim) {
+      value = value.trim();
+    }
+    if (preserve && isEditingLoadedSystem() && savedSecretConfigured(system, configuredKey, legacyKey) && !value) {
+      return PRESERVE_SECRET_SENTINEL;
+    }
+    return value || null;
   }
 
   function renderHistoryMaintenance() {
@@ -4201,15 +4225,11 @@
     if (elements.setupEnclosureFilter) {
       elements.setupEnclosureFilter.value = "";
     }
-    if (elements.setupApiKey) {
-      elements.setupApiKey.value = "";
-    }
+    setRedactedSecretField(elements.setupApiKey, false);
     if (elements.setupApiUser) {
       elements.setupApiUser.value = "";
     }
-    if (elements.setupApiPassword) {
-      elements.setupApiPassword.value = "";
-    }
+    setRedactedSecretField(elements.setupApiPassword, false);
     if (elements.setupBmcEnabled) {
       elements.setupBmcEnabled.checked = false;
     }
@@ -4219,9 +4239,7 @@
     if (elements.setupBmcUsername) {
       elements.setupBmcUsername.value = "";
     }
-    if (elements.setupBmcPassword) {
-      elements.setupBmcPassword.value = "";
-    }
+    setRedactedSecretField(elements.setupBmcPassword, false);
     if (elements.setupBmcVerifySsl) {
       elements.setupBmcVerifySsl.checked = true;
     }
@@ -4249,12 +4267,8 @@
     if (elements.setupSshKeyPath) {
       elements.setupSshKeyPath.value = "/run/ssh/id_truenas";
     }
-    if (elements.setupSshPassword) {
-      elements.setupSshPassword.value = "";
-    }
-    if (elements.setupSshSudoPassword) {
-      elements.setupSshSudoPassword.value = "";
-    }
+    setRedactedSecretField(elements.setupSshPassword, false);
+    setRedactedSecretField(elements.setupSshSudoPassword, false);
     if (elements.setupSshKnownHosts) {
       elements.setupSshKnownHosts.value = "/app/data/known_hosts";
     }
@@ -4371,15 +4385,17 @@
     if (elements.setupEnclosureFilter) {
       elements.setupEnclosureFilter.value = system.enclosure_filter || "";
     }
-    if (elements.setupApiKey) {
-      elements.setupApiKey.value = system.api_key || "";
-    }
+    setRedactedSecretField(
+      elements.setupApiKey,
+      savedSecretConfigured(system, "api_key_configured", "api_key")
+    );
     if (elements.setupApiUser) {
       elements.setupApiUser.value = system.api_user || "";
     }
-    if (elements.setupApiPassword) {
-      elements.setupApiPassword.value = system.api_password || "";
-    }
+    setRedactedSecretField(
+      elements.setupApiPassword,
+      savedSecretConfigured(system, "api_password_configured", "api_password")
+    );
     if (elements.setupBmcEnabled) {
       elements.setupBmcEnabled.checked = Boolean(system.bmc_enabled);
     }
@@ -4389,9 +4405,10 @@
     if (elements.setupBmcUsername) {
       elements.setupBmcUsername.value = system.bmc_username || "";
     }
-    if (elements.setupBmcPassword) {
-      elements.setupBmcPassword.value = system.bmc_password || "";
-    }
+    setRedactedSecretField(
+      elements.setupBmcPassword,
+      savedSecretConfigured(system, "bmc_password_configured", "bmc_password")
+    );
     if (elements.setupBmcVerifySsl) {
       elements.setupBmcVerifySsl.checked = system.bmc_verify_ssl !== false;
     }
@@ -4417,12 +4434,14 @@
     if (elements.setupSshPort) {
       elements.setupSshPort.value = String(system.ssh_port || 22);
     }
-    if (elements.setupSshPassword) {
-      elements.setupSshPassword.value = system.ssh_password || "";
-    }
-    if (elements.setupSshSudoPassword) {
-      elements.setupSshSudoPassword.value = system.ssh_sudo_password || "";
-    }
+    setRedactedSecretField(
+      elements.setupSshPassword,
+      savedSecretConfigured(system, "ssh_password_configured", "ssh_password")
+    );
+    setRedactedSecretField(
+      elements.setupSshSudoPassword,
+      savedSecretConfigured(system, "ssh_sudo_password_configured", "ssh_sudo_password")
+    );
     if (elements.setupSshKnownHosts) {
       elements.setupSshKnownHosts.value = system.ssh_known_hosts_path || "/app/data/known_hosts";
     }
@@ -4514,7 +4533,7 @@
     void fetchStorageViewCandidates({ quiet: true });
   }
 
-  function collectSetupPayload() {
+  function collectSetupPayload({ preserveRedactedSecrets = false } = {}) {
     const platform = elements.setupPlatform?.value || "core";
     const sshEnabled = Boolean(elements.setupSshEnabled?.checked);
     const sshHost = normalizeConnectionHost(elements.setupSshHost?.value) || null;
@@ -4526,6 +4545,7 @@
     const bmcEnabled = setupPlatformUsesBmcOnlyHost(platform) || Boolean(elements.setupBmcEnabled?.checked);
     const sshUser = elements.setupSshUser?.value?.trim() || (sshEnabled ? recommendedSshUserForPlatform() : null);
     const normalizedSystemId = elements.setupSystemId?.value?.trim() || null;
+    const loadedSystem = isEditingLoadedSystem() ? getSystemById(state.loadedSystemId) : null;
     const apiHost = elements.setupTruenasHost?.value?.trim() || "";
     const primaryHost = apiHost
       || (setupPlatformUsesSshOnlyHost(platform) ? (sshHost || "") : "")
@@ -4535,9 +4555,14 @@
       label: elements.setupSystemLabel?.value?.trim() || "",
       platform,
       truenas_host: primaryHost,
-      api_key: elements.setupApiKey?.value?.trim() || null,
+      api_key: collectSecretField(elements.setupApiKey, loadedSystem, "api_key_configured", "api_key", {
+        preserve: preserveRedactedSecrets,
+        trim: true,
+      }),
       api_user: elements.setupApiUser?.value?.trim() || null,
-      api_password: elements.setupApiPassword?.value || null,
+      api_password: collectSecretField(elements.setupApiPassword, loadedSystem, "api_password_configured", "api_password", {
+        preserve: preserveRedactedSecrets,
+      }),
       verify_ssl: Boolean(elements.setupVerifySsl?.checked),
       tls_ca_bundle_path: elements.setupTlsCaBundlePath?.value?.trim() || null,
       tls_server_name: collectTlsServerName() || null,
@@ -4551,15 +4576,23 @@
       ssh_port: Number(elements.setupSshPort?.value) || 22,
       ssh_user: sshUser,
       ssh_key_path: sshKeyPath,
-      ssh_password: elements.setupSshPassword?.value || null,
-      ssh_sudo_password: platformSupportsSavedSudo() ? (elements.setupSshSudoPassword?.value || null) : null,
+      ssh_password: collectSecretField(elements.setupSshPassword, loadedSystem, "ssh_password_configured", "ssh_password", {
+        preserve: preserveRedactedSecrets,
+      }),
+      ssh_sudo_password: platformSupportsSavedSudo()
+        ? collectSecretField(elements.setupSshSudoPassword, loadedSystem, "ssh_sudo_password_configured", "ssh_sudo_password", {
+            preserve: preserveRedactedSecrets,
+          })
+        : null,
       ssh_known_hosts_path: elements.setupSshKnownHosts?.value?.trim() || null,
       ssh_strict_host_key_checking: Boolean(elements.setupSshStrictHostKey?.checked),
       ssh_commands: collectSetupCommands(),
       bmc_enabled: bmcEnabled,
       bmc_host: bmcHost,
       bmc_username: elements.setupBmcUsername?.value?.trim() || null,
-      bmc_password: elements.setupBmcPassword?.value || null,
+      bmc_password: collectSecretField(elements.setupBmcPassword, loadedSystem, "bmc_password_configured", "bmc_password", {
+        preserve: preserveRedactedSecrets,
+      }),
       bmc_verify_ssl: Boolean(elements.setupBmcVerifySsl?.checked),
       bmc_timeout_seconds: Number(elements.setupBmcTimeoutSeconds?.value) || 15,
       default_profile_id: elements.setupProfile?.value || null,
@@ -5684,7 +5717,7 @@
   }
 
   async function createSystem() {
-    const payload = collectSetupPayload();
+    const payload = collectSetupPayload({ preserveRedactedSecrets: true });
     if (!payload.label || !payload.truenas_host) {
       setBanner("System label and host are required before saving.", "error");
       return;
