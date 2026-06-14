@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 from pathlib import Path
 import re
 import sys
 
 
 DEFAULT_DEMO_DIR = Path("public-demo")
+DEFAULT_MAX_RAW_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_GZIP_BYTES = 1_835_008
 
 PRIVATE_IPV4_PATTERN = re.compile(
     r"(?<![0-9])"
@@ -46,6 +49,24 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DEMO_DIR,
         help="Directory containing the static public demo files.",
     )
+    parser.add_argument(
+        "--max-raw-bytes",
+        type=int,
+        default=DEFAULT_MAX_RAW_BYTES,
+        help=(
+            "Maximum allowed raw index.html size in bytes. "
+            f"Defaults to {DEFAULT_MAX_RAW_BYTES}; pass 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--max-gzip-bytes",
+        type=int,
+        default=DEFAULT_MAX_GZIP_BYTES,
+        help=(
+            "Maximum allowed gzip-9 index.html size in bytes. "
+            f"Defaults to {DEFAULT_MAX_GZIP_BYTES}; pass 0 to disable."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -66,7 +87,20 @@ def main() -> int:
             print(error, file=sys.stderr)
         return 1
 
-    html = index_path.read_text(encoding="utf-8")
+    raw_bytes = index_path.read_bytes()
+    raw_size = len(raw_bytes)
+    gzip_size = len(gzip.compress(raw_bytes, compresslevel=9, mtime=0))
+
+    if args.max_raw_bytes > 0 and raw_size > args.max_raw_bytes:
+        errors.append(
+            f"public demo artifact raw size {raw_size} exceeds budget {args.max_raw_bytes}"
+        )
+    if args.max_gzip_bytes > 0 and gzip_size > args.max_gzip_bytes:
+        errors.append(
+            f"public demo artifact gzip size {gzip_size} exceeds budget {args.max_gzip_bytes}"
+        )
+
+    html = raw_bytes.decode("utf-8")
     for marker in REQUIRED_MARKERS:
         if marker not in html:
             errors.append(f"missing required marker: {marker}")
@@ -82,7 +116,10 @@ def main() -> int:
             print(error, file=sys.stderr)
         return 1
 
-    print(f"Public demo artifact is publishable: {index_path} ({index_path.stat().st_size} bytes)")
+    print(
+        "Public demo artifact is publishable: "
+        f"{index_path} (raw={raw_size} bytes, gzip={gzip_size} bytes)"
+    )
     return 0
 
 

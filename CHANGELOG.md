@@ -2,7 +2,10 @@
 
 ## Unreleased - 0.22.0-dev
 
-- No changes yet.
+- Added raw and gzip size budgets to the checked-in public-demo artifact gate so
+  future payload growth fails visibly instead of only printing byte counts.
+- Aligned the public-demo publish workflow with the existing hosted-Chrome
+  browser-smoke path to avoid slow PR-time Chromium installs.
 
 ## v0.21.2 - 2026-06-13
 
