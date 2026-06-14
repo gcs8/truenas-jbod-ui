@@ -1,6 +1,7 @@
 # Roadmap
 
-This file tracks the current intended release direction after `v0.21.2`.
+This file tracks the current intended release direction after the published
+`v0.21.2` patch and the reopen to `0.22.0-dev`.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -20,10 +21,10 @@ remaining part of the active docs set.
 
 ## Current Snapshot
 
-`v0.21.2` is the current release-candidate patch after the Storage Fabric
-expansion on top of the `v0.20.x` SAS/Storage Fabric foundation. It keeps the
-`v0.21.1` post-publish history-noise hotfix and adds admin-state credential
-redaction hardening before the next development cycle:
+`v0.21.2` is the current published patch after the Storage Fabric expansion on
+top of the `v0.20.x` SAS/Storage Fabric foundation. It keeps the `v0.21.1`
+post-publish history-noise hotfix and adds admin-state credential redaction
+hardening before the `0.22.0-dev` cycle:
 
 - the dedicated fabric surface now presents as `Storage Fabric`
 - CORE keeps the deep SAS/HBA/expander diagnostic path
@@ -36,7 +37,7 @@ redaction hardening before the next development cycle:
   evidence, the `v0.21.1` presence-flap history-noise fix, and the `v0.21.2`
   admin-state redaction hardening are covered by the `0.21.x` validation gate
 
-The next cycle should stay practical and incremental:
+The active `0.22.0-dev` cycle should stay practical and incremental:
 
 - defer richer platform-native Storage Fabric enrichment and performance
   guardrails to `0.22.x`

@@ -8,11 +8,11 @@ Date: `2026-06-13`
 
 This release-prep packet intentionally excludes the open Dependabot PRs #17-#20 and the broader `v0.22.0-dev` performance guardrail work.
 
-Current pre-tag state: PR #22 was merged to `main` at commit `cd86f81`; release-candidate version metadata is `0.21.2`.
+Release commit: `0fe589ae70a93d36c91dd40212442b389eaf07c5`.
 
 Validated against `docs/RELEASE_CHECKLIST.md`.
 
-Pre-tag automated gates are now complete. Tag/publish only after the strict pre-tag validator passes and the release action is intentionally executed.
+All release gates are complete after the GitHub Release, GHCR digest verification, deployment refresh/sniff checks, external wiki sync, and post-release reopen.
 
 ## Checklist Evidence
 
@@ -29,22 +29,33 @@ Pre-tag automated gates are now complete. Tag/publish only after the strict pre-
 | Linux QA restore gate | yes | fresh disposable QA stack was created on `codex-dev-test-target` / `10.13.37.138` without disturbing the existing `0.21.1` source or QA stacks: runtime `/docker-local/truenas-jbod-ui-qa-release-0.21.2-20260613T232658Z/repo`, commit `cd86f81`, compose project `truenas_jbod_ui_qa_release_0212`, ports `18180/18181/18182`, containers `truenas-jbod-ui-qa-release-0212`, `truenas-jbod-history-qa-release-0212`, `truenas-jbod-admin-qa-release-0212`; source history DB copied via SQLite backup (`1,081,786,368` bytes, SHA-256 `845f5107810e63ac1f6c6417ffc355be5604453e0ab469c832bb005a5a927faa`); UI/history/admin `/livez` reported `version: 0.21.2` and `/healthz` reported `status: ok`; exact source-vs-QA provenance matched after browser/perf/export: 11 systems, platform counts core=1/esxi=3/ipmi=1/linux=4/quantastor=1/scale=1, 60 slots, 2 storage views, 347 tracked slots, 20,305 history events, 1,418,806 metric samples, 23 scopes, QA collector idle with `last_error: null` | Pass |  |
 | Restored Linux QA perf harnesses | yes | after `http://10.13.37.138:18181/healthz` showed `collection_running=false`, restored perf passed: `scripts/run_perf_harness.py --base-url http://10.13.37.138:18180 --iterations 3 --format markdown --label release-candidate-v0.21.2-linux-qa-fullsource` wrote `data/perf/latest.md` with cached health avg 3.2 ms, history status avg 8.8 ms, cached inventory avg 37.6 ms, storage views avg 29.0 ms, snapshot estimate avg 2,028.2 ms, forced inventory avg 28.5 s; `scripts/run_history_perf_harness.py --base-url http://10.13.37.138:18181 --iterations 3 --format markdown --label release-candidate-v0.21.2-linux-qa-fullsource-history` wrote `data/history-perf/latest.md` with sidecar health avg 1.6 ms, estimated overview avg 3.5 ms, dashboard avg 12.4 ms, DB size 1.0 GiB, background failures 0 | Pass |  |
 | Snapshot/export/offline artifact gate | yes | checked-in public demo publishability passed via `.venv/bin/python scripts/check_public_demo_artifact.py public-demo`; local release-candidate export estimate returned HTML size 1,821,197 bytes and ZIP download was 903,500 bytes with SHA-256 `cb35a937620cac23b4e2188398a850d186af5258b9f92b29e8b10d22db85fee5`; local offline HTML opened in Chromium with 60 slots, 11 system options, and 0 console/page errors. Restored Linux QA full-source export against `http://10.13.37.138:18180` produced `artifacts/private-v0.21.2/linux-qa-fullsource-snapshot-export/linux-qa-fullsource-snapshot-export-fullscope-20260613T2338Z.zip`, 1,123,096 bytes, SHA-256 `0c2eac4d46b4368c73a121ee91a8893e02e24faebb7974f7f8e845ccb63e6d49`, HTML size 9,269,662 bytes; offline Chromium smoke found 60 slots, 11 system options, 4 enclosure options, storage-view markers present, no horizontal overflow, and 0 console/page issues | Pass |  |
-| Docs/wiki/public-demo gate | yes | `CHANGELOG.md`, `docs/RELEASE_NOTES_0.21.2.md`, this wrap, `docs/ROADMAP.md`, and repo-local `wiki/Home.md` were updated for `v0.21.2`; `.venv/bin/python scripts/check_public_demo_artifact.py public-demo` reported publishable `public-demo/index.html` at 7,178,450 bytes; active-current-version scan found no stale `0.21.2-dev` release metadata outside historical release-wrap wording | Pass |  |
-| GHCR publish verification | yes | post-publish gate: blocked until tag and GitHub release publish trigger the GHCR workflow and digest convergence is recorded | Blocked |  |
-| Deployment refresh/sniff tests | yes | post-publish gate: blocked until GHCR image is available and local/Linux/production deployment refresh and sniff tests are recorded | Blocked |  |
-| Post-release reopen | yes | post-publish gate: blocked until `0.21.2` ships and `main` is reopened to the agreed next lane, currently `0.22.0-dev` | Blocked |  |
+| Docs/wiki/public-demo gate | yes | `CHANGELOG.md`, `docs/RELEASE_NOTES_0.21.2.md`, this wrap, `docs/ROADMAP.md`, and repo-local `wiki/Home.md` were updated for `v0.21.2`; `.venv/bin/python scripts/check_public_demo_artifact.py public-demo` reported publishable `public-demo/index.html` at 7,178,450 bytes; active-current-version scan found no stale `0.21.2-dev` release metadata outside historical release-wrap wording; external GitHub wiki was synced in commit `c5b7dd4f644b1775e906ce88866f0fb01757da8e` | Pass |  |
+| GHCR publish verification | yes | GitHub Release `v0.21.2` published at `2026-06-14T00:29:58Z`; release-triggered GHCR workflow `27483527896` succeeded; `ghcr.io/gcs8/truenas-jbod-ui:v0.21.2`, `:0.21.2`, and `:latest` all converged to digest `sha256:3244efe7b8c950ae924fd371b4c518f5a342d90bd1acbe003284cc49011e721d`; local image labels reported OCI revision `0fe589ae70a93d36c91dd40212442b389eaf07c5` and version `0.21.2` | Pass |  |
+| Deployment refresh/sniff tests | yes | local published-digest sniff passed on `127.0.0.1:19280` with `/livez status=ok version=0.21.2`, `/healthz status=ok`, and matching OCI revision/version labels; `.138` source stack `8080/8081/8082` and full-data QA stack `18080/18081/18082` were recreated from `ghcr.io/gcs8/truenas-jbod-ui@sha256:3244efe7b8c950ae924fd371b4c518f5a342d90bd1acbe003284cc49011e721d`; all six remote services served `/livez status=ok version=0.21.2`, health endpoints reported `status=ok`, and container labels/images matched revision `0fe589ae70a93d36c91dd40212442b389eaf07c5` / version `0.21.2` | Pass |  |
+| Post-release reopen | yes | after release/deployment verification, `main` development metadata was reopened as `0.22.0-dev` in `app/__init__.py`, `package.json`, and `package-lock.json`; `CHANGELOG.md`, `docs/ROADMAP.md`, and `wiki/Home.md` now describe `v0.21.2` as published and `0.22.0-dev` as the active next lane; `v0.21.2` tag remains on immutable release commit `0fe589ae70a93d36c91dd40212442b389eaf07c5` | Pass |  |
 
-## Pre-Tag Validator Status
+## Validator Status
 
-Expected pre-tag validator behavior:
+Expected validator behavior:
 
 - `.venv/bin/python scripts/validate_release_wrap.py 0.21.2 --phase pre-tag --allow-blocked` should pass, proving the evidence table shape is complete.
 - `.venv/bin/python scripts/validate_release_wrap.py 0.21.2 --phase pre-tag` should pass now that every pre-publish gate is `Pass`; only inherently post-publish rows remain blocked.
+- `.venv/bin/python scripts/validate_release_wrap.py 0.21.2` should pass after post-publish rows are recorded.
 
-## Remaining Pre-Tag Work
+## Remaining Work
 
-1. Re-run strict pre-tag validation and only tag after every pre-tag row is `Pass` or justified `N/A`.
+- None for `v0.21.2` release completion. Follow-up feature/performance work moves to `0.22.0-dev`.
 
 ## Publish Result
 
-Blocked in this prep packet. No `v0.21.2` tag, GitHub Release, GHCR digest, deployment refresh, or post-release reopen has been produced yet.
+- Release commit: `0fe589ae70a93d36c91dd40212442b389eaf07c5`
+- Tag: `v0.21.2`
+- GitHub release: `https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.21.2`
+- GHCR workflow: `https://github.com/gcs8/truenas-jbod-ui/actions/runs/27483527896`
+- GHCR digest: `sha256:3244efe7b8c950ae924fd371b4c518f5a342d90bd1acbe003284cc49011e721d`
+- Verified tags: `ghcr.io/gcs8/truenas-jbod-ui:v0.21.2`, `ghcr.io/gcs8/truenas-jbod-ui:0.21.2`, and `ghcr.io/gcs8/truenas-jbod-ui:latest` all converged to the digest above
+- Published source deployment: `10.13.37.138:8080/8081/8082`, all containers pinned to the digest above and reporting `version=0.21.2`
+- Published QA deployment: `10.13.37.138:18080/18081/18082`, all containers pinned to the digest above and reporting `version=0.21.2`
+- Disposable `v0.21.2` restore-QA stack on `18180/18181/18182` was torn down after post-publish sniff passed; the source and full-data QA deployments above remained healthy
+- External wiki commit: `c5b7dd4f644b1775e906ce88866f0fb01757da8e`
+- Post-release development reopened to `0.22.0-dev`
