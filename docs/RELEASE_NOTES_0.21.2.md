@@ -16,9 +16,9 @@ Date: `2026-06-13`
 - The admin setup bootstrap now uses script-safe JSON escaping so saved labels or hosts cannot break out of the bootstrap script block.
 - Regression coverage now checks redacted state payloads, preserve-on-edit behavior, explicit secret replacement, save-only sentinel boundaries, and script-breakout-safe rendering.
 
-## Validation So Far
+## Validation
 
-The release-prep packet has passed source-only gates:
+The release candidate passed the pre-tag validation stack:
 
 - `.venv/bin/python -m compileall -q app admin_service history_service scripts tests`
 - `.venv/bin/python -m unittest tests.test_admin_service tests.test_account_bootstrap tests.test_system_backup -q` — `103` tests passed
@@ -27,8 +27,15 @@ The release-prep packet has passed source-only gates:
 - `node --check app/static/app.js`, `app/static/sas_fabric_view.js`, `admin_service/static/admin.js`, and `qa/public-demo.spec.js`
 - `.venv/bin/python scripts/check_public_demo_artifact.py public-demo` — public demo artifact publishability check passed
 - `git diff --check`
+- Local Docker release-candidate health on `19080/19081/19082`
+- Optional-sidecar runtime matrix
+- Full Playwright browser smoke on the local candidate and restored Linux QA stack
+- Live admin-state redaction probes on the local candidate and restored Linux QA stack
+- Local and restored Linux QA perf harnesses
+- Disposable Linux QA restore/provenance check against the approved full-data source
+- Snapshot/export/offline browser smoke for local and restored Linux QA artifacts
 
-The public tag is not ready from this prep state alone. Docker/runtime, optional-sidecar, browser, live admin/UI, perf, restored Linux QA, snapshot/export/offline, GHCR, deployment refresh, and post-release reopen evidence still need to be recorded in `docs/RELEASE_WRAP_0.21.2.md` before the release can be called complete.
+The pre-tag release wrap validator passes. Post-publish GHCR, deployment refresh, and development-reopen evidence are recorded separately in `docs/RELEASE_WRAP_0.21.2.md` after publication.
 
 ## Upgrade Note
 
