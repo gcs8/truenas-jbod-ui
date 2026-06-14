@@ -427,6 +427,23 @@
     return date.toLocaleString();
   }
 
+  function safeHttpUrl(value) {
+    const rawValue = String(value || "").trim();
+    if (!/^https?:\/\//i.test(rawValue)) {
+      return "";
+    }
+    let parsed;
+    try {
+      parsed = new URL(rawValue);
+    } catch (error) {
+      return "";
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      return "";
+    }
+    return parsed.href;
+  }
+
   function formatBytes(value) {
     const size = Number(value);
     if (!Number.isFinite(size) || size < 0) {
@@ -507,7 +524,7 @@
     if (elements.releaseNote) {
       const releaseStatus = state.releaseStatus || {};
       const summary = String(releaseStatus.summary || "Checking releases...");
-      const latestUrl = String(releaseStatus.latest_url || "").trim();
+      const latestUrl = safeHttpUrl(releaseStatus.latest_url);
       elements.releaseNote.textContent = summary;
       elements.releaseNote.className = `hero-stat-note is-${releaseStatus.status || "unknown"}`;
       if (latestUrl) {

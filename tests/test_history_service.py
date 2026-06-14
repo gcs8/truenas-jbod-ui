@@ -310,6 +310,19 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn('id="collector-state-value"', markup)
         self.assertIn('id="tracked-scopes-body"', markup)
 
+    def test_dashboard_omits_release_link_for_non_http_urls(self) -> None:
+        markup = history_main.render_dashboard(
+            {"collector_running": True},
+            {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
+            [],
+            app_version="0.test",
+            release_status={"summary": "latest release", "latest_url": "javascript:alert(1)"},
+        )
+
+        self.assertIn("latest release", markup)
+        self.assertNotIn("javascript:alert", markup)
+        self.assertNotIn("class='note-link'", markup)
+
     def test_dashboard_renders_collection_activity_banner_state(self) -> None:
         markup = history_main.render_dashboard(
             {

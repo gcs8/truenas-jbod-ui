@@ -7,6 +7,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -49,6 +50,14 @@ def public_collector_status(
     if payload.get("last_error"):
         payload["last_error"] = last_error_detail
     return payload
+
+
+def safe_http_url(value: object) -> str:
+    url = str(value or "").strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return url
 
 
 @lru_cache
@@ -333,7 +342,7 @@ def render_dashboard(
 
     release_payload = release_status or {}
     release_summary = html.escape(str(release_payload.get("summary") or "Checking releases..."))
-    latest_url = str(release_payload.get("latest_url") or "").strip()
+    latest_url = safe_http_url(release_payload.get("latest_url"))
     release_note_markup = (
         f"<a class='note-link' href='{html.escape(latest_url)}' target='_blank' rel='noopener'>{release_summary}</a>"
         if latest_url
