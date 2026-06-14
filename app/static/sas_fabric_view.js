@@ -2233,7 +2233,6 @@
       return "";
     }
     const leaf = text
-      .replace(/^\/dev\//, "/dev/")
       .replace(/^.*\/disk\/by-id\//, "")
       .replace(/^disk\/by-id\//, "")
       .replace(/^(scsi-|ata-|nvme-|wwn-)/i, "");

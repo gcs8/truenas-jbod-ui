@@ -19,6 +19,7 @@ from admin_service.main import app as admin_app
 from admin_service.main import annotate_runtime_versions
 from admin_service.main import build_admin_state_payload
 from admin_service.main import decode_optional_secret_header
+from admin_service.main import enrich_quantastor_nodes_from_ssh
 from admin_service.main import templates as admin_templates
 from app.config import (
     AdminSurfaceConfig,
@@ -113,6 +114,26 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertNotIn("/api/system/backup/export", paths)
         self.assertNotIn("/api/system/backup/import", paths)
+
+    def test_unhandled_exception_handlers_redact_exception_details(self) -> None:
+        for app, port, expected_detail in (
+            (main_app, 8080, "Unhandled application error; see application logs."),
+            (admin_app, 8082, "Unhandled admin service error; see admin logs."),
+        ):
+            handler = app.exception_handlers[Exception]
+            response = asyncio.run(
+                handler(
+                    make_request(port=port),
+                    RuntimeError("Traceback: password=topsecret failure"),
+                )
+            )
+            payload = json.loads(response.body.decode("utf-8"))
+
+            self.assertEqual(response.status_code, 500)
+            self.assertEqual(payload["detail"], expected_detail)
+            joined = json.dumps(payload)
+            self.assertNotIn("Traceback", joined)
+            self.assertNotIn("topsecret", joined)
 
     def test_main_app_exposes_storage_view_runtime_route(self) -> None:
         paths = {route.path for route in main_app.routes}
@@ -900,6 +921,27 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertIn("\\u003c/script\\u003e", rendered)
         self.assertNotIn("</script><script>window.__admin_xss", rendered)
 
+    def test_admin_js_avoids_dom_reinterpretation_for_code_scanning_surfaces(self) -> None:
+        admin_js = (
+            Path(__file__).resolve().parents[1]
+            / "admin_service"
+            / "static"
+            / "admin.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("elements.releaseNote.innerHTML", admin_js)
+        self.assertNotIn("elements.runtimeCards.innerHTML", admin_js)
+
+    def test_sas_fabric_compact_labels_do_not_replace_dev_prefix_with_itself(self) -> None:
+        sas_js = (
+            Path(__file__).resolve().parents[1]
+            / "app"
+            / "static"
+            / "sas_fabric_view.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn('.replace(/^\\/dev\\//, "/dev/")', sas_js)
+
     def test_admin_js_preserve_sentinel_is_save_only(self) -> None:
         admin_js = (
             Path(__file__).resolve().parents[1]
@@ -913,6 +955,38 @@ class AdminStatePayloadTests(unittest.TestCase):
             "const payload = collectSetupPayload({ preserveRedactedSecrets: true });",
             admin_js,
         )
+
+    def test_quantastor_ssh_enrichment_redacts_exception_details_from_result(self) -> None:
+        payload = QuantastorNodeDiscoveryRequest(
+            truenas_host="https://qs.example.test",
+            api_user="qsadmin",
+            api_password="api-secret",
+            ssh_enabled=True,
+            ssh_host="192.0.2.10",
+            ssh_user="root",
+            ssh_password="ssh-secret",
+        )
+        raw_data = TrueNASRawData(
+            enclosures=[],
+            disks=[],
+            pools=[],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+        nodes = [{"id": "node-a", "label": "Node A", "host": ""}]
+
+        with patch(
+            "admin_service.main.SSHProbe.run_commands",
+            new=AsyncMock(side_effect=RuntimeError("Traceback: password=ssh-secret timed out")),
+        ):
+            result = asyncio.run(enrich_quantastor_nodes_from_ssh(payload, raw_data, nodes))
+
+        self.assertFalse(result["ok"])
+        self.assertIn("failures", result)
+        joined = json.dumps(result)
+        self.assertNotIn("Traceback", joined)
+        self.assertNotIn("ssh-secret", joined)
+        self.assertIn("see admin logs", joined)
 
     def test_annotate_runtime_versions_marks_out_of_sync_services(self) -> None:
         runtime_payload = {
@@ -1416,6 +1490,47 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         history_store.delete_system_history.assert_called_once_with("qs-cryostorage")
         runtime_service.mark_restart_required.assert_called_once_with(("ui",))
 
+    def test_delete_system_route_redacts_history_purge_failure_detail(self) -> None:
+        route = next(
+            route for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/{system_id}" and "DELETE" in getattr(route, "methods", set())
+        )
+        initial_settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="qs-cryostorage",
+                    label="QS CryoStorage",
+                    truenas=TrueNASConfig(
+                        host="https://10.13.37.40",
+                        platform="quantastor",
+                    ),
+                )
+            ],
+            default_system_id="qs-cryostorage",
+        )
+        refreshed_settings = Settings(systems=[], default_system_id=None)
+        setup_service = MagicMock()
+        setup_service.delete_system.return_value = ("QS CryoStorage", None)
+        runtime_service = MagicMock()
+        runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
+        history_store = MagicMock()
+        history_store.delete_system_history.side_effect = RuntimeError("Traceback: token=history-secret")
+
+        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings, refreshed_settings]):
+            with patch("admin_service.main.SystemSetupService", return_value=setup_service):
+                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+                    with patch("admin_service.main.get_history_store", return_value=history_store):
+                        response = asyncio.run(route.endpoint(system_id="qs-cryostorage", purge_history=True))
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(payload["history_purge"]["ok"])
+        self.assertEqual(payload["history_purge"]["detail"], "Saved history purge failed; see admin logs.")
+        joined = json.dumps(payload)
+        self.assertNotIn("Traceback", joined)
+        self.assertNotIn("history-secret", joined)
+
     def test_purge_orphaned_history_route_returns_cleanup_summary(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/purge-orphaned")
         settings = Settings(
@@ -1491,6 +1606,43 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["valid_system_ids"], ["archive-core"])
         history_store.list_history_system_summaries.assert_called_once_with(["archive-core"])
 
+    def test_adopt_removed_system_history_route_redacts_inspection_failure_detail(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="example-qs-ha",
+                    label="ExampleQS HA",
+                    truenas=TrueNASConfig(
+                        host="https://10.13.37.40",
+                        platform="quantastor",
+                    ),
+                )
+            ],
+            default_system_id="example-qs-ha",
+        )
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.side_effect = RuntimeError(
+            "Traceback: token=history-secret"
+        )
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_history_store", return_value=history_store):
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(
+                        route.endpoint(
+                            payload=HistoryAdoptRequest(
+                                source_system_id="qs-cryostorage",
+                                target_system_id="example-qs-ha",
+                            )
+                        )
+                    )
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "Unable to inspect orphaned history; see admin logs.")
+        self.assertNotIn("Traceback", str(raised.exception.detail))
+        self.assertNotIn("history-secret", str(raised.exception.detail))
+
     def test_adopt_removed_system_history_route_rehomes_orphaned_history(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
         settings = Settings(
@@ -1554,6 +1706,51 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "example-qs-ha",
             target_system_label="ExampleQS HA",
         )
+
+    def test_adopt_removed_system_history_route_redacts_adoption_failure_detail(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="example-qs-ha",
+                    label="ExampleQS HA",
+                    truenas=TrueNASConfig(
+                        host="https://10.13.37.40",
+                        platform="quantastor",
+                    ),
+                )
+            ],
+            default_system_id="example-qs-ha",
+        )
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.return_value = [
+            {
+                "system_id": "qs-cryostorage",
+                "system_label": "QS CryoStorage",
+                "tracked_slots": 2,
+                "event_count": 3,
+                "metric_sample_count": 4,
+                "total_rows": 9,
+            }
+        ]
+        history_store.adopt_system_history.side_effect = RuntimeError("Traceback: token=history-secret")
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_history_store", return_value=history_store):
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(
+                        route.endpoint(
+                            payload=HistoryAdoptRequest(
+                                source_system_id="qs-cryostorage",
+                                target_system_id="example-qs-ha",
+                            )
+                        )
+                    )
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "Unable to adopt removed system history; see admin logs.")
+        self.assertNotIn("Traceback", str(raised.exception.detail))
+        self.assertNotIn("history-secret", str(raised.exception.detail))
 
     def test_storage_view_candidate_route_returns_unmapped_inventory_candidates(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/storage-views/candidates")

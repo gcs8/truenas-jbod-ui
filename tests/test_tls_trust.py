@@ -95,6 +95,35 @@ class TLSTrustStoreServiceTests(unittest.TestCase):
         self.assertEqual(result["leaf"]["san_dns"], ["archive-core.local"])
 
     @patch("admin_service.services.tls_trust.socket.create_connection")
+    @patch("admin_service.services.tls_trust.ssl.SSLContext")
+    def test_inspect_remote_certificate_enforces_modern_tls_floor(
+        self,
+        ssl_context_cls: MagicMock,
+        create_connection: MagicMock,
+    ) -> None:
+        pem_text = build_self_signed_pem("archive-core.local")
+        certificate = x509.load_pem_x509_certificate(pem_text.encode("utf-8"))
+        der_bytes = certificate.public_bytes(serialization.Encoding.DER)
+
+        raw_socket = MagicMock()
+        raw_socket.__enter__.return_value = raw_socket
+        raw_socket.__exit__.return_value = False
+        create_connection.return_value = raw_socket
+
+        tls_socket = MagicMock()
+        tls_socket.__enter__.return_value = tls_socket
+        tls_socket.__exit__.return_value = False
+        tls_socket.get_unverified_chain.return_value = [der_bytes]
+        context = MagicMock()
+        context.wrap_socket.return_value = tls_socket
+        ssl_context_cls.return_value = context
+
+        self.service.inspect_remote_certificate("https://archive-core.local", timeout_seconds=5)
+
+        ssl_context_cls.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+
+    @patch("admin_service.services.tls_trust.socket.create_connection")
     @patch("admin_service.services.tls_trust.build_tls_client_context")
     def test_validate_bundle_for_host_reports_success(
         self,
@@ -268,6 +297,7 @@ class TLSContextTests(unittest.TestCase):
 
         self.assertIs(returned, context)
         context.load_verify_locations.assert_called_once_with(cafile="/app/config/tls/archive-core.pem")
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
 
     @patch("app.services.tls_context.ssl.create_default_context")
     def test_build_tls_client_context_disables_verification_when_requested(
@@ -287,6 +317,7 @@ class TLSContextTests(unittest.TestCase):
         self.assertIs(returned, context)
         self.assertFalse(context.check_hostname)
         self.assertEqual(context.verify_mode, ssl.CERT_NONE)
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
 
     @patch("app.services.tls_context.urllib.request.build_opener")
     @patch("app.services.tls_context.urllib.request.urlopen")

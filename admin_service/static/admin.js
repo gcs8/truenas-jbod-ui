@@ -511,13 +511,12 @@
       elements.releaseNote.textContent = summary;
       elements.releaseNote.className = `hero-stat-note is-${releaseStatus.status || "unknown"}`;
       if (latestUrl) {
-        elements.releaseNote.innerHTML = "";
         const link = document.createElement("a");
         link.href = latestUrl;
         link.target = "_blank";
         link.rel = "noopener";
         link.textContent = summary;
-        elements.releaseNote.appendChild(link);
+        elements.releaseNote.replaceChildren(link);
       }
     }
     if (elements.adminOriginLink) {
@@ -698,57 +697,106 @@
       ? `Runtime control is available through the mounted Docker socket.${runtime.version_detail ? ` ${runtime.version_detail}` : ""}`
       : String(runtime.detail || "Runtime control is unavailable in this session.");
     const containers = Array.isArray(runtime.containers) ? runtime.containers : [];
-    elements.runtimeCards.innerHTML = containers
-      .map((container) => {
-        const actions = [];
-        if (container.can_stop) {
-          actions.push(
-            `<button class="button secondary small" type="button" data-runtime-action="stop" data-container-key="${escapeHtml(container.key)}">Stop</button>`
-          );
-        }
-        if (container.can_restart) {
-          actions.push(
-            `<button class="button secondary small" type="button" data-runtime-action="restart" data-container-key="${escapeHtml(container.key)}">Restart</button>`
-          );
-        }
-        if (container.can_start) {
-          actions.push(
-            `<button class="button small" type="button" data-runtime-action="start" data-container-key="${escapeHtml(container.key)}">Start</button>`
-          );
-        }
-        const health = container.health ? ` / ${escapeHtml(container.health)}` : "";
-        const lifecycleLabel = String(container.lifecycle_label || container.status_text || container.status || "unknown");
-        const versionNote = String(container.release_status?.summary || container.version_sync_summary || "").trim();
-        return `
-          <article class="runtime-card">
-            <div class="runtime-card-header">
-              <div>
-                <h3 class="runtime-card-title">${escapeHtml(container.label || container.name || container.key)}</h3>
-                <p class="runtime-card-copy">${escapeHtml(container.description || "")}</p>
-              </div>
-              <span class="runtime-card-status ${runtimeStatusClass(container)}">
-                ${escapeHtml(lifecycleLabel)}${health}
-              </span>
-            </div>
-            <div class="runtime-card-copy"><code>${escapeHtml(container.name || container.key)}</code></div>
-            <div class="subtle">${escapeHtml(container.status_text || "No additional runtime detail is available.")}</div>
-            <div class="runtime-version-grid">
-              <div class="runtime-version-row">
-                <span class="runtime-version-label">Running</span>
-                <span class="runtime-version-value">${escapeHtml(formatRuntimeMetaValue(container.running_version, container.running ? "Unavailable" : "Stopped"))}</span>
-              </div>
-              <div class="runtime-version-row">
-                <span class="runtime-version-label">Latest</span>
-                <span class="runtime-version-value">${escapeHtml(formatRuntimeMetaValue(container.latest_version))}</span>
-              </div>
-            </div>
-            <div class="runtime-version-note ${runtimeVersionNoteClass(container)}">${escapeHtml(versionNote)}</div>
-            <div class="runtime-sync-note ${String(container.version_sync_state || "").toLowerCase() === "out_of_sync" ? "is-out-of-sync" : ""}">${escapeHtml(container.version_sync_summary || "")}</div>
-            <div class="button-row">${actions.join("") || '<span class="subtle">No action available from this state.</span>'}</div>
-          </article>
-        `;
-      })
-      .join("");
+    elements.runtimeCards.replaceChildren(...containers.map((container) => renderRuntimeCardElement(container)));
+  }
+
+  function createRuntimeActionButton(container, action, label, secondary = false) {
+    const button = document.createElement("button");
+    button.className = `button${secondary ? " secondary" : ""} small`;
+    button.type = "button";
+    button.dataset.runtimeAction = action;
+    button.dataset.containerKey = String(container.key || "");
+    button.textContent = label;
+    return button;
+  }
+
+  function createRuntimeVersionRow(label, value) {
+    const row = document.createElement("div");
+    row.className = "runtime-version-row";
+    const labelElement = document.createElement("span");
+    labelElement.className = "runtime-version-label";
+    labelElement.textContent = label;
+    const valueElement = document.createElement("span");
+    valueElement.className = "runtime-version-value";
+    valueElement.textContent = value;
+    row.append(labelElement, valueElement);
+    return row;
+  }
+
+  function renderRuntimeCardElement(container) {
+    const card = document.createElement("article");
+    card.className = "runtime-card";
+
+    const header = document.createElement("div");
+    header.className = "runtime-card-header";
+    const headingWrapper = document.createElement("div");
+    const title = document.createElement("h3");
+    title.className = "runtime-card-title";
+    title.textContent = String(container.label || container.name || container.key || "");
+    const description = document.createElement("p");
+    description.className = "runtime-card-copy";
+    description.textContent = String(container.description || "");
+    headingWrapper.append(title, description);
+
+    const status = document.createElement("span");
+    status.className = "runtime-card-status";
+    status.classList.add(runtimeStatusClass(container));
+    const lifecycleLabel = String(container.lifecycle_label || container.status_text || container.status || "unknown");
+    status.textContent = `${lifecycleLabel}${container.health ? ` / ${String(container.health)}` : ""}`;
+    header.append(headingWrapper, status);
+
+    const nameLine = document.createElement("div");
+    nameLine.className = "runtime-card-copy";
+    const code = document.createElement("code");
+    code.textContent = String(container.name || container.key || "");
+    nameLine.appendChild(code);
+
+    const detail = document.createElement("div");
+    detail.className = "subtle";
+    detail.textContent = String(container.status_text || "No additional runtime detail is available.");
+
+    const versionGrid = document.createElement("div");
+    versionGrid.className = "runtime-version-grid";
+    versionGrid.append(
+      createRuntimeVersionRow("Running", formatRuntimeMetaValue(container.running_version, container.running ? "Unavailable" : "Stopped")),
+      createRuntimeVersionRow("Latest", formatRuntimeMetaValue(container.latest_version))
+    );
+
+    const versionNote = document.createElement("div");
+    versionNote.className = "runtime-version-note";
+    const versionNoteClass = runtimeVersionNoteClass(container);
+    if (versionNoteClass) {
+      versionNote.classList.add(versionNoteClass);
+    }
+    versionNote.textContent = String(container.release_status?.summary || container.version_sync_summary || "").trim();
+
+    const syncNote = document.createElement("div");
+    syncNote.className = "runtime-sync-note";
+    if (String(container.version_sync_state || "").toLowerCase() === "out_of_sync") {
+      syncNote.classList.add("is-out-of-sync");
+    }
+    syncNote.textContent = String(container.version_sync_summary || "");
+
+    const actionRow = document.createElement("div");
+    actionRow.className = "button-row";
+    if (container.can_stop) {
+      actionRow.appendChild(createRuntimeActionButton(container, "stop", "Stop", true));
+    }
+    if (container.can_restart) {
+      actionRow.appendChild(createRuntimeActionButton(container, "restart", "Restart", true));
+    }
+    if (container.can_start) {
+      actionRow.appendChild(createRuntimeActionButton(container, "start", "Start"));
+    }
+    if (!actionRow.children.length) {
+      const noAction = document.createElement("span");
+      noAction.className = "subtle";
+      noAction.textContent = "No action available from this state.";
+      actionRow.appendChild(noAction);
+    }
+
+    card.append(header, nameLine, detail, versionGrid, versionNote, syncNote, actionRow);
+    return card;
   }
 
   function runtimeBehaviorOwnerLabel(field) {

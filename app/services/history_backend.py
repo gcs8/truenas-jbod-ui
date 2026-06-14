@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import timedelta
 import urllib.error
 import urllib.parse
@@ -10,6 +11,11 @@ from typing import Any
 
 from app.config import HistoryConfig
 from app.models.domain import utcnow
+
+
+logger = logging.getLogger(__name__)
+HISTORY_BACKEND_FAILURE_DETAIL = "History backend request failed; see application logs."
+HISTORY_BACKEND_DEGRADED_DETAIL = "History backend is degraded; see history service logs."
 
 
 class HistoryBackendClient:
@@ -34,21 +40,24 @@ class HistoryBackendClient:
         try:
             payload = await self._fetch_json("/healthz")
         except Exception as exc:  # noqa: BLE001 - surface optional-backend errors as degraded status.
+            logger.warning("History backend status request failed: %s", exc)
             return {
                 "configured": True,
                 "available": False,
-                "detail": str(exc),
+                "detail": HISTORY_BACKEND_FAILURE_DETAIL,
                 "counts": {},
                 "collector": {},
                 "scopes": [],
             }
-
+        collector = dict(payload.get("collector", {})) if isinstance(payload.get("collector"), dict) else {}
+        if payload.get("status") == "degraded" or collector.get("last_error"):
+            collector["last_error"] = HISTORY_BACKEND_DEGRADED_DETAIL
         return {
             "configured": True,
             "available": True,
-            "detail": payload.get("last_error") if payload.get("status") == "degraded" else None,
+            "detail": HISTORY_BACKEND_DEGRADED_DETAIL if payload.get("status") == "degraded" else None,
             "counts": payload.get("counts", {}),
-            "collector": payload.get("collector", {}),
+            "collector": collector,
             "scopes": payload.get("scopes", []),
         }
 
@@ -86,10 +95,11 @@ class HistoryBackendClient:
                 params={**params, "event_limit": 12},
             )
         except Exception as exc:  # noqa: BLE001 - optional backend should degrade gracefully.
+            logger.warning("History backend slot history request failed: %s", exc)
             return {
                 "configured": True,
                 "available": False,
-                "detail": str(exc),
+                "detail": HISTORY_BACKEND_FAILURE_DETAIL,
                 "slot": slot,
                 "system_id": system_id,
                 "enclosure_id": enclosure_id,

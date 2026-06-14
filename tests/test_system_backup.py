@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -253,16 +254,40 @@ class SystemBackupServiceTests(unittest.TestCase):
         get_settings.cache_clear()
 
     @staticmethod
+    def _fake_7z_passphrase_token(passphrase: str | None) -> str | None:
+        if passphrase is None:
+            return None
+        token = hashlib.pbkdf2_hmac(
+            "sha256",
+            passphrase.encode("utf-8"),
+            b"truenas-jbod-ui-test-fake-7z",
+            100_000,
+        )
+        return token.hex()
+
+    @staticmethod
     def _encode_fake_7z_archive(files: dict[str, bytes], passphrase: str | None) -> bytes:
         payload = {
             "encrypted": passphrase is not None,
-            "passphrase": passphrase,
+            "passphrase_kdf": SystemBackupServiceTests._fake_7z_passphrase_token(passphrase),
             "files": {
                 path: base64.b64encode(content).decode("ascii")
                 for path, content in sorted(files.items())
             },
         }
         return SEVEN_ZIP_SIGNATURE + json.dumps(payload, sort_keys=True).encode("utf-8")
+
+    def test_fake_7z_archive_does_not_store_cleartext_passphrase(self) -> None:
+        archive_bytes = self._encode_fake_7z_archive({"manifest.json": b"{}"}, "topsecret")
+
+        self.assertNotIn(b"topsecret", archive_bytes)
+        payload = json.loads(archive_bytes[len(SEVEN_ZIP_SIGNATURE) :].decode("utf-8"))
+        self.assertNotIn("passphrase", payload)
+        self.assertNotIn("passphrase_sha256", payload)
+        self.assertEqual(
+            payload["passphrase_kdf"],
+            self._fake_7z_passphrase_token("topsecret"),
+        )
 
     @staticmethod
     def _build_zip_bundle(manifest: dict[str, object], files: dict[str, bytes] | None = None) -> bytes:
@@ -479,9 +504,10 @@ class SystemBackupServiceTests(unittest.TestCase):
             )
 
         payload = self._decode_fake_7z_archive(archive_path)
-        expected_passphrase = payload.get("passphrase")
+        expected_passphrase_token = payload.get("passphrase_kdf")
         archive_encrypted = bool(payload.get("encrypted"))
-        if archive_encrypted and passphrase != expected_passphrase:
+        supplied_passphrase_token = self._fake_7z_passphrase_token(passphrase)
+        if archive_encrypted and supplied_passphrase_token != expected_passphrase_token:
             return subprocess.CompletedProcess(
                 ["7z", *args],
                 2,
