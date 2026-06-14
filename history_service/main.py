@@ -29,6 +29,7 @@ store = HistoryStore(settings.sqlite_path)
 collector = HistoryCollector(settings, store)
 logger = logging.getLogger(__name__)
 refresh_lock = asyncio.Lock()
+HISTORY_COLLECTOR_ERROR_DETAIL = "History collector error; see service logs."
 SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "temperature_c": 96,
     "bytes_read": 60,
@@ -37,6 +38,17 @@ SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "annualized_bytes_written": 60,
     "power_on_hours": 60,
 }
+
+
+def public_collector_status(
+    status: dict[str, object],
+    *,
+    last_error_detail: str = HISTORY_COLLECTOR_ERROR_DETAIL,
+) -> dict[str, object]:
+    payload = dict(status)
+    if payload.get("last_error"):
+        payload["last_error"] = last_error_detail
+    return payload
 
 
 @lru_cache
@@ -72,7 +84,7 @@ install_metrics(app, service_name="enclosure-history", version=__version__)
 
 @app.get("/", response_class=HTMLResponse)
 async def index(exact_counts: bool = Query(default=False)) -> HTMLResponse:
-    status = collector.status()
+    status = public_collector_status(collector.status())
     counts = store.counts() if exact_counts else store.estimated_counts()
     scopes = store.list_scopes(include_activity_counts=exact_counts)
     return HTMLResponse(
@@ -89,7 +101,7 @@ async def index(exact_counts: bool = Query(default=False)) -> HTMLResponse:
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
-    collector_status = collector.status()
+    collector_status = public_collector_status(collector.status())
     payload = {
         "status": "ok" if not collector.last_error else "degraded",
         "collector": collector_status,
@@ -113,7 +125,7 @@ async def livez() -> JSONResponse:
 @app.get("/api/history/overview")
 async def overview(exact_counts: bool = Query(default=False)) -> dict[str, object]:
     return {
-        "collector": collector.status(),
+        "collector": public_collector_status(collector.status()),
         "counts": store.counts() if exact_counts else store.estimated_counts(),
         "counts_exact": exact_counts,
         "database": {
@@ -162,13 +174,19 @@ async def refresh_history(mode: str = Query(default="fast")) -> dict[str, object
         )
     except Exception as exc:  # noqa: BLE001 - report manual collection failures as structured API errors.
         logger.exception("Manual history %s refresh failed", normalized_mode)
-        collector.last_error = str(exc)
+        failure_detail = f"History {normalized_mode} refresh failed; see service logs."
+        collector.last_error = failure_detail
         try:
             payload = await overview(exact_counts=False)
+            collector_payload = payload.get("collector")
+            payload["collector"] = public_collector_status(
+                collector_payload if isinstance(collector_payload, dict) else {},
+                last_error_detail=failure_detail,
+            )
         except Exception:  # noqa: BLE001 - keep the original refresh failure visible even if summary loading also fails.
             logger.exception("Manual history %s refresh failed while loading summary payload", normalized_mode)
             payload = {
-                "collector": collector.status(),
+                "collector": public_collector_status(collector.status(), last_error_detail=failure_detail),
                 "counts": {},
                 "counts_exact": False,
                 "scopes": [],
@@ -177,7 +195,7 @@ async def refresh_history(mode: str = Query(default="fast")) -> dict[str, object
             {
                 "ok": False,
                 "mode": normalized_mode,
-                "detail": f"History {normalized_mode} refresh failed: {exc}",
+                "detail": failure_detail,
                 **payload,
             },
             status_code=500,

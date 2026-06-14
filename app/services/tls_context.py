@@ -37,6 +37,7 @@ def build_tls_client_context(config: TrueNASConfig) -> ssl.SSLContext | None:
         return None
 
     context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     if config.verify_ssl:
         if config.tls_ca_bundle_path:
             context.load_verify_locations(cafile=config.tls_ca_bundle_path)

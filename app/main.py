@@ -619,7 +619,8 @@ def create_app() -> FastAPI:
                     invalidate_snapshot=False,
                 )
             except Exception as exc:  # noqa: BLE001 - surface as non-fatal warning.
-                led_warning = str(exc)
+                logger.warning("Failed to clear identify LED after saving slot %s mapping: %s", slot, exc)
+                led_warning = "Saved mapping, but failed to clear the identify LED; see application logs."
 
         service.invalidate_snapshot_cache(
             reason="route.save_mapping",
@@ -1086,8 +1087,11 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
-        logger.exception("Unhandled application error")
-        return JSONResponse({"ok": False, "detail": str(exc)}, status_code=500)
+        logger.error("Unhandled application error", exc_info=(type(exc), exc, exc.__traceback__))
+        return JSONResponse(
+            {"ok": False, "detail": "Unhandled application error; see application logs."},
+            status_code=500,
+        )
 
     return app
 

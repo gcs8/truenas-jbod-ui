@@ -100,11 +100,45 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(payload["configured"])
         self.assertTrue(payload["available"])
-        self.assertEqual(payload["detail"], "collector timed out")
+        self.assertEqual(payload["detail"], "History backend is degraded; see history service logs.")
         self.assertEqual(payload["counts"], {})
         self.assertEqual(payload["collector"]["last_success_at"], "2026-05-14T23:10:00+00:00")
         self.assertEqual(payload["scopes"], [])
         fetch_json.assert_awaited_once_with("/healthz")
+
+    async def test_get_status_redacts_backend_exception_details(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+
+        with patch.object(
+            client,
+            "_fetch_json",
+            AsyncMock(side_effect=RuntimeError("Traceback: password=secret backend timed out")),
+        ):
+            payload = await client.get_status()
+
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["detail"], "History backend request failed; see application logs.")
+        self.assertNotIn("secret", str(payload))
+        self.assertNotIn("Traceback", str(payload))
+
+    async def test_get_slot_history_redacts_backend_exception_details(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+
+        with patch.object(
+            client,
+            "_fetch_json",
+            AsyncMock(side_effect=RuntimeError("Traceback: token=secret backend timed out")),
+        ):
+            payload = await client.get_slot_history(5, "archive-core", "front", window_hours=24)
+
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["detail"], "History backend request failed; see application logs.")
+        self.assertNotIn("secret", str(payload))
+        self.assertNotIn("Traceback", str(payload))
 
     async def test_get_slot_history_shapes_metric_and_event_payloads(self) -> None:
         client = HistoryBackendClient(

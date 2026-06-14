@@ -406,7 +406,8 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         payload = json.loads(response.body)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["mode"], "full")
-        self.assertIn("timed out after 45s", payload["detail"])
+        self.assertEqual(payload["detail"], "History full refresh failed; see service logs.")
+        self.assertNotIn("timed out after 45s", json.dumps(payload))
         self.assertFalse(payload["counts_exact"])
 
     def test_history_refresh_endpoint_reports_existing_collection_as_conflict(self) -> None:

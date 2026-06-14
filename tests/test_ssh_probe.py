@@ -92,6 +92,38 @@ class SSHProbeTests(unittest.TestCase):
         )
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
+    def test_client_uses_tofu_pinning_when_strict_host_key_checking_disabled(
+        self,
+        ssh_client_cls: MagicMock,
+    ) -> None:
+        ssh_client = MagicMock()
+        ssh_client_cls.return_value = ssh_client
+        ssh_client.connect.return_value = None
+        default_known_hosts_path = SSHConfig().known_hosts_path
+
+        with patch.object(SSHProbe, "_prepare_known_hosts_path", return_value=default_known_hosts_path) as prepare_known_hosts_path:
+            probe = SSHProbe(
+                SSHConfig(
+                    enabled=True,
+                    host="unvr.gcs8.io",
+                    user="root",
+                    key_path="",
+                    password="secret-pass",
+                    strict_host_key_checking=False,
+                )
+            )
+
+            probe._client()
+
+        prepare_known_hosts_path.assert_called_once_with(default_known_hosts_path)
+        ssh_client.load_host_keys.assert_called_once_with(default_known_hosts_path)
+        policy = ssh_client.set_missing_host_key_policy.call_args.args[0]
+        self.assertIsInstance(policy, AutoPinHostKeyPolicy)
+        self.assertEqual(policy.known_hosts_path, default_known_hosts_path)
+        self.assertNotIsInstance(policy, paramiko.WarningPolicy)
+        self.assertNotIsInstance(policy, paramiko.AutoAddPolicy)
+
+    @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_client_rejects_unknown_keys_when_strict_mode_has_no_known_hosts_path(
         self,
         ssh_client_cls: MagicMock,

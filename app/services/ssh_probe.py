@@ -320,7 +320,12 @@ class SSHProbe:
             else:
                 client.set_missing_host_key_policy(paramiko.RejectPolicy())
         else:
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            if self.config.known_hosts_path:
+                known_hosts_path = self._prepare_known_hosts_path(self.config.known_hosts_path)
+                client.load_host_keys(known_hosts_path)
+                client.set_missing_host_key_policy(AutoPinHostKeyPolicy(known_hosts_path))
+            else:
+                client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
         connect_kwargs = {
             "hostname": self.config.host,

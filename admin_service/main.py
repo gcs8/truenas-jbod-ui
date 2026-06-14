@@ -651,7 +651,7 @@ def create_app() -> FastAPI:
                     "requested": True,
                     "ok": False,
                     "summary": None,
-                    "detail": f"Saved history purge failed: {exc}",
+                    "detail": "Saved history purge failed; see admin logs.",
                 }
 
         refreshed_settings = reload_app_settings()
@@ -683,7 +683,8 @@ def create_app() -> FastAPI:
         try:
             summary = await asyncio.to_thread(history_store.purge_orphaned_history, valid_system_ids)
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
-            raise HTTPException(status_code=500, detail=f"Unable to purge orphaned history: {exc}") from exc
+            logger.exception("Unable to purge orphaned history")
+            raise HTTPException(status_code=500, detail="Unable to purge orphaned history; see admin logs.") from exc
 
         removed_system_ids = list(summary.get("removed_system_ids") or [])
         if summary["total_rows"]:
@@ -715,7 +716,8 @@ def create_app() -> FastAPI:
                 valid_system_ids,
             )
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
-            raise HTTPException(status_code=500, detail=f"Unable to inspect orphaned history: {exc}") from exc
+            logger.exception("Unable to inspect orphaned history")
+            raise HTTPException(status_code=500, detail="Unable to inspect orphaned history; see admin logs.") from exc
 
         return JSONResponse(
             {
@@ -749,7 +751,8 @@ def create_app() -> FastAPI:
                 valid_system_ids,
             )
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
-            raise HTTPException(status_code=500, detail=f"Unable to inspect orphaned history: {exc}") from exc
+            logger.exception("Unable to inspect orphaned history before adoption")
+            raise HTTPException(status_code=500, detail="Unable to inspect orphaned history; see admin logs.") from exc
 
         source_summary = next(
             (summary for summary in orphaned_systems if summary.get("system_id") == source_system_id),
@@ -775,7 +778,8 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
-            raise HTTPException(status_code=500, detail=f"Unable to adopt removed system history: {exc}") from exc
+            logger.exception("Unable to adopt removed system history")
+            raise HTTPException(status_code=500, detail="Unable to adopt removed system history; see admin logs.") from exc
 
         if summary["total_rows"]:
             detail = (
@@ -962,8 +966,11 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
-        logger.exception("Unhandled admin service error")
-        return JSONResponse({"ok": False, "detail": str(exc)}, status_code=500)
+        logger.error("Unhandled admin service error", exc_info=(type(exc), exc, exc.__traceback__))
+        return JSONResponse(
+            {"ok": False, "detail": "Unhandled admin service error; see admin logs."},
+            status_code=500,
+        )
 
     return app
 
@@ -1346,7 +1353,7 @@ async def enrich_quantastor_nodes_from_ssh(
             results = await SSHProbe(ssh_config).run_commands([command])
         except Exception as exc:  # noqa: BLE001 - keep discovery helper best-effort.
             logger.warning("Quantastor HA node host discovery failed on %s: %s", seed_host, exc)
-            failures.append(f"{seed_host}: {exc}")
+            failures.append(f"{seed_host}: SSH interface discovery failed; see admin logs")
             continue
         result = results[0] if results else None
         if result is None or not result.ok:

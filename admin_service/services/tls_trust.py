@@ -36,6 +36,7 @@ class TLSTrustStoreService:
         normalized_url, connect_host, port = self._normalize_target(host)
         negotiated_server_name = str(tls_server_name or "").strip() or connect_host
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
