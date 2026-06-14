@@ -49,12 +49,13 @@ jobs:
       - name: Install browser QA dependencies
         run: npm ci
 
-      - name: Install Chromium
-        run: npx playwright install --with-deps chromium
+      - name: Use hosted Chrome for browser smoke tests
+        run: google-chrome --version
 
       - name: Smoke test checked-in artifact
         env:
           PUBLIC_DEMO_ARTIFACT: public-demo/index.html
+          PLAYWRIGHT_BROWSER_CHANNEL: chrome
         run: npx playwright test qa/public-demo.spec.js
 
       - name: Configure Pages

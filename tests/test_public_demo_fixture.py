@@ -41,6 +41,22 @@ def clear_export_caches() -> None:
 
 
 class PublicDemoArtifactTests(unittest.TestCase):
+    def _write_minimal_demo_artifact(self, demo_dir: Path, *, padding: str = "") -> None:
+        demo_dir.mkdir(parents=True, exist_ok=True)
+        marker_html = "\n".join(
+            (
+                "Frozen Offline Artifact",
+                "Live-derived CORE 60-bay sample",
+                "Scrambled IDs",
+                "4x NVMe Carrier Card",
+                "Boot SATADOMs",
+                "mirror-8",
+                padding,
+            )
+        )
+        (demo_dir / "index.html").write_text(marker_html, encoding="utf-8")
+        (demo_dir / ".nojekyll").write_text("", encoding="utf-8")
+
     def test_checked_in_public_demo_artifact_is_publishable(self) -> None:
         result = subprocess.run(
             [sys.executable, "scripts/check_public_demo_artifact.py", "public-demo"],
@@ -52,6 +68,65 @@ class PublicDemoArtifactTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Public demo artifact is publishable", result.stdout)
+
+    def test_checked_in_public_demo_artifact_reports_raw_and_gzip_sizes(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/check_public_demo_artifact.py", "public-demo"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("raw=", result.stdout)
+        self.assertIn("gzip=", result.stdout)
+
+    def test_checked_in_public_demo_artifact_enforces_raw_size_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            self._write_minimal_demo_artifact(demo_dir, padding="x" * 128)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/check_public_demo_artifact.py",
+                    str(demo_dir),
+                    "--max-raw-bytes",
+                    "64",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("raw size", result.stderr)
+        self.assertIn("exceeds budget", result.stderr)
+
+    def test_checked_in_public_demo_artifact_enforces_gzip_size_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            self._write_minimal_demo_artifact(demo_dir, padding="x" * 128)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/check_public_demo_artifact.py",
+                    str(demo_dir),
+                    "--max-gzip-bytes",
+                    "16",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gzip size", result.stderr)
+        self.assertIn("exceeds budget", result.stderr)
 
     def test_checked_in_public_demo_artifact_has_operator_markers(self) -> None:
         artifact_path = ROOT / "public-demo" / "index.html"
