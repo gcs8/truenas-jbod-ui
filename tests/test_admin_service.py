@@ -931,6 +931,9 @@ class AdminStatePayloadTests(unittest.TestCase):
 
         self.assertNotIn("elements.releaseNote.innerHTML", admin_js)
         self.assertNotIn("elements.runtimeCards.innerHTML", admin_js)
+        self.assertIn("function safeHttpUrl(value)", admin_js)
+        self.assertIn("const latestUrl = safeHttpUrl(releaseStatus.latest_url);", admin_js)
+        self.assertNotIn("const latestUrl = String(releaseStatus.latest_url || \"\").trim();", admin_js)
 
     def test_sas_fabric_compact_labels_do_not_replace_dev_prefix_with_itself(self) -> None:
         sas_js = (
