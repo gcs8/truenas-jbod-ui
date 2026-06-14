@@ -39,4 +39,4 @@ The pre-tag release wrap validator passes. Post-publish GHCR, deployment refresh
 
 ## Upgrade Note
 
-Deploy `v0.21.2` over `v0.21.1` when the release is published if you use the admin setup/maintenance UI with saved credentials. The patch does not intentionally change Storage Fabric routing, history retention behavior, Quantastor visibility, or public demo data.
+Deploy `v0.21.2` over `v0.21.1` if you use the admin setup/maintenance UI with saved credentials. The patch does not intentionally change Storage Fabric routing, history retention behavior, Quantastor visibility, or public demo data.

@@ -116,14 +116,12 @@ setup notes.
 
 ## Current Version
 
-`0.21.2` is the current release-candidate patch after the Storage Fabric
-expansion. `0.21.1` remains the published stable release until the `0.21.2`
-tag/GHCR/deployment gates complete. The candidate keeps the post-publish
-history-noise hotfix on top of `0.21.0` and adds admin-state credential
-redaction hardening: CORE keeps the deep HBA/SAS diagnostic path, SCALE/Linux,
-Quantastor, ESXi, and BMC-backed systems keep read-only source-labeled maps
-where evidence exists, and richer platform-native Storage Fabric enrichment plus
-performance guardrails remain deferred to `0.22.x`.
+`0.21.2` is the current published patch after the Storage Fabric expansion. It
+keeps the post-publish history-noise hotfix on top of `0.21.0` and adds
+admin-state credential redaction hardening: CORE keeps the deep HBA/SAS
+diagnostic path, SCALE/Linux, Quantastor, ESXi, and BMC-backed systems keep
+read-only source-labeled maps where evidence exists, and richer platform-native
+Storage Fabric enrichment plus performance guardrails move into `0.22.x`.
 
 The public demo from `0.19.0` remains a static GitHub Pages sample data
 experience, not a hosted copy of the live Docker app. Open
