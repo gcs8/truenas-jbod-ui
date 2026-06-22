@@ -40,7 +40,7 @@ jobs:
       INPUT_LATEST: ${{ github.event_name == 'workflow_dispatch' && inputs.make_latest || false }}
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
