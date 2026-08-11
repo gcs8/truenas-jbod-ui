@@ -1164,3 +1164,32 @@ Erase Fail Count          0             N/A        N/A    N/A
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AtaSelfTestLifetimeTests(unittest.TestCase):
+    def test_parse_smartctl_summary_reads_ata_lifetime_hours_as_int(self) -> None:
+        # smartctl reports ATA self-test lifetime_hours as a plain integer;
+        # only the SCSI power_on_time field uses the {"hours": N} dict shape.
+        payload = {
+            "device": {"protocol": "ATA"},
+            "smart_status": {"passed": True},
+            "power_on_time": {"hours": 43110},
+            "ata_smart_self_test_log": {
+                "standard": {
+                    "table": [
+                        {
+                            "type": {"value": 1, "string": "Short offline"},
+                            "status": {"value": 0, "string": "Completed without error", "passed": True},
+                            "lifetime_hours": 43104,
+                        }
+                    ]
+                }
+            },
+        }
+
+        import json as _json
+
+        summary = parse_smartctl_summary(_json.dumps(payload))
+
+        self.assertEqual(summary["last_test_lifetime_hours"], 43104)
+        self.assertEqual(summary["last_test_age_hours"], 6)

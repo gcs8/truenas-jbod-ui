@@ -473,10 +473,10 @@ class ProfileRegistry:
         if resolved is not None:
             return resolved
 
-        rows = fallback_rows or enclosure.rows if enclosure else None
-        columns = fallback_columns or enclosure.columns if enclosure else None
-        slot_count = fallback_slot_count or enclosure.slot_count if enclosure else None
-        slot_layout = fallback_slot_layout or enclosure.slot_layout if enclosure else None
+        rows = fallback_rows or (enclosure.rows if enclosure else None)
+        columns = fallback_columns or (enclosure.columns if enclosure else None)
+        slot_count = fallback_slot_count or (enclosure.slot_count if enclosure else None)
+        slot_layout = fallback_slot_layout or (enclosure.slot_layout if enclosure else None)
         label = fallback_label or (enclosure.label if enclosure else None)
         if rows and columns:
             runtime_id = normalize_text(profile_id) or f"runtime-{(enclosure.id if enclosure else 'enclosure')}"

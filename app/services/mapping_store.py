@@ -23,8 +23,13 @@ class MappingStore:
         if not self.file_path.exists():
             return {}
 
-        with self.file_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        # Tolerate a corrupt/truncated store the same way SlotDetailStore does:
+        # a bad file must degrade to "no mappings", not 500 every snapshot build.
+        try:
+            with self.file_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {}
 
         loaded: dict[str, ManualMapping] = {}
         for key, value in payload.get("slot_mappings", {}).items():

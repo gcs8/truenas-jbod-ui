@@ -341,10 +341,17 @@ class SSHProbe:
         }
 
         try:
-            client.connect(**connect_kwargs)
-        except paramiko.BadAuthenticationType as exc:
-            if not self._try_keyboard_interactive(client, exc):
-                raise
+            try:
+                client.connect(**connect_kwargs)
+            except paramiko.BadAuthenticationType as exc:
+                if not self._try_keyboard_interactive(client, exc):
+                    raise
+        except Exception:
+            # A failed connect can leave a live transport thread and socket
+            # behind; close before propagating so repeated failures can't
+            # accumulate threads/FDs.
+            client.close()
+            raise
         return client
 
     @staticmethod

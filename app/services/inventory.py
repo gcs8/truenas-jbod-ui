@@ -223,13 +223,16 @@ def parse_size_to_bytes(value: Any) -> int | None:
     text = normalize_text(str(value) if value is not None else None)
     if not text:
         return None
-    match = re.match(r"^(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTPE]?)(?:i?B?)$", text, re.IGNORECASE)
+    match = re.match(r"^(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTPE]?)(?P<binary>i)?B?$", text, re.IGNORECASE)
     if not match:
         return None
     number = float(match.group("number"))
     unit = match.group("unit").upper()
     power = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4, "P": 5, "E": 6}[unit]
-    return int(number * (1000 ** power))
+    # KiB/MiB/GiB are binary units (1024^n); KB/MB/GB stay decimal. ESXi and
+    # StorCLI both report binary-suffixed sizes.
+    base = 1024 if match.group("binary") else 1000
+    return int(number * (base ** power))
 
 
 def build_lunid_aliases(value: str | None, platform: str) -> set[str]:
