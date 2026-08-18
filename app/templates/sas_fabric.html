@@ -120,7 +120,7 @@
 </div>
 
 <script>
-  window.SAS_FABRIC_BOOTSTRAP = {{ bootstrap_json | safe }};
+  window.SAS_FABRIC_BOOTSTRAP = {{ bootstrap_json | script_json_text }};
 </script>
 {% endblock %}
 {% block scripts %}
