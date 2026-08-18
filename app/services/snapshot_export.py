@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import hashlib
@@ -357,6 +358,7 @@ class SnapshotExportService:
         self._history_cache = EXPORT_HISTORY_CACHE
         self._render_cache = EXPORT_RENDER_CACHE
         self._zip_cache = EXPORT_ZIP_CACHE
+        self._zip_build_tasks: dict[str, asyncio.Task[bytes]] = {}
 
     async def build_enclosure_snapshot_export(
         self,
@@ -395,16 +397,12 @@ class SnapshotExportService:
         html_bytes = rendered.html.encode("utf-8")
         html_size_bytes = len(html_bytes)
         normalized_packaging = self._normalize_packaging(packaging)
-        with perf_stage("snapshot_export.build_zip_archive"):
-            zip_bytes = self._build_zip_archive_cached(rendered, html_bytes)
-        zip_filename = f"{Path(rendered.filename).stem}.zip"
-        zip_size_bytes = len(zip_bytes)
 
         if normalized_packaging == "html":
             if html_size_bytes > self.size_limit_bytes and not allow_oversize:
                 raise SnapshotExportTooLargeError(
                     html_size_bytes=html_size_bytes,
-                    archive_size_bytes=zip_size_bytes,
+                    archive_size_bytes=None,
                     size_limit_bytes=self.size_limit_bytes,
                 )
             return PackagedSnapshotExport(
@@ -417,6 +415,23 @@ class SnapshotExportService:
                 redaction=rendered.export_meta["redaction"],
                 size_limit_bytes=self.size_limit_bytes,
             )
+
+        if normalized_packaging == "auto" and html_size_bytes <= self.size_limit_bytes:
+            return PackagedSnapshotExport(
+                filename=rendered.filename,
+                content=html_bytes,
+                media_type="text/html; charset=utf-8",
+                size_bytes=html_size_bytes,
+                html_size_bytes=html_size_bytes,
+                packaging="html",
+                redaction=rendered.export_meta["redaction"],
+                size_limit_bytes=self.size_limit_bytes,
+            )
+
+        with perf_stage("snapshot_export.build_zip_archive"):
+            zip_bytes = await self._build_zip_archive_cached(rendered, html_bytes)
+        zip_filename = f"{Path(rendered.filename).stem}.zip"
+        zip_size_bytes = len(zip_bytes)
 
         if normalized_packaging == "zip":
             if zip_size_bytes > self.size_limit_bytes and not allow_oversize:
@@ -432,18 +447,6 @@ class SnapshotExportService:
                 size_bytes=zip_size_bytes,
                 html_size_bytes=html_size_bytes,
                 packaging="zip",
-                redaction=rendered.export_meta["redaction"],
-                size_limit_bytes=self.size_limit_bytes,
-            )
-
-        if html_size_bytes <= self.size_limit_bytes:
-            return PackagedSnapshotExport(
-                filename=rendered.filename,
-                content=html_bytes,
-                media_type="text/html; charset=utf-8",
-                size_bytes=html_size_bytes,
-                html_size_bytes=html_size_bytes,
-                packaging="html",
                 redaction=rendered.export_meta["redaction"],
                 size_limit_bytes=self.size_limit_bytes,
             )
@@ -503,7 +506,8 @@ class SnapshotExportService:
         html_bytes = rendered.html.encode("utf-8")
         html_size_bytes = len(html_bytes)
         with perf_stage("snapshot_export.estimate.measure_zip"):
-            zip_size_bytes = len(self._build_zip_archive_cached(rendered, html_bytes))
+            zip_bytes = await self._build_zip_archive_cached(rendered, html_bytes)
+            zip_size_bytes = len(zip_bytes)
         normalized_packaging = self._normalize_packaging(packaging)
         auto_packaging = self._determine_auto_packaging(html_size_bytes, zip_size_bytes)
         effective_packaging = self._determine_estimated_packaging(
@@ -842,7 +846,12 @@ class SnapshotExportService:
             }
 
             with perf_stage("snapshot_export.render_template"):
-                html = self._inline_static_assets(request, template.render(context))
+                html = await asyncio.to_thread(
+                    self._render_template_with_assets,
+                    request,
+                    template,
+                    context,
+                )
             filename = self._build_filename(snapshot_for_export, generated_at)
             rendered_candidate = RenderedSnapshotExport(
                 cache_key=render_cache_key,
@@ -864,6 +873,14 @@ class SnapshotExportService:
         self._store_cached_value(self._render_cache, render_cache_key, rendered_candidate)
         add_perf_metadata(snapshot_export_render_cache_entries=len(self._render_cache))
         return rendered_candidate
+
+    def _render_template_with_assets(
+        self,
+        request: Request,
+        template: Any,
+        context: dict[str, Any],
+    ) -> str:
+        return self._inline_static_assets(request, template.render(context))
 
     @staticmethod
     def _build_downsampling_strategies() -> list[dict[str, int | None]]:
@@ -1309,7 +1326,11 @@ class SnapshotExportService:
             "latest_values": {},
         }
 
-    def _build_zip_archive_cached(self, rendered: RenderedSnapshotExport, html_content: bytes) -> bytes:
+    async def _build_zip_archive_cached(
+        self,
+        rendered: RenderedSnapshotExport,
+        html_content: bytes,
+    ) -> bytes:
         cache_key = f"{rendered.cache_key}|zip"
         cached_zip = self._get_cached_value(self._zip_cache, cache_key)
         if cached_zip is not None:
@@ -1319,11 +1340,49 @@ class SnapshotExportService:
             )
             return cached_zip
 
-        add_perf_metadata(
-            snapshot_export_zip_cache="miss",
-            snapshot_export_zip_cache_entries=len(self._zip_cache),
+        task = self._zip_build_tasks.get(cache_key)
+        if task is None:
+            add_perf_metadata(
+                snapshot_export_zip_cache="miss",
+                snapshot_export_zip_cache_entries=len(self._zip_cache),
+            )
+            task = asyncio.create_task(
+                self._build_and_cache_zip_archive(
+                    cache_key,
+                    rendered.filename,
+                    html_content,
+                )
+            )
+            self._zip_build_tasks[cache_key] = task
+
+            def cleanup(completed: asyncio.Task[bytes], *, key: str = cache_key) -> None:
+                if self._zip_build_tasks.get(key) is completed:
+                    self._zip_build_tasks.pop(key, None)
+                if not completed.cancelled():
+                    completed.exception()
+
+            task.add_done_callback(cleanup)
+        else:
+            add_perf_metadata(
+                snapshot_export_zip_cache="pending-hit",
+                snapshot_export_zip_cache_entries=len(self._zip_cache),
+            )
+        return await asyncio.shield(task)
+
+    async def _build_and_cache_zip_archive(
+        self,
+        cache_key: str,
+        html_filename: str,
+        html_content: bytes,
+    ) -> bytes:
+        zip_bytes = await asyncio.to_thread(
+            self._build_zip_archive,
+            html_filename,
+            html_content,
         )
-        zip_bytes = self._build_zip_archive(rendered.filename, html_content)
+        cached_zip = self._get_cached_value(self._zip_cache, cache_key)
+        if cached_zip is not None:
+            return cached_zip
         self._store_cached_value(self._zip_cache, cache_key, zip_bytes)
         add_perf_metadata(snapshot_export_zip_cache_entries=len(self._zip_cache))
         return zip_bytes

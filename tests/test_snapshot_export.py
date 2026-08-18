@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
 from starlette.datastructures import URLPath
 from starlette.requests import Request
@@ -683,6 +686,192 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(auto_artifact.packaging, "zip")
         self.assertTrue(auto_artifact.filename.endswith(".zip"))
+
+    async def test_html_and_fitting_auto_exports_do_not_build_unused_zip(self) -> None:
+        snapshot = build_snapshot()
+        request = build_request()
+
+        for packaging in ("html", "auto"):
+            with self.subTest(packaging=packaging):
+                EXPORT_RENDER_CACHE.clear()
+                EXPORT_ZIP_CACHE.clear()
+                exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+                zip_builder = MagicMock(
+                    side_effect=AssertionError("ZIP must stay lazy for HTML output")
+                )
+                exporter._build_zip_archive = zip_builder  # type: ignore[method-assign]
+
+                artifact = await exporter.build_enclosure_snapshot_export(
+                    request=request,
+                    snapshot=snapshot,
+                    smart_summary_cache=build_smart_summary_cache(),
+                    selected_slot=0,
+                    history_window_hours=24,
+                    io_chart_mode="total",
+                    packaging=packaging,
+                    allow_oversize=True,
+                )
+
+                self.assertEqual(artifact.packaging, "html")
+                zip_builder.assert_not_called()
+
+    async def test_zip_compression_does_not_block_the_event_loop(self) -> None:
+        snapshot = build_snapshot()
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        original_builder = exporter._build_zip_archive
+        loop = asyncio.get_running_loop()
+        event_loop_released = threading.Event()
+
+        def blocking_builder(html_filename: str, html_content: bytes) -> bytes:
+            loop.call_soon_threadsafe(event_loop_released.set)
+            if not event_loop_released.wait(timeout=0.5):
+                raise AssertionError("ZIP compression blocked the event loop")
+            return original_builder(html_filename, html_content)
+
+        exporter._build_zip_archive = blocking_builder  # type: ignore[method-assign]
+
+        artifact = await exporter.build_enclosure_snapshot_export(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            io_chart_mode="total",
+            packaging="zip",
+            allow_oversize=True,
+        )
+
+        self.assertEqual(artifact.packaging, "zip")
+        self.assertTrue(event_loop_released.is_set())
+
+    async def test_zip_estimation_does_not_block_the_event_loop(self) -> None:
+        snapshot = build_snapshot()
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        original_builder = exporter._build_zip_archive
+        loop = asyncio.get_running_loop()
+        event_loop_released = threading.Event()
+
+        def blocking_builder(html_filename: str, html_content: bytes) -> bytes:
+            loop.call_soon_threadsafe(event_loop_released.set)
+            if not event_loop_released.wait(timeout=0.5):
+                raise AssertionError("ZIP estimation blocked the event loop")
+            return original_builder(html_filename, html_content)
+
+        exporter._build_zip_archive = blocking_builder  # type: ignore[method-assign]
+
+        estimate = await exporter.estimate_enclosure_snapshot_export(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            io_chart_mode="total",
+            packaging="auto",
+        )
+
+        self.assertTrue(estimate["ok"])
+        self.assertTrue(event_loop_released.is_set())
+
+    async def test_asset_inlining_does_not_block_the_event_loop(self) -> None:
+        snapshot = build_snapshot()
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        original_inliner = exporter._inline_static_assets
+        loop = asyncio.get_running_loop()
+        event_loop_released = threading.Event()
+
+        def blocking_inliner(request, html: str) -> str:
+            loop.call_soon_threadsafe(event_loop_released.set)
+            if not event_loop_released.wait(timeout=0.5):
+                raise AssertionError("Template rendering blocked the event loop")
+            return original_inliner(request, html)
+
+        exporter._inline_static_assets = blocking_inliner  # type: ignore[method-assign]
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            io_chart_mode="total",
+        )
+
+        self.assertGreater(rendered.size_bytes, 0)
+        self.assertTrue(event_loop_released.is_set())
+
+    async def test_template_rendering_does_not_block_the_event_loop(self) -> None:
+        snapshot = build_snapshot()
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        original_get_template = exporter.templates.env.get_template
+        real_template = original_get_template("index.html")
+        loop = asyncio.get_running_loop()
+        event_loop_released = threading.Event()
+
+        class BlockingTemplate:
+            def render(self, context) -> str:
+                loop.call_soon_threadsafe(event_loop_released.set)
+                if not event_loop_released.wait(timeout=0.5):
+                    raise AssertionError("Jinja template rendering blocked the event loop")
+                return real_template.render(context)
+
+        with patch.object(
+            exporter.templates.env,
+            "get_template",
+            side_effect=lambda name, *args, **kwargs: (
+                BlockingTemplate()
+                if name == "index.html"
+                else original_get_template(name, *args, **kwargs)
+            ),
+        ):
+            rendered = await exporter.build_enclosure_snapshot_html(
+                request=build_request(),
+                snapshot=snapshot,
+                smart_summary_cache=build_smart_summary_cache(),
+                selected_slot=0,
+                history_window_hours=24,
+                io_chart_mode="total",
+            )
+
+        self.assertGreater(rendered.size_bytes, 0)
+        self.assertTrue(event_loop_released.is_set())
+
+    async def test_concurrent_zip_requests_share_one_event_loop_owned_cache_build(self) -> None:
+        snapshot = build_snapshot()
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            io_chart_mode="total",
+        )
+        html_bytes = rendered.html.encode("utf-8")
+        original_builder = exporter._build_zip_archive
+        started = threading.Event()
+        release = threading.Event()
+        build_calls = 0
+
+        def controlled_builder(html_filename: str, html_content: bytes) -> bytes:
+            nonlocal build_calls
+            build_calls += 1
+            started.set()
+            if not release.wait(timeout=1):
+                raise AssertionError("Concurrent ZIP test did not release compression")
+            return original_builder(html_filename, html_content)
+
+        exporter._build_zip_archive = controlled_builder  # type: ignore[method-assign]
+        first = asyncio.create_task(exporter._build_zip_archive_cached(rendered, html_bytes))
+        self.assertTrue(await asyncio.to_thread(started.wait, 0.5))
+        second = asyncio.create_task(exporter._build_zip_archive_cached(rendered, html_bytes))
+        await asyncio.sleep(0)
+        release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertEqual(build_calls, 1)
+        self.assertIs(first_result, second_result)
+        self.assertEqual(len(exporter._zip_cache), 1)
+        self.assertEqual(exporter._zip_build_tasks, {})
 
     async def test_estimate_allows_snapshot_to_keep_smart_details_and_oversize_override(self) -> None:
         snapshot = build_snapshot()
