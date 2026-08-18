@@ -22,6 +22,7 @@ services:
       - ./logs:/app/logs
       - ./config/ssh:/run/ssh:ro
     restart: unless-stopped
+    mem_limit: ${APP_MEM_LIMIT:-1g}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=4)"]
       interval: 30s
@@ -68,6 +69,7 @@ services:
       enclosure-ui:
         condition: service_healthy
     restart: unless-stopped
+    mem_limit: ${HISTORY_MEM_LIMIT:-1g}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=4)"]
       interval: 30s
@@ -107,6 +109,7 @@ services:
       - ./config/ssh:/run/ssh:ro
       - /var/run/docker.sock:/var/run/docker.sock
     restart: "no"
+    mem_limit: ${ADMIN_MEM_LIMIT:-1g}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/healthz', timeout=4)"]
       interval: 30s
