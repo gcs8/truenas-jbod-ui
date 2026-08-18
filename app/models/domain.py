@@ -776,10 +776,15 @@ class StorageViewRequest(BaseModel):
     binding: StorageViewBindingRequest = Field(default_factory=StorageViewBindingRequest)
     layout_overrides: StorageViewLayoutOverridesRequest | None = None
 
-    @field_validator("id", "label", "template_id", "profile_id")
+    @field_validator("id", "template_id", "profile_id")
     @classmethod
     def sanitize_text_fields(cls, value: str | None) -> str | None:
         return trim_optional_text(value, max_length=256)
+
+    @field_validator("label")
+    @classmethod
+    def sanitize_label(cls, value: str | None) -> str:
+        return trim_optional_text(value, max_length=256) or ""
 
     @field_validator("order")
     @classmethod
@@ -788,8 +793,6 @@ class StorageViewRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_storage_view(self) -> "StorageViewRequest":
-        if not self.label:
-            raise ValueError("A storage view label is required.")
         if not self.template_id:
             raise ValueError("A storage view template is required.")
         return self
@@ -960,11 +963,15 @@ class SystemSetupRequest(BaseModel):
     @classmethod
     def sanitize_ha_nodes(cls, value: list[HANodeRequest]) -> list[HANodeRequest]:
         cleaned: list[HANodeRequest] = []
-        seen: set[tuple[str | None, str | None]] = set()
+        seen: set[tuple[str | None, str | None, str | None]] = set()
         for node in value[:3]:
             if not (node.system_id or node.label or node.host):
                 continue
-            dedupe_key = (node.system_id, node.host)
+            dedupe_key = (
+                node.system_id,
+                node.host,
+                node.label if not node.system_id and not node.host else None,
+            )
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
@@ -1084,6 +1091,7 @@ class TLSRemoteCertificateTrustRequest(BaseModel):
 
 
 class QuantastorNodeDiscoveryRequest(BaseModel):
+    system_id: str | None = None
     truenas_host: str
     api_user: str
     api_password: str
@@ -1103,6 +1111,7 @@ class QuantastorNodeDiscoveryRequest(BaseModel):
     ha_nodes: list[HANodeRequest] = Field(default_factory=list)
 
     @field_validator(
+        "system_id",
         "truenas_host",
         "api_user",
         "tls_ca_bundle_path",
@@ -1233,6 +1242,7 @@ class SystemSetupBootstrapRequest(BaseModel):
 
 
 class ESXiHostPrepInstallRequest(BaseModel):
+    system_id: str | None = None
     host: str
     port: int = 22
     user: str
@@ -1243,7 +1253,7 @@ class ESXiHostPrepInstallRequest(BaseModel):
     timeout_seconds: int = 15
     upload_token: str
 
-    @field_validator("host", "user", "key_path", "known_hosts_path", "upload_token")
+    @field_validator("system_id", "host", "user", "key_path", "known_hosts_path", "upload_token")
     @classmethod
     def sanitize_text_fields(cls, value: str | None) -> str | None:
         return trim_optional_text(value, max_length=4096)

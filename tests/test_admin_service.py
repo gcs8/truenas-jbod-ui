@@ -41,10 +41,12 @@ from app.models.domain import HistoryAdoptRequest
 from app.models.domain import QuantastorNodeDiscoveryRequest
 from app.models.domain import SnapshotExportRequest
 from app.models.domain import SystemSetupBootstrapRequest
+from app.models.domain import SystemSetupRequest
 from app.models.domain import SystemSetupSudoPreviewRequest
 from app.services.profile_registry import UNIFI_UNVR_FRONT_4_PROFILE_ID
 from app.services.ssh_probe import SSHCommandResult
 from app.services.snapshot_export import PackagedSnapshotExport
+from app.services.system_setup import PRESERVE_SECRET_SENTINEL
 from history_service.config import HistorySettings
 from history_service.main import app as history_app
 from app.services.truenas_ws import TrueNASRawData
@@ -945,7 +947,7 @@ class AdminStatePayloadTests(unittest.TestCase):
 
         self.assertNotIn('.replace(/^\\/dev\\//, "/dev/")', sas_js)
 
-    def test_admin_js_preserve_sentinel_is_save_only(self) -> None:
+    def test_admin_js_preserve_sentinel_is_limited_to_saved_system_flows(self) -> None:
         admin_js = (
             Path(__file__).resolve().parents[1]
             / "admin_service"
@@ -953,9 +955,13 @@ class AdminStatePayloadTests(unittest.TestCase):
             / "admin.js"
         ).read_text(encoding="utf-8")
 
-        self.assertEqual(admin_js.count("preserveRedactedSecrets: true"), 1)
+        self.assertEqual(admin_js.count("preserveRedactedSecrets: true"), 3)
         self.assertIn(
             "const payload = collectSetupPayload({ preserveRedactedSecrets: true });",
+            admin_js,
+        )
+        self.assertIn(
+            "const setupPayload = collectSetupPayload({ preserveRedactedSecrets: true });",
             admin_js,
         )
 
@@ -2293,3 +2299,278 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertFalse(payload["install_ok"])
         self.assertIn("no compatible MegaRAID controller", payload["detail"])
         self.assertEqual(payload["packages"][0]["token"], "storcli-1")
+
+    def test_system_setup_request_preserves_distinct_quantastor_label_only_nodes(self) -> None:
+        payload = SystemSetupRequest(
+            label="Quantastor HA",
+            platform="quantastor",
+            truenas_host="https://192.0.2.30",
+            ha_enabled=True,
+            ha_nodes=[
+                {"label": "Node Alpha"},
+                {"label": "Node Beta"},
+            ],
+        )
+
+        self.assertEqual(
+            [node.label for node in payload.ha_nodes],
+            ["Node Alpha", "Node Beta"],
+        )
+
+    def test_esxi_host_prep_route_resolves_saved_password_sentinel(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/install")
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="saved-esxi",
+                    label="Saved ESXi",
+                    truenas=TrueNASConfig(host="192.0.2.25", platform="esxi"),
+                    ssh=SSHConfig(
+                        enabled=True,
+                        host="192.0.2.25",
+                        user="root",
+                        password=MARKER_ALPHA,
+                        known_hosts_path="/app/data/known_hosts",
+                        timeout_seconds=240,
+                    ),
+                )
+            ]
+        )
+        host_prep_service = MagicMock()
+        host_prep_service.install_package.return_value = {"ok": True, "detail": "installed"}
+        host_prep_service.list_staged_packages.return_value = []
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+                asyncio.run(
+                    route.endpoint(
+                        payload=ESXiHostPrepInstallRequest(
+                            system_id="saved-esxi",
+                            host="192.0.2.25",
+                            user="root",
+                            password=PRESERVE_SECRET_SENTINEL,
+                            timeout_seconds=240,
+                            upload_token="storcli-1",
+                        )
+                    )
+                )
+
+        install_payload = host_prep_service.install_package.call_args.args[0]
+        self.assertEqual(install_payload.password, MARKER_ALPHA)
+        self.assertEqual(install_payload.timeout_seconds, 240)
+
+    def test_esxi_host_prep_rejects_saved_password_for_different_endpoint(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/install")
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="saved-esxi",
+                    label="Saved ESXi",
+                    truenas=TrueNASConfig(host="192.0.2.25", platform="esxi"),
+                    ssh=SSHConfig(
+                        enabled=True,
+                        host="192.0.2.25",
+                        user="root",
+                        password=MARKER_ALPHA,
+                    ),
+                )
+            ]
+        )
+        host_prep_service = MagicMock()
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+                with self.assertRaises(HTTPException) as captured:
+                    asyncio.run(
+                        route.endpoint(
+                            payload=ESXiHostPrepInstallRequest(
+                                system_id="saved-esxi",
+                                host="198.51.100.25",
+                                user="root",
+                                password=PRESERVE_SECRET_SENTINEL,
+                                upload_token="storcli-1",
+                            )
+                        )
+                    )
+
+        self.assertEqual(captured.exception.status_code, 400)
+        host_prep_service.install_package.assert_not_called()
+
+    def test_quantastor_discovery_route_resolves_saved_secret_sentinels(self) -> None:
+        route = next(
+            route
+            for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/quantastor-nodes"
+        )
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="saved-quantastor",
+                    label="Saved Quantastor",
+                    truenas=TrueNASConfig(
+                        host="https://192.0.2.30",
+                        platform="quantastor",
+                        api_user="admin",
+                        api_password=MARKER_ALPHA,
+                    ),
+                    ssh=SSHConfig(
+                        enabled=True,
+                        host="192.0.2.31",
+                        user="svc",
+                        password=MARKER_BRAVO,
+                        known_hosts_path="/app/data/known_hosts",
+                        timeout_seconds=45,
+                    ),
+                )
+            ]
+        )
+        client = MagicMock()
+        client.fetch_all = AsyncMock(return_value=SimpleNamespace())
+        enrich = AsyncMock(return_value={"attempted": False, "ok": True})
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.QuantastorRESTClient", return_value=client) as client_factory:
+                with patch("admin_service.main.serialize_quantastor_nodes", return_value=[]):
+                    with patch("admin_service.main.enrich_quantastor_nodes_from_ssh", enrich):
+                        asyncio.run(
+                            route.endpoint(
+                                QuantastorNodeDiscoveryRequest(
+                                    system_id="saved-quantastor",
+                                    truenas_host="https://192.0.2.30",
+                                    api_user="admin",
+                                    api_password=PRESERVE_SECRET_SENTINEL,
+                                    ssh_enabled=True,
+                                    ssh_host="192.0.2.31",
+                                    ssh_user="svc",
+                                    ssh_password=PRESERVE_SECRET_SENTINEL,
+                                    ssh_timeout_seconds=45,
+                                )
+                            )
+                        )
+
+        api_config = client_factory.call_args.args[0]
+        discovery_payload = enrich.call_args.args[0]
+        self.assertEqual(api_config.api_password, MARKER_ALPHA)
+        self.assertEqual(discovery_payload.ssh_password, MARKER_BRAVO)
+        self.assertEqual(discovery_payload.ssh_timeout_seconds, 45)
+
+    def test_quantastor_discovery_rejects_saved_secrets_for_different_endpoint(self) -> None:
+        route = next(
+            route
+            for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/quantastor-nodes"
+        )
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="saved-quantastor",
+                    label="Saved Quantastor",
+                    truenas=TrueNASConfig(
+                        host="https://192.0.2.30",
+                        platform="quantastor",
+                        api_user="admin",
+                        api_password=MARKER_ALPHA,
+                    ),
+                    ssh=SSHConfig(
+                        enabled=True,
+                        host="192.0.2.31",
+                        user="svc",
+                        password=MARKER_BRAVO,
+                    ),
+                )
+            ]
+        )
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.QuantastorRESTClient") as client_factory:
+                with self.assertRaises(HTTPException) as captured:
+                    asyncio.run(
+                        route.endpoint(
+                            QuantastorNodeDiscoveryRequest(
+                                system_id="saved-quantastor",
+                                truenas_host="https://198.51.100.30",
+                                api_user="admin",
+                                api_password=PRESERVE_SECRET_SENTINEL,
+                            )
+                        )
+                    )
+
+        self.assertEqual(captured.exception.status_code, 400)
+        client_factory.assert_not_called()
+
+    def test_quantastor_discovery_rejects_saved_secrets_for_case_distinct_api_path(self) -> None:
+        route = next(
+            route
+            for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/quantastor-nodes"
+        )
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="saved-quantastor",
+                    label="Saved Quantastor",
+                    truenas=TrueNASConfig(
+                        host="https://192.0.2.30/Tenant",
+                        platform="quantastor",
+                        api_user="admin",
+                        api_password=MARKER_ALPHA,
+                    ),
+                )
+            ]
+        )
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.QuantastorRESTClient") as client_factory:
+                with self.assertRaises(HTTPException) as captured:
+                    asyncio.run(
+                        route.endpoint(
+                            QuantastorNodeDiscoveryRequest(
+                                system_id="saved-quantastor",
+                                truenas_host="https://192.0.2.30/tenant",
+                                api_user="admin",
+                                api_password=PRESERVE_SECRET_SENTINEL,
+                            )
+                        )
+                    )
+
+        self.assertEqual(captured.exception.status_code, 400)
+        client_factory.assert_not_called()
+
+    def test_quantastor_discovery_rejects_saved_secrets_for_identical_invalid_port(self) -> None:
+        route = next(
+            route
+            for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/quantastor-nodes"
+        )
+        invalid_endpoint = "https://192.0.2.30:not-a-port/Tenant"
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="saved-quantastor",
+                    label="Saved Quantastor",
+                    truenas=TrueNASConfig(
+                        host=invalid_endpoint,
+                        platform="quantastor",
+                        api_user="admin",
+                        api_password=MARKER_ALPHA,
+                    ),
+                )
+            ]
+        )
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.QuantastorRESTClient") as client_factory:
+                with self.assertRaises(HTTPException) as captured:
+                    asyncio.run(
+                        route.endpoint(
+                            QuantastorNodeDiscoveryRequest(
+                                system_id="saved-quantastor",
+                                truenas_host=invalid_endpoint,
+                                api_user="admin",
+                                api_password=PRESERVE_SECRET_SENTINEL,
+                            )
+                        )
+                    )
+
+        self.assertEqual(captured.exception.status_code, 400)
+        client_factory.assert_not_called()
