@@ -5,6 +5,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from app.models.domain import SasFabricAlias
 
 
@@ -23,12 +25,20 @@ class SasFabricAliasStore:
         if not self.file_path.exists():
             return {}
 
-        with self.file_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-
-        loaded: dict[str, SasFabricAlias] = {}
-        for key, value in payload.get("sas_fabric_aliases", {}).items():
-            loaded[key] = SasFabricAlias.model_validate(value)
+        try:
+            with self.file_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, dict):
+                return {}
+            raw_aliases = payload.get("sas_fabric_aliases", {})
+            if not isinstance(raw_aliases, dict):
+                return {}
+            loaded = {
+                key: SasFabricAlias.model_validate(value)
+                for key, value in raw_aliases.items()
+            }
+        except (OSError, json.JSONDecodeError, ValidationError):
+            return {}
         return loaded
 
     def list_aliases(self, system_id: str | None = None, enclosure_id: str | None = None) -> list[SasFabricAlias]:

@@ -8603,6 +8603,29 @@ class ReviewRegressionTests(unittest.TestCase):
             store = MappingStore(path)
             self.assertEqual(store.load_all(), {})
 
+    def test_mapping_store_tolerates_malformed_shapes_and_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "slot_mappings.json"
+            store = MappingStore(str(path))
+            for payload in (
+                "null",
+                "[]",
+                '{"slot_mappings": []}',
+                '{"slot_mappings": {"bad": {"slot": "not-an-integer"}}}',
+            ):
+                with self.subTest(payload=payload):
+                    path.write_text(payload, encoding="utf-8")
+                    self.assertEqual(store.load_all(), {})
+
+    def test_mapping_store_tolerates_read_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "slot_mappings.json"
+            path.write_text("{}", encoding="utf-8")
+            store = MappingStore(str(path))
+
+            with patch("app.services.mapping_store.Path.open", side_effect=OSError("synthetic read failure")):
+                self.assertEqual(store.load_all(), {})
+
 
 if __name__ == "__main__":
     unittest.main()

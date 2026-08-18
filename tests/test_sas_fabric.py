@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.config import SystemConfig, TrueNASConfig
 from app.models.domain import (
@@ -700,6 +701,30 @@ mpr0: Controller reported scsi ioc terminated tgt 187 SMID 147 loginfo 32010035
 
 
 class SasFabricAliasStoreTests(unittest.TestCase):
+    def test_alias_store_tolerates_malformed_shapes_and_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "sas_fabric_aliases.json"
+            store = SasFabricAliasStore(path)
+            for payload in (
+                "{",
+                "null",
+                "[]",
+                '{"sas_fabric_aliases": []}',
+                '{"sas_fabric_aliases": {"bad": {"object_id": "", "label": ""}}}',
+            ):
+                with self.subTest(payload=payload):
+                    path.write_text(payload, encoding="utf-8")
+                    self.assertEqual(store.load_all(), {})
+
+    def test_alias_store_tolerates_read_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "sas_fabric_aliases.json"
+            path.write_text("{}", encoding="utf-8")
+            store = SasFabricAliasStore(path)
+
+            with patch("app.services.sas_fabric_alias_store.Path.open", side_effect=OSError("synthetic read failure")):
+                self.assertEqual(store.load_all(), {})
+
     def test_enclosure_alias_overrides_system_alias_for_same_object(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SasFabricAliasStore(Path(temp_dir) / "sas_fabric_aliases.json")
