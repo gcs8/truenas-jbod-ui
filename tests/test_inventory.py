@@ -4248,6 +4248,194 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
 
 
 class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_esxi_smart_summary_reuses_fresh_slot_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="esxi-cache", truenas=TrueNASConfig(platform="esxi"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-a",
+                device_name="naa.cache-a",
+            )
+            expected = SmartSummaryView(available=True, temperature_c=31)
+            service._build_esxi_slot_smart_summary = AsyncMock(return_value=expected)
+
+            first = await service._get_slot_smart_summary_for_slot_view(slot)
+            second = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertIs(first, expected)
+            self.assertIs(second, expected)
+            self.assertEqual(service._build_esxi_slot_smart_summary.await_count, 1)
+
+    async def test_quantastor_smart_summary_reuses_fresh_slot_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="quantastor-cache", truenas=TrueNASConfig(platform="quantastor"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="node-a",
+                device_name="sdb",
+            )
+            expected = SmartSummaryView(available=True, temperature_c=32)
+            service._build_quantastor_smart_summary = MagicMock(return_value=expected)
+
+            first = await service._get_slot_smart_summary_for_slot_view(slot)
+            second = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertEqual(first.temperature_c, 32)
+            self.assertEqual(second.temperature_c, 32)
+            self.assertEqual(service._build_quantastor_smart_summary.call_count, 1)
+
+    async def test_smart_cache_evicts_expired_derived_slot_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="esxi-cache", truenas=TrueNASConfig(platform="esxi"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service._build_esxi_slot_smart_summary = AsyncMock(
+                side_effect=[
+                    SmartSummaryView(available=True, temperature_c=31),
+                    SmartSummaryView(available=True, temperature_c=32),
+                ]
+            )
+            first_slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-a",
+                device_name="naa.cache-a",
+            )
+            second_slot = SlotView(
+                slot=1,
+                slot_label="01",
+                row_index=0,
+                column_index=1,
+                enclosure_id="enc-a",
+                device_name="naa.cache-b",
+            )
+
+            await service._get_slot_smart_summary_for_slot_view(first_slot)
+            expired_key = next(iter(service._smart_cache))
+            service._smart_cache_until[expired_key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            await service._get_slot_smart_summary_for_slot_view(second_slot)
+
+            self.assertNotIn(expired_key, service._smart_cache)
+            self.assertNotIn(expired_key, service._smart_cache_until)
+            self.assertEqual(len(service._smart_cache), 1)
+
+    async def test_scoped_snapshot_invalidation_removes_only_matching_smart_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="esxi-cache", truenas=TrueNASConfig(platform="esxi"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            summary_a = SmartSummaryView(available=True, temperature_c=31)
+            summary_b = SmartSummaryView(available=True, temperature_c=32)
+            service._build_esxi_slot_smart_summary = AsyncMock(side_effect=[summary_a, summary_b])
+            slot_a = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-a",
+                device_name="naa.cache-a",
+            )
+            slot_b = SlotView(
+                slot=1,
+                slot_label="01",
+                row_index=0,
+                column_index=1,
+                enclosure_id="enc-b",
+                device_name="naa.cache-b",
+            )
+
+            await service._get_slot_smart_summary_for_slot_view(slot_a)
+            await service._get_slot_smart_summary_for_slot_view(slot_b)
+            service.invalidate_snapshot_cache(reason="test.smart.scope", cache_keys=["enc-a"])
+
+            self.assertEqual(list(service._smart_cache.values()), [summary_b])
+            self.assertEqual(len(service._smart_cache_until), 1)
+
+    async def test_scoped_invalidation_fences_stale_smart_refresh_without_stopping_other_enclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="esxi-cache", truenas=TrueNASConfig(platform="esxi"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot_a = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-a",
+                device_name="naa.cache-a",
+            )
+            slot_b = SlotView(
+                slot=1,
+                slot_label="01",
+                row_index=0,
+                column_index=1,
+                enclosure_id="enc-b",
+                device_name="naa.cache-b",
+            )
+            stale_a = SmartSummaryView(available=True, temperature_c=21)
+            stale_b = SmartSummaryView(available=True, temperature_c=22)
+            fresh_a = SmartSummaryView(available=True, temperature_c=31)
+            fresh_b = SmartSummaryView(available=True, temperature_c=32)
+            key_a = service._smart_cache_key(slot_a)
+            key_b = service._smart_cache_key(slot_b)
+            expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._smart_cache[key_a] = stale_a
+            service._smart_cache_until[key_a] = expired
+            started = {"enc-a": asyncio.Event(), "enc-b": asyncio.Event()}
+            release = {"enc-a": asyncio.Event(), "enc-b": asyncio.Event()}
+
+            async def build_summary(slot_view: SlotView) -> SmartSummaryView:
+                enclosure_id = slot_view.enclosure_id or ""
+                started[enclosure_id].set()
+                try:
+                    await release[enclosure_id].wait()
+                except asyncio.CancelledError:
+                    await release[enclosure_id].wait()
+                return fresh_a if enclosure_id == "enc-a" else fresh_b
+
+            service._build_esxi_slot_smart_summary = build_summary
+
+            self.assertIs(
+                await service._get_slot_smart_summary_for_slot_view(slot_a, allow_stale_cache=True),
+                stale_a,
+            )
+            service._smart_cache[key_b] = stale_b
+            service._smart_cache_until[key_b] = expired
+            self.assertIs(
+                await service._get_slot_smart_summary_for_slot_view(slot_b, allow_stale_cache=True),
+                stale_b,
+            )
+            task_a = service._smart_refresh_tasks[key_a]
+            task_b = service._smart_refresh_tasks[key_b]
+            await asyncio.gather(started["enc-a"].wait(), started["enc-b"].wait())
+
+            service.invalidate_snapshot_cache(
+                reason="test.smart.inflight.scope",
+                cache_keys=["enc-a"],
+            )
+            release["enc-a"].set()
+            release["enc-b"].set()
+            await asyncio.gather(task_a, task_b, return_exceptions=True)
+            await asyncio.sleep(0)
+
+            self.assertNotIn(key_a, service._smart_cache)
+            self.assertNotIn(key_a, service._smart_cache_until)
+            self.assertIs(service._smart_cache[key_b], fresh_b)
+            self.assertNotIn(key_a, service._smart_refresh_tasks)
+            self.assertNotIn(key_b, service._smart_refresh_tasks)
+
     @staticmethod
     def _build_core_ses_enclosures() -> list[SESMapEnclosure]:
         def make_enclosure(
@@ -8632,6 +8820,67 @@ Enclosure Status diagnostic page:
 
 
 class ReviewRegressionTests(unittest.TestCase):
+    def test_generic_correlator_zero_columns_does_not_evaluate_division_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.layout.slot_count = 1
+            system = SystemConfig(id="zero-column-generic", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            profile = MagicMock()
+            profile.columns = 0
+            profile.slot_layout = [[0]]
+            service.profile_registry.resolve_for_enclosure = MagicMock(return_value=profile)
+
+            slots, _enclosures, _meta, _rows, _slot_count, columns = service._correlate(
+                TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ParsedSSHData(),
+                [],
+            )
+
+            self.assertEqual(columns, 0)
+            self.assertEqual((slots[0].row_index, slots[0].column_index), (0, 0))
+
+    def test_scale_linux_correlator_zero_columns_does_not_evaluate_division_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="zero-column-scale", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            selected_option = EnclosureOption(
+                id="enc-a",
+                label="Front",
+                rows=1,
+                columns=1,
+                slot_count=1,
+                slot_layout=[[0]],
+            )
+            profile = MagicMock()
+            profile.columns = 0
+            profile.slot_layout = [[0]]
+            service._build_scale_linux_enclosure_options = MagicMock(return_value=[selected_option])
+            service.profile_registry.resolve_for_enclosure = MagicMock(return_value=profile)
+
+            slots, _enclosures, _meta, _rows, _slot_count, columns = service._correlate_scale_linux(
+                TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ParsedSSHData(),
+                [],
+                selected_enclosure_id="enc-a",
+            )
+
+            self.assertEqual(columns, 0)
+            self.assertEqual((slots[0].row_index, slots[0].column_index), (0, 0))
+
     def test_parse_size_to_bytes_binary_suffixes_use_1024(self) -> None:
         self.assertEqual(parse_size_to_bytes("1 GiB"), 1024**3)
         self.assertEqual(parse_size_to_bytes("1 GB"), 1000**3)

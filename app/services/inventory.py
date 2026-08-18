@@ -105,6 +105,9 @@ from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebsocketClient
 
+SmartCacheKey = tuple[str, str, str, int, tuple[str, ...]]
+SmartCacheGenerationToken = tuple[int, int]
+
 logger = logging.getLogger(__name__)
 METRICS_SERVICE_NAME = "enclosure-ui"
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
@@ -354,8 +357,10 @@ class InventoryService:
         self.slot_detail_store = slot_detail_store
         self._cache: dict[str, InventorySnapshot] = {}
         self._cache_until: dict[str, datetime] = {}
-        self._smart_cache: dict[str, SmartSummaryView] = {}
-        self._smart_cache_until: dict[str, datetime] = {}
+        self._smart_cache: dict[SmartCacheKey, SmartSummaryView] = {}
+        self._smart_cache_until: dict[SmartCacheKey, datetime] = {}
+        self._smart_cache_global_generation = 0
+        self._smart_cache_enclosure_generations: dict[str, int] = {}
         self._source_bundle: InventorySourceBundle | None = None
         self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
@@ -364,7 +369,7 @@ class InventoryService:
         self._optional_ssh_backoff_until: dict[str, datetime] = {}
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[None] | None = None
-        self._smart_refresh_tasks: dict[str, asyncio.Task[None]] = {}
+        self._smart_refresh_tasks: dict[SmartCacheKey, asyncio.Task[None]] = {}
         self._background_smart_refresh_semaphore = asyncio.Semaphore(
             max(1, self.settings.app.smart_batch_max_concurrency)
         )
@@ -1220,11 +1225,34 @@ class InventoryService:
         if cache_keys is None:
             self._cache.clear()
             self._cache_until.clear()
+            self._smart_cache_global_generation += 1
+            smart_keys_to_remove = (
+                set(self._smart_cache)
+                | set(self._smart_cache_until)
+                | set(self._smart_refresh_tasks)
+            )
         else:
             normalized_keys = {key or "__default__" for key in cache_keys}
             for key in normalized_keys:
                 self._cache.pop(key, None)
                 self._cache_until.pop(key, None)
+                self._smart_cache_enclosure_generations[key] = (
+                    self._smart_cache_enclosure_generations.get(key, 0) + 1
+                )
+            smart_keys_to_remove = {
+                key
+                for key in (
+                    set(self._smart_cache)
+                    | set(self._smart_cache_until)
+                    | set(self._smart_refresh_tasks)
+                )
+                if key[2] in normalized_keys
+            }
+        self._remove_smart_cache_keys(smart_keys_to_remove)
+        for smart_key in smart_keys_to_remove:
+            task = self._smart_refresh_tasks.pop(smart_key, None)
+            if task is not None and not task.done():
+                task.cancel()
         if invalidate_source_bundle:
             self._source_bundle = None
             self._source_bundle_until = datetime.min.replace(tzinfo=timezone.utc)
@@ -2083,15 +2111,22 @@ class InventoryService:
             return True
         return snapshot.platform_context.get("topology_complete") is not False
 
-    def _schedule_background_smart_refresh(self, cache_key: str, slot_view: SlotView) -> None:
+    def _schedule_background_smart_refresh(self, cache_key: SmartCacheKey, slot_view: SlotView) -> None:
         existing = self._smart_refresh_tasks.get(cache_key)
         if existing is not None and not existing.done():
             return
 
-        task = asyncio.create_task(self._background_refresh_smart_summary(cache_key, slot_view.model_copy(deep=True)))
+        generation_token = self._smart_cache_generation_token(cache_key)
+        task = asyncio.create_task(
+            self._background_refresh_smart_summary(
+                cache_key,
+                slot_view.model_copy(deep=True),
+                generation_token,
+            )
+        )
         self._smart_refresh_tasks[cache_key] = task
 
-        def _cleanup(completed: asyncio.Task[None], *, key: str = cache_key) -> None:
+        def _cleanup(completed: asyncio.Task[None], *, key: SmartCacheKey = cache_key) -> None:
             if self._smart_refresh_tasks.get(key) is completed:
                 self._smart_refresh_tasks.pop(key, None)
             if completed.cancelled():
@@ -2102,10 +2137,19 @@ class InventoryService:
 
         task.add_done_callback(_cleanup)
 
-    async def _background_refresh_smart_summary(self, cache_key: str, slot_view: SlotView) -> None:
+    async def _background_refresh_smart_summary(
+        self,
+        cache_key: SmartCacheKey,
+        slot_view: SlotView,
+        generation_token: SmartCacheGenerationToken,
+    ) -> None:
         try:
             async with self._background_smart_refresh_semaphore:
-                await self._get_slot_smart_summary_for_slot_view(slot_view, allow_stale_cache=False)
+                await self._get_slot_smart_summary_for_slot_view(
+                    slot_view,
+                    allow_stale_cache=False,
+                    expected_generation=generation_token,
+                )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background SMART refresh failed for %s", cache_key)
 
@@ -2453,54 +2497,72 @@ class InventoryService:
     def _smart_cache_expiry(self) -> datetime:
         return utcnow() + timedelta(seconds=max(0, int(self.settings.app.smart_cache_ttl_seconds)))
 
+    def _smart_cache_key(self, slot_view: SlotView) -> SmartCacheKey:
+        return (
+            self.system.id,
+            self.system.truenas.platform,
+            normalize_text(slot_view.enclosure_id) or "__default__",
+            slot_view.slot,
+            tuple(self._smart_candidate_devices(slot_view)),
+        )
+
+    def _smart_cache_generation_token(
+        self,
+        cache_key: SmartCacheKey,
+    ) -> SmartCacheGenerationToken:
+        return (
+            self._smart_cache_global_generation,
+            self._smart_cache_enclosure_generations.get(cache_key[2], 0),
+        )
+
+    def _remove_smart_cache_keys(self, cache_keys: Iterable[SmartCacheKey]) -> bool:
+        removed = False
+        for cache_key in cache_keys:
+            removed = cache_key in self._smart_cache or cache_key in self._smart_cache_until or removed
+            self._smart_cache.pop(cache_key, None)
+            self._smart_cache_until.pop(cache_key, None)
+        return removed
+
+    def _evict_expired_smart_cache_entries(self, *, preserve_key: SmartCacheKey | None = None) -> None:
+        now = utcnow()
+        expired_keys = {
+            cache_key
+            for cache_key in set(self._smart_cache) | set(self._smart_cache_until)
+            if cache_key != preserve_key
+            and self._smart_cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc)) <= now
+        }
+        if self._remove_smart_cache_keys(expired_keys):
+            self._observe_inventory_cache_metrics()
+
+    def _store_smart_summary_cache(
+        self,
+        slot_view: SlotView,
+        summary: SmartSummaryView,
+        *,
+        expires_at: datetime | None = None,
+        expected_generation: SmartCacheGenerationToken | None = None,
+    ) -> bool:
+        cache_key = self._smart_cache_key(slot_view)
+        if (
+            expected_generation is not None
+            and self._smart_cache_generation_token(cache_key) != expected_generation
+        ):
+            return False
+        self._evict_expired_smart_cache_entries(preserve_key=cache_key)
+        self._smart_cache[cache_key] = summary
+        self._smart_cache_until[cache_key] = expires_at or self._smart_cache_expiry()
+        return True
+
     async def _get_slot_smart_summary_for_slot_view(
         self,
         slot_view: SlotView,
         *,
         allow_stale_cache: bool = False,
+        expected_generation: SmartCacheGenerationToken | None = None,
     ) -> SmartSummaryView:
-        slot = slot_view.slot
-        smartctl_device_type = self._smart_candidate_device_type(slot_view)
-        if self.system.truenas.platform == "esxi":
-            summary = await self._build_esxi_slot_smart_summary(slot_view)
-            self._smart_cache[f"{self.system.id}|esxi|{slot}"] = summary
-            self._smart_cache_until[f"{self.system.id}|esxi|{slot}"] = self._smart_cache_expiry()
-            self._persist_slot_detail_cache(slot_view, smart_summary=summary)
-            self._observe_inventory_cache_metrics()
-            self._observe_smart_summary_request("esxi-live")
-            return summary
-        if self.system.truenas.platform == "quantastor":
-            summary = self._merge_smart_summary(slot_view, self._build_quantastor_smart_summary(slot_view))
-            candidates = self._smart_candidate_devices(slot_view)
-            if self.system.ssh.enabled and candidates and self._summary_needs_ssh_enrichment(summary):
-                ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(
-                    candidates,
-                    hosts=self._build_quantastor_preferred_hosts(slot_view),
-                    device_type=smartctl_device_type,
-                )
-                if ssh_summary is not None:
-                    summary = self._merge_missing_smart_fields(
-                        summary,
-                        self._merge_smart_summary(slot_view, ssh_summary),
-                    )
-            self._smart_cache[f"{self.system.id}|quantastor|{slot}"] = summary
-            self._smart_cache_until[f"{self.system.id}|quantastor|{slot}"] = self._smart_cache_expiry()
-            self._persist_slot_detail_cache(slot_view, smart_summary=summary)
-            self._observe_inventory_cache_metrics()
-            self._observe_smart_summary_request("quantastor-live")
-            return summary
-
-        candidates = self._smart_candidate_devices(slot_view)
-        if not candidates:
-            fallback = self._fallback_smart_summary(
-                slot_view,
-                "No SMART-capable device path is available for this slot.",
-            )
-            cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
-            self._observe_smart_summary_request("no-device-fallback")
-            return cached_fallback or fallback
-
-        cache_key = f"{self.system.id}|{'|'.join(candidates)}"
+        cache_key = self._smart_cache_key(slot_view)
+        candidates = list(cache_key[4])
+        self._evict_expired_smart_cache_entries(preserve_key=cache_key if allow_stale_cache else None)
         cache_until = self._smart_cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
         cached = self._smart_cache.get(cache_key)
         if cached and utcnow() < cache_until:
@@ -2513,13 +2575,61 @@ class InventoryService:
             self._schedule_background_smart_refresh(cache_key, slot_view)
             return cached
 
+        smartctl_device_type = self._smart_candidate_device_type(slot_view)
+        if self.system.truenas.platform == "esxi":
+            summary = await self._build_esxi_slot_smart_summary(slot_view)
+            if self._store_smart_summary_cache(
+                slot_view,
+                summary,
+                expected_generation=expected_generation,
+            ):
+                self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+                self._observe_inventory_cache_metrics()
+            self._observe_smart_summary_request("esxi-live")
+            return summary
+        if self.system.truenas.platform == "quantastor":
+            summary = self._merge_smart_summary(slot_view, self._build_quantastor_smart_summary(slot_view))
+            if self.system.ssh.enabled and candidates and self._summary_needs_ssh_enrichment(summary):
+                ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(
+                    candidates,
+                    hosts=self._build_quantastor_preferred_hosts(slot_view),
+                    device_type=smartctl_device_type,
+                )
+                if ssh_summary is not None:
+                    summary = self._merge_missing_smart_fields(
+                        summary,
+                        self._merge_smart_summary(slot_view, ssh_summary),
+                    )
+            if self._store_smart_summary_cache(
+                slot_view,
+                summary,
+                expected_generation=expected_generation,
+            ):
+                self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+                self._observe_inventory_cache_metrics()
+            self._observe_smart_summary_request("quantastor-live")
+            return summary
+
+        if not candidates:
+            fallback = self._fallback_smart_summary(
+                slot_view,
+                "No SMART-capable device path is available for this slot.",
+            )
+            cached_fallback = self._merge_cached_smart_summary(slot_view, fallback)
+            self._observe_smart_summary_request("no-device-fallback")
+            return cached_fallback or fallback
+
         persisted = self._build_persisted_smart_summary(slot_view)
         if persisted is not None and allow_stale_cache:
             add_perf_metadata(smart_cache="persistent-hit")
-            self._smart_cache[cache_key] = persisted
-            self._smart_cache_until[cache_key] = utcnow()
-            self._schedule_background_smart_refresh(cache_key, slot_view)
-            self._observe_inventory_cache_metrics()
+            if self._store_smart_summary_cache(
+                slot_view,
+                persisted,
+                expires_at=utcnow(),
+                expected_generation=expected_generation,
+            ):
+                self._schedule_background_smart_refresh(cache_key, slot_view)
+                self._observe_inventory_cache_metrics()
             self._observe_smart_summary_request("persistent-hit")
             return persisted
 
@@ -2531,10 +2641,13 @@ class InventoryService:
             )
             if summary is not None:
                 summary = self._merge_smart_summary(slot_view, summary)
-                self._smart_cache[cache_key] = summary
-                self._smart_cache_until[cache_key] = self._smart_cache_expiry()
-                self._persist_slot_detail_cache(slot_view, smart_summary=summary)
-                self._observe_inventory_cache_metrics()
+                if self._store_smart_summary_cache(
+                    slot_view,
+                    summary,
+                    expected_generation=expected_generation,
+                ):
+                    self._persist_slot_detail_cache(slot_view, smart_summary=summary)
+                    self._observe_inventory_cache_metrics()
                 self._observe_smart_summary_request("ssh-live")
                 return summary
 
@@ -2594,10 +2707,13 @@ class InventoryService:
                         api_summary,
                     )
 
-            self._smart_cache[cache_key] = api_summary
-            self._smart_cache_until[cache_key] = self._smart_cache_expiry()
-            self._persist_slot_detail_cache(slot_view, smart_summary=api_summary)
-            self._observe_inventory_cache_metrics()
+            if self._store_smart_summary_cache(
+                slot_view,
+                api_summary,
+                expected_generation=expected_generation,
+            ):
+                self._persist_slot_detail_cache(slot_view, smart_summary=api_summary)
+                self._observe_inventory_cache_metrics()
             self._observe_smart_summary_request("api-live")
             return api_summary
 
@@ -2608,10 +2724,13 @@ class InventoryService:
             )
             if ssh_summary is not None:
                 ssh_summary = self._merge_smart_summary(slot_view, ssh_summary)
-                self._smart_cache[cache_key] = ssh_summary
-                self._smart_cache_until[cache_key] = self._smart_cache_expiry()
-                self._persist_slot_detail_cache(slot_view, smart_summary=ssh_summary)
-                self._observe_inventory_cache_metrics()
+                if self._store_smart_summary_cache(
+                    slot_view,
+                    ssh_summary,
+                    expected_generation=expected_generation,
+                ):
+                    self._persist_slot_detail_cache(slot_view, smart_summary=ssh_summary)
+                    self._observe_inventory_cache_metrics()
                 self._observe_smart_summary_request("ssh-live")
                 return ssh_summary
             if ssh_error:
@@ -3402,7 +3521,10 @@ class InventoryService:
         slot_views: list[SlotView] = []
 
         for slot in range(layout_slot_count):
-            row_index, column_index = slot_positions.get(slot, (slot // layout_columns, slot % layout_columns))
+            row_index, column_index = slot_positions.get(
+                slot,
+                (slot // max(layout_columns, 1), slot % max(layout_columns, 1)),
+            )
             candidate = dict(slot_candidates.get(slot, {}))
             enclosure_id = selected_meta.get("id") or normalize_text(candidate.get("enclosure_id"))
             mapping = self.mapping_store.get_mapping(self.system.id, enclosure_id, slot)
@@ -4162,8 +4284,8 @@ class InventoryService:
                 self._apply_bmc_serial_match_to_raw_slot_status(candidate, bmc_disk, disk)
             slot_view = self._build_slot_view(
                 slot=slot,
-                row_index=slot_positions.get(slot, (slot // columns, slot % columns))[0],
-                column_index=slot_positions.get(slot, (slot // columns, slot % columns))[1],
+                row_index=slot_positions.get(slot, (slot // max(columns, 1), slot % max(columns, 1)))[0],
+                column_index=slot_positions.get(slot, (slot // max(columns, 1), slot % max(columns, 1)))[1],
                 enclosure_meta=selected_meta,
                 raw_slot_status=candidate,
                 disk=disk,

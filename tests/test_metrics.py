@@ -225,7 +225,7 @@ class InventoryMetricsTests(unittest.IsolatedAsyncioTestCase):
                     column_index=7,
                     device_name="da7",
                 )
-                cache_key = "metrics-smart-system|da7"
+                cache_key = service._smart_cache_key(slot_view)
                 service._smart_cache[cache_key] = SmartSummaryView(available=True, power_on_hours=1200)
                 service._smart_cache_until[cache_key] = datetime.now(timezone.utc) + timedelta(minutes=5)
 
@@ -238,3 +238,46 @@ class InventoryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("truenas_jbod_ui_smart_summary_requests_total", metrics_text)
         self.assertIn('system_id="metrics-smart-system"', metrics_text)
         self.assertIn('cache_state="hit"', metrics_text)
+
+    async def test_smart_cache_eviction_updates_entry_gauge_before_cache_hit_returns(self) -> None:
+        app = FastAPI()
+        system_id = "metrics-smart-eviction"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict("os.environ", {"METRICS_ENABLED": "true", "METRICS_PATH": "/metrics"}, clear=False):
+                install_metrics(app, service_name="test-metrics-scrape-smart-eviction", version="0.0.0-test")
+                service = build_inventory_service(temp_dir=temp_dir, system_id=system_id)
+                expired_slot = SlotView(
+                    slot=6,
+                    slot_label="06",
+                    row_index=0,
+                    column_index=6,
+                    device_name="da6",
+                )
+                fresh_slot = SlotView(
+                    slot=7,
+                    slot_label="07",
+                    row_index=0,
+                    column_index=7,
+                    device_name="da7",
+                )
+                expired_key = service._smart_cache_key(expired_slot)
+                fresh_key = service._smart_cache_key(fresh_slot)
+                service._smart_cache[expired_key] = SmartSummaryView(available=True, power_on_hours=600)
+                service._smart_cache[fresh_key] = SmartSummaryView(available=True, power_on_hours=700)
+                service._smart_cache_until[expired_key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+                service._smart_cache_until[fresh_key] = datetime.now(timezone.utc) + timedelta(minutes=5)
+                service._observe_inventory_cache_metrics()
+
+                summary = await service._get_slot_smart_summary_for_slot_view(fresh_slot)
+
+        self.assertEqual(summary.power_on_hours, 700)
+        self.assertEqual(len(service._smart_cache), 1)
+        metrics_messages = await invoke_asgi(app, "/metrics")
+        metrics_text = response_body(metrics_messages)
+        gauge_line = next(
+            line
+            for line in metrics_text.splitlines()
+            if line.startswith("truenas_jbod_ui_smart_summary_cache_entries{")
+            and f'system_id="{system_id}"' in line
+        )
+        self.assertTrue(gauge_line.endswith(" 1.0"), gauge_line)
