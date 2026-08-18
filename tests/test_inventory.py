@@ -4117,6 +4117,70 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
             self.assertEqual(slot_views[0].raw_status["bmc_controller_id"], 1)
             self.assertEqual(slot_views[0].raw_status["bmc_physical_index"], 3)
 
+    def test_scale_unmapped_ses_element_is_warning_evidence_not_a_slot_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.layout.rows = 2
+            settings.layout.columns = 4
+            settings.layout.slot_count = 8
+            system = SystemConfig(id="scale-unmapped", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            warning = "SES element 7 has no verified physical slot number."
+            ssh_data = ParsedSSHData(
+                ses_enclosures=[
+                    SESMapEnclosure(
+                        ses_device="/dev/sg7",
+                        enclosure_id="scale-ses",
+                        enclosure_label="Unmapped SES Evidence",
+                        unmapped_slots=[
+                            SESMapSlot(
+                                slot_number=-1,
+                                element_id=7,
+                                ses_device="/dev/sg7",
+                                device_names=["sda"],
+                                status="OK",
+                                slot_number_source="ses_element_id_fallback",
+                                slot_number_warning=warning,
+                                control_targets=[
+                                    {
+                                        "ses_device": "/dev/sg7",
+                                        "ses_element_id": 7,
+                                        "ses_slot_number": None,
+                                    }
+                                ],
+                            )
+                        ],
+                    )
+                ]
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                disks=[],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+            warnings: list[str] = []
+
+            slots, _enclosures, selected_meta, _rows, _count, _columns = service._correlate(
+                raw_data,
+                ssh_data,
+                warnings,
+            )
+
+            self.assertTrue(all(not slot.raw_status.get("ses_targets") for slot in slots))
+            self.assertIn(warning, warnings)
+            self.assertEqual(selected_meta["unmapped_ses_elements"][0]["ses_element_id"], 7)
+            self.assertIsNone(
+                selected_meta["unmapped_ses_elements"][0]["ses_targets"][0]["ses_slot_number"]
+            )
+
     def test_quantastor_slot_is_augmented_by_matching_bmc_serial_without_collapsing_system_view(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
