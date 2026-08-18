@@ -3000,19 +3000,23 @@ def _device_name_candidates(*values: Any) -> list[str]:
             continue
         text = str(value)
         cleaned = normalize_text(text)
+        if not cleaned:
+            continue
         if cleaned.startswith("/dev/") and _looks_like_disk_device(cleaned[5:]):
             candidates.append(cleaned[5:])
         if _looks_like_disk_device(cleaned):
             candidates.append(cleaned)
         for token in re.split(r"[^A-Za-z0-9_.-]+", text):
             token_cleaned = normalize_text(token)
-            if _looks_like_disk_device(token_cleaned):
+            if token_cleaned and _looks_like_disk_device(token_cleaned):
                 candidates.append(token_cleaned)
     return _dedupe_strings(candidates)
 
 
 def _looks_like_disk_device(value: str | None) -> bool:
     cleaned = normalize_text(value)
+    if not cleaned:
+        return False
     return bool(re.match(r"^(?:/dev/)?(?:da|ada|pass|mfid|nvd|nvme|sd|hd|xbd)\d", cleaned))
 
 

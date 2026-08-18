@@ -26,7 +26,7 @@ from app.models.domain import (
     StorageViewRuntimeView,
     SystemLocatorStatusView,
 )
-from app.services.inventory import DiskRecord, InventoryService, InventorySourceBundle, build_lunid_aliases, infer_slot_count_from_layout, resolve_persistent_id
+from app.services.inventory import DiskRecord, InventoryService, InventorySourceBundle, build_lunid_aliases, infer_slot_count_from_layout, parse_size_to_bytes, resolve_persistent_id
 from app.services.mapping_store import MappingStore
 from app.services.parsers import (
     LinuxScsiDevice,
@@ -8565,6 +8565,43 @@ Enclosure Status diagnostic page:
             self.assertEqual(cleared.backend, "supermicro_bmc")
             self.assertFalse(cleared.active)
             self.assertNotIn("__default__", service._cache)
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    def test_parse_size_to_bytes_binary_suffixes_use_1024(self) -> None:
+        self.assertEqual(parse_size_to_bytes("1 GiB"), 1024**3)
+        self.assertEqual(parse_size_to_bytes("1 GB"), 1000**3)
+        self.assertEqual(parse_size_to_bytes("3.5 TiB"), int(3.5 * 1024**4))
+        self.assertEqual(parse_size_to_bytes("512"), 512)
+
+    def test_profile_registry_uses_fallback_geometry_without_enclosure(self) -> None:
+        from app.services.profile_registry import ProfileRegistry
+
+        settings = Settings()
+        system = SystemConfig(id="fallback-system", truenas=TrueNASConfig(platform="scale"))
+        view = ProfileRegistry(settings).resolve_for_enclosure(
+            system,
+            None,
+            fallback_rows=4,
+            fallback_columns=6,
+            fallback_slot_count=24,
+        )
+
+        self.assertIsNotNone(view)
+        self.assertEqual(view.rows, 4)
+        self.assertEqual(view.columns, 6)
+
+    def test_mapping_store_tolerates_corrupt_file(self) -> None:
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+
+        from app.services.mapping_store import MappingStore
+
+        with _tempfile.TemporaryDirectory() as temp_dir:
+            path = _Path(temp_dir) / "slot_mappings.json"
+            path.write_text('{"slot_mappings": {"a":', encoding="utf-8")
+            store = MappingStore(path)
+            self.assertEqual(store.load_all(), {})
 
 
 if __name__ == "__main__":

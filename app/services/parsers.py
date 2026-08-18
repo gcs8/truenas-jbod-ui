@@ -2127,8 +2127,13 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
             latest_test = table[0]
             latest_test_type = normalize_text(latest_test.get("type", {}).get("string")) if isinstance(latest_test.get("type"), dict) else normalize_text(latest_test.get("type"))
             latest_test_status = normalize_text(latest_test.get("status", {}).get("string")) if isinstance(latest_test.get("status"), dict) else normalize_text(latest_test.get("status"))
-            lifetime = latest_test.get("lifetime_hours") if isinstance(latest_test.get("lifetime_hours"), dict) else {}
-            latest_test_lifetime_hours = lifetime.get("hours") if isinstance(lifetime.get("hours"), int) else None
+            # ATA self-test log entries report lifetime_hours as a plain int
+            # (the {"hours": N} dict shape belongs to the SCSI power_on_time
+            # field); accept both so SATA disks get a test age.
+            raw_lifetime = latest_test.get("lifetime_hours")
+            if isinstance(raw_lifetime, dict):
+                raw_lifetime = raw_lifetime.get("hours")
+            latest_test_lifetime_hours = raw_lifetime if isinstance(raw_lifetime, int) else None
 
     current_temperature = (
         temperature.get("current")

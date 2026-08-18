@@ -240,6 +240,7 @@ class SSHProbeTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.exit_code, 255)
         self.assertIn("timed out", result.stderr)
+        ssh_client.close.assert_called_once_with()
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_run_commands_sync_returns_failure_results_for_each_command_when_connection_setup_fails(
