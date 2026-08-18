@@ -67,9 +67,14 @@
       (Array.isArray(bootstrap.esxi_host_prep?.staged_packages) && bootstrap.esxi_host_prep.staged_packages[0]?.token)
       || "",
     refreshInFlight: false,
+    refreshPromise: null,
+    refreshQueued: null,
+    refreshQueuedQuiet: true,
     countdownTimerId: null,
     sudoersPreviewTimerId: null,
     sudoersPreviewRequestSeq: 0,
+    liveEnclosuresRequestSeq: 0,
+    storageViewCandidatesRequestSeq: 0,
     haNodes: [],
     haNodesLoading: false,
     orphanedHistory: [],
@@ -3181,6 +3186,8 @@
       renderStorageViews();
       return;
     }
+    const requestSeq = (state.liveEnclosuresRequestSeq || 0) + 1;
+    state.liveEnclosuresRequestSeq = requestSeq;
     state.liveEnclosuresLoading = true;
     state.liveEnclosuresError = null;
     state.liveEnclosuresSystemId = systemId;
@@ -3191,12 +3198,19 @@
         params.set("force", "true");
       }
       const payload = await fetchJson(`/api/admin/storage-views/live-enclosures?${params.toString()}`);
+      if (requestSeq !== state.liveEnclosuresRequestSeq) {
+        // A newer request (fast system switch) owns the state now; drop this response.
+        return;
+      }
       state.liveEnclosures = Array.isArray(payload.enclosures) ? payload.enclosures : [];
       state.liveEnclosuresSystemId = payload.system_id || systemId;
       if (!quiet) {
         setBanner(`Loaded ${state.liveEnclosures.length} discovered live enclosure${state.liveEnclosures.length === 1 ? "" : "s"} for ${state.liveEnclosuresSystemId}.`, "success");
       }
     } catch (error) {
+      if (requestSeq !== state.liveEnclosuresRequestSeq) {
+        return;
+      }
       state.liveEnclosures = [];
       state.liveEnclosuresSystemId = systemId;
       state.liveEnclosuresError = error.message || String(error);
@@ -3204,8 +3218,10 @@
         setBanner(`Unable to inspect live enclosures: ${error.message || error}`, "error");
       }
     } finally {
-      state.liveEnclosuresLoading = false;
-      renderStorageViews();
+      if (requestSeq === state.liveEnclosuresRequestSeq) {
+        state.liveEnclosuresLoading = false;
+        renderStorageViews();
+      }
     }
   }
 
@@ -3367,6 +3383,8 @@
       renderStorageViewCandidates();
       return;
     }
+    const requestSeq = (state.storageViewCandidatesRequestSeq || 0) + 1;
+    state.storageViewCandidatesRequestSeq = requestSeq;
     state.storageViewCandidatesLoading = true;
     renderStorageViewCandidates();
     try {
@@ -3378,6 +3396,10 @@
         params.set("force", "true");
       }
       const payload = await fetchJson(`/api/admin/storage-views/candidates?${params.toString()}`);
+      if (requestSeq !== state.storageViewCandidatesRequestSeq) {
+        // A newer request (fast system switch) owns the state now; drop this response.
+        return;
+      }
       state.storageViewCandidates = Array.isArray(payload.candidates) ? payload.candidates : [];
       state.storageViewCandidatesSystemId = payload.system_id || systemId;
       if (!quiet) {
@@ -3385,14 +3407,19 @@
         setBanner(`Loaded ${state.storageViewCandidates.length} unmapped inventory candidate${state.storageViewCandidates.length === 1 ? "" : "s"} for ${state.storageViewCandidatesSystemId}${targetSuffix}.`, "success");
       }
     } catch (error) {
+      if (requestSeq !== state.storageViewCandidatesRequestSeq) {
+        return;
+      }
       state.storageViewCandidates = [];
       state.storageViewCandidatesSystemId = systemId;
       if (!quiet) {
         setBanner(`Unable to load unmapped inventory candidates: ${error.message || error}`, "error");
       }
     } finally {
-      state.storageViewCandidatesLoading = false;
-      renderStorageViewCandidates();
+      if (requestSeq === state.storageViewCandidatesRequestSeq) {
+        state.storageViewCandidatesLoading = false;
+        renderStorageViewCandidates();
+      }
     }
   }
 
@@ -5210,10 +5237,37 @@
     }
   }
 
-  async function refreshState({ quiet = false } = {}) {
-    if (state.refreshInFlight) {
-      return;
+  function refreshState({ quiet = false } = {}) {
+    if (state.refreshPromise) {
+      // A refresh is already running. Instead of silently returning (which left callers
+      // that awaited refreshState() after a save reading stale lists), queue exactly one
+      // follow-up refresh that starts once the in-flight one settles, and hand every
+      // caller that promise so their post-refresh lookups observe state at least as new
+      // as their own write.
+      state.refreshQueuedQuiet = Boolean(state.refreshQueuedQuiet) && Boolean(quiet);
+      if (!state.refreshQueued) {
+        state.refreshQueued = state.refreshPromise
+          .catch(() => {})
+          .then(() => startRefreshState({ quiet: state.refreshQueuedQuiet }));
+      }
+      return state.refreshQueued;
     }
+    return startRefreshState({ quiet });
+  }
+
+  function startRefreshState({ quiet = false } = {}) {
+    state.refreshQueued = null;
+    state.refreshQueuedQuiet = true;
+    const run = runRefreshState({ quiet }).finally(() => {
+      if (state.refreshPromise === run) {
+        state.refreshPromise = null;
+      }
+    });
+    state.refreshPromise = run;
+    return run;
+  }
+
+  async function runRefreshState({ quiet = false } = {}) {
     state.refreshInFlight = true;
     if (elements.refreshStateButton) {
       elements.refreshStateButton.disabled = true;
@@ -5319,7 +5373,7 @@
       );
       if (!response.ok) {
         const payload = await readJsonResponse(response);
-        throw new Error(payload?.detail || `Request failed with ${response.status}`);
+        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
       }
       const blob = await response.blob();
       const objectUrl = window.URL.createObjectURL(blob);
@@ -5389,7 +5443,7 @@
       );
       if (!response.ok) {
         const payload = await readJsonResponse(response);
-        throw new Error(payload?.detail || `Request failed with ${response.status}`);
+        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
       }
       const blob = await response.blob();
       const objectUrl = window.URL.createObjectURL(blob);
@@ -5462,7 +5516,7 @@
       );
       const payload = await readJsonResponse(response);
       if (!response.ok || payload?.ok === false) {
-        throw new Error(payload?.detail || `Request failed with ${response.status}`);
+        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
       }
       state.systems = Array.isArray(payload.systems) ? payload.systems : state.systems;
       state.defaultSystemId = payload.default_system_id || state.defaultSystemId;
