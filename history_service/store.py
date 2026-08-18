@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import stat
 import threading
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,9 @@ SQLITE_SHARED_DIR_MODE = 0o777
 SQLITE_SHARED_FILE_MODE = 0o666
 SQLITE_TEMP_STORE = "MEMORY"
 SQLITE_CACHE_SIZE_KIB = 16384
+SQLITE_CONNECT_TIMEOUT_SECONDS = 5.0
+SQLITE_WRITE_LOCK_RETRY_ATTEMPTS = 2
+SQLITE_WRITE_LOCK_RETRY_DELAY_SECONDS = 0.05
 
 SLOT_STATE_OPTIONAL_COLUMNS: dict[str, str] = {
     "persistent_id_label": "TEXT",
@@ -161,7 +165,10 @@ class HistoryStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.file_path)
+        connection = sqlite3.connect(
+            self.file_path,
+            timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+        )
         try:
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
@@ -1419,14 +1426,22 @@ class HistoryStore:
 
     def _execute_write(self, operation: Any) -> Any:
         with self._lock:
-            for attempt in range(2):
+            readonly_repair_attempted = False
+            lock_retry_count = 0
+            while True:
                 try:
                     with closing(self._connect()) as connection:
                         result = operation(connection)
                         connection.commit()
                         return result
                 except sqlite3.OperationalError as exc:
-                    if attempt == 0 and self._is_readonly_database_error(exc) and self._attempt_readonly_database_repair(exc):
+                    if not readonly_repair_attempted and self._is_readonly_database_error(exc):
+                        readonly_repair_attempted = True
+                        if self._attempt_readonly_database_repair(exc):
+                            continue
+                    if self._is_database_locked_error(exc) and lock_retry_count < SQLITE_WRITE_LOCK_RETRY_ATTEMPTS:
+                        lock_retry_count += 1
+                        time.sleep(SQLITE_WRITE_LOCK_RETRY_DELAY_SECONDS * lock_retry_count)
                         continue
                     raise
 
@@ -1607,6 +1622,11 @@ class HistoryStore:
     def _is_readonly_database_error(exc: sqlite3.Error) -> bool:
         message = str(exc).lower()
         return "readonly" in message or "read-only" in message
+
+    @staticmethod
+    def _is_database_locked_error(exc: sqlite3.Error) -> bool:
+        message = str(exc).lower()
+        return "database is locked" in message or "database table is locked" in message
 
     @staticmethod
     def _is_journal_mode_fallback_error(exc: sqlite3.Error) -> bool:
