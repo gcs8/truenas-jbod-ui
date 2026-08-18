@@ -5,6 +5,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from app.models.domain import ManualMapping
 
 
@@ -28,12 +30,17 @@ class MappingStore:
         try:
             with self.file_path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
-        except (OSError, json.JSONDecodeError):
+            if not isinstance(payload, dict):
+                return {}
+            raw_mappings = payload.get("slot_mappings", {})
+            if not isinstance(raw_mappings, dict):
+                return {}
+            loaded = {
+                key: ManualMapping.model_validate(value)
+                for key, value in raw_mappings.items()
+            }
+        except (OSError, json.JSONDecodeError, ValidationError):
             return {}
-
-        loaded: dict[str, ManualMapping] = {}
-        for key, value in payload.get("slot_mappings", {}).items():
-            loaded[key] = ManualMapping.model_validate(value)
         return loaded
 
     def get_mapping(self, system_id: str | None, enclosure_id: str | None, slot: int) -> ManualMapping | None:
