@@ -2979,6 +2979,10 @@ class InventoryService:
         elif self.system.truenas.platform == "esxi":
             with perf_stage("inventory.esxi.build_platform_context"):
                 platform_context = self._build_esxi_platform_context(ssh_data)
+        elif self.system.truenas.platform == "scale" and selected_meta.get("unmapped_ses_elements"):
+            platform_context = {
+                "unmapped_ses_elements": selected_meta["unmapped_ses_elements"],
+            }
         if bmc_inventory is not None:
             with perf_stage("inventory.bmc.build_platform_context"):
                 bmc_context = self._build_bmc_platform_context(bmc_inventory)
@@ -3305,7 +3309,7 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
         quantastor_ses_data: ParsedSSHData | None = None,
         bmc_inventory: BMCInventory | None = None,
-    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, Any], list[list[int | None]], int, int]:
         if self.system.truenas.platform == "linux":
             return self._correlate_linux_host(ssh_data, warnings, selected_enclosure_id)
         if self.system.truenas.platform == "esxi":
@@ -4062,7 +4066,7 @@ class InventoryService:
         warnings: list[str],
         selected_enclosure_id: str | None,
         bmc_inventory: BMCInventory | None = None,
-    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
+    ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, Any], list[list[int | None]], int, int]:
         available_enclosures = self._build_scale_linux_enclosure_options(ssh_data)
         selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
         if selected_option is None:
@@ -4088,6 +4092,10 @@ class InventoryService:
             self.system.truenas.enclosure_filter,
             selected_option.id,
         )
+        for warning in ssh_meta.get("warnings") or []:
+            warning_text = normalize_text(warning)
+            if warning_text and warning_text not in warnings:
+                warnings.append(warning_text)
         api_candidates, api_selected_meta = extract_enclosure_slot_candidates(
             raw_data.enclosures,
             self.system.truenas.enclosure_filter,
@@ -9181,9 +9189,9 @@ class InventoryService:
 
     @staticmethod
     def _merge_enclosure_meta(
-        base: dict[str, str | None],
-        overlay: dict[str, str | None],
-    ) -> dict[str, str | None]:
+        base: dict[str, Any],
+        overlay: dict[str, Any],
+    ) -> dict[str, Any]:
         merged = dict(base)
         for key, value in overlay.items():
             if value is None:

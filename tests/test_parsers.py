@@ -1,6 +1,10 @@
 import unittest
 
 from app.services.parsers import (
+    _merge_ses_enclosures,
+    SESMapEnclosure,
+    SESMapSlot,
+    build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
     parse_camcontrol_devlist,
     parse_esxcli_smart_get,
@@ -15,6 +19,7 @@ from app.services.parsers import (
     parse_pool_query_topology,
     parse_ssh_outputs,
     parse_sesutil_show_enclosures,
+    parse_sesutil_map,
     parse_ubntstorage_json,
     parse_sg_ses_aes,
     parse_sg_ses_enclosure_status,
@@ -22,6 +27,7 @@ from app.services.parsers import (
     parse_smart_test_results,
     parse_smartctl_text_enrichment,
     parse_smartctl_summary,
+    parse_storcli_physical_drives,
     parse_unifi_gpio_debug,
     parse_zpool_status,
 )
@@ -456,6 +462,262 @@ Additional element status diagnostic page:
         self.assertEqual(parsed.slots[0].sas_address, "5000cca264d473d5")
         self.assertEqual(parsed.slots[1].sas_address, "5000cca264ccb7ed")
         self.assertTrue(parsed.slots[0].present)
+
+    def test_parse_sg_ses_aes_requires_model_evidence_for_24_bay_operator_profile(self) -> None:
+        output = """
+  ExampleCo  GenericShelf24  0001
+  Primary enclosure logical identifier (hex): 5000000000000024
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        device slot number: 0
+      Element index: 23  eiioe=0
+        device slot number: 23
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg27")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertIsNone(parsed.profile_id)
+        self.assertEqual(parsed.enclosure_label, "24 Bay SES")
+        self.assertIsNone(parsed.slot_layout)
+
+    def test_parse_sg_ses_aes_requires_model_evidence_for_12_bay_operator_profile(self) -> None:
+        output = """
+  ExampleCo  GenericShelf12  0001
+  Primary enclosure logical identifier (hex): 5000000000000012
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        device slot number: 0
+      Element index: 11  eiioe=0
+        device slot number: 11
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg38")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertIsNone(parsed.profile_id)
+        self.assertEqual(parsed.enclosure_label, "12 Bay SES")
+        self.assertIsNone(parsed.slot_layout)
+
+    def test_parse_sesutil_map_preserves_unrecognized_description_with_element_fallback(self) -> None:
+        output = """
+ses0:
+  Enclosure Name: ExampleCo GenericShelf
+  Enclosure ID: 5000000000000007
+  Element 7, Type: Array Device Slot
+    Status: OK
+    Description: ArrayDevice07
+    Device Names: da7, pass7
+""".strip()
+
+        parsed = parse_sesutil_map(output)
+
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].slots, {})
+        slot = parsed[0].unmapped_slots[0]
+        self.assertEqual(slot.description, "ArrayDevice07")
+        self.assertEqual(slot.device_names, ["da7"])
+        self.assertEqual(getattr(slot, "slot_number_source", None), "ses_element_id_fallback")
+        self.assertIn("unrecognized SES slot description", getattr(slot, "slot_number_warning", None) or "")
+
+        candidates, selected = build_slot_candidates_from_ses_enclosures(parsed, 8, None)
+        self.assertEqual(candidates, {})
+        self.assertEqual(selected["unmapped_ses_elements"][0]["ses_element_id"], 7)
+        self.assertEqual(selected["unmapped_ses_elements"][0]["device_names"], ["da7"])
+        self.assertIn("unrecognized SES slot description", selected["warnings"][0])
+
+    def test_parse_sg_ses_aes_preserves_slot_without_device_slot_number(self) -> None:
+        output = """
+  ExampleCo  GenericShelf  0001
+  Primary enclosure logical identifier (hex): 5000000000000007
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 7  eiioe=0
+        Transport protocol: SAS
+        SAS device type: end device
+        SAS address: 0x5000000000007000
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg7")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.slots, {})
+        slot = parsed.unmapped_slots[0]
+        self.assertEqual(slot.sas_address, "5000000000007000")
+        self.assertEqual(getattr(slot, "slot_number_source", None), "ses_element_id_fallback")
+        self.assertIn("did not report a device slot number", getattr(slot, "slot_number_warning", None) or "")
+
+        candidates, selected = build_slot_candidates_from_ses_enclosures([parsed], 8, None)
+        self.assertEqual(candidates, {})
+        self.assertIsNone(selected["unmapped_ses_elements"][0]["ses_slot_number"])
+        self.assertIsNone(
+            selected["unmapped_ses_elements"][0]["ses_targets"][0]["ses_slot_number"]
+        )
+
+    def test_unmapped_element_collision_does_not_replace_reported_slot(self) -> None:
+        output = """
+ses0:
+  Enclosure Name: ExampleCo GenericShelf
+  Enclosure ID: 5000000000000007
+  Element 7, Type: Array Device Slot
+    Status: OK
+    Description: ArrayDevice07
+    Device Names: da7
+  Element 8, Type: Array Device Slot
+    Status: OK
+    Description: Slot07
+    Device Names: da8
+""".strip()
+
+        parsed = parse_sesutil_map(output)
+
+        self.assertEqual(parsed[0].slots[7].device_names, ["da8"])
+        self.assertEqual(parsed[0].slots[7].slot_number_source, "ses_description")
+        self.assertEqual(parsed[0].unmapped_slots[0].element_id, 7)
+        self.assertEqual(parsed[0].unmapped_slots[0].device_names, ["da7"])
+
+    def test_reported_slot_provenance_wins_regardless_of_merge_order(self) -> None:
+        def enclosure(source: str) -> SESMapEnclosure:
+            is_reported = source == "ses_device_slot_number"
+            return SESMapEnclosure(
+                enclosure_id="enc-a",
+                enclosure_name="Shelf",
+                slots={
+                    7: SESMapSlot(
+                        slot_number=7,
+                        element_id=7,
+                        ses_device="/dev/sg7",
+                        slot_number_source=source,
+                        slot_number_warning=None if is_reported else "fallback warning",
+                        control_targets=[
+                            {
+                                "ses_device": "/dev/sg7",
+                                "ses_element_id": 7,
+                                "ses_slot_number": 7 if is_reported else None,
+                            }
+                        ],
+                    )
+                },
+            )
+
+        for enclosures in (
+            [enclosure("ses_element_id_fallback"), enclosure("ses_device_slot_number")],
+            [enclosure("ses_device_slot_number"), enclosure("ses_element_id_fallback")],
+        ):
+            with self.subTest(order=enclosures[0].slots[7].slot_number_source):
+                merged_slot = _merge_ses_enclosures(enclosures)[0].slots[7]
+                self.assertEqual(merged_slot.slot_number_source, "ses_device_slot_number")
+                self.assertIsNone(merged_slot.slot_number_warning)
+                self.assertEqual(merged_slot.control_targets[0]["ses_slot_number"], 7)
+
+    def test_zero_based_preferred_enclosure_capacity_stops_at_exact_slot_count(self) -> None:
+        enclosures = [
+            SESMapEnclosure(
+                enclosure_id=enclosure_id,
+                enclosure_name=name,
+                slots={slot: SESMapSlot(slot_number=slot) for slot in range(30)},
+            )
+            for enclosure_id, name in (("enc-a", "A Shelf"), ("enc-b", "B Shelf"))
+        ]
+
+        candidates, selected = build_slot_candidates_from_ses_enclosures(enclosures, 30, None)
+
+        self.assertEqual(len(candidates), 30)
+        self.assertEqual(selected["id"], "enc-a")
+
+    def test_parse_storcli_physical_drives_rejects_eidless_slot_identity(self) -> None:
+        output = """
+{
+  "Controllers": [
+    {
+      "Command Status": {"Status": "Success"},
+      "Response Data": {
+        "Drive Information": [
+          {"EID:Slt": ":5", "DID": 5, "State": "JBOD", "Model": "Example Disk"}
+        ]
+      }
+    }
+  ]
+}
+""".strip()
+
+        parsed = parse_storcli_physical_drives(output)
+
+        self.assertEqual(parsed, [])
+
+    def test_parse_sg_ses_aes_ignores_warning_preamble_for_enclosure_name(self) -> None:
+        output = """
+warning: diagnostic page was retried
+  ExampleCo  GenericShelf  0001
+  Primary enclosure logical identifier (hex): 5000000000000000
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        device slot number: 0
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg0")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.enclosure_name, "ExampleCo GenericShelf 0001")
+
+    def test_parse_sg_ses_enclosure_status_ignores_warning_preamble_for_enclosure_name(self) -> None:
+        output = """
+warning: diagnostic page was retried
+  ExampleCo  GenericShelf  0001
+  Primary enclosure logical identifier (hex): 5000000000000000
+Enclosure status diagnostic page:
+  status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element 0 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+""".strip()
+
+        parsed = parse_sg_ses_enclosure_status(output, "sg_ses ec /dev/sg0")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.enclosure_name, "ExampleCo GenericShelf 0001")
+
+    def test_parse_sg_ses_join_filter_ignores_warning_preamble_for_enclosure_name(self) -> None:
+        output = """
+warning: joined page was retried
+ExampleCo  GenericShelf  0001
+Primary enclosure logical identifier (hex): 5000000000000000
+Slot00 [0,0]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+""".strip()
+
+        parsed = parse_sg_ses_join_filter(output, "sg_ses join /dev/sg0")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.enclosure_name, "ExampleCo GenericShelf 0001")
+
+    def test_parse_sg_ses_join_filter_stops_name_scan_at_first_slot_without_header(self) -> None:
+        output = """
+ExampleCo  GenericShelf  0001
+Slot00 [0,0]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+""".strip()
+
+        parsed = parse_sg_ses_join_filter(output, "sg_ses join /dev/sg0")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.enclosure_name, "ExampleCo GenericShelf 0001")
 
     def test_parse_sg_ses_aes_marks_empty_rear_slots(self) -> None:
         output = """

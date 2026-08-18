@@ -100,6 +100,8 @@ class SESMapSlot:
     control_targets: list[dict[str, Any]] = field(default_factory=list)
     status: str | None = None
     description: str | None = None
+    slot_number_source: str | None = None
+    slot_number_warning: str | None = None
     device_names: list[str] = field(default_factory=list)
     identify_active: bool = False
     serial: str | None = None
@@ -131,6 +133,7 @@ class SESMapEnclosure:
     layout_columns: int | None = None
     slot_layout: list[list[int | None]] | None = None
     slots: dict[int, SESMapSlot] = field(default_factory=dict)
+    unmapped_slots: list[SESMapSlot] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -639,6 +642,145 @@ def parse_gmultipath_list(output: str) -> dict[str, MultipathInfo]:
     return {key: value for key, value in multipaths.items() if key.startswith("multipath/")}
 
 
+def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
+    source_strength = {
+        None: 0,
+        "ses_element_id_fallback": 1,
+        "ses_description": 2,
+        "ses_device_slot_number": 2,
+    }
+    existing_strength = source_strength.get(existing.slot_number_source, 0)
+    incoming_strength = source_strength.get(slot.slot_number_source, 0)
+    if incoming_strength > existing_strength:
+        existing.slot_number = slot.slot_number
+        existing.slot_number_source = slot.slot_number_source
+        existing.slot_number_warning = slot.slot_number_warning
+        existing.description = slot.description or existing.description
+        if slot.element_id is not None:
+            existing.element_id = slot.element_id
+        existing.control_targets = _merge_control_targets(
+            slot.control_targets,
+            existing.control_targets,
+        )
+    else:
+        if incoming_strength == existing_strength:
+            existing.slot_number_warning = (
+                existing.slot_number_warning or slot.slot_number_warning
+            )
+        existing.control_targets = _merge_control_targets(
+            existing.control_targets,
+            slot.control_targets,
+        )
+
+    existing.device_names = list(dict.fromkeys(existing.device_names + slot.device_names))
+    existing.identify_active = existing.identify_active or slot.identify_active
+    existing.status = existing.status or slot.status
+    existing.description = existing.description or slot.description
+    existing.element_id = existing.element_id if existing.element_id is not None else slot.element_id
+    existing.ses_device = existing.ses_device or slot.ses_device
+    existing.serial = existing.serial or slot.serial
+    existing.model = existing.model or slot.model
+    existing.size_text = existing.size_text or slot.size_text
+    existing.sas_address = existing.sas_address or slot.sas_address
+    existing.attached_sas_address = existing.attached_sas_address or slot.attached_sas_address
+    existing.sas_device_type = existing.sas_device_type or slot.sas_device_type
+    existing.transport_protocol = existing.transport_protocol or slot.transport_protocol
+    existing.phy_identifier = existing.phy_identifier or slot.phy_identifier
+    existing.target_port_protocol = existing.target_port_protocol or slot.target_port_protocol
+    for attribute in (
+        "predicted_failure",
+        "disabled",
+        "hot_spare",
+        "do_not_remove",
+        "fault_sensed",
+        "fault_requested",
+    ):
+        existing_value = getattr(existing, attribute)
+        slot_value = getattr(slot, attribute)
+        if existing_value is None:
+            setattr(existing, attribute, slot_value)
+        elif slot_value is not None:
+            setattr(existing, attribute, bool(existing_value or slot_value))
+    if existing.present is None:
+        existing.present = slot.present
+    elif slot.present is not None:
+        existing.present = existing.present or slot.present
+
+
+def _record_ses_slot(
+    enclosure: SESMapEnclosure,
+    slot: SESMapSlot,
+    *,
+    reported_slot_number: int | None,
+    source: str,
+    warning: str | None = None,
+) -> None:
+    if reported_slot_number is None:
+        if slot.element_id is None:
+            return
+        slot.slot_number = -1
+        slot.slot_number_source = source
+        slot.slot_number_warning = warning
+        slot.control_targets = _merge_control_targets(
+            slot.control_targets,
+            [
+                {
+                    "ses_device": slot.ses_device or enclosure.ses_device,
+                    "ses_element_id": slot.element_id,
+                    "ses_slot_number": None,
+                }
+            ],
+        )
+        existing_unmapped = next(
+            (
+                candidate
+                for candidate in enclosure.unmapped_slots
+                if candidate.element_id == slot.element_id
+            ),
+            None,
+        )
+        if existing_unmapped is None:
+            enclosure.unmapped_slots.append(slot)
+        elif existing_unmapped is not slot:
+            _merge_ses_slot_evidence(existing_unmapped, slot)
+        return
+
+    slot.slot_number = reported_slot_number
+    slot.slot_number_source = source
+    slot.slot_number_warning = warning
+    slot.control_targets = _merge_control_targets(
+        slot.control_targets,
+        [
+            {
+                "ses_device": slot.ses_device or enclosure.ses_device,
+                "ses_element_id": slot.element_id,
+                "ses_slot_number": reported_slot_number,
+            }
+        ],
+    )
+    existing = enclosure.slots.get(reported_slot_number)
+    if existing is None or existing is slot:
+        enclosure.slots[reported_slot_number] = slot
+    else:
+        _merge_ses_slot_evidence(existing, slot)
+
+
+def _record_sg_ses_aes_fallback_slot(enclosure: SESMapEnclosure, slot: SESMapSlot | None) -> None:
+    if slot is None or slot.slot_number >= 0 or slot.element_id is None:
+        return
+    slot.description = slot.description or f"SES element {slot.element_id}"
+    _record_ses_slot(
+        enclosure,
+        slot,
+        reported_slot_number=None,
+        source="ses_element_id_fallback",
+        warning=(
+            f"SES AES did not report a device slot number for element {slot.element_id}; "
+            "preserving it as unmapped SES element evidence."
+        ),
+    )
+
+
 def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
     """
     Parse `sesutil map` output into enclosure/slot records.
@@ -713,8 +855,23 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
             current_slot.description = description
             slot_match = SLOT_REGEX.search(description or "")
             if slot_match:
-                current_slot.slot_number = int(slot_match.group("slot"))
-                current_enclosure.slots[current_slot.slot_number] = current_slot
+                _record_ses_slot(
+                    current_enclosure,
+                    current_slot,
+                    reported_slot_number=int(slot_match.group("slot")),
+                    source="ses_description",
+                )
+            else:
+                _record_ses_slot(
+                    current_enclosure,
+                    current_slot,
+                    reported_slot_number=None,
+                    source="ses_element_id_fallback",
+                    warning=(
+                        f"SES parser found an unrecognized SES slot description {description!r}; preserving element "
+                        f"{current_slot.element_id} as unmapped SES evidence."
+                    ),
+                )
             continue
 
         if stripped.startswith("Device Names:"):
@@ -731,7 +888,7 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
         if in_extra_status and "LED=locate" in stripped:
             current_slot.identify_active = True
 
-    parsed = [item for item in enclosures if item.slots]
+    parsed = [item for item in enclosures if item.slots or item.unmapped_slots]
     for enclosure in parsed:
         _apply_inferred_ses_profile(enclosure)
     return parsed
@@ -822,7 +979,10 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     """
 
     ses_device = _extract_sg_ses_device(command)
-    enclosure = SESMapEnclosure(ses_device=ses_device)
+    enclosure = SESMapEnclosure(
+        ses_device=ses_device,
+        enclosure_name=_extract_sg_ses_enclosure_name(output),
+    )
     current_slot: SESMapSlot | None = None
     in_array_slots = False
 
@@ -832,17 +992,12 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
         if not stripped:
             continue
 
-        if enclosure.enclosure_name is None:
-            name = normalize_text(" ".join(stripped.split()))
-            if name:
-                enclosure.enclosure_name = name
-            continue
-
         if stripped.startswith("Primary enclosure logical identifier"):
             enclosure.enclosure_id = normalize_text(stripped.split(":", 1)[1])
             continue
 
         if stripped.startswith("Element type:"):
+            _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
             in_array_slots = "Array device slot" in stripped
             current_slot = None
             continue
@@ -852,6 +1007,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
 
         element_match = re.match(r"Element index:\s*(?P<element>\d+)", stripped)
         if element_match:
+            _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
             current_slot = SESMapSlot(
                 slot_number=-1,
                 element_id=int(element_match.group("element")),
@@ -868,19 +1024,14 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
 
         slot_match = re.search(r"device slot number:\s*(?P<slot>\d+)", stripped, re.IGNORECASE)
         if slot_match:
-            current_slot.slot_number = int(slot_match.group("slot"))
-            current_slot.description = f"Slot {current_slot.slot_number:02d}"
-            current_slot.control_targets = _merge_control_targets(
-                current_slot.control_targets,
-                [
-                    {
-                        "ses_device": ses_device,
-                        "ses_element_id": current_slot.element_id,
-                        "ses_slot_number": current_slot.slot_number,
-                    }
-                ],
+            reported_slot_number = int(slot_match.group("slot"))
+            current_slot.description = f"Slot {reported_slot_number:02d}"
+            _record_ses_slot(
+                enclosure,
+                current_slot,
+                reported_slot_number=reported_slot_number,
+                source="ses_device_slot_number",
             )
-            enclosure.slots[current_slot.slot_number] = current_slot
             continue
 
         if stripped.startswith("SAS device type:"):
@@ -910,7 +1061,8 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             current_slot.phy_identifier = normalize_text(stripped.split(":", 1)[1])
             continue
 
-    if not enclosure.slots:
+    _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
+    if not enclosure.slots and not enclosure.unmapped_slots:
         return None
 
     _apply_inferred_ses_profile(enclosure)
@@ -927,7 +1079,10 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
     """
 
     ses_device = _extract_sg_ses_device(command)
-    enclosure = SESMapEnclosure(ses_device=ses_device)
+    enclosure = SESMapEnclosure(
+        ses_device=ses_device,
+        enclosure_name=_extract_sg_ses_enclosure_name(output),
+    )
     current_slot: SESMapSlot | None = None
     in_array_slots = False
 
@@ -935,12 +1090,6 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
         line = raw_line.rstrip()
         stripped = line.strip()
         if not stripped:
-            continue
-
-        if enclosure.enclosure_name is None:
-            name = normalize_text(" ".join(stripped.split()))
-            if name:
-                enclosure.enclosure_name = name
             continue
 
         if stripped.startswith("Primary enclosure logical identifier"):
@@ -1027,18 +1176,15 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     """
 
     ses_device = _extract_sg_ses_device(command)
-    enclosure = SESMapEnclosure(ses_device=ses_device)
+    enclosure = SESMapEnclosure(
+        ses_device=ses_device,
+        enclosure_name=_extract_sg_ses_enclosure_name(output),
+    )
     current_slot: SESMapSlot | None = None
 
     for raw_line in output.splitlines():
         stripped = raw_line.strip()
         if not stripped:
-            continue
-
-        if enclosure.enclosure_name is None:
-            name = normalize_text(" ".join(stripped.split()))
-            if name:
-                enclosure.enclosure_name = name
             continue
 
         if stripped.startswith("Primary enclosure logical identifier"):
@@ -1146,6 +1292,33 @@ def _apply_sg_ses_status_line(slot: SESMapSlot, line: str) -> None:
             setattr(slot, attribute, match.group("value") == "1")
 
 
+def _extract_sg_ses_enclosure_name(output: str) -> str | None:
+    candidate: str | None = None
+    stop_prefixes = (
+        "primary enclosure logical identifier",
+        "additional element status diagnostic page",
+        "enclosure status diagnostic page",
+    )
+    ignored_prefixes = ("warning:", "notice:", "error:", "sg_ses:")
+
+    for raw_line in output.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if (
+            lowered.startswith(stop_prefixes)
+            or lowered.startswith(("element type:", "element index:", "overall descriptor:"))
+            or re.match(r"slot\d+\s+\[", lowered)
+        ):
+            break
+        if lowered.startswith(ignored_prefixes):
+            continue
+        candidate = normalize_text(" ".join(stripped.split()))
+
+    return candidate
+
+
 def _extract_sg_ses_device(command: str | None) -> str | None:
     if not command:
         return None
@@ -1163,6 +1336,9 @@ def _infer_ses_slot_count(enclosure: SESMapEnclosure) -> int:
 
 def _apply_inferred_ses_profile(enclosure: SESMapEnclosure) -> None:
     slot_count = _infer_ses_slot_count(enclosure)
+    if slot_count == 0 and enclosure.unmapped_slots:
+        enclosure.enclosure_label = enclosure.enclosure_label or "Unmapped SES Evidence"
+        return
     (
         enclosure.profile_id,
         inferred_label,
@@ -1182,9 +1358,8 @@ def _infer_scale_enclosure_profile(
     slot_count: int,
 ) -> tuple[str | None, str | None, int | None, int | None, list[list[int | None]] | None]:
     name = (enclosure.enclosure_name or "").lower()
-    ses_device = (enclosure.ses_device or "").lower()
 
-    if "sas3x40" in name or slot_count == 24 or ses_device.endswith("sg27"):
+    if "sas3x40" in name:
         # Front 24-bay CryoStorage chassis view: 4 columns across, 6 rows tall.
         # The operator-facing front view counts each column bottom-to-top, so
         # slot 0 sits at the bottom of column 1 and slot 5 sits at the top.
@@ -1203,7 +1378,7 @@ def _infer_scale_enclosure_profile(
                 [0, 6, 12, 18],
             ],
         )
-    if "sas3x28" in name or slot_count == 12 or ses_device.endswith("sg38"):
+    if "sas3x28" in name:
         # Rear 12-bay view: 4 columns across, 3 rows tall, matching the rear
         # backplane numbering diagrams and the operator's front-view notes.
         return (
@@ -1275,42 +1450,22 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
             if existing is None:
                 target.slots[slot_number] = slot
                 continue
-
             # Dual-path SAS shelves often expose the same physical slot twice.
-            existing.device_names = list(dict.fromkeys(existing.device_names + slot.device_names))
-            existing.identify_active = existing.identify_active or slot.identify_active
-            existing.status = existing.status or slot.status
-            existing.description = existing.description or slot.description
-            existing.element_id = existing.element_id or slot.element_id
-            existing.ses_device = existing.ses_device or slot.ses_device
-            existing.control_targets = _merge_control_targets(existing.control_targets, slot.control_targets)
-            existing.serial = existing.serial or slot.serial
-            existing.model = existing.model or slot.model
-            existing.size_text = existing.size_text or slot.size_text
-            existing.sas_address = existing.sas_address or slot.sas_address
-            existing.attached_sas_address = existing.attached_sas_address or slot.attached_sas_address
-            existing.sas_device_type = existing.sas_device_type or slot.sas_device_type
-            existing.transport_protocol = existing.transport_protocol or slot.transport_protocol
-            existing.phy_identifier = existing.phy_identifier or slot.phy_identifier
-            existing.target_port_protocol = existing.target_port_protocol or slot.target_port_protocol
-            for attribute in (
-                "predicted_failure",
-                "disabled",
-                "hot_spare",
-                "do_not_remove",
-                "fault_sensed",
-                "fault_requested",
-            ):
-                existing_value = getattr(existing, attribute)
-                slot_value = getattr(slot, attribute)
-                if existing_value is None:
-                    setattr(existing, attribute, slot_value)
-                elif slot_value is not None:
-                    setattr(existing, attribute, bool(existing_value or slot_value))
-            if existing.present is None:
-                existing.present = slot.present
-            elif slot.present is not None:
-                existing.present = existing.present or slot.present
+            _merge_ses_slot_evidence(existing, slot)
+
+        for slot in enclosure.unmapped_slots:
+            existing_unmapped = next(
+                (
+                    candidate
+                    for candidate in target.unmapped_slots
+                    if candidate.element_id == slot.element_id
+                ),
+                None,
+            )
+            if existing_unmapped is None:
+                target.unmapped_slots.append(slot)
+            else:
+                _merge_ses_slot_evidence(existing_unmapped, slot)
 
     return list(merged.values())
 
@@ -1358,7 +1513,7 @@ def _pick_preferred_enclosures(
     capacity = 0
     for enclosure in ordered:
         selected.append(enclosure)
-        capacity += max(enclosure.slots.keys()) if enclosure.slots else 0
+        capacity += _infer_ses_slot_count(enclosure)
         if slot_count and capacity >= slot_count:
             break
 
@@ -1471,7 +1626,7 @@ def build_slot_candidates_from_ses_enclosures(
     slot_count: int,
     enclosure_filter: str | None,
     selected_enclosure_id: str | None = None,
-) -> tuple[dict[int, dict[str, Any]], dict[str, str | None]]:
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
     """
     Convert parsed SES maps into the app's 0-based slot view.
 
@@ -1506,63 +1661,99 @@ def build_slot_candidates_from_ses_enclosures(
 
     candidates: dict[int, dict[str, Any]] = {}
     labels: list[str] = []
+    unmapped_ses_elements: list[dict[str, Any]] = []
+    unmapped_warnings: list[str] = []
     offset = 0
     for enclosure in ordered:
         slot_numbers = sorted(enclosure.slots.keys())
-        if not slot_numbers:
+        if not slot_numbers and not enclosure.unmapped_slots:
             continue
-        min_slot = slot_numbers[0]
-        max_slot = slot_numbers[-1]
-        slot_base = 0 if min_slot == 0 else 1
         labels.append(enclosure.enclosure_name or enclosure.enclosure_id or "SES enclosure")
-        for slot_number, slot in sorted(enclosure.slots.items()):
-            combined_slot = offset + slot_number - slot_base
-            if combined_slot < 0 or combined_slot >= slot_count:
-                continue
+        if slot_numbers:
+            min_slot = slot_numbers[0]
+            max_slot = slot_numbers[-1]
+            slot_base = 0 if min_slot == 0 else 1
+            for slot_number, slot in sorted(enclosure.slots.items()):
+                combined_slot = offset + slot_number - slot_base
+                if combined_slot < 0 or combined_slot >= slot_count:
+                    continue
 
-            candidates[combined_slot] = {
+                candidates[combined_slot] = {
+                    "status": slot.status,
+                    "descriptor": slot.description,
+                    "slot_number_source": slot.slot_number_source,
+                    "slot_number_warning": slot.slot_number_warning,
+                    "value": slot.status,
+                    "device_hint": slot.device_names[0] if slot.device_names else None,
+                    "device_names": slot.device_names,
+                    "identify_active": slot.identify_active,
+                    "serial_hint": slot.serial,
+                    "model_hint": slot.model,
+                    "reported_size": slot.size_text,
+                    "present": slot.present
+                    if slot.present is not None
+                    else bool(slot.device_names) and "not installed" not in (slot.status or "").lower(),
+                    "enclosure_id": enclosure.enclosure_id,
+                    "enclosure_label": enclosure.enclosure_label,
+                    "enclosure_name": enclosure.enclosure_name,
+                    "ses_device": enclosure.ses_device,
+                    "ses_element_id": slot.element_id,
+                    "ses_slot_number": slot.slot_number,
+                    "sas_address_hint": slot.sas_address,
+                    "attached_sas_address": slot.attached_sas_address,
+                    "sas_device_type": slot.sas_device_type,
+                    "transport_protocol": slot.transport_protocol,
+                    "phy_identifier": slot.phy_identifier,
+                    "target_port_protocol": slot.target_port_protocol,
+                    "ses_predicted_failure": slot.predicted_failure,
+                    "ses_disabled": slot.disabled,
+                    "ses_hot_spare": slot.hot_spare,
+                    "ses_do_not_remove": slot.do_not_remove,
+                    "ses_fault_sensed": slot.fault_sensed,
+                    "ses_fault_requested": slot.fault_requested,
+                    "ses_targets": _merge_control_targets(
+                        slot.control_targets,
+                        [
+                            {
+                                "ses_device": slot.ses_device or enclosure.ses_device,
+                                "ses_element_id": slot.element_id,
+                                "ses_slot_number": slot.slot_number,
+                            }
+                        ],
+                    ),
+                }
+            offset += max_slot - slot_base + 1
+
+        for slot in enclosure.unmapped_slots:
+            warning = slot.slot_number_warning or (
+                f"SES element {slot.element_id} has no verified physical slot number."
+            )
+            unmapped_warnings.append(warning)
+            unmapped_ses_elements.append({
                 "status": slot.status,
                 "descriptor": slot.description,
-                "value": slot.status,
-                "device_hint": slot.device_names[0] if slot.device_names else None,
+                "slot_number_source": slot.slot_number_source,
+                "slot_number_warning": warning,
                 "device_names": slot.device_names,
-                "identify_active": slot.identify_active,
-                "serial_hint": slot.serial,
-                "model_hint": slot.model,
-                "reported_size": slot.size_text,
-                "present": slot.present
-                if slot.present is not None
-                else bool(slot.device_names) and "not installed" not in (slot.status or "").lower(),
                 "enclosure_id": enclosure.enclosure_id,
                 "enclosure_label": enclosure.enclosure_label,
                 "enclosure_name": enclosure.enclosure_name,
                 "ses_device": enclosure.ses_device,
                 "ses_element_id": slot.element_id,
-                "ses_slot_number": slot.slot_number,
+                "ses_slot_number": None,
                 "sas_address_hint": slot.sas_address,
                 "attached_sas_address": slot.attached_sas_address,
-                "sas_device_type": slot.sas_device_type,
-                "transport_protocol": slot.transport_protocol,
-                "phy_identifier": slot.phy_identifier,
-                "target_port_protocol": slot.target_port_protocol,
-                "ses_predicted_failure": slot.predicted_failure,
-                "ses_disabled": slot.disabled,
-                "ses_hot_spare": slot.hot_spare,
-                "ses_do_not_remove": slot.do_not_remove,
-                "ses_fault_sensed": slot.fault_sensed,
-                "ses_fault_requested": slot.fault_requested,
                 "ses_targets": _merge_control_targets(
                     slot.control_targets,
                     [
                         {
                             "ses_device": slot.ses_device or enclosure.ses_device,
                             "ses_element_id": slot.element_id,
-                            "ses_slot_number": slot.slot_number,
+                            "ses_slot_number": None,
                         }
                     ],
                 ),
-            }
-        offset += max_slot - slot_base + 1
+            })
 
     return candidates, {
         "id": "+".join(filter(None, [item.enclosure_id for item in ordered])) or None,
@@ -1572,6 +1763,8 @@ def build_slot_candidates_from_ses_enclosures(
         if ordered
         else None,
         "name": ordered[0].enclosure_name if len(ordered) == 1 else "SES Combined View" if ordered else None,
+        "unmapped_ses_elements": unmapped_ses_elements,
+        "warnings": list(dict.fromkeys(unmapped_warnings)),
     }
 
 
@@ -2971,10 +3164,11 @@ def _parse_storcli_eid_slot(value: Any) -> tuple[str | None, int | None, str | N
     if not text or ":" not in text:
         return None, None, None
     enclosure_text, slot_text = text.split(":", 1)
+    enclosure_id = normalize_text(enclosure_text)
     slot = _coerce_int_like(slot_text)
     if slot is None:
-        return normalize_text(enclosure_text), None, None
-    return normalize_text(enclosure_text), slot, f"{normalize_text(enclosure_text)}:{slot}"
+        return enclosure_id, None, None
+    return enclosure_id, slot, _storcli_slot_key(enclosure_id, slot)
 
 
 def _extract_storcli_drive_path(value: str) -> tuple[str | None, str | None, int | None, str | None]:
