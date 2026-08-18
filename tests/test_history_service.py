@@ -17,7 +17,7 @@ from history_service import main as history_main
 from history_service.collector import HistoryCollector, ScopeSnapshot
 from history_service.config import HistorySettings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
-from history_service.store import HistoryStore
+from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
 
 
 class HistoryDomainTests(unittest.TestCase):
@@ -2126,6 +2126,162 @@ class HistoryStoreTests(unittest.TestCase):
             "serial-5|eui64|eui.000000000000001000a075012b91c7cf",
         )
 
+    def _legacy_metric_row_without_identity_key(self, connection: sqlite3.Connection, slot: int) -> None:
+        connection.execute(
+            """
+            INSERT INTO metric_samples (
+                observed_at, system_id, system_label, enclosure_key, enclosure_id, enclosure_label,
+                slot, slot_label, metric_name, value_integer, value_real, device_name, serial, model,
+                state, gptid, persistent_id_label, disk_identity_key, logical_unit_id, sas_address
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-04-16T22:06:00+00:00",
+                "archive-core",
+                "Archive CORE",
+                "enc-a",
+                "enc-a",
+                "Front Shelf",
+                slot,
+                f"{slot:02d}",
+                "bytes_written",
+                123,
+                None,
+                f"da{slot}",
+                f"SERIAL-{slot}",
+                "Drive",
+                "healthy",
+                f"gptid/{slot}",
+                "gptid",
+                None,
+                None,
+                None,
+            ),
+        )
+
+    def test_disk_identity_backfill_runs_once_and_records_user_version(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        HistoryStore(str(db_path))
+
+        with sqlite3.connect(db_path) as connection:
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                DISK_IDENTITY_BACKFILL_USER_VERSION,
+            )
+            # Simulate a database written before the marker existed: legacy rows, version 0.
+            self._legacy_metric_row_without_identity_key(connection, 5)
+            connection.execute("PRAGMA user_version = 0")
+
+        with patch.object(
+            HistoryStore,
+            "_backfill_disk_identity_keys",
+            wraps=HistoryStore._backfill_disk_identity_keys,
+        ) as backfill:
+            HistoryStore(str(db_path))
+            HistoryStore(str(db_path))  # second container / restart sharing the same file
+            HistoryStore(str(db_path))
+
+        self.assertEqual(backfill.call_count, 1, "only the first initialization after a legacy DB should scan")
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute("SELECT disk_identity_key FROM metric_samples WHERE slot = 5").fetchone()
+            self.assertEqual(row[0], "serial-5|gptid|gptid/5")
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                DISK_IDENTITY_BACKFILL_USER_VERSION,
+            )
+
+    def test_get_slot_states_returns_only_the_requested_scope(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        base = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=0,
+            slot_label="00",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da0",
+            serial="SERIAL-0",
+            model="Drive",
+            gptid="gptid/0",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+        )
+        store.upsert_slot_state(base, "2026-04-16T22:05:00+00:00")
+        store.upsert_slot_state(replace(base, slot=7, slot_label="07", serial="SERIAL-7"), "2026-04-16T22:05:00+00:00")
+        store.upsert_slot_state(
+            replace(base, enclosure_key="enc-b", enclosure_id="enc-b", slot=0, serial="SERIAL-B0"),
+            "2026-04-16T22:05:00+00:00",
+        )
+        store.upsert_slot_state(
+            replace(base, system_id="other", slot=0, serial="SERIAL-O0"),
+            "2026-04-16T22:05:00+00:00",
+        )
+
+        states = store.get_slot_states("archive-core", "enc-a")
+
+        self.assertEqual(sorted(states), [0, 7])
+        self.assertEqual(states[7].serial, "SERIAL-7")
+        self.assertEqual(store.get_slot_states("archive-core", "enc-zzz"), {})
+
+    def test_record_slot_updates_writes_events_and_states_in_one_transaction(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        base = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=0,
+            slot_label="00",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da0",
+            serial="SERIAL-0",
+            model="Drive",
+            gptid="gptid/0",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+        )
+        previous = replace(base, state="healthy")
+        current = replace(base, state="warning")
+        events = build_slot_events(previous, current, "2026-04-16T22:10:00+00:00")
+        self.assertTrue(events, "fixture must produce at least one state event")
+        updates = [
+            SlotStateUpdate(record=current, observed_at="2026-04-16T22:10:00+00:00", events=events),
+            SlotStateUpdate(record=replace(base, slot=1, slot_label="01", serial="SERIAL-1"), observed_at="2026-04-16T22:10:00+00:00"),
+        ]
+
+        connect_calls = 0
+        original_connect = store._connect
+
+        def counting_connect() -> sqlite3.Connection:
+            nonlocal connect_calls
+            connect_calls += 1
+            return original_connect()
+
+        with patch.object(store, "_connect", counting_connect):
+            store.record_slot_updates(updates)
+
+        self.assertEqual(connect_calls, 1, "a batch of updates must use exactly one connection")
+        self.assertEqual(store.get_slot_state("archive-core", "enc-a", 0).state, "warning")
+        self.assertEqual(store.get_slot_state("archive-core", "enc-a", 1).serial, "SERIAL-1")
+        self.assertEqual(
+            [event["event_type"] for event in store.list_slot_events("archive-core", "enc-a", 0)],
+            [event.event_type for event in events],
+        )
+        self.assertEqual(store.list_slot_events("archive-core", "enc-a", 1), [])
+        store.record_slot_updates([])  # empty batch is a no-op
+
     def test_store_retries_write_after_readonly_database_error(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
@@ -2379,6 +2535,65 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(collector.background_consecutive_failures, 0)
         self.assertIsNone(collector.background_backoff_until)
         self.assertEqual(collector.background_backoff_seconds_remaining, 0)
+
+    def test_record_slot_changes_uses_one_read_and_one_write_per_pass(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        base = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=0,
+            slot_label="00",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da0",
+            serial="SERIAL-0",
+            model="Drive",
+            gptid="gptid/0",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+        )
+        first_pass = [replace(base, slot=slot, slot_label=f"{slot:02d}", serial=f"SERIAL-{slot}") for slot in range(12)]
+        collector._record_slot_changes(first_pass, "2026-04-16T22:05:00+00:00")
+        second_pass = [
+            replace(record, state="warning" if record.slot % 3 == 0 else record.state) for record in first_pass
+        ]
+
+        connect_calls = 0
+        original_connect = store._connect
+
+        def counting_connect() -> sqlite3.Connection:
+            nonlocal connect_calls
+            connect_calls += 1
+            return original_connect()
+
+        with patch.object(store, "_connect", counting_connect):
+            collector._record_slot_changes(second_pass, "2026-04-16T22:10:00+00:00")
+
+        self.assertEqual(connect_calls, 2, "one scope read plus one batched write, regardless of slot count")
+        for slot in range(12):
+            loaded = store.get_slot_state("archive-core", "enc-a", slot)
+            self.assertIsNotNone(loaded)
+            expected_state = "warning" if slot % 3 == 0 else "healthy"
+            self.assertEqual(loaded.state, expected_state)
+            events = store.list_slot_events("archive-core", "enc-a", slot)
+            if slot % 3 == 0:
+                self.assertTrue(events, f"slot {slot} changed state and must have an event")
+            else:
+                self.assertEqual(events, [])
 
     def test_record_slot_changes_backfills_extended_state_without_event_noise(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
