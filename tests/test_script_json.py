@@ -39,7 +39,8 @@ from app.services.snapshot_export import (
 # comment openers, ampersands, quotes, and the two JavaScript line separators.
 HOSTILE_TEXT = "</script><script>alert(1)</script><!-- & ' \"" + chr(0x2028) + chr(0x2029) + " tail"
 
-SCRIPT_BLOCK_RE = re.compile(r"<script>(.*?)</script>", re.DOTALL)
+SCRIPT_OPEN = "<script>"
+SCRIPT_CLOSE = "</script>"
 
 
 class FakeHistoryBackend:
@@ -123,6 +124,23 @@ def build_hostile_snapshot() -> InventorySnapshot:
     )
 
 
+def inline_script_block(html: str, marker: str) -> str:
+    """Return the body of the inline <script> element that contains ``marker``.
+
+    Slices from the opening tag that precedes the marker to the *first* closing tag
+    after it — exactly what a browser's HTML parser does — so a hostile ``</script>``
+    that leaked into the payload truncates the body and the JSON parse below fails.
+    """
+
+    marker_index = html.find(marker)
+    assert marker_index != -1, f"bootstrap marker {marker!r} not found"
+    open_index = html.rfind(SCRIPT_OPEN, 0, marker_index)
+    assert open_index != -1, "bootstrap marker must sit inside an inline <script> element"
+    close_index = html.find(SCRIPT_CLOSE, marker_index)
+    assert close_index != -1, "inline <script> element must be closed"
+    return html[open_index + len(SCRIPT_OPEN):close_index]
+
+
 def extract_bootstrap_object(html: str, marker: str) -> dict[str, Any]:
     """Locate the inline bootstrap script and parse it as JSON.
 
@@ -132,16 +150,12 @@ def extract_bootstrap_object(html: str, marker: str) -> dict[str, Any]:
     element early.
     """
 
-    for block in SCRIPT_BLOCK_RE.findall(html):
-        if marker not in block:
-            continue
-        body = block.strip()
-        assert body.startswith(marker), body[:80]
-        literal = body[len(marker):].strip().rstrip(";")
-        literal = re.sub(r"(?m)^(\s*)([A-Za-z_][A-Za-z0-9_]*):", r'\1"\2":', literal)
-        literal = re.sub(r",(\s*[}\]])", r"\1", literal)
-        return json.loads(literal)
-    raise AssertionError(f"bootstrap marker {marker!r} not found in a single <script> block")
+    body = inline_script_block(html, marker).strip()
+    assert body.startswith(marker), body[:80]
+    literal = body[len(marker):].strip().rstrip(";")
+    literal = re.sub(r"(?m)^(\s*)([A-Za-z_][A-Za-z0-9_]*):", r'\1"\2":', literal)
+    literal = re.sub(r",(\s*[}\]])", r"\1", literal)
+    return json.loads(literal)
 
 
 class ScriptSafeJsonHelperTests(unittest.TestCase):
@@ -231,7 +245,7 @@ class MainViewBootstrapTests(unittest.TestCase):
         self.assertEqual(bootstrap["initialHistoryIoChartMode"], "total")
         self.assertEqual(bootstrap["preloadedHistorySummary"], {"counts": {}, "collector": {}})
 
-        script_body = next(block for block in SCRIPT_BLOCK_RE.findall(html) if "window.APP_BOOTSTRAP" in block)
+        script_body = inline_script_block(html, "window.APP_BOOTSTRAP =")
         self.assertNotIn("<", script_body)
         self.assertNotIn(chr(0x2028), script_body)
         self.assertNotIn(chr(0x2029), script_body)
@@ -263,7 +277,7 @@ class StorageFabricBootstrapTests(unittest.TestCase):
         parsed = extract_bootstrap_object(html, "window.SAS_FABRIC_BOOTSTRAP =")
         self.assertEqual(parsed["fabric"]["system_label"], HOSTILE_TEXT)
         self.assertEqual(parsed["snapshot"]["selected_enclosure_label"], HOSTILE_TEXT)
-        script_body = next(block for block in SCRIPT_BLOCK_RE.findall(html) if "SAS_FABRIC_BOOTSTRAP" in block)
+        script_body = inline_script_block(html, "window.SAS_FABRIC_BOOTSTRAP =")
         self.assertNotIn("<", script_body)
         self.assertNotIn(chr(0x2028), script_body)
 
@@ -291,7 +305,7 @@ class SnapshotExportBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bootstrap["snapshot"]["selected_system_label"], HOSTILE_TEXT)
         self.assertEqual(bootstrap["snapshot"]["slots"][0]["model"], HOSTILE_TEXT)
         self.assertEqual(bootstrap["preloadedSmartSummariesBySlot"]["0"]["model"], HOSTILE_TEXT)
-        script_body = next(block for block in SCRIPT_BLOCK_RE.findall(rendered.html) if "window.APP_BOOTSTRAP" in block)
+        script_body = inline_script_block(rendered.html, "window.APP_BOOTSTRAP =")
         self.assertNotIn("<", script_body)
         self.assertNotIn(chr(0x2028), script_body)
 
