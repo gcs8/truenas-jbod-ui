@@ -5,7 +5,9 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -458,6 +460,91 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             payload = asyncio.run(route.endpoint(exact_counts=False))
 
         self.assertEqual(payload["database"]["size_bytes"], 4096)
+
+    def test_history_read_routes_run_store_calls_off_the_event_loop(self) -> None:
+        route_cases = (
+            ("/", {"exact_counts": False}),
+            ("/", {"exact_counts": True}),
+            ("/healthz", {}),
+            ("/api/history/overview", {"exact_counts": False}),
+            ("/api/history/overview", {"exact_counts": True}),
+            (
+                "/api/history/slots/{slot}/events",
+                {"slot": 5, "system_id": "archive-core", "enclosure_id": "front", "limit": 100},
+            ),
+            (
+                "/api/history/slots/{slot}/metrics",
+                {
+                    "slot": 5,
+                    "system_id": "archive-core",
+                    "enclosure_id": "front",
+                    "metric_name": "temperature_c",
+                    "since": None,
+                    "limit": 500,
+                },
+            ),
+            (
+                "/api/history/slots/{slot}/bundle",
+                {
+                    "slot": 5,
+                    "system_id": "archive-core",
+                    "enclosure_id": "front",
+                    "since": None,
+                    "event_limit": 12,
+                },
+            ),
+            (
+                "/api/history/scopes/slots",
+                {
+                    "system_id": "archive-core",
+                    "enclosure_id": "front",
+                    "slots": [5],
+                    "metrics": ["temperature_c"],
+                    "since": None,
+                    "event_limit": 12,
+                },
+            ),
+        )
+        store_results = {
+            "counts": {"tracked_slots": 0},
+            "estimated_counts": {"tracked_slots": 0},
+            "list_scopes": [],
+            "database_size_bytes": 0,
+            "list_slot_events": [],
+            "list_metric_samples": [],
+            "get_slot_history_bundle": {"events": [], "metrics": {}},
+            "list_scope_history": {},
+        }
+
+        for route_path, route_kwargs in route_cases:
+            with self.subTest(route=route_path, exact_counts=route_kwargs.get("exact_counts")):
+                event_loop_thread_id = threading.get_ident()
+                store_thread_ids: list[int] = []
+
+                def tracked_result(result):
+                    def call(*_args, **_kwargs):
+                        store_thread_ids.append(threading.get_ident())
+                        return result
+
+                    return call
+
+                route = next(
+                    route
+                    for route in history_main.app.routes
+                    if getattr(route, "path", None) == route_path
+                )
+                with ExitStack() as stack:
+                    for method_name, result in store_results.items():
+                        stack.enter_context(
+                            patch.object(history_main.store, method_name, side_effect=tracked_result(result))
+                        )
+                    asyncio.run(getattr(route, "endpoint")(**route_kwargs))
+
+                self.assertTrue(store_thread_ids)
+                self.assertTrue(
+                    all(thread_id != event_loop_thread_id for thread_id in store_thread_ids),
+                    f"{route_path} executed a HistoryStore read on the event-loop thread",
+                )
 
     def test_history_fetch_json_timeout_reports_url_and_timeout(self) -> None:
         collector = HistoryCollector(
@@ -2078,6 +2165,45 @@ class HistoryStoreTests(unittest.TestCase):
         working_connection.execute.assert_called_once()
         working_connection.commit.assert_called_once()
 
+    def test_connect_uses_an_explicit_bounded_timeout(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        connection = MagicMock()
+
+        with patch("history_service.store.sqlite3.connect", return_value=connection) as connect:
+            returned_connection = store._connect()
+
+        self.assertIs(returned_connection, connection)
+        self.assertIn("timeout", connect.call_args.kwargs)
+        self.assertGreater(connect.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(connect.call_args.kwargs["timeout"], 10)
+
+    def test_store_retries_transient_database_locked_write(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        operation = MagicMock(
+            side_effect=[sqlite3.OperationalError("database is locked"), "written"]
+        )
+
+        with patch("time.sleep") as sleep:
+            result = store._execute_write(operation)
+
+        self.assertEqual(result, "written")
+        self.assertEqual(operation.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_store_database_locked_write_retries_are_bounded(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        operation = MagicMock(side_effect=sqlite3.OperationalError("database is locked"))
+
+        with patch("time.sleep") as sleep:
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                store._execute_write(operation)
+
+        self.assertEqual(operation.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_connect_applies_temp_store_and_cache_size_pragmas(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
@@ -2121,7 +2247,10 @@ class HistoryStoreTests(unittest.TestCase):
                 return self._connection.execute(sql, *args, **kwargs)
 
         with (
-            patch("history_service.store.sqlite3.connect", side_effect=lambda path: FailingWalConnection(path)),
+            patch(
+                "history_service.store.sqlite3.connect",
+                side_effect=lambda path, **_kwargs: FailingWalConnection(path),
+            ),
             self.assertLogs("history_service.store", level="WARNING") as logs,
         ):
             with store._connect() as connection:

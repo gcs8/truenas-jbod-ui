@@ -7,6 +7,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from typing import cast
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query
@@ -94,8 +95,12 @@ install_metrics(app, service_name="enclosure-history", version=__version__)
 @app.get("/", response_class=HTMLResponse)
 async def index(exact_counts: bool = Query(default=False)) -> HTMLResponse:
     status = public_collector_status(collector.status())
-    counts = store.counts() if exact_counts else store.estimated_counts()
-    scopes = store.list_scopes(include_activity_counts=exact_counts)
+    counts = cast(
+        dict[str, object],
+        await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts),
+    )
+    scopes = await asyncio.to_thread(store.list_scopes, include_activity_counts=exact_counts)
+    database_size_bytes = await asyncio.to_thread(store.database_size_bytes)
     return HTMLResponse(
         render_dashboard(
             status,
@@ -103,7 +108,7 @@ async def index(exact_counts: bool = Query(default=False)) -> HTMLResponse:
             scopes,
             app_version=__version__,
             release_status=get_release_status_service().snapshot(),
-            database_size_bytes=store.database_size_bytes(),
+            database_size_bytes=database_size_bytes,
         )
     )
 
@@ -114,7 +119,7 @@ async def healthz() -> JSONResponse:
     payload = {
         "status": "ok" if not collector.last_error else "degraded",
         "collector": collector_status,
-        "database_size_bytes": store.database_size_bytes(),
+        "database_size_bytes": await asyncio.to_thread(store.database_size_bytes),
         **collector_status,
     }
     return JSONResponse(payload, status_code=200)
@@ -135,12 +140,12 @@ async def livez() -> JSONResponse:
 async def overview(exact_counts: bool = Query(default=False)) -> dict[str, object]:
     return {
         "collector": public_collector_status(collector.status()),
-        "counts": store.counts() if exact_counts else store.estimated_counts(),
+        "counts": await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts),
         "counts_exact": exact_counts,
         "database": {
-            "size_bytes": store.database_size_bytes(),
+            "size_bytes": await asyncio.to_thread(store.database_size_bytes),
         },
-        "scopes": store.list_scopes(include_activity_counts=exact_counts),
+        "scopes": await asyncio.to_thread(store.list_scopes, include_activity_counts=exact_counts),
     }
 
 
@@ -226,7 +231,13 @@ async def slot_events(
     limit: int = Query(default=100, ge=1, le=1000),
 ) -> dict[str, object]:
     return {
-        "events": store.list_slot_events(system_id, enclosure_id, slot, limit=limit),
+        "events": await asyncio.to_thread(
+            store.list_slot_events,
+            system_id,
+            enclosure_id,
+            slot,
+            limit=limit,
+        ),
     }
 
 
@@ -240,7 +251,8 @@ async def slot_metrics(
     limit: int = Query(default=500, ge=1, le=5000),
 ) -> dict[str, object]:
     return {
-        "samples": store.list_metric_samples(
+        "samples": await asyncio.to_thread(
+            store.list_metric_samples,
             system_id,
             enclosure_id,
             slot,
@@ -259,7 +271,8 @@ async def slot_history_bundle(
     since: str | None = Query(default=None),
     event_limit: int = Query(default=12, ge=1, le=1000),
 ) -> dict[str, object]:
-    return store.get_slot_history_bundle(
+    return await asyncio.to_thread(
+        store.get_slot_history_bundle,
         system_id,
         enclosure_id,
         slot,
@@ -283,7 +296,8 @@ async def scope_slot_history(
         for metric_name in (metrics or SLOT_HISTORY_METRIC_LIMITS.keys())
         if metric_name in SLOT_HISTORY_METRIC_LIMITS
     ]
-    histories = store.list_scope_history(
+    histories = await asyncio.to_thread(
+        store.list_scope_history,
         system_id,
         enclosure_id,
         slots=slots or [],
