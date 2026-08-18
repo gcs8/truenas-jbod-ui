@@ -5,9 +5,11 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -29,11 +31,18 @@ from history_service.config import HistorySettings
 from history_service.domain import MetricSample, SlotStateRecord
 from history_service.store import HistoryStore
 from history_service.system_backup import (
+    BACKUP_GROUP_METADATA,
     BUNDLE_FORMAT,
     BUNDLE_SCHEMA_VERSION,
+    CONFIG_FILE_KEY,
     DEBUG_BUNDLE_FORMAT,
+    HISTORY_DB_KEY,
+    MAPPING_FILE_KEY,
+    PROFILE_FILE_KEY,
     RUNTIME_OVERRIDES_FILE_KEY,
+    SAS_FABRIC_ALIAS_FILE_KEY,
     SEVEN_ZIP_SIGNATURE,
+    SLOT_DETAIL_FILE_KEY,
     SSH_KEYS_KEY,
     TLS_TRUST_KEY,
     KNOWN_HOSTS_KEY,
@@ -298,6 +307,40 @@ class SystemBackupServiceTests(unittest.TestCase):
                 archive.writestr(archive_path, content)
         return buffer.getvalue()
 
+    @staticmethod
+    def _build_selected_group_bundle(members: dict[str, bytes]) -> bytes:
+        groups = []
+        files = []
+        archive_members = {}
+        for group_key, content in members.items():
+            metadata = BACKUP_GROUP_METADATA[group_key]
+            archive_path = str(metadata["archive_root"])
+            groups.append(
+                {
+                    "key": group_key,
+                    "selected": True,
+                    "present": True,
+                    "restore_mode": metadata["restore_mode"],
+                }
+            )
+            files.append(
+                {
+                    "key": group_key,
+                    "group_key": group_key,
+                    "archive_path": archive_path,
+                    "size_bytes": len(content),
+                }
+            )
+            archive_members[archive_path] = content
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "packaging": "zip",
+            "groups": groups,
+            "files": files,
+        }
+        return SystemBackupServiceTests._build_zip_bundle(manifest, archive_members)
+
     def test_directory_member_paths_reject_absolute_and_traversal_entries(self) -> None:
         invalid_paths = [
             "/tmp/outside.key",
@@ -440,6 +483,242 @@ class SystemBackupServiceTests(unittest.TestCase):
             self.backup_service.import_bundle(bundle)
 
         self.assertEqual(existing_key.read_text(encoding="utf-8"), "PRIVATE-KEY\n")
+
+    def test_import_preflights_late_file_and_directory_groups_before_config_write(self) -> None:
+        original_config = self.config_path.read_bytes()
+        changed_config = yaml.safe_load(original_config)
+        changed_config.setdefault("app", {})["refresh_interval_seconds"] = 777
+        changed_config_bytes = yaml.safe_dump(changed_config, sort_keys=False).encode("utf-8")
+        config_archive_path = str(BACKUP_GROUP_METADATA[CONFIG_FILE_KEY]["archive_root"])
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            for group_key in (KNOWN_HOSTS_KEY, SSH_KEYS_KEY, TLS_TRUST_KEY):
+                with self.subTest(group_key=group_key):
+                    manifest = {
+                        "schema_version": BUNDLE_SCHEMA_VERSION,
+                        "format": BUNDLE_FORMAT,
+                        "packaging": "zip",
+                        "groups": [
+                            {
+                                "key": CONFIG_FILE_KEY,
+                                "selected": True,
+                                "present": True,
+                                "restore_mode": "file",
+                            },
+                            {
+                                "key": group_key,
+                                "selected": True,
+                                "present": True,
+                                "restore_mode": BACKUP_GROUP_METADATA[group_key]["restore_mode"],
+                            },
+                        ],
+                        "files": [
+                            {
+                                "key": CONFIG_FILE_KEY,
+                                "group_key": CONFIG_FILE_KEY,
+                                "archive_path": config_archive_path,
+                                "size_bytes": len(changed_config_bytes),
+                                "sha256": hashlib.sha256(changed_config_bytes).hexdigest(),
+                            }
+                        ],
+                    }
+                    bundle = self._build_zip_bundle(
+                        manifest,
+                        {config_archive_path: changed_config_bytes},
+                    )
+                    get_settings.cache_clear()
+                    try:
+                        with self.assertRaisesRegex(ValueError, f"selected {group_key}"):
+                            self.backup_service.import_bundle(bundle)
+                        self.assertEqual(self.config_path.read_bytes(), original_config)
+                    finally:
+                        self.config_path.write_bytes(original_config)
+                        get_settings.cache_clear()
+
+    def test_import_accepts_supported_top_level_profile_list(self) -> None:
+        original_profile = self.profile_path.read_bytes()
+        profile_content = yaml.safe_dump(
+            [
+                {
+                    "id": "legacy-list-profile",
+                    "label": "Legacy List Profile",
+                    "rows": 1,
+                    "columns": 1,
+                    "slot_layout": [[0]],
+                }
+            ],
+            sort_keys=False,
+        ).encode("utf-8")
+        bundle = self._build_selected_group_bundle(
+            {PROFILE_FILE_KEY: profile_content}
+        )
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            try:
+                result = self.backup_service.import_bundle(bundle)
+                self.assertTrue(result["ok"])
+                self.assertEqual(self.profile_path.read_bytes(), profile_content)
+            finally:
+                self.profile_path.write_bytes(original_profile)
+                get_settings.cache_clear()
+
+    def test_import_rejects_schema_less_sqlite_history_member(self) -> None:
+        unrelated_path = self.temp_dir / "unrelated.sqlite3"
+        with sqlite3.connect(unrelated_path) as connection:
+            connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+            connection.commit()
+        bundle = self._build_selected_group_bundle(
+            {HISTORY_DB_KEY: unrelated_path.read_bytes()}
+        )
+        restore_dir = self.temp_dir / "history-restore"
+        original_backup = self.store.create_backup(restore_dir)
+        self.assertIsNotNone(original_backup)
+
+        try:
+            with self.assertRaisesRegex(ValueError, "selected history_db member is invalid"):
+                self.backup_service.import_bundle(bundle)
+        finally:
+            assert original_backup is not None
+            self.store.restore_backup(original_backup)
+
+    def test_import_rejects_duplicate_physical_zip_member_paths(self) -> None:
+        content = b'{"slot_mappings": {}}'
+        archive_path = str(BACKUP_GROUP_METADATA[MAPPING_FILE_KEY]["archive_root"])
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "packaging": "zip",
+            "groups": [
+                {
+                    "key": MAPPING_FILE_KEY,
+                    "selected": True,
+                    "present": True,
+                    "restore_mode": "file",
+                }
+            ],
+            "files": [
+                {
+                    "key": MAPPING_FILE_KEY,
+                    "group_key": MAPPING_FILE_KEY,
+                    "archive_path": archive_path,
+                    "size_bytes": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            ],
+        }
+        buffer = io.BytesIO()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", json.dumps(manifest, sort_keys=True))
+                archive.writestr(archive_path, content)
+                archive.writestr(archive_path, content)
+
+        with self.assertRaisesRegex(ValueError, "duplicate physical archive member"):
+            self.backup_service.import_bundle(buffer.getvalue())
+
+    def test_import_rejects_invalid_config_before_replacing_live_config(self) -> None:
+        original_config = self.config_path.read_bytes()
+        bundle = self._build_selected_group_bundle(
+            {CONFIG_FILE_KEY: b"systems: [\n"}
+        )
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            try:
+                with self.assertRaisesRegex(ValueError, "selected config_file member is invalid"):
+                    self.backup_service.import_bundle(bundle)
+                self.assertEqual(self.config_path.read_bytes(), original_config)
+            finally:
+                self.config_path.write_bytes(original_config)
+                get_settings.cache_clear()
+
+    def test_import_rejects_member_size_and_digest_mismatch_before_live_write(self) -> None:
+        expected_content = b'{"slot_mappings": {}}'
+        tampered_content = b'{"slot_mappings": []}'
+        self.assertEqual(len(expected_content), len(tampered_content))
+        archive_path = str(BACKUP_GROUP_METADATA[MAPPING_FILE_KEY]["archive_root"])
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "packaging": "zip",
+            "groups": [
+                {
+                    "key": MAPPING_FILE_KEY,
+                    "selected": True,
+                    "present": True,
+                    "restore_mode": "file",
+                }
+            ],
+            "files": [
+                {
+                    "key": MAPPING_FILE_KEY,
+                    "group_key": MAPPING_FILE_KEY,
+                    "archive_path": archive_path,
+                    "size_bytes": len(expected_content),
+                    "sha256": hashlib.sha256(expected_content).hexdigest(),
+                }
+            ],
+        }
+        bundle = self._build_zip_bundle(manifest, {archive_path: tampered_content})
+        original_mapping = self.mapping_path.read_bytes()
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "SHA-256 does not match"):
+                self.backup_service.import_bundle(bundle)
+
+        self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+
+    def test_import_preflights_every_structured_member_before_first_live_write(self) -> None:
+        original_config = self.config_path.read_bytes()
+        changed_config = yaml.safe_load(original_config)
+        changed_config.setdefault("app", {})["refresh_interval_seconds"] = 777
+        changed_config_bytes = yaml.safe_dump(changed_config, sort_keys=False).encode("utf-8")
+        invalid_members = {
+            RUNTIME_OVERRIDES_FILE_KEY: b"app: [\n",
+            PROFILE_FILE_KEY: b"profiles: [\n",
+            MAPPING_FILE_KEY: b'{"slot_mappings":',
+            SAS_FABRIC_ALIAS_FILE_KEY: b'{"aliases":',
+            SLOT_DETAIL_FILE_KEY: b'{"slot_details":',
+            HISTORY_DB_KEY: b"not a sqlite database",
+        }
+        target_paths = {
+            RUNTIME_OVERRIDES_FILE_KEY: self.runtime_overrides_path,
+            PROFILE_FILE_KEY: self.profile_path,
+            MAPPING_FILE_KEY: self.mapping_path,
+            SAS_FABRIC_ALIAS_FILE_KEY: self.temp_dir / "sas_fabric_aliases.json",
+            SLOT_DETAIL_FILE_KEY: self.slot_detail_path,
+            HISTORY_DB_KEY: self.history_db_path,
+        }
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            for group_key, invalid_content in invalid_members.items():
+                with self.subTest(group_key=group_key):
+                    target_path = target_paths[group_key]
+                    original_target = target_path.read_bytes() if target_path.exists() else None
+                    bundle = self._build_selected_group_bundle(
+                        {
+                            CONFIG_FILE_KEY: changed_config_bytes,
+                            group_key: invalid_content,
+                        }
+                    )
+                    get_settings.cache_clear()
+                    try:
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            f"selected {group_key} member is invalid",
+                        ):
+                            self.backup_service.import_bundle(bundle)
+                        self.assertEqual(self.config_path.read_bytes(), original_config)
+                    finally:
+                        self.config_path.write_bytes(original_config)
+                        if original_target is None:
+                            target_path.unlink(missing_ok=True)
+                        else:
+                            target_path.write_bytes(original_target)
+                        get_settings.cache_clear()
 
     @staticmethod
     def _decode_fake_7z_archive(archive_path: Path) -> dict[str, object]:

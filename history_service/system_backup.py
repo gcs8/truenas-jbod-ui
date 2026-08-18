@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import io
 import json
+import re
 import sqlite3
 import subprocess
 import tarfile
@@ -23,7 +24,9 @@ except ImportError:  # pragma: no cover - exercised in runtime validation instea
     zstd = None
 
 from app import __version__
-from app.config import Settings, _derive_runtime_layout_paths, get_settings
+from app.config import EnclosureProfileConfig, Settings, _derive_runtime_layout_paths, get_settings
+from app.models.domain import ManualMapping, SasFabricAlias
+from app.services.slot_detail_store import SlotDetailCacheEntry
 from history_service.config import HistorySettings
 from history_service.store import HistoryStore
 
@@ -565,6 +568,9 @@ class SystemBackupService:
             raise ValueError("Backup bundle format is not recognized.")
 
         group_entries = self._manifest_group_entries(manifest)
+        self._validate_manifest_member_metadata(manifest, extracted)
+        self._preflight_selected_group_members(manifest, group_entries, extracted)
+        self._preflight_import_members(manifest, group_entries, extracted)
         restored_paths: list[str] = []
         app_settings = self._load_app_settings()
 
@@ -693,6 +699,238 @@ class SystemBackupService:
     def _load_app_settings(self) -> Settings:
         get_settings.cache_clear()
         return get_settings()
+
+    def _preflight_import_members(
+        self,
+        manifest: dict[str, Any],
+        group_entries: dict[str, dict[str, Any]],
+        extracted_members: dict[str, bytes],
+    ) -> None:
+        validators = {
+            CONFIG_FILE_KEY: self._validate_config_member,
+            RUNTIME_OVERRIDES_FILE_KEY: self._validate_runtime_overrides_member,
+            PROFILE_FILE_KEY: self._validate_profile_member,
+            MAPPING_FILE_KEY: self._validate_mapping_member,
+            SAS_FABRIC_ALIAS_FILE_KEY: self._validate_sas_alias_member,
+            SLOT_DETAIL_FILE_KEY: self._validate_slot_detail_member,
+            HISTORY_DB_KEY: self._validate_history_member,
+        }
+        for group_key, validator in validators.items():
+            group_entry = group_entries.get(group_key)
+            if not self._manifest_group_selected(group_entry):
+                continue
+            member_entry = self._first_group_member(manifest, group_key)
+            if member_entry is None:
+                if self._manifest_group_present(group_entry):
+                    raise ValueError(f"Backup bundle is missing the selected {group_key} member.")
+                continue
+            member_key = member_entry["key"]
+            if member_key not in extracted_members:
+                raise ValueError(f"Backup bundle is missing the selected {group_key} member.")
+            try:
+                validator(extracted_members[member_key])
+            except (UnicodeError, yaml.YAMLError, json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Backup bundle selected {group_key} member is invalid."
+                ) from exc
+
+    def _preflight_selected_group_members(
+        self,
+        manifest: dict[str, Any],
+        group_entries: dict[str, dict[str, Any]],
+        extracted_members: dict[str, bytes],
+    ) -> None:
+        for group_key, group_entry in group_entries.items():
+            if not self._manifest_group_selected(group_entry):
+                continue
+            metadata = BACKUP_GROUP_METADATA.get(group_key)
+            if metadata is None:
+                raise ValueError(f"Backup bundle selected unsupported group {group_key!r}.")
+            member_entries = self._group_members(manifest, group_key)
+            present = self._manifest_group_present(group_entry)
+            if present and not member_entries:
+                raise ValueError(f"Backup bundle is missing the selected {group_key} member.")
+            if not present and member_entries:
+                raise ValueError(
+                    f"Backup bundle selected {group_key} is marked absent but contains members."
+                )
+            if not present:
+                continue
+            restore_mode = str(metadata.get("restore_mode") or "")
+            if restore_mode in {"file", "history_db"} and len(member_entries) != 1:
+                raise ValueError(
+                    f"Backup bundle selected {group_key} must contain exactly one member."
+                )
+            for member_entry in member_entries:
+                member_key = member_entry["key"]
+                if member_key not in extracted_members:
+                    raise ValueError(
+                        f"Backup bundle is missing the selected {group_key} member."
+                    )
+                if restore_mode == "directory":
+                    self._directory_member_relative_path(
+                        group_key,
+                        member_entry["archive_path"],
+                    )
+
+    def _validate_manifest_member_metadata(
+        self,
+        manifest: dict[str, Any],
+        extracted_members: dict[str, bytes],
+    ) -> None:
+        seen_keys: set[str] = set()
+        seen_paths: set[str] = set()
+        for index, raw_entry in enumerate(manifest.get("files", [])):
+            if not isinstance(raw_entry, dict):
+                continue
+            raw_archive_path = str(raw_entry.get("archive_path") or "").strip()
+            if not raw_archive_path:
+                continue
+            archive_path = self._normalize_archive_member_path(raw_archive_path)
+            key = str(raw_entry.get("key") or archive_path or f"member-{index}").strip()
+            if key in seen_keys:
+                raise ValueError(f"Backup bundle manifest contains duplicate member key {key!r}.")
+            if archive_path in seen_paths:
+                raise ValueError(
+                    f"Backup bundle manifest contains duplicate archive path {archive_path!r}."
+                )
+            seen_keys.add(key)
+            seen_paths.add(archive_path)
+
+            content = extracted_members.get(key)
+            if content is None:
+                raise ValueError(f"Backup bundle is missing {archive_path}.")
+
+            expected_size = raw_entry.get("size_bytes")
+            if expected_size is not None:
+                if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size < 0:
+                    raise ValueError(
+                        f"Backup bundle member {archive_path} has invalid size metadata."
+                    )
+                if len(content) != expected_size:
+                    raise ValueError(
+                        f"Backup bundle member {archive_path} size does not match its manifest."
+                    )
+
+            expected_sha256 = raw_entry.get("sha256")
+            if expected_sha256 is not None:
+                digest = str(expected_sha256).strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    raise ValueError(
+                        f"Backup bundle member {archive_path} has invalid SHA-256 metadata."
+                    )
+                if hashlib.sha256(content).hexdigest() != digest:
+                    raise ValueError(
+                        f"Backup bundle member {archive_path} SHA-256 does not match its manifest."
+                    )
+
+    @staticmethod
+    def _load_yaml_mapping(content: bytes) -> dict[str, Any]:
+        payload = yaml.safe_load(content.decode("utf-8")) or {}
+        if not isinstance(payload, dict):
+            raise ValueError("YAML payload must contain a mapping.")
+        return payload
+
+    @staticmethod
+    def _load_json_mapping(content: bytes) -> dict[str, Any]:
+        payload = json.loads(content.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("JSON payload must contain an object.")
+        return payload
+
+    @classmethod
+    def _validate_config_member(cls, content: bytes) -> None:
+        Settings.model_validate(cls._load_yaml_mapping(content))
+
+    @classmethod
+    def _validate_runtime_overrides_member(cls, content: bytes) -> None:
+        payload = cls._load_yaml_mapping(content)
+        app_payload = payload.get("app", {})
+        if not isinstance(app_payload, dict):
+            raise ValueError("Runtime override app payload must contain a mapping.")
+        Settings.model_validate({"app": app_payload})
+
+    @classmethod
+    def _validate_profile_member(cls, content: bytes) -> None:
+        payload = yaml.safe_load(content.decode("utf-8")) or {}
+        if isinstance(payload, list):
+            profiles = payload
+        elif isinstance(payload, dict):
+            profiles = payload.get("profiles", payload)
+        else:
+            profiles = None
+        if not isinstance(profiles, list):
+            raise ValueError(
+                "Profile payload must contain a profile list or a mapping with a profiles list."
+            )
+        for profile in profiles:
+            EnclosureProfileConfig.model_validate(profile)
+
+    @classmethod
+    def _validate_mapping_member(cls, content: bytes) -> None:
+        payload = cls._load_json_mapping(content)
+        mappings = payload.get("slot_mappings", {})
+        if not isinstance(mappings, dict):
+            raise ValueError("Mapping payload must contain a slot_mappings object.")
+        for mapping in mappings.values():
+            ManualMapping.model_validate(mapping)
+
+    @classmethod
+    def _validate_sas_alias_member(cls, content: bytes) -> None:
+        payload = cls._load_json_mapping(content)
+        aliases = payload.get("sas_fabric_aliases", {})
+        if not isinstance(aliases, dict):
+            raise ValueError("SAS alias payload must contain a sas_fabric_aliases object.")
+        for alias in aliases.values():
+            SasFabricAlias.model_validate(alias)
+
+    @classmethod
+    def _validate_slot_detail_member(cls, content: bytes) -> None:
+        payload = cls._load_json_mapping(content)
+        entries = payload.get("slot_details", {})
+        if not isinstance(entries, dict):
+            raise ValueError("Slot detail payload must contain a slot_details object.")
+        for entry in entries.values():
+            SlotDetailCacheEntry.model_validate(entry)
+
+    @staticmethod
+    def _validate_history_member(content: bytes) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            candidate_path = Path(temp_dir) / "history.sqlite3"
+            candidate_path.write_bytes(content)
+            database_uri = f"{candidate_path.resolve().as_uri()}?mode=ro"
+            with sqlite3.connect(database_uri, uri=True) as connection:
+                rows = connection.execute("PRAGMA quick_check").fetchall()
+                required_columns = {
+                    "slot_state_current": {"system_id", "enclosure_key", "slot"},
+                    "slot_events": {"system_id", "enclosure_key", "slot", "observed_at"},
+                    "metric_samples": {
+                        "system_id",
+                        "enclosure_key",
+                        "slot",
+                        "observed_at",
+                        "metric_name",
+                    },
+                }
+                for table_name, expected_columns in required_columns.items():
+                    table_row = connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                        (table_name,),
+                    ).fetchone()
+                    if table_row is None:
+                        raise ValueError(f"History database is missing table {table_name}.")
+                    columns = {
+                        str(row[1])
+                        for row in connection.execute(
+                            f'PRAGMA table_info("{table_name}")'
+                        ).fetchall()
+                    }
+                    if not expected_columns.issubset(columns):
+                        raise ValueError(
+                            f"History database table {table_name} is missing required columns."
+                        )
+            if rows != [("ok",)]:
+                raise ValueError("History database integrity check failed.")
 
     def _build_history_snapshot(self) -> bytes:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1297,6 +1535,9 @@ class SystemBackupService:
         if packaging == "zip":
             try:
                 with zipfile.ZipFile(io.BytesIO(archive_bytes), mode="r") as archive:
+                    self._validate_unique_physical_archive_paths(
+                        [member.filename for member in archive.infolist() if not member.is_dir()]
+                    )
                     try:
                         manifest_bytes = archive.read("manifest.json")
                     except KeyError as exc:
@@ -1310,6 +1551,9 @@ class SystemBackupService:
         tar_bytes = self._decompress_tar_archive(archive_bytes, packaging)
         try:
             with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
+                self._validate_unique_physical_archive_paths(
+                    [member.name for member in archive.getmembers() if member.isfile()]
+                )
                 manifest = self._load_manifest(self._read_tar_member(archive, "manifest.json"))
                 extracted = self._extract_manifest_tar_members(archive, manifest)
         except tarfile.TarError as exc:
@@ -1342,6 +1586,9 @@ class SystemBackupService:
                 "Backup bundle 7z archive could not be listed.",
                 passphrase=passphrase,
                 reading_archive=True,
+            )
+            self._validate_unique_physical_archive_paths(
+                self._seven_zip_listed_paths(list_result.stdout, archive_path)
             )
             encrypted = "Encrypted = +" in list_result.stdout or "7zAES" in list_result.stdout
 
@@ -1436,6 +1683,45 @@ class SystemBackupService:
         if any(part in {"", ".", ".."} or ":" in part for part in path_parts):
             raise ValueError(f"Backup bundle archive member path is invalid: {archive_path}")
         return normalized_path
+
+    @classmethod
+    def _validate_unique_physical_archive_paths(cls, archive_paths: list[str]) -> None:
+        seen: set[str] = set()
+        for archive_path in archive_paths:
+            normalized_path = cls._normalize_archive_member_path(archive_path)
+            if normalized_path in seen:
+                raise ValueError(
+                    f"Backup bundle contains duplicate physical archive member {normalized_path!r}."
+                )
+            seen.add(normalized_path)
+
+    @staticmethod
+    def _seven_zip_listed_paths(output: str, archive_path: Path) -> list[str]:
+        entries: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                if current:
+                    entries.append(current)
+                    current = {}
+                continue
+            if " = " not in line:
+                continue
+            key, value = line.split(" = ", 1)
+            current[key] = value
+        if current:
+            entries.append(current)
+
+        archive_name = str(archive_path)
+        return [
+            entry["Path"]
+            for entry in entries
+            if entry.get("Path")
+            and entry["Path"] != archive_name
+            and not entry.get("Attributes", "").startswith("D")
+            and entry.get("Folder") != "+"
+        ]
 
     @staticmethod
     def _safe_child_path(root_dir: Path, relative_path: Path, archive_path: str) -> Path:
