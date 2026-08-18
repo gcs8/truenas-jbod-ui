@@ -81,6 +81,7 @@
     hoveredSlot: null,
     selectedSystemId: bootstrap.snapshot?.selected_system_id || null,
     selectedEnclosureId: bootstrap.snapshot?.selected_enclosure_id || null,
+    mappingFormScopeKey: null,
     snapshotReuseCache: {},
     search: "",
     autoRefresh: snapshotMode ? false : true,
@@ -135,8 +136,9 @@
       ioChartMode: restoredHistoryIoChartMode,
       panelLoading: false,
       panelError: null,
-        slotCache: preloadedHistoryBySlot,
-      },
+      panelRequestToken: 0,
+      slotCache: preloadedHistoryBySlot,
+    },
     setup: {
       step: 0,
       exportRunning: false,
@@ -7587,12 +7589,15 @@
     }
 
     const { slot, cacheKey, fetchUrl } = historyTarget;
+    const requestToken = ++state.history.panelRequestToken;
     if (state.snapshotMode) {
+      state.history.panelLoading = false;
       state.history.panelError = null;
       renderHistoryPanel();
       return;
     }
     if (!force && getCachedHistoryPayload(historyTarget)) {
+      state.history.panelLoading = false;
       state.history.panelError = null;
       renderHistoryPanel();
       return;
@@ -7604,18 +7609,23 @@
 
     try {
       const payload = await fetchJson(fetchUrl);
-      state.history.slotCache[cacheKey] = payload;
       const activeTarget = getSelectedHistoryTarget();
-      if (!activeTarget || cacheKey !== activeTarget.cacheKey) {
+      if (requestToken !== state.history.panelRequestToken || !activeTarget || cacheKey !== activeTarget.cacheKey) {
         return;
       }
+      state.history.slotCache[cacheKey] = payload;
     } catch (error) {
-      state.history.panelError = error.message || String(error);
+      const activeTarget = getSelectedHistoryTarget();
+      if (requestToken === state.history.panelRequestToken && activeTarget?.cacheKey === cacheKey) {
+        state.history.panelError = error.message || String(error);
+      }
     } finally {
-      state.history.panelLoading = false;
+      const activeTarget = getSelectedHistoryTarget();
+      if (requestToken === state.history.panelRequestToken && activeTarget?.cacheKey === cacheKey) {
+        state.history.panelLoading = false;
+        renderHistoryPanel();
+      }
     }
-
-    renderHistoryPanel();
   }
 
   function buildSmartNoteText(slotLike, smartEntry) {
@@ -7672,6 +7682,27 @@
       detailHistoryPanel.classList.add("hidden");
     }
     renderHistoryPanel();
+  }
+
+  function mappingFormScopeKey(slot) {
+    return [
+      state.selectedSystemId || state.snapshot?.selected_system_id || "",
+      state.selectedEnclosureId || state.snapshot?.selected_enclosure_id || "",
+      state.selectedStorageViewRuntimeId || "",
+      slot?.slot ?? "",
+    ].join("|");
+  }
+
+  function syncMappingFormForSlot(slot) {
+    const scopeKey = mappingFormScopeKey(slot);
+    if (state.mappingFormScopeKey === scopeKey) {
+      return;
+    }
+    mappingForm.serial.value = slot.serial || "";
+    mappingForm.device_name.value = slot.device_name || "";
+    mappingForm.gptid.value = slot.gptid || "";
+    mappingForm.notes.value = slot.notes || "";
+    state.mappingFormScopeKey = scopeKey;
   }
 
   function renderLiveSlotDetail(slot, options = {}) {
@@ -7769,10 +7800,7 @@
     renderTopologyContext(slot);
     renderMultipathContext(slot);
 
-    mappingForm.serial.value = slot.serial || "";
-    mappingForm.device_name.value = slot.device_name || "";
-    mappingForm.gptid.value = slot.gptid || "";
-    mappingForm.notes.value = slot.notes || "";
+    syncMappingFormForSlot(slot);
     setMappingFormEnabled(!state.snapshotMode);
     ledButtons.forEach((button) => {
       button.disabled = state.snapshotMode || !slot.led_supported;
@@ -8712,9 +8740,17 @@
       headers: { "Content-Type": "application/json" },
       ...options,
     });
-    const payload = await response.json();
-    if (!response.ok || payload.ok === false) {
-      throw new Error(payload.detail || `Request failed with ${response.status}`);
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      if (!response.ok) {
+        throw new Error(`Request failed with ${response.status}`);
+      }
+      throw error;
+    }
+    if (!response.ok || payload?.ok === false) {
+      throw new Error(payload?.detail || `Request failed with ${response.status}`);
     }
     return payload;
   }
@@ -8898,7 +8934,7 @@
       }
     } finally {
       state.refreshesInFlight = Math.max(0, state.refreshesInFlight - 1);
-      if (refreshToken === state.latestRefreshToken && state.refreshesInFlight === 0) {
+      if (state.refreshesInFlight === 0) {
         scheduleAutoRefresh();
       }
     }
@@ -8955,6 +8991,7 @@
         body: JSON.stringify(payload),
       });
       applySnapshot(result.snapshot);
+      state.mappingFormScopeKey = null;
       renderAll();
       scheduleSmartPrefetch();
       setStatus(result.warning || `Saved mapping for slot ${slot.slot_label}.`);
@@ -8979,6 +9016,7 @@
       setStatus(`Clearing mapping for slot ${slot.slot_label}...`);
       const result = await sendScopedRequest(`/api/slots/${slot.slot}/mapping`, { method: "DELETE" });
       applySnapshot(result.snapshot);
+      state.mappingFormScopeKey = null;
       renderAll();
       scheduleSmartPrefetch();
       setStatus(`Cleared mapping for slot ${slot.slot_label}.`);
@@ -9025,6 +9063,7 @@
         body: JSON.stringify(bundle),
       });
       applySnapshot(result.snapshot);
+      state.mappingFormScopeKey = null;
       renderAll();
       scheduleSmartPrefetch();
       setStatus(`Imported ${result.imported} mappings into the active scope.`);
@@ -9050,6 +9089,7 @@
     mappingForm.device_name.value = "";
     mappingForm.gptid.value = "";
     mappingForm.notes.value = "";
+    state.mappingFormScopeKey = null;
   }
 
   function setMappingFormEnabled(enabled) {

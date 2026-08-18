@@ -135,6 +135,9 @@ jobs:
             node --check "$spec"
           done
 
+      - name: Run deterministic JavaScript unit tests
+        run: npm run test:unit
+
   public-demo-artifact:
     name: Checked-in public demo artifact
     runs-on: ubuntu-latest

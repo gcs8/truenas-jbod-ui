@@ -56,6 +56,7 @@
     mode: modeIds.has(initialMode) ? initialMode : "lanes",
     loading: false,
     error: null,
+    refreshRequestToken: 0,
   };
 
   const elements = {
@@ -689,9 +690,17 @@
       ...options,
       headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     });
-    const payload = await response.json();
-    if (!response.ok || payload.ok === false) {
-      throw new Error(payload.detail || `Request failed with ${response.status}`);
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      if (!response.ok) {
+        throw new Error(`Request failed with ${response.status}`);
+      }
+      throw error;
+    }
+    if (!response.ok || payload?.ok === false) {
+      throw new Error(payload?.detail || `Request failed with ${response.status}`);
     }
     return payload;
   }
@@ -3334,19 +3343,30 @@
   }
 
   async function refreshFabric(force = false) {
+    const requestToken = ++state.refreshRequestToken;
     state.loading = true;
     state.error = null;
     render();
     try {
       const snapshot = await fetchJson(scopedUrl("/api/inventory", { force }));
+      if (requestToken !== state.refreshRequestToken) {
+        return;
+      }
       applySnapshot(snapshot);
       const fabric = await fetchJson(scopedUrl("/api/sas-fabric", { force }));
+      if (requestToken !== state.refreshRequestToken) {
+        return;
+      }
       applyFabric(fabric);
     } catch (error) {
-      state.error = error.message || String(error);
+      if (requestToken === state.refreshRequestToken) {
+        state.error = error.message || String(error);
+      }
     } finally {
-      state.loading = false;
-      render();
+      if (requestToken === state.refreshRequestToken) {
+        state.loading = false;
+        render();
+      }
     }
   }
 
