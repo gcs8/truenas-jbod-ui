@@ -36,6 +36,14 @@ LINUX_NVME_LIST_SUBSYS_COMMAND = (
 )
 
 
+def resolve_preserved_secret(incoming: str | None, existing: str | None = None) -> str:
+    if incoming == PRESERVE_SECRET_SENTINEL:
+        if not existing:
+            raise ValueError("The saved secret requested by this operation is unavailable.")
+        return existing
+    return incoming or ""
+
+
 _PLATFORM_SETUP_REQUIREMENTS: dict[str, dict[str, object]] = {
     "core": {
         "summary": "TrueNAS CORE uses middleware API inventory, with optional FreeBSD SSH enrichment for physical slots, SMART detail, identify LEDs, and SAS Fabric diagnostics.",
@@ -284,9 +292,7 @@ class SystemSetupService:
                 existing_system = SystemConfig.model_validate(raw_systems[existing_index])
 
             def resolve_secret(incoming: str | None, existing: str | None = None) -> str:
-                if incoming == PRESERVE_SECRET_SENTINEL and existing_system is not None:
-                    return existing or ""
-                return incoming or ""
+                return resolve_preserved_secret(incoming, existing)
 
             ssh_enabled = bool(payload.ssh_enabled)
             existing_ssh_commands = list(existing_system.ssh.commands) if existing_system else []

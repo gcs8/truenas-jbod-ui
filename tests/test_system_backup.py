@@ -1635,6 +1635,78 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(saved_view["binding"]["target_system_id"], "node-b")
         self.assertEqual(saved_view["binding"]["pool_names"], ["QSOSN-BOOT-B"])
 
+    def test_save_and_reload_preserves_distinct_label_only_ha_nodes(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(config_path, {})
+        service = SystemSetupService(str(config_path))
+
+        created = service.create_system(
+            SystemSetupRequest(
+                label="QSOSN HA",
+                system_id="qsosn-ha-labels",
+                platform="quantastor",
+                truenas_host="https://192.0.2.40",
+                api_user="admin",
+                api_password="secret",
+                verify_ssl=False,
+                ha_enabled=True,
+                ha_nodes=[
+                    {"label": "QSOSN Left"},
+                    {"label": "QSOSN Right"},
+                ],
+            )
+        )
+
+        self.assertEqual([node.label for node in created.ssh.ha_nodes], ["QSOSN Left", "QSOSN Right"])
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(config_path)}, clear=False):
+            get_settings.cache_clear()
+            try:
+                reloaded = get_settings()
+            finally:
+                get_settings.cache_clear()
+        reloaded_system = next(system for system in reloaded.systems if system.id == "qsosn-ha-labels")
+        self.assertEqual(
+            [node.label for node in reloaded_system.ssh.ha_nodes],
+            ["QSOSN Left", "QSOSN Right"],
+        )
+
+    def test_save_and_reload_preserves_explicit_blank_storage_view_label(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(config_path, {})
+        service = SystemSetupService(str(config_path))
+
+        created = service.create_system(
+            SystemSetupRequest(
+                label="Archive CORE",
+                system_id="archive-blank-view",
+                platform="core",
+                truenas_host="https://192.0.2.50",
+                api_key="API-KEY",
+                storage_views=[
+                    {
+                        "id": "operator-empty-label",
+                        "label": "",
+                        "kind": "manual",
+                        "template_id": "manual-4",
+                        "enabled": True,
+                        "order": 10,
+                    }
+                ],
+            )
+        )
+
+        self.assertEqual(created.storage_views[0].label, "")
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(config_path)}, clear=False):
+            get_settings.cache_clear()
+            try:
+                reloaded = get_settings()
+            finally:
+                get_settings.cache_clear()
+        reloaded_system = next(system for system in reloaded.systems if system.id == "archive-blank-view")
+        self.assertEqual(reloaded_system.storage_views[0].label, "")
+
     def test_delete_system_removes_entry_and_rehomes_default(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         config_path = temp_dir / "config.yaml"

@@ -1045,7 +1045,9 @@
       .map((node) => normalizeHaNode(node))
       .filter(Boolean)
       .filter((node) => {
-        const dedupeKey = `${node.system_id}::${node.host}`;
+        const dedupeKey = node.system_id || node.host
+          ? `${node.system_id}::${node.host}`
+          : `label::${node.label}`;
         if (seen.has(dedupeKey)) {
           return false;
         }
@@ -2573,7 +2575,7 @@
     const slotSizes = normalizeSlotSizeMap(rawView?.layout_overrides?.slot_sizes);
     const rawLabel = rawView?.label;
     const normalizedLabel =
-      rawLabel === undefined || rawLabel === null || rawLabel === ""
+      rawLabel === undefined || rawLabel === null
         ? String(template?.default_label || storageViewId)
         : String(rawLabel);
     return {
@@ -3120,8 +3122,7 @@
     updateSelectedStorageView((storageView) => {
       const previousId = storageView.id;
       const editedLabel = String(elements.setupStorageViewLabel?.value || "");
-      const existingLabel = String(storageView.label || "");
-      storageView.label = editedLabel || existingLabel;
+      storageView.label = editedLabel;
       storageView.id = uniqueStorageViewId(elements.setupStorageViewId?.value?.trim() || storageView.label, previousId);
       storageView.template_id = elements.setupStorageViewTemplateSelect?.value || storageView.template_id;
       storageView.kind = getStorageViewTemplate(storageView.template_id)?.kind || storageView.kind || "manual";
@@ -4651,6 +4652,7 @@
         : null,
       ssh_known_hosts_path: elements.setupSshKnownHosts?.value?.trim() || null,
       ssh_strict_host_key_checking: Boolean(elements.setupSshStrictHostKey?.checked),
+      ssh_timeout_seconds: Number(loadedSystem?.ssh_timeout_seconds) || 15,
       ssh_commands: collectSetupCommands(),
       bmc_enabled: bmcEnabled,
       bmc_host: bmcHost,
@@ -4707,7 +4709,7 @@
     }
     state.haNodesLoading = true;
     syncHaNodesFromInputs();
-    const setupPayload = collectSetupPayload();
+    const setupPayload = collectSetupPayload({ preserveRedactedSecrets: true });
     renderQuantastorHaSection();
     renderStorageViews();
     try {
@@ -4715,12 +4717,13 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          truenas_host: elements.setupTruenasHost?.value?.trim() || "",
-          api_user: elements.setupApiUser?.value?.trim() || "",
-          api_password: elements.setupApiPassword?.value || "",
-          verify_ssl: Boolean(elements.setupVerifySsl?.checked),
-          tls_ca_bundle_path: elements.setupTlsCaBundlePath?.value?.trim() || null,
-          tls_server_name: collectTlsServerName() || null,
+          system_id: setupPayload.system_id,
+          truenas_host: setupPayload.truenas_host,
+          api_user: setupPayload.api_user,
+          api_password: setupPayload.api_password,
+          verify_ssl: setupPayload.verify_ssl,
+          tls_ca_bundle_path: setupPayload.tls_ca_bundle_path,
+          tls_server_name: setupPayload.tls_server_name,
           ssh_enabled: setupPayload.ssh_enabled,
           ssh_host: setupPayload.ssh_host,
           ssh_port: setupPayload.ssh_port,
@@ -4729,6 +4732,7 @@
           ssh_password: setupPayload.ssh_password,
           ssh_known_hosts_path: setupPayload.ssh_known_hosts_path,
           ssh_strict_host_key_checking: setupPayload.ssh_strict_host_key_checking,
+          ssh_timeout_seconds: setupPayload.ssh_timeout_seconds,
           ha_nodes: setupPayload.ha_nodes,
         }),
       });
@@ -4815,7 +4819,7 @@
   }
 
   function collectEsxiHostPrepInstallPayload() {
-    const setupPayload = collectSetupPayload();
+    const setupPayload = collectSetupPayload({ preserveRedactedSecrets: true });
     if (!platformSupportsEsxiHostPrep(setupPayload.platform)) {
       throw new Error("ESXi host prep is only available for VMware ESXi systems.");
     }
@@ -4837,6 +4841,7 @@
     }
     const requestedTimeout = Number(setupPayload.ssh_timeout_seconds) || 15;
     return {
+      system_id: setupPayload.system_id,
       host: setupPayload.ssh_host,
       port: setupPayload.ssh_port || 22,
       user: setupPayload.ssh_user,
@@ -6251,8 +6256,7 @@
       void discoverQuantastorHaNodes();
     });
     document.querySelectorAll("[data-ha-node-system-id], [data-ha-node-label], [data-ha-node-host]").forEach((field) => {
-      const eventName = field.matches("select") ? "change" : "input";
-      field.addEventListener(eventName, () => {
+      field.addEventListener("change", () => {
         syncHaNodesFromInputs({ rerenderStorageViews: true });
         renderQuantastorHaSection();
       });
@@ -6381,8 +6385,7 @@
       if (!field) {
         return;
       }
-      const eventName = field.matches("input[type='checkbox'], select") ? "change" : "input";
-      field.addEventListener(eventName, () => {
+      field.addEventListener("change", () => {
         saveStorageViewEditorToState();
       });
     });

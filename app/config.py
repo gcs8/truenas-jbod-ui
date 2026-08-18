@@ -165,11 +165,15 @@ class SSHConfig(BaseModel):
     @classmethod
     def _normalize_ha_nodes(cls, value: list[HANodeConfig]) -> list[HANodeConfig]:
         normalized: list[HANodeConfig] = []
-        seen: set[tuple[str | None, str | None]] = set()
+        seen: set[tuple[str | None, str | None, str | None]] = set()
         for node in value[:3]:
             if not (node.system_id or node.label or node.host):
                 continue
-            dedupe_key = (node.system_id, node.host)
+            dedupe_key = (
+                node.system_id,
+                node.host,
+                node.label if not node.system_id and not node.host else None,
+            )
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
@@ -860,7 +864,7 @@ def _normalize_storage_views(storage_views: list[StorageViewConfig] | None) -> l
             storage_view.model_copy(
                 update={
                     "id": storage_view_id,
-                    "label": normalize_text(storage_view.label) or storage_view_id.replace("-", " ").title(),
+                    "label": storage_view.label.strip(),
                     "template_id": normalize_text(storage_view.template_id) or "manual-4",
                     "profile_id": normalize_text(storage_view.profile_id),
                     "order": storage_view.order if isinstance(storage_view.order, int) else index * 10,

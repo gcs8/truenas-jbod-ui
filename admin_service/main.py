@@ -10,7 +10,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -62,8 +63,10 @@ from app.services.ssh_probe import SSHProbe
 from app.services.storage_view_templates import list_storage_view_templates
 from app.services.storage_views import resolve_system_storage_views
 from app.services.system_setup import (
+    PRESERVE_SECRET_SENTINEL,
     SystemSetupService,
     default_ssh_commands_for_platform,
+    resolve_preserved_secret,
     setup_requirements_for_platform,
 )
 from app.services.parsers import normalize_text
@@ -111,6 +114,57 @@ def decode_optional_secret_header(value: str | None) -> str | None:
         return decoded.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("Backup passphrase header was not valid UTF-8.") from exc
+
+
+def resolve_saved_secondary_secret(
+    settings: Settings,
+    system_id: str | None,
+    incoming: str | None,
+    saved_value: Callable[[Any], str | None],
+    matches_saved_connection: Callable[[Any], bool],
+) -> str | None:
+    if incoming != PRESERVE_SECRET_SENTINEL:
+        return incoming
+    system = next((item for item in settings.systems if item.id == system_id), None)
+    if system is None or not matches_saved_connection(system):
+        raise ValueError(
+            "A saved secret can only be reused with its saved connection settings."
+        )
+    existing = saved_value(system) if system is not None else None
+    return resolve_preserved_secret(incoming, existing)
+
+
+def same_saved_endpoint(left: str | None, right: str | None) -> bool:
+    def endpoint_identity(value: str | None) -> tuple[Any, ...] | None:
+        normalized = normalize_text(value)
+        if not normalized:
+            return None
+        candidate = normalized if "://" in normalized else f"//{normalized}"
+        try:
+            parsed = urlsplit(candidate)
+            port = parsed.port
+        except ValueError:
+            return None
+        if parsed.hostname is None:
+            return None
+        return (
+            parsed.scheme.lower(),
+            parsed.username,
+            parsed.password,
+            parsed.hostname.lower(),
+            port,
+            parsed.path.rstrip("/"),
+            parsed.query,
+            parsed.fragment,
+        )
+
+    left_identity = endpoint_identity(left)
+    right_identity = endpoint_identity(right)
+    return left_identity is not None and right_identity is not None and left_identity == right_identity
+
+
+def same_saved_text(left: str | None, right: str | None) -> bool:
+    return (normalize_text(left) or "") == (normalize_text(right) or "")
 
 
 @lru_cache
@@ -424,6 +478,32 @@ def create_app() -> FastAPI:
 
     @app.post("/api/admin/esxi-host-prep/install")
     async def install_esxi_host_prep_package(payload: ESXiHostPrepInstallRequest) -> JSONResponse:
+        settings = reload_app_settings()
+        try:
+            payload = payload.model_copy(
+                update={
+                    "password": resolve_saved_secondary_secret(
+                        settings,
+                        payload.system_id,
+                        payload.password,
+                        lambda system: system.ssh.password,
+                        lambda system: (
+                            system.truenas.platform == "esxi"
+                            and same_saved_endpoint(payload.host, system.ssh.host)
+                            and payload.port == system.ssh.port
+                            and same_saved_text(payload.user, system.ssh.user)
+                            and payload.strict_host_key_checking
+                            == system.ssh.strict_host_key_checking
+                            and same_saved_text(
+                                payload.known_hosts_path,
+                                system.ssh.known_hosts_path,
+                            )
+                        ),
+                    )
+                }
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         service = get_esxi_host_prep_service()
         try:
             result = await asyncio.to_thread(service.install_package, payload)
@@ -514,6 +594,65 @@ def create_app() -> FastAPI:
 
     @app.post("/api/admin/system-setup/quantastor-nodes")
     async def discover_quantastor_nodes(payload: QuantastorNodeDiscoveryRequest) -> JSONResponse:
+        settings = reload_app_settings()
+        try:
+            payload = payload.model_copy(
+                update={
+                    "api_password": resolve_saved_secondary_secret(
+                        settings,
+                        payload.system_id,
+                        payload.api_password,
+                        lambda system: system.truenas.api_password,
+                        lambda system: (
+                            system.truenas.platform == "quantastor"
+                            and same_saved_endpoint(
+                                payload.truenas_host,
+                                system.truenas.host,
+                            )
+                            and same_saved_text(
+                                payload.api_user,
+                                system.truenas.api_user,
+                            )
+                            and payload.verify_ssl == system.truenas.verify_ssl
+                            and same_saved_text(
+                                payload.tls_ca_bundle_path,
+                                system.truenas.tls_ca_bundle_path,
+                            )
+                            and same_saved_text(
+                                payload.tls_server_name,
+                                system.truenas.tls_server_name,
+                            )
+                        ),
+                    ),
+                    "ssh_password": resolve_saved_secondary_secret(
+                        settings,
+                        payload.system_id,
+                        payload.ssh_password,
+                        lambda system: system.ssh.password,
+                        lambda system: (
+                            system.truenas.platform == "quantastor"
+                            and system.ssh.enabled
+                            and same_saved_endpoint(
+                                payload.ssh_host,
+                                system.ssh.host,
+                            )
+                            and payload.ssh_port == system.ssh.port
+                            and same_saved_text(
+                                payload.ssh_user,
+                                system.ssh.user,
+                            )
+                            and payload.ssh_strict_host_key_checking
+                            == system.ssh.strict_host_key_checking
+                            and same_saved_text(
+                                payload.ssh_known_hosts_path,
+                                system.ssh.known_hosts_path,
+                            )
+                        ),
+                    ),
+                }
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         client = QuantastorRESTClient(
             TrueNASConfig(
                 host=payload.truenas_host,
