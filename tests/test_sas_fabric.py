@@ -27,6 +27,7 @@ from app.services.sas_fabric import (
     _SAS_FABRIC_BUILDERS,
     _build_sas_fabric_context,
     _build_storage_fabric_route_context,
+    _device_name_candidates,
     _select_sas_fabric_builder,
     _select_sas_fabric_builder_key,
     _select_storage_fabric_route_provider,
@@ -217,6 +218,10 @@ Slots Logical ID       SEPHandle EncHandle Type
 
 
 class SasFabricParserTests(unittest.TestCase):
+    def test_device_name_candidates_ignore_empty_split_tokens(self) -> None:
+        self.assertEqual(_device_name_candidates("/dev/da0"), ["da0", "/dev/da0"])
+        self.assertEqual(_device_name_candidates("(da0)"), ["da0"])
+
     def test_canonicalize_mprutil_unit_command_keeps_unit_shape(self) -> None:
         command = "sudo -n /usr/sbin/mprutil -u 1 show expanders"
 

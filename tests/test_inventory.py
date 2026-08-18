@@ -8567,10 +8567,6 @@ Enclosure Status diagnostic page:
             self.assertNotIn("__default__", service._cache)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ReviewRegressionTests(unittest.TestCase):
     def test_parse_size_to_bytes_binary_suffixes_use_1024(self) -> None:
         self.assertEqual(parse_size_to_bytes("1 GiB"), 1024**3)
@@ -8606,3 +8602,7 @@ class ReviewRegressionTests(unittest.TestCase):
             path.write_text('{"slot_mappings": {"a":', encoding="utf-8")
             store = MappingStore(path)
             self.assertEqual(store.load_all(), {})
+
+
+if __name__ == "__main__":
+    unittest.main()
