@@ -714,10 +714,19 @@ def _record_ses_slot(
     reported_slot_number: int | None,
     source: str,
     warning: str | None = None,
-) -> None:
+) -> SESMapSlot:
+    """
+    Record slot evidence on the enclosure and return the canonical slot object.
+
+    Callers that keep accumulating parsed detail lines (device names, SAS
+    addresses, LED state) MUST continue on the returned object: when the slot
+    number was already recorded by an earlier element, the incoming object is
+    merged into the stored one and would otherwise be an orphan that silently
+    swallows the remaining detail lines.
+    """
     if reported_slot_number is None:
         if slot.element_id is None:
-            return
+            return slot
         slot.slot_number = -1
         slot.slot_number_source = source
         slot.slot_number_warning = warning
@@ -741,9 +750,10 @@ def _record_ses_slot(
         )
         if existing_unmapped is None:
             enclosure.unmapped_slots.append(slot)
-        elif existing_unmapped is not slot:
+            return slot
+        if existing_unmapped is not slot:
             _merge_ses_slot_evidence(existing_unmapped, slot)
-        return
+        return existing_unmapped
 
     slot.slot_number = reported_slot_number
     slot.slot_number_source = source
@@ -761,8 +771,9 @@ def _record_ses_slot(
     existing = enclosure.slots.get(reported_slot_number)
     if existing is None or existing is slot:
         enclosure.slots[reported_slot_number] = slot
-    else:
-        _merge_ses_slot_evidence(existing, slot)
+        return slot
+    _merge_ses_slot_evidence(existing, slot)
+    return existing
 
 
 def _record_sg_ses_aes_fallback_slot(enclosure: SESMapEnclosure, slot: SESMapSlot | None) -> None:
@@ -855,14 +866,14 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
             current_slot.description = description
             slot_match = SLOT_REGEX.search(description or "")
             if slot_match:
-                _record_ses_slot(
+                current_slot = _record_ses_slot(
                     current_enclosure,
                     current_slot,
                     reported_slot_number=int(slot_match.group("slot")),
                     source="ses_description",
                 )
             else:
-                _record_ses_slot(
+                current_slot = _record_ses_slot(
                     current_enclosure,
                     current_slot,
                     reported_slot_number=None,
@@ -1026,7 +1037,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
         if slot_match:
             reported_slot_number = int(slot_match.group("slot"))
             current_slot.description = f"Slot {reported_slot_number:02d}"
-            _record_ses_slot(
+            current_slot = _record_ses_slot(
                 enclosure,
                 current_slot,
                 reported_slot_number=reported_slot_number,
