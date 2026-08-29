@@ -22,7 +22,7 @@ from history_service.domain import (
     normalize_text,
     utcnow,
 )
-from history_service.store import HistoryStore
+from history_service.store import HistoryStore, SlotStateUpdate
 
 logger = logging.getLogger(__name__)
 STORAGE_VIEW_SCOPE_PREFIX = "storage-view:"
@@ -599,10 +599,17 @@ class HistoryCollector:
     def _record_slot_changes(self, slot_records: list[SlotStateRecord], observed_at: str) -> None:
         suppressed_topology_degradations = 0
         pending_topology_changes = 0
+        # One read per scope and one write transaction per pass instead of three
+        # connection open/PRAGMA/commit cycles per slot.
+        previous_by_scope: dict[tuple[str, str], dict[int, SlotStateRecord]] = {}
+        updates: list[SlotStateUpdate] = []
         for record in slot_records:
-            previous = self.store.get_slot_state(record.system_id, record.enclosure_id, record.slot)
+            scope_key = (record.system_id, record.enclosure_key)
+            if scope_key not in previous_by_scope:
+                previous_by_scope[scope_key] = self.store.get_slot_states(record.system_id, record.enclosure_id)
+            previous = previous_by_scope[scope_key].get(record.slot)
             if self._should_backfill_extended_state(previous, record):
-                self.store.upsert_slot_state(record, observed_at)
+                updates.append(SlotStateUpdate(record=record, observed_at=observed_at))
                 continue
             record, topology_degraded, topology_pending = self._prepare_slot_record_for_history(
                 previous,
@@ -613,8 +620,8 @@ class HistoryCollector:
             if topology_pending:
                 pending_topology_changes += 1
             events = build_slot_events(previous, record, observed_at)
-            self.store.insert_events(events)
-            self.store.upsert_slot_state(record, observed_at)
+            updates.append(SlotStateUpdate(record=record, observed_at=observed_at, events=list(events)))
+        self.store.record_slot_updates(updates)
         if suppressed_topology_degradations:
             if self._is_mass_topology_degradation(suppressed_topology_degradations, len(slot_records)):
                 logger.warning(

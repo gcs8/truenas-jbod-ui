@@ -239,7 +239,7 @@ class InventoryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('system_id="metrics-smart-system"', metrics_text)
         self.assertIn('cache_state="hit"', metrics_text)
 
-    async def test_smart_cache_eviction_updates_entry_gauge_before_cache_hit_returns(self) -> None:
+    async def test_smart_cache_retention_eviction_updates_entry_gauge_before_cache_hit_returns(self) -> None:
         app = FastAPI()
         system_id = "metrics-smart-eviction"
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -264,7 +264,11 @@ class InventoryMetricsTests(unittest.IsolatedAsyncioTestCase):
                 fresh_key = service._smart_cache_key(fresh_slot)
                 service._smart_cache[expired_key] = SmartSummaryView(available=True, power_on_hours=600)
                 service._smart_cache[fresh_key] = SmartSummaryView(available=True, power_on_hours=700)
-                service._smart_cache_until[expired_key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+                service._smart_cache_until[expired_key] = (
+                    datetime.now(timezone.utc)
+                    - service._smart_cache_stale_retention()
+                    - timedelta(seconds=1)
+                )
                 service._smart_cache_until[fresh_key] = datetime.now(timezone.utc) + timedelta(minutes=5)
                 service._observe_inventory_cache_metrics()
 

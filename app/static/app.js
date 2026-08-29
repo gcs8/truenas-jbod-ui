@@ -128,7 +128,7 @@
       loading: false,
       statusFetchedAt: snapshotMode ? Date.now() : 0,
       statusRefreshPromise: null,
-      detail: snapshotMode ? null : null,
+      detail: null,
       counts: snapshotMode ? (preloadedHistorySummary.counts || {}) : {},
       collector: snapshotMode ? (preloadedHistorySummary.collector || {}) : {},
       panelOpen: snapshotMode ? Boolean(bootstrap.initialHistoryPanelOpen) : false,
@@ -1559,7 +1559,10 @@
   }
 
   function groupColumnTemplate(rowGroups, layoutMode) {
-    if (!Array.isArray(rowGroups) || rowGroups.length <= 1) {
+    if (!Array.isArray(rowGroups)) {
+      return "";
+    }
+    if (rowGroups.length <= 1) {
       return rowGroups.map((group) => `minmax(0, ${group.length}fr)`).join(" ");
     }
 
@@ -3092,13 +3095,22 @@
     });
   }
 
+  function replaceLocationIfChanged(nextUrl) {
+    const currentUrl = `${window.location.pathname}${window.location.search}`;
+    if (currentUrl === nextUrl) {
+      return false;
+    }
+    window.history.replaceState({}, "", nextUrl);
+    return true;
+  }
+
   function syncLocation() {
     if (state.snapshotMode) {
       return;
     }
     const params = buildSelectionParams({ includeStorageView: true });
     const query = params.toString();
-    window.history.replaceState({}, "", query ? `/?${query}` : "/");
+    replaceLocationIfChanged(query ? `/?${query}` : "/");
   }
 
   function setStatus(message, tone = "info") {
@@ -8579,30 +8591,65 @@
     ];
   }
 
+  function setTextIfChanged(node, text) {
+    if (node && node.textContent !== text) {
+      node.textContent = text;
+    }
+  }
+
+  function setBarWidthIfChanged(node, percent) {
+    const width = `${Math.round(Math.max(0, Math.min(1, Number(percent) || 0)) * 100)}%`;
+    if (node && node.style.width !== width) {
+      node.style.width = width;
+    }
+  }
+
   function renderCacheTimingChips() {
     if (!cacheTimingChips) {
       return;
     }
     cacheTimingChips.classList.toggle("hidden", state.snapshotMode);
     if (state.snapshotMode) {
-      cacheTimingChips.innerHTML = "";
+      if (cacheTimingChips.childElementCount) {
+        cacheTimingChips.innerHTML = "";
+      }
       return;
     }
-    cacheTimingChips.innerHTML = cacheTimingDefinitions()
-      .map((item) => {
-        const countdown = cacheCountdownParts(item.startMs, item.ttlSeconds);
-        const classes = ["cache-timing-chip", countdown.expired ? "is-expired" : ""].filter(Boolean).join(" ");
-        return `
-          <div class="${classes}" data-cache-timing-key="${escapeHtml(item.key)}" title="${escapeHtml(item.title)}">
+    const definitions = cacheTimingDefinitions();
+    const existingKeys = Array.from(cacheTimingChips.querySelectorAll("[data-cache-timing-key]"))
+      .map((chip) => chip.dataset.cacheTimingKey);
+    const structureChanged =
+      existingKeys.length !== definitions.length ||
+      definitions.some((item, index) => existingKeys[index] !== item.key);
+    if (structureChanged) {
+      // Chips are keyed by cache kind, so the structure only changes on first render;
+      // every later tick updates the countdown text, bar, and expired class in place
+      // instead of tearing the DOM down each second.
+      cacheTimingChips.innerHTML = definitions
+        .map((item) => `
+          <div class="cache-timing-chip" data-cache-timing-key="${escapeHtml(item.key)}" title="${escapeHtml(item.title)}">
             <span class="cache-timing-chip-label">${escapeHtml(item.label)}</span>
-            <span class="cache-timing-chip-value">${escapeHtml(countdown.label)}</span>
+            <span class="cache-timing-chip-value"></span>
             <span class="cache-timing-chip-bar" aria-hidden="true">
-              <span style="width: ${Math.round(countdown.percent * 100)}%"></span>
+              <span style="width: 0%"></span>
             </span>
           </div>
-        `;
-      })
-      .join("");
+        `)
+        .join("");
+    }
+    definitions.forEach((item) => {
+      const chip = cacheTimingChips.querySelector(`[data-cache-timing-key="${item.key}"]`);
+      if (!chip) {
+        return;
+      }
+      const countdown = cacheCountdownParts(item.startMs, item.ttlSeconds);
+      if (chip.title !== item.title) {
+        chip.title = item.title;
+      }
+      chip.classList.toggle("is-expired", countdown.expired);
+      setTextIfChanged(chip.querySelector(".cache-timing-chip-value"), countdown.label);
+      setBarWidthIfChanged(chip.querySelector(".cache-timing-chip-bar > span"), countdown.percent);
+    });
   }
 
   function renderRefreshTiming() {
@@ -8614,24 +8661,24 @@
       return;
     }
     if (state.refreshesInFlight > 0) {
-      refreshCountdownLabel.textContent = "Refresh running";
-      refreshCountdownBar.style.width = "100%";
+      setTextIfChanged(refreshCountdownLabel, "Refresh running");
+      setBarWidthIfChanged(refreshCountdownBar, 1);
       return;
     }
     if (!state.autoRefresh) {
-      refreshCountdownLabel.textContent = "Auto refresh off";
-      refreshCountdownBar.style.width = "0%";
+      setTextIfChanged(refreshCountdownLabel, "Auto refresh off");
+      setBarWidthIfChanged(refreshCountdownBar, 0);
       return;
     }
     if (!state.timerDueAt || !state.timerDelayMs) {
-      refreshCountdownLabel.textContent = `Next refresh: ${formatRefreshInterval(state.refreshIntervalSeconds)}`;
-      refreshCountdownBar.style.width = "0%";
+      setTextIfChanged(refreshCountdownLabel, `Next refresh: ${formatRefreshInterval(state.refreshIntervalSeconds)}`);
+      setBarWidthIfChanged(refreshCountdownBar, 0);
       return;
     }
     const remainingMs = Math.max(0, state.timerDueAt - Date.now());
     const progress = Math.max(0, Math.min(1, remainingMs / state.timerDelayMs));
-    refreshCountdownLabel.textContent = `Next refresh in ${formatTimingDuration(remainingMs / 1000)}`;
-    refreshCountdownBar.style.width = `${Math.round(progress * 100)}%`;
+    setTextIfChanged(refreshCountdownLabel, `Next refresh in ${formatTimingDuration(remainingMs / 1000)}`);
+    setBarWidthIfChanged(refreshCountdownBar, progress);
   }
 
   function renderTimingSurfaces() {
@@ -8639,11 +8686,26 @@
     renderCacheTimingChips();
   }
 
+  function timingTick() {
+    if (typeof document !== "undefined" && document.hidden) {
+      // Countdowns are re-rendered on visibilitychange; skip DOM work for hidden tabs.
+      return;
+    }
+    renderTimingSurfaces();
+  }
+
   function ensureTimingTick() {
     if (state.snapshotMode || state.timingTickId) {
       return;
     }
-    state.timingTickId = window.setInterval(renderTimingSurfaces, 1000);
+    state.timingTickId = window.setInterval(timingTick, 1000);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) {
+          renderTimingSurfaces();
+        }
+      });
+    }
   }
 
   function renderSelectors() {

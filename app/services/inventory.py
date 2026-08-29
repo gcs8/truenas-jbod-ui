@@ -108,6 +108,13 @@ from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebs
 SmartCacheKey = tuple[str, str, str, int, tuple[str, ...]]
 SmartCacheGenerationToken = tuple[int, int]
 
+# Expired SMART cache entries stay resident (and stale-servable) for a grace
+# window past their TTL so one slot's lookup cannot destroy the stale-serve
+# entries of every other slot in the grid.  Entries older than the retention
+# horizon are evicted to keep the cache bounded.
+SMART_CACHE_STALE_RETENTION_TTL_MULTIPLIER = 12
+SMART_CACHE_STALE_RETENTION_FLOOR_SECONDS = 3600
+
 logger = logging.getLogger(__name__)
 METRICS_SERVICE_NAME = "enclosure-ui"
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
@@ -2497,6 +2504,15 @@ class InventoryService:
     def _smart_cache_expiry(self) -> datetime:
         return utcnow() + timedelta(seconds=max(0, int(self.settings.app.smart_cache_ttl_seconds)))
 
+    def _smart_cache_stale_retention(self) -> timedelta:
+        ttl_seconds = max(0, int(self.settings.app.smart_cache_ttl_seconds))
+        return timedelta(
+            seconds=max(
+                ttl_seconds * SMART_CACHE_STALE_RETENTION_TTL_MULTIPLIER,
+                SMART_CACHE_STALE_RETENTION_FLOOR_SECONDS,
+            )
+        )
+
     def _smart_cache_key(self, slot_view: SlotView) -> SmartCacheKey:
         return (
             self.system.id,
@@ -2523,13 +2539,20 @@ class InventoryService:
             self._smart_cache_until.pop(cache_key, None)
         return removed
 
-    def _evict_expired_smart_cache_entries(self, *, preserve_key: SmartCacheKey | None = None) -> None:
-        now = utcnow()
+    def _evict_expired_smart_cache_entries(self) -> None:
+        # Evict only entries that have been expired for longer than the stale
+        # retention window.  Merely-expired entries must survive lookups for
+        # *other* slots: stale-serving is only reachable once an entry has
+        # expired, so evicting at the TTL boundary would let the first slot in
+        # a batch destroy every other slot's stale-serve entry and force
+        # foreground refetches across the grid.  Evicting past the horizon also
+        # bounds how old a stale-served summary can get.
+        eviction_horizon = utcnow() - self._smart_cache_stale_retention()
         expired_keys = {
             cache_key
             for cache_key in set(self._smart_cache) | set(self._smart_cache_until)
-            if cache_key != preserve_key
-            and self._smart_cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc)) <= now
+            if self._smart_cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
+            <= eviction_horizon
         }
         if self._remove_smart_cache_keys(expired_keys):
             self._observe_inventory_cache_metrics()
@@ -2548,7 +2571,7 @@ class InventoryService:
             and self._smart_cache_generation_token(cache_key) != expected_generation
         ):
             return False
-        self._evict_expired_smart_cache_entries(preserve_key=cache_key)
+        self._evict_expired_smart_cache_entries()
         self._smart_cache[cache_key] = summary
         self._smart_cache_until[cache_key] = expires_at or self._smart_cache_expiry()
         return True
@@ -2562,7 +2585,7 @@ class InventoryService:
     ) -> SmartSummaryView:
         cache_key = self._smart_cache_key(slot_view)
         candidates = list(cache_key[4])
-        self._evict_expired_smart_cache_entries(preserve_key=cache_key if allow_stale_cache else None)
+        self._evict_expired_smart_cache_entries()
         cache_until = self._smart_cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
         cached = self._smart_cache.get(cache_key)
         if cached and utcnow() < cache_until:

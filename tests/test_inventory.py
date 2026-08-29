@@ -4324,12 +4324,80 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
 
             await service._get_slot_smart_summary_for_slot_view(first_slot)
             expired_key = next(iter(service._smart_cache))
-            service._smart_cache_until[expired_key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._smart_cache_until[expired_key] = (
+                datetime.now(timezone.utc) - service._smart_cache_stale_retention() - timedelta(seconds=1)
+            )
             await service._get_slot_smart_summary_for_slot_view(second_slot)
 
             self.assertNotIn(expired_key, service._smart_cache)
             self.assertNotIn(expired_key, service._smart_cache_until)
             self.assertEqual(len(service._smart_cache), 1)
+
+    async def test_smart_cache_lookup_preserves_other_slots_stale_entries_within_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="esxi-cache", truenas=TrueNASConfig(platform="esxi"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            fresh_b = SmartSummaryView(available=True, temperature_c=32)
+            service._build_esxi_slot_smart_summary = AsyncMock(return_value=fresh_b)
+            slot_a = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-a",
+                device_name="naa.cache-a",
+            )
+            slot_b = SlotView(
+                slot=1,
+                slot_label="01",
+                row_index=0,
+                column_index=1,
+                enclosure_id="enc-a",
+                device_name="naa.cache-b",
+            )
+            stale_a = SmartSummaryView(available=True, temperature_c=21)
+            key_a = service._smart_cache_key(slot_a)
+            service._smart_cache[key_a] = stale_a
+            service._smart_cache_until[key_a] = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+            # Slot B's lookup (foreground or background-refresh style) must not
+            # evict slot A's expired-but-retained entry...
+            await service._get_slot_smart_summary_for_slot_view(slot_b)
+            self.assertIn(key_a, service._smart_cache)
+
+            # ...so slot A can still be stale-served afterwards.
+            served = await service._get_slot_smart_summary_for_slot_view(slot_a, allow_stale_cache=True)
+            self.assertIs(served, stale_a)
+            refresh_task = service._smart_refresh_tasks.get(key_a)
+            if refresh_task is not None:
+                await refresh_task
+
+    async def test_smart_cache_stale_serving_is_bounded_by_retention_horizon(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="esxi-cache", truenas=TrueNASConfig(platform="esxi"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            fresh_a = SmartSummaryView(available=True, temperature_c=33)
+            service._build_esxi_slot_smart_summary = AsyncMock(return_value=fresh_a)
+            slot_a = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-a",
+                device_name="naa.cache-a",
+            )
+            ancient_a = SmartSummaryView(available=True, temperature_c=11)
+            key_a = service._smart_cache_key(slot_a)
+            service._smart_cache[key_a] = ancient_a
+            service._smart_cache_until[key_a] = (
+                datetime.now(timezone.utc) - service._smart_cache_stale_retention() - timedelta(seconds=1)
+            )
+
+            served = await service._get_slot_smart_summary_for_slot_view(slot_a, allow_stale_cache=True)
+
+            self.assertIs(served, fresh_a)
 
     async def test_scoped_snapshot_invalidation_removes_only_matching_smart_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

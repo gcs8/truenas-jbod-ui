@@ -4,12 +4,16 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import tarfile
 import tempfile
+import uuid
 import zipfile
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -222,6 +226,489 @@ class BackupArtifact:
     content: bytes
     media_type: str
     manifest: dict[str, Any]
+
+
+@dataclass(slots=True)
+class _ImportRollbackEntry:
+    target_path: Path
+    kind: Literal["missing", "file", "directory", "symlink", "history"]
+    backup_path: Path | None = None
+    history_store: HistoryStore | None = None
+    mutated: bool = False
+
+
+class _ImportActivationTransaction:
+    _MISSING_FILE_MODE = 0o600
+    _MISSING_DIRECTORY_MODE = 0o700
+
+    def __init__(
+        self,
+        extracted_members: dict[str, bytes],
+        *,
+        history_store: HistoryStore | None = None,
+    ) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-import-"))
+        self.staging_root = self.root / "staged"
+        self.rollback_root = self.root / "rollback"
+        self.staging_root.mkdir(parents=True, exist_ok=True)
+        self.rollback_root.mkdir(parents=True, exist_ok=True)
+        self._staged_members: dict[str, Path] = {}
+        self._journal: dict[str, _ImportRollbackEntry] = {}
+        self._journal_order: list[str] = []
+        self._created_parents: list[Path] = []
+        self._sibling_artifacts: set[Path] = set()
+        self._protected_history_key = (
+            self._journal_key(history_store.file_path)
+            if history_store is not None
+            else None
+        )
+        self._committed = False
+        try:
+            for member_key, content in sorted(extracted_members.items()):
+                staged_path = self.staging_root / hashlib.sha256(
+                    member_key.encode("utf-8")
+                ).hexdigest()
+                self._write_staged_bytes(staged_path, content)
+                self._staged_members[member_key] = staged_path
+            self._fsync_directory(self.staging_root)
+            self._fsync_directory(self.rollback_root)
+            self._fsync_directory(self.root)
+        except Exception:
+            shutil.rmtree(self.root, ignore_errors=True)
+            raise
+
+    def __enter__(self) -> "_ImportActivationTransaction":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> Literal[False]:
+        if exc is not None and not self._committed:
+            try:
+                self.rollback()
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "Import activation rollback is incomplete; recovery material was "
+                    f"preserved at {self.root}: {rollback_error}"
+                ) from exc
+            try:
+                self._cleanup_root()
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    "Import activation rollback cleanup is incomplete; recovery material "
+                    f"was preserved at {self.root}: {cleanup_error}"
+                ) from exc
+            return False
+
+        if self._committed:
+            try:
+                self._finalize_commit()
+                self._cleanup_root()
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    "Import activation cleanup is incomplete; recovery material was "
+                    f"preserved at {self.root}: {cleanup_error}"
+                ) from cleanup_error
+        else:
+            self._cleanup_root()
+        return False
+
+    def commit(self) -> None:
+        self._committed = True
+
+    def activate_file(self, target_path: Path, member_key: str) -> None:
+        entry = self._record_target(target_path)
+        staged_path = self._staged_member(member_key)
+        self._ensure_parent_hierarchy(target_path.parent)
+        file_descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{target_path.name}.restore-",
+            dir=target_path.parent,
+        )
+        temp_path = Path(temp_name)
+        self._sibling_artifacts.add(temp_path)
+        try:
+            os.close(file_descriptor)
+            shutil.copyfile(staged_path, temp_path)
+            file_mode = (
+                target_path.stat(follow_symlinks=False).st_mode & 0o7777
+                if entry.kind == "file"
+                else self._MISSING_FILE_MODE
+            )
+            temp_path.chmod(file_mode)
+            self._fsync_file(temp_path)
+            self._park_original(entry)
+            os.replace(temp_path, target_path)
+            self._sibling_artifacts.discard(temp_path)
+            entry.mutated = True
+            self._fsync_directory(target_path.parent)
+        finally:
+            self._cleanup_sibling_artifact(temp_path)
+
+    def delete_target(self, target_path: Path) -> None:
+        entry = self._record_target(target_path)
+        self._park_original(entry)
+
+    def activate_directory(
+        self,
+        target_dir: Path,
+        members: list[tuple[str, Path]],
+    ) -> None:
+        entry = self._record_target(target_dir)
+        existing_directory = target_dir if entry.kind == "directory" else None
+        self._ensure_parent_hierarchy(target_dir.parent)
+        staged_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f".{target_dir.name}.restore-",
+                dir=target_dir.parent,
+            )
+        )
+        self._sibling_artifacts.add(staged_dir)
+        root_mode = self._existing_mode(existing_directory, directory=True)
+        staged_dir.chmod(root_mode or self._MISSING_DIRECTORY_MODE)
+        try:
+            for member_key, relative_path in members:
+                staged_target = staged_dir / relative_path
+                current_relative = Path()
+                for part in relative_path.parts[:-1]:
+                    current_relative /= part
+                    staged_parent = staged_dir / current_relative
+                    if not staged_parent.exists():
+                        staged_parent.mkdir()
+                    existing_parent = (
+                        existing_directory / current_relative
+                        if existing_directory is not None
+                        else None
+                    )
+                    staged_parent.chmod(
+                        self._existing_mode(existing_parent, directory=True)
+                        or self._MISSING_DIRECTORY_MODE
+                    )
+                shutil.copyfile(self._staged_member(member_key), staged_target)
+                existing_target = (
+                    existing_directory / relative_path
+                    if existing_directory is not None
+                    else None
+                )
+                staged_target.chmod(
+                    self._existing_mode(existing_target, directory=False)
+                    or self._MISSING_FILE_MODE
+                )
+            self._fsync_tree(staged_dir)
+            self._park_original(entry)
+            os.replace(staged_dir, target_dir)
+            self._sibling_artifacts.discard(staged_dir)
+            entry.mutated = True
+            self._fsync_directory(target_dir.parent)
+        finally:
+            self._cleanup_sibling_artifact(staged_dir)
+
+    def activate_history(self, store: HistoryStore, member_key: str) -> None:
+        entry = self._record_history(store)
+        self._ensure_parent_hierarchy(entry.target_path.parent)
+        entry.mutated = True
+        store.restore_backup(self._staged_member(member_key))
+        self._fsync_file(entry.target_path)
+        self._fsync_directory(entry.target_path.parent)
+
+    def rollback(self) -> None:
+        failures: list[tuple[str, Exception]] = []
+        for journal_key in reversed(self._journal_order):
+            entry = self._journal[journal_key]
+            try:
+                if entry.kind == "history":
+                    self._rollback_history(entry)
+                else:
+                    self._restore_target(entry)
+            except Exception as rollback_error:
+                failures.append((str(entry.target_path), rollback_error))
+        if failures:
+            raise RuntimeError(self._failure_summary(failures))
+
+        cleanup_failures = self._cleanup_sibling_artifacts()
+        cleanup_failures.extend(self._remove_created_parent_hierarchy())
+        if cleanup_failures:
+            raise RuntimeError(self._failure_summary(cleanup_failures))
+
+    def _staged_member(self, member_key: str) -> Path:
+        staged_path = self._staged_members.get(member_key)
+        if staged_path is None:
+            raise ValueError(f"Backup bundle is missing staged member {member_key!r}.")
+        return staged_path
+
+    def _record_target(self, target_path: Path) -> _ImportRollbackEntry:
+        journal_key = self._journal_key(target_path)
+        if journal_key == self._protected_history_key:
+            raise ValueError(
+                f"Live restore target {target_path} collides with the history database."
+            )
+        if journal_key in self._journal:
+            raise ValueError(f"Live restore target {target_path} collides with another restore target.")
+        if target_path.is_symlink():
+            entry = _ImportRollbackEntry(target_path=target_path, kind="symlink")
+        elif target_path.is_dir():
+            entry = _ImportRollbackEntry(target_path=target_path, kind="directory")
+        elif target_path.is_file():
+            entry = _ImportRollbackEntry(target_path=target_path, kind="file")
+        elif target_path.exists():
+            raise ValueError(f"Live restore target {target_path} is not a regular file or directory.")
+        else:
+            entry = _ImportRollbackEntry(target_path=target_path, kind="missing")
+        self._journal[journal_key] = entry
+        self._journal_order.append(journal_key)
+        return entry
+
+    def _record_history(self, store: HistoryStore) -> _ImportRollbackEntry:
+        target_path = store.file_path
+        self._reject_symlinked_history_target(target_path)
+        journal_key = self._journal_key(target_path)
+        if journal_key in self._journal:
+            raise ValueError(
+                f"Live restore target {target_path} collides with the history database."
+            )
+        if target_path.exists() and not target_path.is_file():
+            raise ValueError(f"Live history restore target {target_path} is not a regular file.")
+        if target_path.exists():
+            backup_dir = self.rollback_root / f"history-{len(self._journal_order):04d}"
+            backup_path = store.create_backup(
+                backup_dir,
+                retention_count=1,
+                long_term_backup_dir=None,
+                weekly_retention_count=0,
+                monthly_retention_count=0,
+            )
+            if backup_path is None:
+                raise ValueError("Unable to create rollback snapshot for the live history database.")
+            backup_path = Path(backup_path)
+            self._fsync_file(backup_path)
+            self._fsync_directory(backup_path.parent)
+            self._fsync_directory(self.rollback_root)
+            entry = _ImportRollbackEntry(
+                target_path=target_path,
+                kind="history",
+                backup_path=backup_path,
+                history_store=store,
+            )
+        else:
+            entry = _ImportRollbackEntry(
+                target_path=target_path,
+                kind="history",
+                history_store=store,
+            )
+        self._journal[journal_key] = entry
+        self._journal_order.append(journal_key)
+        return entry
+
+    def _restore_target(self, entry: _ImportRollbackEntry) -> None:
+        if not entry.mutated:
+            return
+        displaced_path: Path | None = None
+        if self._path_exists(entry.target_path):
+            displaced_path = self._new_sibling_path(entry.target_path, "restore")
+            os.replace(entry.target_path, displaced_path)
+            self._sibling_artifacts.add(displaced_path)
+            self._fsync_directory(entry.target_path.parent)
+
+        try:
+            if entry.kind != "missing":
+                if entry.backup_path is None or not self._path_exists(entry.backup_path):
+                    raise RuntimeError(f"Rollback material is missing for {entry.target_path}.")
+                os.replace(entry.backup_path, entry.target_path)
+                self._sibling_artifacts.discard(entry.backup_path)
+                entry.backup_path = None
+                self._fsync_directory(entry.target_path.parent)
+        except Exception as restore_error:
+            recovery_error: Exception | None = None
+            if (
+                displaced_path is not None
+                and self._path_exists(displaced_path)
+                and not self._path_exists(entry.target_path)
+            ):
+                try:
+                    os.replace(displaced_path, entry.target_path)
+                    self._sibling_artifacts.discard(displaced_path)
+                    self._fsync_directory(entry.target_path.parent)
+                except Exception as exc:
+                    recovery_error = exc
+            if recovery_error is not None:
+                raise RuntimeError(
+                    f"{restore_error}; active-target recovery also failed: {recovery_error}"
+                ) from restore_error
+            raise
+
+        if displaced_path is not None:
+            self._cleanup_sibling_artifact(displaced_path)
+        entry.mutated = False
+
+    def _rollback_history(self, entry: _ImportRollbackEntry) -> None:
+        if not entry.mutated:
+            return
+        if entry.history_store is None:
+            raise RuntimeError("Rollback history store is missing.")
+        if entry.backup_path is None:
+            failures: list[tuple[str, Exception]] = []
+            for suffix in ("", "-shm", "-wal"):
+                sidecar_path = Path(f"{entry.target_path}{suffix}")
+                try:
+                    sidecar_path.unlink(missing_ok=True)
+                except Exception as unlink_error:
+                    failures.append((str(sidecar_path), unlink_error))
+            try:
+                self._fsync_directory(entry.target_path.parent)
+            except Exception as fsync_error:
+                failures.append((str(entry.target_path.parent), fsync_error))
+            if failures:
+                raise RuntimeError(self._failure_summary(failures))
+        else:
+            entry.history_store.restore_backup(entry.backup_path)
+            self._fsync_file(entry.target_path)
+            self._fsync_directory(entry.target_path.parent)
+        entry.mutated = False
+
+    def _park_original(self, entry: _ImportRollbackEntry) -> None:
+        if entry.kind == "missing":
+            return
+        previous_path = self._new_sibling_path(entry.target_path, "previous")
+        os.replace(entry.target_path, previous_path)
+        entry.backup_path = previous_path
+        entry.mutated = True
+        self._sibling_artifacts.add(previous_path)
+        self._fsync_directory(entry.target_path.parent)
+
+    def _ensure_parent_hierarchy(self, parent_path: Path) -> None:
+        missing: list[Path] = []
+        cursor = parent_path
+        while not self._path_exists(cursor):
+            missing.append(cursor)
+            if cursor == cursor.parent:
+                break
+            cursor = cursor.parent
+        for directory in reversed(missing):
+            directory.mkdir()
+            directory.chmod(self._MISSING_DIRECTORY_MODE)
+            self._created_parents.append(directory)
+            self._fsync_directory(directory)
+            self._fsync_directory(directory.parent)
+
+    def _remove_created_parent_hierarchy(self) -> list[tuple[str, Exception]]:
+        failures: list[tuple[str, Exception]] = []
+        for directory in reversed(self._created_parents):
+            try:
+                if directory.exists():
+                    directory.rmdir()
+                    self._fsync_directory(directory.parent)
+            except Exception as cleanup_error:
+                failures.append((str(directory), cleanup_error))
+        if not failures:
+            self._created_parents.clear()
+        return failures
+
+    def _finalize_commit(self) -> None:
+        failures = self._cleanup_sibling_artifacts()
+        if failures:
+            raise RuntimeError(self._failure_summary(failures))
+
+    def _cleanup_sibling_artifacts(self) -> list[tuple[str, Exception]]:
+        failures: list[tuple[str, Exception]] = []
+        for artifact_path in sorted(self._sibling_artifacts, key=str):
+            try:
+                self._cleanup_sibling_artifact(artifact_path)
+            except Exception as cleanup_error:
+                failures.append((str(artifact_path), cleanup_error))
+        return failures
+
+    def _cleanup_sibling_artifact(self, artifact_path: Path) -> None:
+        if self._path_exists(artifact_path):
+            self._remove_path(artifact_path)
+            self._fsync_directory(artifact_path.parent)
+        self._sibling_artifacts.discard(artifact_path)
+
+    def _cleanup_root(self) -> None:
+        if self.root.exists():
+            shutil.rmtree(self.root)
+
+    def _fsync_tree(self, root: Path) -> None:
+        paths = list(root.rglob("*"))
+        for path in paths:
+            if path.is_file() and not path.is_symlink():
+                self._fsync_file(path)
+        directories = [path for path in paths if path.is_dir() and not path.is_symlink()]
+        for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+            self._fsync_directory(directory)
+        self._fsync_directory(root)
+
+    @staticmethod
+    def _existing_mode(path: Path | None, *, directory: bool) -> int | None:
+        if path is None or path.is_symlink():
+            return None
+        if directory and not path.is_dir():
+            return None
+        if not directory and not path.is_file():
+            return None
+        return path.stat(follow_symlinks=False).st_mode & 0o7777
+
+    @staticmethod
+    def _journal_key(target_path: Path) -> str:
+        return os.path.normcase(os.path.realpath(os.path.abspath(target_path)))
+
+    @staticmethod
+    def _reject_symlinked_history_target(target_path: Path) -> None:
+        cursor = target_path
+        while True:
+            if cursor.is_symlink():
+                raise ValueError(
+                    f"Live history restore target {target_path} uses unsafe symlink component {cursor}."
+                )
+            if cursor == cursor.parent:
+                return
+            cursor = cursor.parent
+
+    @staticmethod
+    def _new_sibling_path(target_path: Path, artifact_kind: str) -> Path:
+        while True:
+            candidate = target_path.parent / (
+                f".{target_path.name}.{artifact_kind}-{uuid.uuid4().hex}"
+            )
+            if not candidate.exists() and not candidate.is_symlink():
+                return candidate
+
+    @staticmethod
+    def _failure_summary(failures: list[tuple[str, Exception]]) -> str:
+        return "; ".join(
+            f"{path}: {type(error).__name__}: {error}"
+            for path, error in failures
+        )
+
+    @staticmethod
+    def _write_staged_bytes(target_path: Path, content: bytes) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with target_path.open("wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _path_exists(path: Path) -> bool:
+        return path.exists() or path.is_symlink()
+
+    @classmethod
+    def _remove_path(cls, path: Path) -> None:
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _fsync_file(path: Path) -> None:
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def default_backup_included_paths() -> list[str]:
@@ -571,6 +1058,34 @@ class SystemBackupService:
         self._validate_manifest_member_metadata(manifest, extracted)
         self._preflight_selected_group_members(manifest, group_entries, extracted)
         self._preflight_import_members(manifest, group_entries, extracted)
+        try:
+            with _ImportActivationTransaction(
+                extracted,
+                history_store=self.store,
+            ) as transaction:
+                result = self._activate_import_bundle(
+                    manifest,
+                    extracted,
+                    group_entries,
+                    detected_packaging,
+                    archive_meta,
+                    transaction,
+                )
+                transaction.commit()
+                return result
+        except Exception:
+            get_settings.cache_clear()
+            raise
+
+    def _activate_import_bundle(
+        self,
+        manifest: dict[str, Any],
+        extracted: dict[str, bytes],
+        group_entries: dict[str, dict[str, Any]],
+        detected_packaging: ArchivePackaging,
+        archive_meta: dict[str, Any],
+        transaction: _ImportActivationTransaction,
+    ) -> dict[str, Any]:
         restored_paths: list[str] = []
         app_settings = self._load_app_settings()
 
@@ -581,6 +1096,7 @@ class SystemBackupService:
             extracted,
             Path(app_settings.config_file),
             restored_paths,
+            transaction,
         )
 
         imported_settings = self._load_app_settings()
@@ -591,6 +1107,7 @@ class SystemBackupService:
             extracted,
             Path(imported_settings.paths.runtime_overrides_file),
             restored_paths,
+            transaction,
         )
 
         imported_settings = self._load_app_settings()
@@ -601,6 +1118,7 @@ class SystemBackupService:
             extracted,
             Path(imported_settings.paths.profile_file),
             restored_paths,
+            transaction,
         )
         self._restore_file_group(
             MAPPING_FILE_KEY,
@@ -609,6 +1127,7 @@ class SystemBackupService:
             extracted,
             Path(imported_settings.paths.mapping_file),
             restored_paths,
+            transaction,
         )
         self._restore_file_group(
             SAS_FABRIC_ALIAS_FILE_KEY,
@@ -617,6 +1136,7 @@ class SystemBackupService:
             extracted,
             Path(imported_settings.paths.sas_fabric_alias_file),
             restored_paths,
+            transaction,
         )
         self._restore_file_group(
             SLOT_DETAIL_FILE_KEY,
@@ -625,6 +1145,7 @@ class SystemBackupService:
             extracted,
             Path(imported_settings.paths.slot_detail_cache_file),
             restored_paths,
+            transaction,
         )
 
         imported_settings = self._load_app_settings()
@@ -636,6 +1157,7 @@ class SystemBackupService:
             extracted,
             config_root / "ssh",
             restored_paths,
+            transaction,
         )
         self._restore_directory_group(
             TLS_TRUST_KEY,
@@ -644,6 +1166,7 @@ class SystemBackupService:
             extracted,
             config_root / "tls",
             restored_paths,
+            transaction,
         )
         known_hosts_target = Path(_derive_runtime_layout_paths(imported_settings.config_file)["known_hosts_path"])
         self._restore_file_group(
@@ -653,6 +1176,7 @@ class SystemBackupService:
             extracted,
             known_hosts_target,
             restored_paths,
+            transaction,
         )
 
         history_restored = False
@@ -660,10 +1184,7 @@ class SystemBackupService:
         if self._manifest_group_selected(history_group):
             history_member = self._first_group_member(manifest, HISTORY_DB_KEY)
             if history_member and history_member["key"] in extracted:
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_history_path = Path(temp_dir) / "history-import.sqlite3"
-                    temp_history_path.write_bytes(extracted[history_member["key"]])
-                    self.store.restore_backup(temp_history_path)
+                transaction.activate_history(self.store, history_member["key"])
                 restored_paths.append(str(self.store.file_path))
                 history_restored = True
             elif self._manifest_group_present(history_group):
@@ -899,7 +1420,7 @@ class SystemBackupService:
             candidate_path = Path(temp_dir) / "history.sqlite3"
             candidate_path.write_bytes(content)
             database_uri = f"{candidate_path.resolve().as_uri()}?mode=ro"
-            with sqlite3.connect(database_uri, uri=True) as connection:
+            with closing(sqlite3.connect(database_uri, uri=True)) as connection:
                 rows = connection.execute("PRAGMA quick_check").fetchall()
                 required_columns = {
                     "slot_state_current": {"system_id", "enclosure_key", "slot"},
@@ -1817,6 +2338,7 @@ class SystemBackupService:
         extracted_members: dict[str, bytes],
         target_path: Path,
         restored_paths: list[str],
+        transaction: _ImportActivationTransaction | None = None,
     ) -> None:
         group_entry = group_entries.get(group_key)
         if not self._manifest_group_selected(group_entry):
@@ -1826,12 +2348,18 @@ class SystemBackupService:
             member_key = member_entries[0]["key"]
             if member_key not in extracted_members:
                 raise ValueError(f"Backup bundle is missing the selected {group_key} member.")
-            self._write_bytes_atomic(target_path, extracted_members[member_key])
+            if transaction is None:
+                self._write_bytes_atomic(target_path, extracted_members[member_key])
+            else:
+                transaction.activate_file(target_path, member_key)
             restored_paths.append(str(target_path))
             return
         if self._manifest_group_present(group_entry):
             raise ValueError(f"Backup bundle is missing the selected {group_key} member.")
-        self._delete_if_exists(target_path)
+        if transaction is None:
+            self._delete_if_exists(target_path)
+        else:
+            transaction.delete_target(target_path)
 
     def _restore_directory_group(
         self,
@@ -1841,6 +2369,7 @@ class SystemBackupService:
         extracted_members: dict[str, bytes],
         target_dir: Path,
         restored_paths: list[str],
+        transaction: _ImportActivationTransaction | None = None,
     ) -> None:
         group_entry = group_entries.get(group_key)
         if not self._manifest_group_selected(group_entry):
@@ -1849,10 +2378,14 @@ class SystemBackupService:
         if not member_entries:
             if self._manifest_group_present(group_entry):
                 raise ValueError(f"Backup bundle is missing the selected {group_key} directory members.")
-            self._remove_tree_if_exists(target_dir)
+            if transaction is None:
+                self._remove_tree_if_exists(target_dir)
+            else:
+                transaction.delete_target(target_dir)
             return
 
         restore_targets: list[tuple[str, Path]] = []
+        transaction_members: list[tuple[str, Path]] = []
         for entry in member_entries:
             relative_path = self._directory_member_relative_path(group_key, entry["archive_path"])
             target_path = self._safe_child_path(target_dir, relative_path, entry["archive_path"])
@@ -1860,11 +2393,15 @@ class SystemBackupService:
             if member_key not in extracted_members:
                 raise ValueError(f"Backup bundle is missing the selected {group_key} member {entry['archive_path']}.")
             restore_targets.append((member_key, target_path))
+            transaction_members.append((member_key, relative_path))
 
-        self._remove_tree_if_exists(target_dir)
-        for member_key, target_path in restore_targets:
-            self._write_bytes_atomic(target_path, extracted_members[member_key])
-            restored_paths.append(str(target_path))
+        if transaction is None:
+            self._remove_tree_if_exists(target_dir)
+            for member_key, target_path in restore_targets:
+                self._write_bytes_atomic(target_path, extracted_members[member_key])
+        else:
+            transaction.activate_directory(target_dir, transaction_members)
+        restored_paths.extend(str(target_path) for _member_key, target_path in restore_targets)
 
     @staticmethod
     def _directory_member_relative_path(group_key: str, archive_path: str) -> Path:
