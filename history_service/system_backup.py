@@ -8,11 +8,14 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import tarfile
 import tempfile
+import threading
 import uuid
 import zipfile
+import zlib
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -196,6 +199,15 @@ ARCHIVE_MEDIA_TYPES: dict[ArchivePackaging, str] = {
 SEVEN_ZIP_SIGNATURE = b"\x37\x7a\xbc\xaf\x27\x1c"
 SEVEN_ZIP_TIMEOUT_SECONDS = 120
 SEVEN_ZIP_BINARY = "7z"
+MAX_BACKUP_ARCHIVE_BYTES = 256 * 1024 * 1024
+MAX_ARCHIVE_MEMBER_COUNT = 1024
+MAX_ARCHIVE_MEMBER_BYTES = 512 * 1024 * 1024
+MAX_ARCHIVE_EXPANDED_BYTES = 1024 * 1024 * 1024
+MAX_ARCHIVE_COMPRESSION_RATIO = 200
+MAX_ARCHIVE_METADATA_BYTES = 8 * 1024 * 1024
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_7Z_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
+ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -1054,17 +1066,14 @@ class SystemBackupService:
         )
 
     def import_bundle(self, content: bytes, *, passphrase: str | None = None) -> dict[str, Any]:
+        if len(content) > MAX_BACKUP_ARCHIVE_BYTES:
+            raise ValueError(
+                f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
+            )
         manifest, extracted, detected_packaging, archive_meta = self._read_archive(
             content,
             passphrase=passphrase,
         )
-        if manifest.get("schema_version") != BUNDLE_SCHEMA_VERSION:
-            raise ValueError(
-                f"Unsupported backup schema version {manifest.get('schema_version')!r}."
-            )
-        if manifest.get("format") != BUNDLE_FORMAT:
-            raise ValueError("Backup bundle format is not recognized.")
-
         group_entries = self._manifest_group_entries(manifest)
         self._validate_manifest_member_metadata(manifest, extracted)
         self._preflight_selected_group_members(manifest, group_entries, extracted)
@@ -2072,28 +2081,46 @@ class SystemBackupService:
             return self._read_7z_archive(archive_bytes, passphrase=passphrase)
 
         if packaging == "zip":
+            self._preflight_zip_archive(archive_bytes)
             try:
                 with zipfile.ZipFile(io.BytesIO(archive_bytes), mode="r") as archive:
+                    members = archive.infolist()
+                    self._validate_zip_members(members)
+                    physical_paths = [member.filename for member in members if not member.is_dir()]
                     self._validate_unique_physical_archive_paths(
-                        [member.filename for member in archive.infolist() if not member.is_dir()]
+                        physical_paths
                     )
                     try:
-                        manifest_bytes = archive.read("manifest.json")
+                        manifest_member = archive.getinfo("manifest.json")
                     except KeyError as exc:
                         raise ValueError("Backup bundle is missing manifest.json.") from exc
+                    if manifest_member.file_size > MAX_MANIFEST_BYTES:
+                        raise ValueError("Backup bundle manifest exceeds its size limit.")
+                    manifest_bytes = archive.read(manifest_member)
                     manifest = self._load_manifest(manifest_bytes)
+                    self._validate_manifest_before_extraction(manifest)
+                    self._validate_supported_physical_archive_paths(physical_paths, manifest)
                     extracted = self._extract_manifest_zip_members(archive, manifest)
             except zipfile.BadZipFile as exc:
                 raise ValueError("Backup bundle ZIP archive is corrupted.") from exc
             return manifest, extracted, packaging, {"encrypted": False}
 
         tar_bytes = self._decompress_tar_archive(archive_bytes, packaging)
+        preflight_tar_paths = self._preflight_tar_archive(tar_bytes)
         try:
             with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
+                members = self._read_bounded_tar_members(archive)
+                physical_paths = [member.name for member in members if member.isfile()]
+                if physical_paths != preflight_tar_paths:
+                    raise ValueError(
+                        "Backup bundle TAR members do not match its physical headers."
+                    )
                 self._validate_unique_physical_archive_paths(
-                    [member.name for member in archive.getmembers() if member.isfile()]
+                    physical_paths
                 )
                 manifest = self._load_manifest(self._read_tar_member(archive, "manifest.json"))
+                self._validate_manifest_before_extraction(manifest)
+                self._validate_supported_physical_archive_paths(physical_paths, manifest)
                 extracted = self._extract_manifest_tar_members(archive, manifest)
         except tarfile.TarError as exc:
             raise ValueError("Backup bundle TAR archive is corrupted.") from exc
@@ -2126,8 +2153,16 @@ class SystemBackupService:
                 passphrase=passphrase,
                 reading_archive=True,
             )
+            listed_entries = self._seven_zip_listed_entries(list_result.stdout, archive_path)
+            self._validate_7z_listed_entries(listed_entries, archive_size=len(archive_bytes))
+            listed_paths = [entry["Path"] for entry in listed_entries]
+            listed_file_paths = [
+                entry["Path"]
+                for entry in listed_entries
+                if not self._is_7z_directory_entry(entry)
+            ]
             self._validate_unique_physical_archive_paths(
-                self._seven_zip_listed_paths(list_result.stdout, archive_path)
+                listed_paths
             )
             encrypted = "Encrypted = +" in list_result.stdout or "7zAES" in list_result.stdout
 
@@ -2151,19 +2186,553 @@ class SystemBackupService:
             manifest_path = extract_dir / "manifest.json"
             if not manifest_path.exists():
                 raise ValueError("Backup bundle is missing manifest.json.")
+            self._validate_extracted_7z_tree(extract_dir, listed_entries)
+            if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
+                raise ValueError("Backup bundle manifest exceeds its size limit.")
             manifest = self._load_manifest(manifest_path.read_bytes())
+            self._validate_manifest_before_extraction(manifest)
+            self._validate_supported_physical_archive_paths(listed_file_paths, manifest)
             extracted = self._extract_manifest_directory_members(extract_dir, manifest)
             return manifest, extracted, "7z", {"encrypted": encrypted}
 
     @staticmethod
     def _load_manifest(manifest_bytes: bytes) -> dict[str, Any]:
+        if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+            raise ValueError("Backup bundle manifest exceeds its size limit.")
+
+        def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            payload: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in payload:
+                    raise ValueError("Backup bundle manifest contains a duplicate JSON key.")
+                payload[key] = value
+            return payload
+
         try:
-            manifest = json.loads(manifest_bytes.decode("utf-8"))
-        except json.JSONDecodeError as exc:
+            manifest = json.loads(
+                manifest_bytes.decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("Backup bundle manifest is not valid JSON.") from exc
         if not isinstance(manifest, dict):
             raise ValueError("Backup bundle manifest is not valid JSON.")
         return manifest
+
+    @classmethod
+    def _validate_manifest_before_extraction(cls, manifest: dict[str, Any]) -> None:
+        schema_version = manifest.get("schema_version")
+        if type(schema_version) is not int or schema_version != BUNDLE_SCHEMA_VERSION:
+            raise ValueError(f"Unsupported backup schema version {schema_version!r}.")
+        if manifest.get("format") != BUNDLE_FORMAT:
+            raise ValueError("Backup bundle format is not recognized.")
+
+        for collection_name in ("groups", "files"):
+            collection = manifest.get(collection_name, [])
+            if not isinstance(collection, list):
+                raise ValueError(f"Backup bundle manifest {collection_name} must be a list.")
+            if len(collection) > MAX_ARCHIVE_MEMBER_COUNT:
+                raise ValueError(
+                    f"Backup bundle manifest {collection_name} exceeds its entry limit."
+                )
+            if any(not isinstance(entry, dict) for entry in collection):
+                raise ValueError(
+                    f"Backup bundle manifest {collection_name} entries must be objects."
+                )
+
+        seen_group_keys: set[str] = set()
+        for raw_group in manifest.get("groups", []):
+            group_key = str(raw_group.get("key") or "").strip()
+            if group_key and group_key in seen_group_keys:
+                raise ValueError(
+                    f"Backup bundle manifest contains duplicate group key {group_key!r}."
+                )
+            if group_key:
+                seen_group_keys.add(group_key)
+
+        seen_keys: set[str] = set()
+        seen_paths: set[str] = set()
+        declared_total = 0
+        for index, raw_entry in enumerate(manifest.get("files", [])):
+            raw_archive_path = str(raw_entry.get("archive_path") or "").strip()
+            if not raw_archive_path:
+                raise ValueError("Backup bundle manifest member is missing its archive path.")
+            archive_path = cls._normalize_archive_member_path(raw_archive_path)
+            if archive_path == "manifest.json":
+                raise ValueError("Backup bundle manifest cannot declare manifest.json as a member.")
+            key = str(raw_entry.get("key") or archive_path or f"member-{index}").strip()
+            if key in seen_keys:
+                raise ValueError(f"Backup bundle manifest contains duplicate member key {key!r}.")
+            if archive_path in seen_paths:
+                raise ValueError(
+                    f"Backup bundle manifest contains duplicate archive path {archive_path!r}."
+                )
+            seen_keys.add(key)
+            seen_paths.add(archive_path)
+
+            expected_size = raw_entry.get("size_bytes")
+            if expected_size is not None:
+                if (
+                    isinstance(expected_size, bool)
+                    or not isinstance(expected_size, int)
+                    or expected_size < 0
+                ):
+                    raise ValueError(
+                        f"Backup bundle member {archive_path} has invalid size metadata."
+                    )
+                if expected_size > MAX_ARCHIVE_MEMBER_BYTES:
+                    raise ValueError(
+                        f"Backup bundle member {archive_path} exceeds its expanded byte limit."
+                    )
+                declared_total += expected_size
+                if declared_total > MAX_ARCHIVE_EXPANDED_BYTES:
+                    raise ValueError(
+                        "Backup bundle manifest members exceed the expanded byte limit."
+                    )
+
+            expected_sha256 = raw_entry.get("sha256")
+            if expected_sha256 is not None:
+                digest = str(expected_sha256).strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    raise ValueError(
+                        f"Backup bundle member {archive_path} has invalid SHA-256 metadata."
+                    )
+
+    @staticmethod
+    def _validate_declared_archive_limits(
+        entries: list[tuple[int, int]],
+        *,
+        compressed_total: int | None = None,
+    ) -> None:
+        if len(entries) > MAX_ARCHIVE_MEMBER_COUNT:
+            raise ValueError("Backup bundle archive contains too many members.")
+        expanded_total = 0
+        declared_compressed_total = 0
+        for compressed_size, expanded_size in entries:
+            if compressed_size < 0 or expanded_size < 0:
+                raise ValueError("Backup bundle archive contains invalid member size metadata.")
+            if expanded_size > MAX_ARCHIVE_MEMBER_BYTES:
+                raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+            if (
+                compressed_total is None
+                and expanded_size > MAX_ARCHIVE_COMPRESSION_RATIO * max(compressed_size, 1)
+            ):
+                raise ValueError("Backup bundle archive member compression ratio exceeds its limit.")
+            expanded_total += expanded_size
+            declared_compressed_total += compressed_size
+            if expanded_total > MAX_ARCHIVE_EXPANDED_BYTES:
+                raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
+        ratio_denominator = (
+            declared_compressed_total
+            if compressed_total is None
+            else compressed_total
+        )
+        if expanded_total > MAX_ARCHIVE_COMPRESSION_RATIO * max(ratio_denominator, 1):
+            raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
+
+    @staticmethod
+    def _validate_zip_extra_metadata(extra: bytes) -> None:
+        extra_cursor = 0
+        while extra_cursor < len(extra):
+            if extra_cursor + 4 > len(extra):
+                raise ValueError("Backup bundle ZIP archive extra metadata is malformed.")
+            extra_id, extra_length = struct.unpack_from("<HH", extra, extra_cursor)
+            extra_cursor += 4
+            if extra_cursor + extra_length > len(extra):
+                raise ValueError("Backup bundle ZIP archive extra metadata is malformed.")
+            if extra_id == 0x0001:
+                raise ValueError("Backup bundle ZIP archive uses unsupported ZIP64 metadata.")
+            extra_cursor += extra_length
+
+    @classmethod
+    def _preflight_zip_archive(cls, archive_bytes: bytes) -> None:
+        eocd_signature = b"PK\x05\x06"
+        search_start = max(0, len(archive_bytes) - (65535 + 22))
+        candidates: list[tuple[int, tuple[Any, ...]]] = []
+        signature_positions: list[int] = []
+        position = archive_bytes.find(eocd_signature, search_start)
+        while position >= 0:
+            signature_positions.append(position)
+            if position + 22 <= len(archive_bytes):
+                fields = struct.unpack_from("<4s4H2IH", archive_bytes, position)
+                if position + 22 + fields[7] == len(archive_bytes):
+                    candidates.append((position, fields))
+            position = archive_bytes.find(eocd_signature, position + 1)
+        if (
+            len(candidates) != 1
+            or not signature_positions
+            or candidates[0][0] != signature_positions[-1]
+        ):
+            raise ValueError("Backup bundle ZIP archive has an invalid or ambiguous directory footer.")
+
+        eocd_offset, fields = candidates[0]
+        disk_number, directory_disk, disk_entries, total_entries = fields[1:5]
+        directory_size, directory_offset = fields[5:7]
+        if (
+            disk_number != 0
+            or directory_disk != 0
+            or disk_entries != total_entries
+            or total_entries == 0xFFFF
+            or directory_size == 0xFFFFFFFF
+            or directory_offset == 0xFFFFFFFF
+        ):
+            raise ValueError("Backup bundle ZIP archive uses unsupported multidisk or ZIP64 metadata.")
+        if total_entries > MAX_ARCHIVE_MEMBER_COUNT:
+            raise ValueError("Backup bundle archive contains too many members.")
+        if directory_size > MAX_ARCHIVE_METADATA_BYTES:
+            raise ValueError("Backup bundle ZIP directory metadata exceeds its byte limit.")
+        if directory_offset + directory_size != eocd_offset:
+            raise ValueError("Backup bundle ZIP archive directory offsets are invalid.")
+
+        directory_end = directory_offset + directory_size
+        cursor = directory_offset
+        declared_entries: list[tuple[int, int]] = []
+        local_ranges: list[tuple[int, int]] = []
+        parsed_count = 0
+        while cursor < directory_end:
+            if cursor + 46 > directory_end:
+                raise ValueError("Backup bundle ZIP archive directory is truncated.")
+            central = struct.unpack_from("<4s6H3I5H2I", archive_bytes, cursor)
+            if central[0] != b"PK\x01\x02":
+                raise ValueError("Backup bundle ZIP archive directory is malformed.")
+            compressed_size = central[8]
+            expanded_size = central[9]
+            filename_size, extra_size, comment_size = central[10:13]
+            disk_start = central[13]
+            local_offset = central[16]
+            general_flags = central[3]
+            compression_method = central[4]
+            if general_flags & (0x0001 | 0x0040 | 0x2000):
+                raise ValueError("Backup bundle ZIP archive uses unsupported encryption flags.")
+            if general_flags & 0x0008:
+                raise ValueError("Backup bundle ZIP archive uses an unsupported data descriptor.")
+            if compression_method not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+                raise ValueError(
+                    "Backup bundle ZIP archive uses an unsupported compression method."
+                )
+            if (
+                compressed_size == 0xFFFFFFFF
+                or expanded_size == 0xFFFFFFFF
+                or disk_start == 0xFFFF
+                or local_offset == 0xFFFFFFFF
+            ):
+                raise ValueError("Backup bundle ZIP archive uses unsupported ZIP64 metadata.")
+            record_end = cursor + 46 + filename_size + extra_size + comment_size
+            if record_end > directory_end:
+                raise ValueError("Backup bundle ZIP archive directory record is truncated.")
+            if local_offset + 30 > directory_offset:
+                raise ValueError("Backup bundle ZIP archive local header is invalid.")
+            local_header = struct.unpack_from("<4s5H3I2H", archive_bytes, local_offset)
+            if (
+                local_header[0] != b"PK\x03\x04"
+                or local_header[1] != central[2]
+                or local_header[2] != general_flags
+                or local_header[3] != compression_method
+                or local_header[4] != central[5]
+                or local_header[5] != central[6]
+            ):
+                raise ValueError("Backup bundle ZIP archive local header is inconsistent.")
+            local_crc, local_compressed_size, local_expanded_size = local_header[6:9]
+            if (
+                local_compressed_size == 0xFFFFFFFF
+                or local_expanded_size == 0xFFFFFFFF
+            ):
+                raise ValueError("Backup bundle ZIP archive uses unsupported ZIP64 metadata.")
+            if (
+                local_crc != central[7]
+                or local_compressed_size != compressed_size
+                or local_expanded_size != expanded_size
+            ):
+                raise ValueError("Backup bundle ZIP archive local header is inconsistent.")
+            local_filename_size, local_extra_size = local_header[9:11]
+            local_record_end = local_offset + 30 + local_filename_size + local_extra_size
+            if local_record_end > directory_offset:
+                raise ValueError("Backup bundle ZIP archive local header is truncated.")
+            local_data_end = local_record_end + compressed_size
+            if local_data_end > directory_offset:
+                raise ValueError("Backup bundle ZIP archive member data is truncated.")
+            local_ranges.append((local_offset, local_data_end))
+            central_filename = archive_bytes[cursor + 46 : cursor + 46 + filename_size]
+            local_filename = archive_bytes[local_offset + 30 : local_offset + 30 + local_filename_size]
+            if central_filename != local_filename:
+                raise ValueError("Backup bundle ZIP archive member names are inconsistent.")
+            local_extra = archive_bytes[
+                local_offset + 30 + local_filename_size : local_record_end
+            ]
+            cls._validate_zip_extra_metadata(local_extra)
+            extra = archive_bytes[cursor + 46 + filename_size : cursor + 46 + filename_size + extra_size]
+            cls._validate_zip_extra_metadata(extra)
+            declared_entries.append((compressed_size, expanded_size))
+            parsed_count += 1
+            if parsed_count > MAX_ARCHIVE_MEMBER_COUNT:
+                raise ValueError("Backup bundle archive contains too many members.")
+            cursor = record_end
+        if cursor != directory_end or parsed_count != total_entries:
+            raise ValueError("Backup bundle ZIP archive directory entry count is invalid.")
+        for (_, previous_end), (current_start, _) in zip(
+            sorted(local_ranges),
+            sorted(local_ranges)[1:],
+        ):
+            if current_start < previous_end:
+                raise ValueError("Backup bundle ZIP archive local records overlap.")
+        cls._validate_declared_archive_limits(declared_entries)
+
+    @staticmethod
+    def _parse_tar_octal(field: bytes, *, label: str) -> int:
+        if field and field[0] & 0x80:
+            raise ValueError(f"Backup bundle TAR {label} uses unsupported binary metadata.")
+        stripped = field.rstrip(b"\0 ").lstrip(b" ")
+        if not stripped:
+            return 0
+        if any(byte not in b"01234567" for byte in stripped):
+            raise ValueError(f"Backup bundle TAR {label} is invalid.")
+        return int(stripped, 8)
+
+    @classmethod
+    def _parse_pax_path(cls, payload: bytes) -> str:
+        attributes: dict[str, str] = {}
+        cursor = 0
+        while cursor < len(payload):
+            separator = payload.find(b" ", cursor)
+            if separator <= cursor:
+                raise ValueError("Backup bundle TAR PAX metadata is malformed.")
+            raw_length = payload[cursor:separator]
+            if (
+                not raw_length.isdigit()
+                or len(raw_length) > 20
+                or (len(raw_length) > 1 and raw_length.startswith(b"0"))
+            ):
+                raise ValueError("Backup bundle TAR PAX metadata is malformed.")
+            record_length = int(raw_length)
+            record_end = cursor + record_length
+            if record_length <= separator - cursor + 2 or record_end > len(payload):
+                raise ValueError("Backup bundle TAR PAX metadata is malformed.")
+            record = payload[separator + 1 : record_end]
+            if not record.endswith(b"\n") or b"=" not in record:
+                raise ValueError("Backup bundle TAR PAX metadata is malformed.")
+            raw_key, raw_value = record[:-1].split(b"=", 1)
+            try:
+                key = raw_key.decode("ascii")
+                value = raw_value.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Backup bundle TAR PAX metadata is not valid UTF-8.") from exc
+            if key != "path":
+                raise ValueError(f"Backup bundle TAR PAX metadata key is unsupported: {key}")
+            if key in attributes:
+                raise ValueError("Backup bundle TAR PAX metadata contains a duplicate key.")
+            attributes[key] = value
+            cursor = record_end
+        if set(attributes) != {"path"}:
+            raise ValueError("Backup bundle TAR PAX metadata must declare exactly one path.")
+        return cls._normalize_archive_member_path(attributes["path"])
+
+    @classmethod
+    def _preflight_tar_archive(cls, tar_bytes: bytes) -> list[str]:
+        if not tar_bytes or len(tar_bytes) % 512:
+            raise ValueError("Backup bundle TAR archive framing is invalid.")
+        paths: list[str] = []
+        expanded_total = 0
+        metadata_total = 0
+        physical_count = 0
+        pending_pax_path: str | None = None
+        cursor = 0
+        while cursor + 512 <= len(tar_bytes):
+            header = tar_bytes[cursor : cursor + 512]
+            if header == b"\0" * 512:
+                if cursor + 1024 > len(tar_bytes) or tar_bytes[cursor + 512 : cursor + 1024] != b"\0" * 512:
+                    raise ValueError("Backup bundle TAR archive trailer is truncated.")
+                if any(tar_bytes[cursor + 1024 :]):
+                    raise ValueError("Backup bundle TAR archive has non-zero trailing data.")
+                if pending_pax_path is not None:
+                    raise ValueError("Backup bundle TAR PAX metadata has no following member.")
+                if not paths:
+                    raise ValueError("Backup bundle TAR archive contains no members.")
+                return paths
+
+            if header[257:263] != b"ustar\0" or header[263:265] != b"00":
+                raise ValueError("Backup bundle TAR archive is not strict USTAR format.")
+            stored_checksum = cls._parse_tar_octal(header[148:156], label="checksum")
+            checksum_header = bytearray(header)
+            checksum_header[148:156] = b" " * 8
+            if sum(checksum_header) != stored_checksum:
+                raise ValueError("Backup bundle TAR archive checksum is invalid.")
+            member_type = header[156:157]
+            if member_type not in {b"0", b"\0", b"x"}:
+                raise ValueError("Backup bundle TAR archive contains an unsupported member type.")
+
+            member_size = cls._parse_tar_octal(header[124:136], label="member size")
+            if member_size > MAX_ARCHIVE_MEMBER_BYTES:
+                raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+            expanded_total += member_size
+            if expanded_total > MAX_ARCHIVE_EXPANDED_BYTES:
+                raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
+
+            physical_count += 1
+            if physical_count > MAX_ARCHIVE_MEMBER_COUNT:
+                raise ValueError("Backup bundle archive contains too many members.")
+
+            padded_size = ((member_size + 511) // 512) * 512
+            member_data_start = cursor + 512
+            member_data_end = member_data_start + member_size
+            next_cursor = member_data_start + padded_size
+            if next_cursor > len(tar_bytes):
+                raise ValueError("Backup bundle TAR member data is truncated.")
+
+            if member_type == b"x":
+                if pending_pax_path is not None:
+                    raise ValueError("Backup bundle TAR archive has stacked PAX metadata.")
+                metadata_total += member_size
+                if metadata_total > MAX_ARCHIVE_METADATA_BYTES:
+                    raise ValueError("Backup bundle TAR metadata exceeds its byte limit.")
+                pending_pax_path = cls._parse_pax_path(
+                    tar_bytes[member_data_start:member_data_end]
+                )
+                cursor = next_cursor
+                continue
+
+            name_bytes = header[0:100].split(b"\0", 1)[0]
+            prefix_bytes = header[345:500].split(b"\0", 1)[0]
+            try:
+                name = name_bytes.decode("utf-8")
+                prefix = prefix_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Backup bundle TAR member name is not valid UTF-8.") from exc
+            archive_path = pending_pax_path or (f"{prefix}/{name}" if prefix else name)
+            paths.append(cls._normalize_archive_member_path(archive_path))
+            pending_pax_path = None
+            cursor = next_cursor
+        raise ValueError("Backup bundle TAR archive is missing its trailer.")
+
+    @classmethod
+    def _validate_zip_members(cls, members: list[zipfile.ZipInfo]) -> None:
+        cls._validate_declared_archive_limits(
+            [(member.compress_size, member.file_size) for member in members]
+        )
+
+    @classmethod
+    def _read_bounded_tar_members(cls, archive: tarfile.TarFile) -> list[tarfile.TarInfo]:
+        members: list[tarfile.TarInfo] = []
+        expanded_total = 0
+        while True:
+            member = archive.next()
+            if member is None:
+                break
+            members.append(member)
+            if len(members) > MAX_ARCHIVE_MEMBER_COUNT:
+                raise ValueError("Backup bundle archive contains too many members.")
+            if not member.isfile():
+                raise ValueError("Backup bundle TAR archive contains an unsupported member type.")
+            cls._normalize_archive_member_path(member.name)
+            if member.size > MAX_ARCHIVE_MEMBER_BYTES:
+                raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+            expanded_total += member.size
+            if expanded_total > MAX_ARCHIVE_EXPANDED_BYTES:
+                raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
+        return members
+
+    @classmethod
+    def _validate_supported_physical_archive_paths(
+        cls,
+        physical_paths: list[str],
+        manifest: dict[str, Any],
+    ) -> None:
+        expected_paths = {"manifest.json"}
+        expected_paths.update(entry["archive_path"] for entry in cls._manifest_file_entries(manifest))
+        normalized_physical = {cls._normalize_archive_member_path(path) for path in physical_paths}
+        if normalized_physical - expected_paths:
+            raise ValueError("Backup bundle archive contains a member not declared in its manifest.")
+
+    @classmethod
+    def _validate_7z_listed_entries(
+        cls,
+        entries: list[dict[str, str]],
+        *,
+        archive_size: int,
+    ) -> None:
+        declared: list[tuple[int, int]] = []
+        materialized_paths: set[str] = set()
+        for entry in entries:
+            normalized_path = cls._normalize_archive_member_path(entry.get("Path", ""))
+            path_parts = normalized_path.split("/")
+            materialized_paths.add(normalized_path)
+            materialized_paths.update(
+                "/".join(path_parts[:index])
+                for index in range(1, len(path_parts))
+            )
+            if len(materialized_paths) > MAX_ARCHIVE_MEMBER_COUNT:
+                raise ValueError("Backup bundle archive contains too many members.")
+            is_directory = cls._is_7z_directory_entry(entry)
+            attributes = entry.get("Attributes", "")
+            attribute_tokens = attributes.split()
+            if (
+                entry.get("Symbolic Link")
+                or entry.get("Hard Link")
+                or any(len(token) >= 10 and token.startswith("l") for token in attribute_tokens)
+            ):
+                raise ValueError("Backup bundle 7z archive contains an unsupported link.")
+            try:
+                expanded_size = int(entry.get("Size", "0" if is_directory else ""))
+            except ValueError as exc:
+                raise ValueError("Backup bundle 7z member size metadata is invalid.") from exc
+            raw_packed_size = entry.get("Packed Size", "").strip()
+            packed_size = 0
+            if raw_packed_size:
+                try:
+                    packed_size = int(raw_packed_size)
+                except ValueError as exc:
+                    raise ValueError("Backup bundle 7z packed-size metadata is invalid.") from exc
+                if expanded_size > MAX_ARCHIVE_COMPRESSION_RATIO * max(packed_size, 1):
+                    raise ValueError(
+                        "Backup bundle archive member compression ratio exceeds its limit."
+                    )
+            declared.append((packed_size, expanded_size))
+        cls._validate_declared_archive_limits(declared, compressed_total=archive_size)
+
+    @staticmethod
+    def _is_7z_directory_entry(entry: dict[str, str]) -> bool:
+        return entry.get("Folder") == "+" or entry.get("Attributes", "").startswith("D")
+
+    @classmethod
+    def _validate_extracted_7z_tree(
+        cls,
+        extract_dir: Path,
+        listed_entries: list[dict[str, str]],
+    ) -> None:
+        expected_sizes = {
+            cls._normalize_archive_member_path(entry["Path"]): int(entry["Size"])
+            for entry in listed_entries
+            if not cls._is_7z_directory_entry(entry)
+        }
+        expected_directories = {
+            cls._normalize_archive_member_path(entry["Path"])
+            for entry in listed_entries
+            if cls._is_7z_directory_entry(entry)
+        }
+        actual_sizes: dict[str, int] = {}
+        actual_directories: set[str] = set()
+        for root, directories, filenames in os.walk(extract_dir, followlinks=False):
+            root_path = Path(root)
+            for directory in directories:
+                directory_path = root_path / directory
+                if directory_path.is_symlink():
+                    raise ValueError("Backup bundle 7z archive extracted an unsupported link.")
+                actual_directories.add(
+                    cls._normalize_archive_member_path(
+                        directory_path.relative_to(extract_dir).as_posix()
+                    )
+                )
+            for filename in filenames:
+                file_path = root_path / filename
+                if file_path.is_symlink() or not file_path.is_file():
+                    raise ValueError("Backup bundle 7z archive extracted an unsupported file type.")
+                relative = cls._normalize_archive_member_path(
+                    file_path.relative_to(extract_dir).as_posix()
+                )
+                actual_sizes[relative] = file_path.stat().st_size
+        if actual_sizes != expected_sizes:
+            raise ValueError("Backup bundle 7z extracted members do not match its listing.")
+        if not expected_directories.issubset(actual_directories):
+            raise ValueError("Backup bundle 7z extracted directories do not match its listing.")
 
     def _extract_manifest_zip_members(
         self,
@@ -2235,7 +2804,7 @@ class SystemBackupService:
             seen.add(normalized_path)
 
     @staticmethod
-    def _seven_zip_listed_paths(output: str, archive_path: Path) -> list[str]:
+    def _seven_zip_listed_entries(output: str, archive_path: Path) -> list[dict[str, str]]:
         entries: list[dict[str, str]] = []
         current: dict[str, str] = {}
         for raw_line in output.splitlines():
@@ -2252,14 +2821,15 @@ class SystemBackupService:
         if current:
             entries.append(current)
 
-        archive_name = str(archive_path)
+        archive_names = {str(archive_path), archive_path.name}
         return [
-            entry["Path"]
+            entry
             for entry in entries
             if entry.get("Path")
-            and entry["Path"] != archive_name
-            and not entry.get("Attributes", "").startswith("D")
-            and entry.get("Folder") != "+"
+            and not (
+                entry["Path"] in archive_names
+                and entry.get("Type") == "7z"
+            )
         ]
 
     @staticmethod
@@ -2271,7 +2841,8 @@ class SystemBackupService:
             raise ValueError(f"Backup bundle archive member path is invalid: {archive_path}") from exc
         return target_path
 
-    def _manifest_file_entries(self, manifest: dict[str, Any]) -> list[dict[str, str]]:
+    @classmethod
+    def _manifest_file_entries(cls, manifest: dict[str, Any]) -> list[dict[str, str]]:
         entries: list[dict[str, str]] = []
         for index, raw_entry in enumerate(manifest.get("files", [])):
             if not isinstance(raw_entry, dict):
@@ -2279,7 +2850,7 @@ class SystemBackupService:
             raw_archive_path = str(raw_entry.get("archive_path") or "").strip()
             if not raw_archive_path:
                 continue
-            archive_path = self._normalize_archive_member_path(raw_archive_path)
+            archive_path = cls._normalize_archive_member_path(raw_archive_path)
             key = str(raw_entry.get("key") or archive_path or f"member-{index}").strip()
             group_key = str(raw_entry.get("group_key") or raw_entry.get("key") or key).strip()
             entries.append(
@@ -2481,21 +3052,85 @@ class SystemBackupService:
             return "7z"
         return None
 
-    @staticmethod
-    def _decompress_tar_archive(archive_bytes: bytes, packaging: ArchivePackaging) -> bytes:
+    @classmethod
+    def _decompress_single_gzip_member(cls, archive_bytes: bytes) -> bytes:
+        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        content = bytearray()
+        ratio_limit = MAX_ARCHIVE_COMPRESSION_RATIO * max(len(archive_bytes), 1)
+        output_limit = min(MAX_ARCHIVE_EXPANDED_BYTES, ratio_limit)
+
+        def reject_output_limit() -> None:
+            if ratio_limit <= MAX_ARCHIVE_EXPANDED_BYTES:
+                raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
+            raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
+
+        for offset in range(0, len(archive_bytes), ARCHIVE_READ_CHUNK_BYTES):
+            chunk = archive_bytes[offset : offset + ARCHIVE_READ_CHUNK_BYTES]
+            content.extend(
+                decompressor.decompress(
+                    chunk,
+                    output_limit - len(content) + 1,
+                )
+            )
+            if len(content) > output_limit:
+                reject_output_limit()
+            if decompressor.eof:
+                trailing = decompressor.unused_data + archive_bytes[offset + len(chunk) :]
+                if trailing:
+                    raise ValueError("Backup bundle tar.gz archive contains concatenated gzip data.")
+                break
+        if not decompressor.eof:
+            raise ValueError("Backup bundle tar.gz archive is corrupted.")
+        content.extend(decompressor.flush(output_limit - len(content) + 1))
+        if len(content) > output_limit:
+            reject_output_limit()
+        return bytes(content)
+
+    @classmethod
+    def _decompress_single_zstd_frame(cls, archive_bytes: bytes) -> bytes:
+        if zstd is None:
+            raise ValueError("tar.zst import requires the optional 'zstandard' dependency.")
+        declared_size = zstd.frame_content_size(archive_bytes)
+        if declared_size in {zstd.CONTENTSIZE_ERROR, zstd.CONTENTSIZE_UNKNOWN}:
+            raise ValueError("Backup bundle tar.zst archive has unsupported frame metadata.")
+        if declared_size > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
+        if declared_size > MAX_ARCHIVE_COMPRESSION_RATIO * max(len(archive_bytes), 1):
+            raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
+        decompressor = zstd.ZstdDecompressor().decompressobj()
+        content = decompressor.decompress(archive_bytes)
+        if not decompressor.eof:
+            raise ValueError("Backup bundle tar.zst archive is corrupted.")
+        if decompressor.unused_data:
+            raise ValueError("Backup bundle tar.zst archive contains concatenated zstd data.")
+        content += decompressor.flush()
+        if len(content) != declared_size:
+            raise ValueError("Backup bundle tar.zst archive size does not match its frame metadata.")
+        return content
+
+    @classmethod
+    def _decompress_tar_archive(
+        cls,
+        archive_bytes: bytes,
+        packaging: ArchivePackaging,
+    ) -> bytes:
         if packaging == "tar.gz":
             try:
-                return gzip.decompress(archive_bytes)
-            except OSError as exc:
+                tar_bytes = cls._decompress_single_gzip_member(archive_bytes)
+            except zlib.error as exc:
                 raise ValueError("Backup bundle tar.gz archive is corrupted.") from exc
-        if packaging == "tar.zst":
+        elif packaging == "tar.zst":
             if zstd is None:
                 raise ValueError("tar.zst import requires the optional 'zstandard' dependency.")
             try:
-                return zstd.ZstdDecompressor().decompress(archive_bytes)
+                tar_bytes = cls._decompress_single_zstd_frame(archive_bytes)
             except zstd.ZstdError as exc:
                 raise ValueError("Backup bundle tar.zst archive is corrupted.") from exc
-        raise ValueError(f"Unsupported tar archive packaging '{packaging}'.")
+        else:
+            raise ValueError(f"Unsupported tar archive packaging '{packaging}'.")
+        if len(tar_bytes) > MAX_ARCHIVE_COMPRESSION_RATIO * max(len(archive_bytes), 1):
+            raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
+        return tar_bytes
 
     def _run_7z_command(
         self,
@@ -2504,15 +3139,71 @@ class SystemBackupService:
         cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run(
-                [SEVEN_ZIP_BINARY, *args],
+            command = [SEVEN_ZIP_BINARY, *args]
+            process = subprocess.Popen(
+                command,
                 cwd=str(cwd) if cwd is not None else None,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=SEVEN_ZIP_TIMEOUT_SECONDS,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if process.stdout is None or process.stderr is None:
+                process.kill()
+                raise ValueError("Portable 7z backup command output could not be captured.")
+
+            overflow = threading.Event()
+            read_errors: list[Exception] = []
+            stdout_content = bytearray()
+            stderr_content = bytearray()
+
+            def read_bounded(stream: Any, target: bytearray) -> None:
+                try:
+                    while True:
+                        remaining = MAX_7Z_COMMAND_OUTPUT_BYTES - len(target)
+                        chunk = stream.read(min(ARCHIVE_READ_CHUNK_BYTES, remaining + 1))
+                        if not chunk:
+                            return
+                        target.extend(chunk)
+                        if len(target) > MAX_7Z_COMMAND_OUTPUT_BYTES:
+                            overflow.set()
+                            process.kill()
+                            return
+                except Exception as exc:  # pragma: no cover - OS pipe failures are rare
+                    read_errors.append(exc)
+                    process.kill()
+
+            stdout_thread = threading.Thread(
+                target=read_bounded,
+                args=(process.stdout, stdout_content),
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=read_bounded,
+                args=(process.stderr, stderr_content),
+                daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+            try:
+                returncode = process.wait(timeout=SEVEN_ZIP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise
+            finally:
+                stdout_thread.join()
+                stderr_thread.join()
+                process.stdout.close()
+                process.stderr.close()
+
+            if overflow.is_set():
+                raise ValueError("Portable 7z backup command output exceeded its byte limit.")
+            if read_errors:
+                raise ValueError("Portable 7z backup command output could not be read.") from read_errors[0]
+            return subprocess.CompletedProcess(
+                command,
+                returncode,
+                stdout=stdout_content.decode("utf-8", errors="replace"),
+                stderr=stderr_content.decode("utf-8", errors="replace"),
             )
         except FileNotFoundError as exc:
             raise ValueError(

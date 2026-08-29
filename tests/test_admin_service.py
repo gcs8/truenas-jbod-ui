@@ -21,6 +21,7 @@ from admin_service.main import build_admin_state_payload
 from admin_service.main import decode_optional_secret_header
 from admin_service.main import enrich_quantastor_nodes_from_ssh
 from admin_service.main import get_history_store
+from admin_service.main import read_limited_request_body
 from admin_service.main import templates as admin_templates
 from app.config import (
     AdminSurfaceConfig,
@@ -75,6 +76,62 @@ def make_request(host: str = "localhost", port: int = 8082) -> Request:
             "server": (host, port),
         }
     )
+
+
+def make_streaming_request(
+    chunks: list[bytes],
+    *,
+    content_length: int | None = None,
+) -> tuple[Request, MagicMock]:
+    receive_probe = MagicMock()
+    pending = list(chunks)
+
+    async def receive() -> dict[str, object]:
+        receive_probe()
+        if pending:
+            body = pending.pop(0)
+            return {"type": "http.request", "body": body, "more_body": bool(pending)}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    headers = [(b"host", b"admin.example.test")]
+    if content_length is not None:
+        headers.append((b"content-length", str(content_length).encode("ascii")))
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/admin/backup/import",
+            "raw_path": b"/api/admin/backup/import",
+            "query_string": b"",
+            "headers": headers,
+            "client": ("127.0.0.1", 12345),
+            "server": ("admin.example.test", 80),
+        },
+        receive,
+    )
+    return request, receive_probe
+
+
+class BackupImportRequestLimitTests(unittest.TestCase):
+    def test_declared_oversize_body_is_rejected_without_reading_stream(self) -> None:
+        request, receive_probe = make_streaming_request([b"ignored"], content_length=5)
+
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(read_limited_request_body(request, max_bytes=4))
+
+        self.assertEqual(raised.exception.status_code, 413)
+        receive_probe.assert_not_called()
+
+    def test_chunked_body_stops_when_cumulative_limit_is_crossed(self) -> None:
+        request, receive_probe = make_streaming_request([b"abc", b"def"])
+
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(read_limited_request_body(request, max_bytes=4))
+
+        self.assertEqual(raised.exception.status_code, 413)
+        self.assertEqual(receive_probe.call_count, 2)
 
 
 class MainAppBoundaryTests(unittest.TestCase):

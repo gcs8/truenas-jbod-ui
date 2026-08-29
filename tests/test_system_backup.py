@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import io
 import json
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
+import tarfile
 import tempfile
 import unittest
 import warnings
@@ -30,12 +33,14 @@ from app.services.demo_system_factory import DemoSystemFactory
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.system_setup import PRESERVE_SECRET_SENTINEL, SystemSetupService
 from history_service.config import HistorySettings
+from history_service import system_backup as system_backup_module
 from history_service.domain import MetricSample, SlotStateRecord
 from history_service.store import HistoryStore
 from history_service.system_backup import (
     BACKUP_GROUP_METADATA,
     BUNDLE_FORMAT,
     BUNDLE_SCHEMA_VERSION,
+    BundleMember,
     CONFIG_FILE_KEY,
     DEBUG_BUNDLE_FORMAT,
     HISTORY_DB_KEY,
@@ -343,6 +348,606 @@ class SystemBackupServiceTests(unittest.TestCase):
             "files": files,
         }
         return SystemBackupServiceTests._build_zip_bundle(manifest, archive_members)
+
+    def test_import_rejects_oversized_archive_before_format_processing(self) -> None:
+        with patch("history_service.system_backup.MAX_BACKUP_ARCHIVE_BYTES", 4):
+            with self.assertRaisesRegex(ValueError, "archive exceeds"):
+                self.backup_service.import_bundle(b"PK123")
+
+    def test_zip_member_limit_rejects_before_zipfile_construction(self) -> None:
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [],
+        }
+        bundle = self._build_zip_bundle(
+            manifest,
+            {f"ignored-{index}.txt": b"" for index in range(3)},
+        )
+
+        with (
+            patch("history_service.system_backup.MAX_ARCHIVE_MEMBER_COUNT", 3),
+            patch(
+                "history_service.system_backup.zipfile.ZipFile",
+                side_effect=AssertionError("ZipFile must not run before member-count rejection"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "too many members"):
+                self.backup_service.import_bundle(bundle)
+
+    def test_zip_member_limit_counts_directory_records_instead_of_trusting_footer(self) -> None:
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [],
+        }
+        bundle = bytearray(
+            self._build_zip_bundle(
+                manifest,
+                {f"ignored-{index}.txt": b"" for index in range(3)},
+            )
+        )
+        footer_offset = bundle.rfind(b"PK\x05\x06")
+        self.assertGreaterEqual(footer_offset, 0)
+        struct.pack_into("<HH", bundle, footer_offset + 8, 1, 1)
+
+        with (
+            patch("history_service.system_backup.MAX_ARCHIVE_MEMBER_COUNT", 3),
+            patch(
+                "history_service.system_backup.zipfile.ZipFile",
+                side_effect=AssertionError("ZipFile must not run before member-count rejection"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "too many members"):
+                self.backup_service.import_bundle(bytes(bundle))
+
+    def test_zip_rejects_later_eocd_signature_hidden_in_footer_comment(self) -> None:
+        bundle = bytearray(
+            self._build_zip_bundle(
+                {
+                    "schema_version": BUNDLE_SCHEMA_VERSION,
+                    "format": BUNDLE_FORMAT,
+                    "groups": [],
+                    "files": [],
+                }
+            )
+        )
+        footer_offset = bundle.rfind(b"PK\x05\x06")
+        self.assertGreaterEqual(footer_offset, 0)
+        hidden_footer = struct.pack(
+            "<4s4H2IH",
+            b"PK\x05\x06",
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+        )
+        comment = b"prefix" + hidden_footer + b"trailing"
+        bundle.extend(comment)
+        struct.pack_into("<H", bundle, footer_offset + 20, len(comment))
+
+        with patch(
+            "history_service.system_backup.zipfile.ZipFile",
+            side_effect=AssertionError("ZipFile must not resolve a different EOCD footer"),
+        ):
+            with self.assertRaisesRegex(ValueError, "invalid or ambiguous directory footer"):
+                self.backup_service.import_bundle(bytes(bundle))
+
+    def test_zip_compression_ratio_counts_ignored_members(self) -> None:
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [],
+        }
+        bundle = self._build_zip_bundle(manifest, {"ignored-bomb.bin": b"0" * 4096})
+
+        with patch("history_service.system_backup.MAX_ARCHIVE_COMPRESSION_RATIO", 2):
+            with self.assertRaisesRegex(ValueError, "compression ratio"):
+                self.backup_service.import_bundle(bundle)
+
+    def test_zip_rejects_unsupported_compression_before_zipfile_construction(self) -> None:
+        bundle = bytearray(
+            self._build_zip_bundle(
+                {
+                    "schema_version": BUNDLE_SCHEMA_VERSION,
+                    "format": BUNDLE_FORMAT,
+                    "groups": [],
+                    "files": [],
+                }
+            )
+        )
+        local_offset = bundle.find(b"PK\x03\x04")
+        central_offset = bundle.find(b"PK\x01\x02")
+        self.assertGreaterEqual(local_offset, 0)
+        self.assertGreaterEqual(central_offset, 0)
+        struct.pack_into("<H", bundle, local_offset + 8, 99)
+        struct.pack_into("<H", bundle, central_offset + 10, 99)
+
+        with patch(
+            "history_service.system_backup.zipfile.ZipFile",
+            side_effect=AssertionError("ZipFile must not run for unsupported compression"),
+        ):
+            with self.assertRaisesRegex(ValueError, "compression method"):
+                self.backup_service.import_bundle(bytes(bundle))
+
+    def test_zip_rejects_encryption_flags_before_zipfile_construction(self) -> None:
+        bundle = bytearray(
+            self._build_zip_bundle(
+                {
+                    "schema_version": BUNDLE_SCHEMA_VERSION,
+                    "format": BUNDLE_FORMAT,
+                    "groups": [],
+                    "files": [],
+                }
+            )
+        )
+        local_offset = bundle.find(b"PK\x03\x04")
+        central_offset = bundle.find(b"PK\x01\x02")
+        self.assertGreaterEqual(local_offset, 0)
+        self.assertGreaterEqual(central_offset, 0)
+        struct.pack_into("<H", bundle, local_offset + 6, 1)
+        struct.pack_into("<H", bundle, central_offset + 8, 1)
+
+        with patch(
+            "history_service.system_backup.zipfile.ZipFile",
+            side_effect=AssertionError("ZipFile must not run for encrypted ZIP input"),
+        ):
+            with self.assertRaisesRegex(ValueError, "encryption"):
+                self.backup_service.import_bundle(bytes(bundle))
+
+    def test_zip_rejects_local_zip64_size_sentinels_before_zipfile_construction(self) -> None:
+        bundle = bytearray(
+            self._build_zip_bundle(
+                {
+                    "schema_version": BUNDLE_SCHEMA_VERSION,
+                    "format": BUNDLE_FORMAT,
+                    "groups": [],
+                    "files": [],
+                }
+            )
+        )
+        local_offset = bundle.find(b"PK\x03\x04")
+        self.assertGreaterEqual(local_offset, 0)
+        struct.pack_into("<II", bundle, local_offset + 18, 0xFFFFFFFF, 0xFFFFFFFF)
+
+        with patch(
+            "history_service.system_backup.zipfile.ZipFile",
+            side_effect=AssertionError("ZipFile must not run for local ZIP64 metadata"),
+        ):
+            with self.assertRaisesRegex(ValueError, "ZIP64"):
+                self.backup_service.import_bundle(bytes(bundle))
+
+    def test_zip_rejects_local_crc_mismatch_before_zipfile_construction(self) -> None:
+        bundle = bytearray(
+            self._build_zip_bundle(
+                {
+                    "schema_version": BUNDLE_SCHEMA_VERSION,
+                    "format": BUNDLE_FORMAT,
+                    "groups": [],
+                    "files": [],
+                }
+            )
+        )
+        local_offset = bundle.find(b"PK\x03\x04")
+        self.assertGreaterEqual(local_offset, 0)
+        original_crc = struct.unpack_from("<I", bundle, local_offset + 14)[0]
+        struct.pack_into("<I", bundle, local_offset + 14, original_crc ^ 0xFFFFFFFF)
+
+        with patch(
+            "history_service.system_backup.zipfile.ZipFile",
+            side_effect=AssertionError("ZipFile must not run for inconsistent local metadata"),
+        ):
+            with self.assertRaisesRegex(ValueError, "local header is inconsistent"):
+                self.backup_service.import_bundle(bytes(bundle))
+
+    def test_zip_rejects_local_zip64_extra_before_zipfile_construction(self) -> None:
+        bundle = bytearray(
+            self._build_zip_bundle(
+                {
+                    "schema_version": BUNDLE_SCHEMA_VERSION,
+                    "format": BUNDLE_FORMAT,
+                    "groups": [],
+                    "files": [],
+                }
+            )
+        )
+        local_offset = bundle.find(b"PK\x03\x04")
+        central_offset = bundle.find(b"PK\x01\x02")
+        self.assertGreaterEqual(local_offset, 0)
+        self.assertGreaterEqual(central_offset, 0)
+        local_filename_size = struct.unpack_from("<H", bundle, local_offset + 26)[0]
+        local_extra_size = struct.unpack_from("<H", bundle, local_offset + 28)[0]
+        zip64_extra = struct.pack("<HHQ", 0x0001, 8, 0)
+        insert_offset = local_offset + 30 + local_filename_size + local_extra_size
+        bundle[insert_offset:insert_offset] = zip64_extra
+        struct.pack_into(
+            "<H",
+            bundle,
+            local_offset + 28,
+            local_extra_size + len(zip64_extra),
+        )
+        footer_offset = bundle.rfind(b"PK\x05\x06")
+        self.assertGreaterEqual(footer_offset, 0)
+        struct.pack_into("<I", bundle, footer_offset + 16, central_offset + len(zip64_extra))
+
+        with patch(
+            "history_service.system_backup.zipfile.ZipFile",
+            side_effect=AssertionError("ZipFile must not run for local ZIP64 extra metadata"),
+        ):
+            with self.assertRaisesRegex(ValueError, "ZIP64"):
+                self.backup_service.import_bundle(bytes(bundle))
+
+    def test_manifest_schema_version_rejects_json_boolean(self) -> None:
+        bundle = self._build_zip_bundle(
+            {
+                "schema_version": True,
+                "format": BUNDLE_FORMAT,
+                "groups": [],
+                "files": [],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "schema version"):
+            self.backup_service.import_bundle(bundle)
+
+    def test_manifest_rejects_duplicate_json_keys_before_materialization(self) -> None:
+        manifest_bytes = (
+            b'{"schema_version":2,"schema_version":1,"format":"'
+            + BUNDLE_FORMAT.encode("ascii")
+            + b'","groups":[],"files":[]}'
+        )
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("manifest.json", manifest_bytes)
+
+        with self.assertRaisesRegex(ValueError, "duplicate JSON key"):
+            self.backup_service.import_bundle(buffer.getvalue())
+
+    def test_manifest_rejects_duplicate_member_reference_before_payload_extraction(self) -> None:
+        content = b"payload"
+        entry = {
+            "key": "duplicate",
+            "group_key": SSH_KEYS_KEY,
+            "archive_path": "config/ssh/duplicate",
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        bundle = self._build_zip_bundle(
+            {
+                "schema_version": BUNDLE_SCHEMA_VERSION,
+                "format": BUNDLE_FORMAT,
+                "groups": [],
+                "files": [entry, dict(entry)],
+            },
+            {entry["archive_path"]: content},
+        )
+
+        with patch.object(
+            self.backup_service,
+            "_extract_manifest_zip_members",
+            side_effect=AssertionError("payload extraction must not start"),
+        ):
+            with self.assertRaisesRegex(ValueError, "duplicate member key"):
+                self.backup_service.import_bundle(bundle)
+
+    def test_manifest_rejects_non_list_group_and_file_collections(self) -> None:
+        for field_name in ("groups", "files"):
+            with self.subTest(field_name=field_name):
+                manifest = {
+                    "schema_version": BUNDLE_SCHEMA_VERSION,
+                    "format": BUNDLE_FORMAT,
+                    "groups": [],
+                    "files": [],
+                    field_name: {},
+                }
+                bundle = self._build_zip_bundle(manifest)
+
+                with self.assertRaisesRegex(ValueError, f"{field_name} must be a list"):
+                    self.backup_service.import_bundle(bundle)
+
+    def test_tar_expanded_byte_limit_rejects_before_member_reads(self) -> None:
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [],
+        }
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            manifest_bytes = json.dumps(manifest).encode("utf-8")
+            manifest_info = tarfile.TarInfo("manifest.json")
+            manifest_info.size = len(manifest_bytes)
+            archive.addfile(manifest_info, io.BytesIO(manifest_bytes))
+            ignored = b"x" * 2048
+            ignored_info = tarfile.TarInfo("ignored.bin")
+            ignored_info.size = len(ignored)
+            archive.addfile(ignored_info, io.BytesIO(ignored))
+
+        with patch("history_service.system_backup.MAX_ARCHIVE_EXPANDED_BYTES", 1024):
+            with self.assertRaisesRegex(ValueError, "expanded data exceeds"):
+                self.backup_service.import_bundle(buffer.getvalue())
+
+    def test_tar_member_limit_counts_ignored_members(self) -> None:
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [],
+        }
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            manifest_bytes = json.dumps(manifest).encode("utf-8")
+            manifest_info = tarfile.TarInfo("manifest.json")
+            manifest_info.size = len(manifest_bytes)
+            archive.addfile(manifest_info, io.BytesIO(manifest_bytes))
+            for index in range(3):
+                info = tarfile.TarInfo(f"ignored-{index}.txt")
+                info.size = 0
+                archive.addfile(info, io.BytesIO())
+
+        with patch("history_service.system_backup.MAX_ARCHIVE_MEMBER_COUNT", 3):
+            with self.assertRaisesRegex(ValueError, "too many members"):
+                self.backup_service.import_bundle(buffer.getvalue())
+
+    def test_tar_rejects_unsupported_pax_metadata_before_logical_member_parsing(self) -> None:
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [],
+        }
+        tar_buffer = io.BytesIO()
+        with tarfile.open(fileobj=tar_buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            manifest_bytes = json.dumps(manifest).encode("utf-8")
+            manifest_info = tarfile.TarInfo("manifest.json")
+            manifest_info.size = len(manifest_bytes)
+            manifest_info.pax_headers = {"comment": "x" * 2048}
+            archive.addfile(manifest_info, io.BytesIO(manifest_bytes))
+        compressed = gzip.compress(tar_buffer.getvalue())
+
+        with self.assertRaisesRegex(ValueError, "PAX metadata key"):
+            self.backup_service.import_bundle(compressed)
+
+    def test_tar_rejects_oversized_pax_path_before_logical_member_parsing(self) -> None:
+        tar_buffer = io.BytesIO()
+        with tarfile.open(fileobj=tar_buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            member_info = tarfile.TarInfo(f"config/ssh/{'a' * 2048}")
+            member_info.size = 0
+            archive.addfile(member_info, io.BytesIO())
+        compressed = gzip.compress(tar_buffer.getvalue())
+
+        with patch("history_service.system_backup.MAX_ARCHIVE_MEMBER_BYTES", 256):
+            with self.assertRaisesRegex(ValueError, "member exceeds"):
+                self.backup_service.import_bundle(compressed)
+
+    def test_tar_member_limit_counts_physical_pax_headers(self) -> None:
+        tar_buffer = io.BytesIO()
+        with tarfile.open(fileobj=tar_buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            for suffix in ("a", "b"):
+                member_info = tarfile.TarInfo(f"config/ssh/{suffix * 120}")
+                member_info.size = 0
+                archive.addfile(member_info, io.BytesIO())
+
+        with patch("history_service.system_backup.MAX_ARCHIVE_MEMBER_COUNT", 3):
+            with self.assertRaisesRegex(ValueError, "too many members"):
+                self.backup_service._preflight_tar_archive(tar_buffer.getvalue())
+
+    def test_tar_gzip_export_round_trip_preserves_long_member_path(self) -> None:
+        content = b"long-path-content"
+        archive_path = f"config/ssh/{'a' * 120}"
+        member = BundleMember(
+            key="ssh-long-path",
+            group_key=SSH_KEYS_KEY,
+            archive_path=archive_path,
+            source_path=None,
+            present=True,
+            content=content,
+        )
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "packaging": "tar.gz",
+            "groups": [],
+            "files": [
+                {
+                    "key": member.key,
+                    "group_key": member.group_key,
+                    "archive_path": archive_path,
+                    "size_bytes": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            ],
+        }
+
+        archive_bytes = self.backup_service._build_archive([member], manifest, "tar.gz")
+        restored_manifest, extracted, packaging, _ = self.backup_service._read_archive(
+            archive_bytes
+        )
+
+        self.assertEqual(packaging, "tar.gz")
+        self.assertEqual(restored_manifest, manifest)
+        self.assertEqual(extracted, {member.key: content})
+
+    def test_tar_gzip_rejects_concatenated_member_before_archive_parse(self) -> None:
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [],
+        }
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            manifest_bytes = json.dumps(manifest).encode("utf-8")
+            manifest_info = tarfile.TarInfo("manifest.json")
+            manifest_info.size = len(manifest_bytes)
+            archive.addfile(manifest_info, io.BytesIO(manifest_bytes))
+        concatenated = buffer.getvalue() + gzip.compress(b"\0" * 1024)
+
+        with self.assertRaisesRegex(ValueError, "concatenated gzip"):
+            self.backup_service.import_bundle(concatenated)
+
+    def test_tar_gzip_applies_ratio_cap_during_decompression(self) -> None:
+        observed_max_lengths: list[int] = []
+
+        class FakeDecompressor:
+            eof = True
+            unused_data = b""
+
+            def decompress(self, chunk: bytes, max_length: int) -> bytes:
+                observed_max_lengths.append(max_length)
+                return b""
+
+            def flush(self, length: int) -> bytes:
+                return b""
+
+        archive_bytes = b"x" * 100
+        with (
+            patch("history_service.system_backup.MAX_ARCHIVE_COMPRESSION_RATIO", 2),
+            patch("history_service.system_backup.MAX_ARCHIVE_EXPANDED_BYTES", 10_000),
+            patch(
+                "history_service.system_backup.zlib.decompressobj",
+                return_value=FakeDecompressor(),
+            ),
+        ):
+            self.backup_service._decompress_single_gzip_member(archive_bytes)
+
+        self.assertEqual(observed_max_lengths, [201])
+
+    def test_tar_zstd_rejects_concatenated_frame_before_archive_parse(self) -> None:
+        if system_backup_module.zstd is None:
+            self.skipTest("zstandard is not installed")
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [],
+        }
+        tar_buffer = io.BytesIO()
+        with tarfile.open(fileobj=tar_buffer, mode="w") as archive:
+            manifest_bytes = json.dumps(manifest).encode("utf-8")
+            manifest_info = tarfile.TarInfo("manifest.json")
+            manifest_info.size = len(manifest_bytes)
+            archive.addfile(manifest_info, io.BytesIO(manifest_bytes))
+        compressor = system_backup_module.zstd.ZstdCompressor()
+        concatenated = compressor.compress(tar_buffer.getvalue()) + compressor.compress(b"\0" * 1024)
+
+        with self.assertRaisesRegex(ValueError, "concatenated zstd"):
+            self.backup_service.import_bundle(concatenated)
+
+    def test_7z_limits_count_and_ratio_from_listing_before_extraction(self) -> None:
+        entries = [
+            {"Path": "manifest.json", "Size": "100", "Packed Size": "10"},
+            {"Path": "ignored.bin", "Size": "100", "Packed Size": "1"},
+        ]
+        with patch("history_service.system_backup.MAX_ARCHIVE_MEMBER_COUNT", 1):
+            with self.assertRaisesRegex(ValueError, "too many members"):
+                self.backup_service._validate_7z_listed_entries(entries, archive_size=100)
+        with patch("history_service.system_backup.MAX_ARCHIVE_COMPRESSION_RATIO", 1):
+            with self.assertRaisesRegex(ValueError, "compression ratio"):
+                self.backup_service._validate_7z_listed_entries(entries, archive_size=100)
+
+    def test_7z_listing_enforces_available_per_member_packed_sizes(self) -> None:
+        entries = [
+            {"Path": "manifest.json", "Size": "100", "Packed Size": "1"},
+            {"Path": "padding.bin", "Size": "100", "Packed Size": "199"},
+        ]
+
+        with patch("history_service.system_backup.MAX_ARCHIVE_COMPRESSION_RATIO", 10):
+            with self.assertRaisesRegex(ValueError, "member compression ratio"):
+                self.backup_service._validate_7z_listed_entries(entries, archive_size=1000)
+
+    def test_7z_member_limit_counts_directory_entries(self) -> None:
+        output = "\n\n".join(
+            [
+                "Path = bundle.7z\nType = 7z",
+                "Path = config\nFolder = +\nAttributes = D....\nSize = 0",
+                "Path = config/ssh\nFolder = +\nAttributes = D....\nSize = 0",
+                "Path = data\nFolder = +\nAttributes = D....\nSize = 0",
+                "Path = manifest.json\nFolder = -\nSize = 100\nPacked Size = 100",
+            ]
+        )
+        entries = self.backup_service._seven_zip_listed_entries(
+            output,
+            Path("bundle.7z"),
+        )
+
+        with patch("history_service.system_backup.MAX_ARCHIVE_MEMBER_COUNT", 1):
+            with self.assertRaisesRegex(ValueError, "too many members"):
+                self.backup_service._validate_7z_listed_entries(entries, archive_size=1000)
+
+    def test_7z_listing_does_not_hide_member_matching_archive_basename(self) -> None:
+        output = "\n\n".join(
+            [
+                "Path = /tmp/bundle.7z\nType = 7z",
+                "Path = bundle.7z\nFolder = -\nSize = 100\nPacked Size = 100",
+            ]
+        )
+
+        entries = self.backup_service._seven_zip_listed_entries(
+            output,
+            Path("/tmp/bundle.7z"),
+        )
+
+        self.assertEqual([entry["Path"] for entry in entries], ["bundle.7z"])
+
+    def test_7z_member_limit_counts_implicit_extraction_directories(self) -> None:
+        entries = [
+            {
+                "Path": "one/two/manifest.json",
+                "Folder": "-",
+                "Size": "100",
+                "Packed Size": "100",
+            }
+        ]
+
+        with patch("history_service.system_backup.MAX_ARCHIVE_MEMBER_COUNT", 2):
+            with self.assertRaisesRegex(ValueError, "too many members"):
+                self.backup_service._validate_7z_listed_entries(entries, archive_size=1000)
+
+    def test_7z_listing_rejects_symbolic_links_before_extraction(self) -> None:
+        entries = [
+            {
+                "Path": "config/ssh/escape",
+                "Size": "0",
+                "Packed Size": "0",
+                "Symbolic Link": "../../outside",
+            }
+        ]
+
+        with self.assertRaisesRegex(ValueError, "link"):
+            self.backup_service._validate_7z_listed_entries(entries, archive_size=100)
+
+    def test_7z_command_output_is_killed_when_runtime_cap_is_crossed(self) -> None:
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = io.BytesIO(b"12345")
+                self.stderr = io.BytesIO()
+                self.returncode: int | None = None
+                self.killed = False
+
+            def wait(self, timeout: int | None = None) -> int:
+                self.returncode = -9 if self.killed else 0
+                return self.returncode
+
+            def kill(self) -> None:
+                self.killed = True
+                self.returncode = -9
+
+        process = FakeProcess()
+
+        with (
+            patch("history_service.system_backup.MAX_7Z_COMMAND_OUTPUT_BYTES", 4),
+            patch("history_service.system_backup.subprocess.Popen", return_value=process),
+        ):
+            with self.assertRaisesRegex(ValueError, "command output exceeded"):
+                self.backup_service._run_7z_command(["l", "bundle.7z"])
+        self.assertTrue(process.killed)
 
     def test_directory_member_paths_reject_absolute_and_traversal_entries(self) -> None:
         invalid_paths = [
@@ -883,6 +1488,8 @@ class SystemBackupServiceTests(unittest.TestCase):
                     [
                         "",
                         f"Path = {relative_path}",
+                        f"Size = {len(stored_files[relative_path])}",
+                        f"Packed Size = {len(stored_files[relative_path])}",
                         f"Encrypted = {'+' if archive_encrypted else '-'}",
                     ]
                 )

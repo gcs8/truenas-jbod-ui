@@ -75,6 +75,7 @@ from app.services.parsers import normalize_text
 from history_service.config import get_history_settings
 from history_service.store import HistoryStore
 from history_service.system_backup import (
+    MAX_BACKUP_ARCHIVE_BYTES,
     SystemBackupService,
     default_backup_included_paths,
     default_debug_included_paths,
@@ -168,6 +169,31 @@ def validate_admin_export_policy(
         "Plaintext backup export is disabled. Enable encryption or explicitly set "
         "ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true for a trusted-operator deployment."
     )
+
+
+async def read_limited_request_body(
+    request: Request,
+    *,
+    max_bytes: int = MAX_BACKUP_ARCHIVE_BYTES,
+) -> bytes:
+    raw_content_length = request.headers.get("content-length")
+    if raw_content_length is not None:
+        try:
+            content_length = int(raw_content_length)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Content-Length must be an integer.") from exc
+        if content_length < 0:
+            raise HTTPException(status_code=400, detail="Content-Length must not be negative.")
+        if content_length > max_bytes:
+            raise HTTPException(status_code=413, detail="Backup import request body is too large.")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > max_bytes:
+            raise HTTPException(status_code=413, detail="Backup import request body is too large.")
+        body.extend(chunk)
+    return bytes(body)
+
 
 SERVICE_STARTED_AT = datetime.now(timezone.utc)
 
@@ -550,7 +576,7 @@ def create_app() -> FastAPI:
         stop_services: bool = Query(default=True),
         restart_services: bool = Query(default=True),
     ) -> JSONResponse:
-        content = await request.body()
+        content = await read_limited_request_body(request)
         if not content:
             raise HTTPException(status_code=400, detail="Backup import request body was empty.")
 
