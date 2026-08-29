@@ -4889,6 +4889,18 @@
     }
   }
 
+  function restartFailureKeys(failures) {
+    if (!failures || typeof failures !== "object") {
+      return "";
+    }
+    return Object.keys(failures).filter(Boolean).join(",");
+  }
+
+  function describeRestartFailures(failureKeys) {
+    const keys = String(failureKeys || "").split(",").map((key) => key.trim()).filter(Boolean);
+    return keys.length ? ` Restart failed: ${keys.join(", ")}.` : "";
+  }
+
   function describeApiError(detail) {
     if (detail === undefined || detail === null || detail === "") {
       return "";
@@ -5390,10 +5402,15 @@
       window.URL.revokeObjectURL(objectUrl);
       const stopped = response.headers.get("X-Admin-Stopped-Containers") || "none";
       const restarted = response.headers.get("X-Admin-Restarted-Containers") || "none";
+      const restartFailures = response.headers.get("X-Admin-Restart-Failures") || "";
       if (elements.backupExportResult) {
-        elements.backupExportResult.textContent = `Exported ${actualPackaging}. Stopped: ${stopped}. Restarted: ${restarted}.`;
+        elements.backupExportResult.textContent = `Exported ${actualPackaging}. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(restartFailures)}`;
       }
-      setBanner(`Full backup exported as ${actualPackaging}.`, "success");
+      if (restartFailures) {
+        setBanner(`Full backup exported as ${actualPackaging}, but these containers did not restart: ${restartFailures}. Use the runtime cards to start them.`, "error");
+      } else {
+        setBanner(`Full backup exported as ${actualPackaging}.`, "success");
+      }
       await refreshState({ quiet: true });
     } catch (error) {
       if (elements.backupExportResult) {
@@ -5460,6 +5477,7 @@
       window.URL.revokeObjectURL(objectUrl);
       const stopped = response.headers.get("X-Admin-Stopped-Containers") || "none";
       const restarted = response.headers.get("X-Admin-Restarted-Containers") || "none";
+      const restartFailures = response.headers.get("X-Admin-Restart-Failures") || "";
       const scrubbed = [];
       if (response.headers.get("X-Debug-Scrub-Secrets") === "true") {
         scrubbed.push("secrets");
@@ -5469,9 +5487,13 @@
       }
       const scrubLabel = scrubbed.length ? `Scrubbed ${scrubbed.join(" + ")}` : "Raw";
       if (elements.debugExportResult) {
-        elements.debugExportResult.textContent = `${scrubLabel} ${actualPackaging} debug bundle exported. Stopped: ${stopped}. Restarted: ${restarted}.`;
+        elements.debugExportResult.textContent = `${scrubLabel} ${actualPackaging} debug bundle exported. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(restartFailures)}`;
       }
-      setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}.`, "success");
+      if (restartFailures) {
+        setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}, but these containers did not restart: ${restartFailures}. Use the runtime cards to start them.`, "error");
+      } else {
+        setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}.`, "success");
+      }
       await refreshState({ quiet: true });
     } catch (error) {
       if (elements.debugExportResult) {
@@ -5520,12 +5542,17 @@
       }
       state.systems = Array.isArray(payload.systems) ? payload.systems : state.systems;
       state.defaultSystemId = payload.default_system_id || state.defaultSystemId;
+      const importRestartFailures = restartFailureKeys(payload.restart_failures);
       if (elements.backupImportResult) {
         const stopped = Array.isArray(payload.stopped_containers) ? payload.stopped_containers.join(", ") || "none" : "none";
         const restarted = Array.isArray(payload.restarted_containers) ? payload.restarted_containers.join(", ") || "none" : "none";
-        elements.backupImportResult.textContent = `Imported ${file.name}. Stopped: ${stopped}. Restarted: ${restarted}.`;
+        elements.backupImportResult.textContent = `Imported ${file.name}. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(importRestartFailures)}`;
       }
-      setBanner(`Full backup imported from ${file.name}.`, "success");
+      if (importRestartFailures) {
+        setBanner(`Full backup imported from ${file.name}, but these containers did not restart: ${importRestartFailures}. Use the runtime cards to start them.`, "error");
+      } else {
+        setBanner(`Full backup imported from ${file.name}.`, "success");
+      }
       await refreshState({ quiet: true });
     } catch (error) {
       if (elements.backupImportResult) {

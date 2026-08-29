@@ -368,6 +368,7 @@ def create_app() -> FastAPI:
                 "X-Backup-Schema-Version": str(artifact.manifest.get("schema_version") or 1),
                 "X-Admin-Stopped-Containers": ",".join(maintenance.stopped_containers),
                 "X-Admin-Restarted-Containers": ",".join(maintenance.restarted_containers),
+                "X-Admin-Restart-Failures": ",".join(maintenance.restart_failures),
             },
         )
 
@@ -401,6 +402,7 @@ def create_app() -> FastAPI:
                 "X-Debug-Scrub-Disk-Identifiers": "true" if payload.scrub_disk_identifiers else "false",
                 "X-Admin-Stopped-Containers": ",".join(maintenance.stopped_containers),
                 "X-Admin-Restarted-Containers": ",".join(maintenance.restarted_containers),
+                "X-Admin-Restart-Failures": ",".join(maintenance.restart_failures),
             },
         )
 
@@ -442,6 +444,10 @@ def create_app() -> FastAPI:
         )
         if restart_services:
             await asyncio.to_thread(runtime_service.clear_restart_required, impacted)
+            if maintenance.restart_failures:
+                # These were stopped for the import and could not be started again;
+                # keep them flagged so the runtime cards do not imply they came back.
+                await asyncio.to_thread(runtime_service.mark_restart_required, tuple(maintenance.restart_failures))
         else:
             await asyncio.to_thread(runtime_service.mark_restart_required, impacted)
         return JSONResponse(
@@ -451,6 +457,7 @@ def create_app() -> FastAPI:
                 "default_system_id": settings.default_system_id,
                 "stopped_containers": maintenance.stopped_containers,
                 "restarted_containers": maintenance.restarted_containers,
+                "restart_failures": dict(maintenance.restart_failures),
                 "runtime": await build_runtime_payload(runtime_service),
             }
         )
