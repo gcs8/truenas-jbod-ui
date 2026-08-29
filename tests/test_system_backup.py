@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -12,6 +13,7 @@ import unittest
 import warnings
 import zipfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import yaml
@@ -47,6 +49,7 @@ from history_service.system_backup import (
     TLS_TRUST_KEY,
     KNOWN_HOSTS_KEY,
     SystemBackupService,
+    _ImportActivationTransaction,
 )
 
 
@@ -582,6 +585,28 @@ class SystemBackupServiceTests(unittest.TestCase):
             assert original_backup is not None
             self.store.restore_backup(original_backup)
 
+    def test_history_member_validation_closes_sqlite_connection(self) -> None:
+        real_connect = sqlite3.connect
+        opened_connections: list[sqlite3.Connection] = []
+
+        def tracking_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+            connection = real_connect(*args, **kwargs)
+            opened_connections.append(connection)
+            return connection
+
+        with patch(
+            "history_service.system_backup.sqlite3.connect",
+            side_effect=tracking_connect,
+        ):
+            SystemBackupService._validate_history_member(self.history_db_path.read_bytes())
+
+        self.assertEqual(len(opened_connections), 1)
+        try:
+            with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
+                opened_connections[0].execute("SELECT 1")
+        finally:
+            opened_connections[0].close()
+
     def test_import_rejects_duplicate_physical_zip_member_paths(self) -> None:
         content = b'{"slot_mappings": {}}'
         archive_path = str(BACKUP_GROUP_METADATA[MAPPING_FILE_KEY]["archive_root"])
@@ -995,6 +1020,451 @@ class SystemBackupServiceTests(unittest.TestCase):
                     self.known_hosts_path.read_text(encoding="utf-8"),
                     "archive-core.local ssh-ed25519 AAAATEST\n",
                 )
+
+    def test_import_rolls_back_all_live_state_when_final_validation_fails(self) -> None:
+        def tree_bytes(root: Path) -> dict[str, bytes]:
+            if not root.exists():
+                return {}
+            return {
+                str(path.relative_to(root)): path.read_bytes()
+                for path in sorted(root.rglob("*"))
+                if path.is_file()
+            }
+
+        included_paths = [
+            CONFIG_FILE_KEY,
+            RUNTIME_OVERRIDES_FILE_KEY,
+            PROFILE_FILE_KEY,
+            MAPPING_FILE_KEY,
+            SAS_FABRIC_ALIAS_FILE_KEY,
+            SLOT_DETAIL_FILE_KEY,
+            HISTORY_DB_KEY,
+            SSH_KEYS_KEY,
+            TLS_TRUST_KEY,
+            KNOWN_HOSTS_KEY,
+        ]
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with patch.object(self.backup_service, "_run_7z_command", side_effect=self._fake_7z_command):
+                artifact = self.backup_service.export_bundle(
+                    encrypt=True,
+                    passphrase="topsecret",
+                    packaging="7z",
+                    included_paths=included_paths,
+                )
+
+                live_config = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+                live_config.setdefault("app", {})["refresh_interval_seconds"] = 999
+                write_yaml(self.config_path, live_config)
+                write_yaml(
+                    self.runtime_overrides_path,
+                    {"app": {"source_bundle_cache_ttl_seconds": 456}},
+                )
+                live_profiles = yaml.safe_load(self.profile_path.read_text(encoding="utf-8"))
+                if not isinstance(live_profiles, dict):
+                    raise AssertionError("Expected mapping-form profile fixture.")
+                live_profile_entries = live_profiles.setdefault("profiles", [])
+                live_profile_entries.append(
+                    {
+                        "id": "live-only-profile",
+                        "label": "Live Only Profile",
+                        "rows": 1,
+                        "columns": 1,
+                        "slot_layout": [[0]],
+                    }
+                )
+                write_yaml(self.profile_path, live_profiles)
+                sas_alias_path = self.temp_dir / "sas_fabric_aliases.json"
+                self.mapping_path.write_text('{"slot_mappings": {}}\n', encoding="utf-8")
+                sas_alias_path.write_text('{"sas_fabric_aliases": {}}\n', encoding="utf-8")
+                self.slot_detail_path.write_text('{"slot_details": {}}\n', encoding="utf-8")
+                (self.ssh_dir / "id_truenas").write_text("LIVE-PRIVATE-KEY\n", encoding="utf-8")
+                (self.ssh_dir / "live-extra.pub").write_text("LIVE-PUBLIC-KEY\n", encoding="utf-8")
+                (self.tls_dir / "archive-core.pem").write_text("LIVE-CERTIFICATE\n", encoding="utf-8")
+                self.known_hosts_path.write_text("live-host ssh-ed25519 LIVEKEY\n", encoding="utf-8")
+                self.store.insert_metric_samples(
+                    [
+                        MetricSample(
+                            observed_at="2026-04-18T10:05:00+00:00",
+                            system_id="archive-core",
+                            system_label="Archive CORE",
+                            enclosure_key="enc-a",
+                            enclosure_id="enc-a",
+                            enclosure_label="Front Shelf",
+                            slot=0,
+                            slot_label="00",
+                            metric_name="temperature_c",
+                            value_integer=37,
+                            value_real=None,
+                            device_name="da0",
+                            serial="SERIAL-0",
+                            model="Drive 0",
+                            state="healthy",
+                        )
+                    ]
+                )
+
+                expected_files = {
+                    self.config_path: self.config_path.read_bytes(),
+                    self.runtime_overrides_path: self.runtime_overrides_path.read_bytes(),
+                    self.profile_path: self.profile_path.read_bytes(),
+                    self.mapping_path: self.mapping_path.read_bytes(),
+                    sas_alias_path: sas_alias_path.read_bytes(),
+                    self.slot_detail_path: self.slot_detail_path.read_bytes(),
+                    self.known_hosts_path: self.known_hosts_path.read_bytes(),
+                }
+                expected_ssh = tree_bytes(self.ssh_dir)
+                expected_tls = tree_bytes(self.tls_dir)
+                expected_counts = self.store.counts()
+                real_load_settings = self.backup_service._load_app_settings
+                load_calls = 0
+
+                def fail_after_history_activation():
+                    nonlocal load_calls
+                    load_calls += 1
+                    if load_calls == 5:
+                        raise RuntimeError("injected final validation failure")
+                    return real_load_settings()
+
+                with patch.object(
+                    self.backup_service,
+                    "_load_app_settings",
+                    side_effect=fail_after_history_activation,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "injected final validation failure"):
+                        self.backup_service.import_bundle(
+                            artifact.content,
+                            passphrase="topsecret",
+                        )
+
+                self.assertEqual(load_calls, 5)
+                for path, expected_content in expected_files.items():
+                    with self.subTest(path=path):
+                        self.assertEqual(path.read_bytes(), expected_content)
+                self.assertEqual(tree_bytes(self.ssh_dir), expected_ssh)
+                self.assertEqual(tree_bytes(self.tls_dir), expected_tls)
+                self.assertEqual(self.store.counts(), expected_counts)
+
+    def test_directory_activation_failure_keeps_original_tree_intact(self) -> None:
+        target_dir = self.temp_dir / "transaction-directory"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / "original.key").write_bytes(b"ORIGINAL")
+        transaction = _ImportActivationTransaction(
+            {"first": b"FIRST", "second": b"SECOND"}
+        )
+        real_copyfile = shutil.copyfile
+
+        def fail_second_copy(source, destination, *args, **kwargs):
+            if Path(destination).name == "second.key":
+                raise OSError("injected staging write failure")
+            return real_copyfile(source, destination, *args, **kwargs)
+
+        with self.assertRaisesRegex(OSError, "injected staging write failure"):
+            with transaction:
+                with patch(
+                    "history_service.system_backup.shutil.copyfile",
+                    side_effect=fail_second_copy,
+                ):
+                    transaction.activate_directory(
+                        target_dir,
+                        [("first", Path("first.key")), ("second", Path("second.key"))],
+                    )
+
+        self.assertEqual(
+            {
+                str(path.relative_to(target_dir)): path.read_bytes()
+                for path in target_dir.rglob("*")
+                if path.is_file()
+            },
+            {"original.key": b"ORIGINAL"},
+        )
+
+    def test_rollback_continues_after_failure_and_preserves_recovery_material(self) -> None:
+        first_path = self.temp_dir / "first-live.txt"
+        second_path = self.temp_dir / "second-live.txt"
+        third_path = self.temp_dir / "third-live.txt"
+        first_path.write_bytes(b"FIRST-ORIGINAL")
+        second_path.write_bytes(b"SECOND-ORIGINAL")
+        third_path.write_bytes(b"THIRD-ORIGINAL")
+        transaction = _ImportActivationTransaction(
+            {
+                "first": b"FIRST-IMPORTED",
+                "second": b"SECOND-IMPORTED",
+                "third": b"THIRD-IMPORTED",
+            }
+        )
+        transaction_root = transaction.root
+        real_restore_target = transaction._restore_target
+        attempted_paths: list[Path] = []
+
+        def fail_two_restores(entry):
+            attempted_paths.append(entry.target_path)
+            if entry.target_path == third_path:
+                raise OSError("injected third rollback failure")
+            if entry.target_path == second_path:
+                raise OSError("injected second rollback failure")
+            return real_restore_target(entry)
+
+        try:
+            with self.assertRaisesRegex(RuntimeError, "rollback.*incomplete") as raised:
+                with patch.object(
+                    transaction,
+                    "_restore_target",
+                    side_effect=fail_two_restores,
+                ):
+                    with transaction:
+                        transaction.activate_file(first_path, "first")
+                        transaction.activate_file(second_path, "second")
+                        transaction.activate_file(third_path, "third")
+                        raise ValueError("original import failure")
+
+            self.assertEqual(attempted_paths, [third_path, second_path, first_path])
+            self.assertEqual(first_path.read_bytes(), b"FIRST-ORIGINAL")
+            self.assertEqual(second_path.read_bytes(), b"SECOND-IMPORTED")
+            self.assertEqual(third_path.read_bytes(), b"THIRD-IMPORTED")
+            self.assertIsInstance(raised.exception.__cause__, ValueError)
+            self.assertRegex(str(raised.exception.__cause__), "original import failure")
+            self.assertIn("injected second rollback failure", str(raised.exception))
+            self.assertIn("injected third rollback failure", str(raised.exception))
+            self.assertTrue(transaction_root.exists())
+        finally:
+            shutil.rmtree(transaction_root, ignore_errors=True)
+
+    def test_file_target_collision_with_history_is_rejected_before_history_activation(self) -> None:
+        rollback_dir = self.temp_dir / "collision-history-snapshot"
+        history_snapshot = self.store.create_backup(rollback_dir, retention_count=1)
+        self.assertIsNotNone(history_snapshot)
+        assert history_snapshot is not None
+        imported_config = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        imported_config["paths"]["mapping_file"] = str(self.history_db_path)
+        bundle = self._build_selected_group_bundle(
+            {
+                CONFIG_FILE_KEY: yaml.safe_dump(imported_config, sort_keys=False).encode("utf-8"),
+                MAPPING_FILE_KEY: b'{"version": 1, "slot_mappings": {}}',
+                HISTORY_DB_KEY: history_snapshot.read_bytes(),
+            }
+        )
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with patch.object(self.store, "restore_backup", wraps=self.store.restore_backup) as restore:
+                with self.assertRaisesRegex(ValueError, "collides with the history database"):
+                    self.backup_service.import_bundle(bundle)
+
+        restore.assert_not_called()
+
+    def test_file_target_collision_with_unselected_history_is_rejected(self) -> None:
+        imported_config = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        imported_config["paths"]["mapping_file"] = str(self.history_db_path)
+        bundle = self._build_selected_group_bundle(
+            {
+                CONFIG_FILE_KEY: yaml.safe_dump(imported_config, sort_keys=False).encode("utf-8"),
+                MAPPING_FILE_KEY: b'{"version": 1, "slot_mappings": {}}',
+            }
+        )
+        expected_counts = self.store.counts()
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "collides with the history database"):
+                self.backup_service.import_bundle(bundle)
+
+        self.assertEqual(self.store.counts(), expected_counts)
+
+    def test_symlinked_history_target_is_rejected_before_snapshot_or_activation(self) -> None:
+        source_dir = self.temp_dir / "symlink-history-source"
+        source_path = self.store.create_backup(source_dir, retention_count=1)
+        self.assertIsNotNone(source_path)
+        assert source_path is not None
+        real_path = self.temp_dir / "real-history.sqlite3"
+        shutil.copyfile(source_path, real_path)
+        symlink_path = self.temp_dir / "symlink-history.sqlite3"
+        symlink_path.symlink_to(real_path)
+        symlink_store = HistoryStore(str(symlink_path))
+        transaction = _ImportActivationTransaction({"history": source_path.read_bytes()})
+
+        with patch.object(symlink_store, "create_backup", wraps=symlink_store.create_backup) as snapshot:
+            with patch.object(symlink_store, "restore_backup", wraps=symlink_store.restore_backup) as restore:
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    with transaction:
+                        transaction.activate_history(symlink_store, "history")
+
+        snapshot.assert_not_called()
+        restore.assert_not_called()
+        self.assertTrue(symlink_path.is_symlink())
+
+    def test_history_rollback_uses_store_snapshot_and_clears_sidecars(self) -> None:
+        imported_source_dir = self.temp_dir / "imported-history-source"
+        imported_source = self.store.create_backup(imported_source_dir, retention_count=1)
+        self.assertIsNotNone(imported_source)
+        assert imported_source is not None
+        expected_counts = self.store.counts()
+        transaction = _ImportActivationTransaction({"history": imported_source.read_bytes()})
+
+        with patch.object(self.store, "create_backup", wraps=self.store.create_backup) as snapshot:
+            with patch.object(self.store, "restore_backup", wraps=self.store.restore_backup) as restore:
+                with self.assertRaisesRegex(RuntimeError, "late failure"):
+                    with transaction:
+                        transaction.activate_history(self.store, "history")
+                        Path(f"{self.history_db_path}-wal").write_bytes(b"stale-wal")
+                        Path(f"{self.history_db_path}-shm").write_bytes(b"stale-shm")
+                        raise RuntimeError("late failure")
+
+        self.assertEqual(snapshot.call_count, 1)
+        self.assertEqual(restore.call_count, 2)
+        self.assertEqual(self.store.counts(), expected_counts)
+        self.assertFalse(Path(f"{self.history_db_path}-wal").exists())
+        self.assertFalse(Path(f"{self.history_db_path}-shm").exists())
+
+    def test_history_snapshot_fsyncs_rollback_directory_hierarchy(self) -> None:
+        imported_source_dir = self.temp_dir / "durable-history-source"
+        imported_source = self.store.create_backup(imported_source_dir, retention_count=1)
+        self.assertIsNotNone(imported_source)
+        assert imported_source is not None
+        transaction = _ImportActivationTransaction({"history": imported_source.read_bytes()})
+        real_fsync_directory = transaction._fsync_directory
+        fsynced_paths: list[Path] = []
+
+        def record_directory_fsync(path: Path) -> None:
+            fsynced_paths.append(path)
+            real_fsync_directory(path)
+
+        with patch.object(transaction, "_fsync_directory", side_effect=record_directory_fsync):
+            with transaction:
+                transaction.activate_history(self.store, "history")
+                transaction.commit()
+
+        self.assertIn(transaction.rollback_root, fsynced_paths)
+
+    def test_directory_open_fsync_failure_fails_activation_and_restores_original(self) -> None:
+        target_path = self.temp_dir / "fsync-live.txt"
+        target_path.write_bytes(b"ORIGINAL")
+        transaction = _ImportActivationTransaction({"member": b"IMPORTED"})
+        real_open = os.open
+        failed = False
+
+        def fail_first_target_directory_open(path, flags, *args, **kwargs):
+            nonlocal failed
+            if Path(path) == target_path.parent and not failed:
+                failed = True
+                raise OSError("injected directory open failure")
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch("history_service.system_backup.os.open", side_effect=fail_first_target_directory_open):
+            with self.assertRaisesRegex(OSError, "injected directory open failure"):
+                with transaction:
+                    transaction.activate_file(target_path, "member")
+
+        self.assertTrue(failed)
+        self.assertEqual(target_path.read_bytes(), b"ORIGINAL")
+
+    def test_directory_staging_fsyncs_nested_hierarchy_before_publication(self) -> None:
+        target_dir = self.temp_dir / "durable-directory"
+        transaction = _ImportActivationTransaction({"member": b"KEY"})
+        real_fsync_directory = transaction._fsync_directory
+        fsynced_names: list[str] = []
+
+        def record_directory_fsync(path: Path) -> None:
+            fsynced_names.append(path.name)
+            real_fsync_directory(path)
+
+        with patch.object(transaction, "_fsync_directory", side_effect=record_directory_fsync):
+            with transaction:
+                transaction.activate_directory(
+                    target_dir,
+                    [("member", Path("nested/deeper/id_key"))],
+                )
+                transaction.commit()
+
+        self.assertIn("deeper", fsynced_names)
+        self.assertIn("nested", fsynced_names)
+        self.assertTrue(any(name.startswith(f".{target_dir.name}.restore-") for name in fsynced_names))
+
+    def test_rollback_removes_created_parent_hierarchy_and_sibling_artifacts(self) -> None:
+        hierarchy_root = self.temp_dir / "new-parent"
+        target_path = hierarchy_root / "nested" / "live.txt"
+        transaction = _ImportActivationTransaction({"member": b"IMPORTED"})
+
+        with self.assertRaisesRegex(RuntimeError, "late activation failure"):
+            with transaction:
+                transaction.activate_file(target_path, "member")
+                raise RuntimeError("late activation failure")
+
+        self.assertFalse(hierarchy_root.exists())
+        self.assertEqual(list(self.temp_dir.rglob("*.restore-*")), [])
+        self.assertEqual(list(self.temp_dir.rglob("*.previous-*")), [])
+
+    def test_file_staging_descriptor_failure_removes_sibling_artifact(self) -> None:
+        target_path = self.temp_dir / "descriptor-live.txt"
+        target_path.write_bytes(b"ORIGINAL")
+        transaction = _ImportActivationTransaction({"member": b"IMPORTED"})
+        real_close = os.close
+        failed = False
+
+        def fail_first_close(descriptor: int) -> None:
+            nonlocal failed
+            real_close(descriptor)
+            if not failed:
+                failed = True
+                raise OSError("injected descriptor close failure")
+
+        with patch("history_service.system_backup.os.close", side_effect=fail_first_close):
+            with self.assertRaisesRegex(OSError, "injected descriptor close failure"):
+                with transaction:
+                    transaction.activate_file(target_path, "member")
+
+        self.assertTrue(failed)
+        self.assertEqual(target_path.read_bytes(), b"ORIGINAL")
+        self.assertEqual(list(self.temp_dir.glob(".descriptor-live.txt.restore-*")), [])
+
+    def test_activation_preserves_modes_for_existing_file_and_directory_entries(self) -> None:
+        file_target = self.temp_dir / "mode-file.txt"
+        file_target.write_bytes(b"ORIGINAL")
+        file_target.chmod(0o640)
+        directory_target = self.temp_dir / "mode-directory"
+        nested_target = directory_target / "nested"
+        nested_target.mkdir(parents=True)
+        directory_target.chmod(0o750)
+        nested_target.chmod(0o710)
+        existing_key = nested_target / "id_key"
+        existing_key.write_bytes(b"ORIGINAL-KEY")
+        existing_key.chmod(0o600)
+        transaction = _ImportActivationTransaction(
+            {"file": b"IMPORTED", "key": b"IMPORTED-KEY"}
+        )
+
+        with transaction:
+            transaction.activate_file(file_target, "file")
+            transaction.activate_directory(
+                directory_target,
+                [("key", Path("nested/id_key"))],
+            )
+            transaction.commit()
+
+        self.assertEqual(file_target.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(directory_target.stat().st_mode & 0o777, 0o750)
+        self.assertEqual(nested_target.stat().st_mode & 0o777, 0o710)
+        self.assertEqual(existing_key.stat().st_mode & 0o777, 0o600)
+
+    def test_activation_applies_private_modes_to_missing_targets(self) -> None:
+        file_target = self.temp_dir / "missing-file.txt"
+        directory_target = self.temp_dir / "missing-directory"
+        transaction = _ImportActivationTransaction(
+            {"file": b"IMPORTED", "key": b"IMPORTED-KEY"}
+        )
+
+        with transaction:
+            transaction.activate_file(file_target, "file")
+            transaction.activate_directory(
+                directory_target,
+                [("key", Path("nested/id_key"))],
+            )
+            transaction.commit()
+
+        self.assertEqual(file_target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(directory_target.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((directory_target / "nested").stat().st_mode & 0o777, 0o700)
+        self.assertEqual((directory_target / "nested/id_key").stat().st_mode & 0o777, 0o600)
 
     def test_debug_bundle_scrubs_config_and_identifier_fields(self) -> None:
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):

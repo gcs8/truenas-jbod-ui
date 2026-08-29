@@ -15,6 +15,13 @@ class DockerRuntimeError(RuntimeError):
     pass
 
 
+# Docker only answers a stop/restart request after the container has actually stopped,
+# which can take the full `t=` grace period. The HTTP read timeout for those calls must
+# therefore exceed the grace period, or a slow-but-successful stop is reported as a
+# failure and the maintenance flow aborts against a container that is still shutting down.
+CONTAINER_CONTROL_RESPONSE_GRACE_SECONDS = 15
+
+
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
     def __init__(self, socket_path: str, timeout: int = 5) -> None:
         super().__init__("localhost", timeout=timeout)
@@ -100,8 +107,20 @@ class DockerRuntimeService:
             if item.get("key") in requested and item.get("running")
         ]
 
+    @property
+    def _stop_grace_seconds(self) -> int:
+        return max(0, int(self.settings.container_control_timeout_seconds))
+
+    @property
+    def _control_response_timeout_seconds(self) -> int:
+        return self._stop_grace_seconds + CONTAINER_CONTROL_RESPONSE_GRACE_SECONDS
+
     def stop_container(self, key: str) -> None:
-        self._request("POST", f"/containers/{self._quoted_name(key)}/stop?t={self.settings.container_control_timeout_seconds}")
+        self._request(
+            "POST",
+            f"/containers/{self._quoted_name(key)}/stop?t={self._stop_grace_seconds}",
+            timeout=self._control_response_timeout_seconds,
+        )
 
     def start_container(self, key: str) -> None:
         self._request("POST", f"/containers/{self._quoted_name(key)}/start")
@@ -110,7 +129,8 @@ class DockerRuntimeService:
     def restart_container(self, key: str) -> None:
         self._request(
             "POST",
-            f"/containers/{self._quoted_name(key)}/restart?t={self.settings.container_control_timeout_seconds}",
+            f"/containers/{self._quoted_name(key)}/restart?t={self._stop_grace_seconds}",
+            timeout=self._control_response_timeout_seconds,
         )
         self.clear_restart_required([key])
 
@@ -136,12 +156,22 @@ class DockerRuntimeService:
         except json.JSONDecodeError as exc:
             raise DockerRuntimeError("Docker runtime returned invalid JSON.") from exc
 
-    def _request(self, method: str, path: str, body: bytes | None = None) -> bytes:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        *,
+        timeout: int | None = None,
+    ) -> bytes:
         if not self.available:
             raise DockerRuntimeError(
                 f"Docker socket {self.socket_path} is not mounted into the admin sidecar."
             )
-        connection = UnixSocketHTTPConnection(self.socket_path, timeout=self.settings.container_control_timeout_seconds)
+        effective_timeout = (
+            int(timeout) if timeout is not None else int(self.settings.container_control_timeout_seconds)
+        )
+        connection = UnixSocketHTTPConnection(self.socket_path, timeout=effective_timeout)
         try:
             connection.request(method, path, body=body, headers={"Content-Type": "application/json"})
             response = connection.getresponse()
