@@ -371,6 +371,64 @@ test("fetchStorageViewCandidates ignores a slow response for a system the operat
   assert.equal(banners.filter(([, tone]) => tone === "error").length, 0, "stale failure must not banner");
 });
 
+test("clearing the selected system invalidates in-flight live-enclosure and candidate requests", async () => {
+  const liveRequest = deferred();
+  const candidateRequest = deferred();
+  let systemId = "system-a";
+  const banners = [];
+  const state = {
+    liveEnclosuresRequestSeq: 0,
+    liveEnclosuresLoading: false,
+    liveEnclosuresError: null,
+    liveEnclosuresSystemId: null,
+    liveEnclosures: [],
+    storageViewCandidatesRequestSeq: 0,
+    storageViewCandidatesLoading: false,
+    storageViewCandidatesSystemId: null,
+    storageViewCandidates: [],
+  };
+  const { fetchLiveEnclosures, fetchStorageViewCandidates, resetLiveEnclosureState, resetStorageViewCandidateState } = loadFunctions(
+    ["resetLiveEnclosureState", "resetStorageViewCandidateState", "fetchLiveEnclosures", "fetchStorageViewCandidates"],
+    {
+      state,
+      currentStorageViewSystemId() {
+        return systemId;
+      },
+      currentStorageViewTargetSystemId() {
+        return "";
+      },
+      renderStorageViews() {},
+      renderStorageViewCandidates() {},
+      setBanner(message, tone) {
+        banners.push([message, tone]);
+      },
+      fetchJson(url) {
+        return url.includes("live-enclosures") ? liveRequest.promise : candidateRequest.promise;
+      },
+      Array,
+    }
+  );
+
+  const staleLive = fetchLiveEnclosures({ quiet: false });
+  const staleCandidates = fetchStorageViewCandidates({ quiet: false });
+  systemId = "";
+  await fetchLiveEnclosures({ quiet: false });
+  await fetchStorageViewCandidates({ quiet: false });
+
+  liveRequest.resolve({ system_id: "system-a", enclosures: [{ id: "stale-enclosure" }] });
+  candidateRequest.resolve({ system_id: "system-a", candidates: [{ id: "stale-candidate" }] });
+  await staleLive;
+  await staleCandidates;
+
+  assert.equal(state.liveEnclosures.length, 0);
+  assert.equal(state.liveEnclosuresSystemId, null);
+  assert.equal(state.storageViewCandidates.length, 0);
+  assert.equal(state.storageViewCandidatesSystemId, null);
+  assert.equal(banners.length, 0, "cleared requests must not emit stale success banners");
+  assert.match(functionSource("resetSetupForm"), /resetLiveEnclosureState\(\)/);
+  assert.match(functionSource("resetSetupForm"), /resetStorageViewCandidateState\(\)/);
+});
+
 test("backup export, debug export, and import errors are described instead of stringified objects", () => {
   const { describeApiError } = loadFunctions(["describeApiError"], { JSON, Array, String });
   const validationDetail = [

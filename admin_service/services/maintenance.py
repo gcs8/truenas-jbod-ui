@@ -43,6 +43,29 @@ class MaintenanceStopError(DockerRuntimeError):
         self.restart_failures = dict(restart_failures)
 
 
+class MaintenanceOperationError(DockerRuntimeError):
+    """The maintenance operation failed and one or more stopped services stayed down."""
+
+    def __init__(
+        self,
+        operation_error: Exception,
+        *,
+        stopped_containers: list[str],
+        restarted_containers: list[str],
+        restart_failures: dict[str, str],
+    ) -> None:
+        failure_detail = ", ".join(
+            f"{key} ({reason})" for key, reason in restart_failures.items()
+        )
+        super().__init__(
+            f"{operation_error} Maintenance cleanup could not restart: {failure_detail}."
+        )
+        self.operation_error = operation_error
+        self.stopped_containers = list(stopped_containers)
+        self.restarted_containers = list(restarted_containers)
+        self.restart_failures = dict(restart_failures)
+
+
 class AdminMaintenanceService:
     def __init__(
         self,
@@ -122,9 +145,19 @@ class AdminMaintenanceService:
             stopped_containers = self._stop_targets(restart_on_failure=restart_services)
         try:
             result = operation(stopped_containers)
-        finally:
+        except Exception as operation_error:
             if stop_services and restart_services:
                 restarted_containers, restart_failures = self._start_targets(stopped_containers)
+            if restart_failures:
+                raise MaintenanceOperationError(
+                    operation_error,
+                    stopped_containers=stopped_containers,
+                    restarted_containers=restarted_containers,
+                    restart_failures=restart_failures,
+                ) from operation_error
+            raise
+        if stop_services and restart_services:
+            restarted_containers, restart_failures = self._start_targets(stopped_containers)
         return result, MaintenanceOutcome(stopped_containers, restarted_containers, restart_failures)
 
     # --------------------------------------------------------------- operations

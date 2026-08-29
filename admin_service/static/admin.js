@@ -3173,10 +3173,18 @@
   }
 
   function resetLiveEnclosureState() {
+    state.liveEnclosuresRequestSeq = (state.liveEnclosuresRequestSeq || 0) + 1;
     state.liveEnclosures = [];
     state.liveEnclosuresLoading = false;
     state.liveEnclosuresSystemId = null;
     state.liveEnclosuresError = null;
+  }
+
+  function resetStorageViewCandidateState() {
+    state.storageViewCandidatesRequestSeq = (state.storageViewCandidatesRequestSeq || 0) + 1;
+    state.storageViewCandidates = [];
+    state.storageViewCandidatesSystemId = null;
+    state.storageViewCandidatesLoading = false;
   }
 
   async function fetchLiveEnclosures({ force = false, quiet = false } = {}) {
@@ -3377,9 +3385,7 @@
     const systemId = currentStorageViewSystemId();
     const targetSystemId = currentStorageViewTargetSystemId();
     if (!systemId) {
-      state.storageViewCandidates = [];
-      state.storageViewCandidatesSystemId = null;
-      state.storageViewCandidatesLoading = false;
+      resetStorageViewCandidateState();
       renderStorageViewCandidates();
       return;
     }
@@ -4283,9 +4289,7 @@
     state.haNodesLoading = false;
     state.sshUserAutoPlatform = null;
     state.storageViews = [];
-    state.storageViewCandidates = [];
-    state.storageViewCandidatesSystemId = null;
-    state.storageViewCandidatesLoading = false;
+    resetStorageViewCandidateState();
     resetLiveEnclosureState();
     state.selectedStorageViewId = "";
     if (elements.setupSystemLabel) {

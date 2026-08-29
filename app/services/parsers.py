@@ -887,7 +887,12 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
 
         if stripped.startswith("Device Names:"):
             names = [item.strip() for item in stripped.split(":", 1)[1].split(",")]
-            current_slot.device_names = [item for item in names if item and not item.startswith("pass")]
+            current_slot.device_names = list(
+                dict.fromkeys(
+                    current_slot.device_names
+                    + [item for item in names if item and not item.startswith("pass")]
+                )
+            )
             if current_slot.device_names:
                 current_slot.present = True
             continue
@@ -1046,30 +1051,58 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             continue
 
         if stripped.startswith("SAS device type:"):
-            current_slot.sas_device_type = normalize_text(stripped.split(":", 1)[1])
-            if current_slot.sas_device_type:
-                lowered = current_slot.sas_device_type.lower()
-                current_slot.present = "no sas device attached" not in lowered
+            sas_device_type = normalize_text(stripped.split(":", 1)[1])
+            if sas_device_type:
+                incoming_present = "no sas device attached" not in sas_device_type.lower()
+                current_type_is_absent = bool(
+                    current_slot.sas_device_type
+                    and "no sas device attached" in current_slot.sas_device_type.lower()
+                )
+                if not current_slot.sas_device_type or (current_type_is_absent and incoming_present):
+                    current_slot.sas_device_type = sas_device_type
+                current_slot.present = (
+                    incoming_present
+                    if current_slot.present is None
+                    else current_slot.present or incoming_present
+                )
             continue
 
         if stripped.startswith("SAS address:"):
-            current_slot.sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
-            if current_slot.sas_address == "0":
-                current_slot.present = False
-            elif current_slot.sas_address:
-                current_slot.present = True
+            sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
+            if sas_address:
+                incoming_present = sas_address != "0"
+                if not current_slot.sas_address or (
+                    current_slot.sas_address == "0" and incoming_present
+                ):
+                    current_slot.sas_address = sas_address
+                current_slot.present = (
+                    incoming_present
+                    if current_slot.present is None
+                    else current_slot.present or incoming_present
+                )
             continue
 
         if stripped.startswith("attached SAS address:"):
-            current_slot.attached_sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
+            attached_sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
+            if not current_slot.attached_sas_address or (
+                current_slot.attached_sas_address == "0"
+                and attached_sas_address not in (None, "0")
+            ):
+                current_slot.attached_sas_address = attached_sas_address
             continue
 
         if stripped.startswith("target port for:"):
-            current_slot.target_port_protocol = normalize_text(stripped.split(":", 1)[1])
+            current_slot.target_port_protocol = (
+                current_slot.target_port_protocol
+                or normalize_text(stripped.split(":", 1)[1])
+            )
             continue
 
         if stripped.startswith("phy identifier:"):
-            current_slot.phy_identifier = normalize_text(stripped.split(":", 1)[1])
+            current_slot.phy_identifier = (
+                current_slot.phy_identifier
+                or normalize_text(stripped.split(":", 1)[1])
+            )
             continue
 
     _record_sg_ses_aes_fallback_slot(enclosure, current_slot)

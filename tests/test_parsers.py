@@ -626,6 +626,85 @@ Additional element status diagnostic page:
         self.assertEqual(slot.sas_address, "5000cca264d47000")
         self.assertTrue(slot.present)
 
+    def test_parse_sesutil_map_duplicate_slot_merges_device_names_from_both_elements(self) -> None:
+        output = """
+ses0:
+  Enclosure Name: ExampleCo DualPathShelf
+  Enclosure ID: 5000000000000005
+  Element 5, Type: Array Device Slot
+    Status: OK
+    Description: Slot05
+    Device Names: da5, pass5
+  Element 29, Type: Array Device Slot
+    Status: OK
+    Description: Slot05
+    Device Names: da29, pass29
+""".strip()
+
+        slot = parse_sesutil_map(output)[0].slots[5]
+
+        self.assertEqual(slot.device_names, ["da5", "da29"])
+
+    def test_parse_sg_ses_aes_duplicate_slot_keeps_first_nonempty_path_details(self) -> None:
+        output = """
+  ExampleCo  DualPathShelf  0001
+  Primary enclosure logical identifier (hex): 5000000000000005
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 5
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x500000000000503f
+          SAS address: 0x5000cca264d47000
+          phy identifier: 0x0
+      Element index: 1  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 5
+        phy index: 1
+          SAS device type: end device
+          attached SAS address: 0x500000000000603f
+          SAS address: 0x5000cca264d47001
+          phy identifier: 0x1
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg5")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        slot = parsed.slots[5]
+        self.assertEqual(slot.attached_sas_address, "500000000000503f")
+        self.assertEqual(slot.sas_address, "5000cca264d47000")
+        self.assertEqual(slot.phy_identifier, "0x0")
+
+    def test_parse_sg_ses_aes_duplicate_slot_prefers_attached_path_over_absent_path(self) -> None:
+        output = """
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 5
+          SAS device type: no SAS device attached
+          SAS address: 0x0
+      Element index: 1  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 5
+          SAS device type: end device
+          SAS address: 0x5000cca264d47000
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg5")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        slot = parsed.slots[5]
+        self.assertEqual(slot.sas_device_type, "end device")
+        self.assertEqual(slot.sas_address, "5000cca264d47000")
+        self.assertTrue(slot.present)
+
     def test_unmapped_element_collision_does_not_replace_reported_slot(self) -> None:
         output = """
 ses0:
