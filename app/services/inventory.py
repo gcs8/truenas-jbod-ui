@@ -2172,11 +2172,17 @@ class InventoryService:
             logger.exception("Background SMART refresh failed for %s", cache_key)
 
     def _apply_persisted_slot_details(self, slots: list[SlotView]) -> None:
-        if not self.slot_detail_store:
+        if not self.slot_detail_store or not slots:
             return
 
+        loaded_entries = self.slot_detail_store.load_all()
         for slot_view in slots:
-            entry = self.slot_detail_store.get_entry(self.system.id, slot_view.enclosure_id, slot_view.slot)
+            entry = self.slot_detail_store.get_entry(
+                self.system.id,
+                slot_view.enclosure_id,
+                slot_view.slot,
+                loaded_entries=loaded_entries,
+            )
             if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
                 continue
 

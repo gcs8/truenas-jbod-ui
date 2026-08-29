@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -46,8 +47,15 @@ class SlotDetailStore:
             loaded[key] = SlotDetailCacheEntry.model_validate(value)
         return loaded
 
-    def get_entry(self, system_id: str | None, enclosure_id: str | None, slot: int) -> SlotDetailCacheEntry | None:
-        current = self.load_all()
+    def get_entry(
+        self,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> SlotDetailCacheEntry | None:
+        current = self.load_all() if loaded_entries is None else loaded_entries
         return current.get(self._slot_key(system_id, enclosure_id, slot))
 
     def save_entries(self, entries: list[SlotDetailCacheEntry]) -> None:
