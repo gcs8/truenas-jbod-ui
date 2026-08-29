@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import threading
+import time
 import unittest
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import paramiko
@@ -10,6 +13,70 @@ from app.services.ssh_probe import AutoPinHostKeyPolicy, SSHCommandResult, SSHPr
 
 
 class SSHProbeTests(unittest.TestCase):
+    def test_tofu_pinning_serializes_reload_add_save_for_shared_known_hosts(self) -> None:
+        shared_hosts: set[str] = set()
+        active_saves = 0
+        peak_saves = 0
+        state_lock = threading.Lock()
+        start = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        class FakeHostKeys:
+            def __init__(self) -> None:
+                self.hosts: set[str] = set()
+
+            def add(self, hostname: str, _key_type: str, _key) -> None:
+                self.hosts.add(hostname)
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self._host_keys = FakeHostKeys()
+
+            def load_host_keys(self, _path: str) -> None:
+                self._host_keys.hosts = set(shared_hosts)
+
+            def get_host_keys(self) -> FakeHostKeys:
+                return self._host_keys
+
+            def save_host_keys(self, _path: str) -> None:
+                nonlocal active_saves, peak_saves
+                with state_lock:
+                    active_saves += 1
+                    peak_saves = max(peak_saves, active_saves)
+                time.sleep(0.02)
+                shared_hosts.clear()
+                shared_hosts.update(self._host_keys.hosts)
+                with state_lock:
+                    active_saves -= 1
+
+        def pin(hostname: str) -> None:
+            try:
+                client = FakeClient()
+                key = MagicMock()
+                key.get_name.return_value = "ssh-rsa"
+                start.wait()
+                AutoPinHostKeyPolicy("/tmp/shared-known-hosts").missing_host_key(
+                    cast(paramiko.SSHClient, client),
+                    hostname,
+                    key,
+                )
+            except BaseException as exc:  # noqa: BLE001 - surface thread failures below.
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=pin, args=("host-a.example.test",)),
+            threading.Thread(target=pin, args=("host-b.example.test",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(shared_hosts, {"host-a.example.test", "host-b.example.test"})
+        self.assertEqual(peak_saves, 1)
+
     def test_redact_ssh_command_masks_inline_quantastor_server_secret(self) -> None:
         command = "/usr/bin/qs disk-list --json '--server=localhost,jbodmap,super-secret'"
 

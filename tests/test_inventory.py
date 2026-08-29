@@ -8,7 +8,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.config import BMCConfig, HANodeConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig
+from app.config import (
+    BMCConfig,
+    HANodeConfig,
+    SSHConfig,
+    Settings,
+    StorageViewConfig,
+    SystemConfig,
+    TrueNASConfig,
+)
 from app.models.domain import (
     EnclosureOption,
     InventorySummary,
@@ -76,6 +84,43 @@ def build_inventory_service(
 
 
 class InventoryHelpersTests(unittest.TestCase):
+    def test_ordered_storage_view_candidates_do_not_mutate_shared_payloads(self) -> None:
+        service = object.__new__(InventoryService)
+        storage_view = StorageViewConfig.model_validate(
+            {
+                "id": "boot-devices",
+                "label": "Boot devices",
+                "kind": "boot_devices",
+                "template_id": "boot-satadom-2",
+                "binding": {
+                    "mode": "hybrid",
+                    "device_names": ["ada1"],
+                    "pool_names": ["boot-pool"],
+                },
+            }
+        )
+        candidates = [
+            {
+                "candidate_id": "disk-a",
+                "device_names": ["ada0"],
+                "serial": "SER-A",
+                "pool_name": "boot-pool",
+            },
+            {
+                "candidate_id": "disk-b",
+                "device_names": ["ada1"],
+                "serial": "SER-B",
+                "pool_name": "boot-pool",
+            },
+        ]
+
+        ordered = service._ordered_storage_view_candidates(storage_view, candidates, set())
+
+        self.assertEqual([candidate["candidate_id"] for candidate in ordered], ["disk-b", "disk-a"])
+        self.assertEqual(ordered[0]["_placement_key"], "device match: ada1")
+        self.assertEqual(ordered[1]["_placement_key"], "pool match: boot-pool")
+        self.assertTrue(all("_placement_key" not in candidate for candidate in candidates))
+
     def test_infer_slot_count_from_layout_ignores_gap_cells(self) -> None:
         layout_rows = [
             [88, 89, 90, 91, 92, 93, None, None, 94, 95, 96, 97, 98, 99],
@@ -955,7 +1000,10 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertIn("local physical device", smart.message or "")
             self.assertEqual(
                 probe.commands,
-                ["esxcli storage core device smart get -d naa.5000cca07316765c"],
+                [
+                    "esxcli storage core device smart get -d naa.5000cca07316765c",
+                    "esxcli storage core device smart get -d vml.02000000005000cca07316765c483732343041",
+                ],
             )
 
     def test_build_esxi_topology_members_uses_jbod_class_for_direct_member(self) -> None:
@@ -1315,6 +1363,66 @@ class InventoryHelpersTests(unittest.TestCase):
 
 
 class InventoryStorageViewCandidateTests(unittest.TestCase):
+    def test_storage_view_candidate_build_reuses_parsed_ssh_bundle_per_enclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="linux-host", truenas=TrueNASConfig(platform="linux"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            source_bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=True,
+                warnings=[],
+                sources={"ssh": SourceStatus(enabled=True, ok=True)},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+            snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_enclosure_id="enc-a",
+            )
+
+            with patch("app.services.inventory.parse_ssh_outputs", wraps=parse_ssh_outputs) as parser:
+                service._build_storage_view_candidate_payloads(source_bundle, snapshot)
+                service._build_storage_view_candidate_payloads(source_bundle, snapshot)
+
+            self.assertEqual(parser.call_count, 1)
+
+    def test_parsed_ssh_bundle_cache_is_bounded_across_enclosure_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="linux-host", truenas=TrueNASConfig(platform="linux"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            source_bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=True,
+                warnings=[],
+                sources={"ssh": SourceStatus(enabled=True, ok=True)},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+
+            for index in range(65):
+                service._parsed_ssh_data_for_enclosure(source_bundle, f"enc-{index}")
+
+            self.assertLessEqual(len(source_bundle.parsed_ssh_data_by_enclosure), 64)
+            self.assertNotIn("enc-0", source_bundle.parsed_ssh_data_by_enclosure)
+            self.assertIn("enc-64", source_bundle.parsed_ssh_data_by_enclosure)
+
     def test_get_storage_view_candidates_excludes_disks_already_tied_to_slots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -4248,6 +4356,419 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
 
 
 class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ssh_batches_for_different_hosts_are_not_globally_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="multi-host",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.10", user="operator"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                SSHProbe(system.ssh),
+                temp_dir,
+            )
+            entered: list[str] = []
+            release = asyncio.Event()
+
+            async def run_commands(probe: SSHProbe, commands) -> list[SSHCommandResult]:
+                entered.append(probe.config.host)
+                await release.wait()
+                return [
+                    SSHCommandResult(command=command, ok=True, stdout="ok", exit_code=0)
+                    for command in commands
+                ]
+
+            with patch.object(SSHProbe, "run_commands", new=run_commands):
+                tasks = [
+                    asyncio.create_task(service._run_ssh_commands(["first"], "192.0.2.10")),
+                    asyncio.create_task(service._run_ssh_commands(["second"], "192.0.2.11")),
+                ]
+                try:
+                    for _ in range(5):
+                        await asyncio.sleep(0)
+                    self.assertEqual(set(entered), {"192.0.2.10", "192.0.2.11"})
+                finally:
+                    release.set()
+                    await asyncio.gather(*tasks)
+
+    async def test_planned_inventory_session_does_not_block_same_host_operator_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="operator-command",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.12", user="operator"),
+            )
+            api_client = AsyncMock()
+            api_client.fetch_all.return_value = TrueNASRawData(
+                enclosures=[],
+                disks=[],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                api_client,
+                SSHProbe(system.ssh),
+                temp_dir,
+            )
+            planned_started = asyncio.Event()
+            command_started = asyncio.Event()
+            release_planned = asyncio.Event()
+
+            async def run_planned_commands(_probe: SSHProbe, _planner) -> list[SSHCommandResult]:
+                planned_started.set()
+                await release_planned.wait()
+                return []
+
+            async def run_command(_probe: SSHProbe, command: str) -> SSHCommandResult:
+                command_started.set()
+                return SSHCommandResult(command=command, ok=True, stdout="ok", exit_code=0)
+
+            with (
+                patch.object(SSHProbe, "run_planned_commands", new=run_planned_commands),
+                patch.object(SSHProbe, "run_command", new=run_command),
+            ):
+                collection = asyncio.create_task(service._collect_inventory_source_bundle())
+                await planned_started.wait()
+                command = asyncio.create_task(service._run_ssh_command("set-led"))
+                try:
+                    for _ in range(5):
+                        await asyncio.sleep(0)
+                    self.assertTrue(command_started.is_set())
+                finally:
+                    release_planned.set()
+                    await asyncio.gather(collection, command)
+
+    async def test_linux_nvme_enrichment_batches_three_commands_in_one_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="linux-nvme",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.20", user="operator"),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service._run_ssh_command = AsyncMock(
+                return_value=SSHCommandResult(command="legacy", ok=False, exit_code=1)
+            )
+            service._run_ssh_commands = AsyncMock(
+                return_value=[
+                    SSHCommandResult(command=f"command-{index}", ok=False, exit_code=1)
+                    for index in range(3)
+                ]
+            )
+
+            await service._fetch_linux_nvme_enrichment_over_ssh("/dev/nvme0n1", "192.0.2.20")
+
+            service._run_ssh_commands.assert_awaited_once()
+            nvme_batch = service._run_ssh_commands.await_args
+            self.assertIsNotNone(nvme_batch)
+            assert nvme_batch is not None
+            self.assertEqual(len(nvme_batch.args[0]), 3)
+            service._run_ssh_command.assert_not_awaited()
+
+    async def test_linux_nvme_smartctl_and_nvme_probes_share_one_host_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="linux-nvme",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.21", user="operator"),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+
+            async def run_commands(commands, _host=None):
+                return [
+                    SSHCommandResult(
+                        command=command,
+                        ok=True,
+                        stdout=(
+                            '{"smart_status":{"passed":true},"temperature":{"current":31}}'
+                            if "smartctl" in command and " -j " in command
+                            else ""
+                        ),
+                        exit_code=0,
+                    )
+                    for command in commands
+                ]
+
+            service._run_ssh_commands = AsyncMock(side_effect=run_commands)
+
+            summary, error = await service._fetch_smart_summary_over_ssh(
+                ["nvme0n1"],
+                hosts=["192.0.2.21"],
+            )
+
+            self.assertIsNone(error)
+            self.assertIsNotNone(summary)
+            self.assertEqual(service._run_ssh_commands.await_count, 1)
+            combined_batch = service._run_ssh_commands.await_args
+            self.assertIsNotNone(combined_batch)
+            assert combined_batch is not None
+            self.assertEqual(len(combined_batch.args[0]), 5)
+
+    async def test_esxi_host_smart_candidates_share_one_command_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="esxi-host",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.30", user="root"),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                smart_device_names=["naa.second"],
+                raw_status={
+                    "storcli_physical_drive": {
+                        "esxi_device_id": "naa.first",
+                        "esxi_drive_type": "physical",
+                        "esxi_raid_level": "NA",
+                    }
+                },
+            )
+            service._run_ssh_command = AsyncMock(
+                return_value=SSHCommandResult(command="legacy", ok=False, exit_code=1)
+            )
+            service._run_ssh_commands = AsyncMock(
+                return_value=[
+                    SSHCommandResult(command="first", ok=False, exit_code=1),
+                    SSHCommandResult(command="second", ok=False, exit_code=1),
+                ]
+            )
+
+            await service._fetch_esxi_host_smart_summary(slot)
+
+            service._run_ssh_commands.assert_awaited_once()
+            esxi_batch = service._run_ssh_commands.await_args
+            self.assertIsNotNone(esxi_batch)
+            assert esxi_batch is not None
+            self.assertEqual(len(esxi_batch.args[0]), 2)
+            service._run_ssh_command.assert_not_awaited()
+
+    async def test_background_smart_refresh_uses_a_shallow_slot_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="cache-host", truenas=TrueNASConfig(platform="linux"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-a",
+                raw_status={"large_vendor_payload": {"nested": [1, 2, 3]}},
+            )
+            service._background_refresh_smart_summary = AsyncMock()
+            cache_key = service._smart_cache_key(slot)
+
+            service._schedule_background_smart_refresh(cache_key, slot)
+            await service._smart_refresh_tasks[cache_key]
+
+            refresh_call = service._background_refresh_smart_summary.await_args
+            self.assertIsNotNone(refresh_call)
+            assert refresh_call is not None
+            copied_slot = refresh_call.args[1]
+            self.assertIsNot(copied_slot, slot)
+            self.assertIs(copied_slot.raw_status, slot.raw_status)
+
+    async def test_quantastor_cli_partial_winner_preserves_failure_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-partial",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.40", user="operator"),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service._build_quantastor_ssh_hosts = MagicMock(return_value=["192.0.2.40"])
+
+            async def run_commands(commands, _host):
+                results = [
+                    SSHCommandResult(command=command, ok=True, stdout='[{"id":"row"}]', exit_code=0)
+                    for command in commands[:3]
+                ]
+                results.append(
+                    SSHCommandResult(
+                        command=commands[3],
+                        ok=False,
+                        stderr="network port probe failed",
+                        exit_code=1,
+                    )
+                )
+                return results
+
+            service._run_ssh_commands = AsyncMock(side_effect=run_commands)
+
+            overlay, failures = await service._fetch_quantastor_cli_overlay()
+
+            self.assertTrue(overlay["cli_disks"])
+            self.assertTrue(any("network port inventory failed" in failure for failure in failures))
+
+    async def test_ses_partial_winner_preserves_failure_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="ses-partial", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            overlay = ParsedSSHData(
+                ses_enclosures=[
+                    SESMapEnclosure(
+                        enclosure_id="enc-a",
+                        slots={0: SESMapSlot(slot_number=0, present=True)},
+                    )
+                ]
+            )
+            service._discover_and_fetch_sg_ses_host_overlay = AsyncMock(
+                return_value=(
+                    ["/dev/sg0"],
+                    overlay,
+                    ["TrueNAS SCALE SSH SES EC page probe failed."],
+                )
+            )
+
+            selected, failures, best_host = await service._fetch_sg_ses_overlay(
+                ["192.0.2.50"],
+                failure_prefix="TrueNAS SCALE SSH SES",
+            )
+
+            self.assertIs(selected, overlay)
+            self.assertEqual(best_host, "192.0.2.50")
+            self.assertEqual(failures, ["TrueNAS SCALE SSH SES EC page probe failed."])
+
+    async def test_sg_ses_discovery_and_page_probes_share_one_planned_session(self) -> None:
+        class RecordingSSHProbe(SSHProbe):
+            def __init__(self, config: SSHConfig) -> None:
+                super().__init__(config)
+                self.session_count = 0
+                self.commands: list[str] = []
+
+            async def run_planned_commands(
+                self,
+                planner,
+                *,
+                initial_commands=None,
+            ) -> list[SSHCommandResult]:
+                self.session_count += 1
+                discovery_commands = list(initial_commands or [])
+                self.commands.extend(discovery_commands)
+                results = [
+                    SSHCommandResult(
+                        command=discovery_commands[0],
+                        ok=True,
+                        stdout="/dev/sg0\n",
+                        exit_code=0,
+                    )
+                ]
+                page_commands = list(planner(results))
+                self.commands.extend(page_commands)
+                results.extend(
+                    SSHCommandResult(command=command, ok=True, stdout="page", exit_code=0)
+                    for command in page_commands
+                )
+                self.assert_no_more_commands(planner, results)
+                return results
+
+            async def run_commands(self, commands=None):
+                raise AssertionError("sg_ses discovery and page probes must share one planned session")
+
+            @staticmethod
+            def assert_no_more_commands(planner, results) -> None:
+                if list(planner(results)):
+                    raise AssertionError("sg_ses planner emitted duplicate commands")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="scale-ses",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.60", user="operator"),
+            )
+            probe = RecordingSSHProbe(system.ssh)
+            service = build_inventory_service(settings, system, AsyncMock(), probe, temp_dir)
+            overlay = ParsedSSHData(
+                ses_enclosures=[
+                    SESMapEnclosure(
+                        enclosure_id="enc-a",
+                        slots={0: SESMapSlot(slot_number=0, present=True)},
+                    )
+                ]
+            )
+
+            with patch("app.services.inventory.parse_ssh_outputs", return_value=overlay):
+                selected, failures, best_host = await service._fetch_sg_ses_overlay(
+                    ["192.0.2.60"],
+                    failure_prefix="TrueNAS SCALE SSH SES",
+                )
+
+            self.assertEqual(
+                [enclosure.enclosure_id for enclosure in selected.ses_enclosures],
+                ["enc-a"],
+            )
+            self.assertEqual(failures, [])
+            self.assertEqual(best_host, "192.0.2.60")
+            self.assertEqual(probe.session_count, 1)
+            self.assertEqual(len(probe.commands), 4)
+
+    async def test_sg_ses_planned_session_serializes_same_host_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="scale-ses-lock",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.61", user="operator"),
+            )
+            probe = SSHProbe(system.ssh)
+            service = build_inventory_service(settings, system, AsyncMock(), probe, temp_dir)
+            planned_started = asyncio.Event()
+            release_planned = asyncio.Event()
+            batch_started = asyncio.Event()
+
+            async def run_planned_commands(_planner, *, initial_commands=None):
+                planned_started.set()
+                await release_planned.wait()
+                return [
+                    SSHCommandResult(command=command, ok=True, stdout="ok", exit_code=0)
+                    for command in (initial_commands or [])
+                ]
+
+            async def run_commands(commands):
+                batch_started.set()
+                return [
+                    SSHCommandResult(command=command, ok=True, stdout="ok", exit_code=0)
+                    for command in commands
+                ]
+
+            probe.run_planned_commands = AsyncMock(side_effect=run_planned_commands)  # type: ignore[method-assign]
+            probe.run_commands = AsyncMock(side_effect=run_commands)  # type: ignore[method-assign]
+            planned = asyncio.create_task(
+                service._run_ssh_planned_commands(
+                    lambda _results: [],
+                    initial_commands=["discover"],
+                    host="192.0.2.61",
+                )
+            )
+            await planned_started.wait()
+            batch = asyncio.create_task(service._run_ssh_commands(["batch"], "192.0.2.61"))
+            try:
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                self.assertFalse(batch_started.is_set())
+            finally:
+                release_planned.set()
+                await asyncio.gather(planned, batch)
+
+            self.assertTrue(batch_started.is_set())
+
     async def test_esxi_smart_summary_reuses_fresh_slot_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
