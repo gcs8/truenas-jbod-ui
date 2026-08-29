@@ -435,12 +435,18 @@ class _ImportActivationTransaction:
 
     def _record_target(self, target_path: Path) -> _ImportRollbackEntry:
         journal_key = self._journal_key(target_path)
-        if journal_key == self._protected_history_key:
+        if self._protected_history_key and self._journal_paths_overlap(
+            journal_key,
+            self._protected_history_key,
+        ):
             raise ValueError(
                 f"Live restore target {target_path} collides with the history database."
             )
-        if journal_key in self._journal:
-            raise ValueError(f"Live restore target {target_path} collides with another restore target.")
+        for existing_key in self._journal:
+            if self._journal_paths_overlap(journal_key, existing_key):
+                raise ValueError(
+                    f"Live restore target {target_path} collides with another restore target."
+                )
         if target_path.is_symlink():
             entry = _ImportRollbackEntry(target_path=target_path, kind="symlink")
         elif target_path.is_dir():
@@ -459,10 +465,11 @@ class _ImportActivationTransaction:
         target_path = store.file_path
         self._reject_symlinked_history_target(target_path)
         journal_key = self._journal_key(target_path)
-        if journal_key in self._journal:
-            raise ValueError(
-                f"Live restore target {target_path} collides with the history database."
-            )
+        for existing_key in self._journal:
+            if self._journal_paths_overlap(journal_key, existing_key):
+                raise ValueError(
+                    f"Live restore target {target_path} collides with the history database."
+                )
         if target_path.exists() and not target_path.is_file():
             raise ValueError(f"Live history restore target {target_path} is not a regular file.")
         if target_path.exists():
@@ -647,6 +654,14 @@ class _ImportActivationTransaction:
     @staticmethod
     def _journal_key(target_path: Path) -> str:
         return os.path.normcase(os.path.realpath(os.path.abspath(target_path)))
+
+    @staticmethod
+    def _journal_paths_overlap(first_path: str, second_path: str) -> bool:
+        try:
+            common_path = os.path.commonpath((first_path, second_path))
+        except ValueError:
+            return False
+        return common_path == first_path or common_path == second_path
 
     @staticmethod
     def _reject_symlinked_history_target(target_path: Path) -> None:

@@ -101,6 +101,10 @@ class DockerRuntimeService:
     def running_container_keys(self, keys: list[str] | tuple[str, ...] | None = None) -> list[str]:
         requested = set(keys or self.managed_containers.keys())
         payload = self.status_payload()
+        if not payload.get("available"):
+            raise DockerRuntimeError(
+                str(payload.get("detail") or "Docker runtime status is unavailable.")
+            )
         return [
             item["key"]
             for item in payload.get("containers", [])

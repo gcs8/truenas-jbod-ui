@@ -5,7 +5,11 @@ from typing import Any
 from unittest.mock import patch
 
 from admin_service.config import AdminSettings
-from admin_service.services.maintenance import AdminMaintenanceService, MaintenanceStopError
+from admin_service.services.maintenance import (
+    AdminMaintenanceService,
+    MaintenanceOperationError,
+    MaintenanceStopError,
+)
 from admin_service.services.runtime_control import (
     CONTAINER_CONTROL_RESPONSE_GRACE_SECONDS,
     DockerRuntimeError,
@@ -160,11 +164,17 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime = FakeRuntimeService(["ui", "history"], start_failures={"ui": "HTTP 500: cannot start"})
         backup = FakeBackupService(fail=ValueError("Bundle manifest is invalid."))
 
-        with self.assertRaises(ValueError):
+        with self.assertRaises(MaintenanceOperationError) as raised:
             build_service(runtime, backup).import_bundle(b"bundle", stop_services=True)
 
         self.assertEqual(runtime.calls, [("stop", "ui"), ("stop", "history"), ("start", "ui"), ("start", "history")])
         self.assertEqual(runtime.running, ["history"])
+        self.assertIsInstance(raised.exception.operation_error, ValueError)
+        self.assertEqual(raised.exception.stopped_containers, ["ui", "history"])
+        self.assertEqual(raised.exception.restarted_containers, ["history"])
+        self.assertEqual(raised.exception.restart_failures, {"ui": "HTTP 500: cannot start"})
+        self.assertIn("Bundle manifest is invalid", str(raised.exception))
+        self.assertIn("ui", str(raised.exception))
 
     def test_restart_services_false_leaves_targets_stopped(self) -> None:
         runtime = FakeRuntimeService(["ui", "history"])
@@ -256,6 +266,12 @@ class DockerControlTimeoutTests(unittest.TestCase):
                     service._request("GET", "/containers/json?all=1")
 
         self.assertEqual(created, [45, 30])
+
+    def test_running_container_keys_fails_when_runtime_status_is_unavailable(self) -> None:
+        service = self._service(30)
+
+        with self.assertRaisesRegex(DockerRuntimeError, "not mounted"):
+            service.running_container_keys(("ui", "history"))
 
 
 if __name__ == "__main__":

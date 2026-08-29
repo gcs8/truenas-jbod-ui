@@ -1230,6 +1230,46 @@ class SystemBackupServiceTests(unittest.TestCase):
         finally:
             shutil.rmtree(transaction_root, ignore_errors=True)
 
+    def test_activation_rejects_file_then_parent_directory_target_collision(self) -> None:
+        target_dir = self.temp_dir / "overlapping-target"
+        target_dir.mkdir()
+        nested_file = target_dir / "mapping.json"
+        nested_file.write_bytes(b"ORIGINAL")
+        transaction = _ImportActivationTransaction(
+            {"file-member": b"IMPORTED-FILE", "directory-member": b"IMPORTED-DIRECTORY"}
+        )
+
+        with self.assertRaisesRegex(ValueError, "collides with another restore target"):
+            with transaction:
+                transaction.activate_file(nested_file, "file-member")
+                transaction.activate_directory(
+                    target_dir,
+                    [("directory-member", Path("key.pem"))],
+                )
+
+        self.assertEqual(nested_file.read_bytes(), b"ORIGINAL")
+        self.assertEqual(sorted(path.name for path in target_dir.iterdir()), ["mapping.json"])
+
+    def test_activation_rejects_directory_then_nested_file_target_collision(self) -> None:
+        target_dir = self.temp_dir / "overlapping-target"
+        target_dir.mkdir()
+        original_file = target_dir / "original.key"
+        original_file.write_bytes(b"ORIGINAL")
+        transaction = _ImportActivationTransaction(
+            {"directory-member": b"IMPORTED-DIRECTORY", "file-member": b"IMPORTED-FILE"}
+        )
+
+        with self.assertRaisesRegex(ValueError, "collides with another restore target"):
+            with transaction:
+                transaction.activate_directory(
+                    target_dir,
+                    [("directory-member", Path("key.pem"))],
+                )
+                transaction.activate_file(target_dir / "mapping.json", "file-member")
+
+        self.assertEqual(original_file.read_bytes(), b"ORIGINAL")
+        self.assertEqual(sorted(path.name for path in target_dir.iterdir()), ["original.key"])
+
     def test_file_target_collision_with_history_is_rejected_before_history_activation(self) -> None:
         rollback_dir = self.temp_dir / "collision-history-snapshot"
         history_snapshot = self.store.create_backup(rollback_dir, retention_count=1)
