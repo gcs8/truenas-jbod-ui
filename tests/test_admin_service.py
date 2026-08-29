@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+import tempfile
+import threading
 import urllib.error
 import unittest
 from datetime import datetime, timezone
@@ -12,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
 from fastapi import Request
+from fastapi.responses import FileResponse
 
 from app import __version__
 from admin_service.config import AdminSettings
@@ -45,12 +48,14 @@ from app.models.domain import SnapshotExportRequest
 from app.models.domain import SystemSetupBootstrapRequest
 from app.models.domain import SystemSetupRequest
 from app.models.domain import SystemSetupSudoPreviewRequest
+from app.models.domain import SystemBackupExportRequest
 from app.services.profile_registry import UNIFI_UNVR_FRONT_4_PROFILE_ID
 from app.services.ssh_probe import SSHCommandResult
 from app.services.snapshot_export import PackagedSnapshotExport
 from app.services.system_setup import PRESERVE_SECRET_SENTINEL
 from history_service.config import HistorySettings
 from history_service.main import app as history_app
+from history_service.system_backup import FileBackupArtifact
 from app.services.truenas_ws import TrueNASRawData
 
 
@@ -193,6 +198,207 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertNotIn("/api/system/backup/export", paths)
         self.assertNotIn("/api/system/backup/import", paths)
+
+    def test_admin_backup_export_returns_file_response_and_cleans_workspace(self) -> None:
+        workspace = Path(tempfile.mkdtemp(prefix="admin-export-response-"))
+        archive_path = workspace / "backup.zip"
+        archive_path.write_bytes(b"PK-file-backed")
+        artifact = FileBackupArtifact(
+            filename="backup.zip",
+            path=archive_path,
+            media_type="application/zip",
+            manifest={"packaging": "zip", "schema_version": 1},
+            cleanup_root=workspace,
+        )
+        maintenance = SimpleNamespace(
+            stopped_containers=[],
+            restarted_containers=[],
+            restart_failures={},
+        )
+        service = MagicMock()
+        service.export_bundle.return_value = (artifact, maintenance)
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
+
+        with patch("admin_service.main.get_maintenance_service", return_value=service):
+            response = asyncio.run(
+                route.endpoint(
+                    SystemBackupExportRequest(
+                        packaging="zip",
+                        encrypt=True,
+                        passphrase="test-passphrase",
+                    ),
+                    stop_services=False,
+                    restart_services=True,
+                )
+            )
+
+        self.assertIsInstance(response, FileResponse)
+        self.assertEqual(response.headers["content-disposition"], 'attachment; filename="backup.zip"')
+        self.assertTrue(archive_path.exists())
+
+        async def disconnect_during_body() -> None:
+            async def receive() -> dict[str, object]:
+                return {"type": "http.disconnect"}
+
+            async def send(message: dict[str, object]) -> None:
+                if message.get("type") == "http.response.body":
+                    raise asyncio.CancelledError()
+
+            await response(
+                {"type": "http", "method": "GET", "headers": []},
+                receive,
+                send,
+            )
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(disconnect_during_body())
+        self.assertFalse(workspace.exists())
+
+    def test_admin_backup_export_cleans_workspace_when_response_setup_fails(self) -> None:
+        workspace = Path(tempfile.mkdtemp(prefix="admin-export-setup-failure-"))
+        archive_path = workspace / "backup.zip"
+        archive_path.write_bytes(b"PK-file-backed")
+        artifact = FileBackupArtifact(
+            filename="backup.zip",
+            path=archive_path,
+            media_type="application/zip",
+            manifest={"packaging": "zip", "schema_version": 1},
+            cleanup_root=workspace,
+        )
+        maintenance = SimpleNamespace(
+            stopped_containers=[],
+            restarted_containers=[],
+            restart_failures={},
+        )
+        service = MagicMock()
+        service.export_bundle.return_value = (artifact, maintenance)
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
+
+        with (
+            patch("admin_service.main.get_maintenance_service", return_value=service),
+            patch(
+                "admin_service.main.TemporaryFileResponse",
+                side_effect=RuntimeError("response setup failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "response setup failed"):
+                asyncio.run(
+                    route.endpoint(
+                        SystemBackupExportRequest(
+                            packaging="zip",
+                            encrypt=True,
+                            passphrase="test-passphrase",
+                        ),
+                        stop_services=False,
+                        restart_services=True,
+                    )
+                )
+
+        self.assertFalse(workspace.exists())
+
+    def test_admin_backup_export_cleans_workspace_when_request_is_cancelled(self) -> None:
+        workspace = Path(tempfile.mkdtemp(prefix="admin-export-cancelled-"))
+        archive_path = workspace / "backup.zip"
+        archive_path.write_bytes(b"PK-file-backed")
+        artifact = FileBackupArtifact(
+            filename="backup.zip",
+            path=archive_path,
+            media_type="application/zip",
+            manifest={"packaging": "zip", "schema_version": 1},
+            cleanup_root=workspace,
+        )
+        maintenance = SimpleNamespace(
+            stopped_containers=[],
+            restarted_containers=[],
+            restart_failures={},
+        )
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        service = MagicMock()
+
+        def export_bundle(*_: object, **__: object) -> tuple[FileBackupArtifact, object]:
+            worker_started.set()
+            release_worker.wait(timeout=1.0)
+            return artifact, maintenance
+
+        service.export_bundle.side_effect = export_bundle
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
+
+        async def cancel_export() -> None:
+            with patch("admin_service.main.get_maintenance_service", return_value=service):
+                export_task = asyncio.create_task(
+                    route.endpoint(
+                        SystemBackupExportRequest(
+                            packaging="zip",
+                            encrypt=True,
+                            passphrase="test-passphrase",
+                        ),
+                        stop_services=False,
+                        restart_services=True,
+                    )
+                )
+                started = await asyncio.to_thread(worker_started.wait, 1.0)
+                self.assertTrue(started)
+                export_task.cancel()
+                release_worker.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await export_task
+
+        asyncio.run(cancel_export())
+        self.assertFalse(workspace.exists())
+
+    def test_admin_backup_export_cleanup_survives_repeated_cancellation(self) -> None:
+        workspace = Path(tempfile.mkdtemp(prefix="admin-export-cancelled-twice-"))
+        archive_path = workspace / "backup.zip"
+        archive_path.write_bytes(b"PK-file-backed")
+        artifact = FileBackupArtifact(
+            filename="backup.zip",
+            path=archive_path,
+            media_type="application/zip",
+            manifest={"packaging": "zip", "schema_version": 1},
+            cleanup_root=workspace,
+        )
+        maintenance = SimpleNamespace(
+            stopped_containers=[],
+            restarted_containers=[],
+            restart_failures={},
+        )
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        service = MagicMock()
+
+        def export_bundle(*_: object, **__: object) -> tuple[FileBackupArtifact, object]:
+            worker_started.set()
+            release_worker.wait(timeout=1.0)
+            return artifact, maintenance
+
+        service.export_bundle.side_effect = export_bundle
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
+
+        async def cancel_export_twice() -> None:
+            with patch("admin_service.main.get_maintenance_service", return_value=service):
+                export_task = asyncio.create_task(
+                    route.endpoint(
+                        SystemBackupExportRequest(
+                            packaging="zip",
+                            encrypt=True,
+                            passphrase="test-passphrase",
+                        ),
+                        stop_services=False,
+                        restart_services=True,
+                    )
+                )
+                started = await asyncio.to_thread(worker_started.wait, 1.0)
+                self.assertTrue(started)
+                export_task.cancel()
+                await asyncio.sleep(0)
+                export_task.cancel()
+                release_worker.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await export_task
+
+        asyncio.run(cancel_export_twice())
+        self.assertFalse(workspace.exists())
 
     def test_unhandled_exception_handlers_redact_exception_details(self) -> None:
         for app, port, expected_detail in (

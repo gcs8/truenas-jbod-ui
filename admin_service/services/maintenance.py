@@ -170,7 +170,7 @@ class AdminMaintenanceService:
         restart_services: bool = True,
     ) -> tuple[Any, MaintenanceOutcome]:
         def operation(_stopped: list[str]) -> Any:
-            return self.backup_service.export_bundle(
+            return self.backup_service.export_bundle_to_file(
                 encrypt=payload.encrypt,
                 passphrase=payload.passphrase,
                 packaging=payload.packaging,
@@ -194,7 +194,7 @@ class AdminMaintenanceService:
 
         def operation(stopped_containers: list[str]) -> Any:
             runtime_after_stop = self.runtime_service.status_payload()
-            return self.backup_service.export_debug_bundle(
+            return self.backup_service.export_debug_bundle_to_file(
                 encrypt=payload.encrypt,
                 passphrase=payload.passphrase,
                 packaging=payload.packaging,
