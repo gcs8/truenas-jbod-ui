@@ -675,9 +675,18 @@
     return params.toString() ? `${path}?${params.toString()}` : path;
   }
 
+  function replaceLocationIfChanged(nextUrl) {
+    const currentUrl = `${window.location.pathname}${window.location.search}`;
+    if (currentUrl === nextUrl) {
+      return false;
+    }
+    window.history.replaceState({}, "", nextUrl);
+    return true;
+  }
+
   function syncLocation() {
     const pageParams = selectedParams({ includeMode: true });
-    window.history.replaceState({}, "", pageParams.toString() ? `/sas-fabric?${pageParams.toString()}` : "/sas-fabric");
+    replaceLocationIfChanged(pageParams.toString() ? `/sas-fabric?${pageParams.toString()}` : "/sas-fabric");
     const backParams = selectedParams();
     const backHref = backParams.toString() ? `/?${backParams.toString()}` : "/";
     elements.backLinks.forEach((link) => {
@@ -1050,6 +1059,10 @@
   function selectionTouchesSlots(slots) {
     const slotSet = selectedSlots();
     return slotSet.size > 0 && slotsOverlap(slots, slotSet);
+  }
+
+  function sesNodeTouchesSlot(node, slotNumber) {
+    return node?.kind === "ses-enclosure" && sortedSlots(node.related_slots).includes(Number(slotNumber));
   }
 
   function slotByNumber(slotNumber) {
@@ -2389,7 +2402,7 @@
     const expanderPhy = expanderPhyForDevice(expanderNode, mprDevice);
     const sesNodes = list(trace.node_ids)
       .map((nodeId) => nodes.get(nodeId))
-      .filter((node) => node?.kind === "ses-enclosure" && selectionTouchesSlots([slotNumber]));
+      .filter((node) => sesNodeTouchesSlot(node, slotNumber));
     const poolNode = firstTraceNode(trace, fabric, (node) => node?.kind === "pool");
     const vdevNode = firstTraceNode(trace, fabric, (node) => node?.kind === "vdev");
     const zone = backplaneZoneForSlot(slotNumber, fabric);
