@@ -9,9 +9,9 @@ import threading
 import time
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
 
@@ -162,11 +162,114 @@ CREATE TABLE IF NOT EXISTS metric_samples (
     sas_address TEXT
 );
 
+CREATE TABLE IF NOT EXISTS metric_rollups (
+    bucket_start TEXT NOT NULL,
+    bucket_seconds INTEGER NOT NULL,
+    system_id TEXT NOT NULL,
+    system_label TEXT,
+    enclosure_key TEXT NOT NULL,
+    enclosure_id TEXT,
+    enclosure_label TEXT,
+    slot INTEGER NOT NULL,
+    slot_label TEXT NOT NULL,
+    metric_name TEXT NOT NULL,
+    sample_count INTEGER NOT NULL,
+    value_sum REAL NOT NULL,
+    value_min REAL NOT NULL,
+    value_max REAL NOT NULL,
+    last_value REAL NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    device_name TEXT,
+    serial TEXT,
+    model TEXT,
+    state TEXT,
+    gptid TEXT,
+    persistent_id_label TEXT,
+    disk_identity_key TEXT NOT NULL DEFAULT '',
+    logical_unit_id TEXT,
+    sas_address TEXT,
+    PRIMARY KEY (
+        bucket_seconds,
+        bucket_start,
+        system_id,
+        enclosure_key,
+        slot,
+        metric_name,
+        disk_identity_key
+    )
+);
+
+CREATE TABLE IF NOT EXISTS history_table_counts (
+    table_name TEXT PRIMARY KEY,
+    row_count INTEGER NOT NULL CHECK (row_count >= 0)
+);
+
+CREATE TRIGGER IF NOT EXISTS count_slot_events_insert
+AFTER INSERT ON slot_events BEGIN
+    UPDATE history_table_counts
+    SET row_count = row_count + 1
+    WHERE table_name = 'slot_events';
+END;
+
+CREATE TRIGGER IF NOT EXISTS count_slot_events_delete
+AFTER DELETE ON slot_events BEGIN
+    UPDATE history_table_counts
+    SET row_count = row_count - 1
+    WHERE table_name = 'slot_events';
+END;
+
+CREATE TRIGGER IF NOT EXISTS count_metric_samples_insert
+AFTER INSERT ON metric_samples BEGIN
+    UPDATE history_table_counts
+    SET row_count = row_count + 1
+    WHERE table_name = 'metric_samples';
+END;
+
+CREATE TRIGGER IF NOT EXISTS count_metric_samples_delete
+AFTER DELETE ON metric_samples BEGIN
+    UPDATE history_table_counts
+    SET row_count = row_count - 1
+    WHERE table_name = 'metric_samples';
+END;
+
+CREATE TRIGGER IF NOT EXISTS count_metric_rollups_insert
+AFTER INSERT ON metric_rollups BEGIN
+    UPDATE history_table_counts
+    SET row_count = row_count + 1
+    WHERE table_name = 'metric_rollups';
+END;
+
+CREATE TRIGGER IF NOT EXISTS count_metric_rollups_delete
+AFTER DELETE ON metric_rollups BEGIN
+    UPDATE history_table_counts
+    SET row_count = row_count - 1
+    WHERE table_name = 'metric_rollups';
+END;
+
 CREATE INDEX IF NOT EXISTS idx_slot_events_scope
     ON slot_events (system_id, enclosure_key, slot, observed_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_metric_samples_scope
     ON metric_samples (system_id, enclosure_key, slot, metric_name, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_slot_events_observed_at
+    ON slot_events (observed_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_metric_samples_observed_at
+    ON metric_samples (observed_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_metric_rollups_scope
+    ON metric_rollups (
+        system_id,
+        enclosure_key,
+        slot,
+        metric_name,
+        bucket_seconds,
+        bucket_start DESC
+    );
+
+CREATE INDEX IF NOT EXISTS idx_metric_rollups_retention
+    ON metric_rollups (bucket_seconds, bucket_start);
 """
 
 
@@ -280,7 +383,21 @@ class HistoryStore:
             self._ensure_metric_sample_columns(connection)
             self._backfill_disk_identity_keys_once(connection)
             self._ensure_identity_indexes(connection)
+            self._synchronize_table_counts(connection)
             connection.commit()
+
+    @staticmethod
+    def _synchronize_table_counts(connection: sqlite3.Connection) -> None:
+        for table_name in ("slot_events", "metric_samples", "metric_rollups"):
+            connection.execute(
+                f"""
+                INSERT INTO history_table_counts (table_name, row_count)
+                VALUES (?, (SELECT COUNT(*) FROM {table_name}))
+                ON CONFLICT (table_name) DO UPDATE SET
+                    row_count = excluded.row_count
+                """,
+                (table_name,),
+            )
 
     @staticmethod
     def _backfill_disk_identity_keys_once(connection: sqlite3.Connection) -> None:
@@ -444,6 +561,8 @@ class HistoryStore:
                 Path(f"{self.file_path}{suffix}").unlink(missing_ok=True)
             temp_path.replace(self.file_path)
             self._normalize_database_permissions()
+            self._journal_mode_identity = None
+            self._initialize_schema()
 
     @staticmethod
     def _backup_stamp(snapshot_label: str | None) -> str:
@@ -815,6 +934,353 @@ class HistoryStore:
             )
         )
 
+    def maintain_retention(
+        self,
+        *,
+        now: datetime,
+        raw_metric_retention_days: int,
+        event_retention_days: int,
+        hourly_rollup_retention_days: int,
+        daily_rollup_retention_days: int,
+        batch_size: int,
+        max_batches: int,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        retention_values = (
+            raw_metric_retention_days,
+            event_retention_days,
+            hourly_rollup_retention_days,
+            daily_rollup_retention_days,
+        )
+        if any(value < 0 for value in retention_values):
+            raise ValueError("History retention days cannot be negative.")
+        if batch_size < 1:
+            raise ValueError("History retention batch size must be at least 1.")
+        if max_batches < 1:
+            raise ValueError("History retention max batches must be at least 1.")
+
+        normalized_now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        normalized_now = normalized_now.astimezone(timezone.utc)
+        cutoffs = {
+            "metric": self._retention_cutoff(normalized_now, raw_metric_retention_days),
+            "event": self._retention_cutoff(normalized_now, event_retention_days),
+            "hourly": self._retention_cutoff(normalized_now, hourly_rollup_retention_days),
+            "daily": self._retention_cutoff(normalized_now, daily_rollup_retention_days),
+        }
+        summary: dict[str, Any] = {
+            "metric_samples_removed": 0,
+            "events_removed": 0,
+            "hourly_rollups_removed": 0,
+            "daily_rollups_removed": 0,
+            "total_rows_removed": 0,
+            "batches_completed": 0,
+            "has_more": False,
+            "interrupted": False,
+        }
+
+        for _ in range(max_batches):
+            if should_continue is not None and not should_continue():
+                summary["interrupted"] = True
+                break
+            try:
+                batch = self._execute_write(
+                    lambda connection: self._maintain_retention_batch(
+                        connection,
+                        cutoffs=cutoffs,
+                        batch_size=batch_size,
+                    )
+                )
+            except Exception as exc:
+                summary["has_more"] = True
+                summary["total_rows_removed"] = self._retention_total_rows_removed(summary)
+                setattr(exc, "retention_summary", dict(summary))
+                raise
+            summary["batches_completed"] += 1
+            for key in (
+                "metric_samples_removed",
+                "events_removed",
+                "hourly_rollups_removed",
+                "daily_rollups_removed",
+            ):
+                summary[key] += int(batch[key])
+            summary["has_more"] = bool(batch["has_more"])
+            if not summary["has_more"]:
+                break
+
+        summary["total_rows_removed"] = self._retention_total_rows_removed(summary)
+        return summary
+
+    @staticmethod
+    def _retention_total_rows_removed(summary: dict[str, Any]) -> int:
+        return sum(
+            int(summary[key])
+            for key in (
+                "metric_samples_removed",
+                "events_removed",
+                "hourly_rollups_removed",
+                "daily_rollups_removed",
+            )
+        )
+
+    @staticmethod
+    def _retention_cutoff(now: datetime, days: int) -> str | None:
+        if days <= 0:
+            return None
+        return (now - timedelta(days=days)).isoformat()
+
+    @classmethod
+    def _maintain_retention_batch(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        cutoffs: dict[str, str | None],
+        batch_size: int,
+    ) -> dict[str, Any]:
+        metric_ids = cls._retention_row_ids(
+            connection,
+            table_name="metric_samples",
+            timestamp_column="observed_at",
+            cutoff=cutoffs["metric"],
+            batch_size=batch_size,
+        )
+        if metric_ids:
+            cls._roll_up_metric_rows(connection, metric_ids, bucket_seconds=3600)
+            cls._roll_up_metric_rows(connection, metric_ids, bucket_seconds=86400)
+            metric_samples_removed = cls._delete_rows_by_id(connection, "metric_samples", metric_ids)
+        else:
+            metric_samples_removed = 0
+
+        event_ids = cls._retention_row_ids(
+            connection,
+            table_name="slot_events",
+            timestamp_column="observed_at",
+            cutoff=cutoffs["event"],
+            batch_size=batch_size,
+        )
+        events_removed = cls._delete_rows_by_id(connection, "slot_events", event_ids)
+        hourly_rollups_removed = cls._delete_rollup_batch(
+            connection,
+            bucket_seconds=3600,
+            cutoff=cutoffs["hourly"],
+            batch_size=batch_size,
+        )
+        daily_rollups_removed = cls._delete_rollup_batch(
+            connection,
+            bucket_seconds=86400,
+            cutoff=cutoffs["daily"],
+            batch_size=batch_size,
+        )
+        has_more = any(
+            (
+                cls._retention_rows_exist(connection, "metric_samples", "observed_at", cutoffs["metric"]),
+                cls._retention_rows_exist(connection, "slot_events", "observed_at", cutoffs["event"]),
+                cls._rollups_exist(connection, 3600, cutoffs["hourly"]),
+                cls._rollups_exist(connection, 86400, cutoffs["daily"]),
+            )
+        )
+        return {
+            "metric_samples_removed": metric_samples_removed,
+            "events_removed": events_removed,
+            "hourly_rollups_removed": hourly_rollups_removed,
+            "daily_rollups_removed": daily_rollups_removed,
+            "has_more": has_more,
+        }
+
+    @staticmethod
+    def _retention_row_ids(
+        connection: sqlite3.Connection,
+        *,
+        table_name: str,
+        timestamp_column: str,
+        cutoff: str | None,
+        batch_size: int,
+    ) -> list[int]:
+        if cutoff is None:
+            return []
+        rows = connection.execute(
+            f"""
+            SELECT id
+            FROM {table_name}
+            WHERE {timestamp_column} < ?
+            ORDER BY {timestamp_column}, id
+            LIMIT ?
+            """,
+            (cutoff, batch_size),
+        ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    @staticmethod
+    def _delete_rows_by_id(
+        connection: sqlite3.Connection,
+        table_name: str,
+        row_ids: list[int],
+    ) -> int:
+        if not row_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in row_ids)
+        return int(
+            connection.execute(
+                f"DELETE FROM {table_name} WHERE id IN ({placeholders})",
+                row_ids,
+            ).rowcount
+        )
+
+    @staticmethod
+    def _roll_up_metric_rows(
+        connection: sqlite3.Connection,
+        row_ids: list[int],
+        *,
+        bucket_seconds: int,
+    ) -> None:
+        if not row_ids:
+            return
+        if bucket_seconds == 3600:
+            bucket_expression = "strftime('%Y-%m-%dT%H:00:00+00:00', observed_at)"
+        elif bucket_seconds == 86400:
+            bucket_expression = "strftime('%Y-%m-%dT00:00:00+00:00', observed_at)"
+        else:
+            raise ValueError("Unsupported history rollup interval.")
+        placeholders = ", ".join("?" for _ in row_ids)
+        connection.execute(
+            f"""
+            INSERT INTO metric_rollups (
+                bucket_start, bucket_seconds, system_id, system_label,
+                enclosure_key, enclosure_id, enclosure_label, slot, slot_label,
+                metric_name, sample_count, value_sum, value_min, value_max,
+                last_value, last_observed_at,
+                device_name, serial, model, state, gptid, persistent_id_label,
+                disk_identity_key, logical_unit_id, sas_address
+            )
+            SELECT
+                {bucket_expression}, ?, system_id, MAX(system_label),
+                enclosure_key, MAX(enclosure_id), MAX(enclosure_label), slot,
+                MAX(slot_label), metric_name, COUNT(*),
+                SUM(COALESCE(value_real, CAST(value_integer AS REAL))),
+                MIN(COALESCE(value_real, CAST(value_integer AS REAL))),
+                MAX(COALESCE(value_real, CAST(value_integer AS REAL))),
+                MAX(
+                    CASE WHEN rollup_rank = 1
+                    THEN COALESCE(value_real, CAST(value_integer AS REAL)) END
+                ),
+                MAX(observed_at),
+                MAX(device_name), MAX(serial), MAX(model), MAX(state),
+                MAX(gptid), MAX(persistent_id_label),
+                COALESCE(disk_identity_key, ''), MAX(logical_unit_id), MAX(sas_address)
+            FROM (
+                SELECT
+                    metric_samples.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            {bucket_expression}, system_id, enclosure_key, slot,
+                            metric_name, COALESCE(disk_identity_key, '')
+                        ORDER BY observed_at DESC, id DESC
+                    ) AS rollup_rank
+                FROM metric_samples
+                WHERE id IN ({placeholders})
+            ) selected_samples
+            WHERE 1 = 1
+              AND COALESCE(value_real, CAST(value_integer AS REAL)) IS NOT NULL
+            GROUP BY
+                {bucket_expression}, system_id, enclosure_key, slot,
+                metric_name, COALESCE(disk_identity_key, '')
+            ON CONFLICT (
+                bucket_seconds, bucket_start, system_id, enclosure_key,
+                slot, metric_name, disk_identity_key
+            ) DO UPDATE SET
+                system_label = COALESCE(excluded.system_label, metric_rollups.system_label),
+                enclosure_id = COALESCE(excluded.enclosure_id, metric_rollups.enclosure_id),
+                enclosure_label = COALESCE(excluded.enclosure_label, metric_rollups.enclosure_label),
+                slot_label = excluded.slot_label,
+                sample_count = metric_rollups.sample_count + excluded.sample_count,
+                value_sum = metric_rollups.value_sum + excluded.value_sum,
+                value_min = MIN(metric_rollups.value_min, excluded.value_min),
+                value_max = MAX(metric_rollups.value_max, excluded.value_max),
+                last_value = CASE
+                    WHEN excluded.last_observed_at >= metric_rollups.last_observed_at
+                    THEN excluded.last_value
+                    ELSE metric_rollups.last_value
+                END,
+                last_observed_at = MAX(
+                    metric_rollups.last_observed_at,
+                    excluded.last_observed_at
+                ),
+                device_name = COALESCE(excluded.device_name, metric_rollups.device_name),
+                serial = COALESCE(excluded.serial, metric_rollups.serial),
+                model = COALESCE(excluded.model, metric_rollups.model),
+                state = COALESCE(excluded.state, metric_rollups.state),
+                gptid = COALESCE(excluded.gptid, metric_rollups.gptid),
+                persistent_id_label = COALESCE(
+                    excluded.persistent_id_label,
+                    metric_rollups.persistent_id_label
+                ),
+                logical_unit_id = COALESCE(excluded.logical_unit_id, metric_rollups.logical_unit_id),
+                sas_address = COALESCE(excluded.sas_address, metric_rollups.sas_address)
+            """,
+            [bucket_seconds, *row_ids],
+        )
+
+    @staticmethod
+    def _delete_rollup_batch(
+        connection: sqlite3.Connection,
+        *,
+        bucket_seconds: int,
+        cutoff: str | None,
+        batch_size: int,
+    ) -> int:
+        if cutoff is None:
+            return 0
+        return int(
+            connection.execute(
+                """
+                DELETE FROM metric_rollups
+                WHERE rowid IN (
+                    SELECT rowid
+                    FROM metric_rollups
+                    WHERE bucket_seconds = ? AND bucket_start < ?
+                    ORDER BY bucket_start
+                    LIMIT ?
+                )
+                """,
+                (bucket_seconds, cutoff, batch_size),
+            ).rowcount
+        )
+
+    @staticmethod
+    def _retention_rows_exist(
+        connection: sqlite3.Connection,
+        table_name: str,
+        timestamp_column: str,
+        cutoff: str | None,
+    ) -> bool:
+        if cutoff is None:
+            return False
+        row = connection.execute(
+            f"SELECT EXISTS(SELECT 1 FROM {table_name} WHERE {timestamp_column} < ? LIMIT 1)",
+            (cutoff,),
+        ).fetchone()
+        return bool(row[0])
+
+    @staticmethod
+    def _rollups_exist(
+        connection: sqlite3.Connection,
+        bucket_seconds: int,
+        cutoff: str | None,
+    ) -> bool:
+        if cutoff is None:
+            return False
+        row = connection.execute(
+            """
+            SELECT EXISTS(
+                SELECT 1
+                FROM metric_rollups
+                WHERE bucket_seconds = ? AND bucket_start < ?
+                LIMIT 1
+            )
+            """,
+            (bucket_seconds, cutoff),
+        ).fetchone()
+        return bool(row[0])
+
     def list_slot_events(
         self,
         system_id: str,
@@ -846,11 +1312,13 @@ class HistoryStore:
         since: str | None = None,
     ) -> list[dict[str, Any]]:
         enclosure_key = enclosure_id or ""
-        where_clauses = ["system_id = ?", "enclosure_key = ?", "slot = ?"]
-        parameters: list[Any] = [system_id, enclosure_key, slot]
+        base_where_clauses = ["system_id = ?", "enclosure_key = ?", "slot = ?"]
+        base_parameters: list[Any] = [system_id, enclosure_key, slot]
         if metric_name:
-            where_clauses.append("metric_name = ?")
-            parameters.append(metric_name)
+            base_where_clauses.append("metric_name = ?")
+            base_parameters.append(metric_name)
+        where_clauses = list(base_where_clauses)
+        parameters = list(base_parameters)
         if since:
             where_clauses.append("observed_at >= ?")
             parameters.append(since)
@@ -865,8 +1333,15 @@ class HistoryStore:
         """
         with closing(self._connect()) as connection:
             rows = connection.execute(query, parameters).fetchall()
-
-        return self._metric_rows_to_payload(rows)
+            samples = self._metric_rows_to_payload(rows)
+            return self._append_metric_rollups(
+                connection,
+                samples,
+                where_clauses=base_where_clauses,
+                parameters=base_parameters,
+                limit=limit,
+                since=since,
+            )
 
     def list_disk_metric_samples(
         self,
@@ -880,11 +1355,13 @@ class HistoryStore:
         if not normalized_identity_key:
             return []
 
-        where_clauses = ["disk_identity_key = ?"]
-        parameters: list[Any] = [normalized_identity_key]
+        base_where_clauses = ["disk_identity_key = ?"]
+        base_parameters: list[Any] = [normalized_identity_key]
         if metric_name:
-            where_clauses.append("metric_name = ?")
-            parameters.append(metric_name)
+            base_where_clauses.append("metric_name = ?")
+            base_parameters.append(metric_name)
+        where_clauses = list(base_where_clauses)
+        parameters = list(base_parameters)
         if since:
             where_clauses.append("observed_at >= ?")
             parameters.append(since)
@@ -899,7 +1376,100 @@ class HistoryStore:
         """
         with closing(self._connect()) as connection:
             rows = connection.execute(query, parameters).fetchall()
-        return self._metric_rows_to_payload(rows)
+            samples = self._metric_rows_to_payload(rows)
+            return self._append_metric_rollups(
+                connection,
+                samples,
+                where_clauses=base_where_clauses,
+                parameters=base_parameters,
+                limit=limit,
+                since=since,
+            )
+
+    @classmethod
+    def _append_metric_rollups(
+        cls,
+        connection: sqlite3.Connection,
+        samples: list[dict[str, Any]],
+        *,
+        where_clauses: list[str],
+        parameters: list[Any],
+        limit: int,
+        since: str | None,
+    ) -> list[dict[str, Any]]:
+        if len(samples) >= limit:
+            return samples[:limit]
+
+        before = str(samples[-1]["observed_at"]) if samples else None
+        hourly_rollup_added = False
+        for bucket_seconds in (3600, 86400):
+            remaining = limit - len(samples)
+            if remaining <= 0:
+                break
+            rollup_where = [*where_clauses, "bucket_seconds = ?"]
+            rollup_parameters: list[Any] = [*parameters, bucket_seconds]
+            if since is not None:
+                rollup_where.append("bucket_start >= ?")
+                rollup_parameters.append(since)
+            if before:
+                boundary = (
+                    f"{before[:10]}T00:00:00+00:00"
+                    if bucket_seconds == 86400 and hourly_rollup_added
+                    else before
+                )
+                rollup_where.append("bucket_start < ?")
+                rollup_parameters.append(boundary)
+            rollup_parameters.append(remaining)
+            rows = connection.execute(
+                f"""
+                SELECT
+                    NULL AS id,
+                    CASE
+                        WHEN metric_name IN ('bytes_read', 'bytes_written', 'power_on_hours')
+                        THEN last_observed_at
+                        ELSE bucket_start
+                    END AS observed_at,
+                    system_id,
+                    system_label,
+                    enclosure_key,
+                    enclosure_id,
+                    enclosure_label,
+                    slot,
+                    slot_label,
+                    metric_name,
+                    NULL AS value_integer,
+                    CASE
+                        WHEN metric_name IN ('bytes_read', 'bytes_written', 'power_on_hours')
+                        THEN last_value
+                        ELSE value_sum / sample_count
+                    END AS value_real,
+                    device_name,
+                    serial,
+                    model,
+                    state,
+                    gptid,
+                    persistent_id_label,
+                    NULLIF(disk_identity_key, '') AS disk_identity_key,
+                    logical_unit_id,
+                    sas_address,
+                    bucket_seconds AS rollup_seconds,
+                    sample_count,
+                    value_min,
+                    value_max
+                FROM metric_rollups
+                WHERE {' AND '.join(rollup_where)}
+                ORDER BY bucket_start DESC
+                LIMIT ?
+                """,
+                rollup_parameters,
+            ).fetchall()
+            rollups = cls._metric_rows_to_payload(rows)
+            samples.extend(rollups)
+            if rollups:
+                if bucket_seconds == 3600:
+                    hourly_rollup_added = True
+                before = str(rollups[-1]["observed_at"])
+        return samples[:limit]
 
     def list_disk_metric_homes(
         self,
@@ -910,35 +1480,73 @@ class HistoryStore:
         normalized_identity_key = disk_identity_key.strip()
         if not normalized_identity_key:
             return []
-
-        where_clauses = ["disk_identity_key = ?"]
+        raw_since_clause = "AND observed_at >= ?" if since else ""
+        rollup_since_clause = "AND bucket_start >= ?" if since else ""
         parameters: list[Any] = [normalized_identity_key]
         if since:
-            where_clauses.append("observed_at >= ?")
+            parameters.append(since)
+        parameters.append(normalized_identity_key)
+        if since:
+            parameters.append(since)
+        parameters.append(normalized_identity_key)
+        if since:
             parameters.append(since)
 
         query = f"""
             SELECT
                 system_id,
-                system_label,
+                MAX(system_label) AS system_label,
                 enclosure_key,
-                enclosure_id,
-                enclosure_label,
+                MAX(enclosure_id) AS enclosure_id,
+                MAX(enclosure_label) AS enclosure_label,
                 slot,
-                slot_label,
-                MIN(observed_at) AS first_seen_at,
-                MAX(observed_at) AS last_seen_at,
-                COUNT(*) AS sample_count
-            FROM metric_samples
-            WHERE {' AND '.join(where_clauses)}
-            GROUP BY
-                system_id,
-                system_label,
-                enclosure_key,
-                enclosure_id,
-                enclosure_label,
-                slot,
-                slot_label
+                MAX(slot_label) AS slot_label,
+                MIN(first_seen_at) AS first_seen_at,
+                MAX(last_seen_at) AS last_seen_at,
+                SUM(sample_count) AS sample_count
+            FROM (
+                SELECT
+                    system_id, system_label, enclosure_key, enclosure_id,
+                    enclosure_label, slot, slot_label,
+                    observed_at AS first_seen_at,
+                    observed_at AS last_seen_at,
+                    1 AS sample_count
+                FROM metric_samples
+                WHERE disk_identity_key = ? {raw_since_clause}
+                UNION ALL
+                SELECT
+                    system_id, system_label, enclosure_key, enclosure_id,
+                    enclosure_label, slot, slot_label,
+                    bucket_start AS first_seen_at,
+                    bucket_start AS last_seen_at,
+                    sample_count
+                FROM metric_rollups hourly
+                WHERE disk_identity_key = ?
+                  AND bucket_seconds = 3600
+                  {rollup_since_clause}
+                UNION ALL
+                SELECT
+                    system_id, system_label, enclosure_key, enclosure_id,
+                    enclosure_label, slot, slot_label,
+                    bucket_start AS first_seen_at,
+                    bucket_start AS last_seen_at,
+                    sample_count
+                FROM metric_rollups daily
+                WHERE disk_identity_key = ?
+                  AND bucket_seconds = 86400
+                  {rollup_since_clause}
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM metric_rollups hourly
+                      WHERE hourly.disk_identity_key = daily.disk_identity_key
+                        AND hourly.system_id = daily.system_id
+                        AND hourly.enclosure_key = daily.enclosure_key
+                        AND hourly.slot = daily.slot
+                        AND hourly.bucket_seconds = 3600
+                        AND substr(hourly.bucket_start, 1, 10) = substr(daily.bucket_start, 1, 10)
+                  )
+            ) history
+            GROUP BY system_id, enclosure_key, slot
             ORDER BY first_seen_at ASC, last_seen_at ASC, system_id ASC, enclosure_key ASC, slot ASC
         """
         with closing(self._connect()) as connection:
@@ -1089,6 +1697,114 @@ class HistoryStore:
             payload.append(item)
         return payload
 
+    @classmethod
+    def _append_scope_metric_rollups(
+        cls,
+        connection: sqlite3.Connection,
+        payload_by_slot: dict[int, dict[str, Any]],
+        *,
+        where_clauses: list[str],
+        parameters: list[Any],
+        metric_name: str,
+        limit: int,
+        since: str | None,
+    ) -> None:
+        if limit <= 0:
+            return
+        rollups_by_interval: dict[int, dict[int, list[dict[str, Any]]]] = {}
+        for bucket_seconds in (3600, 86400):
+            rollup_where = [
+                *where_clauses,
+                "metric_name = ?",
+                "bucket_seconds = ?",
+            ]
+            rollup_parameters = [*parameters, metric_name, bucket_seconds]
+            if since is not None:
+                rollup_where.append("bucket_start >= ?")
+                rollup_parameters.append(since)
+            rollup_parameters.append(limit)
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM (
+                    SELECT
+                        NULL AS id,
+                        CASE
+                            WHEN metric_name IN ('bytes_read', 'bytes_written', 'power_on_hours')
+                            THEN last_observed_at
+                            ELSE bucket_start
+                        END AS observed_at,
+                        system_id,
+                        system_label,
+                        enclosure_key,
+                        enclosure_id,
+                        enclosure_label,
+                        slot,
+                        slot_label,
+                        metric_name,
+                        NULL AS value_integer,
+                        CASE
+                            WHEN metric_name IN ('bytes_read', 'bytes_written', 'power_on_hours')
+                            THEN last_value
+                            ELSE value_sum / sample_count
+                        END AS value_real,
+                        device_name,
+                        serial,
+                        model,
+                        state,
+                        gptid,
+                        persistent_id_label,
+                        NULLIF(disk_identity_key, '') AS disk_identity_key,
+                        logical_unit_id,
+                        sas_address,
+                        bucket_seconds AS rollup_seconds,
+                        sample_count,
+                        value_min,
+                        value_max,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY slot, metric_name
+                            ORDER BY bucket_start DESC
+                        ) AS row_number
+                    FROM metric_rollups
+                    WHERE {' AND '.join(rollup_where)}
+                )
+                WHERE row_number <= ?
+                ORDER BY slot, observed_at DESC
+                """,
+                rollup_parameters,
+            ).fetchall()
+            by_slot: dict[int, list[dict[str, Any]]] = {}
+            for item in cls._metric_rows_to_payload(rows):
+                item.pop("row_number", None)
+                by_slot.setdefault(int(item["slot"]), []).append(item)
+            rollups_by_interval[bucket_seconds] = by_slot
+
+        for slot, payload in payload_by_slot.items():
+            samples = payload.setdefault("metrics", {}).setdefault(metric_name, [])
+            before = str(samples[-1]["observed_at"]) if samples else None
+            hourly_rollup_added = False
+            for bucket_seconds in (3600, 86400):
+                if len(samples) >= limit:
+                    break
+                boundary = None
+                if before:
+                    boundary = (
+                        f"{before[:10]}T00:00:00+00:00"
+                        if bucket_seconds == 86400 and hourly_rollup_added
+                        else before
+                    )
+                candidates = rollups_by_interval[bucket_seconds].get(slot, [])
+                additions = [
+                    item
+                    for item in candidates
+                    if boundary is None or str(item["observed_at"]) < boundary
+                ][: max(0, limit - len(samples))]
+                samples.extend(additions)
+                if additions:
+                    if bucket_seconds == 3600:
+                        hourly_rollup_added = True
+                    before = str(additions[-1]["observed_at"])
+
     def list_scope_history(
         self,
         system_id: str,
@@ -1225,6 +1941,15 @@ class HistoryStore:
                             "latest_values": {},
                         },
                     )["metrics"].setdefault(metric_name, []).append(item)
+                self._append_scope_metric_rollups(
+                    connection,
+                    payload_by_slot,
+                    where_clauses=where_clauses,
+                    parameters=parameters,
+                    metric_name=metric_name,
+                    limit=limit,
+                    since=since,
+                )
 
         for slot, payload in payload_by_slot.items():
             metrics = payload.setdefault("metrics", {})
@@ -1250,6 +1975,7 @@ class HistoryStore:
                         MAX(current.last_seen_at) AS last_seen_at,
                         NULL AS event_count,
                         NULL AS metric_sample_count,
+                        NULL AS metric_rollup_count,
                         1 AS activity_counts_deferred
                     FROM slot_state_current current
                     GROUP BY
@@ -1284,7 +2010,13 @@ class HistoryStore:
                         FROM metric_samples metrics
                         WHERE metrics.system_id = current.system_id
                           AND metrics.enclosure_key = current.enclosure_key
-                    ) AS metric_sample_count
+                    ) AS metric_sample_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM metric_rollups rollups
+                        WHERE rollups.system_id = current.system_id
+                          AND rollups.enclosure_key = current.enclosure_key
+                    ) AS metric_rollup_count
                 FROM slot_state_current current
                 GROUP BY
                     current.system_id,
@@ -1302,29 +2034,31 @@ class HistoryStore:
             tracked_slots = int(connection.execute("SELECT COUNT(*) FROM slot_state_current").fetchone()[0])
             event_count = int(connection.execute("SELECT COUNT(*) FROM slot_events").fetchone()[0])
             metric_sample_count = int(connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0])
+            metric_rollup_count = int(connection.execute("SELECT COUNT(*) FROM metric_rollups").fetchone()[0])
         return {
             "tracked_slots": tracked_slots,
             "event_count": event_count,
             "metric_sample_count": metric_sample_count,
+            "metric_rollup_count": metric_rollup_count,
         }
 
     def estimated_counts(self) -> dict[str, Any]:
         with closing(self._connect()) as connection:
             tracked_slots = int(connection.execute("SELECT COUNT(*) FROM slot_state_current").fetchone()[0])
-            event_count = self._table_id_upper_bound(connection, "slot_events")
-            metric_sample_count = self._table_id_upper_bound(connection, "metric_samples")
+            tracked_counts = {
+                str(row["table_name"]): int(row["row_count"])
+                for row in connection.execute(
+                    "SELECT table_name, row_count FROM history_table_counts"
+                ).fetchall()
+            }
         return {
             "tracked_slots": tracked_slots,
-            "event_count": event_count,
-            "metric_sample_count": metric_sample_count,
-            "estimated": True,
-            "count_mode": "id_upper_bound",
+            "event_count": tracked_counts.get("slot_events", 0),
+            "metric_sample_count": tracked_counts.get("metric_samples", 0),
+            "metric_rollup_count": tracked_counts.get("metric_rollups", 0),
+            "estimated": False,
+            "count_mode": "tracked",
         }
-
-    @staticmethod
-    def _table_id_upper_bound(connection: sqlite3.Connection, table_name: str) -> int:
-        row = connection.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table_name}").fetchone()
-        return int(row[0] or 0)
 
     def list_history_system_summaries(
         self,
@@ -1499,6 +2233,60 @@ class HistoryStore:
                     ),
                 ).rowcount
             )
+            metric_rollup_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM metric_rollups WHERE system_id = ?",
+                    (normalized_source_id,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                INSERT INTO metric_rollups (
+                    bucket_start, bucket_seconds, system_id, system_label,
+                    enclosure_key, enclosure_id, enclosure_label, slot, slot_label,
+                    metric_name, sample_count, value_sum, value_min, value_max,
+                    last_value, last_observed_at,
+                    device_name, serial, model, state, gptid, persistent_id_label,
+                    disk_identity_key, logical_unit_id, sas_address
+                )
+                SELECT
+                    bucket_start, bucket_seconds, ?, ?, enclosure_key,
+                    enclosure_id, enclosure_label, slot, slot_label, metric_name,
+                    sample_count, value_sum, value_min, value_max,
+                    last_value, last_observed_at, device_name,
+                    serial, model, state, gptid, persistent_id_label,
+                    disk_identity_key, logical_unit_id, sas_address
+                FROM metric_rollups
+                WHERE system_id = ?
+                ON CONFLICT (
+                    bucket_seconds, bucket_start, system_id, enclosure_key,
+                    slot, metric_name, disk_identity_key
+                ) DO UPDATE SET
+                    system_label = excluded.system_label,
+                    sample_count = metric_rollups.sample_count + excluded.sample_count,
+                    value_sum = metric_rollups.value_sum + excluded.value_sum,
+                    value_min = MIN(metric_rollups.value_min, excluded.value_min),
+                    value_max = MAX(metric_rollups.value_max, excluded.value_max),
+                    last_value = CASE
+                        WHEN excluded.last_observed_at >= metric_rollups.last_observed_at
+                        THEN excluded.last_value
+                        ELSE metric_rollups.last_value
+                    END,
+                    last_observed_at = MAX(
+                        metric_rollups.last_observed_at,
+                        excluded.last_observed_at
+                    )
+                """,
+                (
+                    normalized_target_id,
+                    normalized_target_label,
+                    normalized_source_id,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM metric_rollups WHERE system_id = ?",
+                (normalized_source_id,),
+            )
             return {
                 "source_system_id": normalized_source_id,
                 "target_system_id": normalized_target_id,
@@ -1506,7 +2294,8 @@ class HistoryStore:
                 "tracked_slots": source_slot_count,
                 "event_count": event_count,
                 "metric_sample_count": metric_sample_count,
-                "total_rows": source_slot_count + event_count + metric_sample_count,
+                "metric_rollup_count": metric_rollup_count,
+                "total_rows": source_slot_count + event_count + metric_sample_count + metric_rollup_count,
                 "slot_state_conflicts": max(source_slot_count - max(inserted_slot_count, 0), 0),
             }
 
@@ -1584,6 +2373,7 @@ class HistoryStore:
             "tracked_slots": 0,
             "event_count": 0,
             "metric_sample_count": 0,
+            "metric_rollup_count": 0,
             "total_rows": 0,
             "removed_system_ids": [],
         }
@@ -1612,11 +2402,18 @@ class HistoryStore:
                 system_ids,
             ).rowcount
         )
+        metric_rollup_count = int(
+            connection.execute(
+                f"DELETE FROM metric_rollups WHERE system_id IN ({placeholders})",
+                system_ids,
+            ).rowcount
+        )
         return {
             "tracked_slots": tracked_slots,
             "event_count": event_count,
             "metric_sample_count": metric_sample_count,
-            "total_rows": tracked_slots + event_count + metric_sample_count,
+            "metric_rollup_count": metric_rollup_count,
+            "total_rows": tracked_slots + event_count + metric_sample_count + metric_rollup_count,
             "removed_system_ids": [],
         }
 
@@ -1633,14 +2430,16 @@ class HistoryStore:
                 MAX(system_label) AS system_label,
                 SUM(tracked_slots) AS tracked_slots,
                 SUM(event_count) AS event_count,
-                SUM(metric_sample_count) AS metric_sample_count
+                SUM(metric_sample_count) AS metric_sample_count,
+                SUM(metric_rollup_count) AS metric_rollup_count
             FROM (
                 SELECT
                     system_id,
                     MAX(system_label) AS system_label,
                     COUNT(*) AS tracked_slots,
                     0 AS event_count,
-                    0 AS metric_sample_count
+                    0 AS metric_sample_count,
+                    0 AS metric_rollup_count
                 FROM slot_state_current
                 GROUP BY system_id
                 UNION ALL
@@ -1649,7 +2448,8 @@ class HistoryStore:
                     MAX(system_label) AS system_label,
                     0 AS tracked_slots,
                     COUNT(*) AS event_count,
-                    0 AS metric_sample_count
+                    0 AS metric_sample_count,
+                    0 AS metric_rollup_count
                 FROM slot_events
                 GROUP BY system_id
                 UNION ALL
@@ -1658,8 +2458,19 @@ class HistoryStore:
                     MAX(system_label) AS system_label,
                     0 AS tracked_slots,
                     0 AS event_count,
-                    COUNT(*) AS metric_sample_count
+                    COUNT(*) AS metric_sample_count,
+                    0 AS metric_rollup_count
                 FROM metric_samples
+                GROUP BY system_id
+                UNION ALL
+                SELECT
+                    system_id,
+                    MAX(system_label) AS system_label,
+                    0 AS tracked_slots,
+                    0 AS event_count,
+                    0 AS metric_sample_count,
+                    COUNT(*) AS metric_rollup_count
+                FROM metric_rollups
                 GROUP BY system_id
             )
         """
@@ -1680,6 +2491,7 @@ class HistoryStore:
             tracked_slots = int(row["tracked_slots"] or 0)
             event_count = int(row["event_count"] or 0)
             metric_sample_count = int(row["metric_sample_count"] or 0)
+            metric_rollup_count = int(row["metric_rollup_count"] or 0)
             summaries.append(
                 {
                     "system_id": system_id,
@@ -1687,7 +2499,8 @@ class HistoryStore:
                     "tracked_slots": tracked_slots,
                     "event_count": event_count,
                     "metric_sample_count": metric_sample_count,
-                    "total_rows": tracked_slots + event_count + metric_sample_count,
+                    "metric_rollup_count": metric_rollup_count,
+                    "total_rows": tracked_slots + event_count + metric_sample_count + metric_rollup_count,
                 }
             )
         return summaries

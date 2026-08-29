@@ -174,12 +174,37 @@ If you are running the optional history sidecar, the main retention knobs are:
 - `HISTORY_LONG_TERM_BACKUP_DIR`
 - `HISTORY_WEEKLY_BACKUP_RETENTION_COUNT`
 - `HISTORY_MONTHLY_BACKUP_RETENTION_COUNT`
+- `HISTORY_RAW_METRIC_RETENTION_DAYS`
+- `HISTORY_EVENT_RETENTION_DAYS`
+- `HISTORY_HOURLY_ROLLUP_RETENTION_DAYS`
+- `HISTORY_DAILY_ROLLUP_RETENTION_DAYS`
+- `HISTORY_RETENTION_INTERVAL_SECONDS`
+- `HISTORY_RETENTION_BATCH_SIZE`
+- `HISTORY_RETENTION_MAX_BATCHES_PER_RUN`
 
 The default behavior is:
 
 - keep short-term rotating SQLite snapshots under `./history/backups`
 - keep `4` weekly promoted copies
 - keep `3` monthly promoted copies
+- keep raw metric samples for `30` days and slot events for `365` days
+- keep hourly metric rollups for `365` days and daily rollups for `1825` days
+- run retention hourly in at most `20` transactions of `5000` rows per table
+
+Set any of the four retention-day values to `0` to keep that data tier forever.
+Each retention transaction commits separately, so a stop or restart resumes from
+the remaining rows instead of restarting one large delete. The collector starts
+retention only after creating a backup successfully in the same slow pass.
+SQLite reuses pages
+released by pruning. The database file therefore plateaus near its high-water
+size rather than shrinking after every pass; retention does not run `VACUUM` or
+replace the live database.
+
+History queries combine retained raw values with hourly and daily rollups.
+Temperature and annualized-rate rollups use the sample-count-weighted average;
+cumulative byte and power-on-hour counters use the latest value in each bucket.
+Slot events remain discrete records and are unavailable before the configured
+event-retention cutoff.
 
 If you want longer-lived copies on a different disk or NAS later, point
 `HISTORY_LONG_TERM_BACKUP_DIR` at that mounted path and leave the short-term

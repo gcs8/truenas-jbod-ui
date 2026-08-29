@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from app.config import Settings, SystemConfig, TrueNASConfig
 from app.metrics import install_metrics
 from app.metrics import observe_history_collection_run
+from app.metrics import observe_history_retention_run
 from app.metrics import set_history_collection_schedule_overrun
 from app.metrics import set_history_collector_running
 from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView
@@ -156,6 +157,35 @@ class HistoryMetricsTests(unittest.TestCase):
             f'truenas_jbod_ui_history_collection_schedule_overrun_seconds{{service="{history_service_name}"}} 2.5',
             metrics_text,
         )
+
+    def test_history_metrics_publish_retention_results(self) -> None:
+        app = FastAPI()
+        scrape_service_name = "test-retention-metrics-scrape"
+        history_service_name = "test-history-retention"
+
+        with patch.dict("os.environ", {"METRICS_ENABLED": "true", "METRICS_PATH": "/metrics"}, clear=False):
+            install_metrics(app, service_name=scrape_service_name, version="0.0.0-test")
+            observe_history_retention_run(
+                service_name=history_service_name,
+                result="success",
+                duration_seconds=0.75,
+                removed_rows={
+                    "metric_samples": 12,
+                    "events": 3,
+                    "hourly_rollups": 2,
+                    "daily_rollups": 1,
+                },
+                completed_at="2026-07-01T00:00:00+00:00",
+            )
+
+        metrics_text = response_body(asyncio.run(invoke_asgi(app, "/metrics")))
+
+        self.assertIn("truenas_jbod_ui_history_retention_runs_total", metrics_text)
+        self.assertIn('result="success"', metrics_text)
+        self.assertIn("truenas_jbod_ui_history_retention_duration_seconds", metrics_text)
+        self.assertIn("truenas_jbod_ui_history_retention_rows_removed_total", metrics_text)
+        self.assertIn('table="metric_samples"', metrics_text)
+        self.assertIn("truenas_jbod_ui_history_last_retention_timestamp_seconds", metrics_text)
 
 
 class InventoryMetricsTests(unittest.IsolatedAsyncioTestCase):

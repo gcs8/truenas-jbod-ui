@@ -138,10 +138,11 @@ async def livez() -> JSONResponse:
 
 @app.get("/api/history/overview")
 async def overview(exact_counts: bool = Query(default=False)) -> dict[str, object]:
+    counts = await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts)
     return {
         "collector": public_collector_status(collector.status()),
-        "counts": await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts),
-        "counts_exact": exact_counts,
+        "counts": counts,
+        "counts_exact": exact_counts or counts.get("estimated") is False,
         "database": {
             "size_bytes": await asyncio.to_thread(store.database_size_bytes),
         },
@@ -368,6 +369,12 @@ def render_dashboard(
     last_duration_label = f"{float(last_duration):.1f}s" if isinstance(last_duration, (int, float)) else "not recorded"
     last_overrun = status.get("last_background_overrun_seconds")
     last_overrun_label = f"{float(last_overrun):.1f}s" if isinstance(last_overrun, (int, float)) else "not recorded"
+    retention_duration = status.get("last_retention_duration_seconds")
+    retention_duration_label = (
+        f"{float(retention_duration):.1f}s"
+        if isinstance(retention_duration, (int, float))
+        else "not recorded"
+    )
     last_inventory_forced = status.get("last_collection_inventory_forced")
     if last_inventory_forced is True:
         last_inventory_mode = "forced"
@@ -572,6 +579,10 @@ def render_dashboard(
           <div id="metric-samples-value" class="value">{html.escape(format_count(counts.get('metric_sample_count', 0), estimated=counts_are_estimated))}</div>
         </div>
         <div class="card">
+          <div class="label">Metric Rollups</div>
+          <div id="metric-rollups-value" class="value">{html.escape(format_count(counts.get('metric_rollup_count', 0), estimated=counts_are_estimated))}</div>
+        </div>
+        <div class="card">
           <div class="label">DB Size</div>
           <div id="db-size-value" class="value">{html.escape(format_bytes(database_size_bytes))}</div>
         </div>
@@ -592,6 +603,11 @@ def render_dashboard(
           Last fast metrics pass: <code id="status-last-fast-metrics-at">{html.escape(str(status.get('last_fast_metrics_at') or 'never'))}</code><br>
           Last slow metrics pass: <code id="status-last-slow-metrics-at">{html.escape(str(status.get('last_slow_metrics_at') or 'never'))}</code><br>
           Last backup snapshot: <code id="status-last-backup-at">{html.escape(str(status.get('last_backup_at') or 'never'))}</code><br>
+          Last retention pass: <code id="status-last-retention-at">{html.escape(str(status.get('last_retention_at') or 'never'))}</code><br>
+          Last retention duration: <code id="status-last-retention-duration">{html.escape(retention_duration_label)}</code><br>
+          Last retention rows removed: <code id="status-last-retention-rows-removed">{html.escape(str(status.get('last_retention_rows_removed') or 0))}</code><br>
+          Retention catch-up pending: <code id="status-last-retention-has-more">{'yes' if status.get('last_retention_has_more') else 'no'}</code><br>
+          Last retention failure: <code id="status-last-retention-error">{html.escape(str(status.get('last_retention_error') or 'none'))}</code><br>
           Last collection duration: <code id="status-last-collection-duration">{html.escape(last_duration_label)}</code><br>
           Last schedule overrun: <code id="status-last-background-overrun">{html.escape(last_overrun_label)}</code><br>
           Last collection inventory: <code id="status-last-collection-inventory">{html.escape(last_inventory_mode)}</code><br>
@@ -711,6 +727,11 @@ def render_dashboard(
           setText("status-last-fast-metrics-at", statusValue(collector.last_fast_metrics_at));
           setText("status-last-slow-metrics-at", statusValue(collector.last_slow_metrics_at));
           setText("status-last-backup-at", statusValue(collector.last_backup_at));
+          setText("status-last-retention-at", statusValue(collector.last_retention_at));
+          setText("status-last-retention-duration", collectionDurationLabel(collector.last_retention_duration_seconds));
+          setText("status-last-retention-rows-removed", String(collector.last_retention_rows_removed || 0));
+          setText("status-last-retention-has-more", collector.last_retention_has_more ? "yes" : "no");
+          setText("status-last-retention-error", statusValue(collector.last_retention_error, "none"));
           setText("status-last-collection-duration", collectionDurationLabel(collector.last_collection_duration_seconds));
           setText("status-last-background-overrun", collectionDurationLabel(collector.last_background_overrun_seconds));
           setText("status-last-collection-inventory", collectionInventoryLabel(collector.last_collection_inventory_forced));
@@ -731,6 +752,7 @@ def render_dashboard(
           setText("tracked-slots-value", statusValue(counts.tracked_slots, "0"));
           setText("slot-events-value", formatCount(counts.event_count, !countsExact));
           setText("metric-samples-value", formatCount(counts.metric_sample_count, !countsExact));
+          setText("metric-rollups-value", formatCount(counts.metric_rollup_count, !countsExact));
           setText("db-size-value", formatBytes(payload.database?.size_bytes ?? payload.database_size_bytes));
           renderScopes(payload.scopes || []);
         }}

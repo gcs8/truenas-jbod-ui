@@ -144,6 +144,37 @@ HISTORY_LAST_BACKUP_TIMESTAMP = Gauge(
     labelnames=("service",),
     namespace=METRICS_NAMESPACE,
 )
+HISTORY_RETENTION_RUNS_TOTAL = Counter(
+    "history_retention_runs_total",
+    "History retention passes.",
+    labelnames=("service", "result"),
+    namespace=METRICS_NAMESPACE,
+)
+HISTORY_RETENTION_DURATION_SECONDS = Histogram(
+    "history_retention_duration_seconds",
+    "History retention pass duration in seconds.",
+    labelnames=("service", "result"),
+    namespace=METRICS_NAMESPACE,
+    buckets=HTTP_DURATION_BUCKETS,
+)
+HISTORY_RETENTION_ROWS_REMOVED_TOTAL = Counter(
+    "history_retention_rows_removed_total",
+    "History rows removed by retention.",
+    labelnames=("service", "table"),
+    namespace=METRICS_NAMESPACE,
+)
+HISTORY_LAST_RETENTION_TIMESTAMP = Gauge(
+    "history_last_retention_timestamp_seconds",
+    "Unix timestamp of the last completed history retention pass.",
+    labelnames=("service",),
+    namespace=METRICS_NAMESPACE,
+)
+HISTORY_RETENTION_LAST_ERROR = Gauge(
+    "history_retention_last_error",
+    "Whether the latest history retention pass failed.",
+    labelnames=("service",),
+    namespace=METRICS_NAMESPACE,
+)
 INVENTORY_SNAPSHOT_REQUESTS_TOTAL = Counter(
     "inventory_snapshot_requests_total",
     "Inventory snapshot requests by cache outcome.",
@@ -314,6 +345,37 @@ def observe_history_collection_run(
         HISTORY_TRACKED_SLOTS.labels(service=service_name).set(int(counts.get("tracked_slots") or 0))
         HISTORY_EVENT_COUNT.labels(service=service_name).set(int(counts.get("event_count") or 0))
         HISTORY_METRIC_SAMPLE_COUNT.labels(service=service_name).set(int(counts.get("metric_sample_count") or 0))
+
+
+def observe_history_retention_run(
+    *,
+    service_name: str,
+    result: str,
+    duration_seconds: float,
+    removed_rows: dict[str, int],
+    completed_at: object,
+) -> None:
+    if not metrics_enabled():
+        return
+    normalized_result = result if result in {"success", "error"} else "error"
+    HISTORY_RETENTION_RUNS_TOTAL.labels(service=service_name, result=normalized_result).inc()
+    HISTORY_RETENTION_DURATION_SECONDS.labels(
+        service=service_name,
+        result=normalized_result,
+    ).observe(max(0.0, duration_seconds))
+    HISTORY_RETENTION_LAST_ERROR.labels(service=service_name).set(
+        1 if normalized_result == "error" else 0
+    )
+    _set_timestamp_metric(
+        HISTORY_LAST_RETENTION_TIMESTAMP,
+        service_name,
+        completed_at,
+    )
+    for table_name, count in removed_rows.items():
+        HISTORY_RETENTION_ROWS_REMOVED_TOTAL.labels(
+            service=service_name,
+            table=table_name,
+        ).inc(max(0, int(count)))
 
 
 def observe_inventory_snapshot_request(

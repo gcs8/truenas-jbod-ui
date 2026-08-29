@@ -49,6 +49,13 @@ class HistorySettings(BaseModel):
     smart_batch_size: int = 24
     startup_grace_seconds: int = 20
     force_inventory_on_fast_collection: bool = False
+    raw_metric_retention_days: int = Field(default=30, ge=0)
+    event_retention_days: int = Field(default=365, ge=0)
+    hourly_rollup_retention_days: int = Field(default=365, ge=0)
+    daily_rollup_retention_days: int = Field(default=1825, ge=0)
+    retention_interval_seconds: int = Field(default=3600, ge=1)
+    retention_batch_size: int = Field(default=5000, ge=1)
+    retention_max_batches_per_run: int = Field(default=20, ge=1)
 
     @model_validator(mode="after")
     def align_backup_paths(self) -> "HistorySettings":
@@ -92,6 +99,13 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_SMART_BATCH_SIZE": "smart_batch_size",
     "HISTORY_STARTUP_GRACE_SECONDS": "startup_grace_seconds",
     "HISTORY_FORCE_INVENTORY_ON_FAST_COLLECTION": "force_inventory_on_fast_collection",
+    "HISTORY_RAW_METRIC_RETENTION_DAYS": "raw_metric_retention_days",
+    "HISTORY_EVENT_RETENTION_DAYS": "event_retention_days",
+    "HISTORY_HOURLY_ROLLUP_RETENTION_DAYS": "hourly_rollup_retention_days",
+    "HISTORY_DAILY_ROLLUP_RETENTION_DAYS": "daily_rollup_retention_days",
+    "HISTORY_RETENTION_INTERVAL_SECONDS": "retention_interval_seconds",
+    "HISTORY_RETENTION_BATCH_SIZE": "retention_batch_size",
+    "HISTORY_RETENTION_MAX_BATCHES_PER_RUN": "retention_max_batches_per_run",
 }
 
 
