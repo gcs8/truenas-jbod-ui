@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import hmac
 import logging
 import os
 import shlex
@@ -34,7 +36,7 @@ from app.config import (
     save_runtime_behavior_overrides,
 )
 from app.logging_config import configure_service_logging
-from app.metrics import install_metrics
+from app.metrics import install_metrics, metrics_path
 from app.models.domain import (
     DebugBundleExportRequest,
     DemoSystemRequest,
@@ -88,6 +90,84 @@ configure_service_logging(
     service_name="enclosure-admin",
 )
 logger = logging.getLogger(__name__)
+
+
+def _basic_auth_matches(authorization: str | None, settings: AdminSettings) -> bool:
+    if not authorization:
+        return False
+    scheme, separator, encoded = authorization.partition(" ")
+    if separator != " " or scheme.lower() != "basic" or not encoded:
+        return False
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    username, separator, password = decoded.partition(b":")
+    if separator != b":" or settings.auth_password is None:
+        return False
+    expected_username = str(settings.auth_username or "").encode("utf-8")
+    expected_password = settings.auth_password.get_secret_value().encode("utf-8")
+    username_matches = hmac.compare_digest(username, expected_username)
+    password_matches = hmac.compare_digest(
+        password,
+        expected_password,
+    )
+    return bool(username_matches & password_matches)
+
+
+def _origin_identity(value: str | None) -> tuple[str, str, int] | None:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    if (
+        scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, parsed.hostname.lower(), port
+
+
+def _request_origin_allowed(request: Request, settings: AdminSettings) -> bool:
+    supplied_origin = request.headers.get("origin") or request.headers.get("referer")
+    if supplied_origin is None:
+        # Non-browser automation does not normally send Origin or Referer.
+        return True
+    candidate = _origin_identity(supplied_origin)
+    if candidate is None:
+        return False
+    allowed_origins = {
+        identity
+        for identity in (
+            _origin_identity(str(request.base_url)),
+            _origin_identity(settings.public_origin),
+        )
+        if identity is not None
+    }
+    return candidate in allowed_origins
+
+
+def validate_admin_export_policy(
+    settings: AdminSettings,
+    *,
+    encrypt: bool,
+    scrub_secrets: bool,
+) -> None:
+    if encrypt or scrub_secrets or settings.allow_plaintext_backup_export:
+        return
+    raise ValueError(
+        "Plaintext backup export is disabled. Enable encryption or explicitly set "
+        "ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true for a trusted-operator deployment."
+    )
 
 SERVICE_STARTED_AT = datetime.now(timezone.utc)
 
@@ -237,6 +317,17 @@ def format_history_system_summary(summary: dict[str, Any]) -> str:
 
 def create_app() -> FastAPI:
     admin_settings = get_admin_settings()
+    admin_metrics_path = metrics_path()
+    if (
+        admin_metrics_path in {"/", "/livez", "/healthz", "/openapi.json"}
+        or admin_metrics_path == "/static"
+        or admin_metrics_path.startswith("/static/")
+        or admin_metrics_path == "/api"
+        or admin_metrics_path.startswith("/api/")
+    ):
+        raise ValueError(
+            "METRICS_PATH must not overlap an admin UI, health, static, or API route."
+        )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -268,6 +359,34 @@ def create_app() -> FastAPI:
         redoc_url=None,
         lifespan=lifespan,
     )
+
+    @app.middleware("http")
+    async def enforce_admin_authentication(request: Request, call_next):
+        public_paths = {
+            "/livez",
+            "/healthz",
+            admin_metrics_path,
+        }
+        if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"} and not _request_origin_allowed(
+            request,
+            admin_settings,
+        ):
+            return JSONResponse(
+                {"detail": "Cross-origin admin mutation rejected."},
+                status_code=403,
+            )
+        if (
+            admin_settings.auth_mode != "basic"
+            or request.url.path in public_paths
+            or _basic_auth_matches(request.headers.get("authorization"), admin_settings)
+        ):
+            return await call_next(request)
+        return JSONResponse(
+            {"detail": "Admin authentication required."},
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="truenas-jbod-admin"'},
+        )
+
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
     install_metrics(app, service_name="enclosure-admin", version=__version__)
 
@@ -350,6 +469,14 @@ def create_app() -> FastAPI:
         stop_services: bool = Query(default=False),
         restart_services: bool = Query(default=True),
     ) -> Response:
+        try:
+            validate_admin_export_policy(
+                admin_settings,
+                encrypt=payload.encrypt,
+                scrub_secrets=False,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         maintenance_service = get_maintenance_service()
         try:
             artifact, maintenance = await asyncio.to_thread(
@@ -381,6 +508,14 @@ def create_app() -> FastAPI:
         stop_services: bool = Query(default=True),
         restart_services: bool = Query(default=True),
     ) -> Response:
+        try:
+            validate_admin_export_policy(
+                admin_settings,
+                encrypt=payload.encrypt,
+                scrub_secrets=payload.scrub_secrets,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         maintenance_service = get_maintenance_service()
         try:
             artifact, maintenance = await asyncio.to_thread(

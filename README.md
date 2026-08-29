@@ -139,6 +139,7 @@ the wiki:
 - [Visual Tour](wiki/Visual-Tour.md)
 - [Architecture and Services](wiki/Architecture-and-Services.md)
 - [Admin UI and System Setup](wiki/Admin-UI-and-System-Setup.md)
+- [Admin Trust Boundary](docs/ADMIN_TRUST_BOUNDARY.md)
 - [Backup, Restore, and Debug Bundles](wiki/Backup-Restore-and-Debug-Bundles.md)
 - [Operations, Logging, and Metrics](wiki/Operations-Logging-and-Metrics.md)
 - [SSH Setup and Sudo](wiki/SSH-Setup-and-Sudo.md)
