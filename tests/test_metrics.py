@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from app.config import Settings, SystemConfig, TrueNASConfig
-from app.metrics import install_metrics
-from app.metrics import observe_history_collection_run
-from app.metrics import observe_history_retention_run
-from app.metrics import set_history_collection_schedule_overrun
-from app.metrics import set_history_collector_running
+from app.metrics import (
+    ScheduledBackupStatusCollector,
+    install_metrics,
+    observe_history_collection_run,
+    observe_history_retention_run,
+    set_history_collection_schedule_overrun,
+    set_history_collector_running,
+)
 from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView
 from app.services.inventory import InventoryService
 from app.services.mapping_store import MappingStore
@@ -186,6 +191,83 @@ class HistoryMetricsTests(unittest.TestCase):
         self.assertIn("truenas_jbod_ui_history_retention_rows_removed_total", metrics_text)
         self.assertIn('table="metric_samples"', metrics_text)
         self.assertIn("truenas_jbod_ui_history_last_retention_timestamp_seconds", metrics_text)
+
+
+class ScheduledBackupMetricsTests(unittest.TestCase):
+    def test_scheduled_backup_metrics_reject_malformed_durable_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_file = Path(temp_dir) / "scheduled-backup.json"
+            status_file.write_text(
+                json.dumps({"schema_version": 1, "success_count": "not-an-integer"}),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {"SCHEDULED_BACKUP_STATUS_FILE": str(status_file)},
+                clear=False,
+            ):
+                self.assertIsNone(ScheduledBackupStatusCollector._read_status())
+
+    def test_scheduled_backup_metrics_read_durable_status_without_private_labels(self) -> None:
+        app = FastAPI()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_file = Path(temp_dir) / "scheduled-backup.json"
+            status_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "enabled": True,
+                        "success_count": 4,
+                        "failure_count": 2,
+                        "last_attempt_at": "2030-01-01T03:04:05+00:00",
+                        "last_success_at": (
+                            datetime.now(timezone.utc) - timedelta(seconds=90)
+                        ).isoformat(),
+                        "last_failure_at": "2030-01-01T03:04:05+00:00",
+                        "last_size_bytes": 12345,
+                        "last_sha256": "a" * 64,
+                        "last_error_code": None,
+                        "last_artifact_name": (
+                            "jbod-scheduled-backup-20300101T030405Z-1234abcd.tar.zst.enc"
+                        ),
+                        "included_groups": ["private-group"],
+                        "last_absent_groups": [],
+                        "last_retention_removed": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "METRICS_ENABLED": "true",
+                    "METRICS_PATH": "/metrics",
+                    "SCHEDULED_BACKUP_STATUS_FILE": str(status_file),
+                },
+                clear=False,
+            ):
+                install_metrics(app, service_name="test-scheduled-scrape", version="0.0.0-test")
+                metrics_text = response_body(asyncio.run(invoke_asgi(app, "/metrics")))
+
+        self.assertIn("truenas_jbod_ui_scheduled_backup_runs_total", metrics_text)
+        self.assertIn(
+            'truenas_jbod_ui_scheduled_backup_runs_total{result="success",service="enclosure-backup"} 4.0',
+            metrics_text,
+        )
+        self.assertIn(
+            'truenas_jbod_ui_scheduled_backup_runs_total{result="error",service="enclosure-backup"} 2.0',
+            metrics_text,
+        )
+        self.assertIn("truenas_jbod_ui_scheduled_backup_last_success_timestamp_seconds", metrics_text)
+        self.assertIn("truenas_jbod_ui_scheduled_backup_last_failure_timestamp_seconds", metrics_text)
+        self.assertIn("truenas_jbod_ui_scheduled_backup_last_success_age_seconds", metrics_text)
+        self.assertIn(
+            'truenas_jbod_ui_scheduled_backup_last_size_bytes{service="enclosure-backup"} 12345.0',
+            metrics_text,
+        )
+        self.assertNotIn("private-name", metrics_text)
+        self.assertNotIn("private-group", metrics_text)
+        self.assertNotIn(str(status_file), metrics_text)
 
 
 class InventoryMetricsTests(unittest.IsolatedAsyncioTestCase):

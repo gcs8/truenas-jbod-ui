@@ -41,6 +41,16 @@ ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true
 
 That override is for a separately protected trusted-operator deployment. Debug bundles may remain unencrypted while secret scrubbing is enabled. Turning off both encryption and secret scrubbing requires the same explicit plaintext override.
 
+Scheduled state backups have no plaintext mode. They read a private regular
+passphrase file at execution time and use an in-process authenticated encryption
+envelope, so the passphrase is never placed in generated unit files, subprocess
+arguments, logs, status payloads, or metrics. The schedule is disabled by
+default and refuses to run unless the operator explicitly configures its
+destination, status file, retention count, included groups, and passphrase-file
+reference. A host timer invokes a separate one-shot container with no network,
+published port, or Docker socket. The admin sidecar retains its default
+`ADMIN_AUTO_STOP_SECONDS=3600` boundary.
+
 ## Deployment check
 
 Before starting the admin profile:

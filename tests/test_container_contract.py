@@ -12,6 +12,7 @@ EXPECTED_MEMORY_LIMITS = {
     "enclosure-ui": "${APP_MEM_LIMIT:-1g}",
     "enclosure-history": "${HISTORY_MEM_LIMIT:-1g}",
     "enclosure-admin": "${ADMIN_MEM_LIMIT:-1g}",
+    "enclosure-backup": "${BACKUP_MEM_LIMIT:-1g}",
 }
 
 
@@ -34,6 +35,69 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("APP_MEM_LIMIT=1g", example_lines)
         self.assertIn("HISTORY_MEM_LIMIT=1g", example_lines)
         self.assertIn("ADMIN_MEM_LIMIT=1g", example_lines)
+        self.assertIn("BACKUP_MEM_LIMIT=1g", example_lines)
+
+    def test_scheduled_backup_service_is_one_shot_non_networked_and_has_no_docker_socket(self) -> None:
+        for compose_name in COMPOSE_FILES:
+            compose = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))
+            service = compose["services"]["enclosure-backup"]
+            with self.subTest(compose=compose_name):
+                self.assertEqual(service["profiles"], ["backup"])
+                self.assertEqual(
+                    service["command"],
+                    ["python", "-m", "history_service.scheduled_backup_main"],
+                )
+                self.assertEqual(service["network_mode"], "none")
+                self.assertEqual(service["restart"], "no")
+                self.assertEqual(service["user"], "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}")
+                self.assertNotIn("ports", service)
+                self.assertFalse(
+                    any("docker.sock" in volume for volume in service.get("volumes", []))
+                )
+                self.assertIn("./config:/app/config:ro", service["volumes"])
+                self.assertIn("./data:/app/data:ro", service["volumes"])
+                self.assertIn("./config/backup-secrets:/run/backup-secrets:ro", service["volumes"])
+                environment = service["environment"]
+                self.assertNotIn("SCHEDULED_BACKUP_PASSPHRASE", environment)
+                self.assertIn("SCHEDULED_BACKUP_PASSPHRASE_FILE", environment)
+
+                runbook = (
+                    REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md"
+                ).read_text(encoding="utf-8")
+                self.assertIn("BACKUP_UID=$(id -u)", runbook)
+                self.assertIn("BACKUP_GID=$(id -g)", runbook)
+
+            admin = compose["services"]["enclosure-admin"]
+            with self.subTest(compose=compose_name, service="enclosure-admin"):
+                self.assertEqual(admin["restart"], "no")
+                self.assertEqual(
+                    admin["environment"]["ADMIN_AUTO_STOP_SECONDS"],
+                    "${ADMIN_AUTO_STOP_SECONDS:-3600}",
+                )
+                self.assertFalse(
+                    any(key.startswith("ADMIN_SCHEDULED_BACKUP_") for key in admin["environment"])
+                )
+
+    def test_systemd_timer_invokes_one_shot_runner_without_secret_values(self) -> None:
+        service = (REPO_ROOT / "deploy/systemd/truenas-jbod-system-backup.service").read_text(
+            encoding="utf-8"
+        )
+        timer = (REPO_ROOT / "deploy/systemd/truenas-jbod-system-backup.timer").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("docker compose --profile backup run --rm enclosure-backup", service)
+        self.assertNotIn("passphrase=", service.lower())
+        self.assertNotIn("Environment=SCHEDULED_BACKUP_PASSPHRASE", service)
+        self.assertIn("OnCalendar=daily", timer)
+        self.assertIn("Persistent=true", timer)
+
+    def test_scheduled_backup_artifacts_status_and_secret_directory_are_git_ignored(self) -> None:
+        gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+
+        self.assertIn("config/backup-secrets/*", gitignore)
+        self.assertIn("backups/*", gitignore)
+        self.assertIn("backup-status/*", gitignore)
 
     def test_image_limits_glibc_malloc_arenas(self) -> None:
         dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")

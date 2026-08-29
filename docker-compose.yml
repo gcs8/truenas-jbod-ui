@@ -12,6 +12,7 @@ services:
       ADMIN_PORT: ${ADMIN_PORT:-8082}
       ADMIN_BIND_ADDRESS: ${ADMIN_BIND_ADDRESS:-0.0.0.0}
       ADMIN_TIMEOUT_SECONDS: ${ADMIN_TIMEOUT_SECONDS:-0.75}
+      SCHEDULED_BACKUP_STATUS_FILE: ${SCHEDULED_BACKUP_STATUS_FILE:-}
     ports:
       - "${APP_PORT:-8080}:8000"
     volumes:
@@ -19,6 +20,7 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./config/ssh:/run/ssh:ro
+      - ./backup-status:/app/backup-status:ro
     restart: unless-stopped
     mem_limit: ${APP_MEM_LIMIT:-1g}
     healthcheck:
@@ -121,3 +123,32 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  enclosure-backup:
+    profiles:
+      - backup
+    image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
+    command: ["python", "-m", "history_service.scheduled_backup_main"]
+    user: "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}"
+    network_mode: none
+    environment:
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+      HISTORY_SQLITE_PATH: /app/history/history.db
+      HISTORY_BACKUP_DIR: /app/history/backups
+      SCHEDULED_BACKUP_ENABLED: ${SCHEDULED_BACKUP_ENABLED:-false}
+      SCHEDULED_BACKUP_DIR: ${SCHEDULED_BACKUP_DIR:-}
+      SCHEDULED_BACKUP_STATUS_FILE: ${SCHEDULED_BACKUP_STATUS_FILE:-}
+      SCHEDULED_BACKUP_RETENTION_COUNT: ${SCHEDULED_BACKUP_RETENTION_COUNT:-0}
+      SCHEDULED_BACKUP_INCLUDED_GROUPS_JSON: '${SCHEDULED_BACKUP_INCLUDED_GROUPS_JSON:-[]}'
+      SCHEDULED_BACKUP_PASSPHRASE_FILE: ${SCHEDULED_BACKUP_PASSPHRASE_FILE:-}
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data:ro
+      - ./history:/app/history
+      - ./backups:/app/backups
+      - ./backup-status:/app/backup-status
+      - ./config/ssh:/run/ssh:ro
+      - ./config/backup-secrets:/run/backup-secrets:ro
+    restart: "no"
+    mem_limit: ${BACKUP_MEM_LIMIT:-1g}

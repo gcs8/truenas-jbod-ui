@@ -8,6 +8,7 @@ config/config.yaml
 config/ssh/*
 !config/ssh/.gitkeep
 config/tls/*
+config/backup-secrets/*
 data/slot_mappings.json
 data/sas_fabric_aliases.json
 data/slot_detail_cache.json
@@ -23,6 +24,8 @@ history/*
 history/backups/*
 !history/.gitkeep
 !history/backups/.gitkeep
+backups/*
+backup-status/*
 logs/*.log*
 docker-compose.override.yml
 node_modules/

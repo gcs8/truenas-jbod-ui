@@ -1,0 +1,16 @@
+[Unit]
+Description=TrueNAS JBOD scheduled encrypted state backup
+ConditionPathExists=/opt/truenas-jbod-ui/docker-compose.yml
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/truenas-jbod-ui
+ExecStart=/usr/bin/env docker compose --profile backup run --rm enclosure-backup
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/docker.sock /opt/truenas-jbod-ui/backups /opt/truenas-jbod-ui/backup-status
+
+[Install]
+WantedBy=multi-user.target
