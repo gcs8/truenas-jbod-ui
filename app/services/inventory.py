@@ -182,6 +182,7 @@ STABLE_SMART_DETAIL_FIELDS = (
     "negotiated_link_rate",
 )
 OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
+PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
 SSH_CONNECTION_FAILURE_MARKERS = (
     "error reading ssh protocol banner",
     "no existing session",
@@ -338,6 +339,7 @@ class InventorySourceBundle:
     quantastor_ses_data: ParsedSSHData
     ssh_failure_details: list[dict[str, Any]] = field(default_factory=list)
     bmc_inventory: BMCInventory | None = None
+    parsed_ssh_data_by_enclosure: dict[str | None, ParsedSSHData] = field(default_factory=dict)
 
 
 class InventoryService:
@@ -372,7 +374,7 @@ class InventoryService:
         self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
         self._source_bundle_lock = asyncio.Lock()
-        self._ssh_session_lock = asyncio.Lock()
+        self._ssh_session_locks: dict[str, asyncio.Lock] = {}
         self._optional_ssh_backoff_until: dict[str, datetime] = {}
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[None] | None = None
@@ -1098,24 +1100,31 @@ class InventoryService:
                 continue
             available_candidates.append(candidate)
 
-        remaining_candidates = list(available_candidates)
+        remaining_candidates = list(enumerate(available_candidates))
         ordered_candidates: list[dict[str, Any]] = []
         for field_name, token in self._storage_view_binding_sequence(storage_view):
             matched_for_token = [
-                candidate
-                for candidate in remaining_candidates
+                (index, candidate)
+                for index, candidate in remaining_candidates
                 if self._candidate_matches_binding_token(candidate, field_name, token)
             ]
-            matched_for_token.sort(key=self._candidate_sort_key)
-            for candidate in matched_for_token:
-                candidate["_placement_key"] = f"{field_name} match: {token}"
-                ordered_candidates.append(candidate)
-                remaining_candidates.remove(candidate)
+            matched_for_token.sort(key=lambda item: self._candidate_sort_key(item[1]))
+            matched_indices = {index for index, _candidate in matched_for_token}
+            ordered_candidates.extend(
+                {**candidate, "_placement_key": f"{field_name} match: {token}"}
+                for _index, candidate in matched_for_token
+            )
+            remaining_candidates = [
+                (index, candidate)
+                for index, candidate in remaining_candidates
+                if index not in matched_indices
+            ]
 
-        remaining_candidates.sort(key=self._candidate_sort_key)
-        for candidate in remaining_candidates:
-            candidate["_placement_key"] = "fallback inventory order"
-        ordered_candidates.extend(remaining_candidates)
+        remaining_candidates.sort(key=lambda item: self._candidate_sort_key(item[1]))
+        ordered_candidates.extend(
+            {**candidate, "_placement_key": "fallback inventory order"}
+            for _index, candidate in remaining_candidates
+        )
         return ordered_candidates
 
     def _storage_view_binding_sequence(
@@ -1918,10 +1927,9 @@ class InventoryService:
         async def load_ssh_payload() -> tuple[dict[str, str], bool, list[str], list[dict[str, Any]], SourceStatus]:
             with perf_stage("inventory.ssh.run_commands"):
                 ssh_started = time.perf_counter()
-                async with self._ssh_session_lock:
-                    command_results = await self.ssh_probe.run_planned_commands(
-                        self._ssh_inventory_enrichment_probe_commands
-                    )
+                command_results = await self.ssh_probe.run_planned_commands(
+                    self._ssh_inventory_enrichment_probe_commands
+                )
                 logger.info(
                     "Inventory SSH refresh completed for system=%s platform=%s profile=%s: connections=%s commands=%s failures=%s duration=%.3fs",
                     self.system.id,
@@ -2127,7 +2135,10 @@ class InventoryService:
         task = asyncio.create_task(
             self._background_refresh_smart_summary(
                 cache_key,
-                slot_view.model_copy(deep=True),
+                # SMART refreshes only read nested slot metadata. A shallow model
+                # copy isolates top-level assignment without duplicating large
+                # vendor payloads on every stale-cache hit.
+                slot_view.model_copy(),
                 generation_token,
             )
         )
@@ -2840,9 +2851,17 @@ class InventoryService:
                             text_command_parts.extend(["-d", device_type])
                         text_command_parts.extend(["-x", device_path])
                         text_command = shlex.join(text_command_parts)
+                        nvme_command_parsers = self._linux_nvme_enrichment_command_parsers(device_path)
                         command_results = {
                             result.command: result
-                            for result in await self._run_ssh_commands([command, text_command], target_host)
+                            for result in await self._run_ssh_commands(
+                                [
+                                    command,
+                                    text_command,
+                                    *(nvme_command for nvme_command, _parser in nvme_command_parsers),
+                                ],
+                                target_host,
+                            )
                         }
                         result = command_results.get(
                             command,
@@ -2882,7 +2901,10 @@ class InventoryService:
                                 ),
                             )
                         if self.system.truenas.platform == "linux":
-                            nvme_summary = await self._fetch_linux_nvme_enrichment_over_ssh(device_path, target_host)
+                            nvme_summary = self._parse_linux_nvme_enrichment_results(
+                                nvme_command_parsers,
+                                command_results,
+                            )
                             if nvme_summary is not None:
                                 summary = self._merge_missing_smart_fields(summary, nvme_summary)
                         if summary.available or summary.message != "SMART JSON parsing failed.":
@@ -2924,19 +2946,32 @@ class InventoryService:
         device_path: str,
         host: str | None = None,
     ) -> SmartSummaryView | None:
-        if self.system.truenas.platform != "linux":
+        command_parsers = self._linux_nvme_enrichment_command_parsers(device_path)
+        if not command_parsers:
             return None
+        results = {
+            result.command: result
+            for result in await self._run_ssh_commands(
+                [command for command, _parser in command_parsers],
+                host,
+            )
+        }
+        return self._parse_linux_nvme_enrichment_results(command_parsers, results)
 
+    def _linux_nvme_enrichment_command_parsers(
+        self,
+        device_path: str,
+    ) -> tuple[tuple[str, Any], ...]:
+        if self.system.truenas.platform != "linux":
+            return ()
         device_name = normalize_device_name(device_path)
         controller_name = extract_nvme_controller_name(device_name)
         if not controller_name:
-            return None
+            return ()
 
         controller_path = f"/dev/{controller_name}"
         namespace_path = device_path if device_path.startswith("/dev/") else f"/dev/{device_name}"
-        summary: SmartSummaryView | None = None
-
-        for command, parser in (
+        return (
             (
                 shlex.join(["sudo", "-n", "/usr/sbin/nvme", "smart-log", "-o", "json", controller_path]),
                 parse_nvme_smart_log_summary,
@@ -2949,8 +2984,18 @@ class InventoryService:
                 shlex.join(["sudo", "-n", "/usr/sbin/nvme", "id-ns", "-o", "json", namespace_path]),
                 parse_nvme_id_ns_summary,
             ),
-        ):
-            result = await self._run_ssh_command(command, host)
+        )
+
+    def _parse_linux_nvme_enrichment_results(
+        self,
+        command_parsers: Iterable[tuple[str, Any]],
+        results: dict[str, SSHCommandResult],
+    ) -> SmartSummaryView | None:
+        summary: SmartSummaryView | None = None
+        for command, parser in command_parsers:
+            result = results.get(command)
+            if result is None:
+                continue
             if not result.stdout.strip():
                 continue
             parsed = SmartSummaryView.model_validate(parser(result.stdout))
@@ -3013,10 +3058,8 @@ class InventoryService:
         ssh_data = ParsedSSHData()
         if source_bundle.ssh_collected:
             with perf_stage("inventory.ssh.parse_outputs", command_count=len(source_bundle.ssh_outputs)):
-                ssh_data = parse_ssh_outputs(
-                    source_bundle.ssh_outputs,
-                    self.settings.layout.slot_count,
-                    self.system.truenas.enclosure_filter,
+                ssh_data = self._parsed_ssh_data_for_enclosure(
+                    source_bundle,
                     selected_enclosure_id,
                 )
             if self.system.truenas.platform == "esxi":
@@ -3614,16 +3657,35 @@ class InventoryService:
             parse_smart_test_results(raw_data.smart_test_results),
         )
 
+    def _parsed_ssh_data_for_enclosure(
+        self,
+        source_bundle: InventorySourceBundle,
+        selected_enclosure_id: str | None,
+    ) -> ParsedSSHData:
+        cache_key = normalize_text(selected_enclosure_id)
+        cached = source_bundle.parsed_ssh_data_by_enclosure.get(cache_key)
+        if cached is not None:
+            return cached
+        parsed = parse_ssh_outputs(
+            source_bundle.ssh_outputs,
+            self.settings.layout.slot_count,
+            self.system.truenas.enclosure_filter,
+            selected_enclosure_id=cache_key,
+        )
+        while len(source_bundle.parsed_ssh_data_by_enclosure) >= PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(source_bundle.parsed_ssh_data_by_enclosure))
+            source_bundle.parsed_ssh_data_by_enclosure.pop(oldest_key, None)
+        source_bundle.parsed_ssh_data_by_enclosure[cache_key] = parsed
+        return parsed
+
     def _build_storage_view_candidate_payloads(
         self,
         source_bundle: InventorySourceBundle,
         snapshot: InventorySnapshot,
     ) -> list[dict[str, Any]]:
-        ssh_data = parse_ssh_outputs(
-            source_bundle.ssh_outputs,
-            self.settings.layout.slot_count,
-            self.system.truenas.enclosure_filter,
-            selected_enclosure_id=snapshot.selected_enclosure_id,
+        ssh_data = self._parsed_ssh_data_for_enclosure(
+            source_bundle,
+            snapshot.selected_enclosure_id,
         )
         disk_records = self._build_storage_view_candidate_records(
             source_bundle.raw_data,
@@ -5982,10 +6044,23 @@ class InventoryService:
             return None
 
         logical_block_size = slot_view.logical_block_size or self._int_like(raw_drive.get("logical_block_size"))
-        for device_name in self._esxi_host_smart_device_candidates(slot_view, raw_drive):
-            result = await self._run_ssh_command(
-                shlex.join(["esxcli", "storage", "core", "device", "smart", "get", "-d", device_name])
+        device_commands = [
+            (
+                device_name,
+                shlex.join(["esxcli", "storage", "core", "device", "smart", "get", "-d", device_name]),
             )
+            for device_name in self._esxi_host_smart_device_candidates(slot_view, raw_drive)
+        ]
+        results = {
+            result.command: result
+            for result in await self._run_ssh_commands(
+                [command for _device_name, command in device_commands]
+            )
+        }
+        for _device_name, command in device_commands:
+            result = results.get(command)
+            if result is None:
+                continue
             if not result.stdout.strip():
                 continue
             summary = SmartSummaryView.model_validate(
@@ -6155,6 +6230,7 @@ class InventoryService:
         best_overlay = dict(overlay)
         best_score = 0
         best_host: str | None = None
+        best_failures: list[str] = []
         failures: list[str] = []
         target_specs = (
             ("disk-list", "disk inventory", "cli_disks"),
@@ -6206,16 +6282,17 @@ class InventoryService:
                 best_overlay = host_overlay
                 best_score = host_score
                 best_host = host
+                best_failures = list(host_failures)
 
             populated_targets = sum(1 for rows in host_overlay.values() if rows)
             if populated_targets == len(target_specs) and host_score > 0:
                 self._quantastor_preferred_ses_host = host
-                return host_overlay, []
+                return host_overlay, host_failures
 
         if best_score <= 0:
             return overlay, failures
         self._quantastor_preferred_ses_host = best_host
-        return best_overlay, []
+        return best_overlay, best_failures
 
     async def _fetch_quantastor_ses_overlay(
         self,
@@ -6231,7 +6308,7 @@ class InventoryService:
         )
         if best_host:
             self._quantastor_preferred_ses_host = best_host
-            return overlay, []
+            return overlay, failures
         return overlay, failures
 
     async def _fetch_scale_ses_overlay(self) -> tuple[ParsedSSHData, list[str]]:
@@ -6241,7 +6318,7 @@ class InventoryService:
         )
         if best_host:
             self._scale_preferred_ses_host = best_host
-            return overlay, []
+            return overlay, failures
         return overlay, failures
 
     def _get_cached_sg_ses_devices(self, host: str) -> list[str]:
@@ -6303,12 +6380,74 @@ class InventoryService:
             return [], [f"{failure_prefix} discovery found no usable sg_ses devices on {host}."]
         return devices, []
 
+    async def _discover_and_fetch_sg_ses_host_overlay(
+        self,
+        host: str,
+        *,
+        failure_prefix: str,
+    ) -> tuple[list[str], ParsedSSHData, list[str]]:
+        discovery_command = self._build_sg_ses_discovery_command()
+
+        def planner(results: list[SSHCommandResult]) -> list[str]:
+            if len(results) != 1 or results[0].command != discovery_command or not results[0].ok:
+                return []
+            devices = self._parse_sg_ses_discovery_devices(results[0].stdout)
+            commands: list[str] = []
+            for device in devices:
+                commands.extend(
+                    [
+                        shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "aes", device]),
+                        shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "ec", device]),
+                        shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "--join", "--filter", device]),
+                    ]
+                )
+            return commands
+
+        results = await self._run_ssh_planned_commands(
+            planner,
+            initial_commands=[discovery_command],
+            host=host,
+        )
+        discovery_result = next(
+            (result for result in results if result.command == discovery_command),
+            SSHCommandResult(
+                command=discovery_command,
+                ok=False,
+                stderr="SSH command result missing.",
+                exit_code=255,
+            ),
+        )
+        if not discovery_result.ok:
+            detail = (
+                normalize_text(discovery_result.stderr)
+                or normalize_text(discovery_result.stdout)
+                or f"exit {discovery_result.exit_code}"
+            )
+            return [], ParsedSSHData(), [f"{failure_prefix} discovery failed on {host}: {detail}"]
+
+        devices = self._parse_sg_ses_discovery_devices(discovery_result.stdout)
+        if not devices:
+            return (
+                [],
+                ParsedSSHData(),
+                [f"{failure_prefix} discovery found no usable sg_ses devices on {host}."],
+            )
+        page_results = [result for result in results if result.command != discovery_command]
+        overlay, failures = await self._fetch_sg_ses_host_overlay(
+            host,
+            devices,
+            failure_prefix=failure_prefix,
+            command_results=page_results,
+        )
+        return devices, overlay, failures
+
     async def _fetch_sg_ses_host_overlay(
         self,
         host: str,
         devices: Iterable[str],
         *,
         failure_prefix: str,
+        command_results: Iterable[SSHCommandResult] | None = None,
     ) -> tuple[ParsedSSHData, list[str]]:
         host_overlay = ParsedSSHData()
         host_failures: list[str] = []
@@ -6321,12 +6460,17 @@ class InventoryService:
             device_commands[device] = (aes_command, ec_command, join_command)
             commands.extend([aes_command, ec_command, join_command])
 
-        command_results = {result.command: result for result in await self._run_ssh_commands(commands, host)}
-        transport_detail = self._optional_ssh_transport_failure_detail(command_results.values())
+        result_list = (
+            list(command_results)
+            if command_results is not None
+            else await self._run_ssh_commands(commands, host)
+        )
+        results_by_command = {result.command: result for result in result_list}
+        transport_detail = self._optional_ssh_transport_failure_detail(results_by_command.values())
         if transport_detail is not None:
             return host_overlay, [f"{failure_prefix} page probes failed on {host}: {transport_detail}."]
         for device, (aes_command, ec_command, join_command) in device_commands.items():
-            aes_result = command_results.get(
+            aes_result = results_by_command.get(
                 aes_command,
                 SSHCommandResult(command=aes_command, ok=False, stderr="SSH command result missing.", exit_code=255),
             )
@@ -6338,10 +6482,10 @@ class InventoryService:
                 continue
 
             outputs = {aes_command: aes_result.stdout}
-            ec_result = command_results.get(ec_command)
+            ec_result = results_by_command.get(ec_command)
             if ec_result is not None and ec_result.ok:
                 outputs[ec_command] = ec_result.stdout
-            join_result = command_results.get(join_command)
+            join_result = results_by_command.get(join_command)
             if join_result is not None and join_result.ok:
                 outputs[join_command] = join_result.stdout
 
@@ -6362,6 +6506,7 @@ class InventoryService:
         best_overlay = ParsedSSHData()
         best_score = 0
         best_host: str | None = None
+        best_failures: list[str] = []
         failures: list[str] = []
         successful_overlays: list[ParsedSSHData] = []
 
@@ -6382,21 +6527,19 @@ class InventoryService:
                         best_overlay = cached_overlay
                         best_score = cached_score
                         best_host = host
+                        best_failures = []
                     continue
                 self._sg_ses_device_cache.pop(normalize_text(host), None)
 
-            devices, discovery_failures = await self._discover_sg_ses_devices(host, failure_prefix=failure_prefix)
+            devices, host_overlay, host_failures = await self._discover_and_fetch_sg_ses_host_overlay(
+                host,
+                failure_prefix=failure_prefix,
+            )
             if not devices:
-                failures.extend(discovery_failures)
+                failures.extend(host_failures)
                 if cached_failures:
                     failures.extend(cached_failures)
                 continue
-
-            host_overlay, host_failures = await self._fetch_sg_ses_host_overlay(
-                host,
-                devices,
-                failure_prefix=failure_prefix,
-            )
 
             if host_failures:
                 failures.extend(host_failures)
@@ -6409,12 +6552,13 @@ class InventoryService:
                 best_overlay = host_overlay
                 best_score = host_score
                 best_host = host
+                best_failures = list(host_failures)
 
         if best_score <= 0:
             return ParsedSSHData(), failures, None
         if merge_hosts and successful_overlays:
             best_overlay = self._augment_ses_targets_from_redundant_hosts(best_overlay, successful_overlays)
-        return best_overlay, [], best_host
+        return best_overlay, best_failures, best_host
 
     def _build_scale_ssh_hosts(self) -> list[str]:
         hosts: list[str] = []
@@ -9203,7 +9347,7 @@ class InventoryService:
 
     async def _run_ssh_command(self, command: str, host: str | None = None) -> Any:
         if isinstance(self.ssh_probe, SSHProbe):
-            async with self._ssh_session_lock:
+            async with self._ssh_session_lock_for_host(host):
                 target_host = normalize_text(host)
                 if not target_host or target_host == normalize_text(self.system.ssh.host):
                     return await self.ssh_probe.run_command(command)
@@ -9215,6 +9359,14 @@ class InventoryService:
 
     def _optional_ssh_backoff_key(self, host: str | None = None) -> str:
         return normalize_text(host) or normalize_text(self.system.ssh.host) or "__default__"
+
+    def _ssh_session_lock_for_host(self, host: str | None = None) -> asyncio.Lock:
+        key = self._optional_ssh_backoff_key(host)
+        lock = self._ssh_session_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ssh_session_locks[key] = lock
+        return lock
 
     def _optional_ssh_backoff_failure_results(
         self,
@@ -9309,6 +9461,54 @@ class InventoryService:
         )
         return any(marker in details for marker in SSH_CONNECTION_FAILURE_MARKERS)
 
+    async def _run_ssh_planned_commands(
+        self,
+        planner: Any,
+        *,
+        initial_commands: Iterable[str],
+        host: str | None = None,
+    ) -> list[SSHCommandResult]:
+        initial_list = list(initial_commands)
+        if not initial_list:
+            return []
+
+        backoff_results = self._optional_ssh_backoff_failure_results(initial_list, host)
+        if backoff_results is not None:
+            return backoff_results
+
+        if isinstance(self.ssh_probe, SSHProbe):
+            target_host = normalize_text(host)
+            probe = (
+                self.ssh_probe
+                if not target_host or target_host == normalize_text(self.system.ssh.host)
+                else SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
+            )
+            async with self._ssh_session_lock_for_host(host):
+                results = await probe.run_planned_commands(
+                    planner,
+                    initial_commands=initial_list,
+                )
+            self._record_optional_ssh_batch_failure(results, host)
+            return results
+
+        results: list[SSHCommandResult] = []
+        seen_commands: set[str] = set()
+
+        def unseen(commands: Iterable[str]) -> list[str]:
+            selected: list[str] = []
+            for command in commands:
+                if command in seen_commands:
+                    continue
+                seen_commands.add(command)
+                selected.append(command)
+            return selected
+
+        pending = unseen(initial_list)
+        while pending:
+            results.extend(await self._run_ssh_commands(pending, host))
+            pending = unseen(planner(list(results)))
+        return results
+
     async def _run_ssh_commands(self, commands: Iterable[str], host: str | None = None) -> list[SSHCommandResult]:
         command_list = list(commands)
         if not command_list:
@@ -9319,7 +9519,7 @@ class InventoryService:
             return backoff_results
 
         if isinstance(self.ssh_probe, SSHProbe):
-            async with self._ssh_session_lock:
+            async with self._ssh_session_lock_for_host(host):
                 target_host = normalize_text(host)
                 if not target_host or target_host == normalize_text(self.system.ssh.host):
                     results = await self.ssh_probe.run_commands(command_list)

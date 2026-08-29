@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import shlex
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -37,6 +38,18 @@ INLINE_SECRET_RE = re.compile(
     r"(?i)\b(?P<key>api[_-]?key|pass(?:wd|word)?|secret|token)=(?P<value>[^\s'\";]+)"
 )
 SERVER_SPEC_RE = re.compile(r"(?i)(?P<prefix>--server=)(?P<value>[^\s'\"]+)")
+_KNOWN_HOSTS_LOCKS: dict[str, threading.Lock] = {}
+_KNOWN_HOSTS_LOCKS_GUARD = threading.Lock()
+
+
+def _known_hosts_lock(path_value: str) -> threading.Lock:
+    normalized_path = str(Path(path_value).resolve())
+    with _KNOWN_HOSTS_LOCKS_GUARD:
+        lock = _KNOWN_HOSTS_LOCKS.get(normalized_path)
+        if lock is None:
+            lock = threading.Lock()
+            _KNOWN_HOSTS_LOCKS[normalized_path] = lock
+        return lock
 
 
 def redact_ssh_command(command: str) -> str:
@@ -108,8 +121,13 @@ class AutoPinHostKeyPolicy(paramiko.MissingHostKeyPolicy):
         hostname: str,
         key: paramiko.PKey,
     ) -> None:
-        client._host_keys.add(hostname, key.get_name(), key)
-        client.save_host_keys(self.known_hosts_path)
+        with _known_hosts_lock(self.known_hosts_path):
+            # Each concurrent client loaded the file before connecting. Reload
+            # inside the path lock so saving this new key cannot overwrite a key
+            # pinned by another host session in the meantime.
+            client.load_host_keys(self.known_hosts_path)
+            client.get_host_keys().add(hostname, key.get_name(), key)
+            client.save_host_keys(self.known_hosts_path)
         logger.info(
             "Pinned new SSH host key for %s (%s) in %s",
             hostname,
