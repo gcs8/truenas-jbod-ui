@@ -39,6 +39,7 @@ from app.models.domain import (
 )
 from app.metrics import install_metrics
 from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
+from app.script_json import register_script_json_filters
 from app.services.history_backend import HistoryBackendClient
 from app.services.inventory_registry import InventoryRegistry
 from app.services.release_status import ReleaseStatusService
@@ -47,6 +48,7 @@ from app.services.truenas_ws import TrueNASAPIError
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+register_script_json_filters(templates.env)
 
 logger = logging.getLogger(__name__)
 

@@ -67,9 +67,14 @@
       (Array.isArray(bootstrap.esxi_host_prep?.staged_packages) && bootstrap.esxi_host_prep.staged_packages[0]?.token)
       || "",
     refreshInFlight: false,
+    refreshPromise: null,
+    refreshQueued: null,
+    refreshQueuedQuiet: true,
     countdownTimerId: null,
     sudoersPreviewTimerId: null,
     sudoersPreviewRequestSeq: 0,
+    liveEnclosuresRequestSeq: 0,
+    storageViewCandidatesRequestSeq: 0,
     haNodes: [],
     haNodesLoading: false,
     orphanedHistory: [],
@@ -3181,6 +3186,8 @@
       renderStorageViews();
       return;
     }
+    const requestSeq = (state.liveEnclosuresRequestSeq || 0) + 1;
+    state.liveEnclosuresRequestSeq = requestSeq;
     state.liveEnclosuresLoading = true;
     state.liveEnclosuresError = null;
     state.liveEnclosuresSystemId = systemId;
@@ -3191,12 +3198,19 @@
         params.set("force", "true");
       }
       const payload = await fetchJson(`/api/admin/storage-views/live-enclosures?${params.toString()}`);
+      if (requestSeq !== state.liveEnclosuresRequestSeq) {
+        // A newer request (fast system switch) owns the state now; drop this response.
+        return;
+      }
       state.liveEnclosures = Array.isArray(payload.enclosures) ? payload.enclosures : [];
       state.liveEnclosuresSystemId = payload.system_id || systemId;
       if (!quiet) {
         setBanner(`Loaded ${state.liveEnclosures.length} discovered live enclosure${state.liveEnclosures.length === 1 ? "" : "s"} for ${state.liveEnclosuresSystemId}.`, "success");
       }
     } catch (error) {
+      if (requestSeq !== state.liveEnclosuresRequestSeq) {
+        return;
+      }
       state.liveEnclosures = [];
       state.liveEnclosuresSystemId = systemId;
       state.liveEnclosuresError = error.message || String(error);
@@ -3204,8 +3218,10 @@
         setBanner(`Unable to inspect live enclosures: ${error.message || error}`, "error");
       }
     } finally {
-      state.liveEnclosuresLoading = false;
-      renderStorageViews();
+      if (requestSeq === state.liveEnclosuresRequestSeq) {
+        state.liveEnclosuresLoading = false;
+        renderStorageViews();
+      }
     }
   }
 
@@ -3367,6 +3383,8 @@
       renderStorageViewCandidates();
       return;
     }
+    const requestSeq = (state.storageViewCandidatesRequestSeq || 0) + 1;
+    state.storageViewCandidatesRequestSeq = requestSeq;
     state.storageViewCandidatesLoading = true;
     renderStorageViewCandidates();
     try {
@@ -3378,6 +3396,10 @@
         params.set("force", "true");
       }
       const payload = await fetchJson(`/api/admin/storage-views/candidates?${params.toString()}`);
+      if (requestSeq !== state.storageViewCandidatesRequestSeq) {
+        // A newer request (fast system switch) owns the state now; drop this response.
+        return;
+      }
       state.storageViewCandidates = Array.isArray(payload.candidates) ? payload.candidates : [];
       state.storageViewCandidatesSystemId = payload.system_id || systemId;
       if (!quiet) {
@@ -3385,14 +3407,19 @@
         setBanner(`Loaded ${state.storageViewCandidates.length} unmapped inventory candidate${state.storageViewCandidates.length === 1 ? "" : "s"} for ${state.storageViewCandidatesSystemId}${targetSuffix}.`, "success");
       }
     } catch (error) {
+      if (requestSeq !== state.storageViewCandidatesRequestSeq) {
+        return;
+      }
       state.storageViewCandidates = [];
       state.storageViewCandidatesSystemId = systemId;
       if (!quiet) {
         setBanner(`Unable to load unmapped inventory candidates: ${error.message || error}`, "error");
       }
     } finally {
-      state.storageViewCandidatesLoading = false;
-      renderStorageViewCandidates();
+      if (requestSeq === state.storageViewCandidatesRequestSeq) {
+        state.storageViewCandidatesLoading = false;
+        renderStorageViewCandidates();
+      }
     }
   }
 
@@ -4862,6 +4889,18 @@
     }
   }
 
+  function restartFailureKeys(failures) {
+    if (!failures || typeof failures !== "object") {
+      return "";
+    }
+    return Object.keys(failures).filter(Boolean).join(",");
+  }
+
+  function describeRestartFailures(failureKeys) {
+    const keys = String(failureKeys || "").split(",").map((key) => key.trim()).filter(Boolean);
+    return keys.length ? ` Restart failed: ${keys.join(", ")}.` : "";
+  }
+
   function describeApiError(detail) {
     if (detail === undefined || detail === null || detail === "") {
       return "";
@@ -5210,10 +5249,37 @@
     }
   }
 
-  async function refreshState({ quiet = false } = {}) {
-    if (state.refreshInFlight) {
-      return;
+  function refreshState({ quiet = false } = {}) {
+    if (state.refreshPromise) {
+      // A refresh is already running. Instead of silently returning (which left callers
+      // that awaited refreshState() after a save reading stale lists), queue exactly one
+      // follow-up refresh that starts once the in-flight one settles, and hand every
+      // caller that promise so their post-refresh lookups observe state at least as new
+      // as their own write.
+      state.refreshQueuedQuiet = Boolean(state.refreshQueuedQuiet) && Boolean(quiet);
+      if (!state.refreshQueued) {
+        state.refreshQueued = state.refreshPromise
+          .catch(() => {})
+          .then(() => startRefreshState({ quiet: state.refreshQueuedQuiet }));
+      }
+      return state.refreshQueued;
     }
+    return startRefreshState({ quiet });
+  }
+
+  function startRefreshState({ quiet = false } = {}) {
+    state.refreshQueued = null;
+    state.refreshQueuedQuiet = true;
+    const run = runRefreshState({ quiet }).finally(() => {
+      if (state.refreshPromise === run) {
+        state.refreshPromise = null;
+      }
+    });
+    state.refreshPromise = run;
+    return run;
+  }
+
+  async function runRefreshState({ quiet = false } = {}) {
     state.refreshInFlight = true;
     if (elements.refreshStateButton) {
       elements.refreshStateButton.disabled = true;
@@ -5319,7 +5385,7 @@
       );
       if (!response.ok) {
         const payload = await readJsonResponse(response);
-        throw new Error(payload?.detail || `Request failed with ${response.status}`);
+        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
       }
       const blob = await response.blob();
       const objectUrl = window.URL.createObjectURL(blob);
@@ -5336,10 +5402,15 @@
       window.URL.revokeObjectURL(objectUrl);
       const stopped = response.headers.get("X-Admin-Stopped-Containers") || "none";
       const restarted = response.headers.get("X-Admin-Restarted-Containers") || "none";
+      const restartFailures = response.headers.get("X-Admin-Restart-Failures") || "";
       if (elements.backupExportResult) {
-        elements.backupExportResult.textContent = `Exported ${actualPackaging}. Stopped: ${stopped}. Restarted: ${restarted}.`;
+        elements.backupExportResult.textContent = `Exported ${actualPackaging}. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(restartFailures)}`;
       }
-      setBanner(`Full backup exported as ${actualPackaging}.`, "success");
+      if (restartFailures) {
+        setBanner(`Full backup exported as ${actualPackaging}, but these containers did not restart: ${restartFailures}. Use the runtime cards to start them.`, "error");
+      } else {
+        setBanner(`Full backup exported as ${actualPackaging}.`, "success");
+      }
       await refreshState({ quiet: true });
     } catch (error) {
       if (elements.backupExportResult) {
@@ -5389,7 +5460,7 @@
       );
       if (!response.ok) {
         const payload = await readJsonResponse(response);
-        throw new Error(payload?.detail || `Request failed with ${response.status}`);
+        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
       }
       const blob = await response.blob();
       const objectUrl = window.URL.createObjectURL(blob);
@@ -5406,6 +5477,7 @@
       window.URL.revokeObjectURL(objectUrl);
       const stopped = response.headers.get("X-Admin-Stopped-Containers") || "none";
       const restarted = response.headers.get("X-Admin-Restarted-Containers") || "none";
+      const restartFailures = response.headers.get("X-Admin-Restart-Failures") || "";
       const scrubbed = [];
       if (response.headers.get("X-Debug-Scrub-Secrets") === "true") {
         scrubbed.push("secrets");
@@ -5415,9 +5487,13 @@
       }
       const scrubLabel = scrubbed.length ? `Scrubbed ${scrubbed.join(" + ")}` : "Raw";
       if (elements.debugExportResult) {
-        elements.debugExportResult.textContent = `${scrubLabel} ${actualPackaging} debug bundle exported. Stopped: ${stopped}. Restarted: ${restarted}.`;
+        elements.debugExportResult.textContent = `${scrubLabel} ${actualPackaging} debug bundle exported. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(restartFailures)}`;
       }
-      setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}.`, "success");
+      if (restartFailures) {
+        setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}, but these containers did not restart: ${restartFailures}. Use the runtime cards to start them.`, "error");
+      } else {
+        setBanner(`${scrubLabel} debug bundle exported as ${actualPackaging}.`, "success");
+      }
       await refreshState({ quiet: true });
     } catch (error) {
       if (elements.debugExportResult) {
@@ -5462,16 +5538,21 @@
       );
       const payload = await readJsonResponse(response);
       if (!response.ok || payload?.ok === false) {
-        throw new Error(payload?.detail || `Request failed with ${response.status}`);
+        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
       }
       state.systems = Array.isArray(payload.systems) ? payload.systems : state.systems;
       state.defaultSystemId = payload.default_system_id || state.defaultSystemId;
+      const importRestartFailures = restartFailureKeys(payload.restart_failures);
       if (elements.backupImportResult) {
         const stopped = Array.isArray(payload.stopped_containers) ? payload.stopped_containers.join(", ") || "none" : "none";
         const restarted = Array.isArray(payload.restarted_containers) ? payload.restarted_containers.join(", ") || "none" : "none";
-        elements.backupImportResult.textContent = `Imported ${file.name}. Stopped: ${stopped}. Restarted: ${restarted}.`;
+        elements.backupImportResult.textContent = `Imported ${file.name}. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(importRestartFailures)}`;
       }
-      setBanner(`Full backup imported from ${file.name}.`, "success");
+      if (importRestartFailures) {
+        setBanner(`Full backup imported from ${file.name}, but these containers did not restart: ${importRestartFailures}. Use the runtime cards to start them.`, "error");
+      } else {
+        setBanner(`Full backup imported from ${file.name}.`, "success");
+      }
       await refreshState({ quiet: true });
     } catch (error) {
       if (elements.backupImportResult) {
