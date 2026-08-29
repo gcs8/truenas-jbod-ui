@@ -366,6 +366,8 @@ def render_dashboard(
     backoff_label = f"{backoff_seconds}s remaining" if backoff_seconds > 0 else "inactive"
     last_duration = status.get("last_collection_duration_seconds")
     last_duration_label = f"{float(last_duration):.1f}s" if isinstance(last_duration, (int, float)) else "not recorded"
+    last_overrun = status.get("last_background_overrun_seconds")
+    last_overrun_label = f"{float(last_overrun):.1f}s" if isinstance(last_overrun, (int, float)) else "not recorded"
     last_inventory_forced = status.get("last_collection_inventory_forced")
     if last_inventory_forced is True:
         last_inventory_mode = "forced"
@@ -591,6 +593,7 @@ def render_dashboard(
           Last slow metrics pass: <code id="status-last-slow-metrics-at">{html.escape(str(status.get('last_slow_metrics_at') or 'never'))}</code><br>
           Last backup snapshot: <code id="status-last-backup-at">{html.escape(str(status.get('last_backup_at') or 'never'))}</code><br>
           Last collection duration: <code id="status-last-collection-duration">{html.escape(last_duration_label)}</code><br>
+          Last schedule overrun: <code id="status-last-background-overrun">{html.escape(last_overrun_label)}</code><br>
           Last collection inventory: <code id="status-last-collection-inventory">{html.escape(last_inventory_mode)}</code><br>
           Next background pass: <code id="status-next-collection-at">{html.escape(str(status.get('next_collection_at') or 'not scheduled'))}</code><br>
           Background failures: <code id="status-background-failures">{html.escape(str(status.get('background_consecutive_failures') or 0))}</code><br>
@@ -709,6 +712,7 @@ def render_dashboard(
           setText("status-last-slow-metrics-at", statusValue(collector.last_slow_metrics_at));
           setText("status-last-backup-at", statusValue(collector.last_backup_at));
           setText("status-last-collection-duration", collectionDurationLabel(collector.last_collection_duration_seconds));
+          setText("status-last-background-overrun", collectionDurationLabel(collector.last_background_overrun_seconds));
           setText("status-last-collection-inventory", collectionInventoryLabel(collector.last_collection_inventory_forced));
           setText("status-next-collection-at", statusValue(collector.next_collection_at, "not scheduled"));
           setText("status-background-failures", String(collector.background_consecutive_failures || 0));

@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from history_service import main as history_main
-from history_service.collector import HistoryCollector, ScopeSnapshot
+from history_service.collector import HistoryCollectionStopping, HistoryCollector, ScopeSnapshot
 from history_service.config import HistorySettings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
 from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
@@ -302,6 +302,8 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn("Next background pass", markup)
         self.assertIn("Background backoff", markup)
         self.assertIn("Last collection duration", markup)
+        self.assertIn("Last schedule overrun", markup)
+        self.assertIn('id="status-last-background-overrun"', markup)
         self.assertIn("Last collection inventory", markup)
         self.assertIn("DB Size", markup)
         self.assertIn("collector-activity-banner", markup)
@@ -569,6 +571,48 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
 
 class HistoryStoreTests(unittest.TestCase):
+    def test_store_configures_wal_once_per_database_identity(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        executed_statements: list[str] = []
+        original_connect = sqlite3.connect
+
+        class TrackingConnection:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                self.connection = connection
+
+            @property
+            def row_factory(self) -> object:
+                return self.connection.row_factory
+
+            @row_factory.setter
+            def row_factory(self, value: object) -> None:
+                self.connection.row_factory = value  # type: ignore[assignment]
+
+            def execute(self, statement: str, parameters: object = ()) -> sqlite3.Cursor:
+                executed_statements.append(statement)
+                return self.connection.execute(statement, parameters)  # type: ignore[arg-type]
+
+            def close(self) -> None:
+                self.connection.close()
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.connection, name)
+
+        def tracking_connect(*args: object, **kwargs: object) -> TrackingConnection:
+            return TrackingConnection(original_connect(*args, **kwargs))  # type: ignore[arg-type]
+
+        with patch("history_service.store.sqlite3.connect", side_effect=tracking_connect):
+            store = HistoryStore(str(temp_dir / "history.db"))
+            store.estimated_counts()
+            store.list_scopes()
+
+        wal_statements = [
+            statement
+            for statement in executed_statements
+            if statement.strip().upper() == "PRAGMA JOURNAL_MODE=WAL"
+        ]
+        self.assertEqual(wal_statements, ["PRAGMA journal_mode=WAL"])
+
     def test_database_size_bytes_includes_wal_and_shm_files(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         db_path = temp_dir / "history.db"
@@ -2393,6 +2437,7 @@ class HistoryStoreTests(unittest.TestCase):
     def test_connect_falls_back_when_wal_enablement_hits_disk_io_error(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
+        store._journal_mode_identity = None
         original_connect = sqlite3.connect
 
         class FailingWalConnection:
@@ -2460,6 +2505,7 @@ class HistoryStoreTests(unittest.TestCase):
         store.upsert_slot_state(record, "2026-04-16T22:05:00+00:00")
         backup_path = store.create_backup(temp_dir / "backups", retention_count=1)
         self.assertIsNotNone(backup_path)
+        original_journal_identity = store._journal_mode_identity
 
         db_path.write_text("placeholder", encoding="utf-8")
         wal_path = Path(f"{db_path}-wal")
@@ -2474,9 +2520,218 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertTrue(db_path.exists())
         self.assertFalse(wal_path.exists())
         self.assertFalse(shm_path.exists())
+        with store._connect() as connection:
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        self.assertEqual(journal_mode, "wal")
+        self.assertNotEqual(store._journal_mode_identity, original_journal_identity)
 
 
 class HistoryCollectorTests(unittest.TestCase):
+    def test_stop_waits_for_inflight_worker_before_returning(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            MagicMock(),
+        )
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_finished = threading.Event()
+
+        async def enumerate_scopes(**_: object) -> list[ScopeSnapshot]:
+            worker_started.set()
+            while not release_worker.is_set():
+                await asyncio.sleep(0.01)
+            worker_finished.set()
+            return []
+
+        collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
+
+        async def exercise_stop() -> bool:
+            await collector.start()
+            started = await asyncio.to_thread(worker_started.wait, 1.0)
+            self.assertTrue(started)
+            stop_task = asyncio.create_task(collector.stop())
+            await asyncio.sleep(0.05)
+            returned_before_worker = stop_task.done()
+            release_worker.set()
+            await asyncio.wait_for(stop_task, timeout=1.0)
+            return returned_before_worker
+
+        returned_before_worker = asyncio.run(exercise_stop())
+
+        self.assertFalse(returned_before_worker)
+        self.assertTrue(worker_finished.is_set())
+        self.assertFalse(collector.collection_running)
+        self.assertIsNone(collector._task)
+
+    def test_stop_request_prevents_later_scope_writes(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = MagicMock()
+        store.estimated_counts.return_value = {}
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        scopes = [
+            ScopeSnapshot(
+                system_id=f"system-{index}",
+                system_label=f"System {index}",
+                enclosure_id=None,
+                enclosure_label=None,
+                snapshot={"slots": []},
+            )
+            for index in range(2)
+        ]
+        collector._enumerate_scopes = AsyncMock(return_value=scopes)  # type: ignore[method-assign]
+        first_write_started = threading.Event()
+        release_first_write = threading.Event()
+        written_scopes: list[str] = []
+
+        def record_slot_changes(records: list[SlotStateRecord], _: str) -> None:
+            written_scopes.append(records[0].system_id if records else scopes[len(written_scopes)].system_id)
+            if len(written_scopes) == 1:
+                first_write_started.set()
+                release_first_write.wait(timeout=1.0)
+
+        collector._record_slot_changes = record_slot_changes  # type: ignore[method-assign]
+
+        async def exercise_stop() -> None:
+            await collector.start()
+            started = await asyncio.to_thread(first_write_started.wait, 1.0)
+            self.assertTrue(started)
+            stop_task = asyncio.create_task(collector.stop())
+            await asyncio.sleep(0.02)
+            release_first_write.set()
+            await asyncio.wait_for(stop_task, timeout=1.0)
+
+        with patch("history_service.collector.observe_history_collection_run"):
+            asyncio.run(exercise_stop())
+
+        self.assertEqual(written_scopes, ["system-0"])
+
+    def test_stop_waits_for_manual_collection_worker(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            MagicMock(),
+        )
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        async def enumerate_scopes(**_: object) -> list[ScopeSnapshot]:
+            worker_started.set()
+            while not release_worker.is_set():
+                await asyncio.sleep(0.01)
+            return []
+
+        collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
+
+        async def exercise_stop() -> bool:
+            manual_task = asyncio.create_task(
+                collector.run_once(collection_kind="manual")
+            )
+            started = await asyncio.to_thread(worker_started.wait, 1.0)
+            self.assertTrue(started)
+            await collector.start()
+            stop_task = asyncio.create_task(collector.stop())
+            await asyncio.sleep(0.05)
+            returned_before_worker = stop_task.done()
+            release_worker.set()
+            with self.assertRaises(HistoryCollectionStopping):
+                await asyncio.wait_for(manual_task, timeout=1.0)
+            await asyncio.wait_for(stop_task, timeout=1.0)
+            return returned_before_worker
+
+        returned_before_worker = asyncio.run(exercise_stop())
+
+        self.assertFalse(returned_before_worker)
+        self.assertFalse(collector.collection_running)
+
+    def test_background_schedule_uses_pass_start_and_reports_overrun(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            MagicMock(),
+        )
+        now = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+        with (
+            patch("history_service.collector.time.perf_counter", return_value=112.5),
+            patch("history_service.collector.utcnow", return_value=now),
+            self.assertLogs("history_service.collector", level="WARNING") as captured,
+        ):
+            sleep_for = collector._schedule_next_background_collection(
+                started_monotonic=100.0,
+                target_interval=10.0,
+            )
+
+        self.assertEqual(sleep_for, 7.5)
+        self.assertEqual(collector.last_background_overrun_seconds, 2.5)
+        self.assertEqual(collector.next_collection_at, now + timedelta(seconds=7.5))
+        self.assertIn("overran its 10.0-second interval by 2.5 seconds", captured.output[0])
+
+    def test_stop_interrupts_startup_grace_without_running_collection(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=60,
+            ),
+            MagicMock(),
+        )
+        collector.run_once = AsyncMock()  # type: ignore[method-assign]
+
+        async def exercise_stop() -> None:
+            await collector.start()
+            await asyncio.wait_for(collector.stop(), timeout=0.5)
+
+        asyncio.run(exercise_stop())
+
+        collector.run_once.assert_not_awaited()  # type: ignore[attr-defined]
+
+    def test_background_schedule_skips_exact_boundary_catch_up(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            MagicMock(),
+        )
+        now = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+        with (
+            patch("history_service.collector.time.perf_counter", return_value=120.0),
+            patch("history_service.collector.utcnow", return_value=now),
+            self.assertLogs("history_service.collector", level="WARNING"),
+        ):
+            sleep_for = collector._schedule_next_background_collection(
+                started_monotonic=100.0,
+                target_interval=10.0,
+            )
+
+        self.assertEqual(sleep_for, 10.0)
+        self.assertEqual(collector.last_background_overrun_seconds, 10.0)
+        self.assertEqual(collector.next_collection_at, now + timedelta(seconds=10.0))
+
     def test_background_startup_collection_is_fast_only(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = MagicMock()
