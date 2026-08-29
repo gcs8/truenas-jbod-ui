@@ -562,6 +562,70 @@ Additional element status diagnostic page:
             selected["unmapped_ses_elements"][0]["ses_targets"][0]["ses_slot_number"]
         )
 
+    def test_parse_sesutil_map_duplicate_slot_keeps_later_detail_lines(self) -> None:
+        output = """
+ses0:
+  Enclosure Name: ExampleCo DualPathShelf
+  Enclosure ID: 5000000000000005
+  Element 5, Type: Array Device Slot
+    Status: OK
+    Description: Slot05
+  Element 29, Type: Array Device Slot
+    Status: OK
+    Description: Slot05
+    Device Names: da5, pass5
+    Extra status:
+      - LED=locate
+""".strip()
+
+        parsed = parse_sesutil_map(output)
+
+        self.assertEqual(len(parsed), 1)
+        slot = parsed[0].slots[5]
+        # The second sighting of the same physical slot keeps feeding detail
+        # lines after the merge; they must land on the stored slot instead of
+        # an orphaned accumulation object.
+        self.assertEqual(slot.device_names, ["da5"])
+        self.assertTrue(slot.identify_active)
+        self.assertTrue(slot.present)
+        target_elements = {target.get("ses_element_id") for target in slot.control_targets}
+        self.assertIn(5, target_elements)
+        self.assertIn(29, target_elements)
+
+    def test_parse_sg_ses_aes_duplicate_slot_keeps_later_detail_lines(self) -> None:
+        output = """
+  ExampleCo  DualPathShelf  0001
+  Primary enclosure logical identifier (hex): 5000000000000005
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 5
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x500000000000503f
+      Element index: 1  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 5
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x500000000000603f
+          SAS address: 0x5000cca264d47000
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg5")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(list(parsed.slots), [5])
+        slot = parsed.slots[5]
+        # The SAS address is only reported by the second element sighting and
+        # is parsed after the duplicate slot number merges; it must reach the
+        # stored slot instead of an orphaned accumulation object.
+        self.assertEqual(slot.sas_address, "5000cca264d47000")
+        self.assertTrue(slot.present)
+
     def test_unmapped_element_collision_does_not_replace_reported_slot(self) -> None:
         output = """
 ses0:
