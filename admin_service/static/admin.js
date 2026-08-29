@@ -21,7 +21,7 @@
     selectedDebugPaths: Array.isArray(bootstrap.backup_defaults?.debug_included_paths)
       ? [...bootstrap.backup_defaults.debug_included_paths]
       : [],
-    backupManualEncrypt: false,
+    backupManualEncrypt: true,
     backupLastPlainPackaging:
       bootstrap.backup_defaults && bootstrap.backup_defaults.packaging !== "7z"
         ? bootstrap.backup_defaults.packaging

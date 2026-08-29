@@ -459,3 +459,8 @@ test("backup import reports source-absent groups whose live data was preserved",
   assert.match(source, /Preserved live data/);
   assert.match(source, /"info"/);
 });
+
+test("backup encryption remains enabled after JavaScript startup state sync", () => {
+  assert.match(SOURCE, /backupManualEncrypt:\s*true/);
+  assert.match(functionSource("syncSingleBundleControls"), /encryptToggle\.checked = encryptEnabled/);
+});
