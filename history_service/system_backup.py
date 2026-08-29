@@ -3654,15 +3654,20 @@ class SystemBackupService:
         connection = sqlite3.connect(target_path)
         try:
             connection.row_factory = sqlite3.Row
-            slot_state_rules, slot_event_rules, metric_sample_rules = self._history_scrubbing_rules(
-                scrubber
-            )
+            (
+                slot_state_rules,
+                slot_event_rules,
+                metric_sample_rules,
+                metric_rollup_rules,
+            ) = self._history_scrubbing_rules(scrubber)
             if slot_state_rules:
                 self._scrub_history_table(connection, "slot_state_current", slot_state_rules)
             if slot_event_rules:
                 self._scrub_history_table(connection, "slot_events", slot_event_rules)
             if metric_sample_rules:
                 self._scrub_history_table(connection, "metric_samples", metric_sample_rules)
+            if metric_rollup_rules:
+                self._scrub_history_table(connection, "metric_rollups", metric_rollup_rules)
             connection.commit()
         finally:
             connection.close()
@@ -3671,10 +3676,11 @@ class SystemBackupService:
     @staticmethod
     def _history_scrubbing_rules(
         scrubber: DebugScrubber,
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
         slot_state_rules: dict[str, Any] = {}
         slot_event_rules: dict[str, Any] = {}
         metric_sample_rules: dict[str, Any] = {}
+        metric_rollup_rules: dict[str, Any] = {}
         if scrubber.scrub_disk_identifiers:
             common_rules = {
                 "device_name": scrubber.alias_device_name,
@@ -3694,9 +3700,10 @@ class SystemBackupService:
             )
             slot_event_rules.update(common_rules)
             metric_sample_rules.update(common_rules)
+            metric_rollup_rules.update(common_rules)
         if scrubber.scrub_secrets or scrubber.scrub_disk_identifiers:
             slot_event_rules["details_json"] = scrubber.scrub_json_text
-        return slot_state_rules, slot_event_rules, metric_sample_rules
+        return slot_state_rules, slot_event_rules, metric_sample_rules, metric_rollup_rules
 
     def _build_scrubbed_history_snapshot(self, snapshot_bytes: bytes, scrubber: DebugScrubber | None) -> bytes:
         if scrubber is None or not snapshot_bytes:
@@ -3707,53 +3714,20 @@ class SystemBackupService:
             connection = sqlite3.connect(temp_path)
             try:
                 connection.row_factory = sqlite3.Row
-                slot_state_rules: dict[str, Any] = {}
-                slot_event_rules: dict[str, Any] = {}
-                metric_sample_rules: dict[str, Any] = {}
-                if scrubber.scrub_disk_identifiers:
-                    slot_state_rules.update(
-                        {
-                            "device_name": scrubber.alias_device_name,
-                            "serial": lambda value: scrubber.alias_identifier("serial", value),
-                            "gptid": lambda value: scrubber.alias_identifier("gptid", value),
-                            "persistent_id_label": lambda value: scrubber.alias_identifier("persistent_id", value),
-                            "disk_identity_key": lambda value: scrubber.alias_identifier("disk_identity_key", value),
-                            "logical_unit_id": lambda value: scrubber.alias_identifier("logical_unit_id", value),
-                            "sas_address": lambda value: scrubber.alias_identifier("sas_address", value),
-                            "multipath_device": scrubber.alias_device_name,
-                            "multipath_lunid": lambda value: scrubber.alias_identifier("multipath_lunid", value),
-                        }
-                    )
-                    slot_event_rules.update(
-                        {
-                            "device_name": scrubber.alias_device_name,
-                            "serial": lambda value: scrubber.alias_identifier("serial", value),
-                            "gptid": lambda value: scrubber.alias_identifier("gptid", value),
-                            "persistent_id_label": lambda value: scrubber.alias_identifier("persistent_id", value),
-                            "disk_identity_key": lambda value: scrubber.alias_identifier("disk_identity_key", value),
-                            "logical_unit_id": lambda value: scrubber.alias_identifier("logical_unit_id", value),
-                            "sas_address": lambda value: scrubber.alias_identifier("sas_address", value),
-                        }
-                    )
-                    metric_sample_rules.update(
-                        {
-                            "device_name": scrubber.alias_device_name,
-                            "serial": lambda value: scrubber.alias_identifier("serial", value),
-                            "gptid": lambda value: scrubber.alias_identifier("gptid", value),
-                            "persistent_id_label": lambda value: scrubber.alias_identifier("persistent_id", value),
-                            "disk_identity_key": lambda value: scrubber.alias_identifier("disk_identity_key", value),
-                            "logical_unit_id": lambda value: scrubber.alias_identifier("logical_unit_id", value),
-                            "sas_address": lambda value: scrubber.alias_identifier("sas_address", value),
-                        }
-                    )
-                if scrubber.scrub_secrets or scrubber.scrub_disk_identifiers:
-                    slot_event_rules["details_json"] = scrubber.scrub_json_text
+                (
+                    slot_state_rules,
+                    slot_event_rules,
+                    metric_sample_rules,
+                    metric_rollup_rules,
+                ) = self._history_scrubbing_rules(scrubber)
                 if slot_state_rules:
                     self._scrub_history_table(connection, "slot_state_current", slot_state_rules)
                 if slot_event_rules:
                     self._scrub_history_table(connection, "slot_events", slot_event_rules)
                 if metric_sample_rules:
                     self._scrub_history_table(connection, "metric_samples", metric_sample_rules)
+                if metric_rollup_rules:
+                    self._scrub_history_table(connection, "metric_rollups", metric_rollup_rules)
                 connection.commit()
             finally:
                 connection.close()

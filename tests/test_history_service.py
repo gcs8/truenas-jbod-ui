@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import ExitStack
 from dataclasses import replace
@@ -270,6 +271,30 @@ class HistoryConfigTests(unittest.TestCase):
     def test_history_settings_fast_collection_uses_cached_inventory_by_default(self) -> None:
         self.assertFalse(HistorySettings().force_inventory_on_fast_collection)
 
+    def test_history_settings_use_conservative_retention_defaults(self) -> None:
+        settings = HistorySettings()
+
+        self.assertEqual(settings.raw_metric_retention_days, 30)
+        self.assertEqual(settings.event_retention_days, 365)
+        self.assertEqual(settings.hourly_rollup_retention_days, 365)
+        self.assertEqual(settings.daily_rollup_retention_days, 1825)
+        self.assertEqual(settings.retention_interval_seconds, 3600)
+        self.assertEqual(settings.retention_batch_size, 5000)
+        self.assertEqual(settings.retention_max_batches_per_run, 20)
+
+    def test_history_settings_allow_keep_forever_retention_values(self) -> None:
+        settings = HistorySettings(
+            raw_metric_retention_days=0,
+            event_retention_days=0,
+            hourly_rollup_retention_days=0,
+            daily_rollup_retention_days=0,
+        )
+
+        self.assertEqual(settings.raw_metric_retention_days, 0)
+        self.assertEqual(settings.event_retention_days, 0)
+        self.assertEqual(settings.hourly_rollup_retention_days, 0)
+        self.assertEqual(settings.daily_rollup_retention_days, 0)
+
     def test_history_settings_uses_sqlite_parent_for_backup_dirs_when_sqlite_path_changes(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         settings = HistorySettings(sqlite_path=str(temp_dir / "history.db"))
@@ -304,6 +329,12 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn("Last collection duration", markup)
         self.assertIn("Last schedule overrun", markup)
         self.assertIn('id="status-last-background-overrun"', markup)
+        self.assertIn("Last retention pass", markup)
+        self.assertIn('id="status-last-retention-at"', markup)
+        self.assertIn("Last retention rows removed", markup)
+        self.assertIn('id="status-last-retention-rows-removed"', markup)
+        self.assertIn("Last retention failure", markup)
+        self.assertIn('id="status-last-retention-error"', markup)
         self.assertIn("Last collection inventory", markup)
         self.assertIn("DB Size", markup)
         self.assertIn("collector-activity-banner", markup)
@@ -347,6 +378,21 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn("History ${kind} collection running", markup)
         self.assertIn("renderCollectorStatus(payload)", markup)
         self.assertIn("renderOverview(initialOverviewPayload)", markup)
+
+    def test_overview_marks_trigger_tracked_counts_as_exact(self) -> None:
+        with (
+            patch.object(history_main.collector, "status", return_value={}),
+            patch.object(
+                history_main.store,
+                "estimated_counts",
+                return_value={"tracked_slots": 1, "estimated": False, "count_mode": "tracked"},
+            ),
+            patch.object(history_main.store, "list_scopes", return_value=[]),
+            patch.object(history_main.store, "database_size_bytes", return_value=0),
+        ):
+            payload = asyncio.run(history_main.overview(exact_counts=False))
+
+        self.assertTrue(payload["counts_exact"])
 
     def test_history_refresh_endpoint_forces_fast_collection(self) -> None:
         route = next(route for route in history_main.app.routes if route.path == "/api/history/refresh")
@@ -571,6 +617,597 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
 
 class HistoryStoreTests(unittest.TestCase):
+    @staticmethod
+    def _metric_sample(observed_at: str, value: int, *, slot: int = 5) -> MetricSample:
+        return MetricSample(
+            observed_at=observed_at,
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=slot,
+            slot_label=f"{slot:02d}",
+            metric_name="temperature_c",
+            value_integer=value,
+            value_real=None,
+            device_name=f"da{slot}",
+            serial=f"SERIAL-{slot}",
+            model="Drive",
+            state="healthy",
+            gptid=f"gptid/{slot}",
+            persistent_id_label="GPTID",
+            disk_identity_key=f"serial:SERIAL-{slot}",
+            logical_unit_id=None,
+            sas_address=None,
+        )
+
+    @staticmethod
+    def _insert_event_rows(store: HistoryStore, observed_times: list[str]) -> None:
+        connection = sqlite3.connect(store.file_path)
+        try:
+            connection.executemany(
+                """
+                INSERT INTO slot_events (
+                    observed_at, system_id, system_label, enclosure_key,
+                    enclosure_id, enclosure_label, slot, slot_label,
+                    event_type, previous_value, current_value, device_name,
+                    serial, details_json
+                ) VALUES (?, 'archive-core', 'Archive CORE', 'enc-a',
+                          'enc-a', 'Front Shelf', 5, '05',
+                          'slot_state_changed', 'healthy', 'degraded', 'da5',
+                          'SERIAL-5', '{}')
+                """,
+                [(observed_at,) for observed_at in observed_times],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def test_retention_rolls_up_old_metrics_and_prunes_in_bounded_batches(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [
+                self._metric_sample("2026-01-01T10:05:00+00:00", 20),
+                self._metric_sample("2026-01-01T10:35:00+00:00", 30),
+                self._metric_sample("2026-01-01T10:55:00+00:00", 40),
+                self._metric_sample("2026-06-01T00:00:00+00:00", 50),
+            ]
+        )
+        self._insert_event_rows(
+            store,
+            [
+                "2024-01-01T00:00:00+00:00",
+                "2024-01-02T00:00:00+00:00",
+                "2026-06-01T00:00:00+00:00",
+            ],
+        )
+
+        first = store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=365,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=2,
+            max_batches=1,
+        )
+        second = store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=365,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=2,
+            max_batches=1,
+        )
+
+        self.assertEqual(first["metric_samples_removed"], 2)
+        self.assertTrue(first["has_more"])
+        self.assertEqual(second["metric_samples_removed"], 1)
+        self.assertFalse(second["has_more"])
+        self.assertEqual(store.counts()["metric_sample_count"], 1)
+        self.assertEqual(store.counts()["event_count"], 1)
+        samples = store.list_metric_samples(
+            "archive-core",
+            "enc-a",
+            5,
+            metric_name="temperature_c",
+            since="2026-01-01T00:00:00+00:00",
+        )
+        self.assertEqual([sample["value"] for sample in samples], [50, 30.0])
+        self.assertEqual(samples[1]["rollup_seconds"], 3600)
+        self.assertEqual(samples[1]["sample_count"], 3)
+
+    def test_rollups_average_gauges_but_keep_the_latest_counter_value(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [
+                self._metric_sample("2026-01-01T10:05:00+00:00", 20),
+                self._metric_sample("2026-01-01T10:55:00+00:00", 30),
+                replace(
+                    self._metric_sample("2026-01-01T10:05:00+00:00", 100),
+                    metric_name="bytes_read",
+                ),
+                replace(
+                    self._metric_sample("2026-01-01T10:55:00+00:00", 250),
+                    metric_name="bytes_read",
+                ),
+            ]
+        )
+
+        store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=100,
+            max_batches=2,
+        )
+
+        temperatures = store.list_metric_samples(
+            "archive-core", "enc-a", 5,
+            metric_name="temperature_c", limit=10,
+            since="2026-01-01T00:00:00+00:00",
+        )
+        counters = store.list_metric_samples(
+            "archive-core", "enc-a", 5,
+            metric_name="bytes_read", limit=10,
+            since="2026-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(temperatures[0]["value"], 25.0)
+        self.assertEqual(counters[0]["value"], 250.0)
+        self.assertEqual(counters[0]["sample_count"], 2)
+
+    def test_partial_batch_keeps_raw_and_rolled_up_values_from_the_same_hour_visible(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [
+                self._metric_sample("2026-01-01T10:05:00+00:00", 20),
+                self._metric_sample("2026-01-01T10:55:00+00:00", 30),
+            ]
+        )
+
+        result = store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=1,
+            max_batches=1,
+        )
+        samples = store.list_metric_samples(
+            "archive-core", "enc-a", 5,
+            metric_name="temperature_c", limit=10,
+            since="2026-01-01T00:00:00+00:00",
+        )
+        scope = store.list_scope_history(
+            "archive-core",
+            "enc-a",
+            slots=[5],
+            event_limit=0,
+            metric_limits={"temperature_c": 10},
+            since="2026-01-01T00:00:00+00:00",
+        )
+        homes = store.list_disk_metric_homes(
+            "serial:SERIAL-5",
+            since="2026-01-01T00:00:00+00:00",
+        )
+
+        self.assertTrue(result["has_more"])
+        self.assertEqual([sample["value"] for sample in samples], [30, 20.0])
+        self.assertEqual(samples[1]["rollup_seconds"], 3600)
+        self.assertEqual(
+            [sample["value"] for sample in scope[5]["metrics"]["temperature_c"]],
+            [30, 20.0],
+        )
+        self.assertEqual(homes[0]["sample_count"], 2)
+
+    def test_daily_rollup_remains_visible_beside_newer_raw_value_from_same_day(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [
+                self._metric_sample("2026-06-01T10:00:00+00:00", 20),
+                self._metric_sample("2026-06-01T14:00:00+00:00", 30),
+            ]
+        )
+
+        store.maintain_retention(
+            now=datetime(2026, 7, 1, 12, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=30,
+            daily_rollup_retention_days=365,
+            batch_size=100,
+            max_batches=2,
+        )
+        samples = store.list_metric_samples(
+            "archive-core", "enc-a", 5,
+            metric_name="temperature_c", limit=10,
+            since="2026-06-01T00:00:00+00:00",
+        )
+        scope = store.list_scope_history(
+            "archive-core",
+            "enc-a",
+            slots=[5],
+            event_limit=0,
+            metric_limits={"temperature_c": 10},
+            since="2026-06-01T00:00:00+00:00",
+        )
+
+        self.assertEqual([sample["value"] for sample in samples], [30, 20.0])
+        self.assertEqual(samples[1]["rollup_seconds"], 86400)
+        self.assertEqual(
+            [sample["value"] for sample in scope[5]["metrics"]["temperature_c"]],
+            [30, 20.0],
+        )
+
+    def test_all_history_queries_include_retained_rollups_without_since(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [self._metric_sample("2026-01-01T10:05:00+00:00", 30)]
+        )
+        store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=100,
+            max_batches=2,
+        )
+
+        samples = store.list_metric_samples(
+            "archive-core", "enc-a", 5,
+            metric_name="temperature_c", limit=10,
+        )
+        scope = store.list_scope_history(
+            "archive-core",
+            "enc-a",
+            slots=[5],
+            event_limit=0,
+            metric_limits={"temperature_c": 10},
+        )
+
+        self.assertEqual([sample["value"] for sample in samples], [30.0])
+        self.assertEqual(
+            [sample["value"] for sample in scope[5]["metrics"]["temperature_c"]],
+            [30.0],
+        )
+
+    def test_retention_keeps_rows_at_the_exact_cutoff(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [self._metric_sample("2026-06-01T00:00:00+00:00", 31)]
+        )
+        self._insert_event_rows(store, ["2025-07-01T00:00:00+00:00"])
+
+        result = store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=365,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=100,
+            max_batches=2,
+        )
+
+        self.assertEqual(result["total_rows_removed"], 0)
+        self.assertEqual(store.counts()["metric_sample_count"], 1)
+        self.assertEqual(store.counts()["event_count"], 1)
+
+    def test_retention_zero_values_keep_raw_history_forever(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [self._metric_sample("2020-01-01T00:00:00+00:00", 31)]
+        )
+        self._insert_event_rows(store, ["2020-01-01T00:00:00+00:00"])
+
+        result = store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=0,
+            event_retention_days=0,
+            hourly_rollup_retention_days=0,
+            daily_rollup_retention_days=0,
+            batch_size=100,
+            max_batches=2,
+        )
+
+        self.assertEqual(result["total_rows_removed"], 0)
+        self.assertEqual(store.counts()["metric_sample_count"], 1)
+        self.assertEqual(store.counts()["event_count"], 1)
+
+    def test_retention_can_stop_between_batches(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [
+                self._metric_sample("2020-01-01T00:00:00+00:00", 20),
+                self._metric_sample("2020-01-01T01:00:00+00:00", 21),
+                self._metric_sample("2020-01-01T02:00:00+00:00", 22),
+            ]
+        )
+        continuation_checks = 0
+
+        def should_continue() -> bool:
+            nonlocal continuation_checks
+            continuation_checks += 1
+            return continuation_checks == 1
+
+        result = store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=1,
+            max_batches=10,
+            should_continue=should_continue,
+        )
+
+        self.assertEqual(result["metric_samples_removed"], 1)
+        self.assertTrue(result["interrupted"])
+        self.assertEqual(store.counts()["metric_sample_count"], 2)
+
+    def test_retention_failure_exposes_rows_committed_by_prior_batches(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [
+                self._metric_sample("2020-01-01T00:00:00+00:00", 20),
+                self._metric_sample("2020-01-01T01:00:00+00:00", 21),
+                self._metric_sample("2020-01-01T02:00:00+00:00", 22),
+            ]
+        )
+        original_execute_write = store._execute_write
+        calls = 0
+
+        def fail_second_batch(operation):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("private failure detail")
+            return original_execute_write(operation)
+
+        with patch.object(store, "_execute_write", side_effect=fail_second_batch):
+            with self.assertRaises(RuntimeError) as raised:
+                store.maintain_retention(
+                    now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                    raw_metric_retention_days=30,
+                    event_retention_days=0,
+                    hourly_rollup_retention_days=365,
+                    daily_rollup_retention_days=1825,
+                    batch_size=1,
+                    max_batches=3,
+                )
+
+        summary = getattr(raised.exception, "retention_summary", None)
+        self.assertIsInstance(summary, dict)
+        assert isinstance(summary, dict)
+        self.assertEqual(summary["metric_samples_removed"], 1)
+        self.assertEqual(summary["hourly_rollups_removed"], 1)
+        self.assertEqual(summary["daily_rollups_removed"], 1)
+        self.assertEqual(summary["total_rows_removed"], 3)
+        self.assertTrue(summary["has_more"])
+        self.assertEqual(store.counts()["metric_sample_count"], 2)
+
+    def test_retention_batch_is_bounded_for_60_and_347_slot_fixtures(self) -> None:
+        for slot_count in (60, 347):
+            with self.subTest(slot_count=slot_count):
+                temp_dir = Path(tempfile.mkdtemp())
+                store = HistoryStore(str(temp_dir / "history.db"))
+                store.insert_metric_samples(
+                    [
+                        self._metric_sample("2020-01-01T00:00:00+00:00", slot, slot=slot)
+                        for slot in range(slot_count)
+                    ]
+                )
+
+                result = store.maintain_retention(
+                    now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                    raw_metric_retention_days=30,
+                    event_retention_days=0,
+                    hourly_rollup_retention_days=365,
+                    daily_rollup_retention_days=1825,
+                    batch_size=60,
+                    max_batches=1,
+                )
+
+                self.assertEqual(result["metric_samples_removed"], 60)
+                self.assertEqual(result["has_more"], slot_count > 60)
+                self.assertEqual(store.counts()["metric_sample_count"], max(0, slot_count - 60))
+
+    def test_retention_preserves_batched_query_behavior_for_60_and_347_slots(self) -> None:
+        for slot_count in (60, 347):
+            with self.subTest(slot_count=slot_count):
+                temp_dir = Path(tempfile.mkdtemp())
+                store = HistoryStore(str(temp_dir / "history.db"))
+                samples: list[MetricSample] = []
+                for slot in range(slot_count):
+                    samples.extend(
+                        [
+                            self._metric_sample(
+                                "2022-01-01T00:05:00+00:00",
+                                slot,
+                                slot=slot,
+                            ),
+                            self._metric_sample(
+                                "2026-06-30T00:05:00+00:00",
+                                slot + 1000,
+                                slot=slot,
+                            ),
+                        ]
+                    )
+                store.insert_metric_samples(samples)
+                connect_calls = 0
+                original_connect = store._connect
+
+                def counting_connect() -> sqlite3.Connection:
+                    nonlocal connect_calls
+                    connect_calls += 1
+                    return original_connect()
+
+                started = time.perf_counter()
+                with patch.object(store, "_connect", counting_connect):
+                    before = store.list_scope_history(
+                        "archive-core",
+                        "enc-a",
+                        slots=list(range(slot_count)),
+                        event_limit=0,
+                        metric_limits={"temperature_c": 4},
+                        since="2022-01-01T00:00:00+00:00",
+                    )
+                pre_query_seconds = time.perf_counter() - started
+                self.assertEqual(connect_calls, 1)
+
+                maintenance_started = time.perf_counter()
+                summary = store.maintain_retention(
+                    now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                    raw_metric_retention_days=30,
+                    event_retention_days=365,
+                    hourly_rollup_retention_days=365,
+                    daily_rollup_retention_days=1825,
+                    batch_size=1000,
+                    max_batches=2,
+                )
+                maintenance_seconds = time.perf_counter() - maintenance_started
+                connect_calls = 0
+                started = time.perf_counter()
+                with patch.object(store, "_connect", counting_connect):
+                    after = store.list_scope_history(
+                        "archive-core",
+                        "enc-a",
+                        slots=list(range(slot_count)),
+                        event_limit=0,
+                        metric_limits={"temperature_c": 4},
+                        since="2022-01-01T00:00:00+00:00",
+                    )
+                post_query_seconds = time.perf_counter() - started
+
+                self.assertEqual(summary["metric_samples_removed"], slot_count)
+                self.assertEqual(connect_calls, 1)
+                self.assertLess(pre_query_seconds, 5.0)
+                self.assertLess(maintenance_seconds, 5.0)
+                self.assertLess(post_query_seconds, 5.0)
+                for slot in range(slot_count):
+                    self.assertEqual(before[slot]["latest_values"]["temperature_c"], slot + 1000)
+                    self.assertEqual(after[slot]["latest_values"]["temperature_c"], slot + 1000)
+                    self.assertEqual(len(after[slot]["metrics"]["temperature_c"]), 2)
+
+    def test_rollups_participate_in_counts_cleanup_and_adoption(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [self._metric_sample("2026-01-01T10:05:00+00:00", 30)]
+        )
+        store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=100,
+            max_batches=2,
+        )
+
+        self.assertEqual(store.counts()["metric_rollup_count"], 2)
+        summaries = store.list_history_system_summaries()
+        self.assertEqual(summaries[0]["metric_rollup_count"], 2)
+
+        adopted = store.adopt_system_history(
+            "archive-core",
+            "archive-renamed",
+            target_system_label="Archive Renamed",
+        )
+
+        self.assertEqual(adopted["metric_rollup_count"], 2)
+        self.assertEqual(
+            [
+                item["value"]
+                for item in store.list_metric_samples(
+                    "archive-renamed",
+                    "enc-a",
+                    5,
+                    metric_name="temperature_c",
+                    since="2026-01-01T00:00:00+00:00",
+                )
+            ],
+            [30.0],
+        )
+        deleted = store.delete_system_history("archive-renamed")
+        self.assertEqual(deleted["metric_rollup_count"], 2)
+        self.assertEqual(store.counts()["metric_rollup_count"], 0)
+
+    def test_fast_counts_remain_truthful_after_retention_deletes_rows(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [
+                self._metric_sample("2020-01-01T00:00:00+00:00", 20),
+                self._metric_sample("2020-01-01T01:00:00+00:00", 21),
+                self._metric_sample("2026-06-30T00:00:00+00:00", 22),
+            ]
+        )
+
+        store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=100,
+            max_batches=2,
+        )
+
+        fast_counts = store.estimated_counts()
+        self.assertEqual(fast_counts["metric_sample_count"], 1)
+        self.assertEqual(fast_counts["metric_rollup_count"], 0)
+        self.assertFalse(fast_counts["estimated"])
+        self.assertEqual(fast_counts["count_mode"], "tracked")
+
+    def test_retention_rollups_remain_visible_in_batched_scope_and_disk_history(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [self._metric_sample("2026-01-01T10:05:00+00:00", 30)]
+        )
+        store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=100,
+            max_batches=2,
+        )
+
+        scope = store.list_scope_history(
+            "archive-core",
+            "enc-a",
+            slots=[5],
+            event_limit=0,
+            metric_limits={"temperature_c": 10},
+            since="2026-01-01T00:00:00+00:00",
+        )
+        homes = store.list_disk_metric_homes(
+            "serial:SERIAL-5",
+            since="2026-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(scope[5]["metrics"]["temperature_c"][0]["value"], 30.0)
+        self.assertEqual(scope[5]["metrics"]["temperature_c"][0]["rollup_seconds"], 3600)
+        self.assertEqual(homes[0]["sample_count"], 1)
+        self.assertEqual(homes[0]["slot"], 5)
     def test_store_configures_wal_once_per_database_identity(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         executed_statements: list[str] = []
@@ -878,7 +1515,7 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(payload[5]["events"], [])
         self.assertEqual(payload[5]["latest_values"]["bytes_written"], 100)
 
-    def test_store_fast_overview_uses_estimated_activity_counts(self) -> None:
+    def test_store_fast_overview_uses_tracked_activity_counts(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
         record = SlotStateRecord(
@@ -952,9 +1589,9 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(exact_counts["tracked_slots"], 1)
         self.assertEqual(exact_counts["metric_sample_count"], 1)
         self.assertEqual(estimated_counts["tracked_slots"], 1)
-        self.assertEqual(estimated_counts["metric_sample_count"], 2)
-        self.assertTrue(estimated_counts["estimated"])
-        self.assertEqual(estimated_counts["count_mode"], "id_upper_bound")
+        self.assertEqual(estimated_counts["metric_sample_count"], 1)
+        self.assertFalse(estimated_counts["estimated"])
+        self.assertEqual(estimated_counts["count_mode"], "tracked")
         self.assertEqual(len(fast_scopes), 1)
         self.assertEqual(fast_scopes[0]["tracked_slots"], 1)
         self.assertIsNone(fast_scopes[0]["event_count"])
@@ -2525,8 +3162,174 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(journal_mode, "wal")
         self.assertNotEqual(store._journal_mode_identity, original_journal_identity)
 
+    def test_restore_backup_adopts_pre_rollup_schema(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        store = HistoryStore(str(db_path))
+        legacy_path = temp_dir / "legacy.sqlite3"
+        backup_path = store.create_backup(temp_dir / "backups", retention_count=1)
+        self.assertIsNotNone(backup_path)
+        assert backup_path is not None
+        legacy_path.write_bytes(backup_path.read_bytes())
+        with sqlite3.connect(legacy_path) as connection:
+            connection.execute("DROP TABLE metric_rollups")
+            connection.execute("DROP TABLE history_table_counts")
+            connection.commit()
+
+        store.restore_backup(legacy_path)
+
+        self.assertEqual(store.estimated_counts()["metric_rollup_count"], 0)
+        with store._connect() as connection:
+            table_names = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+        self.assertIn("metric_rollups", table_names)
+        self.assertIn("history_table_counts", table_names)
+
 
 class HistoryCollectorTests(unittest.TestCase):
+    def test_retention_runs_when_due_and_reports_status(self) -> None:
+        store = MagicMock()
+        store.maintain_retention.return_value = {
+            "metric_samples_removed": 12,
+            "events_removed": 3,
+            "hourly_rollups_removed": 2,
+            "daily_rollups_removed": 1,
+            "total_rows_removed": 18,
+            "batches_completed": 2,
+            "has_more": False,
+            "interrupted": False,
+        }
+        settings = HistorySettings(
+            raw_metric_retention_days=30,
+            event_retention_days=365,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            retention_interval_seconds=3600,
+            retention_batch_size=60,
+            retention_max_batches_per_run=4,
+        )
+        collector = HistoryCollector(settings, store)
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+        collector._run_retention_if_due(now, backup_succeeded=True)
+
+        store.maintain_retention.assert_called_once()
+        call = store.maintain_retention.call_args.kwargs
+        self.assertEqual(call["now"], now)
+        self.assertEqual(call["batch_size"], 60)
+        self.assertEqual(call["max_batches"], 4)
+        self.assertTrue(call["should_continue"]())
+        status = collector.status()
+        self.assertEqual(status["last_retention_at"], "2026-07-01T00:00:00+00:00")
+        self.assertEqual(status["last_retention_rows_removed"], 18)
+        self.assertEqual(status["last_retention_metric_samples_removed"], 12)
+        self.assertEqual(status["last_retention_events_removed"], 3)
+        self.assertIsNone(status["last_retention_error"])
+
+    def test_retention_catchup_runs_again_before_interval_when_more_rows_remain(self) -> None:
+        store = MagicMock()
+        store.maintain_retention.side_effect = [
+            {
+                "metric_samples_removed": 10,
+                "events_removed": 0,
+                "hourly_rollups_removed": 0,
+                "daily_rollups_removed": 0,
+                "total_rows_removed": 10,
+                "batches_completed": 1,
+                "has_more": True,
+                "interrupted": False,
+            },
+            {
+                "metric_samples_removed": 2,
+                "events_removed": 0,
+                "hourly_rollups_removed": 0,
+                "daily_rollups_removed": 0,
+                "total_rows_removed": 2,
+                "batches_completed": 1,
+                "has_more": False,
+                "interrupted": False,
+            },
+        ]
+        collector = HistoryCollector(HistorySettings(retention_interval_seconds=3600), store)
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+        collector._run_retention_if_due(now, backup_succeeded=True)
+        collector._run_retention_if_due(
+            now + timedelta(minutes=5),
+            backup_succeeded=True,
+        )
+
+        self.assertEqual(store.maintain_retention.call_count, 2)
+        self.assertFalse(collector.status()["last_retention_has_more"])
+
+    def test_retention_failure_reports_only_exception_class_and_does_not_raise(self) -> None:
+        store = MagicMock()
+        store.maintain_retention.side_effect = RuntimeError("private database path")
+        collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(
+            datetime(2026, 7, 1, tzinfo=timezone.utc),
+            backup_succeeded=True,
+        )
+
+        status = collector.status()
+        self.assertEqual(status["last_retention_error"], "RuntimeError")
+        self.assertNotIn("private database path", str(status))
+
+    def test_retention_failure_reports_prior_commits_and_keeps_catchup_pending(self) -> None:
+        store = MagicMock()
+        failure = RuntimeError("private database path")
+        setattr(failure, "retention_summary", {
+            "metric_samples_removed": 1,
+            "events_removed": 2,
+            "hourly_rollups_removed": 0,
+            "daily_rollups_removed": 0,
+            "total_rows_removed": 3,
+            "batches_completed": 1,
+            "has_more": True,
+            "interrupted": False,
+        })
+        store.maintain_retention.side_effect = failure
+        collector = HistoryCollector(HistorySettings(), store)
+
+        with patch("history_service.collector.observe_history_retention_run") as observe:
+            collector._run_retention_if_due(
+                datetime(2026, 7, 1, tzinfo=timezone.utc),
+                backup_succeeded=True,
+            )
+
+        status = collector.status()
+        self.assertEqual(status["last_retention_rows_removed"], 3)
+        self.assertEqual(status["last_retention_metric_samples_removed"], 1)
+        self.assertEqual(status["last_retention_events_removed"], 2)
+        self.assertTrue(status["last_retention_has_more"])
+        observe.assert_called_once()
+        self.assertEqual(
+            observe.call_args.kwargs["removed_rows"],
+            {
+                "metric_samples": 1,
+                "events": 2,
+                "hourly_rollups": 0,
+                "daily_rollups": 0,
+            },
+        )
+
+    def test_retention_requires_a_successful_same_pass_backup(self) -> None:
+        store = MagicMock()
+        collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(
+            datetime(2026, 7, 1, tzinfo=timezone.utc),
+            backup_succeeded=False,
+        )
+
+        store.maintain_retention.assert_not_called()
+        self.assertIsNone(collector.status()["last_retention_attempt_at"])
+
     def test_stop_waits_for_inflight_worker_before_returning(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         collector = HistoryCollector(

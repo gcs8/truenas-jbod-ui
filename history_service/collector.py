@@ -15,6 +15,7 @@ from typing import Any
 from history_service.config import HistorySettings
 from app.metrics import (
     observe_history_collection_run,
+    observe_history_retention_run,
     set_history_collection_schedule_overrun,
     set_history_collector_running,
 )
@@ -95,6 +96,16 @@ class HistoryCollector:
         self.last_slow_metrics_at: str | None = None
         self.last_success_at: str | None = None
         self.last_backup_at: str | None = None
+        self.last_retention_at: str | None = None
+        self.last_retention_attempt_at: str | None = None
+        self.last_retention_duration_seconds: float | None = None
+        self.last_retention_rows_removed: int = 0
+        self.last_retention_metric_samples_removed: int = 0
+        self.last_retention_events_removed: int = 0
+        self.last_retention_hourly_rollups_removed: int = 0
+        self.last_retention_daily_rollups_removed: int = 0
+        self.last_retention_has_more: bool = False
+        self.last_retention_error: str | None = None
         self.last_error: str | None = None
         self.last_scope_count: int = 0
         self.current_collection_started_at: str | None = None
@@ -348,6 +359,7 @@ class HistoryCollector:
                     sample_count=len(metric_samples),
                 )
 
+        backup_succeeded = False
         if collect_fast:
             self.last_fast_metrics_at = observed_at
         if collect_slow:
@@ -384,8 +396,14 @@ class HistoryCollector:
                     )
                     if backup_path:
                         self.last_backup_at = observed_at
+                        backup_succeeded = True
             except Exception as exc:  # noqa: BLE001 - keep collection alive even if backup snapshotting fails.
                 logger.warning("History backup snapshot failed: %s", exc)
+        self._raise_if_stopping()
+        self._run_retention_if_due(
+            run_started,
+            backup_succeeded=backup_succeeded,
+        )
         self.last_success_at = observed_at
         self.last_error = None
         self._set_collection_activity("collection completed")
@@ -419,6 +437,16 @@ class HistoryCollector:
             "last_slow_metrics_at": self.last_slow_metrics_at,
             "last_success_at": self.last_success_at,
             "last_backup_at": self.last_backup_at,
+            "last_retention_at": self.last_retention_at,
+            "last_retention_attempt_at": self.last_retention_attempt_at,
+            "last_retention_duration_seconds": self.last_retention_duration_seconds,
+            "last_retention_rows_removed": self.last_retention_rows_removed,
+            "last_retention_metric_samples_removed": self.last_retention_metric_samples_removed,
+            "last_retention_events_removed": self.last_retention_events_removed,
+            "last_retention_hourly_rollups_removed": self.last_retention_hourly_rollups_removed,
+            "last_retention_daily_rollups_removed": self.last_retention_daily_rollups_removed,
+            "last_retention_has_more": self.last_retention_has_more,
+            "last_retention_error": self.last_retention_error,
             "last_error": self.last_error,
             "last_scope_count": self.last_scope_count,
             "source_base_url": self.settings.source_base_url,
@@ -625,6 +653,115 @@ class HistoryCollector:
         if collect_fast and self.settings.force_inventory_on_fast_collection:
             return True
         return False
+
+    def _run_retention_if_due(
+        self,
+        now: datetime,
+        *,
+        backup_succeeded: bool,
+    ) -> None:
+        if not backup_succeeded or not self._retention_due(now):
+            return
+        started = time.perf_counter()
+        attempted_at = isoformat_utc(now)
+        self.last_retention_attempt_at = attempted_at
+        self._set_collection_activity("pruning and rolling up history")
+        try:
+            result = self.store.maintain_retention(
+                now=now,
+                raw_metric_retention_days=self.settings.raw_metric_retention_days,
+                event_retention_days=self.settings.event_retention_days,
+                hourly_rollup_retention_days=self.settings.hourly_rollup_retention_days,
+                daily_rollup_retention_days=self.settings.daily_rollup_retention_days,
+                batch_size=self.settings.retention_batch_size,
+                max_batches=self.settings.retention_max_batches_per_run,
+                should_continue=lambda: not self._stopping.is_set(),
+            )
+        except Exception as exc:  # noqa: BLE001 - retention failure must not stop collection.
+            duration = time.perf_counter() - started
+            self.last_retention_duration_seconds = round(duration, 3)
+            self.last_retention_error = type(exc).__name__
+            partial_result = getattr(exc, "retention_summary", None)
+            if not isinstance(partial_result, dict):
+                partial_result = {}
+            removed_rows = self._apply_retention_result(
+                {**partial_result, "has_more": True}
+            )
+            logger.warning(
+                "History retention pass failed with %s; collection will continue.",
+                type(exc).__name__,
+            )
+            observe_history_retention_run(
+                service_name=HISTORY_METRICS_SERVICE_NAME,
+                result="error",
+                duration_seconds=duration,
+                removed_rows=removed_rows,
+                completed_at=attempted_at,
+            )
+            self._record_collection_stage(
+                "db.retention.failed",
+                duration,
+                error_type=type(exc).__name__,
+            )
+            return
+
+        duration = time.perf_counter() - started
+        self.last_retention_at = attempted_at
+        self.last_retention_duration_seconds = round(duration, 3)
+        self.last_retention_error = None
+        removed_rows = self._apply_retention_result(result)
+        observe_history_retention_run(
+            service_name=HISTORY_METRICS_SERVICE_NAME,
+            result="success",
+            duration_seconds=duration,
+            removed_rows=removed_rows,
+            completed_at=attempted_at,
+        )
+        self._record_collection_stage(
+            "db.retention",
+            duration,
+            rows_removed=self.last_retention_rows_removed,
+            batches_completed=int(result.get("batches_completed") or 0),
+            has_more=self.last_retention_has_more,
+            interrupted=bool(result.get("interrupted")),
+        )
+        if self.last_retention_rows_removed:
+            logger.info(
+                "History retention removed %s rows in %.3f seconds; has_more=%s.",
+                self.last_retention_rows_removed,
+                duration,
+                self.last_retention_has_more,
+            )
+
+    def _apply_retention_result(self, result: dict[str, Any]) -> dict[str, int]:
+        self.last_retention_rows_removed = int(result.get("total_rows_removed") or 0)
+        self.last_retention_metric_samples_removed = int(result.get("metric_samples_removed") or 0)
+        self.last_retention_events_removed = int(result.get("events_removed") or 0)
+        self.last_retention_hourly_rollups_removed = int(result.get("hourly_rollups_removed") or 0)
+        self.last_retention_daily_rollups_removed = int(result.get("daily_rollups_removed") or 0)
+        self.last_retention_has_more = bool(result.get("has_more"))
+        return {
+            "metric_samples": self.last_retention_metric_samples_removed,
+            "events": self.last_retention_events_removed,
+            "hourly_rollups": self.last_retention_hourly_rollups_removed,
+            "daily_rollups": self.last_retention_daily_rollups_removed,
+        }
+
+    def _retention_due(self, now: datetime) -> bool:
+        if self.last_retention_has_more:
+            return True
+        if not self.last_retention_attempt_at:
+            return True
+        try:
+            attempted_at = datetime.fromisoformat(self.last_retention_attempt_at)
+        except ValueError:
+            return True
+        if attempted_at.tzinfo is None:
+            attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+        interval = max(1, int(self.settings.retention_interval_seconds))
+        return now.astimezone(timezone.utc) - attempted_at.astimezone(timezone.utc) >= timedelta(
+            seconds=interval
+        )
 
     def _latest_backup_at(self) -> datetime | None:
         if self.last_backup_at:

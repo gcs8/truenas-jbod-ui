@@ -2441,6 +2441,72 @@ class SystemBackupServiceTests(unittest.TestCase):
             self.assertIn("redacted-host-01.invalid", scrubbed_config)
             self.assertIn("selected_groups", debug_state)
 
+    def test_debug_history_scrubbing_includes_metric_rollups(self) -> None:
+        connection = sqlite3.connect(self.history_db_path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO metric_rollups (
+                    bucket_start, bucket_seconds, system_id, system_label,
+                    enclosure_key, enclosure_id, enclosure_label, slot, slot_label,
+                    metric_name, sample_count, value_sum, value_min, value_max,
+                    last_value, last_observed_at,
+                    device_name, serial, model, state, gptid,
+                    persistent_id_label, disk_identity_key
+                ) VALUES (
+                    '2026-01-01T10:00:00+00:00', 3600,
+                    'archive-core', 'Archive CORE', 'enc-a', 'enc-a',
+                    'Front Shelf', 5, '05', 'temperature_c', 2, 60, 29, 31,
+                    31, '2026-01-01T10:55:00+00:00',
+                    'da5', 'ROLLUP-SERIAL-5', 'Drive', 'healthy', 'gptid/rollup-5',
+                    'GPTID', 'serial:ROLLUP-SERIAL-5'
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        snapshot_path = self.store.create_backup(self.temp_dir / "scrub-source", retention_count=1)
+        self.assertIsNotNone(snapshot_path)
+        assert snapshot_path is not None
+        target_path = self.temp_dir / "scrubbed-history.sqlite3"
+
+        self.backup_service._build_scrubbed_history_snapshot_file(
+            snapshot_path,
+            system_backup_module.DebugScrubber(scrub_secrets=False, scrub_disk_identifiers=True),
+            target_path,
+        )
+
+        scrubbed = sqlite3.connect(target_path)
+        try:
+            row = scrubbed.execute(
+                "SELECT device_name, serial, gptid, disk_identity_key FROM metric_rollups"
+            ).fetchone()
+        finally:
+            scrubbed.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertNotIn("ROLLUP-SERIAL-5", row)
+        self.assertNotEqual(row[0], "da5")
+
+        scrubbed_bytes = self.backup_service._build_scrubbed_history_snapshot(
+            snapshot_path.read_bytes(),
+            system_backup_module.DebugScrubber(scrub_secrets=False, scrub_disk_identifiers=True),
+        )
+        bytes_path = self.temp_dir / "scrubbed-history-bytes.sqlite3"
+        bytes_path.write_bytes(scrubbed_bytes)
+        scrubbed = sqlite3.connect(bytes_path)
+        try:
+            bytes_row = scrubbed.execute(
+                "SELECT device_name, serial, gptid, disk_identity_key FROM metric_rollups"
+            ).fetchone()
+        finally:
+            scrubbed.close()
+        self.assertIsNotNone(bytes_row)
+        assert bytes_row is not None
+        self.assertNotIn("ROLLUP-SERIAL-5", bytes_row)
+        self.assertNotEqual(bytes_row[0], "da5")
+
     def test_debug_bundle_can_scrub_only_secrets(self) -> None:
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
             get_settings.cache_clear()
