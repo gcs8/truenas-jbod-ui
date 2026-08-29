@@ -179,6 +179,40 @@ errors: No known data errors
         self.assertIsNone(parsed[1].block_device)
         self.assertEqual(parsed[1].sg_device, "/dev/sg26")
 
+    def test_parse_lsscsi_g_preserves_colon_bearing_vendor(self) -> None:
+        parsed = parse_lsscsi_devices(
+            "[0:0:0:0] disk ACME:Storage Array Model R1 /dev/sda /dev/sg0"
+        )
+
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].vendor, "ACME:Storage")
+        self.assertEqual(parsed[0].model, "Array Model")
+        self.assertEqual(parsed[0].revision, "R1")
+        self.assertIsNone(parsed[0].transport)
+        self.assertIsNone(parsed[0].transport_address)
+        self.assertEqual(parsed[0].block_device, "/dev/sda")
+        self.assertEqual(parsed[0].sg_device, "/dev/sg0")
+
+    def test_parse_ssh_outputs_merges_colon_vendor_with_transport_evidence(self) -> None:
+        parsed = parse_ssh_outputs(
+            {
+                "lsscsi -g": "[0:0:0:0] disk ACME:Storage Array Model R1 /dev/sda /dev/sg0",
+                "lsscsi -g -t": "[0:0:0:0] disk sas:0x5000c50012345678 /dev/sda /dev/sg0",
+            },
+            slot_count=1,
+            enclosure_filter=None,
+        )
+
+        self.assertEqual(len(parsed.linux_scsi_devices), 1)
+        device = parsed.linux_scsi_devices[0]
+        self.assertEqual(device.vendor, "ACME:Storage")
+        self.assertEqual(device.model, "Array Model")
+        self.assertEqual(device.revision, "R1")
+        self.assertEqual(device.transport, "sas")
+        self.assertEqual(device.transport_address, "0x5000c50012345678")
+        self.assertEqual(device.block_device, "/dev/sda")
+        self.assertEqual(device.sg_device, "/dev/sg0")
+
     def test_parse_sg_ses_join_filter_extracts_joined_slot_detail(self) -> None:
         output = """
 LSI       SAS3x40           0601

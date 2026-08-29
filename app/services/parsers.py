@@ -2963,8 +2963,8 @@ def parse_lsscsi_devices(output: str, *, transport: bool = False) -> list[LinuxS
             sg_device=normalize_text(sg_device),
         )
 
-        transport_match = re.search(r"\b(?P<transport>[A-Za-z0-9_+-]+):(?P<address>\S+)", detail)
-        if transport or transport_match:
+        if transport:
+            transport_match = re.search(r"\b(?P<transport>[A-Za-z0-9_+-]+):(?P<address>\S+)", detail)
             if transport_match:
                 parsed.transport = normalize_text(transport_match.group("transport").lower())
                 parsed.transport_address = normalize_text(transport_match.group("address").rstrip(",;"))
