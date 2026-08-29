@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import json
 import os
 import platform
+import stat
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, Request
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, Info, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, Counter, Gauge, Histogram, Info, generate_latest
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from starlette.responses import Response
+
+from history_service.scheduled_backup import validate_scheduled_backup_status
 
 METRICS_NAMESPACE = "truenas_jbod_ui"
 DEFAULT_METRICS_PATH = "/metrics"
@@ -175,6 +181,7 @@ HISTORY_RETENTION_LAST_ERROR = Gauge(
     labelnames=("service",),
     namespace=METRICS_NAMESPACE,
 )
+
 INVENTORY_SNAPSHOT_REQUESTS_TOTAL = Counter(
     "inventory_snapshot_requests_total",
     "Inventory snapshot requests by cache outcome.",
@@ -376,6 +383,107 @@ def observe_history_retention_run(
             service=service_name,
             table=table_name,
         ).inc(max(0, int(count)))
+
+
+class ScheduledBackupStatusCollector:
+    _MAX_STATUS_BYTES = 64 * 1024
+
+    @classmethod
+    def _read_status(cls) -> dict[str, object] | None:
+        raw_path = str(os.getenv("SCHEDULED_BACKUP_STATUS_FILE", "")).strip()
+        if not raw_path:
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(Path(raw_path), flags)
+        except OSError:
+            return None
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > cls._MAX_STATUS_BYTES:
+                return None
+            content = os.read(descriptor, cls._MAX_STATUS_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        try:
+            payload = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            validate_scheduled_backup_status(payload)
+        except ValueError:
+            return None
+        return payload
+
+    def collect(self):
+        status = self._read_status()
+        if status is None:
+            return
+        service_name = "enclosure-backup"
+        success_count = status["success_count"]
+        failure_count = status["failure_count"]
+        runs = CounterMetricFamily(
+            f"{METRICS_NAMESPACE}_scheduled_backup_runs",
+            "Scheduled state backup attempts from durable status.",
+            labels=["service", "result"],
+        )
+        runs.add_metric(
+            [service_name, "success"],
+            success_count,
+        )
+        runs.add_metric(
+            [service_name, "error"],
+            failure_count,
+        )
+        yield runs
+
+        last_success = _parse_timestamp(status.get("last_success_at"))
+        last_failure = _parse_timestamp(status.get("last_failure_at"))
+        if last_success is not None:
+            metric = GaugeMetricFamily(
+                f"{METRICS_NAMESPACE}_scheduled_backup_last_success_timestamp_seconds",
+                "Unix timestamp of the last successful scheduled state backup.",
+                labels=["service"],
+            )
+            metric.add_metric([service_name], last_success)
+            yield metric
+            age = GaugeMetricFamily(
+                f"{METRICS_NAMESPACE}_scheduled_backup_last_success_age_seconds",
+                "Age in seconds of the last successful scheduled state backup.",
+                labels=["service"],
+            )
+            age.add_metric([service_name], max(0.0, datetime.now(timezone.utc).timestamp() - last_success))
+            yield age
+        if last_failure is not None:
+            metric = GaugeMetricFamily(
+                f"{METRICS_NAMESPACE}_scheduled_backup_last_failure_timestamp_seconds",
+                "Unix timestamp of the last failed scheduled state backup.",
+                labels=["service"],
+            )
+            metric.add_metric([service_name], last_failure)
+            yield metric
+        size_bytes = status.get("last_size_bytes")
+        if isinstance(size_bytes, int):
+            metric = GaugeMetricFamily(
+                f"{METRICS_NAMESPACE}_scheduled_backup_last_size_bytes",
+                "Size in bytes of the last successful scheduled state backup.",
+                labels=["service"],
+            )
+            metric.add_metric([service_name], max(0, size_bytes))
+            yield metric
+        last_error = GaugeMetricFamily(
+            f"{METRICS_NAMESPACE}_scheduled_backup_last_error",
+            "Whether the latest scheduled state backup attempt failed.",
+            labels=["service"],
+        )
+        last_error.add_metric([service_name], 1 if status.get("last_error_code") else 0)
+        yield last_error
+
+
+SCHEDULED_BACKUP_STATUS_COLLECTOR = ScheduledBackupStatusCollector()
+REGISTRY.register(SCHEDULED_BACKUP_STATUS_COLLECTOR)
 
 
 def observe_inventory_snapshot_request(

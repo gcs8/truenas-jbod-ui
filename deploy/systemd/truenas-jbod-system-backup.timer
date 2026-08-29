@@ -1,0 +1,11 @@
+[Unit]
+Description=Run TrueNAS JBOD encrypted state backup daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+Unit=truenas-jbod-system-backup.service
+
+[Install]
+WantedBy=timers.target

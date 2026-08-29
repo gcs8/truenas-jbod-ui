@@ -33,6 +33,7 @@ from app.models.domain import (
 from app.services.demo_system_factory import DemoSystemFactory
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.system_setup import PRESERVE_SECRET_SENTINEL, SystemSetupService
+from history_service.scheduled_backup import ScheduledBackupRunner
 from history_service.config import HistorySettings
 from history_service import system_backup as system_backup_module
 from history_service.domain import MetricSample, SlotStateRecord
@@ -44,6 +45,9 @@ from history_service.system_backup import (
     BundleMember,
     CONFIG_FILE_KEY,
     DEBUG_BUNDLE_FORMAT,
+    ENCRYPTED_BACKUP_MAGIC,
+    ENCRYPTED_BACKUP_NONCE_BYTES,
+    ENCRYPTED_BACKUP_SALT_BYTES,
     HISTORY_DB_KEY,
     MAPPING_FILE_KEY,
     PROFILE_FILE_KEY,
@@ -308,6 +312,240 @@ class SystemBackupServiceTests(unittest.TestCase):
             payload["passphrase_kdf"],
             self._fake_7z_passphrase_token("topsecret"),
         )
+
+    def test_native_encrypted_scheduled_backup_restores_selected_state_without_7z_arguments(
+        self,
+    ) -> None:
+        original_mapping = self.mapping_path.read_bytes()
+        original_profile = self.profile_path.read_bytes()
+        original_slot_detail = self.slot_detail_path.read_bytes()
+        passphrase = "scheduled backup test passphrase"
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=AssertionError("scheduled encryption must not invoke 7z"),
+            ),
+        ):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_scheduled_bundle_to_file(
+                passphrase=passphrase,
+                included_paths=[MAPPING_FILE_KEY, PROFILE_FILE_KEY, SLOT_DETAIL_FILE_KEY],
+            )
+            try:
+                encrypted = artifact.path.read_bytes()
+                self.assertTrue(encrypted.startswith(ENCRYPTED_BACKUP_MAGIC))
+                self.assertNotIn(passphrase.encode("utf-8"), encrypted)
+
+                self.mapping_path.write_text('{"version": 1, "slot_mappings": {}}', encoding="utf-8")
+                write_yaml(self.profile_path, {"profiles": []})
+                self.slot_detail_path.write_text(
+                    '{"version": 1, "slot_details": {}}',
+                    encoding="utf-8",
+                )
+
+                result = self.backup_service.import_bundle(encrypted, passphrase=passphrase)
+            finally:
+                artifact.cleanup()
+
+        self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+        self.assertEqual(self.profile_path.read_bytes(), original_profile)
+        self.assertEqual(self.slot_detail_path.read_bytes(), original_slot_detail)
+        self.assertEqual(
+            set(result["included_groups"]),
+            {MAPPING_FILE_KEY, PROFILE_FILE_KEY, SLOT_DETAIL_FILE_KEY},
+        )
+
+    def test_native_encrypted_scheduled_backup_rejects_wrong_passphrase_before_activation(
+        self,
+    ) -> None:
+        original_mapping = self.mapping_path.read_bytes()
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_scheduled_bundle_to_file(
+                passphrase="correct passphrase",
+                included_paths=[MAPPING_FILE_KEY],
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "could not be decrypted"):
+                    self.backup_service.import_bundle(
+                        artifact.path.read_bytes(),
+                        passphrase="wrong passphrase",
+                    )
+            finally:
+                artifact.cleanup()
+
+        self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+
+    def test_native_scheduled_encryption_randomizes_and_authenticates_the_envelope(self) -> None:
+        passphrase = "scheduled envelope authentication passphrase"
+        selected_groups = [MAPPING_FILE_KEY]
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            first = self.backup_service.export_scheduled_bundle_to_file(
+                passphrase=passphrase,
+                included_paths=selected_groups,
+            )
+            second = self.backup_service.export_scheduled_bundle_to_file(
+                passphrase=passphrase,
+                included_paths=selected_groups,
+            )
+            try:
+                first_bytes = first.path.read_bytes()
+                second_bytes = second.path.read_bytes()
+                random_start = len(ENCRYPTED_BACKUP_MAGIC)
+                random_end = random_start + ENCRYPTED_BACKUP_SALT_BYTES + ENCRYPTED_BACKUP_NONCE_BYTES
+                self.assertNotEqual(first_bytes, second_bytes)
+                self.assertNotEqual(first_bytes[random_start:random_end], second_bytes[random_start:random_end])
+
+                for index in (0, len(first_bytes) - 1):
+                    tampered = bytearray(first_bytes)
+                    tampered[index] ^= 1
+                    tampered_path = self.temp_dir / f"tampered-scheduled-{index}.enc"
+                    tampered_path.write_bytes(tampered)
+                    with self.assertRaises(ValueError):
+                        self.backup_service.preflight_scheduled_bundle_file(
+                            tampered_path,
+                            passphrase=passphrase,
+                            expected_groups=selected_groups,
+                        )
+            finally:
+                first.cleanup()
+                second.cleanup()
+
+    def test_native_encrypted_schedule_can_include_locked_secret_groups_without_7z(
+        self,
+    ) -> None:
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=AssertionError("scheduled encryption must not invoke 7z"),
+            ),
+        ):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_scheduled_bundle_to_file(
+                passphrase="scheduled secret group passphrase",
+                included_paths=[SSH_KEYS_KEY, TLS_TRUST_KEY, KNOWN_HOSTS_KEY],
+            )
+            try:
+                group_entries = {
+                    entry["key"]: entry for entry in artifact.manifest.get("groups", [])
+                }
+                self.assertTrue(group_entries[SSH_KEYS_KEY]["selected"])
+                self.assertTrue(group_entries[TLS_TRUST_KEY]["selected"])
+                self.assertTrue(group_entries[KNOWN_HOSTS_KEY]["selected"])
+            finally:
+                artifact.cleanup()
+
+    def test_public_file_export_has_no_plaintext_outer_envelope_bypass(self) -> None:
+        artifact = None
+        try:
+            with self.assertRaises(TypeError):
+                artifact = self.backup_service.export_bundle_to_file(
+                    encrypt=False,
+                    packaging="tar.zst",
+                    included_paths=[SSH_KEYS_KEY],
+                    _encrypted_outer_envelope=True,
+                )
+        finally:
+            if artifact is not None:
+                artifact.cleanup()
+
+    def test_scheduled_backup_public_preflight_validates_copy_and_exact_group_contract(
+        self,
+    ) -> None:
+        passphrase = "scheduled public preflight passphrase"
+        selected_groups = [MAPPING_FILE_KEY, PROFILE_FILE_KEY]
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_scheduled_bundle_to_file(
+                passphrase=passphrase,
+                included_paths=selected_groups,
+            )
+            copied = self.temp_dir / "copied-scheduled-backup.tar.zst.enc"
+            copied.write_bytes(artifact.path.read_bytes())
+            try:
+                result = self.backup_service.preflight_scheduled_bundle_file(
+                    copied,
+                    passphrase=passphrase,
+                    expected_groups=selected_groups,
+                )
+                self.assertEqual(set(result["selected_groups"]), set(selected_groups))
+                self.assertEqual(result["absent_groups"], [])
+
+                with self.assertRaisesRegex(ValueError, "do not match"):
+                    self.backup_service.preflight_scheduled_bundle_file(
+                        copied,
+                        passphrase=passphrase,
+                        expected_groups=[MAPPING_FILE_KEY],
+                    )
+
+                tampered = bytearray(copied.read_bytes())
+                tampered[len(tampered) // 2] ^= 1
+                copied.write_bytes(tampered)
+                with self.assertRaisesRegex(ValueError, "could not be decrypted"):
+                    self.backup_service.preflight_scheduled_bundle_file(
+                        copied,
+                        passphrase=passphrase,
+                        expected_groups=selected_groups,
+                    )
+            finally:
+                artifact.cleanup()
+
+    def test_one_shot_runner_publishes_restore_grade_mapping_profile_and_calibration_backup(
+        self,
+    ) -> None:
+        original_mapping = self.mapping_path.read_bytes()
+        original_profile = self.profile_path.read_bytes()
+        original_slot_detail = self.slot_detail_path.read_bytes()
+        destination = self.temp_dir / "scheduled-destination"
+        status_file = self.temp_dir / "scheduled-status" / "status.json"
+        passphrase_file = self.temp_dir / "scheduled-passphrase"
+        passphrase_file.write_text("end to end scheduled passphrase\n", encoding="utf-8")
+        passphrase_file.chmod(0o600)
+        selected_groups = [MAPPING_FILE_KEY, PROFILE_FILE_KEY, SLOT_DETAIL_FILE_KEY]
+        runner = ScheduledBackupRunner(
+            self.backup_service,
+            destination_dir=destination,
+            status_file=status_file,
+            passphrase_file=passphrase_file,
+            included_groups=selected_groups,
+            retention_count=3,
+        )
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=AssertionError("one-shot scheduled backup must not invoke 7z"),
+            ),
+        ):
+            get_settings.cache_clear()
+            status = runner.run_once()
+            archives = list(destination.glob("jbod-scheduled-backup-*.tar.zst.enc"))
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(status["success_count"], 1)
+            self.assertEqual(status["last_absent_groups"], [])
+
+            self.mapping_path.write_text('{"version": 1, "slot_mappings": {}}', encoding="utf-8")
+            write_yaml(self.profile_path, {"profiles": []})
+            self.slot_detail_path.write_text(
+                '{"version": 1, "slot_details": {}}',
+                encoding="utf-8",
+            )
+            self.backup_service.import_bundle(
+                archives[0].read_bytes(),
+                passphrase="end to end scheduled passphrase",
+            )
+
+        self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+        self.assertEqual(self.profile_path.read_bytes(), original_profile)
+        self.assertEqual(self.slot_detail_path.read_bytes(), original_slot_detail)
 
     @staticmethod
     def _build_zip_bundle(manifest: dict[str, object], files: dict[str, bytes] | None = None) -> bytes:

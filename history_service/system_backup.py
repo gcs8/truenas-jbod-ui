@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import struct
 import subprocess
 import tarfile
@@ -24,6 +25,9 @@ from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import yaml
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 try:
     import zstandard as zstd
@@ -197,6 +201,13 @@ ARCHIVE_MEDIA_TYPES: dict[ArchivePackaging, str] = {
     "7z": "application/x-7z-compressed",
 }
 SEVEN_ZIP_SIGNATURE = b"\x37\x7a\xbc\xaf\x27\x1c"
+ENCRYPTED_BACKUP_MAGIC = b"TJBENC01"
+ENCRYPTED_BACKUP_SALT_BYTES = 16
+ENCRYPTED_BACKUP_NONCE_BYTES = 12
+ENCRYPTED_BACKUP_TAG_BYTES = 16
+ENCRYPTED_BACKUP_SCRYPT_N = 2**15
+ENCRYPTED_BACKUP_SCRYPT_R = 8
+ENCRYPTED_BACKUP_SCRYPT_P = 1
 SEVEN_ZIP_TIMEOUT_SECONDS = 120
 SEVEN_ZIP_BINARY = "7z"
 MAX_BACKUP_ARCHIVE_BYTES = 256 * 1024 * 1024
@@ -963,6 +974,13 @@ class SystemBackupService:
         self.history_settings = history_settings
         self.store = store
 
+    def validate_scheduled_backup_scope(self, included_paths: list[str]) -> None:
+        selected_groups = self._resolve_selected_groups(
+            included_paths,
+            bundle_type="backup",
+        )
+        self._validate_encrypted_scope(selected_groups, encrypt=True)
+
     def export_bundle(
         self,
         *,
@@ -995,10 +1013,30 @@ class SystemBackupService:
         packaging: ArchivePackaging = "tar.zst",
         included_paths: list[str] | None = None,
     ) -> FileBackupArtifact:
+        return self._export_bundle_to_file(
+            encrypt=encrypt,
+            passphrase=passphrase,
+            packaging=packaging,
+            included_paths=included_paths,
+            encrypted_outer_envelope=False,
+        )
+
+    def _export_bundle_to_file(
+        self,
+        *,
+        encrypt: bool = False,
+        passphrase: str | None = None,
+        packaging: ArchivePackaging = "tar.zst",
+        included_paths: list[str] | None = None,
+        encrypted_outer_envelope: bool,
+    ) -> FileBackupArtifact:
         app_settings = self._load_app_settings()
         exported_at = datetime.now(timezone.utc)
         selected_groups = self._resolve_selected_groups(included_paths, bundle_type="backup")
-        self._validate_encrypted_scope(selected_groups, encrypt=encrypt)
+        self._validate_encrypted_scope(
+            selected_groups,
+            encrypt=encrypt or encrypted_outer_envelope,
+        )
         requested_packaging = self._normalize_packaging(packaging)
         if encrypt and not passphrase:
             raise ValueError("A passphrase is required when encryption is enabled.")
@@ -1049,6 +1087,161 @@ class SystemBackupService:
         except Exception:
             shutil.rmtree(workspace, ignore_errors=True)
             raise
+
+    def export_scheduled_bundle_to_file(
+        self,
+        *,
+        passphrase: str,
+        included_paths: list[str] | None = None,
+    ) -> FileBackupArtifact:
+        if not passphrase:
+            raise ValueError("A passphrase is required when encryption is enabled.")
+        artifact = self._export_bundle_to_file(
+            encrypt=False,
+            packaging="tar.zst",
+            included_paths=included_paths,
+            encrypted_outer_envelope=True,
+        )
+        encrypted_path = artifact.path.with_name(f"{artifact.path.name}.enc")
+        try:
+            self._encrypt_scheduled_archive(artifact.path, encrypted_path, passphrase)
+            verification = self.preflight_scheduled_bundle_file(
+                encrypted_path,
+                passphrase=passphrase,
+                expected_groups=list(included_paths or []),
+            )
+            artifact.path.unlink(missing_ok=True)
+            return FileBackupArtifact(
+                filename=f"{artifact.filename}.enc",
+                path=encrypted_path,
+                media_type="application/octet-stream",
+                manifest=verification["manifest"],
+                cleanup_root=artifact.cleanup_root,
+            )
+        except Exception:
+            artifact.cleanup()
+            raise
+
+    def preflight_scheduled_bundle_file(
+        self,
+        archive_path: str | Path,
+        *,
+        passphrase: str,
+        expected_groups: list[str],
+    ) -> dict[str, Any]:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(Path(archive_path), flags)
+        except OSError as exc:
+            raise ValueError("Scheduled backup archive could not be opened.") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_BACKUP_ARCHIVE_BYTES:
+                raise ValueError("Scheduled backup archive exceeds its size or type limits.")
+            chunks: list[bytes] = []
+            remaining = MAX_BACKUP_ARCHIVE_BYTES + 1
+            while remaining > 0:
+                chunk = os.read(descriptor, min(ARCHIVE_READ_CHUNK_BYTES, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            archive_bytes = b"".join(chunks)
+            if len(archive_bytes) > MAX_BACKUP_ARCHIVE_BYTES:
+                raise ValueError("Scheduled backup archive exceeds its size limit.")
+        finally:
+            os.close(descriptor)
+
+        manifest, extracted, _packaging, archive_meta = self._read_archive(
+            archive_bytes,
+            passphrase=passphrase,
+        )
+        if not archive_meta.get("encrypted"):
+            raise ValueError("Scheduled backup encryption could not be verified.")
+        group_entries = self._manifest_group_entries(manifest)
+        selected_groups = [
+            key
+            for key, entry in group_entries.items()
+            if self._manifest_group_selected(entry)
+        ]
+        if set(selected_groups) != set(expected_groups) or len(selected_groups) != len(expected_groups):
+            raise ValueError("Scheduled backup selected groups do not match its configuration.")
+        self._validate_manifest_member_metadata(manifest, extracted)
+        self._preflight_selected_group_members(manifest, group_entries, extracted)
+        self._preflight_import_members(manifest, group_entries, extracted)
+        absent_groups = [
+            key
+            for key in expected_groups
+            if not self._manifest_group_present(group_entries.get(key))
+        ]
+        return {
+            "manifest": manifest,
+            "selected_groups": selected_groups,
+            "absent_groups": absent_groups,
+        }
+
+    @staticmethod
+    def _scheduled_backup_key(passphrase: str, salt: bytes) -> bytes:
+        return Scrypt(
+            salt=salt,
+            length=32,
+            n=ENCRYPTED_BACKUP_SCRYPT_N,
+            r=ENCRYPTED_BACKUP_SCRYPT_R,
+            p=ENCRYPTED_BACKUP_SCRYPT_P,
+        ).derive(passphrase.encode("utf-8"))
+
+    @classmethod
+    def _encrypt_scheduled_archive(
+        cls,
+        source_path: Path,
+        output_path: Path,
+        passphrase: str,
+    ) -> None:
+        salt = os.urandom(ENCRYPTED_BACKUP_SALT_BYTES)
+        nonce = os.urandom(ENCRYPTED_BACKUP_NONCE_BYTES)
+        header = ENCRYPTED_BACKUP_MAGIC + salt + nonce
+        key = cls._scheduled_backup_key(passphrase, salt)
+        encryptor = Cipher(algorithms.AES(key), modes.GCM(nonce)).encryptor()
+        encryptor.authenticate_additional_data(header)
+        with source_path.open("rb") as source, output_path.open("wb") as output:
+            output.write(header)
+            while chunk := source.read(ARCHIVE_READ_CHUNK_BYTES):
+                output.write(encryptor.update(chunk))
+            output.write(encryptor.finalize())
+            output.write(encryptor.tag)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(output_path, 0o600)
+        if output_path.stat().st_size > MAX_BACKUP_ARCHIVE_BYTES:
+            raise ValueError(
+                f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
+            )
+
+    @classmethod
+    def _decrypt_scheduled_archive(cls, archive_bytes: bytes, passphrase: str | None) -> bytes:
+        header_size = (
+            len(ENCRYPTED_BACKUP_MAGIC)
+            + ENCRYPTED_BACKUP_SALT_BYTES
+            + ENCRYPTED_BACKUP_NONCE_BYTES
+        )
+        if len(archive_bytes) < header_size + ENCRYPTED_BACKUP_TAG_BYTES:
+            raise ValueError("Scheduled backup archive is corrupted.")
+        if not passphrase:
+            raise ValueError("A passphrase is required for this encrypted backup bundle.")
+        header = archive_bytes[:header_size]
+        salt_start = len(ENCRYPTED_BACKUP_MAGIC)
+        nonce_start = salt_start + ENCRYPTED_BACKUP_SALT_BYTES
+        salt = header[salt_start:nonce_start]
+        nonce = header[nonce_start:]
+        ciphertext = archive_bytes[header_size:-ENCRYPTED_BACKUP_TAG_BYTES]
+        tag = archive_bytes[-ENCRYPTED_BACKUP_TAG_BYTES:]
+        key = cls._scheduled_backup_key(passphrase, salt)
+        decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+        decryptor.authenticate_additional_data(header)
+        try:
+            return decryptor.update(ciphertext) + decryptor.finalize()
+        except InvalidTag as exc:
+            raise ValueError("Scheduled backup archive could not be decrypted.") from exc
 
     def export_debug_bundle(
         self,
@@ -2441,6 +2634,15 @@ class SystemBackupService:
         *,
         passphrase: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, bytes], ArchivePackaging, dict[str, Any]]:
+        if archive_bytes.startswith(ENCRYPTED_BACKUP_MAGIC):
+            decrypted = self._decrypt_scheduled_archive(archive_bytes, passphrase)
+            manifest, extracted, packaging, archive_meta = self._read_archive(decrypted)
+            return manifest, extracted, packaging, {
+                **archive_meta,
+                "encrypted": True,
+                "encryption": "aes-256-gcm-scrypt",
+            }
+
         packaging = self._detect_archive_packaging(archive_bytes)
         if not packaging:
             raise ValueError("Backup bundle archive format is not supported.")
