@@ -16,7 +16,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -85,6 +85,46 @@ from history_service.system_backup import (
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+class TemporaryFileResponse(FileResponse):
+    def __init__(self, *args: Any, cleanup: Callable[[], None], **kwargs: Any) -> None:
+        self._cleanup = cleanup
+        super().__init__(*args, **kwargs)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await asyncio.to_thread(self._cleanup)
+
+
+async def run_file_export_worker(
+    operation: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[Any, Any]:
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except BaseException:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if worker.done() and not worker.cancelled():
+            try:
+                artifact, _maintenance = worker.result()
+            except BaseException:
+                pass
+            else:
+                artifact.cleanup()
+        raise
+
+
 configure_service_logging(
     log_level=os.getenv("APP_LOG_LEVEL", "INFO"),
     log_format=os.getenv("LOG_FORMAT", "text"),
@@ -505,7 +545,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         maintenance_service = get_maintenance_service()
         try:
-            artifact, maintenance = await asyncio.to_thread(
+            artifact, maintenance = await run_file_export_worker(
                 maintenance_service.export_bundle,
                 payload,
                 stop_services=stop_services,
@@ -514,19 +554,25 @@ def create_app() -> FastAPI:
         except (ValueError, DockerRuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        return Response(
-            content=artifact.content,
-            media_type=artifact.media_type or "application/octet-stream",
-            headers={
-                "Content-Disposition": f'attachment; filename="{artifact.filename}"',
-                "X-Backup-Encrypted": "true" if payload.encrypt else "false",
-                "X-Backup-Packaging": str(artifact.manifest.get("packaging") or payload.packaging),
-                "X-Backup-Schema-Version": str(artifact.manifest.get("schema_version") or 1),
-                "X-Admin-Stopped-Containers": ",".join(maintenance.stopped_containers),
-                "X-Admin-Restarted-Containers": ",".join(maintenance.restarted_containers),
-                "X-Admin-Restart-Failures": ",".join(maintenance.restart_failures),
-            },
-        )
+        headers = {
+            "Content-Disposition": f'attachment; filename="{artifact.filename}"',
+            "X-Backup-Encrypted": "true" if payload.encrypt else "false",
+            "X-Backup-Packaging": str(artifact.manifest.get("packaging") or payload.packaging),
+            "X-Backup-Schema-Version": str(artifact.manifest.get("schema_version") or 1),
+            "X-Admin-Stopped-Containers": ",".join(maintenance.stopped_containers),
+            "X-Admin-Restarted-Containers": ",".join(maintenance.restarted_containers),
+            "X-Admin-Restart-Failures": ",".join(maintenance.restart_failures),
+        }
+        try:
+            return TemporaryFileResponse(
+                path=artifact.path,
+                media_type=artifact.media_type or "application/octet-stream",
+                headers=headers,
+                cleanup=artifact.cleanup,
+            )
+        except Exception:
+            artifact.cleanup()
+            raise
 
     @app.post("/api/admin/debug/export")
     async def export_debug_bundle(
@@ -544,7 +590,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         maintenance_service = get_maintenance_service()
         try:
-            artifact, maintenance = await asyncio.to_thread(
+            artifact, maintenance = await run_file_export_worker(
                 maintenance_service.export_debug_bundle,
                 payload,
                 stop_services=stop_services,
@@ -553,22 +599,28 @@ def create_app() -> FastAPI:
         except (ValueError, DockerRuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        return Response(
-            content=artifact.content,
-            media_type=artifact.media_type or "application/octet-stream",
-            headers={
-                "Content-Disposition": f'attachment; filename="{artifact.filename}"',
-                "X-Debug-Encrypted": "true" if payload.encrypt else "false",
-                "X-Debug-Packaging": str(artifact.manifest.get("packaging") or payload.packaging),
-                "X-Debug-Schema-Version": str(artifact.manifest.get("schema_version") or 1),
-                "X-Debug-Scrubbed": "true" if (payload.scrub_secrets or payload.scrub_disk_identifiers) else "false",
-                "X-Debug-Scrub-Secrets": "true" if payload.scrub_secrets else "false",
-                "X-Debug-Scrub-Disk-Identifiers": "true" if payload.scrub_disk_identifiers else "false",
-                "X-Admin-Stopped-Containers": ",".join(maintenance.stopped_containers),
-                "X-Admin-Restarted-Containers": ",".join(maintenance.restarted_containers),
-                "X-Admin-Restart-Failures": ",".join(maintenance.restart_failures),
-            },
-        )
+        headers = {
+            "Content-Disposition": f'attachment; filename="{artifact.filename}"',
+            "X-Debug-Encrypted": "true" if payload.encrypt else "false",
+            "X-Debug-Packaging": str(artifact.manifest.get("packaging") or payload.packaging),
+            "X-Debug-Schema-Version": str(artifact.manifest.get("schema_version") or 1),
+            "X-Debug-Scrubbed": "true" if (payload.scrub_secrets or payload.scrub_disk_identifiers) else "false",
+            "X-Debug-Scrub-Secrets": "true" if payload.scrub_secrets else "false",
+            "X-Debug-Scrub-Disk-Identifiers": "true" if payload.scrub_disk_identifiers else "false",
+            "X-Admin-Stopped-Containers": ",".join(maintenance.stopped_containers),
+            "X-Admin-Restarted-Containers": ",".join(maintenance.restarted_containers),
+            "X-Admin-Restart-Failures": ",".join(maintenance.restart_failures),
+        }
+        try:
+            return TemporaryFileResponse(
+                path=artifact.path,
+                media_type=artifact.media_type or "application/octet-stream",
+                headers=headers,
+                cleanup=artifact.cleanup,
+            )
+        except Exception:
+            artifact.cleanup()
+            raise
 
     @app.post("/api/admin/backup/import")
     async def import_backup(

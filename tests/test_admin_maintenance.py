@@ -68,11 +68,17 @@ class FakeBackupService:
             raise self.fail
         return "artifact"
 
+    def export_bundle_to_file(self, **kwargs: Any) -> str:
+        return self.export_bundle(**kwargs)
+
     def export_debug_bundle(self, **kwargs: Any) -> str:
         self.debug_calls.append(kwargs)
         if self.fail:
             raise self.fail
         return "debug-artifact"
+
+    def export_debug_bundle_to_file(self, **kwargs: Any) -> str:
+        return self.export_debug_bundle(**kwargs)
 
     def import_bundle(self, content: bytes, *, passphrase: str | None = None) -> dict[str, Any]:
         self.import_calls += 1

@@ -12,6 +12,7 @@ import struct
 import subprocess
 import tarfile
 import tempfile
+import tracemalloc
 import unittest
 import warnings
 import zipfile
@@ -53,6 +54,8 @@ from history_service.system_backup import (
     SSH_KEYS_KEY,
     TLS_TRUST_KEY,
     KNOWN_HOSTS_KEY,
+    MAX_BACKUP_ARCHIVE_BYTES,
+    MAX_ARCHIVE_MEMBER_COUNT,
     SystemBackupService,
     _ImportActivationTransaction,
 )
@@ -1570,6 +1573,258 @@ class SystemBackupServiceTests(unittest.TestCase):
                         self.assertIn("archive-core:enc-a:0", restored_slot_detail["slot_details"])
                         self.assertEqual(counts["tracked_slots"], 1)
                         self.assertEqual(counts["metric_sample_count"], 1)
+
+    def test_export_without_history_does_not_create_history_snapshot(self) -> None:
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(
+                self.store,
+                "create_backup",
+                side_effect=AssertionError("history snapshot must not be created"),
+            ),
+        ):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_bundle(
+                packaging="zip",
+                included_paths=[CONFIG_FILE_KEY],
+            )
+
+        self.assertTrue(artifact.content.startswith(b"PK"))
+        self.assertNotIn(HISTORY_DB_KEY, [entry["group_key"] for entry in artifact.manifest["files"]])
+
+    def test_file_export_keeps_history_snapshot_path_backed_during_packaging(self) -> None:
+        observed_history_path: Path | None = None
+
+        def build_archive(
+            members: list[BundleMember],
+            manifest: dict[str, Any],
+            packaging: str,
+            output_path: Path,
+            *,
+            passphrase: str | None = None,
+        ) -> None:
+            nonlocal observed_history_path
+            history_member = next(member for member in members if member.group_key == HISTORY_DB_KEY)
+            self.assertIsNone(history_member.content)
+            self.assertIsNotNone(history_member.file_path)
+            assert history_member.file_path is not None
+            self.assertTrue(history_member.file_path.is_file())
+            observed_history_path = history_member.file_path
+            with zipfile.ZipFile(
+                output_path,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as archive:
+                archive.writestr("manifest.json", json.dumps(manifest))
+                archive.write(history_member.file_path, history_member.archive_path)
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(self.backup_service, "_build_archive_to_path", side_effect=build_archive),
+        ):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+
+        try:
+            self.assertTrue(artifact.path.read_bytes().startswith(b"PK"))
+            self.assertIsNotNone(observed_history_path)
+            assert observed_history_path is not None
+            self.assertTrue(observed_history_path.exists())
+            history_entry = next(
+                entry for entry in artifact.manifest["files"] if entry["group_key"] == HISTORY_DB_KEY
+            )
+            self.assertEqual(history_entry["size_bytes"], observed_history_path.stat().st_size)
+            self.assertEqual(
+                history_entry["sha256"],
+                hashlib.sha256(observed_history_path.read_bytes()).hexdigest(),
+            )
+        finally:
+            artifact.cleanup()
+
+        self.assertFalse(observed_history_path.exists())
+
+    def test_file_export_round_trips_each_supported_packaging_format(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with patch.object(self.backup_service, "_run_7z_command", side_effect=self._fake_7z_command):
+                for packaging in ("tar.zst", "zip", "tar.gz", "7z"):
+                    with self.subTest(packaging=packaging):
+                        artifact = self.backup_service.export_bundle_to_file(packaging=packaging)
+                        workspace = artifact.cleanup_root
+                        try:
+                            self.assertTrue(artifact.path.is_file())
+                            result = self.backup_service.import_bundle(artifact.path.read_bytes())
+                            self.assertTrue(result["ok"])
+                            self.assertEqual(result["packaging"], packaging)
+                        finally:
+                            artifact.cleanup()
+                        self.assertFalse(workspace.exists())
+
+    def test_debug_export_without_history_does_not_create_history_snapshot(self) -> None:
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(
+                self.store,
+                "create_backup",
+                side_effect=AssertionError("history snapshot must not be created"),
+            ),
+        ):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_debug_bundle_to_file(
+                packaging="zip",
+                included_paths=[CONFIG_FILE_KEY],
+            )
+
+        try:
+            self.assertTrue(artifact.path.is_file())
+        finally:
+            artifact.cleanup()
+
+    def test_file_export_peak_python_memory_is_not_archive_sized(self) -> None:
+        large_snapshot = self.temp_dir / "large-history.sqlite3"
+        with large_snapshot.open("wb") as output:
+            for _ in range(32):
+                output.write(os.urandom(1024 * 1024))
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(
+                self.backup_service,
+                "_build_history_snapshot_to_directory",
+                return_value=large_snapshot,
+            ),
+        ):
+            get_settings.cache_clear()
+            tracemalloc.start()
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+        try:
+            self.assertTrue(artifact.path.is_file())
+            self.assertLess(peak_bytes, 8 * 1024 * 1024)
+        finally:
+            artifact.cleanup()
+
+    def test_file_export_cleans_workspace_when_packaging_fails(self) -> None:
+        workspace = self.temp_dir / "failed-file-export"
+        workspace.mkdir()
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch("history_service.system_backup.tempfile.mkdtemp", return_value=str(workspace)),
+            patch.object(
+                self.backup_service,
+                "_build_archive_to_path",
+                side_effect=ValueError("packaging failed"),
+            ),
+        ):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "packaging failed"):
+                self.backup_service.export_bundle_to_file(
+                    packaging="zip",
+                    included_paths=[CONFIG_FILE_KEY],
+                )
+
+        self.assertFalse(workspace.exists())
+
+    def test_file_export_rejects_oversized_output_and_cleans_workspace(self) -> None:
+        workspace = self.temp_dir / "oversized-file-export"
+        workspace.mkdir()
+
+        def build_oversized_archive(
+            members: list[BundleMember],
+            manifest: dict[str, Any],
+            packaging: str,
+            output_path: Path,
+            *,
+            passphrase: str | None = None,
+        ) -> None:
+            with output_path.open("wb") as output:
+                output.truncate(MAX_BACKUP_ARCHIVE_BYTES + 1)
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch("history_service.system_backup.tempfile.mkdtemp", return_value=str(workspace)),
+            patch.object(
+                self.backup_service,
+                "_build_archive_to_path",
+                side_effect=build_oversized_archive,
+            ),
+        ):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "archive exceeds"):
+                self.backup_service.export_bundle_to_file(
+                    packaging="zip",
+                    included_paths=[CONFIG_FILE_KEY],
+                )
+
+        self.assertFalse(workspace.exists())
+
+    def test_file_export_reserves_member_limit_for_manifest(self) -> None:
+        members = [
+            BundleMember(
+                key=f"member-{index}",
+                group_key=CONFIG_FILE_KEY,
+                archive_path=f"config/member-{index}",
+                source_path=None,
+                present=True,
+                content=b"",
+            )
+            for index in range(MAX_ARCHIVE_MEMBER_COUNT)
+        ]
+
+        with self.assertRaisesRegex(ValueError, "too many members"):
+            self.backup_service._collect_file_specs(members)
+
+    def test_tar_file_export_counts_physical_pax_headers(self) -> None:
+        members = [
+            BundleMember(
+                key=f"member-{index}",
+                group_key=CONFIG_FILE_KEY,
+                archive_path=f"config/{index:04d}-{'x' * 110}",
+                source_path=None,
+                present=True,
+                content=b"",
+            )
+            for index in range(MAX_ARCHIVE_MEMBER_COUNT - 1)
+        ]
+        manifest = {"files": self.backup_service._collect_file_specs(members)}
+        archive_path = self.temp_dir / "physical-member-boundary.tar.gz"
+
+        with self.assertRaisesRegex(ValueError, "too many members"):
+            self.backup_service._build_archive_to_path(
+                members,
+                manifest,
+                "tar.gz",
+                archive_path,
+            )
+
+    def test_file_export_rejects_incompatible_compression_ratio(self) -> None:
+        compressible_snapshot = self.temp_dir / "compressible-history.sqlite3"
+        with compressible_snapshot.open("wb") as output:
+            output.truncate(4 * 1024 * 1024)
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(
+                self.backup_service,
+                "_build_history_snapshot_to_directory",
+                return_value=compressible_snapshot,
+            ),
+        ):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "compression ratio"):
+                self.backup_service.export_bundle_to_file(
+                    packaging="zip",
+                    included_paths=[HISTORY_DB_KEY],
+                )
 
     def test_encrypted_backup_requires_correct_passphrase(self) -> None:
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):

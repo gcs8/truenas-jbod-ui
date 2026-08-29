@@ -218,6 +218,7 @@ class BundleMember:
     source_path: str | None
     present: bool
     content: bytes | None
+    file_path: Path | None = None
 
 
 @dataclass(slots=True)
@@ -238,6 +239,18 @@ class BackupArtifact:
     content: bytes
     media_type: str
     manifest: dict[str, Any]
+
+
+@dataclass(slots=True)
+class FileBackupArtifact:
+    filename: str
+    path: Path
+    media_type: str
+    manifest: dict[str, Any]
+    cleanup_root: Path
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.cleanup_root, ignore_errors=True)
 
 
 @dataclass(slots=True)
@@ -958,41 +971,84 @@ class SystemBackupService:
         packaging: ArchivePackaging = "tar.zst",
         included_paths: list[str] | None = None,
     ) -> BackupArtifact:
+        artifact = self.export_bundle_to_file(
+            encrypt=encrypt,
+            passphrase=passphrase,
+            packaging=packaging,
+            included_paths=included_paths,
+        )
+        try:
+            return BackupArtifact(
+                filename=artifact.filename,
+                content=artifact.path.read_bytes(),
+                media_type=artifact.media_type,
+                manifest=artifact.manifest,
+            )
+        finally:
+            artifact.cleanup()
+
+    def export_bundle_to_file(
+        self,
+        *,
+        encrypt: bool = False,
+        passphrase: str | None = None,
+        packaging: ArchivePackaging = "tar.zst",
+        included_paths: list[str] | None = None,
+    ) -> FileBackupArtifact:
         app_settings = self._load_app_settings()
         exported_at = datetime.now(timezone.utc)
-        history_snapshot_bytes = self._build_history_snapshot()
         selected_groups = self._resolve_selected_groups(included_paths, bundle_type="backup")
         self._validate_encrypted_scope(selected_groups, encrypt=encrypt)
         requested_packaging = self._normalize_packaging(packaging)
         if encrypt and not passphrase:
             raise ValueError("A passphrase is required when encryption is enabled.")
         normalized_packaging: ArchivePackaging = "7z" if encrypt else requested_packaging
-        bundle_groups, bundle_members = self._collect_backup_bundle(
-            app_settings,
-            history_snapshot_bytes,
-            selected_groups=selected_groups,
-        )
-        manifest = self._build_manifest(
-            format_name=BUNDLE_FORMAT,
-            app_settings=app_settings,
-            exported_at=exported_at,
-            packaging=normalized_packaging,
-            bundle_groups=bundle_groups,
-            bundle_members=bundle_members,
-        )
-        archive_bytes = self._build_archive(
-            bundle_members,
-            manifest,
-            normalized_packaging,
-            passphrase=passphrase if encrypt else None,
-        )
-        stem = f"jbod-system-backup-{exported_at.strftime('%Y%m%dT%H%M%SZ')}"
-        return BackupArtifact(
-            filename=f"{stem}{ARCHIVE_FILE_SUFFIXES[normalized_packaging]}",
-            content=archive_bytes,
-            media_type=ARCHIVE_MEDIA_TYPES[normalized_packaging],
-            manifest=manifest,
-        )
+        workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-export-"))
+        try:
+            history_snapshot_path = (
+                self._build_history_snapshot_to_directory(workspace / "history-snapshot")
+                if HISTORY_DB_KEY in selected_groups
+                else None
+            )
+            bundle_groups, bundle_members = self._collect_backup_bundle(
+                app_settings,
+                history_snapshot_path,
+                selected_groups=selected_groups,
+            )
+            manifest = self._build_manifest(
+                format_name=BUNDLE_FORMAT,
+                app_settings=app_settings,
+                exported_at=exported_at,
+                packaging=normalized_packaging,
+                bundle_groups=bundle_groups,
+                bundle_members=bundle_members,
+            )
+            stem = f"jbod-system-backup-{exported_at.strftime('%Y%m%dT%H%M%SZ')}"
+            filename = f"{stem}{ARCHIVE_FILE_SUFFIXES[normalized_packaging]}"
+            archive_path = workspace / filename
+            expanded_archive_size = self._build_archive_to_path(
+                bundle_members,
+                manifest,
+                normalized_packaging,
+                archive_path,
+                passphrase=passphrase if encrypt else None,
+            )
+            self._validate_export_archive(
+                archive_path,
+                normalized_packaging,
+                expanded_archive_size=expanded_archive_size,
+                passphrase=passphrase if encrypt else None,
+            )
+            return FileBackupArtifact(
+                filename=filename,
+                path=archive_path,
+                media_type=ARCHIVE_MEDIA_TYPES[normalized_packaging],
+                manifest=manifest,
+                cleanup_root=workspace,
+            )
+        except Exception:
+            shutil.rmtree(workspace, ignore_errors=True)
+            raise
 
     def export_debug_bundle(
         self,
@@ -1006,9 +1062,40 @@ class SystemBackupService:
         runtime_payload: dict[str, Any] | None = None,
         maintenance_payload: dict[str, Any] | None = None,
     ) -> BackupArtifact:
+        artifact = self.export_debug_bundle_to_file(
+            encrypt=encrypt,
+            passphrase=passphrase,
+            packaging=packaging,
+            included_paths=included_paths,
+            scrub_secrets=scrub_secrets,
+            scrub_disk_identifiers=scrub_disk_identifiers,
+            runtime_payload=runtime_payload,
+            maintenance_payload=maintenance_payload,
+        )
+        try:
+            return BackupArtifact(
+                filename=artifact.filename,
+                content=artifact.path.read_bytes(),
+                media_type=artifact.media_type,
+                manifest=artifact.manifest,
+            )
+        finally:
+            artifact.cleanup()
+
+    def export_debug_bundle_to_file(
+        self,
+        *,
+        encrypt: bool = False,
+        passphrase: str | None = None,
+        packaging: ArchivePackaging = "tar.zst",
+        included_paths: list[str] | None = None,
+        scrub_secrets: bool = True,
+        scrub_disk_identifiers: bool = True,
+        runtime_payload: dict[str, Any] | None = None,
+        maintenance_payload: dict[str, Any] | None = None,
+    ) -> FileBackupArtifact:
         app_settings = self._load_app_settings()
         exported_at = datetime.now(timezone.utc)
-        history_snapshot_bytes = self._build_history_snapshot()
         selected_groups = self._resolve_selected_groups(included_paths, bundle_type="debug")
         sensitive_selection = [key for key in selected_groups if key in SENSITIVE_GROUP_KEYS]
         if scrub_secrets and sensitive_selection:
@@ -1029,41 +1116,67 @@ class SystemBackupService:
             if scrub_secrets or scrub_disk_identifiers
             else None
         )
-        bundle_groups, bundle_members = self._collect_debug_bundle(
-            app_settings,
-            history_snapshot_bytes,
-            selected_groups=selected_groups,
-            scrubber=scrubber,
-            runtime_payload=runtime_payload,
-            maintenance_payload=maintenance_payload,
-            exported_at=exported_at,
-        )
-        manifest = self._build_manifest(
-            format_name=DEBUG_BUNDLE_FORMAT,
-            app_settings=app_settings,
-            exported_at=exported_at,
-            packaging=normalized_packaging,
-            bundle_groups=bundle_groups,
-            bundle_members=bundle_members,
-            extra_fields={
-                "scrub_sensitive": scrub_secrets or scrub_disk_identifiers,
-                "scrub_secrets": scrub_secrets,
-                "scrub_disk_identifiers": scrub_disk_identifiers,
-            },
-        )
-        archive_bytes = self._build_archive(
-            bundle_members,
-            manifest,
-            normalized_packaging,
-            passphrase=passphrase if encrypt else None,
-        )
-        stem = f"jbod-debug-bundle-{exported_at.strftime('%Y%m%dT%H%M%SZ')}"
-        return BackupArtifact(
-            filename=f"{stem}{ARCHIVE_FILE_SUFFIXES[normalized_packaging]}",
-            content=archive_bytes,
-            media_type=ARCHIVE_MEDIA_TYPES[normalized_packaging],
-            manifest=manifest,
-        )
+        workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-debug-export-"))
+        try:
+            history_snapshot_path = (
+                self._build_history_snapshot_to_directory(workspace / "history-snapshot")
+                if HISTORY_DB_KEY in selected_groups
+                else None
+            )
+            if history_snapshot_path is not None and scrubber is not None:
+                history_snapshot_path = self._build_scrubbed_history_snapshot_file(
+                    history_snapshot_path,
+                    scrubber,
+                    workspace / "history-scrub.sqlite3",
+                )
+            bundle_groups, bundle_members = self._collect_debug_bundle(
+                app_settings,
+                history_snapshot_path,
+                selected_groups=selected_groups,
+                scrubber=scrubber,
+                runtime_payload=runtime_payload,
+                maintenance_payload=maintenance_payload,
+                exported_at=exported_at,
+            )
+            manifest = self._build_manifest(
+                format_name=DEBUG_BUNDLE_FORMAT,
+                app_settings=app_settings,
+                exported_at=exported_at,
+                packaging=normalized_packaging,
+                bundle_groups=bundle_groups,
+                bundle_members=bundle_members,
+                extra_fields={
+                    "scrub_sensitive": scrub_secrets or scrub_disk_identifiers,
+                    "scrub_secrets": scrub_secrets,
+                    "scrub_disk_identifiers": scrub_disk_identifiers,
+                },
+            )
+            stem = f"jbod-debug-bundle-{exported_at.strftime('%Y%m%dT%H%M%SZ')}"
+            filename = f"{stem}{ARCHIVE_FILE_SUFFIXES[normalized_packaging]}"
+            archive_path = workspace / filename
+            expanded_archive_size = self._build_archive_to_path(
+                bundle_members,
+                manifest,
+                normalized_packaging,
+                archive_path,
+                passphrase=passphrase if encrypt else None,
+            )
+            self._validate_export_archive(
+                archive_path,
+                normalized_packaging,
+                expanded_archive_size=expanded_archive_size,
+                passphrase=passphrase if encrypt else None,
+            )
+            return FileBackupArtifact(
+                filename=filename,
+                path=archive_path,
+                media_type=ARCHIVE_MEDIA_TYPES[normalized_packaging],
+                manifest=manifest,
+                cleanup_root=workspace,
+            )
+        except Exception:
+            shutil.rmtree(workspace, ignore_errors=True)
+            raise
 
     def import_bundle(self, content: bytes, *, passphrase: str | None = None) -> dict[str, Any]:
         if len(content) > MAX_BACKUP_ARCHIVE_BYTES:
@@ -1482,16 +1595,20 @@ class SystemBackupService:
 
     def _build_history_snapshot(self) -> bytes:
         with tempfile.TemporaryDirectory() as temp_dir:
-            backup_path = self.store.create_backup(
-                temp_dir,
-                retention_count=1,
-                long_term_backup_dir=None,
-                weekly_retention_count=0,
-                monthly_retention_count=0,
-            )
+            backup_path = self._build_history_snapshot_to_directory(Path(temp_dir))
             if backup_path is None:
                 return b""
-            return Path(backup_path).read_bytes()
+            return backup_path.read_bytes()
+
+    def _build_history_snapshot_to_directory(self, target_dir: Path) -> Path | None:
+        backup_path = self.store.create_backup(
+            target_dir,
+            retention_count=1,
+            long_term_backup_dir=None,
+            weekly_retention_count=0,
+            monthly_retention_count=0,
+        )
+        return Path(backup_path) if backup_path is not None else None
 
     def _resolve_selected_groups(
         self,
@@ -1534,7 +1651,7 @@ class SystemBackupService:
     def _collect_backup_bundle(
         self,
         app_settings: Settings,
-        history_snapshot_bytes: bytes,
+        history_snapshot_path: Path | None,
         *,
         selected_groups: list[str],
     ) -> tuple[list[BundleGroup], list[BundleMember]]:
@@ -1585,9 +1702,9 @@ class SystemBackupService:
                     selected=selected,
                 )
             elif group_key == HISTORY_DB_KEY:
-                group, members = self._collect_generated_file_group(
+                group, members = self._collect_generated_path_group(
                     group_key,
-                    history_snapshot_bytes,
+                    history_snapshot_path,
                     selected=selected,
                     source_path=str(self.store.file_path),
                 )
@@ -1619,7 +1736,7 @@ class SystemBackupService:
     def _collect_debug_bundle(
         self,
         app_settings: Settings,
-        history_snapshot_bytes: bytes,
+        history_snapshot_path: Path | None,
         *,
         selected_groups: list[str],
         scrubber: DebugScrubber | None,
@@ -1686,14 +1803,9 @@ class SystemBackupService:
                     source_path=app_settings.paths.slot_detail_cache_file,
                 )
             elif group_key == HISTORY_DB_KEY:
-                content_bytes = (
-                    self._build_scrubbed_history_snapshot(history_snapshot_bytes, scrubber)
-                    if scrubber is not None
-                    else history_snapshot_bytes
-                )
-                group, members = self._collect_generated_file_group(
+                group, members = self._collect_generated_path_group(
                     group_key,
-                    content_bytes,
+                    history_snapshot_path,
                     selected=selected,
                     source_path=str(self.store.file_path),
                 )
@@ -1859,6 +1971,50 @@ class SystemBackupService:
             members,
         )
 
+    def _collect_generated_path_group(
+        self,
+        group_key: str,
+        file_path: Path | None,
+        *,
+        selected: bool,
+        source_path: str | None,
+    ) -> tuple[BundleGroup, list[BundleMember]]:
+        metadata = BACKUP_GROUP_METADATA[group_key]
+        present = bool(
+            selected
+            and file_path is not None
+            and file_path.is_file()
+            and file_path.stat().st_size > 0
+        )
+        members = (
+            [
+                BundleMember(
+                    key=group_key,
+                    group_key=group_key,
+                    archive_path=metadata["archive_root"],
+                    source_path=source_path,
+                    present=True,
+                    content=None,
+                    file_path=file_path,
+                )
+            ]
+            if present
+            else []
+        )
+        return (
+            BundleGroup(
+                key=group_key,
+                label=metadata["label"],
+                archive_root=metadata["archive_root"],
+                source_path=source_path,
+                selected=selected,
+                present=present,
+                sensitive=bool(metadata["sensitive"]),
+                restore_mode=metadata["restore_mode"],
+            ),
+            members,
+        )
+
     def _collect_directory_group(
         self,
         group_key: str,
@@ -1962,22 +2118,104 @@ class SystemBackupService:
             for group in bundle_groups
         ]
 
-    @staticmethod
-    def _collect_file_specs(bundle_members: list[BundleMember]) -> list[dict[str, Any]]:
+    @classmethod
+    def _collect_file_specs(cls, bundle_members: list[BundleMember]) -> list[dict[str, Any]]:
+        if len(bundle_members) + 1 > MAX_ARCHIVE_MEMBER_COUNT:
+            raise ValueError("Backup bundle archive contains too many members.")
         manifest_files: list[dict[str, Any]] = []
+        expanded_total = 0
         for member in bundle_members:
-            content_bytes = member.content or b""
+            size_bytes, digest = cls._bundle_member_size_and_digest(member)
+            if size_bytes > MAX_ARCHIVE_MEMBER_BYTES:
+                raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+            expanded_total += size_bytes
+            if expanded_total > MAX_ARCHIVE_EXPANDED_BYTES:
+                raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
             manifest_files.append(
                 {
                     "key": member.key,
                     "group_key": member.group_key,
                     "archive_path": member.archive_path,
                     "source_path": member.source_path,
-                    "size_bytes": len(content_bytes),
-                    "sha256": hashlib.sha256(content_bytes).hexdigest() if member.present else None,
+                    "size_bytes": size_bytes,
+                    "sha256": digest,
                 }
             )
         return manifest_files
+
+    def _validate_export_archive(
+        self,
+        archive_path: Path,
+        packaging: ArchivePackaging,
+        *,
+        expanded_archive_size: int | None,
+        passphrase: str | None,
+    ) -> None:
+        archive_size = archive_path.stat().st_size
+        if archive_size > MAX_BACKUP_ARCHIVE_BYTES:
+            raise ValueError(
+                f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
+            )
+        if packaging == "zip":
+            try:
+                with zipfile.ZipFile(archive_path, mode="r") as archive:
+                    members = archive.infolist()
+            except zipfile.BadZipFile as exc:
+                raise ValueError("Backup bundle ZIP archive is corrupted.") from exc
+            if len(members) > MAX_ARCHIVE_MEMBER_COUNT:
+                raise ValueError("Backup bundle archive contains too many members.")
+            self._validate_declared_archive_limits(
+                [(member.compress_size, member.file_size) for member in members]
+            )
+            return
+        if packaging in {"tar.gz", "tar.zst"}:
+            if expanded_archive_size is None:
+                raise ValueError("Backup bundle TAR archive size could not be verified.")
+            self._validate_declared_archive_limits(
+                [(archive_size, expanded_archive_size)],
+                compressed_total=archive_size,
+            )
+            return
+        if packaging == "7z":
+            list_result = self._run_7z_command(
+                [
+                    "l",
+                    "-slt",
+                    str(archive_path),
+                    f"-p{passphrase or ''}",
+                ]
+            )
+            self._raise_for_7z_failure(
+                list_result,
+                "Portable 7z backup export could not be verified.",
+                passphrase=passphrase,
+                reading_archive=True,
+            )
+            listed_entries = self._seven_zip_listed_entries(
+                list_result.stdout,
+                archive_path,
+            )
+            self._validate_7z_listed_entries(
+                listed_entries,
+                archive_size=archive_size,
+            )
+            return
+        raise ValueError(f"Unsupported backup packaging '{packaging}'.")
+
+    @staticmethod
+    def _bundle_member_size_and_digest(member: BundleMember) -> tuple[int, str | None]:
+        if not member.present:
+            return 0, None
+        if member.file_path is not None:
+            digest = hashlib.sha256()
+            size_bytes = 0
+            with member.file_path.open("rb") as source:
+                while chunk := source.read(ARCHIVE_READ_CHUNK_BYTES):
+                    size_bytes += len(chunk)
+                    digest.update(chunk)
+            return size_bytes, digest.hexdigest()
+        content = member.content or b""
+        return len(content), hashlib.sha256(content).hexdigest()
 
     def _build_archive(
         self,
@@ -1987,41 +2225,154 @@ class SystemBackupService:
         *,
         passphrase: str | None = None,
     ) -> bytes:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / f"bundle{ARCHIVE_FILE_SUFFIXES[packaging]}"
+            self._build_archive_to_path(
+                bundle_members,
+                manifest,
+                packaging,
+                archive_path,
+                passphrase=passphrase,
+            )
+            return archive_path.read_bytes()
+
+    def _build_archive_to_path(
+        self,
+        bundle_members: list[BundleMember],
+        manifest: dict[str, Any],
+        packaging: ArchivePackaging,
+        output_path: Path,
+        *,
+        passphrase: str | None = None,
+    ) -> int | None:
         if passphrase is not None and not passphrase:
             raise ValueError("A passphrase is required when encryption is enabled.")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
         if packaging == "zip":
-            buffer = io.BytesIO()
             with zipfile.ZipFile(
-                buffer,
+                output_path,
                 mode="w",
                 compression=zipfile.ZIP_DEFLATED,
                 compresslevel=9,
             ) as archive:
                 archive.writestr("manifest.json", manifest_bytes)
                 for member in bundle_members:
-                    if member.present and member.content is not None:
-                        archive.writestr(member.archive_path, member.content)
-            return buffer.getvalue()
+                    self._write_zip_bundle_member(archive, member)
+            return None
         if packaging == "7z":
-            return self._build_7z_archive(bundle_members, manifest_bytes, passphrase=passphrase)
-
-        tar_bytes = self._build_tar_archive(bundle_members, manifest_bytes)
-        if packaging == "tar.gz":
-            return gzip.compress(tar_bytes, compresslevel=9)
-        if packaging == "tar.zst":
-            if zstd is None:
+            self._build_7z_archive_to_path(
+                bundle_members,
+                manifest_bytes,
+                output_path,
+                passphrase=passphrase,
+            )
+            return None
+        if packaging in {"tar.gz", "tar.zst"}:
+            if packaging == "tar.zst" and zstd is None:
                 raise ValueError("tar.zst export requires the optional 'zstandard' dependency.")
-            return zstd.ZstdCompressor(level=9).compress(tar_bytes)
+            tar_path = output_path.with_name(f".{output_path.name}.tar.tmp")
+            try:
+                with tarfile.open(tar_path, mode="w") as archive:
+                    self._write_tar_bundle(archive, bundle_members, manifest_bytes)
+                self._validate_export_tar_physical_members(tar_path)
+                tar_size = tar_path.stat().st_size
+                if packaging == "tar.gz":
+                    with tar_path.open("rb") as source, output_path.open("wb") as output:
+                        with gzip.GzipFile(
+                            fileobj=output,
+                            mode="wb",
+                            compresslevel=9,
+                            mtime=0,
+                        ) as compressed:
+                            shutil.copyfileobj(
+                                source,
+                                compressed,
+                                length=ARCHIVE_READ_CHUNK_BYTES,
+                            )
+                else:
+                    assert zstd is not None
+                    with tar_path.open("rb") as source, output_path.open("wb") as output:
+                        with zstd.ZstdCompressor(level=9).stream_writer(
+                            output,
+                            size=tar_size,
+                            closefd=False,
+                        ) as compressed:
+                            shutil.copyfileobj(
+                                source,
+                                compressed,
+                                length=ARCHIVE_READ_CHUNK_BYTES,
+                            )
+            finally:
+                tar_path.unlink(missing_ok=True)
+            return tar_size
         raise ValueError(f"Unsupported backup packaging '{packaging}'.")
+
+    @classmethod
+    def _validate_export_tar_physical_members(cls, tar_path: Path) -> None:
+        archive_size = tar_path.stat().st_size
+        if not archive_size or archive_size % 512:
+            raise ValueError("Backup bundle TAR archive framing is invalid.")
+        physical_count = 0
+        cursor = 0
+        with tar_path.open("rb", buffering=0) as archive:
+            while cursor + 512 <= archive_size:
+                archive.seek(cursor)
+                header = archive.read(512)
+                if len(header) != 512:
+                    raise ValueError("Backup bundle TAR archive framing is invalid.")
+                if header == b"\0" * 512:
+                    trailer = archive.read(512)
+                    if trailer != b"\0" * 512:
+                        raise ValueError("Backup bundle TAR archive trailer is truncated.")
+                    return
+                physical_count += 1
+                if physical_count > MAX_ARCHIVE_MEMBER_COUNT:
+                    raise ValueError("Backup bundle archive contains too many members.")
+                member_size = cls._parse_tar_octal(header[124:136], label="member size")
+                padded_size = ((member_size + 511) // 512) * 512
+                cursor += 512 + padded_size
+                if cursor > archive_size:
+                    raise ValueError("Backup bundle TAR member data is truncated.")
+        raise ValueError("Backup bundle TAR archive is missing its trailer.")
+
+    @classmethod
+    def _write_zip_bundle_member(
+        cls,
+        archive: zipfile.ZipFile,
+        member: BundleMember,
+    ) -> None:
+        if not member.present:
+            return
+        if member.file_path is None:
+            archive.writestr(member.archive_path, member.content or b"")
+            return
+        with member.file_path.open("rb") as source, archive.open(member.archive_path, mode="w") as target:
+            shutil.copyfileobj(source, target, length=ARCHIVE_READ_CHUNK_BYTES)
+
+    @classmethod
+    def _write_tar_bundle(
+        cls,
+        archive: tarfile.TarFile,
+        bundle_members: list[BundleMember],
+        manifest_bytes: bytes,
+    ) -> None:
+        cls._add_tar_member(archive, "manifest.json", manifest_bytes)
+        for member in bundle_members:
+            if not member.present:
+                continue
+            if member.file_path is None:
+                cls._add_tar_member(archive, member.archive_path, member.content or b"")
+                continue
+            info = tarfile.TarInfo(name=member.archive_path)
+            info.size = member.file_path.stat().st_size
+            with member.file_path.open("rb") as source:
+                archive.addfile(info, source)
 
     def _build_tar_archive(self, bundle_members: list[BundleMember], manifest_bytes: bytes) -> bytes:
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w") as archive:
-            self._add_tar_member(archive, "manifest.json", manifest_bytes)
-            for member in bundle_members:
-                if member.present and member.content is not None:
-                    self._add_tar_member(archive, member.archive_path, member.content)
+            self._write_tar_bundle(archive, bundle_members, manifest_bytes)
         return buffer.getvalue()
 
     def _build_7z_archive(
@@ -2032,20 +2383,38 @@ class SystemBackupService:
         passphrase: str | None = None,
     ) -> bytes:
         with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "bundle.7z"
+            self._build_7z_archive_to_path(
+                bundle_members,
+                manifest_bytes,
+                archive_path,
+                passphrase=passphrase,
+            )
+            return archive_path.read_bytes()
+
+    def _build_7z_archive_to_path(
+        self,
+        bundle_members: list[BundleMember],
+        manifest_bytes: bytes,
+        archive_path: Path,
+        *,
+        passphrase: str | None = None,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
             staging_dir = Path(temp_dir) / "bundle"
             staging_dir.mkdir(parents=True, exist_ok=True)
             (staging_dir / "manifest.json").write_bytes(manifest_bytes)
             top_level_entries = {"manifest.json"}
-
             for member in bundle_members:
-                if not member.present or member.content is None:
+                if not member.present:
                     continue
                 target_path = staging_dir / member.archive_path
                 target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_bytes(member.content)
+                if member.file_path is not None:
+                    shutil.copyfile(member.file_path, target_path)
+                else:
+                    target_path.write_bytes(member.content or b"")
                 top_level_entries.add(member.archive_path.split("/", 1)[0])
-
-            archive_path = Path(temp_dir) / "bundle.7z"
             command = [
                 "a",
                 "-t7z",
@@ -2065,7 +2434,6 @@ class SystemBackupService:
                 "Portable 7z backup export failed.",
                 passphrase=passphrase,
             )
-            return archive_path.read_bytes()
 
     def _read_archive(
         self,
@@ -3276,6 +3644,60 @@ class SystemBackupService:
             payload = scrubber.scrub_payload(payload)
         return json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
 
+    def _build_scrubbed_history_snapshot_file(
+        self,
+        snapshot_path: Path,
+        scrubber: DebugScrubber,
+        target_path: Path,
+    ) -> Path:
+        shutil.copyfile(snapshot_path, target_path)
+        connection = sqlite3.connect(target_path)
+        try:
+            connection.row_factory = sqlite3.Row
+            slot_state_rules, slot_event_rules, metric_sample_rules = self._history_scrubbing_rules(
+                scrubber
+            )
+            if slot_state_rules:
+                self._scrub_history_table(connection, "slot_state_current", slot_state_rules)
+            if slot_event_rules:
+                self._scrub_history_table(connection, "slot_events", slot_event_rules)
+            if metric_sample_rules:
+                self._scrub_history_table(connection, "metric_samples", metric_sample_rules)
+            connection.commit()
+        finally:
+            connection.close()
+        return target_path
+
+    @staticmethod
+    def _history_scrubbing_rules(
+        scrubber: DebugScrubber,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        slot_state_rules: dict[str, Any] = {}
+        slot_event_rules: dict[str, Any] = {}
+        metric_sample_rules: dict[str, Any] = {}
+        if scrubber.scrub_disk_identifiers:
+            common_rules = {
+                "device_name": scrubber.alias_device_name,
+                "serial": lambda value: scrubber.alias_identifier("serial", value),
+                "gptid": lambda value: scrubber.alias_identifier("gptid", value),
+                "persistent_id_label": lambda value: scrubber.alias_identifier("persistent_id", value),
+                "disk_identity_key": lambda value: scrubber.alias_identifier("disk_identity_key", value),
+                "logical_unit_id": lambda value: scrubber.alias_identifier("logical_unit_id", value),
+                "sas_address": lambda value: scrubber.alias_identifier("sas_address", value),
+            }
+            slot_state_rules.update(
+                {
+                    **common_rules,
+                    "multipath_device": scrubber.alias_device_name,
+                    "multipath_lunid": lambda value: scrubber.alias_identifier("multipath_lunid", value),
+                }
+            )
+            slot_event_rules.update(common_rules)
+            metric_sample_rules.update(common_rules)
+        if scrubber.scrub_secrets or scrubber.scrub_disk_identifiers:
+            slot_event_rules["details_json"] = scrubber.scrub_json_text
+        return slot_state_rules, slot_event_rules, metric_sample_rules
+
     def _build_scrubbed_history_snapshot(self, snapshot_bytes: bytes, scrubber: DebugScrubber | None) -> bytes:
         if scrubber is None or not snapshot_bytes:
             return snapshot_bytes
@@ -3343,26 +3765,27 @@ class SystemBackupService:
         table_name: str,
         scrubbing_rules: dict[str, Any],
     ) -> None:
-        rows = connection.execute(f"SELECT rowid AS _rowid_, * FROM {table_name}").fetchall()
-        for row in rows:
-            updates: dict[str, Any] = {}
-            for column_name, scrubber in scrubbing_rules.items():
-                if column_name not in row.keys():
+        cursor = connection.execute(f"SELECT rowid AS _rowid_, * FROM {table_name}")
+        while rows := cursor.fetchmany(500):
+            for row in rows:
+                updates: dict[str, Any] = {}
+                for column_name, scrubber in scrubbing_rules.items():
+                    if column_name not in row.keys():
+                        continue
+                    value = row[column_name]
+                    if value in {None, ""}:
+                        continue
+                    scrubbed = scrubber(value)
+                    if scrubbed != value:
+                        updates[column_name] = scrubbed
+                if not updates:
                     continue
-                value = row[column_name]
-                if value in {None, ""}:
-                    continue
-                scrubbed = scrubber(value)
-                if scrubbed != value:
-                    updates[column_name] = scrubbed
-            if not updates:
-                continue
-            set_clause = ", ".join(f"{column} = ?" for column in updates)
-            parameters = [updates[column] for column in updates] + [row["_rowid_"]]
-            connection.execute(
-                f"UPDATE {table_name} SET {set_clause} WHERE rowid = ?",
-                parameters,
-            )
+                set_clause = ", ".join(f"{column} = ?" for column in updates)
+                parameters = [updates[column] for column in updates] + [row["_rowid_"]]
+                connection.execute(
+                    f"UPDATE {table_name} SET {set_clause} WHERE rowid = ?",
+                    parameters,
+                )
 
     def _build_debug_state_bytes(
         self,
