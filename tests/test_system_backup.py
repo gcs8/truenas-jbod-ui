@@ -13,6 +13,7 @@ import unittest
 import warnings
 import zipfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import yaml
@@ -583,6 +584,28 @@ class SystemBackupServiceTests(unittest.TestCase):
         finally:
             assert original_backup is not None
             self.store.restore_backup(original_backup)
+
+    def test_history_member_validation_closes_sqlite_connection(self) -> None:
+        real_connect = sqlite3.connect
+        opened_connections: list[sqlite3.Connection] = []
+
+        def tracking_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+            connection = real_connect(*args, **kwargs)
+            opened_connections.append(connection)
+            return connection
+
+        with patch(
+            "history_service.system_backup.sqlite3.connect",
+            side_effect=tracking_connect,
+        ):
+            SystemBackupService._validate_history_member(self.history_db_path.read_bytes())
+
+        self.assertEqual(len(opened_connections), 1)
+        try:
+            with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
+                opened_connections[0].execute("SELECT 1")
+        finally:
+            opened_connections[0].close()
 
     def test_import_rejects_duplicate_physical_zip_member_paths(self) -> None:
         content = b'{"slot_mappings": {}}'

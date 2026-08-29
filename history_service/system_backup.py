@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import uuid
 import zipfile
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -1419,7 +1420,7 @@ class SystemBackupService:
             candidate_path = Path(temp_dir) / "history.sqlite3"
             candidate_path.write_bytes(content)
             database_uri = f"{candidate_path.resolve().as_uri()}?mode=ro"
-            with sqlite3.connect(database_uri, uri=True) as connection:
+            with closing(sqlite3.connect(database_uri, uri=True)) as connection:
                 rows = connection.execute("PRAGMA quick_check").fetchall()
                 required_columns = {
                     "slot_state_current": {"system_id", "enclosure_key", "slot"},
