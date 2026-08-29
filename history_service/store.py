@@ -8,6 +8,7 @@ import stat
 import threading
 import time
 from contextlib import closing
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,18 @@ SQLITE_CACHE_SIZE_KIB = 16384
 SQLITE_CONNECT_TIMEOUT_SECONDS = 5.0
 SQLITE_WRITE_LOCK_RETRY_ATTEMPTS = 2
 SQLITE_WRITE_LOCK_RETRY_DELAY_SECONDS = 0.05
+# PRAGMA user_version marker: once the disk-identity backfill has run against a database
+# it is recorded here so later service starts (in every container sharing the file) skip
+# the full-table UPDATE scans. Writers populate disk_identity_key on insert, so the
+# backfill only ever has work to do for rows that predate the column.
+DISK_IDENTITY_BACKFILL_USER_VERSION = 1
+
+
+@dataclass(slots=True)
+class SlotStateUpdate:
+    record: SlotStateRecord
+    observed_at: str
+    events: list[SlotEvent] = field(default_factory=list)
 
 SLOT_STATE_OPTIONAL_COLUMNS: dict[str, str] = {
     "persistent_id_label": "TEXT",
@@ -238,9 +251,18 @@ class HistoryStore:
             self._ensure_slot_state_columns(connection)
             self._ensure_slot_event_columns(connection)
             self._ensure_metric_sample_columns(connection)
-            self._backfill_disk_identity_keys(connection)
+            self._backfill_disk_identity_keys_once(connection)
             self._ensure_identity_indexes(connection)
             connection.commit()
+
+    @staticmethod
+    def _backfill_disk_identity_keys_once(connection: sqlite3.Connection) -> None:
+        row = connection.execute("PRAGMA user_version").fetchone()
+        current_version = int(row[0]) if row and row[0] is not None else 0
+        if current_version >= DISK_IDENTITY_BACKFILL_USER_VERSION:
+            return
+        HistoryStore._backfill_disk_identity_keys(connection)
+        connection.execute(f"PRAGMA user_version = {int(DISK_IDENTITY_BACKFILL_USER_VERSION)}")
 
     @staticmethod
     def _ensure_slot_state_columns(connection: sqlite3.Connection) -> None:
@@ -498,176 +520,216 @@ class HistoryStore:
         return self._row_to_slot_state(row) if row else None
 
     def upsert_slot_state(self, record: SlotStateRecord, observed_at: str) -> None:
-        self._execute_write(
-            lambda connection: connection.execute(
-                """
-                INSERT INTO slot_state_current (
-                    system_id,
-                    system_label,
-                    enclosure_key,
-                    enclosure_id,
-                    enclosure_label,
-                    slot,
-                    slot_label,
-                    present,
-                    state,
-                    identify_active,
-                    device_name,
-                    serial,
-                    model,
-                    gptid,
-                    persistent_id_label,
-                    disk_identity_key,
-                    logical_unit_id,
-                    sas_address,
-                    pool_name,
-                    vdev_name,
-                    health,
-                    topology_label,
-                    multipath_device,
-                    multipath_mode,
-                    multipath_state,
-                    multipath_lunid,
-                    multipath_primary_path,
-                    multipath_alternate_path,
-                    multipath_active_paths,
-                    multipath_passive_paths,
-                    multipath_failed_paths,
-                    multipath_other_paths,
-                    multipath_active_controllers,
-                    multipath_passive_controllers,
-                    multipath_failed_controllers,
-                    last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(system_id, enclosure_key, slot) DO UPDATE SET
-                    system_label = excluded.system_label,
-                    enclosure_id = excluded.enclosure_id,
-                    enclosure_label = excluded.enclosure_label,
-                    slot_label = excluded.slot_label,
-                    present = excluded.present,
-                    state = excluded.state,
-                    identify_active = excluded.identify_active,
-                    device_name = excluded.device_name,
-                    serial = excluded.serial,
-                    model = excluded.model,
-                    gptid = excluded.gptid,
-                    persistent_id_label = excluded.persistent_id_label,
-                    disk_identity_key = excluded.disk_identity_key,
-                    logical_unit_id = excluded.logical_unit_id,
-                    sas_address = excluded.sas_address,
-                    pool_name = excluded.pool_name,
-                    vdev_name = excluded.vdev_name,
-                    health = excluded.health,
-                    topology_label = excluded.topology_label,
-                    multipath_device = excluded.multipath_device,
-                    multipath_mode = excluded.multipath_mode,
-                    multipath_state = excluded.multipath_state,
-                    multipath_lunid = excluded.multipath_lunid,
-                    multipath_primary_path = excluded.multipath_primary_path,
-                    multipath_alternate_path = excluded.multipath_alternate_path,
-                    multipath_active_paths = excluded.multipath_active_paths,
-                    multipath_passive_paths = excluded.multipath_passive_paths,
-                    multipath_failed_paths = excluded.multipath_failed_paths,
-                    multipath_other_paths = excluded.multipath_other_paths,
-                    multipath_active_controllers = excluded.multipath_active_controllers,
-                    multipath_passive_controllers = excluded.multipath_passive_controllers,
-                    multipath_failed_controllers = excluded.multipath_failed_controllers,
-                    last_seen_at = excluded.last_seen_at
-                """,
-                (
-                    record.system_id,
-                    record.system_label,
-                    record.enclosure_key,
-                    record.enclosure_id,
-                    record.enclosure_label,
-                    record.slot,
-                    record.slot_label,
-                    int(record.present),
-                    record.state,
-                    int(record.identify_active),
-                    record.device_name,
-                    record.serial,
-                    record.model,
-                    record.gptid,
-                    record.persistent_id_label,
-                    record.disk_identity_key,
-                    record.logical_unit_id,
-                    record.sas_address,
-                    record.pool_name,
-                    record.vdev_name,
-                    record.health,
-                    record.topology_label,
-                    record.multipath_device,
-                    record.multipath_mode,
-                    record.multipath_state,
-                    record.multipath_lunid,
-                    record.multipath_primary_path,
-                    record.multipath_alternate_path,
-                    record.multipath_active_paths,
-                    record.multipath_passive_paths,
-                    record.multipath_failed_paths,
-                    record.multipath_other_paths,
-                    record.multipath_active_controllers,
-                    record.multipath_passive_controllers,
-                    record.multipath_failed_controllers,
-                    observed_at,
-                ),
-            )
+        self._execute_write(lambda connection: self._upsert_slot_state_row(connection, record, observed_at))
+
+    @staticmethod
+    def _upsert_slot_state_row(connection: sqlite3.Connection, record: SlotStateRecord, observed_at: str) -> None:
+        connection.execute(
+            """
+            INSERT INTO slot_state_current (
+                system_id,
+                system_label,
+                enclosure_key,
+                enclosure_id,
+                enclosure_label,
+                slot,
+                slot_label,
+                present,
+                state,
+                identify_active,
+                device_name,
+                serial,
+                model,
+                gptid,
+                persistent_id_label,
+                disk_identity_key,
+                logical_unit_id,
+                sas_address,
+                pool_name,
+                vdev_name,
+                health,
+                topology_label,
+                multipath_device,
+                multipath_mode,
+                multipath_state,
+                multipath_lunid,
+                multipath_primary_path,
+                multipath_alternate_path,
+                multipath_active_paths,
+                multipath_passive_paths,
+                multipath_failed_paths,
+                multipath_other_paths,
+                multipath_active_controllers,
+                multipath_passive_controllers,
+                multipath_failed_controllers,
+                last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(system_id, enclosure_key, slot) DO UPDATE SET
+                system_label = excluded.system_label,
+                enclosure_id = excluded.enclosure_id,
+                enclosure_label = excluded.enclosure_label,
+                slot_label = excluded.slot_label,
+                present = excluded.present,
+                state = excluded.state,
+                identify_active = excluded.identify_active,
+                device_name = excluded.device_name,
+                serial = excluded.serial,
+                model = excluded.model,
+                gptid = excluded.gptid,
+                persistent_id_label = excluded.persistent_id_label,
+                disk_identity_key = excluded.disk_identity_key,
+                logical_unit_id = excluded.logical_unit_id,
+                sas_address = excluded.sas_address,
+                pool_name = excluded.pool_name,
+                vdev_name = excluded.vdev_name,
+                health = excluded.health,
+                topology_label = excluded.topology_label,
+                multipath_device = excluded.multipath_device,
+                multipath_mode = excluded.multipath_mode,
+                multipath_state = excluded.multipath_state,
+                multipath_lunid = excluded.multipath_lunid,
+                multipath_primary_path = excluded.multipath_primary_path,
+                multipath_alternate_path = excluded.multipath_alternate_path,
+                multipath_active_paths = excluded.multipath_active_paths,
+                multipath_passive_paths = excluded.multipath_passive_paths,
+                multipath_failed_paths = excluded.multipath_failed_paths,
+                multipath_other_paths = excluded.multipath_other_paths,
+                multipath_active_controllers = excluded.multipath_active_controllers,
+                multipath_passive_controllers = excluded.multipath_passive_controllers,
+                multipath_failed_controllers = excluded.multipath_failed_controllers,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                record.system_id,
+                record.system_label,
+                record.enclosure_key,
+                record.enclosure_id,
+                record.enclosure_label,
+                record.slot,
+                record.slot_label,
+                int(record.present),
+                record.state,
+                int(record.identify_active),
+                record.device_name,
+                record.serial,
+                record.model,
+                record.gptid,
+                record.persistent_id_label,
+                record.disk_identity_key,
+                record.logical_unit_id,
+                record.sas_address,
+                record.pool_name,
+                record.vdev_name,
+                record.health,
+                record.topology_label,
+                record.multipath_device,
+                record.multipath_mode,
+                record.multipath_state,
+                record.multipath_lunid,
+                record.multipath_primary_path,
+                record.multipath_alternate_path,
+                record.multipath_active_paths,
+                record.multipath_passive_paths,
+                record.multipath_failed_paths,
+                record.multipath_other_paths,
+                record.multipath_active_controllers,
+                record.multipath_passive_controllers,
+                record.multipath_failed_controllers,
+                observed_at,
+            ),
         )
 
     def insert_events(self, events: list[SlotEvent]) -> None:
         if not events:
             return
-        self._execute_write(
-            lambda connection: connection.executemany(
+        self._execute_write(lambda connection: self._insert_event_rows(connection, events))
+
+    def get_slot_states(self, system_id: str, enclosure_id: str | None) -> dict[int, SlotStateRecord]:
+        """Load every current slot-state row for one scope with a single connection."""
+
+        enclosure_key = enclosure_id or ""
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
                 """
-                INSERT INTO slot_events (
-                    observed_at,
-                    system_id,
-                    system_label,
-                    enclosure_key,
-                    enclosure_id,
-                    enclosure_label,
-                    slot,
-                    slot_label,
-                    event_type,
-                    previous_value,
-                    current_value,
-                    device_name,
-                    serial,
-                    details_json,
-                    gptid,
-                    persistent_id_label,
-                    disk_identity_key,
-                    logical_unit_id,
-                    sas_address
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT *
+                FROM slot_state_current
+                WHERE system_id = ? AND enclosure_key = ?
                 """,
-                [
-                    (
-                        item.observed_at,
-                        item.system_id,
-                        item.system_label,
-                        item.enclosure_key,
-                        item.enclosure_id,
-                        item.enclosure_label,
-                        item.slot,
-                        item.slot_label,
-                        item.event_type,
-                        item.previous_value,
-                        item.current_value,
-                        item.device_name,
-                        item.serial,
-                        item.details_json,
-                        item.gptid,
-                        item.persistent_id_label,
-                        item.disk_identity_key,
-                        item.logical_unit_id,
-                        item.sas_address,
-                    )
-                    for item in events
-                ],
-            )
+                (system_id, enclosure_key),
+            ).fetchall()
+        return {int(row["slot"]): self._row_to_slot_state(row) for row in rows}
+
+    def record_slot_updates(self, updates: list[SlotStateUpdate]) -> None:
+        """Apply a batch of slot-state upserts (and their events) in one connection/transaction.
+
+        Replaces the per-slot open/PRAGMA/commit/close cycle the collector used to pay
+        three times per slot per pass. Event rows for a slot are written before its
+        state row, matching the single-call ordering.
+        """
+
+        if not updates:
+            return
+
+        def apply(connection: sqlite3.Connection) -> None:
+            for update in updates:
+                if update.events:
+                    self._insert_event_rows(connection, list(update.events))
+                self._upsert_slot_state_row(connection, update.record, update.observed_at)
+
+        self._execute_write(apply)
+
+    @staticmethod
+    def _insert_event_rows(connection: sqlite3.Connection, events: list[SlotEvent]) -> None:
+        if not events:
+            return
+        connection.executemany(
+            """
+            INSERT INTO slot_events (
+                observed_at,
+                system_id,
+                system_label,
+                enclosure_key,
+                enclosure_id,
+                enclosure_label,
+                slot,
+                slot_label,
+                event_type,
+                previous_value,
+                current_value,
+                device_name,
+                serial,
+                details_json,
+                gptid,
+                persistent_id_label,
+                disk_identity_key,
+                logical_unit_id,
+                sas_address
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    item.observed_at,
+                    item.system_id,
+                    item.system_label,
+                    item.enclosure_key,
+                    item.enclosure_id,
+                    item.enclosure_label,
+                    item.slot,
+                    item.slot_label,
+                    item.event_type,
+                    item.previous_value,
+                    item.current_value,
+                    item.device_name,
+                    item.serial,
+                    item.details_json,
+                    item.gptid,
+                    item.persistent_id_label,
+                    item.disk_identity_key,
+                    item.logical_unit_id,
+                    item.sas_address,
+                )
+                for item in events
+            ],
         )
 
     def insert_metric_samples(self, samples: list[MetricSample]) -> None:

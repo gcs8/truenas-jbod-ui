@@ -376,6 +376,9 @@ class PathConfig(BaseModel):
 class HistoryConfig(BaseModel):
     service_url: str = ""
     timeout_seconds: int = 10
+    # Upper bound on concurrent per-slot requests when the batched scope endpoint fails
+    # and the client falls back to one request per slot.
+    fallback_max_concurrency: int = 4
 
 
 class AdminSurfaceConfig(BaseModel):
@@ -467,6 +470,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_COMMANDS_JSON": ("ssh", "commands"),
     "HISTORY_BACKEND_URL": ("history", "service_url"),
     "HISTORY_BACKEND_TIMEOUT": ("history", "timeout_seconds"),
+    "HISTORY_BACKEND_FALLBACK_CONCURRENCY": ("history", "fallback_max_concurrency"),
     "ADMIN_SERVICE_URL": ("admin", "service_url"),
     "ADMIN_PUBLIC_URL": ("admin", "public_url"),
     "ADMIN_PORT": ("admin", "port"),

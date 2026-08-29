@@ -131,7 +131,7 @@
         <option value="300">5 min</option>
       </select>
     </label>
-    <div id="refresh-timing-strip" class="refresh-timing-strip" aria-live="polite">
+    <div id="refresh-timing-strip" class="refresh-timing-strip">
       <span id="refresh-countdown-label" class="refresh-countdown-label">Next refresh pending</span>
       <div class="refresh-progress" aria-hidden="true">
         <span id="refresh-countdown-bar"></span>
@@ -588,8 +588,8 @@
 
 <script>
   window.APP_BOOTSTRAP = {
-    snapshot: {{ initial_snapshot_json | safe }},
-    storageViewsRuntime: {{ initial_storage_view_runtime_json | safe }},
+    snapshot: {{ initial_snapshot_json | script_json_text }},
+    storageViewsRuntime: {{ initial_storage_view_runtime_json | script_json_text }},
     layoutRows: {{ snapshot.layout_rows | tojson }},
     refreshIntervalSeconds: {{ snapshot.refresh_interval_seconds }},
     smartBatchMaxConcurrency: {{ settings.app.smart_batch_max_concurrency }},
@@ -609,17 +609,17 @@
     slotCount: {{ snapshot.layout_slot_count or settings.layout.slot_count }},
     historyConfigured: {{ history_configured | tojson }},
     snapshotMode: {{ snapshot_mode | tojson }},
-    snapshotExportMeta: {{ snapshot_export_meta_json | safe }},
-    preloadedHistoryBySlot: {{ preloaded_history_json | safe }},
-    preloadedSmartSummariesBySlot: {{ preloaded_smart_summary_json | safe }},
-    preloadedSnapshotsByEnclosure: {{ preloaded_snapshots_json | safe }},
-    preloadedSnapshotSmartSummaries: {{ preloaded_snapshot_smart_summary_json | safe }},
-    preloadedStorageViewSmartSummaries: {{ preloaded_storage_view_smart_summary_json | safe }},
-    preloadedHistorySummary: {{ preloaded_history_summary_json | safe }},
-    initialSelectedSlot: {{ initial_selected_slot_json | safe }},
-    initialHistoryTimeframeHours: {{ initial_history_timeframe_hours_json | safe }},
-    initialHistoryPanelOpen: {{ initial_history_panel_open_json | safe }},
-    initialHistoryIoChartMode: {{ initial_history_io_chart_mode_json | safe }},
+    snapshotExportMeta: {{ snapshot_export_meta_json | script_json_text }},
+    preloadedHistoryBySlot: {{ preloaded_history_json | script_json_text }},
+    preloadedSmartSummariesBySlot: {{ preloaded_smart_summary_json | script_json_text }},
+    preloadedSnapshotsByEnclosure: {{ preloaded_snapshots_json | script_json_text }},
+    preloadedSnapshotSmartSummaries: {{ preloaded_snapshot_smart_summary_json | script_json_text }},
+    preloadedStorageViewSmartSummaries: {{ preloaded_storage_view_smart_summary_json | script_json_text }},
+    preloadedHistorySummary: {{ preloaded_history_summary_json | script_json_text }},
+    initialSelectedSlot: {{ initial_selected_slot_json | script_json_text }},
+    initialHistoryTimeframeHours: {{ initial_history_timeframe_hours_json | script_json_text }},
+    initialHistoryPanelOpen: {{ initial_history_panel_open_json | script_json_text }},
+    initialHistoryIoChartMode: {{ initial_history_io_chart_mode_json | script_json_text }},
   };
 </script>
 {% endblock %}
