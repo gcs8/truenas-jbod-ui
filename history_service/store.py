@@ -181,6 +181,8 @@ class HistoryStore:
         self.recover_unreadable_database = bool(recover_unreadable_database)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._journal_mode_lock = threading.Lock()
+        self._journal_mode_identity: tuple[int, int] | None = None
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -192,6 +194,21 @@ class HistoryStore:
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
             connection.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_SIZE_KIB}")
+            self._ensure_journal_mode(connection)
+        except sqlite3.Error:
+            connection.close()
+            raise
+        return connection
+
+    def _ensure_journal_mode(self, connection: sqlite3.Connection) -> None:
+        try:
+            stat_result = self.file_path.stat()
+            identity = (int(stat_result.st_dev), int(stat_result.st_ino))
+        except FileNotFoundError:
+            identity = None
+        with self._journal_mode_lock:
+            if identity is not None and identity == self._journal_mode_identity:
+                return
             try:
                 connection.execute("PRAGMA journal_mode=WAL")
             except sqlite3.OperationalError as exc:
@@ -202,10 +219,8 @@ class HistoryStore:
                     self.file_path,
                     exc,
                 )
-        except sqlite3.Error:
-            connection.close()
-            raise
-        return connection
+                return
+            self._journal_mode_identity = identity
 
     def database_size_bytes(self) -> int:
         total = 0

@@ -78,6 +78,12 @@ HISTORY_COLLECTOR_RUNNING = Gauge(
     labelnames=("service",),
     namespace=METRICS_NAMESPACE,
 )
+HISTORY_COLLECTION_SCHEDULE_OVERRUN_SECONDS = Gauge(
+    "history_collection_schedule_overrun_seconds",
+    "Seconds by which the latest background collection exceeded its configured interval.",
+    labelnames=("service",),
+    namespace=METRICS_NAMESPACE,
+)
 HISTORY_LAST_SCOPE_COUNT = Gauge(
     "history_last_scope_count",
     "Number of inventory scopes seen in the latest collector pass.",
@@ -248,6 +254,17 @@ def set_history_collector_running(service_name: str, running: bool) -> None:
     if not metrics_enabled():
         return
     HISTORY_COLLECTOR_RUNNING.labels(service=service_name).set(1 if running else 0)
+
+
+def set_history_collection_schedule_overrun(
+    service_name: str,
+    overrun_seconds: float,
+) -> None:
+    if not metrics_enabled():
+        return
+    HISTORY_COLLECTION_SCHEDULE_OVERRUN_SECONDS.labels(service=service_name).set(
+        max(0.0, overrun_seconds)
+    )
 
 
 def observe_history_collection_run(

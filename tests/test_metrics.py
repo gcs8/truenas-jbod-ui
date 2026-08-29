@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from app.config import Settings, SystemConfig, TrueNASConfig
 from app.metrics import install_metrics
 from app.metrics import observe_history_collection_run
+from app.metrics import set_history_collection_schedule_overrun
 from app.metrics import set_history_collector_running
 from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView
 from app.services.inventory import InventoryService
@@ -121,6 +122,7 @@ class HistoryMetricsTests(unittest.TestCase):
         with patch.dict("os.environ", {"METRICS_ENABLED": "true", "METRICS_PATH": "/metrics"}, clear=False):
             install_metrics(app, service_name=scrape_service_name, version="0.0.0-test")
             set_history_collector_running(history_service_name, True)
+            set_history_collection_schedule_overrun(history_service_name, 2.5)
             observe_history_collection_run(
                 service_name=history_service_name,
                 result="success",
@@ -149,6 +151,11 @@ class HistoryMetricsTests(unittest.TestCase):
         self.assertIn('result="success"', metrics_text)
         self.assertIn('truenas_jbod_ui_history_last_scope_count', metrics_text)
         self.assertIn('truenas_jbod_ui_history_tracked_slots', metrics_text)
+        self.assertIn('truenas_jbod_ui_history_collection_schedule_overrun_seconds', metrics_text)
+        self.assertIn(
+            f'truenas_jbod_ui_history_collection_schedule_overrun_seconds{{service="{history_service_name}"}} 2.5',
+            metrics_text,
+        )
 
 
 class InventoryMetricsTests(unittest.IsolatedAsyncioTestCase):

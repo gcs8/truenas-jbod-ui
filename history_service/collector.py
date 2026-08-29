@@ -13,7 +13,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from history_service.config import HistorySettings
-from app.metrics import observe_history_collection_run, set_history_collector_running
+from app.metrics import (
+    observe_history_collection_run,
+    set_history_collection_schedule_overrun,
+    set_history_collector_running,
+)
 from history_service.domain import (
     MetricSample,
     SlotStateRecord,
@@ -75,6 +79,10 @@ class HistoryCollectionAlreadyRunning(RuntimeError):
     pass
 
 
+class HistoryCollectionStopping(RuntimeError):
+    pass
+
+
 class HistoryCollector:
     def __init__(self, settings: HistorySettings, store: HistoryStore) -> None:
         self.settings = settings
@@ -96,6 +104,7 @@ class HistoryCollector:
         self.current_collection_stage_timings: list[dict[str, Any]] = []
         self.last_collection_inventory_forced: bool | None = None
         self.last_collection_duration_seconds: float | None = None
+        self.last_background_overrun_seconds: float = 0.0
         self.last_collection_stage_timings: list[dict[str, Any]] = []
         self.background_consecutive_failures: int = 0
         self.background_backoff_until: datetime | None = None
@@ -115,15 +124,17 @@ class HistoryCollector:
         set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, True)
 
     async def stop(self) -> None:
-        if not self._task:
-            return
+        task = self._task
         self._stopping.set()
-        self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
-        self._task = None
+        if task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await asyncio.to_thread(self._wait_for_collection_quiescence)
+        if task:
+            if self._task is task:
+                self._task = None
         set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, False)
 
     async def run_once(
@@ -188,6 +199,7 @@ class HistoryCollector:
         include_due_intervals: bool = True,
         cached_root_only: bool = False,
     ) -> None:
+        self._raise_if_stopping()
         run_started = utcnow()
         observed_at = isoformat_utc(run_started)
         collect_fast = force_fast or (
@@ -218,6 +230,7 @@ class HistoryCollector:
         if cached_root_only and not force_inventory:
             enumerate_kwargs["cached_root_only"] = True
         scopes = await self._enumerate_scopes(**enumerate_kwargs)
+        self._raise_if_stopping()
         self._record_collection_stage(
             "enumerate.scopes",
             time.perf_counter() - enumerate_started,
@@ -228,6 +241,7 @@ class HistoryCollector:
         self.last_inventory_at = observed_at
 
         for scope_index, scope in enumerate(scopes, start=1):
+            self._raise_if_stopping()
             scope_label = self._scope_activity_label(scope)
             self._set_collection_activity(f"recording {scope_label} ({scope_index}/{len(scopes)})")
             if not self._should_record_scope_snapshot(scope.snapshot):
@@ -251,6 +265,7 @@ class HistoryCollector:
                 for slot_payload in scope.snapshot.get("slots", [])
             ]
             slot_state_started = time.perf_counter()
+            self._raise_if_stopping()
             self._record_slot_changes(slot_records, observed_at)
             self._record_collection_stage(
                 "db.slot_state",
@@ -292,6 +307,7 @@ class HistoryCollector:
                     error=str(exc),
                 )
                 continue
+            self._raise_if_stopping()
             self._record_collection_stage(
                 "smart.fresh" if collect_slow else "smart.cached",
                 time.perf_counter() - smart_started,
@@ -319,6 +335,7 @@ class HistoryCollector:
                     )
             if metric_samples:
                 metrics_started = time.perf_counter()
+                self._raise_if_stopping()
                 self.store.insert_metric_samples(metric_samples)
                 self._record_collection_stage(
                     "db.metrics",
@@ -335,6 +352,7 @@ class HistoryCollector:
             self.last_fast_metrics_at = observed_at
         if collect_slow:
             self.last_slow_metrics_at = observed_at
+            self._raise_if_stopping()
             try:
                 latest_backup_at = self._latest_backup_at()
                 if not self._backup_due(run_started, latest_backup_at=latest_backup_at):
@@ -350,6 +368,7 @@ class HistoryCollector:
                 else:
                     self._set_collection_activity("creating history database backup")
                     backup_started = time.perf_counter()
+                    self._raise_if_stopping()
                     backup_path = self.store.create_backup(
                         self.settings.backup_dir,
                         snapshot_label=observed_at,
@@ -387,6 +406,7 @@ class HistoryCollector:
             else list(self.last_collection_stage_timings),
             "last_collection_inventory_forced": self.last_collection_inventory_forced,
             "last_collection_duration_seconds": self.last_collection_duration_seconds,
+            "last_background_overrun_seconds": self.last_background_overrun_seconds,
             "background_consecutive_failures": self.background_consecutive_failures,
             "background_backoff_until": isoformat_utc(self.background_backoff_until)
             if self.background_backoff_until
@@ -418,7 +438,13 @@ class HistoryCollector:
 
     async def _run_loop(self) -> None:
         if self.settings.startup_grace_seconds > 0:
-            await asyncio.sleep(self.settings.startup_grace_seconds)
+            try:
+                await asyncio.wait_for(
+                    self._stopping.wait(),
+                    timeout=self.settings.startup_grace_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
 
         while not self._stopping.is_set():
             if self.collection_running:
@@ -474,6 +500,9 @@ class HistoryCollector:
                 )
             except HistoryCollectionAlreadyRunning:
                 logger.info("Skipping scheduled history collection because another collection pass is already running.")
+            except HistoryCollectionStopping:
+                logger.info("Stopping the scheduled history collection at a safe stage boundary.")
+                break
             except Exception as exc:  # noqa: BLE001 - keep the collector alive across transient appliance errors.
                 logger.exception("History collection pass failed")
                 self.last_error = str(exc)
@@ -494,8 +523,10 @@ class HistoryCollector:
                     if self.last_success_at is None
                     else self.settings.poll_interval_seconds
                 )
-                sleep_for = max(1.0, target_interval)
-                self._schedule_next_collection_after(sleep_for)
+                sleep_for = self._schedule_next_background_collection(
+                    started_monotonic=started_monotonic,
+                    target_interval=max(1.0, float(target_interval)),
+                )
             try:
                 await asyncio.wait_for(self._stopping.wait(), timeout=sleep_for)
             except asyncio.TimeoutError:
@@ -527,6 +558,45 @@ class HistoryCollector:
 
     def _schedule_next_collection_after(self, seconds: float) -> None:
         self.next_collection_at = utcnow() + timedelta(seconds=max(1.0, seconds))
+
+    def _raise_if_stopping(self) -> None:
+        if self._stopping.is_set():
+            raise HistoryCollectionStopping("History collection is stopping.")
+
+    def _wait_for_collection_quiescence(self) -> None:
+        self._run_lock.acquire()
+        self._run_lock.release()
+
+    def _schedule_next_background_collection(
+        self,
+        *,
+        started_monotonic: float,
+        target_interval: float,
+    ) -> float:
+        elapsed = max(0.0, time.perf_counter() - started_monotonic)
+        overrun = max(0.0, elapsed - target_interval)
+        self.last_background_overrun_seconds = round(overrun, 3)
+        set_history_collection_schedule_overrun(
+            HISTORY_METRICS_SERVICE_NAME,
+            self.last_background_overrun_seconds,
+        )
+        if overrun <= 0:
+            sleep_for = max(0.0, target_interval - elapsed)
+        else:
+            interval_remainder = elapsed % target_interval
+            sleep_for = (
+                target_interval
+                if interval_remainder < 1e-9
+                else target_interval - interval_remainder
+            )
+        self.next_collection_at = utcnow() + timedelta(seconds=sleep_for)
+        if overrun > 0:
+            logger.warning(
+                "History background collection overran its %.1f-second interval by %.1f seconds.",
+                target_interval,
+                overrun,
+            )
+        return sleep_for
 
     def _set_collection_activity(self, message: str) -> None:
         self.current_collection_activity = message
