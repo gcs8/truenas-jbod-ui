@@ -1690,6 +1690,25 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertTrue(db_path.exists())
         self.assertEqual(len(broken_files), 1)
 
+    def test_store_can_fail_closed_without_quarantining_unreadable_database(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        original = b"not a sqlite database"
+        db_path.write_bytes(original)
+
+        with self.assertRaises(sqlite3.DatabaseError):
+            HistoryStore(str(db_path), recover_unreadable_database=False)
+
+        self.assertEqual(db_path.read_bytes(), original)
+        self.assertEqual(list(temp_dir.glob("history.db.broken-*")), [])
+
+    def test_store_does_not_quarantine_transient_open_failures(self) -> None:
+        self.assertFalse(
+            HistoryStore._should_recover_database(
+                sqlite3.OperationalError("unable to open database file")
+            )
+        )
+
     def test_store_creates_rotating_backup_snapshots(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))

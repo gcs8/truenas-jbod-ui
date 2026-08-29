@@ -20,6 +20,7 @@ from admin_service.main import annotate_runtime_versions
 from admin_service.main import build_admin_state_payload
 from admin_service.main import decode_optional_secret_header
 from admin_service.main import enrich_quantastor_nodes_from_ssh
+from admin_service.main import get_history_store
 from admin_service.main import templates as admin_templates
 from app.config import (
     AdminSurfaceConfig,
@@ -101,6 +102,25 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("/api/admin/history/adopt-removed-system", paths)
         self.assertIn("/api/admin/debug/export", paths)
         self.assertIn("/api/admin/runtime-behavior", paths)
+
+    def test_admin_history_store_disables_destructive_database_recovery(self) -> None:
+        get_history_store.cache_clear()
+        try:
+            with (
+                patch(
+                    "admin_service.main.get_history_settings",
+                    return_value=SimpleNamespace(sqlite_path="/tmp/admin-history.sqlite3"),
+                ),
+                patch("admin_service.main.HistoryStore") as history_store,
+            ):
+                get_history_store()
+
+            history_store.assert_called_once_with(
+                "/tmp/admin-history.sqlite3",
+                recover_unreadable_database=False,
+            )
+        finally:
+            get_history_store.cache_clear()
 
     def test_main_app_does_not_expose_embedded_admin_routes(self) -> None:
         paths = {route.path for route in main_app.routes}

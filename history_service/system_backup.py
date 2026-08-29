@@ -342,10 +342,6 @@ class _ImportActivationTransaction:
         finally:
             self._cleanup_sibling_artifact(temp_path)
 
-    def delete_target(self, target_path: Path) -> None:
-        entry = self._record_target(target_path)
-        self._park_original(entry)
-
     def activate_directory(
         self,
         target_dir: Path,
@@ -1102,6 +1098,12 @@ class SystemBackupService:
         transaction: _ImportActivationTransaction,
     ) -> dict[str, Any]:
         restored_paths: list[str] = []
+        preserved_absent_groups = [
+            key
+            for key in BACKUP_GROUP_METADATA
+            if self._manifest_group_selected(group_entries.get(key))
+            and not self._manifest_group_present(group_entries.get(key))
+        ]
         app_settings = self._load_app_settings()
 
         self._restore_file_group(
@@ -1230,6 +1232,7 @@ class SystemBackupService:
             ],
             "restored_history_database": history_restored,
             "restored_paths": restored_paths,
+            "preserved_absent_groups": preserved_absent_groups,
         }
 
     def _load_app_settings(self) -> Settings:
@@ -2371,10 +2374,8 @@ class SystemBackupService:
             return
         if self._manifest_group_present(group_entry):
             raise ValueError(f"Backup bundle is missing the selected {group_key} member.")
-        if transaction is None:
-            self._delete_if_exists(target_path)
-        else:
-            transaction.delete_target(target_path)
+        # `present=false` describes the source backup. It is not permission to
+        # delete data that may have been created after that backup was taken.
 
     def _restore_directory_group(
         self,
@@ -2393,10 +2394,8 @@ class SystemBackupService:
         if not member_entries:
             if self._manifest_group_present(group_entry):
                 raise ValueError(f"Backup bundle is missing the selected {group_key} directory members.")
-            if transaction is None:
-                self._remove_tree_if_exists(target_dir)
-            else:
-                transaction.delete_target(target_dir)
+            # Preserve newer live keys or trust material when an older backup
+            # selected this group but had no directory to export.
             return
 
         restore_targets: list[tuple[str, Path]] = []
@@ -2552,11 +2551,6 @@ class SystemBackupService:
         temp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
         temp_path.write_bytes(content)
         temp_path.replace(target_path)
-
-    @staticmethod
-    def _delete_if_exists(target_path: Path) -> None:
-        if target_path.exists():
-            target_path.unlink()
 
     @staticmethod
     def _remove_tree_if_exists(target_dir: Path) -> None:

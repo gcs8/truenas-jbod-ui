@@ -5547,13 +5547,21 @@
       state.systems = Array.isArray(payload.systems) ? payload.systems : state.systems;
       state.defaultSystemId = payload.default_system_id || state.defaultSystemId;
       const importRestartFailures = restartFailureKeys(payload.restart_failures);
+      const preservedAbsentGroups = Array.isArray(payload.preserved_absent_groups)
+        ? payload.preserved_absent_groups.filter(Boolean)
+        : [];
+      const preservedAbsentDetail = preservedAbsentGroups.length
+        ? ` Preserved live data for source-absent groups: ${preservedAbsentGroups.join(", ")}.`
+        : "";
       if (elements.backupImportResult) {
         const stopped = Array.isArray(payload.stopped_containers) ? payload.stopped_containers.join(", ") || "none" : "none";
         const restarted = Array.isArray(payload.restarted_containers) ? payload.restarted_containers.join(", ") || "none" : "none";
-        elements.backupImportResult.textContent = `Imported ${file.name}. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(importRestartFailures)}`;
+        elements.backupImportResult.textContent = `Imported ${file.name}. Stopped: ${stopped}. Restarted: ${restarted}.${describeRestartFailures(importRestartFailures)}${preservedAbsentDetail}`;
       }
       if (importRestartFailures) {
-        setBanner(`Full backup imported from ${file.name}, but these containers did not restart: ${importRestartFailures}. Use the runtime cards to start them.`, "error");
+        setBanner(`Full backup imported from ${file.name}, but these containers did not restart: ${importRestartFailures}. Use the runtime cards to start them.${preservedAbsentDetail}`, "error");
+      } else if (preservedAbsentGroups.length) {
+        setBanner(`Full backup imported from ${file.name}.${preservedAbsentDetail}`, "info");
       } else {
         setBanner(`Full backup imported from ${file.name}.`, "success");
       }

@@ -100,7 +100,10 @@ def reload_app_settings() -> Settings:
 @lru_cache
 def get_history_store() -> HistoryStore:
     history_settings = get_history_settings()
-    return HistoryStore(history_settings.sqlite_path)
+    return HistoryStore(
+        history_settings.sqlite_path,
+        recover_unreadable_database=False,
+    )
 
 
 def decode_optional_secret_header(value: str | None) -> str | None:

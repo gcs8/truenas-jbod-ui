@@ -171,8 +171,14 @@ CREATE INDEX IF NOT EXISTS idx_metric_samples_scope
 
 
 class HistoryStore:
-    def __init__(self, file_path: str) -> None:
+    def __init__(
+        self,
+        file_path: str,
+        *,
+        recover_unreadable_database: bool = True,
+    ) -> None:
         self.file_path = Path(file_path)
+        self.recover_unreadable_database = bool(recover_unreadable_database)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._initialize()
@@ -222,7 +228,10 @@ class HistoryStore:
             if self._is_readonly_database_error(exc) and self._attempt_readonly_database_repair(exc):
                 self._initialize_schema()
                 return
-            if not self._should_recover_database(exc):
+            if (
+                not self.recover_unreadable_database
+                or not self._should_recover_database(exc)
+            ):
                 raise
             broken_path = self._quarantine_database()
             logger.warning(
@@ -233,7 +242,10 @@ class HistoryStore:
             )
             self._initialize_schema()
         except sqlite3.Error as exc:
-            if not self._should_recover_database(exc):
+            if (
+                not self.recover_unreadable_database
+                or not self._should_recover_database(exc)
+            ):
                 raise
             broken_path = self._quarantine_database()
             logger.warning(
@@ -332,7 +344,6 @@ class HistoryStore:
         return any(
             fragment in message
             for fragment in (
-                "unable to open database file",
                 "file is not a database",
                 "database disk image is malformed",
             )
