@@ -451,3 +451,11 @@ test("backup export, debug export, and import errors are described instead of st
     assert.match(functionSource(name), /describeApiError\(payload\?\.detail\)/, `${name} must describe API errors`);
   }
 });
+
+test("backup import reports source-absent groups whose live data was preserved", () => {
+  const source = functionSource("importBackup");
+
+  assert.match(source, /payload\.preserved_absent_groups/);
+  assert.match(source, /Preserved live data/);
+  assert.match(source, /"info"/);
+});

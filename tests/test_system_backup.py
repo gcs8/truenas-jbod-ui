@@ -454,6 +454,55 @@ class SystemBackupServiceTests(unittest.TestCase):
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
         self.assertEqual(restored_paths, [])
 
+    def test_import_preserves_live_targets_for_selected_absent_groups(self) -> None:
+        def tree_bytes(root: Path) -> dict[str, bytes]:
+            return {
+                str(path.relative_to(root)): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+        original_mapping = self.mapping_path.read_bytes()
+        original_ssh = tree_bytes(self.ssh_dir)
+        original_history_counts = self.store.counts()
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "packaging": "zip",
+            "groups": [
+                {
+                    "key": MAPPING_FILE_KEY,
+                    "selected": True,
+                    "present": False,
+                    "restore_mode": "file",
+                },
+                {
+                    "key": SSH_KEYS_KEY,
+                    "selected": True,
+                    "present": False,
+                    "restore_mode": "directory",
+                },
+                {
+                    "key": HISTORY_DB_KEY,
+                    "selected": True,
+                    "present": False,
+                    "restore_mode": "history_db",
+                },
+            ],
+            "files": [],
+        }
+
+        result = self.backup_service.import_bundle(self._build_zip_bundle(manifest))
+
+        self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+        self.assertEqual(tree_bytes(self.ssh_dir), original_ssh)
+        self.assertEqual(self.store.counts(), original_history_counts)
+        self.assertEqual(result["restored_paths"], [])
+        self.assertEqual(
+            result["preserved_absent_groups"],
+            [MAPPING_FILE_KEY, HISTORY_DB_KEY, SSH_KEYS_KEY],
+        )
+
     def test_import_rejects_missing_manifest_member_before_replacing_existing_dir(self) -> None:
         manifest = {
             "schema_version": BUNDLE_SCHEMA_VERSION,
