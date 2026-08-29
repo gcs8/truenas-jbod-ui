@@ -8242,6 +8242,235 @@ Enclosure Status diagnostic page:
             self.assertIn("sudo -n /usr/sbin/nvme id-ns -o json /dev/nvme0n2", service.ssh_probe.commands)
 
 
+class InventorySlotDetailCacheTests(unittest.TestCase):
+    def _assert_apply_loads_once(self, slot_count: int) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            slots = [
+                SlotView(
+                    slot=slot,
+                    slot_label=str(slot),
+                    row_index=slot,
+                    column_index=0,
+                    enclosure_id="enc-1",
+                    present=True,
+                    state=SlotState.healthy,
+                    device_name=f"da{slot}",
+                )
+                for slot in range(slot_count)
+            ]
+            store = service.slot_detail_store
+            self.assertIsNotNone(store)
+            assert store is not None
+            store.save_entries(
+                [
+                    SlotDetailCacheEntry(
+                        system_id=system.id,
+                        enclosure_id="enc-1",
+                        slot=slot,
+                        identifiers=[f"da{slot}"],
+                        slot_fields={"model": f"cached-model-{slot}"},
+                    )
+                    for slot in range(slot_count)
+                ]
+            )
+            store.load_all = MagicMock(  # type: ignore[method-assign]
+                wraps=store.load_all
+            )
+
+            service._apply_persisted_slot_details(slots)
+
+            self.assertEqual(store.load_all.call_count, 1)
+            self.assertEqual(
+                [slot.model for slot in slots],
+                [f"cached-model-{slot}" for slot in range(slot_count)],
+            )
+
+    def test_apply_persisted_slot_details_loads_once_for_60_slot_snapshot(self) -> None:
+        self._assert_apply_loads_once(60)
+
+    def test_apply_persisted_slot_details_loads_once_for_347_slot_snapshot(self) -> None:
+        self._assert_apply_loads_once(347)
+
+    def test_apply_persisted_slot_details_keeps_zero_slot_snapshots_at_zero_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            store = service.slot_detail_store
+            self.assertIsNotNone(store)
+            assert store is not None
+            store.load_all = MagicMock(wraps=store.load_all)  # type: ignore[method-assign]
+
+            service._apply_persisted_slot_details([])
+
+            store.load_all.assert_not_called()
+
+    def test_get_entry_uses_supplied_empty_mapping_without_reloading(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json"))
+            store.load_all = MagicMock(wraps=store.load_all)  # type: ignore[method-assign]
+
+            entry = store.get_entry("default", "enc-1", 0, loaded_entries={})
+
+            self.assertIsNone(entry)
+            store.load_all.assert_not_called()
+
+    def test_apply_persisted_slot_details_preserves_live_fields_and_rejects_identifier_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                Settings(),
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            slots = [
+                SlotView(
+                    slot=0,
+                    slot_label="0",
+                    row_index=0,
+                    column_index=0,
+                    enclosure_id="enc-1",
+                    present=True,
+                    state=SlotState.healthy,
+                    device_name="da0",
+                ),
+                SlotView(
+                    slot=1,
+                    slot_label="1",
+                    row_index=0,
+                    column_index=1,
+                    enclosure_id="enc-1",
+                    present=True,
+                    state=SlotState.healthy,
+                    device_name="da1",
+                    model="live-model",
+                ),
+                SlotView(
+                    slot=2,
+                    slot_label="2",
+                    row_index=0,
+                    column_index=2,
+                    enclosure_id="enc-1",
+                    present=True,
+                    state=SlotState.healthy,
+                    device_name="da2",
+                ),
+            ]
+            store = service.slot_detail_store
+            self.assertIsNotNone(store)
+            assert store is not None
+            store.save_entries(
+                [
+                    SlotDetailCacheEntry(
+                        system_id=system.id,
+                        enclosure_id="enc-1",
+                        slot=0,
+                        identifiers=["da0"],
+                        slot_fields={"model": "cached-model"},
+                    ),
+                    SlotDetailCacheEntry(
+                        system_id=system.id,
+                        enclosure_id="enc-1",
+                        slot=1,
+                        identifiers=["da1"],
+                        slot_fields={"model": "stale-model"},
+                    ),
+                    SlotDetailCacheEntry(
+                        system_id=system.id,
+                        enclosure_id="enc-1",
+                        slot=2,
+                        identifiers=["different-device"],
+                        slot_fields={"model": "wrong-model"},
+                    ),
+                ]
+            )
+
+            service._apply_persisted_slot_details(slots)
+
+            self.assertEqual(slots[0].model, "cached-model")
+            self.assertEqual(slots[1].model, "live-model")
+            self.assertIsNone(slots[2].model)
+
+    def test_apply_persisted_slot_details_loads_corrupt_cache_once_and_leaves_slots_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            slot = SlotView(
+                slot=0,
+                slot_label="0",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-1",
+                present=True,
+                state=SlotState.healthy,
+                device_name="da0",
+            )
+            store = service.slot_detail_store
+            self.assertIsNotNone(store)
+            assert store is not None
+            store.file_path.write_text("{", encoding="utf-8")
+            store.load_all = MagicMock(wraps=store.load_all)  # type: ignore[method-assign]
+
+            service._apply_persisted_slot_details([slot])
+
+            self.assertEqual(store.load_all.call_count, 1)
+            self.assertIsNone(slot.model)
+
+    def test_persist_slot_details_writes_once_for_60_and_347_slot_batches(self) -> None:
+        for slot_count in (60, 347):
+            with self.subTest(slot_count=slot_count), tempfile.TemporaryDirectory() as temp_dir:
+                service = build_inventory_service(
+                    Settings(),
+                    SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                    AsyncMock(),
+                    AsyncMock(),
+                    temp_dir,
+                )
+                slots = [
+                    SlotView(
+                        slot=slot,
+                        slot_label=str(slot),
+                        row_index=slot,
+                        column_index=0,
+                        enclosure_id="enc-1",
+                        present=True,
+                        state=SlotState.healthy,
+                        device_name=f"da{slot}",
+                        model=f"model-{slot}",
+                    )
+                    for slot in range(slot_count)
+                ]
+                store = service.slot_detail_store
+                self.assertIsNotNone(store)
+                assert store is not None
+                store._write = MagicMock(wraps=store._write)  # type: ignore[method-assign]
+
+                service._persist_slot_details(slots)
+
+                self.assertEqual(store._write.call_count, 1)
+                self.assertEqual(len(store.load_all()), slot_count)
+
+
 class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_snapshot_can_return_stale_cache_while_refresh_runs_in_background(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
