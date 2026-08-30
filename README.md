@@ -1,6 +1,6 @@
 # TrueNAS JBOD Enclosure UI
 
-Off-box enclosure and disk visualization for oddball storage hardware.
+Off-box enclosure and disk visualization for validated TrueNAS, ESXi, generic Linux, Quantastor, BMC/IPMI, and UniFi paths.
 
 This project runs in Docker on a separate host and gives you a physical slot
 view, disk detail, topology context, and LED actions where the platform can
