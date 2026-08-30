@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "fixture_version": 1,
+  "modeled": true,
+  "wall_clock_policy": "report-only",
+  "cases": {
+    "60": {
+      "slot_count": 60,
+      "inventory_response_bytes": 84590,
+      "scope_history_response_bytes": 495708,
+      "scope_history_connections": 1,
+      "scope_history_select_statements": 20,
+      "history_status_calls": 1,
+      "history_scope_calls": 1,
+      "history_slot_calls": 0,
+      "render_calls": 1,
+      "zip_build_calls": 0,
+      "history_cache_entries": 1,
+      "render_cache_entries": 1,
+      "zip_cache_entries": 0,
+      "export_html_bytes": 2253004,
+      "logical_retained_bytes": 2752718,
+      "thresholds": {
+        "inventory_response_bytes": 98304,
+        "scope_history_response_bytes": 655360,
+        "scope_history_select_statements": 20,
+        "export_html_bytes": 8388608,
+        "logical_retained_bytes": 20971520
+      }
+    },
+    "347": {
+      "slot_count": 347,
+      "inventory_response_bytes": 488252,
+      "scope_history_response_bytes": 2884190,
+      "scope_history_connections": 1,
+      "scope_history_select_statements": 20,
+      "history_status_calls": 1,
+      "history_scope_calls": 1,
+      "history_slot_calls": 0,
+      "render_calls": 1,
+      "zip_build_calls": 0,
+      "history_cache_entries": 1,
+      "render_cache_entries": 1,
+      "zip_cache_entries": 0,
+      "export_html_bytes": 5274048,
+      "logical_retained_bytes": 8181473,
+      "thresholds": {
+        "inventory_response_bytes": 524288,
+        "scope_history_response_bytes": 3145728,
+        "scope_history_select_statements": 20,
+        "export_html_bytes": 12582912,
+        "logical_retained_bytes": 33554432
+      }
+    }
+  }
+}

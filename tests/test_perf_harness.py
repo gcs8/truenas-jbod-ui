@@ -24,6 +24,39 @@ HISTORY_SPEC.loader.exec_module(run_history_perf_harness)
 
 
 class PerfHarnessTests(unittest.TestCase):
+    def test_request_metrics_retain_response_bytes_and_payload_counts(self) -> None:
+        response = run_perf_harness.ApiResponse(
+            data={
+                "slots": [{"slot": 0}, {"slot": 1}],
+                "summary": {"disk_count": 2},
+                "cache_state": "fresh",
+                "html_size_bytes": 4096,
+            },
+            headers={"server-timing": 'app;desc="total";dur=5.0'},
+            response_bytes=512,
+        )
+
+        metrics = run_perf_harness.build_request_metrics(response)
+        merged = run_perf_harness.merge_request_metrics(metrics, metrics)
+        result = run_perf_harness.RunResult(
+            name="inventory_cached",
+            duration_ms=5.0,
+            request_count=merged.request_count,
+            response_bytes=merged.response_bytes,
+            metadata_counts=merged.metadata_counts,
+        )
+        summary = run_perf_harness.summarize([result])[0]
+
+        self.assertEqual(metrics.response_bytes, 512)
+        self.assertEqual(metrics.metadata_counts["slot_count"], 2)
+        self.assertEqual(metrics.metadata_counts["summary.disk_count"], 2)
+        self.assertEqual(metrics.metadata_counts["cache_state.fresh"], 1)
+        self.assertEqual(metrics.metadata_counts["html_size_bytes"], 4096)
+        self.assertEqual(merged.response_bytes, 1024)
+        self.assertEqual(summary["avg_response_bytes"], 1024.0)
+        self.assertEqual(summary["max_response_bytes"], 1024)
+        self.assertEqual(summary["metadata_summary"][0]["label"], "html_size_bytes")
+
     def test_parse_server_timing_extracts_named_stage_durations(self) -> None:
         header = 'app;desc="total";dur=101.4, stage-1;desc="inventory.build_snapshot";dur=87.2, stage-2;desc="smart.ssh.fetch x4";dur=42.0'
 
@@ -82,6 +115,42 @@ class PerfHarnessTests(unittest.TestCase):
 
         self.assertEqual([item["name"] for item in summary], ["faster", "slower"])
 
+    def test_markdown_includes_response_bytes_and_payload_metadata(self) -> None:
+        payload = {
+            "recorded_at": "2026-08-29T20:00:00Z",
+            "label": "modeled",
+            "base_url": "http://127.0.0.1:8080",
+            "system_id": None,
+            "enclosure_id": None,
+            "git": {"branch": "topic", "commit": "abc123", "dirty": True},
+            "summary": [
+                {
+                    "name": "inventory_cached",
+                    "iterations": 1,
+                    "avg_requests": 1.0,
+                    "avg_response_bytes": 2048.0,
+                    "max_response_bytes": 2048,
+                    "min_ms": 1.0,
+                    "avg_ms": 1.0,
+                    "p50_ms": 1.0,
+                    "p95_ms": 1.0,
+                    "max_ms": 1.0,
+                    "stage_summary": [],
+                    "metadata_summary": [
+                        {"label": "slot_count", "avg": 347.0, "max": 347.0}
+                    ],
+                }
+            ],
+            "comparison": [],
+            "baseline": None,
+            "artifacts": None,
+        }
+
+        markdown = run_perf_harness.render_markdown(payload)
+
+        self.assertIn("2.0 KiB", markdown)
+        self.assertIn("slot_count", markdown)
+
     def test_write_history_files_creates_latest_and_csv_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             record_dir = Path(temp_dir)
@@ -127,6 +196,22 @@ class PerfHarnessTests(unittest.TestCase):
 
 
 class HistoryPerfHarnessTests(unittest.TestCase):
+    def test_history_response_bytes_flow_into_shared_request_metrics(self) -> None:
+        response = run_history_perf_harness.HistoryApiResponse(
+            data={"cache_state": "stale", "counts": {"tracked_slots": 347}},
+            headers={},
+            response_bytes=2048,
+        )
+
+        metrics = run_history_perf_harness.metrics_from_payload(
+            response.data,
+            response_bytes=response.response_bytes,
+        )
+
+        self.assertEqual(metrics.response_bytes, 2048)
+        self.assertEqual(metrics.metadata_counts["cache_state.stale"], 1)
+        self.assertEqual(metrics.metadata_counts["counts.tracked_slots"], 347)
+
     def test_collector_stage_totals_from_payload_sums_duplicate_stages(self) -> None:
         payload = {
             "collector": {
@@ -177,6 +262,11 @@ class HistoryPerfHarnessTests(unittest.TestCase):
                     "p50_ms": 12.0,
                     "p95_ms": 15.0,
                     "max_ms": 15.0,
+                    "avg_response_bytes": 2048.0,
+                    "max_response_bytes": 2048,
+                    "metadata_summary": [
+                        {"label": "counts.tracked_slots", "avg": 227.0, "max": 227.0}
+                    ],
                     "stage_summary": [],
                 }
             ],
@@ -191,6 +281,8 @@ class HistoryPerfHarnessTests(unittest.TestCase):
         self.assertIn("collecting SMART metrics", markdown)
         self.assertIn("462.1 MiB", markdown)
         self.assertIn("overview_estimated", markdown)
+        self.assertIn("2.0 KiB", markdown)
+        self.assertIn("counts.tracked_slots", markdown)
 
     def test_write_history_perf_files_creates_latest_and_csv_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
