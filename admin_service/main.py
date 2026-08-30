@@ -472,6 +472,11 @@ def create_app() -> FastAPI:
     async def get_admin_state(request: Request) -> JSONResponse:
         return JSONResponse(await build_admin_state_payload(request))
 
+    @app.get("/api/admin/runtime")
+    async def get_admin_runtime() -> JSONResponse:
+        runtime_payload = await build_runtime_payload()
+        return JSONResponse({"ok": True, "runtime": project_runtime_observation(runtime_payload)})
+
     @app.post("/api/admin/runtime-behavior")
     async def update_runtime_behavior(payload: dict[str, Any]) -> JSONResponse:
         settings = reload_app_settings()
@@ -1404,6 +1409,59 @@ async def build_runtime_payload(runtime_service: DockerRuntimeService | None = N
     service = runtime_service or get_runtime_service()
     runtime_payload = await asyncio.to_thread(service.status_payload)
     return annotate_runtime_versions(runtime_payload, get_release_status_service().snapshot())
+
+
+RUNTIME_OBSERVATION_CONTAINER_FIELDS = (
+    "key",
+    "name",
+    "label",
+    "description",
+    "status",
+    "status_text",
+    "running",
+    "health",
+    "restart_required",
+    "lifecycle_state",
+    "lifecycle_label",
+    "can_stop",
+    "can_start",
+    "can_restart",
+    "running_version",
+    "latest_version",
+    "version_sync_state",
+)
+
+
+def project_runtime_observation(runtime_payload: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(runtime_payload or {})
+    available = bool(payload.get("available"))
+    containers: list[dict[str, Any]] = []
+    for raw_container in payload.get("containers") or []:
+        if not isinstance(raw_container, dict):
+            continue
+        container = {
+            field_name: raw_container.get(field_name)
+            for field_name in RUNTIME_OBSERVATION_CONTAINER_FIELDS
+        }
+        raw_release_status = raw_container.get("release_status")
+        release_status = raw_release_status if isinstance(raw_release_status, dict) else {}
+        container["release_status"] = {
+            "status": release_status.get("status"),
+            "summary": release_status.get("summary"),
+        }
+        container["version_sync_summary"] = (
+            "Running container could not report a version."
+            if raw_container.get("version_probe_error")
+            else raw_container.get("version_sync_summary")
+        )
+        containers.append(container)
+    return {
+        "available": available,
+        "detail": None if available else "Docker runtime control is unavailable.",
+        "version_state": payload.get("version_state"),
+        "version_detail": payload.get("version_detail"),
+        "containers": containers,
+    }
 
 
 def annotate_runtime_versions(

@@ -70,6 +70,8 @@
     refreshPromise: null,
     refreshQueued: null,
     refreshQueuedQuiet: true,
+    runtimeActionPromises: new Map(),
+    runtimeActionControllers: new Map(),
     countdownTimerId: null,
     sudoersPreviewTimerId: null,
     sudoersPreviewRequestSeq: 0,
@@ -729,6 +731,7 @@
     button.dataset.runtimeAction = action;
     button.dataset.containerKey = String(container.key || "");
     button.textContent = label;
+    button.disabled = state.runtimeActionPromises.has(button.dataset.containerKey);
     return button;
   }
 
@@ -5337,24 +5340,224 @@
     }
   }
 
-  async function runRuntimeAction(containerKey, action) {
+  function runtimeContainerObservation(payload, containerKey) {
+    const runtime = payload?.runtime || payload || {};
+    const containers = Array.isArray(runtime.containers) ? runtime.containers : [];
+    return {
+      runtime,
+      runtimeAvailable: runtime.available === true,
+      container: containers.find((item) => String(item?.key || "") === String(containerKey || "")) || null,
+    };
+  }
+
+  function runtimeActionHasConverged(observation, action) {
+    const container = observation?.container;
+    if (!observation?.runtimeAvailable || !container || typeof container.running !== "boolean") {
+      return false;
+    }
+    if (action === "stop") {
+      return container.running === false;
+    }
+    const health = String(container.health || "").trim().toLowerCase();
+    const healthReady = !health || health === "healthy" || health === "unavailable";
+    return container.running === true && healthReady;
+  }
+
+  function describeRuntimeObservation(observation) {
+    const container = observation?.container;
+    if (!observation?.runtimeAvailable) {
+      return `runtime unavailable${observation?.runtime?.detail ? ` (${observation.runtime.detail})` : ""}`;
+    }
+    if (!container) {
+      return "container absent from runtime status";
+    }
+    const health = String(container.health || "").trim() || "unavailable";
+    const statusText = String(container.status_text || container.status || "unknown").trim();
+    return `running=${String(container.running)}, health=${health}, status=${statusText}`;
+  }
+
+  function setRuntimeContainerPending(containerKey, pending) {
+    const buttons = elements.runtimeCards?.querySelectorAll("[data-runtime-action][data-container-key]") || [];
+    buttons.forEach((button) => {
+      if (String(button.dataset.containerKey || "") === String(containerKey || "")) {
+        button.disabled = Boolean(pending);
+      }
+    });
+  }
+
+  function sleepForRuntimePoll(delayMs, signal) {
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException("Runtime action polling was cancelled.", "AbortError"));
+    }
+    return new Promise((resolve, reject) => {
+      const cleanup = () => signal?.removeEventListener("abort", cancelDelay);
+      const finishDelay = () => {
+        cleanup();
+        resolve();
+      };
+      const timerId = setTimeout(finishDelay, Math.max(0, Number(delayMs) || 0));
+      const cancelDelay = () => {
+        clearTimeout(timerId);
+        cleanup();
+        reject(new DOMException("Runtime action polling was cancelled.", "AbortError"));
+      };
+      signal?.addEventListener("abort", cancelDelay, { once: true });
+    });
+  }
+
+  async function waitForRuntimeConvergence(containerKey, action, options = {}) {
+    const maxAttempts = Math.max(1, Number(options.maxAttempts) || 20);
+    const pollIntervalMs = Math.max(0, Number(options.pollIntervalMs) || 1000);
+    const pollTimeoutMs = Math.max(1, Number(options.pollTimeoutMs) || 5000);
+    const signal = options.signal;
+    const sleep = options.sleep || sleepForRuntimePoll;
+    let lastObservation = null;
+    let lastPollError = "";
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      if (attempt > 0) {
+        await sleep(pollIntervalMs, signal);
+      }
+      if (signal?.aborted) {
+        throw new DOMException("Runtime action polling was cancelled.", "AbortError");
+      }
+      const pollController = new AbortController();
+      let pollTimedOut = false;
+      const cancelPoll = () => pollController.abort();
+      signal?.addEventListener("abort", cancelPoll, { once: true });
+      const pollTimerId = setTimeout(() => {
+        pollTimedOut = true;
+        pollController.abort();
+      }, pollTimeoutMs);
+      try {
+        const payload = await fetchJson("/api/admin/runtime", { signal: pollController.signal });
+        lastObservation = runtimeContainerObservation(payload, containerKey);
+        lastPollError = "";
+        state.runtime = lastObservation.runtime;
+        renderRuntimeCards();
+        if (runtimeActionHasConverged(lastObservation, action)) {
+          return lastObservation;
+        }
+      } catch (error) {
+        if (signal?.aborted) {
+          throw new DOMException("Runtime action polling was cancelled.", "AbortError");
+        }
+        if (pollTimedOut && error?.name === "AbortError") {
+          lastPollError = `Status request timed out after ${pollTimeoutMs} ms`;
+        } else {
+          lastPollError = String(error?.message || error);
+        }
+      } finally {
+        clearTimeout(pollTimerId);
+        signal?.removeEventListener("abort", cancelPoll);
+      }
+    }
+
+    const lastState = describeRuntimeObservation(lastObservation);
+    const pollError = lastPollError ? ` Last poll error: ${lastPollError}.` : "";
+    throw new Error(
+      `Timed out waiting for ${containerKey} ${action} convergence after ${maxAttempts} observations. Last observed: ${lastState}.${pollError}`
+    );
+  }
+
+  async function executeRuntimeAction(containerKey, action, options = {}) {
     const verb =
       action === "stop"
         ? "Stopping"
         : action === "restart"
           ? "Restarting"
           : "Starting";
+    const actionTimeoutMs = Math.max(1, Number(options.actionTimeoutMs) || 35000);
+    const signal = options.signal;
     setBanner(`${verb} ${containerKey} container...`);
     try {
-      const payload = await fetchJson(`/api/admin/runtime/containers/${encodeURIComponent(containerKey)}/${action}`, {
-        method: "POST",
-      });
-      state.runtime = payload.runtime || state.runtime;
-      renderRuntimeCards();
-      setBanner(`${verb} ${containerKey} container completed.`, "success");
+      if (signal?.aborted) {
+        throw new DOMException("Runtime action was cancelled.", "AbortError");
+      }
+      const actionController = new AbortController();
+      let actionTimedOut = false;
+      const cancelAction = () => actionController.abort();
+      signal?.addEventListener("abort", cancelAction, { once: true });
+      const actionTimerId = setTimeout(() => {
+        actionTimedOut = true;
+        actionController.abort();
+      }, actionTimeoutMs);
+      let payload;
+      try {
+        payload = await fetchJson(`/api/admin/runtime/containers/${encodeURIComponent(containerKey)}/${action}`, {
+          method: "POST",
+          signal: actionController.signal,
+        });
+      } catch (error) {
+        if (signal?.aborted) {
+          throw new DOMException("Runtime action was cancelled.", "AbortError");
+        }
+        if (actionTimedOut && error?.name === "AbortError") {
+          const timeoutError = new Error(
+            `Action request timed out after ${actionTimeoutMs} ms; container state may have changed.`
+          );
+          timeoutError.runtimeActionOutcomeUnknown = true;
+          throw timeoutError;
+        }
+        throw error;
+      } finally {
+        clearTimeout(actionTimerId);
+        signal?.removeEventListener("abort", cancelAction);
+      }
+      if (payload?.runtime) {
+        state.runtime = payload.runtime;
+        renderRuntimeCards();
+      }
+      const observation = await waitForRuntimeConvergence(containerKey, action, options);
+      const health = String(observation.container?.health || "").trim().toLowerCase();
+      if (action === "stop") {
+        setBanner(`${verb} ${containerKey} container confirmed stopped.`, "success");
+      } else if (health && health !== "unavailable") {
+        setBanner(`${verb} ${containerKey} container confirmed running and healthy.`, "success");
+      } else {
+        setBanner(`${verb} ${containerKey} container confirmed running; health unavailable.`, "success");
+      }
+      return true;
     } catch (error) {
-      setBanner(`Container ${action} failed: ${error.message || error}`, "error");
+      if (error?.name === "AbortError" || signal?.aborted) {
+        setBanner(`Container ${action} polling cancelled for ${containerKey}.`, "info");
+      } else if (error?.runtimeActionOutcomeUnknown) {
+        setBanner(`Container ${action} status unknown for ${containerKey}: ${error.message}`, "error");
+      } else {
+        setBanner(`Container ${action} failed: ${error.message || error}`, "error");
+      }
+      return false;
     }
+  }
+
+  function runRuntimeAction(containerKey, action, options = {}) {
+    const key = String(containerKey || "");
+    const existing = state.runtimeActionPromises.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const controller = new AbortController();
+    state.runtimeActionControllers.set(key, controller);
+    const pending = executeRuntimeAction(key, action, { ...options, signal: controller.signal })
+      .finally(() => {
+        if (state.runtimeActionPromises.get(key) === pending) {
+          state.runtimeActionPromises.delete(key);
+          state.runtimeActionControllers.delete(key);
+          setRuntimeContainerPending(key, false);
+        }
+      });
+    state.runtimeActionPromises.set(key, pending);
+    setRuntimeContainerPending(key, true);
+    return pending;
+  }
+
+  function cancelRuntimeActionPolling(containerKey) {
+    state.runtimeActionControllers.get(String(containerKey || ""))?.abort();
+  }
+
+  function cancelAllRuntimeActionPolling() {
+    state.runtimeActionControllers.forEach((controller) => controller.abort());
   }
 
   async function exportBackup() {
@@ -6189,6 +6392,7 @@
     window.addEventListener("popstate", () => {
       setAdminView(new URLSearchParams(window.location.search).get("view"), { updateUrl: false });
     });
+    window.addEventListener("pagehide", () => cancelAllRuntimeActionPolling());
     elements.refreshStateButton?.addEventListener("click", () => {
       void refreshState();
     });
