@@ -134,7 +134,8 @@ The restore-grade archive contract accepts a history database up to 1.5 GiB and
 up to 2 GiB of expanded members in total. The admin and one-shot backup services
 therefore default to a 3 GiB container memory ceiling. Operators can lower those
 overrides for small installations, but a FULL backup or restore must keep enough
-headroom for the selected history snapshot.
+headroom for the selected history snapshot. Each 7z create, verify, list, or
+extract operation remains bounded to 10 minutes.
 
 ## Restore Pattern
 

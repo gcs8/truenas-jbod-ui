@@ -55,6 +55,7 @@ from history_service.system_backup import (
     RUNTIME_OVERRIDES_FILE_KEY,
     SAS_FABRIC_ALIAS_FILE_KEY,
     SEVEN_ZIP_SIGNATURE,
+    SEVEN_ZIP_TIMEOUT_SECONDS,
     SLOT_DETAIL_FILE_KEY,
     SSH_KEYS_KEY,
     TLS_TRUST_KEY,
@@ -1190,6 +1191,9 @@ class SystemBackupServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "command output exceeded"):
                 self.backup_service._run_7z_command(["l", "bundle.7z"])
         self.assertTrue(process.killed)
+
+    def test_7z_timeout_allows_restore_grade_full_history_archives(self) -> None:
+        self.assertGreaterEqual(SEVEN_ZIP_TIMEOUT_SECONDS, 600)
 
     def test_7z_prompt_channel_keeps_passphrase_out_of_process_argv(self) -> None:
         fake_7z = self.temp_dir / "fake-7z-prompt.py"
