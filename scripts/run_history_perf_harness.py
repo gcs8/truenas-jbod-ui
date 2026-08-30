@@ -21,6 +21,7 @@ from run_perf_harness import (  # noqa: E402
     RunResult,
     compare_summary,
     detect_git_context,
+    extract_payload_metadata,
     load_baseline_payload,
     slugify,
     summarize,
@@ -32,6 +33,7 @@ from run_perf_harness import (  # noqa: E402
 class HistoryApiResponse:
     data: Any
     headers: dict[str, str]
+    response_bytes: int = 0
 
 
 class HistoryApiClient:
@@ -46,14 +48,20 @@ class HistoryApiClient:
     def get_text(self, path: str, params: dict[str, Any] | None = None) -> HistoryApiResponse:
         request = Request(self._build_url(path, params=params), method="GET")
         with urlopen(request, timeout=self.timeout) as response:
+            body = response.read()
             return HistoryApiResponse(
-                data=response.read().decode("utf-8", errors="replace"),
+                data=body.decode("utf-8", errors="replace"),
                 headers={key.lower(): value for key, value in response.headers.items()},
+                response_bytes=len(body),
             )
 
     def get_json(self, path: str, params: dict[str, Any] | None = None) -> HistoryApiResponse:
         response = self.get_text(path, params=params)
-        return HistoryApiResponse(data=json.loads(str(response.data)), headers=response.headers)
+        return HistoryApiResponse(
+            data=json.loads(str(response.data)),
+            headers=response.headers,
+            response_bytes=response.response_bytes,
+        )
 
 
 def run_timed(name: str, fn: Callable[[], RequestMetrics | None]) -> RunResult:
@@ -64,6 +72,8 @@ def run_timed(name: str, fn: Callable[[], RequestMetrics | None]) -> RunResult:
         duration_ms=(time.perf_counter() - started) * 1000,
         stage_totals_ms=metrics.stage_totals_ms,
         request_count=metrics.request_count,
+        response_bytes=metrics.response_bytes,
+        metadata_counts=metrics.metadata_counts,
     )
 
 
@@ -98,8 +108,17 @@ def collector_stage_totals_from_payload(payload: dict[str, Any] | None) -> dict[
     return totals
 
 
-def metrics_from_payload(payload: dict[str, Any] | None) -> RequestMetrics:
-    return RequestMetrics(stage_totals_ms=collector_stage_totals_from_payload(payload), request_count=1)
+def metrics_from_payload(
+    payload: dict[str, Any] | None,
+    *,
+    response_bytes: int = 0,
+) -> RequestMetrics:
+    return RequestMetrics(
+        stage_totals_ms=collector_stage_totals_from_payload(payload),
+        request_count=1,
+        response_bytes=response_bytes,
+        metadata_counts=extract_payload_metadata(payload),
+    )
 
 
 def format_bytes(value: Any) -> str:
@@ -239,14 +258,16 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"- Worktree Dirty: `{payload['git'].get('dirty')}`",
         f"- Exact Counts Included: `{payload.get('include_exact_counts')}`",
         "",
-        "| Workflow | Iterations | Avg requests | Min ms | Avg ms | P50 ms | P95 ms | Max ms |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Workflow | Iterations | Avg requests | Avg bytes | Max bytes | Min ms | Avg ms | P50 ms | P95 ms | Max ms |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     stage_sections: list[str] = []
+    metadata_sections: list[str] = []
     for item in payload["summary"]:
         lines.append(
-            f"| {item['name']} | {item['iterations']} | {item['avg_requests']} | {item['min_ms']} | "
-            f"{item['avg_ms']} | {item['p50_ms']} | {item['p95_ms']} | {item['max_ms']} |"
+            f"| {item['name']} | {item['iterations']} | {item['avg_requests']} | "
+            f"{format_bytes(item.get('avg_response_bytes'))} | {format_bytes(item.get('max_response_bytes'))} | "
+            f"{item['min_ms']} | {item['avg_ms']} | {item['p50_ms']} | {item['p95_ms']} | {item['max_ms']} |"
         )
         if item.get("stage_summary"):
             stage_sections.append(f"### {item['name']} collector stages")
@@ -255,6 +276,13 @@ def render_markdown(payload: dict[str, Any]) -> str:
                     f"- `{stage['label']}` avg `{stage['avg_ms']} ms` max `{stage['max_ms']} ms`"
                 )
             stage_sections.append("")
+        if item.get("metadata_summary"):
+            metadata_sections.append(f"### {item['name']} payload metadata")
+            for metric in item["metadata_summary"][:8]:
+                metadata_sections.append(
+                    f"- `{metric['label']}` avg `{metric['avg']}` max `{metric['max']}`"
+                )
+            metadata_sections.append("")
 
     if collector:
         lines.extend(
@@ -291,6 +319,10 @@ def render_markdown(payload: dict[str, Any]) -> str:
     if stage_sections:
         lines.extend(["", "## Collector Stage Rollups", ""])
         lines.extend(stage_sections[:-1] if stage_sections[-1] == "" else stage_sections)
+
+    if metadata_sections:
+        lines.extend(["", "## Payload metadata", ""])
+        lines.extend(metadata_sections[:-1] if metadata_sections[-1] == "" else metadata_sections)
 
     if payload.get("comparison"):
         baseline = payload.get("baseline") or {}
@@ -363,27 +395,30 @@ def main() -> int:
     latest_overview: dict[str, Any] | None = None
 
     def sidecar_livez() -> RequestMetrics:
-        client.get_text("/livez")
-        return RequestMetrics(request_count=1)
+        response = client.get_text("/livez")
+        return RequestMetrics(request_count=1, response_bytes=response.response_bytes)
 
     def sidecar_healthz() -> RequestMetrics:
         nonlocal latest_healthz
-        latest_healthz = client.get_json("/healthz").data
-        return metrics_from_payload(latest_healthz)
+        response = client.get_json("/healthz")
+        latest_healthz = response.data
+        return metrics_from_payload(latest_healthz, response_bytes=response.response_bytes)
 
     def dashboard_html() -> RequestMetrics:
-        client.get_text("/")
-        return RequestMetrics(request_count=1)
+        response = client.get_text("/")
+        return RequestMetrics(request_count=1, response_bytes=response.response_bytes)
 
     def overview_estimated() -> RequestMetrics:
         nonlocal latest_overview
-        latest_overview = client.get_json("/api/history/overview").data
-        return metrics_from_payload(latest_overview)
+        response = client.get_json("/api/history/overview")
+        latest_overview = response.data
+        return metrics_from_payload(latest_overview, response_bytes=response.response_bytes)
 
     def overview_exact() -> RequestMetrics:
         nonlocal latest_overview
-        latest_overview = client.get_json("/api/history/overview", params={"exact_counts": "true"}).data
-        return metrics_from_payload(latest_overview)
+        response = client.get_json("/api/history/overview", params={"exact_counts": "true"})
+        latest_overview = response.data
+        return metrics_from_payload(latest_overview, response_bytes=response.response_bytes)
 
     workflows: list[tuple[str, Callable[[], RequestMetrics | None]]] = [
         ("sidecar_livez", sidecar_livez),
@@ -436,6 +471,8 @@ def main() -> int:
                 "name": item.name,
                 "duration_ms": round(item.duration_ms, 1),
                 "request_count": item.request_count,
+                "response_bytes": item.response_bytes,
+                "metadata_counts": item.metadata_counts,
                 "stage_totals_ms": item.stage_totals_ms,
             }
             for item in results

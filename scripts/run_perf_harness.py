@@ -25,12 +25,16 @@ class RunResult:
     duration_ms: float
     stage_totals_ms: dict[str, float] = field(default_factory=dict)
     request_count: int = 0
+    response_bytes: int = 0
+    metadata_counts: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class RequestMetrics:
     stage_totals_ms: dict[str, float] = field(default_factory=dict)
     request_count: int = 0
+    response_bytes: int = 0
+    metadata_counts: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -44,6 +48,7 @@ class GitContext:
 class ApiResponse:
     data: dict[str, Any]
     headers: dict[str, str]
+    response_bytes: int = 0
 
 
 class ApiClient:
@@ -67,9 +72,11 @@ class ApiClient:
     def get_json_with_headers(self, path: str, params: dict[str, Any] | None = None) -> ApiResponse:
         request = Request(self._build_url(path, params=params), method="GET")
         with urlopen(request, timeout=120) as response:
+            body = response.read()
             return ApiResponse(
-                data=json.loads(response.read().decode("utf-8")),
+                data=json.loads(body.decode("utf-8")),
                 headers={key.lower(): value for key, value in response.headers.items()},
+                response_bytes=len(body),
             )
 
     def post_json(self, path: str, payload: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -89,9 +96,11 @@ class ApiClient:
             headers={"Content-Type": "application/json"},
         )
         with urlopen(request, timeout=120) as response:
+            body = response.read()
             return ApiResponse(
-                data=json.loads(response.read().decode("utf-8")),
+                data=json.loads(body.decode("utf-8")),
                 headers={key.lower(): value for key, value in response.headers.items()},
+                response_bytes=len(body),
             )
 
 
@@ -107,13 +116,20 @@ def summarize(results: list[RunResult]) -> list[dict[str, Any]]:
     grouped: dict[str, list[float]] = {}
     grouped_stage_totals: dict[str, dict[str, list[float]]] = {}
     grouped_request_counts: dict[str, list[int]] = {}
+    grouped_response_bytes: dict[str, list[int]] = {}
+    grouped_metadata_counts: dict[str, dict[str, list[float]]] = {}
     for result in results:
         grouped.setdefault(result.name, []).append(result.duration_ms)
         grouped_request_counts.setdefault(result.name, []).append(result.request_count)
+        grouped_response_bytes.setdefault(result.name, []).append(result.response_bytes)
         if result.stage_totals_ms:
             workflow_stage_totals = grouped_stage_totals.setdefault(result.name, {})
             for label, value in result.stage_totals_ms.items():
                 workflow_stage_totals.setdefault(label, []).append(value)
+        if result.metadata_counts:
+            workflow_metadata = grouped_metadata_counts.setdefault(result.name, {})
+            for label, value in result.metadata_counts.items():
+                workflow_metadata.setdefault(label, []).append(value)
     summary: list[dict[str, Any]] = []
     for name, durations in grouped.items():
         stage_summary = [
@@ -129,17 +145,33 @@ def summarize(results: list[RunResult]) -> list[dict[str, Any]]:
                 reverse=True,
             )
         ]
+        metadata_summary = [
+            {
+                "label": label,
+                "avg": round(statistics.fmean(values), 1),
+                "max": round(max(values), 1),
+            }
+            for label, values in sorted(
+                grouped_metadata_counts.get(name, {}).items(),
+                key=lambda item: statistics.fmean(item[1]),
+                reverse=True,
+            )
+        ]
+        response_bytes = grouped_response_bytes.get(name, [0])
         summary.append(
             {
                 "name": name,
                 "iterations": len(durations),
                 "avg_requests": round(statistics.fmean(grouped_request_counts.get(name, [0])), 1),
+                "avg_response_bytes": round(statistics.fmean(response_bytes), 1),
+                "max_response_bytes": max(response_bytes),
                 "min_ms": round(min(durations), 1),
                 "avg_ms": round(statistics.fmean(durations), 1),
                 "p50_ms": round(percentile(durations, 0.50), 1),
                 "p95_ms": round(percentile(durations, 0.95), 1),
                 "max_ms": round(max(durations), 1),
                 "stage_summary": stage_summary,
+                "metadata_summary": metadata_summary,
             }
         )
     summary.sort(key=lambda item: (item["avg_ms"], item["name"]))
@@ -179,17 +211,52 @@ def build_request_metrics(response: ApiResponse) -> RequestMetrics:
     return RequestMetrics(
         stage_totals_ms=stage_totals,
         request_count=1,
+        response_bytes=response.response_bytes,
+        metadata_counts=extract_payload_metadata(response.data),
     )
+
+
+def extract_payload_metadata(payload: Any) -> dict[str, float]:
+    if not isinstance(payload, dict):
+        return {}
+    metadata: dict[str, float] = {}
+    slots = payload.get("slots")
+    if isinstance(slots, list):
+        metadata["slot_count"] = float(len(slots))
+    for container_name in ("summary", "counts"):
+        container = payload.get(container_name)
+        if not isinstance(container, dict):
+            continue
+        for key, value in container.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                metadata[f"{container_name}.{key}"] = float(value)
+    for key, value in payload.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if key.endswith(("_count", "_bytes", "_size_bytes", "_entries")):
+                metadata[key] = float(value)
+        elif "cache" in key and isinstance(value, str) and value:
+            metadata[f"{key}.{value}"] = 1.0
+    return metadata
 
 
 def merge_request_metrics(*metrics: RequestMetrics) -> RequestMetrics:
     stage_totals: dict[str, float] = {}
     request_count = 0
+    response_bytes = 0
+    metadata_counts: dict[str, float] = {}
     for metric in metrics:
         request_count += metric.request_count
+        response_bytes += metric.response_bytes
         for label, value in metric.stage_totals_ms.items():
             stage_totals[label] = round(stage_totals.get(label, 0.0) + value, 1)
-    return RequestMetrics(stage_totals_ms=stage_totals, request_count=request_count)
+        for label, value in metric.metadata_counts.items():
+            metadata_counts[label] = metadata_counts.get(label, 0.0) + value
+    return RequestMetrics(
+        stage_totals_ms=stage_totals,
+        request_count=request_count,
+        response_bytes=response_bytes,
+        metadata_counts=metadata_counts,
+    )
 
 
 def run_timed(name: str, fn: Callable[[], RequestMetrics | None]) -> RunResult:
@@ -200,6 +267,8 @@ def run_timed(name: str, fn: Callable[[], RequestMetrics | None]) -> RunResult:
         duration_ms=(time.perf_counter() - started) * 1000,
         stage_totals_ms=metrics.stage_totals_ms,
         request_count=metrics.request_count,
+        response_bytes=metrics.response_bytes,
+        metadata_counts=metrics.metadata_counts,
     )
 
 
@@ -210,6 +279,24 @@ def utc_timestamp() -> str:
 def slugify(value: str) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return normalized or "run"
+
+
+def format_bytes(value: Any) -> str:
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        size = 0.0
+    size = max(0.0, size)
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if size < 1024 or candidate == units[-1]:
+            break
+        size /= 1024
+    if unit == "B":
+        return f"{int(size)} B"
+    return f"{size:.1f} {unit}"
 
 
 def detect_git_context(repo_root: Path) -> GitContext:
@@ -426,14 +513,16 @@ def render_markdown(
         f"- SMART Prefetch Chunk Size: `{payload.get('smart_prefetch_chunk_size') or 'default'}`",
         f"- SMART Prefetch Batch Concurrency: `{payload.get('smart_prefetch_batch_concurrency') or 'default'}`",
         "",
-        "| Workflow | Iterations | Avg requests | Min ms | Avg ms | P50 ms | P95 ms | Max ms |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Workflow | Iterations | Avg requests | Avg bytes | Max bytes | Min ms | Avg ms | P50 ms | P95 ms | Max ms |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     stage_sections: list[str] = []
+    metadata_sections: list[str] = []
     for item in summary:
         lines.append(
-            f"| {item['name']} | {item['iterations']} | {item['avg_requests']} | {item['min_ms']} | {item['avg_ms']} | "
-            f"{item['p50_ms']} | {item['p95_ms']} | {item['max_ms']} |"
+            f"| {item['name']} | {item['iterations']} | {item['avg_requests']} | "
+            f"{format_bytes(item.get('avg_response_bytes'))} | {format_bytes(item.get('max_response_bytes'))} | "
+            f"{item['min_ms']} | {item['avg_ms']} | {item['p50_ms']} | {item['p95_ms']} | {item['max_ms']} |"
         )
         if item.get("stage_summary"):
             stage_sections.append(f"### {item['name']} stages")
@@ -442,10 +531,21 @@ def render_markdown(
                     f"  - `{stage['label']}` avg `{stage['avg_ms']} ms` max `{stage['max_ms']} ms`"
                 )
             stage_sections.append("")
+        if item.get("metadata_summary"):
+            metadata_sections.append(f"### {item['name']} payload metadata")
+            for metric in item["metadata_summary"][:8]:
+                metadata_sections.append(
+                    f"- `{metric['label']}` avg `{metric['avg']}` max `{metric['max']}`"
+                )
+            metadata_sections.append("")
 
     if stage_sections:
         lines.extend(["", "## Stage Rollups", ""])
         lines.extend(stage_sections[:-1] if stage_sections[-1] == "" else stage_sections)
+
+    if metadata_sections:
+        lines.extend(["", "## Payload metadata", ""])
+        lines.extend(metadata_sections[:-1] if metadata_sections[-1] == "" else metadata_sections)
 
     if payload.get("comparison"):
         baseline = payload.get("baseline") or {}
@@ -669,6 +769,8 @@ def main() -> int:
                 "name": item.name,
                 "duration_ms": round(item.duration_ms, 1),
                 "request_count": item.request_count,
+                "response_bytes": item.response_bytes,
+                "metadata_counts": item.metadata_counts,
                 "stage_totals_ms": item.stage_totals_ms,
             }
             for item in results
