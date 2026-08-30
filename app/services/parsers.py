@@ -1670,6 +1670,8 @@ def build_slot_candidates_from_ses_enclosures(
     slot_count: int,
     enclosure_filter: str | None,
     selected_enclosure_id: str | None = None,
+    *,
+    enclosures_are_merged: bool = False,
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
     """
     Convert parsed SES maps into the app's 0-based slot view.
@@ -1678,7 +1680,7 @@ def build_slot_candidates_from_ses_enclosures(
     is detected, we stack the groups into one 60-slot view in name order, preferring
     "Front" before "Rear". Duplicate paths to the same enclosure ID are merged.
     """
-    merged_enclosures = _merge_ses_enclosures(enclosures)
+    merged_enclosures = enclosures if enclosures_are_merged else _merge_ses_enclosures(enclosures)
     selected_ids = {
         item
         for item in (
@@ -3602,27 +3604,16 @@ def parse_ssh_outputs(
         parsed.camcontrol_controllers = camcontrol_info.controllers
         parsed.camcontrol_peer_devices = camcontrol_info.peer_devices
 
-    if normalized_outputs.get("sesutil map"):
-        ses_map_enclosures = parse_sesutil_map(normalized_outputs["sesutil map"])
+    ses_map_output = normalized_outputs.get("sesutil map")
+    ses_show_output = normalized_outputs.get("sesutil show")
+    ses_map_has_enclosures = False
+    if ses_map_output:
+        ses_map_enclosures = parse_sesutil_map(ses_map_output)
+        ses_map_has_enclosures = bool(ses_map_enclosures)
         parsed.ses_enclosures.extend(ses_map_enclosures)
-        parsed.ses_slot_candidates, parsed.ses_selected_meta = build_slot_candidates_from_ses_enclosures(
-            ses_map_enclosures,
-            slot_count,
-            enclosure_filter,
-            selected_enclosure_id,
-        )
 
-    if normalized_outputs.get("sesutil show"):
-        ses_show_enclosures = parse_sesutil_show_enclosures(normalized_outputs["sesutil show"])
-        parsed.ses_enclosures.extend(ses_show_enclosures)
-        show_candidates, show_meta = build_slot_candidates_from_ses_enclosures(
-            ses_show_enclosures,
-            slot_count,
-            enclosure_filter,
-            selected_enclosure_id,
-        )
-        parsed.ses_slot_candidates = merge_slot_candidate_maps(parsed.ses_slot_candidates, show_candidates)
-        parsed.ses_selected_meta = merge_enclosure_meta(parsed.ses_selected_meta, show_meta)
+    if ses_show_output:
+        parsed.ses_enclosures.extend(parse_sesutil_show_enclosures(ses_show_output))
 
     for command_key, output in normalized_outputs.items():
         if not command_key.startswith("sg_ses aes /dev/sg"):
@@ -3647,14 +3638,24 @@ def parse_ssh_outputs(
 
     if parsed.ses_enclosures:
         parsed.ses_enclosures = _merge_ses_enclosures(parsed.ses_enclosures)
-        sg_candidates, sg_meta = build_slot_candidates_from_ses_enclosures(
+    if parsed.ses_enclosures or ses_map_output or ses_show_output:
+        ses_candidates, ses_meta = build_slot_candidates_from_ses_enclosures(
             parsed.ses_enclosures,
             slot_count,
             enclosure_filter,
             selected_enclosure_id,
+            enclosures_are_merged=True,
         )
-        parsed.ses_slot_candidates = merge_slot_candidate_maps(parsed.ses_slot_candidates, sg_candidates)
-        parsed.ses_selected_meta = merge_enclosure_meta(parsed.ses_selected_meta, sg_meta)
+        parsed.ses_slot_candidates = (
+            ses_candidates
+            if ses_map_has_enclosures
+            else merge_slot_candidate_maps({}, ses_candidates)
+        )
+        parsed.ses_selected_meta = (
+            ses_meta
+            if ses_map_output
+            else merge_enclosure_meta({}, ses_meta)
+        )
 
     for slot, payload in parsed.ses_slot_candidates.items():
         device_hint = normalize_device_name(payload.get("device_hint"))

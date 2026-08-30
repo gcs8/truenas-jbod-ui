@@ -729,10 +729,13 @@ def _build_core_mpr_fabric_snapshot(
 
     adapter_summary = parse_mpr_adapter_summary(normalized_outputs.get("mprutil show adapters", ""))
     unit_data = _parse_unit_data(normalized_outputs)
+    pci_controllers = parse_pciconf_sas_controllers(normalized_outputs.get("pciconf -lv", ""))
+    pcie_slots = parse_dmidecode_slots(normalized_outputs.get("dmidecode slot", ""))
+    mpr_sysctl_locations = parse_mpr_sysctl_locations(normalized_outputs.get("mpr sysctl pci locations", ""))
     pci_inventory = _pci_inventory_by_controller(
-        normalized_outputs.get("pciconf -lv", ""),
-        normalized_outputs.get("dmidecode slot", ""),
-        normalized_outputs.get("mpr sysctl pci locations", ""),
+        pci_controllers,
+        pcie_slots,
+        mpr_sysctl_locations,
     )
     path_counts, path_slots = _path_counts_from_slots(snapshot.slots)
     controller_names = sorted(
@@ -1087,11 +1090,9 @@ def _build_core_mpr_fabric_snapshot(
             "selected_enclosure_keys": sorted(selected_enclosure_keys),
             "selected_bay_slots": _snapshot_slot_numbers(snapshot.slots),
             "selected_disk_slots": _snapshot_disk_slot_numbers(snapshot.slots),
-            "pci_controllers": parse_pciconf_sas_controllers(normalized_outputs.get("pciconf -lv", "")),
-            "pcie_slots": parse_dmidecode_slots(normalized_outputs.get("dmidecode slot", "")),
-            "mpr_sysctl_locations": parse_mpr_sysctl_locations(
-                normalized_outputs.get("mpr sysctl pci locations", "")
-            ),
+            "pci_controllers": pci_controllers,
+            "pcie_slots": pcie_slots,
+            "mpr_sysctl_locations": mpr_sysctl_locations,
             "mpr_kernel_events": {
                 "event_count": mpr_kernel_diagnostics.get("event_count", 0),
                 "controllers": sorted((mpr_kernel_diagnostics.get("by_controller") or {}).keys()),
@@ -2038,18 +2039,17 @@ def _freebsd_pci_location_to_address(location: str) -> str:
 
 
 def _pci_inventory_by_controller(
-    pciconf_text: str,
-    dmidecode_text: str,
-    sysctl_text: str = "",
+    pci_controllers: list[dict[str, Any]],
+    pcie_slots: list[dict[str, Any]],
+    sysctl_rows: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     slots_by_address = {
         str(slot.get("bus_address") or "").lower(): slot
-        for slot in parse_dmidecode_slots(dmidecode_text)
+        for slot in pcie_slots
         if slot.get("bus_address")
     }
     inventory: dict[str, dict[str, Any]] = {}
-    sysctl_rows = parse_mpr_sysctl_locations(sysctl_text)
-    for row in parse_pciconf_sas_controllers(pciconf_text):
+    for row in pci_controllers:
         controller = normalize_text(row.get("controller"))
         if not controller:
             continue

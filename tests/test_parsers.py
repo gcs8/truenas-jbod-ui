@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from app.services.parsers import (
     _merge_ses_enclosures,
@@ -980,6 +981,89 @@ Slot 06  -  -  -  Not installed
         self.assertEqual(parsed[0].slot_layout, [[5, 11, 17, 23], [4, 10, 16, 22], [3, 9, 15, 21], [2, 8, 14, 20], [1, 7, 13, 19], [0, 6, 12, 18]])
         self.assertTrue(parsed[0].slots[0].present)
         self.assertFalse(parsed[0].slots[6].present)
+
+    def test_parse_ssh_outputs_builds_ses_candidates_once_after_collecting_all_evidence(self) -> None:
+        ses_map = """
+ses2:
+  Enclosure Name: LSI SAS3x40
+  Enclosure ID: 50030480090c4f7f
+  Element 0, Type: Array Device Slot
+    Status: OK
+    Description: Slot00
+    Device Names: da0, pass0
+""".strip()
+        ses_show = """
+ses2:  <LSI SAS3x40 0601>; ID: 50030480090c4f7f
+Desc  Device  Model  Serial  Status
+Slot 00  da0  Samsung SSD  SER000  OK
+""".strip()
+
+        with (
+            patch(
+                "app.services.parsers.build_slot_candidates_from_ses_enclosures",
+                wraps=build_slot_candidates_from_ses_enclosures,
+            ) as build_candidates,
+            patch(
+                "app.services.parsers._merge_ses_enclosures",
+                wraps=_merge_ses_enclosures,
+            ) as merge_enclosures,
+        ):
+            parsed = parse_ssh_outputs(
+                {"sesutil map": ses_map, "sesutil show": ses_show},
+                slot_count=24,
+                enclosure_filter=None,
+            )
+
+        self.assertEqual(build_candidates.call_count, 1)
+        self.assertEqual(merge_enclosures.call_count, 1)
+        self.assertEqual(len(parsed.ses_enclosures), 1)
+        self.assertEqual(parsed.ses_slot_candidates[0]["device_hint"], "da0")
+        self.assertEqual(parsed.ses_slot_candidates[0]["model_hint"], "Samsung SSD")
+        self.assertEqual(parsed.ses_slot_candidates[0]["serial_hint"], "SER000")
+        self.assertEqual(parsed.ses_slot_candidates[0]["ses_device"], "/dev/ses2")
+
+    def test_parse_ssh_outputs_preserves_default_meta_for_unparseable_sesutil_map(self) -> None:
+        with patch(
+            "app.services.parsers.build_slot_candidates_from_ses_enclosures",
+            wraps=build_slot_candidates_from_ses_enclosures,
+        ) as build_candidates:
+            parsed = parse_ssh_outputs(
+                {"sesutil map": "command returned no parseable enclosure rows"},
+                slot_count=24,
+                enclosure_filter=None,
+            )
+
+        self.assertEqual(build_candidates.call_count, 1)
+        self.assertEqual(parsed.ses_slot_candidates, {})
+        self.assertEqual(
+            parsed.ses_selected_meta,
+            {
+                "id": None,
+                "label": None,
+                "name": None,
+                "unmapped_ses_elements": [],
+                "warnings": [],
+            },
+        )
+
+    def test_parse_ssh_outputs_show_only_candidates_omit_empty_overlay_fields(self) -> None:
+        ses_show = """
+ses2:  <LSI SAS3x40 0601>; ID: 50030480090c4f7f
+Desc  Device  Model  Serial  Status
+Slot 00  da0  Samsung SSD  SER000  OK
+""".strip()
+
+        parsed = parse_ssh_outputs(
+            {"sesutil show": ses_show},
+            slot_count=24,
+            enclosure_filter=None,
+        )
+
+        candidate = parsed.ses_slot_candidates[0]
+        self.assertFalse(any(value is None for value in candidate.values()))
+        self.assertNotIn("sas_address_hint", candidate)
+        self.assertNotIn("ses_element_id", candidate)
+        self.assertNotIn("slot_number_source", candidate)
 
     def test_parse_ssh_outputs_preserves_scale_profile_id_after_ses_merge(self) -> None:
         aes_output = """
