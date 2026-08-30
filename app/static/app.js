@@ -9292,9 +9292,13 @@
     event.preventDefault();
     const slot = getSlotById(state.selectedSlot);
     if (!slot) return;
-
+    if (!slot.mapping_revision) {
+      setStatus("Mapping revision is unavailable. Refresh inventory before saving.", "error");
+      return;
+    }
     const formData = new FormData(mappingForm);
     const payload = {
+      expected_revision: slot.mapping_revision,
       serial: formData.get("serial") || null,
       device_name: formData.get("device_name") || null,
       gptid: formData.get("gptid") || null,
@@ -9326,14 +9330,21 @@
     }
     const slot = getSlotById(state.selectedSlot);
     if (!slot) return;
-
+    if (!slot.mapping_clear_revision) {
+      setStatus("Mapping revision is unavailable. Refresh inventory before clearing.", "error");
+      return;
+    }
     if (!window.confirm(`Clear the saved mapping for slot ${slot.slot_label}?`)) {
       return;
     }
 
     try {
       setStatus(`Clearing mapping for slot ${slot.slot_label}...`);
-      const result = await sendScopedRequest(`/api/slots/${slot.slot}/mapping`, { method: "DELETE" });
+      const revision = encodeURIComponent(slot.mapping_clear_revision);
+      const result = await sendScopedRequest(
+        `/api/slots/${slot.slot}/mapping?expected_revision=${revision}`,
+        { method: "DELETE" },
+      );
       applySnapshot(result.snapshot);
       invalidateHistoryCaches();
       state.mappingFormScopeKey = null;
@@ -9368,6 +9379,40 @@
     }
   }
 
+  function mappingImportPreviewMessage(preview) {
+    const formatValue = (value) => (
+      value === null || value === undefined ? "∅" : String(value).replace(/\s+/g, " ")
+    );
+    const formatRecord = (record) => Object.entries(record || {})
+      .map(([field, value]) => `${field}=${formatValue(value)}`)
+      .join(", ");
+    const formatChanges = (changes) => Object.entries(changes || {})
+      .map(([field, values]) => `${field}: ${formatValue(values.from)} → ${formatValue(values.to)}`)
+      .join(", ");
+    const formatEntries = (entries, detail) => {
+      if (!Array.isArray(entries) || entries.length === 0) return "none";
+      return entries
+        .map((entry) => {
+          const identity = `${entry.enclosure_id || "default enclosure"} slot ${entry.slot}`;
+          const renderedDetail = detail(entry);
+          return renderedDetail ? `${identity} [${renderedDetail}]` : identity;
+        })
+        .join(", ");
+    };
+    const additions = preview?.additions || [];
+    const updates = preview?.updates || [];
+    const removals = preview?.removals || [];
+    const unchanged = preview?.unchanged || [];
+    return [
+      "Confirm this exact mapping import diff:",
+      `Add (${additions.length}): ${formatEntries(additions, (entry) => formatRecord(entry.incoming))}`,
+      `Update (${updates.length}): ${formatEntries(updates, (entry) => formatChanges(entry.changes))}`,
+      `Remove (${removals.length}): ${formatEntries(removals, (entry) => formatRecord(entry.current))}`,
+      `Unchanged (${unchanged.length}): ${formatEntries(unchanged, () => "")}`,
+      "The import will be rejected if the active mapping scope changes before confirmation.",
+    ].join("\n");
+  }
+
   async function importMappingsFromFile(file) {
     if (state.snapshotMode) {
       setStatus("Mapping import is disabled in an offline snapshot export.", "error");
@@ -9375,12 +9420,26 @@
     }
     if (!file) return;
     try {
-      setStatus(`Importing mappings from ${file.name}...`);
+      setStatus(`Previewing mappings from ${file.name}...`);
       const rawText = await file.text();
       const bundle = JSON.parse(rawText);
-      const result = await sendScopedRequest("/api/mappings/import", {
+      const preview = await sendScopedRequest("/api/mappings/import/preview", {
         method: "POST",
         body: JSON.stringify(bundle),
+      });
+      if (!window.confirm(mappingImportPreviewMessage(preview))) {
+        setStatus("Mapping import canceled after preview.");
+        return;
+      }
+      setStatus(`Importing confirmed mappings from ${file.name}...`);
+      const result = await sendScopedRequest("/api/mappings/import", {
+        method: "POST",
+        body: JSON.stringify({
+          bundle,
+          expected_revision: preview.revision,
+          import_digest: preview.import_digest,
+          confirmed: true,
+        }),
       });
       applySnapshot(result.snapshot);
       invalidateHistoryCaches();

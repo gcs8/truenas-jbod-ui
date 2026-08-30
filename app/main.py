@@ -26,6 +26,7 @@ from app.models.domain import (
     LedAction,
     LedRequest,
     MappingBundle,
+    MappingImportConfirmation,
     MappingRequest,
     SasFabricAliasRequest,
     SnapshotExportRequest,
@@ -42,6 +43,7 @@ from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_sta
 from app.script_json import register_script_json_filters
 from app.services.history_backend import HistoryBackendClient
 from app.services.inventory_registry import InventoryRegistry
+from app.services.mapping_store import MappingImportDigestMismatch, MappingRevisionConflict
 from app.services.release_status import ReleaseStatusService
 from app.services.snapshot_export import SnapshotExportService, SnapshotExportTooLargeError
 from app.services.truenas_ws import TrueNASAPIError
@@ -604,12 +606,24 @@ def create_app() -> FastAPI:
             "gptid": payload.gptid,
             "notes": payload.notes,
         }
-        mapping = await service.save_mapping(
-            slot,
-            mapping_payload,
-            selected_enclosure_id=enclosure_id,
-            invalidate_snapshot=False,
-        )
+        try:
+            mapping = await service.save_mapping(
+                slot,
+                mapping_payload,
+                selected_enclosure_id=enclosure_id,
+                expected_revision=payload.expected_revision,
+                invalidate_snapshot=False,
+            )
+        except MappingRevisionConflict as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "error": "mapping_revision_conflict",
+                    "detail": str(exc),
+                    "current_revision": exc.current_revision,
+                },
+            )
 
         led_warning = None
         if payload.clear_identify_after_save:
@@ -643,12 +657,29 @@ def create_app() -> FastAPI:
         slot: int,
         system_id: str | None = None,
         enclosure_id: str | None = None,
+        expected_revision: str = Query(..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"),
     ) -> JSONResponse:
         ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
-        cleared = await service.clear_mapping(slot, selected_enclosure_id=enclosure_id, invalidate_snapshot=False)
+        try:
+            cleared = await service.clear_mapping(
+                slot,
+                selected_enclosure_id=enclosure_id,
+                expected_revision=expected_revision,
+                invalidate_snapshot=False,
+            )
+        except MappingRevisionConflict as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "error": "mapping_revision_conflict",
+                    "detail": str(exc),
+                    "current_revision": exc.current_revision,
+                },
+            )
         if cleared:
             service.invalidate_snapshot_cache(reason="route.clear_mapping", cache_keys=[enclosure_id, None])
         snapshot = await service.get_snapshot(force_refresh=cleared, selected_enclosure_id=enclosure_id)
@@ -663,25 +694,68 @@ def create_app() -> FastAPI:
         service = registry.get_service(system_id)
         return await service.export_mapping_bundle(selected_enclosure_id=enclosure_id)
 
-    @app.post("/api/mappings/import")
-    async def import_mappings(
+    @app.post("/api/mappings/import/preview")
+    async def preview_mapping_import(
         payload: MappingBundle,
         system_id: str | None = None,
         enclosure_id: str | None = None,
     ) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        imported = await service.import_mapping_bundle(
-            payload,
-            selected_enclosure_id=enclosure_id,
-            invalidate_snapshot=False,
-        )
+        try:
+            preview = await service.preview_mapping_bundle(
+                payload,
+                selected_enclosure_id=enclosure_id,
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=422, content={"detail": str(exc)})
+        return JSONResponse(preview)
+
+    @app.post("/api/mappings/import")
+    async def import_mappings(
+        payload: MappingImportConfirmation,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+    ) -> JSONResponse:
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        try:
+            result = await service.import_mapping_bundle(
+                payload.bundle,
+                selected_enclosure_id=enclosure_id,
+                expected_revision=payload.expected_revision,
+                import_digest=payload.import_digest,
+                invalidate_snapshot=False,
+            )
+        except MappingRevisionConflict as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "error": "mapping_revision_conflict",
+                    "detail": str(exc),
+                    "current_revision": exc.current_revision,
+                },
+            )
+        except MappingImportDigestMismatch as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "error": "mapping_import_digest_mismatch",
+                    "detail": str(exc),
+                    "current_revision": exc.current_revision,
+                    "current_import_digest": exc.current_import_digest,
+                },
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=422, content={"detail": str(exc)})
         service.invalidate_snapshot_cache(reason="route.import_mappings")
         snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
         return JSONResponse(
             {
                 "ok": True,
-                "imported": imported,
+                **result,
                 "snapshot": snapshot.model_dump(mode="json"),
             }
         )

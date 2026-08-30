@@ -253,6 +253,8 @@ class SlotView(BaseModel):
     ssh_ses_element_id: int | None = None
     ssh_ses_targets: list[dict[str, Any]] = Field(default_factory=list)
     mapping_source: str = "unknown"
+    mapping_revision: str | None = None
+    mapping_clear_revision: str | None = None
     notes: str | None = None
     search_text: str = ""
     operator_context: dict[str, Any] = Field(default_factory=dict)
@@ -417,6 +419,7 @@ class SystemLocatorStatusView(BaseModel):
 
 
 class MappingRequest(BaseModel):
+    expected_revision: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     serial: str | None = None
     device_name: str | None = None
     gptid: str | None = None
@@ -438,7 +441,15 @@ class MappingBundle(BaseModel):
     exported_at: datetime = Field(default_factory=utcnow)
     system_id: str | None = None
     enclosure_id: str | None = None
+    revision: str | None = Field(default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     mappings: list[ManualMapping] = Field(default_factory=list)
+
+
+class MappingImportConfirmation(BaseModel):
+    bundle: MappingBundle
+    expected_revision: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    import_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    confirmed: Literal[True]
 
 
 class SnapshotExportRequest(BaseModel):

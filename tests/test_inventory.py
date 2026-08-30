@@ -3854,6 +3854,39 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(slot_view.gptid, "gptid/example")
             self.assertEqual(slot_view.persistent_id_label, "GPTID")
 
+    def test_attach_mapping_revisions_includes_effective_fallback_clear_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="archive-core", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service.mapping_store.save_mapping(
+                ManualMapping(system_id=system.id, enclosure_id=None, slot=1, serial="FALLBACK")
+            )
+            slot = SlotView(
+                slot=1,
+                slot_label="01",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-a",
+            )
+
+            revised = service._attach_mapping_revisions([slot])[0]
+
+            self.assertEqual(
+                revised.mapping_revision,
+                service.mapping_store.scope_revision(system.id, "enc-a"),
+            )
+            self.assertEqual(
+                revised.mapping_clear_revision,
+                service.mapping_store.clear_revision(system.id, "enc-a", 1),
+            )
+
 
 class InventoryBmcCorrelationTests(unittest.TestCase):
     def test_correlate_ipmi_host_uses_bmc_slot_hints_for_fattwin_profile(self) -> None:
@@ -5154,6 +5187,12 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.selected_enclosure_id, "500304801f715f3f+500304801f5a003f")
         self.assertEqual(snapshot.selected_profile.id, CORE_CSE_946_PROFILE_ID)
         self.assertEqual(snapshot.summary.enclosure_count, 2)
+        self.assertTrue(snapshot.slots)
+        for slot in snapshot.slots:
+            self.assertEqual(
+                getattr(slot, "mapping_revision", None),
+                service.mapping_store.scope_revision(system.id, slot.enclosure_id),
+            )
         self.assertEqual(
             [option.id for option in snapshot.enclosures],
             [
@@ -9168,18 +9207,117 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             service._cache["__default__"] = InventorySnapshot(slots=[], refresh_interval_seconds=30)
             service._cache_until["__default__"] = datetime.now(timezone.utc) + timedelta(seconds=30)
 
-            imported = await service.import_mapping_bundle(
-                MappingBundle(
-                    mappings=[
-                        ManualMapping(slot=0, enclosure_id="enc-1", serial="SER123"),
-                    ]
-                ),
+            bundle = MappingBundle(
+                mappings=[
+                    ManualMapping(slot=0, enclosure_id="enc-1", serial="SER123"),
+                ]
+            )
+            preview = await service.preview_mapping_bundle(bundle)
+            result = await service.import_mapping_bundle(
+                bundle,
+                expected_revision=preview["revision"],
+                import_digest=preview["import_digest"],
                 invalidate_snapshot=False,
             )
 
-            self.assertEqual(imported, 1)
+            self.assertEqual(result["imported"], 1)
+            self.assertEqual(result["previous_revision"], preview["revision"])
+            self.assertNotEqual(result["revision"], preview["revision"])
             self.assertEqual(service.get_snapshot.await_count, 0)
             self.assertIn("__default__", service._cache)
+
+    async def test_import_mapping_bundle_rejects_stale_preview_without_invalidating_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            cached = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+            service._cache["enc-1"] = cached
+            service._cache_until["enc-1"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+            bundle = MappingBundle(
+                mappings=[ManualMapping(slot=0, enclosure_id="enc-1", serial="IMPORT")]
+            )
+            preview = await service.preview_mapping_bundle(bundle, selected_enclosure_id="enc-1")
+            service.mapping_store.save_mapping(
+                ManualMapping(system_id=system.id, enclosure_id="enc-1", slot=1, serial="NEWER")
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "revision"):
+                await service.import_mapping_bundle(
+                    bundle,
+                    selected_enclosure_id="enc-1",
+                    expected_revision=preview["revision"],
+                    import_digest=preview["import_digest"],
+                )
+
+            self.assertIs(service._cache["enc-1"], cached)
+            self.assertIsNone(service.mapping_store.get_mapping(system.id, "enc-1", 0))
+            self.assertEqual(service.mapping_store.get_mapping(system.id, "enc-1", 1).serial, "NEWER")
+
+    async def test_export_mapping_bundle_includes_current_scope_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service.mapping_store.save_mapping(
+                ManualMapping(system_id=system.id, enclosure_id="enc-1", slot=0, serial="SANITIZED")
+            )
+
+            bundle = await service.export_mapping_bundle(selected_enclosure_id="enc-1")
+            preview = await service.preview_mapping_bundle(bundle, selected_enclosure_id="enc-1")
+
+            self.assertEqual(getattr(bundle, "revision", None), preview["revision"])
+
+    async def test_clear_mapping_uses_effective_fallback_scope_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service.mapping_store.save_mapping(
+                ManualMapping(system_id=system.id, enclosure_id=None, slot=0, serial="FALLBACK")
+            )
+            snapshot = InventorySnapshot(
+                slots=[
+                    SlotView(
+                        slot=0,
+                        slot_label="00",
+                        row_index=0,
+                        column_index=0,
+                        enclosure_id="enc-a",
+                    )
+                ],
+                refresh_interval_seconds=30,
+            )
+            service.get_snapshot = AsyncMock(return_value=snapshot)
+            revision = service.mapping_store.clear_revision(system.id, "enc-a", 0)
+
+            cleared = await service.clear_mapping(
+                0,
+                selected_enclosure_id="enc-a",
+                expected_revision=revision,
+                invalidate_snapshot=False,
+            )
+
+            self.assertTrue(cleared)
+            self.assertIsNone(service.mapping_store.get_mapping(system.id, None, 0))
 
 
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):

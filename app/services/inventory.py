@@ -2466,6 +2466,7 @@ class InventoryService:
         payload: dict[str, Any],
         selected_enclosure_id: str | None = None,
         *,
+        expected_revision: str | None = None,
         invalidate_snapshot: bool = True,
     ) -> ManualMapping:
         snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
@@ -2477,7 +2478,7 @@ class InventoryService:
             enclosure_id=enclosure_id,
             **payload,
         )
-        saved = self.mapping_store.save_mapping(mapping)
+        saved = self.mapping_store.save_mapping(mapping, expected_revision=expected_revision)
         if invalidate_snapshot:
             self.invalidate_snapshot_cache(reason="save_mapping", cache_keys=[enclosure_id, None])
         return saved
@@ -2487,12 +2488,18 @@ class InventoryService:
         slot: int,
         selected_enclosure_id: str | None = None,
         *,
+        expected_revision: str | None = None,
         invalidate_snapshot: bool = True,
     ) -> bool:
         snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         enclosure_id = slot_view.enclosure_id if slot_view else None
-        cleared = self.mapping_store.clear_mapping(self.system.id, enclosure_id, slot)
+        cleared = self.mapping_store.clear_mapping(
+            self.system.id,
+            enclosure_id,
+            slot,
+            expected_revision=expected_revision,
+        )
         if cleared and invalidate_snapshot:
             self.invalidate_snapshot_cache(reason="clear_mapping", cache_keys=[enclosure_id, None])
         return cleared
@@ -3012,20 +3019,25 @@ class InventoryService:
         return summary
 
     async def export_mapping_bundle(self, selected_enclosure_id: str | None = None) -> MappingBundle:
+        mappings = self.mapping_store.list_mappings(self.system.id, selected_enclosure_id)
+        preview = self.mapping_store.preview_replace_mappings(
+            self.system.id,
+            selected_enclosure_id,
+            mappings,
+        )
         return MappingBundle(
             app_version=__version__,
             system_id=self.system.id,
             enclosure_id=selected_enclosure_id,
-            mappings=self.mapping_store.list_mappings(self.system.id, selected_enclosure_id),
+            revision=preview["revision"],
+            mappings=mappings,
         )
 
-    async def import_mapping_bundle(
+    def _rewrite_mapping_bundle(
         self,
         bundle: MappingBundle,
-        selected_enclosure_id: str | None = None,
-        *,
-        invalidate_snapshot: bool = True,
-    ) -> int:
+        selected_enclosure_id: str | None,
+    ) -> list[ManualMapping]:
         rewritten: list[ManualMapping] = []
         for mapping in bundle.mappings:
             target_enclosure_id = selected_enclosure_id or mapping.enclosure_id
@@ -3038,11 +3050,50 @@ class InventoryService:
                     }
                 )
             )
+        return rewritten
 
-        saved_count = self.mapping_store.replace_mappings(self.system.id, selected_enclosure_id, rewritten)
+    async def preview_mapping_bundle(
+        self,
+        bundle: MappingBundle,
+        selected_enclosure_id: str | None = None,
+    ) -> dict[str, Any]:
+        rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
+        preview = self.mapping_store.preview_replace_mappings(
+            self.system.id,
+            selected_enclosure_id,
+            rewritten,
+        )
+        return {
+            **preview,
+            "system_id": self.system.id,
+            "enclosure_id": selected_enclosure_id,
+        }
+
+    async def import_mapping_bundle(
+        self,
+        bundle: MappingBundle,
+        selected_enclosure_id: str | None = None,
+        *,
+        expected_revision: str,
+        import_digest: str,
+        invalidate_snapshot: bool = True,
+    ) -> dict[str, Any]:
+        rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
+        result = self.mapping_store.apply_mapping_import(
+            self.system.id,
+            selected_enclosure_id,
+            rewritten,
+            expected_revision=expected_revision,
+            import_digest=import_digest,
+        )
         if invalidate_snapshot:
             self.invalidate_snapshot_cache(reason="import_mapping_bundle")
-        return saved_count
+        return {
+            "imported": result["saved_count"],
+            "revision": result["revision"],
+            "previous_revision": result["preview"]["revision"],
+            "preview": result["preview"],
+        }
 
     async def _build_snapshot(
         self,
@@ -3186,6 +3237,7 @@ class InventoryService:
         with perf_stage("inventory.slot_detail_cache.persist", slot_count=len(slots)):
             self._persist_slot_details(slots)
 
+        slots = self._attach_mapping_revisions(slots)
         summary = InventorySummary(
             disk_count=disk_count,
             pool_count=pool_count,
@@ -3232,6 +3284,26 @@ class InventoryService:
             capabilities=capabilities,
             summary=summary,
         )
+
+    def _attach_mapping_revisions(self, slots: list[SlotView]) -> list[SlotView]:
+        scopes = {slot.enclosure_id for slot in slots}
+        revisions = {
+            scope: self.mapping_store.scope_revision(self.system.id, scope)
+            for scope in scopes
+        }
+        clear_revisions = self.mapping_store.clear_revisions(
+            self.system.id,
+            list({(slot.enclosure_id, slot.slot) for slot in slots}),
+        )
+        return [
+            slot.model_copy(
+                update={
+                    "mapping_revision": revisions[slot.enclosure_id],
+                    "mapping_clear_revision": clear_revisions[(slot.enclosure_id, slot.slot)],
+                }
+            )
+            for slot in slots
+        ]
 
     def _build_platform_capabilities(
         self,
