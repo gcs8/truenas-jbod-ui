@@ -108,6 +108,48 @@ class ContainerResourceContractTests(unittest.TestCase):
                 else:
                     self.assertIn(compose_reference, SUPPORTED_COMPOSE_FILES)
 
+    def test_quick_start_lists_clean_room_prerequisites(self) -> None:
+        quick_start = (REPO_ROOT / "wiki/Quick-Start.md").read_text(encoding="utf-8")
+
+        self.assertIn("`curl`", quick_start)
+        self.assertIn("write permission", quick_start)
+        self.assertIn("outbound HTTPS", quick_start)
+        self.assertIn("GitHub and GHCR", quick_start)
+        self.assertIn("firewall", quick_start)
+
+    def test_source_build_guides_require_edit_before_start(self) -> None:
+        for relative_path in (
+            "README.md",
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            with self.subTest(guide=relative_path):
+                self.assertIn("Edit `.env` before the first start", guide)
+
+    def test_source_build_guides_explain_env_precedence(self) -> None:
+        for relative_path in (
+            "README.md",
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            with self.subTest(guide=relative_path):
+                self.assertIn("values in `.env` override matching YAML settings", guide)
+
+    def test_admin_launch_guides_repeat_trust_boundary(self) -> None:
+        for relative_path in (
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+            "wiki/Admin-UI-and-System-Setup.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            with self.subTest(guide=relative_path):
+                self.assertIn("../docs/ADMIN_TRUST_BOUNDARY.md", guide)
+                self.assertIn("trusted operator", guide)
+                self.assertIn("Docker socket", guide)
+                self.assertIn("Auto-stop limits exposure; it is not authentication", guide)
+
     def test_secret_overlay_grants_only_required_service_scoped_files(self) -> None:
         overlay_path = REPO_ROOT / "docker-compose.secrets.yml"
         self.assertTrue(overlay_path.is_file())
