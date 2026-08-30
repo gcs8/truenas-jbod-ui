@@ -4311,6 +4311,7 @@ class HistoryCollectorTests(unittest.TestCase):
 
         collector._record_background_failure(now)
         self.assertEqual(collector.background_consecutive_failures, 1)
+        self.assertEqual(collector.status()["background_backoff_delay_seconds"], 5)
         self.assertEqual(collector.background_backoff_until, now + timedelta(seconds=5))
 
         collector._record_background_failure(now + timedelta(seconds=5))
@@ -4319,6 +4320,8 @@ class HistoryCollectorTests(unittest.TestCase):
 
         collector._record_background_failure(now + timedelta(seconds=15))
         self.assertEqual(collector.background_consecutive_failures, 3)
+        self.assertEqual(collector.status()["background_backoff_delay_seconds"], 12)
+        self.assertEqual(collector.status()["failure_backoff_max_seconds"], 12)
         self.assertEqual(collector.background_backoff_until, now + timedelta(seconds=27))
         self.assertEqual(collector.next_collection_at, collector.background_backoff_until)
         self.assertGreater(collector.status()["background_backoff_seconds_remaining"], 0)
@@ -4340,6 +4343,7 @@ class HistoryCollectorTests(unittest.TestCase):
         asyncio.run(collector.run_once())
 
         self.assertEqual(collector.background_consecutive_failures, 0)
+        self.assertEqual(collector.status()["background_backoff_delay_seconds"], 0)
         self.assertIsNone(collector.background_backoff_until)
         self.assertEqual(collector.background_backoff_seconds_remaining, 0)
 
@@ -4877,6 +4881,120 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(failed_stage["system_id"], "archive-core")
         self.assertTrue(failed_stage["force_fresh"])
         self.assertIn("timed out", failed_stage["error"])
+
+    def test_smart_alert_evidence_requires_an_alert_field(self) -> None:
+        self.assertFalse(
+            HistoryCollector._smart_summary_has_alert_evidence(
+                {"available": True, "power_on_hours": 100}
+            )
+        )
+
+    def test_smart_alert_evidence_classifies_storcli_fault_as_failure(self) -> None:
+        self.assertTrue(
+            HistoryCollector._smart_summary_indicates_failure(
+                {"available": True, "smart_health_status": "FAULT"}
+            )
+        )
+
+    def test_run_once_publishes_deduplicated_complete_smart_alert_evidence(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.create_backup = MagicMock(return_value=None)  # type: ignore[method-assign]
+        settings = HistorySettings(
+            sqlite_path=str(temp_dir / "history.db"),
+            backup_dir=str(temp_dir / "backups"),
+            poll_interval_seconds=300,
+            failure_backoff_max_seconds=900,
+            startup_grace_seconds=0,
+        )
+        collector = HistoryCollector(settings, store)
+        live_slots = [
+            {
+                "slot": 0,
+                "present": True,
+                "serial": "DISK-A",
+                "logical_unit_id": "0x5000cca000000001",
+                "device_name": "da0",
+                "state": "healthy",
+            },
+            {
+                "slot": 1,
+                "present": True,
+                "serial": "DISK-B",
+                "gptid": "gptid/disk-b",
+                "persistent_id_label": "GPTID",
+                "device_name": "da1",
+                "state": "healthy",
+            },
+        ]
+        duplicate_view_slot = {
+            "slot": 7,
+            "present": True,
+            "serial": "DISK-A",
+            "logical_unit_id": "0x5000cca000000001",
+            "device_name": "view-da0",
+            "state": "matched",
+        }
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                ScopeSnapshot(
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    snapshot={
+                        "selected_system_id": "archive-core",
+                        "selected_enclosure_id": "enc-a",
+                        "slots": live_slots,
+                    },
+                ),
+                ScopeSnapshot(
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_id="storage-view:critical",
+                    enclosure_label="Critical disks",
+                    snapshot={
+                        "selected_system_id": "archive-core",
+                        "selected_enclosure_id": "storage-view:critical",
+                        "slots": [duplicate_view_slot],
+                    },
+                ),
+            ]
+        )
+        collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {
+                    0: {"available": True, "temperature_c": 61, "smart_health_status": "FAILED"},
+                    1: {"available": True, "temperature_c": 44, "predictive_errors": 2},
+                },
+                {7: {"available": True, "temperature_c": 60, "smart_health_status": "FAILED"}},
+            ]
+        )
+
+        asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+
+        status = collector.status()
+        self.assertEqual(status["poll_interval_seconds"], 300)
+        self.assertEqual(status["failure_backoff_max_seconds"], 900)
+        self.assertEqual(status["last_smart_failure_evidence_disks"], 2)
+        self.assertEqual(status["last_max_temperature_celsius"], 61)
+        self.assertIsNotNone(status["last_smart_evidence_at"])
+
+        collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {
+                    0: {"available": True, "power_on_hours": 100},
+                    1: {"available": True, "power_on_hours": 200},
+                },
+                {7: {"available": True, "power_on_hours": 100}},
+            ]
+        )
+        asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+
+        partial_status = collector.status()
+        self.assertEqual(partial_status["last_smart_failure_evidence_disks"], 2)
+        self.assertEqual(partial_status["last_max_temperature_celsius"], 61)
+        self.assertEqual(partial_status["last_smart_evidence_at"], status["last_smart_evidence_at"])
 
     def test_run_once_skips_recent_history_backup_during_slow_collection(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

@@ -90,6 +90,48 @@ HISTORY_COLLECTION_SCHEDULE_OVERRUN_SECONDS = Gauge(
     labelnames=("service",),
     namespace=METRICS_NAMESPACE,
 )
+HISTORY_COLLECTION_INTERVAL_SECONDS = Gauge(
+    "history_collection_interval_seconds",
+    "Configured interval between background history collection passes.",
+    labelnames=("service",),
+    namespace=METRICS_NAMESPACE,
+)
+HISTORY_COLLECTION_CONSECUTIVE_FAILURES = Gauge(
+    "history_collection_consecutive_failures",
+    "Consecutive background history collection failures.",
+    labelnames=("service",),
+    namespace=METRICS_NAMESPACE,
+)
+HISTORY_COLLECTION_FAILURE_BACKOFF_SECONDS = Gauge(
+    "history_collection_failure_backoff_seconds",
+    "Scheduled retry delay after the latest background collection failure.",
+    labelnames=("service",),
+    namespace=METRICS_NAMESPACE,
+)
+HISTORY_COLLECTION_FAILURE_BACKOFF_MAX_SECONDS = Gauge(
+    "history_collection_failure_backoff_max_seconds",
+    "Configured maximum background collection failure retry delay.",
+    labelnames=("service",),
+    namespace=METRICS_NAMESPACE,
+)
+HISTORY_SMART_FAILURE_EVIDENCE_DISKS = Gauge(
+    "history_smart_failure_evidence_disks",
+    "Physical disks with SMART failure or predictive-failure evidence in the latest complete evidence pass.",
+    labelnames=("service",),
+    namespace=METRICS_NAMESPACE,
+)
+HISTORY_MAX_TEMPERATURE_CELSIUS = Gauge(
+    "history_max_temperature_celsius",
+    "Maximum disk temperature in Celsius in the latest complete SMART evidence pass.",
+    labelnames=("service",),
+    namespace=METRICS_NAMESPACE,
+)
+HISTORY_SMART_EVIDENCE_TIMESTAMP = Gauge(
+    "history_smart_evidence_timestamp_seconds",
+    "Unix timestamp of the latest complete SMART alert-evidence pass.",
+    labelnames=("service",),
+    namespace=METRICS_NAMESPACE,
+)
 HISTORY_LAST_SCOPE_COUNT = Gauge(
     "history_last_scope_count",
     "Number of inventory scopes seen in the latest collector pass.",
@@ -353,6 +395,31 @@ def observe_history_collection_run(
     )
     HISTORY_LAST_SCOPE_COUNT.labels(service=service_name).set(int(status.get("last_scope_count") or 0))
     HISTORY_LAST_ERROR.labels(service=service_name).set(1 if status.get("last_error") else 0)
+    HISTORY_COLLECTION_INTERVAL_SECONDS.labels(service=service_name).set(
+        max(1, _nonnegative_int(status.get("poll_interval_seconds"), default=1))
+    )
+    HISTORY_COLLECTION_CONSECUTIVE_FAILURES.labels(service=service_name).set(
+        _nonnegative_int(status.get("background_consecutive_failures"))
+    )
+    HISTORY_COLLECTION_FAILURE_BACKOFF_SECONDS.labels(service=service_name).set(
+        _nonnegative_int(status.get("background_backoff_delay_seconds"))
+    )
+    HISTORY_COLLECTION_FAILURE_BACKOFF_MAX_SECONDS.labels(service=service_name).set(
+        max(1, _nonnegative_int(status.get("failure_backoff_max_seconds"), default=1))
+    )
+    HISTORY_SMART_FAILURE_EVIDENCE_DISKS.labels(service=service_name).set(
+        _nonnegative_int(status.get("last_smart_failure_evidence_disks"))
+    )
+    max_temperature = status.get("last_max_temperature_celsius")
+    if isinstance(max_temperature, int | float) and not isinstance(max_temperature, bool):
+        HISTORY_MAX_TEMPERATURE_CELSIUS.labels(service=service_name).set(max_temperature)
+    else:
+        HISTORY_MAX_TEMPERATURE_CELSIUS.remove(service_name)
+    _set_timestamp_metric(
+        HISTORY_SMART_EVIDENCE_TIMESTAMP,
+        service_name,
+        status.get("last_smart_evidence_at"),
+    )
     _set_timestamp_metric(
         HISTORY_LAST_INVENTORY_TIMESTAMP,
         service_name,
@@ -699,6 +766,16 @@ def _set_timestamp_metric(metric: Gauge, service_name: str, raw_timestamp: objec
     if parsed is None:
         return
     metric.labels(service=service_name).set(parsed)
+
+
+def _nonnegative_int(value: object, *, default: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, str | int | float):
+        return default
+    try:
+        parsed = int(value)
+    except (OverflowError, ValueError):
+        return default
+    return max(0, parsed)
 
 
 def _parse_timestamp(raw_timestamp: object) -> float | None:

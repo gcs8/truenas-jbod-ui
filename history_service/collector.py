@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import threading
 import time
 import urllib.error
@@ -65,6 +66,15 @@ TOPOLOGY_FIELDS = ("pool_name", "vdev_name", "topology_label")
 TOPOLOGY_CHANGE_CONFIRMATION_COUNT = 2
 MASS_TOPOLOGY_DEGRADATION_MIN_SLOTS = 4
 MASS_TOPOLOGY_DEGRADATION_RATIO = 0.25
+SMART_FAILURE_STATUSES = {
+    "BAD",
+    "CRITICAL",
+    "FAIL",
+    "FAILED",
+    "FAILING",
+    "FAULT",
+    "OFFLINE",
+}
 
 
 @dataclass(slots=True, frozen=True)
@@ -118,7 +128,11 @@ class HistoryCollector:
         self.last_background_overrun_seconds: float = 0.0
         self.last_collection_stage_timings: list[dict[str, Any]] = []
         self.background_consecutive_failures: int = 0
+        self.background_backoff_delay_seconds: int = 0
         self.background_backoff_until: datetime | None = None
+        self.last_smart_failure_evidence_disks: int = 0
+        self.last_max_temperature_celsius: float | None = None
+        self.last_smart_evidence_at: str | None = None
         self.next_collection_at: datetime | None = None
         self._pending_topology_changes: dict[
             tuple[str, str, int],
@@ -229,6 +243,10 @@ class HistoryCollector:
                 run_started,
             )
         )
+        smart_evidence_expected: set[str] = set()
+        smart_evidence_observed: set[str] = set()
+        smart_failure_evidence: set[str] = set()
+        smart_temperatures: dict[str, float] = {}
         force_inventory = self._should_force_inventory_for_collection(
             collect_fast=collect_fast,
             collect_slow=collect_slow,
@@ -295,6 +313,9 @@ class HistoryCollector:
             present_slots = [record.slot for record in slot_records if record.present]
             if not present_slots:
                 continue
+            records_by_slot = {record.slot: record for record in slot_records if record.present}
+            for record in records_by_slot.values():
+                smart_evidence_expected.add(self._smart_evidence_disk_key(record))
             self._set_collection_activity(f"collecting SMART metrics for {scope_label} ({scope_index}/{len(scopes)})")
             smart_started = time.perf_counter()
             try:
@@ -336,6 +357,16 @@ class HistoryCollector:
                 summary = summaries.get(record.slot)
                 if not isinstance(summary, dict):
                     continue
+                evidence_key = self._smart_evidence_disk_key(record)
+                if self._smart_summary_has_alert_evidence(summary):
+                    smart_evidence_observed.add(evidence_key)
+                    if self._smart_summary_indicates_failure(summary):
+                        smart_failure_evidence.add(evidence_key)
+                    temperature = self._smart_summary_temperature(summary)
+                    if temperature is not None:
+                        previous_temperature = smart_temperatures.get(evidence_key)
+                        if previous_temperature is None or temperature > previous_temperature:
+                            smart_temperatures[evidence_key] = temperature
                 if collect_fast:
                     metric_samples.extend(
                         self._build_metric_samples(record, summary, observed_at, FAST_METRIC_FIELDS)
@@ -358,6 +389,13 @@ class HistoryCollector:
                     scope_index=scope_index,
                     sample_count=len(metric_samples),
                 )
+
+        if (collect_fast or collect_slow) and smart_evidence_expected.issubset(smart_evidence_observed):
+            self.last_smart_failure_evidence_disks = len(smart_failure_evidence)
+            self.last_max_temperature_celsius = (
+                max(smart_temperatures.values()) if smart_temperatures else None
+            )
+            self.last_smart_evidence_at = observed_at
 
         backup_succeeded = False
         if collect_fast:
@@ -425,7 +463,10 @@ class HistoryCollector:
             "last_collection_inventory_forced": self.last_collection_inventory_forced,
             "last_collection_duration_seconds": self.last_collection_duration_seconds,
             "last_background_overrun_seconds": self.last_background_overrun_seconds,
+            "poll_interval_seconds": max(1, int(self.settings.poll_interval_seconds)),
             "background_consecutive_failures": self.background_consecutive_failures,
+            "background_backoff_delay_seconds": self.background_backoff_delay_seconds,
+            "failure_backoff_max_seconds": max(1, int(self.settings.failure_backoff_max_seconds)),
             "background_backoff_until": isoformat_utc(self.background_backoff_until)
             if self.background_backoff_until
             else None,
@@ -435,6 +476,9 @@ class HistoryCollector:
             "last_inventory_at": self.last_inventory_at,
             "last_fast_metrics_at": self.last_fast_metrics_at,
             "last_slow_metrics_at": self.last_slow_metrics_at,
+            "last_smart_failure_evidence_disks": self.last_smart_failure_evidence_disks,
+            "last_max_temperature_celsius": self.last_max_temperature_celsius,
+            "last_smart_evidence_at": self.last_smart_evidence_at,
             "last_success_at": self.last_success_at,
             "last_backup_at": self.last_backup_at,
             "last_retention_at": self.last_retention_at,
@@ -563,6 +607,7 @@ class HistoryCollector:
     def _record_background_failure(self, now: datetime) -> None:
         self.background_consecutive_failures += 1
         delay_seconds = self._background_failure_delay_seconds()
+        self.background_backoff_delay_seconds = delay_seconds
         self.background_backoff_until = now + timedelta(seconds=delay_seconds)
         self.next_collection_at = self.background_backoff_until
         logger.warning(
@@ -576,6 +621,7 @@ class HistoryCollector:
         if self.background_consecutive_failures or self.background_backoff_until:
             logger.info("History background collection recovered; clearing failure backoff.")
         self.background_consecutive_failures = 0
+        self.background_backoff_delay_seconds = 0
         self.background_backoff_until = None
 
     def _background_failure_delay_seconds(self) -> int:
@@ -973,6 +1019,45 @@ class HistoryCollector:
             if isinstance(platform_context, dict) and platform_context.get("topology_complete") is False:
                 return False
         return True
+
+    @staticmethod
+    def _smart_evidence_disk_key(record: SlotStateRecord) -> str:
+        if record.disk_identity_key:
+            return record.disk_identity_key
+        serial = (normalize_text(record.serial) or "").casefold()
+        logical_unit_id = (normalize_text(record.logical_unit_id) or "").casefold()
+        sas_address = (normalize_text(record.sas_address) or "").casefold()
+        if serial and logical_unit_id:
+            return "\x1f".join(("logical-unit", serial, logical_unit_id))
+        if serial and sas_address:
+            return "\x1f".join(("sas", serial, sas_address))
+        return "\x1f".join(("slot", record.system_id, record.enclosure_key, str(record.slot)))
+
+    @staticmethod
+    def _smart_summary_has_alert_evidence(summary: dict[str, Any]) -> bool:
+        return any(
+            summary.get(field_name) is not None
+            for field_name in ("smart_health_status", "predictive_errors", "temperature_c")
+        )
+
+    @staticmethod
+    def _smart_summary_indicates_failure(summary: dict[str, Any]) -> bool:
+        health_status = (normalize_text(summary.get("smart_health_status")) or "").upper()
+        predictive_errors = summary.get("predictive_errors")
+        has_predictive_errors = (
+            isinstance(predictive_errors, int | float)
+            and not isinstance(predictive_errors, bool)
+            and predictive_errors > 0
+        )
+        return health_status in SMART_FAILURE_STATUSES or has_predictive_errors
+
+    @staticmethod
+    def _smart_summary_temperature(summary: dict[str, Any]) -> float | None:
+        value = summary.get("temperature_c")
+        if not isinstance(value, int | float) or isinstance(value, bool):
+            return None
+        temperature = float(value)
+        return temperature if math.isfinite(temperature) else None
 
     def _build_metric_samples(
         self,

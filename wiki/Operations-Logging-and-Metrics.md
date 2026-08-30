@@ -140,6 +140,19 @@ The first pass includes:
 - history-sidecar collector state, tracked-slot counts, and collection-pass
   duration
 
+The starter alert rules use these bounded history-sidecar gauges. Every gauge
+has only the `service` application label:
+
+| Metric | Meaning |
+| --- | --- |
+| `truenas_jbod_ui_history_collection_interval_seconds` | Configured background collection interval |
+| `truenas_jbod_ui_history_collection_consecutive_failures` | Current consecutive background failure count |
+| `truenas_jbod_ui_history_collection_failure_backoff_seconds` | Retry delay scheduled after the latest failure |
+| `truenas_jbod_ui_history_collection_failure_backoff_max_seconds` | Configured retry-delay cap |
+| `truenas_jbod_ui_history_smart_failure_evidence_disks` | Deduplicated physical disks with SMART or predictive-failure evidence in the latest complete evidence pass |
+| `truenas_jbod_ui_history_max_temperature_celsius` | Maximum disk temperature in the latest complete evidence pass |
+| `truenas_jbod_ui_history_smart_evidence_timestamp_seconds` | Completion time of the evidence pass represented by the SMART and temperature gauges |
+
 Disable the endpoints:
 
 ```dotenv
@@ -173,6 +186,84 @@ scrape_configs:
       - targets:
           - your-docker-host:8081
 ```
+
+## Starter alert rules
+
+The versioned example rules live at
+`prometheus/rules/truenas-jbod-ui-alerts-v1.yml`. They are starting points, not
+vendor guarantees. Copy the file into your Prometheus configuration, review
+every threshold, and keep your local changes outside the application checkout.
+
+Add the rules file to `prometheus.yml`:
+
+```yaml
+rule_files:
+  - /etc/prometheus/rules/truenas-jbod-ui-alerts-v1.yml
+```
+
+Label only services that must remain available. The admin sidecar normally
+stops when it is not needed, so do not give it the `required` label unless your
+deployment intentionally keeps it running.
+
+```yaml
+scrape_configs:
+  - job_name: truenas-jbod-ui
+    static_configs:
+      - targets:
+          - your-docker-host:8080
+        labels:
+          truenas_jbod_ui_monitor: required
+  - job_name: truenas-jbod-history
+    static_configs:
+      - targets:
+          - your-docker-host:8081
+        labels:
+          truenas_jbod_ui_monitor: required
+```
+
+After copying or changing the rules, validate them and reload Prometheus using
+your normal deployment process:
+
+```bash
+promtool check rules /etc/prometheus/rules/truenas-jbod-ui-alerts-v1.yml
+```
+
+Repository CI verifies PromQL syntax with pinned `promtool` 3.5.0, then checks
+the exact starter thresholds, durations, labels, privacy boundary, and
+documentation contract with
+`python -m unittest tests.test_prometheus_alert_rules -v`.
+
+### Routing ownership
+
+The checked-in rules use `owner: operator-configure`. Replace that value in your
+local copy with the team or route name your Alertmanager configuration expects.
+The application does not choose a paging destination and does not send
+notifications itself. Route by stable labels such as `owner` and `severity`.
+Do not add system IDs, enclosure IDs, slots, serials, device names, private
+addresses, or endpoint labels to notifications.
+
+### Disable or tune a rule
+
+Remove a rule from your local copy to disable it. To tune one, change its
+numeric expression or `for` duration, run `promtool check rules`, and reload
+Prometheus. Keep the checked-in file unchanged so application updates cannot
+overwrite your site policy.
+
+| Alert | Example default | What to review |
+| --- | --- | --- |
+| `TrueNASJBODUIServiceUnavailable` | Required target down for 5 minutes | Which scrape targets carry `truenas_jbod_ui_monitor="required"` and how long maintenance normally lasts |
+| `TrueNASJBODUIHistoryCollectorStale` | No success for two exported collection intervals, then 5 more minutes | `HISTORY_POLL_INTERVAL_SECONDS`, maintenance windows, and scrape delay |
+| `TrueNASJBODUIHistoryCollectionFailures` | Three consecutive failures for 5 minutes | Transient API failures and the failure count your team wants to investigate |
+| `TrueNASJBODUIHistoryBackoffExhausted` | Retry delay reaches `HISTORY_FAILURE_BACKOFF_MAX_SECONDS` for 5 minutes | Your configured backoff cap and escalation policy |
+| `TrueNASJBODUISmartFailureEvidence` | One or more disks with SMART failure or predictive-error evidence for 5 minutes | Platform SMART support and the urgency required for positive evidence |
+| `TrueNASJBODUIHighTemperature` | Maximum observed temperature at or above 55°C for 15 minutes | Drive vendor limits, chassis airflow, ambient temperature, and seasonal baseline |
+
+SMART failure count and maximum temperature have only the `service` label. The
+collector deduplicates live and saved-view references to the same physical disk.
+It updates those gauges only after a complete evidence pass. If a SMART pass is
+partial, the previous complete-pass values and
+`truenas_jbod_ui_history_smart_evidence_timestamp_seconds` remain in place.
+This prevents a missing response from clearing active failure evidence.
 
 ## Grafana Dashboards
 

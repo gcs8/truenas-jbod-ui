@@ -1,0 +1,88 @@
+# Starter rules, not universal vendor guarantees.
+# Copy this file, set routing ownership, and tune thresholds for your hardware.
+groups:
+  - name: truenas-jbod-ui.v1
+    rules:
+      - alert: TrueNASJBODUIServiceUnavailable
+        expr: >-
+          min by (deployment, job, truenas_jbod_ui_monitor)
+          (up{truenas_jbod_ui_monitor="required"}) == 0
+        for: 5m
+        labels:
+          severity: critical
+          owner: operator-configure
+        annotations:
+          summary: Required TrueNAS JBOD UI scrape target is unavailable
+          description: A target explicitly labeled as required has failed scrapes for 5 minutes.
+
+      - alert: TrueNASJBODUIHistoryCollectorStale
+        expr: >-
+          max by (deployment, service)
+          (
+            (time() - truenas_jbod_ui_history_last_success_timestamp_seconds{service="enclosure-history"})
+            > bool
+            (2 * truenas_jbod_ui_history_collection_interval_seconds{service="enclosure-history"})
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+          owner: operator-configure
+        annotations:
+          summary: History collector is stale
+          description: The history collector has not completed successfully within two configured collection intervals.
+
+      - alert: TrueNASJBODUIHistoryCollectionFailures
+        expr: >-
+          max by (deployment, service)
+          (truenas_jbod_ui_history_collection_consecutive_failures{service="enclosure-history"}) >= 3
+        for: 5m
+        labels:
+          severity: warning
+          owner: operator-configure
+        annotations:
+          summary: History collector is failing repeatedly
+          description: The history collector has reported at least three consecutive background failures.
+
+      - alert: TrueNASJBODUIHistoryBackoffExhausted
+        expr: >-
+          max by (deployment, service)
+          (
+            (truenas_jbod_ui_history_collection_consecutive_failures{service="enclosure-history"} > 0)
+            and
+            (
+              truenas_jbod_ui_history_collection_failure_backoff_seconds{service="enclosure-history"}
+              >=
+              truenas_jbod_ui_history_collection_failure_backoff_max_seconds{service="enclosure-history"}
+            )
+          ) > 0
+        for: 5m
+        labels:
+          severity: critical
+          owner: operator-configure
+        annotations:
+          summary: History collector reached maximum retry backoff
+          description: Repeated collection failures have increased the scheduled retry delay to its configured maximum.
+
+      - alert: TrueNASJBODUISmartFailureEvidence
+        expr: >-
+          max by (deployment, service)
+          (truenas_jbod_ui_history_smart_failure_evidence_disks{service="enclosure-history"}) > 0
+        for: 5m
+        labels:
+          severity: critical
+          owner: operator-configure
+        annotations:
+          summary: SMART or predictive-failure evidence is present
+          description: The latest complete SMART evidence pass found one or more physical disks with failure evidence.
+
+      - alert: TrueNASJBODUIHighTemperature
+        expr: >-
+          max by (deployment, service)
+          (truenas_jbod_ui_history_max_temperature_celsius{service="enclosure-history"}) >= 55
+        for: 15m
+        labels:
+          severity: warning
+          owner: operator-configure
+        annotations:
+          summary: Sustained high disk temperature
+          description: The maximum observed disk temperature has remained at or above the example 55 degree Celsius threshold for 15 minutes.

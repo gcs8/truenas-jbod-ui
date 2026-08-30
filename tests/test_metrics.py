@@ -192,6 +192,13 @@ class HistoryMetricsTests(unittest.TestCase):
                 status={
                     "last_scope_count": 3,
                     "last_error": None,
+                    "poll_interval_seconds": 300,
+                    "background_consecutive_failures": 3,
+                    "background_backoff_delay_seconds": 900,
+                    "failure_backoff_max_seconds": 900,
+                    "last_smart_failure_evidence_disks": 2,
+                    "last_max_temperature_celsius": 61,
+                    "last_smart_evidence_at": "2026-04-27T16:02:30+00:00",
                     "last_inventory_at": "2026-04-27T16:00:00+00:00",
                     "last_fast_metrics_at": "2026-04-27T16:01:00+00:00",
                     "last_slow_metrics_at": "2026-04-27T16:02:00+00:00",
@@ -218,6 +225,36 @@ class HistoryMetricsTests(unittest.TestCase):
             f'truenas_jbod_ui_history_collection_schedule_overrun_seconds{{service="{history_service_name}"}} 2.5',
             metrics_text,
         )
+        expected_samples = (
+            "truenas_jbod_ui_history_collection_interval_seconds",
+            "truenas_jbod_ui_history_collection_consecutive_failures",
+            "truenas_jbod_ui_history_collection_failure_backoff_seconds",
+            "truenas_jbod_ui_history_collection_failure_backoff_max_seconds",
+            "truenas_jbod_ui_history_smart_failure_evidence_disks",
+            "truenas_jbod_ui_history_max_temperature_celsius",
+            "truenas_jbod_ui_history_smart_evidence_timestamp_seconds",
+        )
+        for metric_name in expected_samples:
+            self.assertIn(metric_name, metrics_text)
+        self.assertRegex(
+            metrics_text,
+            rf'truenas_jbod_ui_history_collection_interval_seconds\{{service="{history_service_name}"\}} 300\.0',
+        )
+        self.assertRegex(
+            metrics_text,
+            rf'truenas_jbod_ui_history_collection_failure_backoff_seconds\{{service="{history_service_name}"\}} 900\.0',
+        )
+        self.assertRegex(
+            metrics_text,
+            rf'truenas_jbod_ui_history_smart_failure_evidence_disks\{{service="{history_service_name}"\}} 2\.0',
+        )
+        self.assertRegex(
+            metrics_text,
+            rf'truenas_jbod_ui_history_max_temperature_celsius\{{service="{history_service_name}"\}} 61\.0',
+        )
+        for forbidden_label in ("system_id=", "enclosure_id=", "slot=", "serial=", "device_name="):
+            matching_lines = [line for line in metrics_text.splitlines() if any(name in line for name in expected_samples)]
+            self.assertNotIn(forbidden_label, "\n".join(matching_lines))
 
     def test_history_metrics_publish_retention_results(self) -> None:
         app = FastAPI()

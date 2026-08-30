@@ -88,6 +88,31 @@ jobs:
           python -m pip install -r requirements-dev.txt
           python -m pip check
 
+      - name: Install pinned promtool
+        env:
+          PROMTOOL_VERSION: "3.5.0"
+          PROMTOOL_SHA256: e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz"
+          install_dir="${RUNNER_TEMP}/promtool-${PROMTOOL_VERSION}"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz"
+          printf '%s  %s\n' "$PROMTOOL_SHA256" "$archive" | sha256sum --check --strict
+          mkdir -p "$install_dir"
+          tar -xzf "$archive" \
+            --strip-components=1 \
+            -C "$install_dir" \
+            "prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool"
+          chmod 0755 "$install_dir/promtool"
+          printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
+
+      - name: Validate starter Prometheus alert rules
+        run: |
+          promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml
+          python -m unittest tests.test_prometheus_alert_rules -v
+
       - name: Compile Python source
         run: python -m compileall app admin_service history_service scripts tests
 
