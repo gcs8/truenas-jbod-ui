@@ -19,6 +19,8 @@
   const HISTORY_STATUS_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.historyStatusCacheTtlSeconds, 15);
   const SMART_SUMMARY_CACHE_TTL_MS = SMART_CACHE_TTL_SECONDS * 1000;
   const HISTORY_STATUS_CACHE_TTL_MS = HISTORY_STATUS_CACHE_TTL_SECONDS * 1000;
+  const HISTORY_PAYLOAD_CACHE_TTL_MS = HISTORY_STATUS_CACHE_TTL_MS;
+  const HISTORY_PAYLOAD_CACHE_MAX_ENTRIES = 64;
   const DEFAULT_HISTORY_TIMEFRAME_HOURS = 24;
   const HEATMAP_DEFAULT_METRIC = "attention_score";
   const HEATMAP_HISTORY_METRIC_IDS = new Set(["read_rate", "write_rate"]);
@@ -136,7 +138,11 @@
       ioChartMode: restoredHistoryIoChartMode,
       panelLoading: false,
       panelError: null,
+      panelFreshness: null,
       panelRequestToken: 0,
+      generation: 0,
+      inFlight: {},
+      statusGenerationMarker: null,
       slotCache: preloadedHistoryBySlot,
     },
     setup: {
@@ -177,6 +183,9 @@
       error: null,
       scopeKey: null,
       pendingScopeKey: null,
+      fetchedAt: 0,
+      generation: 0,
+      freshness: "unavailable",
       requestToken: 0,
     },
     sasFabric: {
@@ -3564,22 +3573,166 @@
     if (options.includeWindow === false) {
       return `${systemPart}|${enclosurePart}|${slot.slot}`;
     }
+    const identityPart = slot?.serial || slot?.gptid || slot?.sas_address || slot?.device_name || "empty";
+    const kindPart = options.kind || "bundle";
     const windowPart = currentHistoryWindowHours() === null ? "all" : String(currentHistoryWindowHours());
-    return `${systemPart}|${enclosurePart}|${slot.slot}|${windowPart}`;
+    const generationPart = state.snapshotMode ? "snapshot" : `generation-${state.history.generation || 0}`;
+    return `${systemPart}|${enclosurePart}|${slot.slot}|${identityPart}|${kindPart}|${windowPart}|${generationPart}`;
+  }
+
+  function getLiveHistoryCacheEntry(cacheKey, now = Date.now()) {
+    if (state.snapshotMode || !cacheKey) {
+      return null;
+    }
+    const entry = state.history.slotCache[cacheKey];
+    if (!entry || entry.generation !== state.history.generation || !entry.payload) {
+      return null;
+    }
+    entry.lastAccessedAt = now;
+    return {
+      ...entry,
+      freshness: !entry.requiresRevalidation && now - entry.fetchedAt <= HISTORY_PAYLOAD_CACHE_TTL_MS
+        ? "fresh"
+        : "stale",
+    };
+  }
+
+  function storeLiveHistoryPayload(cacheKey, payload, now = Date.now()) {
+    if (state.snapshotMode || !cacheKey) {
+      return;
+    }
+    state.history.slotCache[cacheKey] = {
+      payload,
+      fetchedAt: now,
+      lastAccessedAt: now,
+      generation: state.history.generation,
+      requiresRevalidation: false,
+    };
+    const cacheKeys = Object.keys(state.history.slotCache);
+    if (cacheKeys.length <= HISTORY_PAYLOAD_CACHE_MAX_ENTRIES) {
+      return;
+    }
+    cacheKeys
+      .sort((left, right) => {
+        const leftEntry = state.history.slotCache[left];
+        const rightEntry = state.history.slotCache[right];
+        return Number(leftEntry?.lastAccessedAt || leftEntry?.fetchedAt || 0)
+          - Number(rightEntry?.lastAccessedAt || rightEntry?.fetchedAt || 0);
+      })
+      .slice(0, cacheKeys.length - HISTORY_PAYLOAD_CACHE_MAX_ENTRIES)
+      .forEach((key) => {
+        delete state.history.slotCache[key];
+      });
   }
 
   function getCachedHistoryPayload(historyTarget) {
     if (!historyTarget) {
       return null;
     }
+    if (!state.snapshotMode) {
+      return getLiveHistoryCacheEntry(historyTarget.cacheKey)?.payload || null;
+    }
     const directPayload = state.history.slotCache[historyTarget.cacheKey];
     if (directPayload) {
       return directPayload;
     }
-    if (!state.snapshotMode || !historyTarget.slot) {
+    if (!historyTarget.slot) {
       return null;
     }
     return state.history.slotCache[getHistoryCacheKey(historyTarget.slot, { includeWindow: false })] || null;
+  }
+
+  function invalidateHistoryCaches() {
+    if (state.snapshotMode) {
+      return;
+    }
+    state.history.generation = Number(state.history.generation || 0) + 1;
+    state.history.slotCache = {};
+    state.history.inFlight = {};
+    state.history.panelFreshness = null;
+    state.history.panelRequestToken += 1;
+    resetHeatmapHistoryCache();
+  }
+
+  function updateHistoryStatusGeneration(payload) {
+    const collector = payload?.collector || {};
+    const marker = JSON.stringify([
+      Boolean(payload?.available),
+      collector.last_success_at || "",
+      collector.last_completed_at || "",
+    ]);
+    const previousMarker = state.history.statusGenerationMarker;
+    const changed = previousMarker !== null && previousMarker !== marker;
+    if (changed) {
+      invalidateHistoryCaches();
+    }
+    state.history.statusGenerationMarker = marker;
+    return changed;
+  }
+
+  function markHistoryCachesStale(error) {
+    const errorMessage = error?.message || String(error || "Refresh failed");
+    Object.values(state.history.slotCache || {}).forEach((entry) => {
+      if (entry && entry.generation === state.history.generation) {
+        entry.requiresRevalidation = true;
+      }
+    });
+    if (state.history.panelFreshness?.fetchedAt) {
+      state.history.panelFreshness = {
+        state: "stale",
+        fetchedAt: state.history.panelFreshness.fetchedAt,
+        error: errorMessage,
+      };
+    }
+    if (
+      state.heatmap.generation === state.history.generation
+      && Object.keys(state.heatmap.histories || {}).length > 0
+    ) {
+      state.heatmap.freshness = "stale";
+      state.heatmap.error = errorMessage;
+    }
+  }
+
+  function historyPayloadUnavailableDetail(payload) {
+    if (payload?.available === false) {
+      return payload.detail || "History data is unavailable.";
+    }
+    if (payload?.histories && typeof payload.histories === "object") {
+      const unavailable = Object.values(payload.histories)
+        .find((entry) => entry?.available === false);
+      if (unavailable) {
+        return unavailable.detail || "History data is unavailable for part of this scope.";
+      }
+    }
+    return null;
+  }
+
+  function fetchLiveHistoryPayload(historyTarget) {
+    const generation = state.history.generation;
+    const requestKey = `${generation}|${historyTarget.cacheKey}`;
+    const existingRequest = state.history.inFlight[requestKey];
+    if (existingRequest) {
+      return existingRequest;
+    }
+    const request = (async () => {
+      try {
+        const payload = await fetchJson(historyTarget.fetchUrl);
+        const unavailableDetail = historyPayloadUnavailableDetail(payload);
+        if (unavailableDetail) {
+          throw new Error(unavailableDetail);
+        }
+        if (state.history.generation === generation) {
+          storeLiveHistoryPayload(historyTarget.cacheKey, payload);
+        }
+        return payload;
+      } finally {
+        if (state.history.inFlight[requestKey] === request) {
+          delete state.history.inFlight[requestKey];
+        }
+      }
+    })();
+    state.history.inFlight[requestKey] = request;
+    return request;
   }
 
   function getStorageViewSmartCacheKey(view, slot) {
@@ -5405,33 +5558,62 @@
     if (!request) {
       return;
     }
-    if (!force && state.heatmap.scopeKey === request.scopeKey && Object.keys(state.heatmap.histories || {}).length) {
+    const generation = state.history.generation;
+    const now = Date.now();
+    const hasCurrentHistories = (
+      state.heatmap.scopeKey === request.scopeKey
+      && state.heatmap.generation === generation
+      && Object.keys(state.heatmap.histories || {}).length > 0
+    );
+    const currentHistoriesAreFresh = (
+      hasCurrentHistories
+      && state.heatmap.freshness === "fresh"
+      && now - Number(state.heatmap.fetchedAt || 0) <= HISTORY_PAYLOAD_CACHE_TTL_MS
+    );
+    if (!force && currentHistoriesAreFresh) {
       return;
     }
-    if (!force && state.heatmap.loading && state.heatmap.pendingScopeKey === request.scopeKey) {
+    const pendingScopeKey = `${generation}|${request.scopeKey}`;
+    if (state.heatmap.loading && state.heatmap.pendingScopeKey === pendingScopeKey) {
       return;
     }
     const requestToken = state.heatmap.requestToken + 1;
     state.heatmap.requestToken = requestToken;
     state.heatmap.loading = true;
-    state.heatmap.pendingScopeKey = request.scopeKey;
+    state.heatmap.pendingScopeKey = pendingScopeKey;
     state.heatmap.error = null;
+    state.heatmap.freshness = hasCurrentHistories ? "refreshing" : "loading";
     renderHeatmapControls();
     try {
       const payload = await fetchJson(request.url);
-      if (requestToken !== state.heatmap.requestToken) {
+      const unavailableDetail = historyPayloadUnavailableDetail(payload);
+      if (unavailableDetail) {
+        throw new Error(unavailableDetail);
+      }
+      if (requestToken !== state.heatmap.requestToken || generation !== state.history.generation) {
         return;
       }
       state.heatmap.histories = payload.histories || {};
       state.heatmap.scopeKey = request.scopeKey;
+      state.heatmap.fetchedAt = Date.now();
+      state.heatmap.generation = generation;
+      state.heatmap.freshness = "fresh";
+      state.heatmap.timelineCacheKey = null;
+      state.heatmap.timelineCache = [];
       state.heatmap.error = null;
     } catch (error) {
-      if (requestToken !== state.heatmap.requestToken) {
+      if (requestToken !== state.heatmap.requestToken || generation !== state.history.generation) {
         return;
       }
       state.heatmap.error = error.message || String(error);
-      state.heatmap.histories = {};
-      state.heatmap.scopeKey = null;
+      if (hasCurrentHistories) {
+        state.heatmap.freshness = "stale";
+      } else {
+        state.heatmap.histories = {};
+        state.heatmap.scopeKey = null;
+        state.heatmap.fetchedAt = 0;
+        state.heatmap.freshness = "unavailable";
+      }
     } finally {
       if (requestToken === state.heatmap.requestToken) {
         state.heatmap.loading = false;
@@ -5446,6 +5628,10 @@
     state.heatmap.histories = {};
     state.heatmap.scopeKey = null;
     state.heatmap.pendingScopeKey = null;
+    state.heatmap.fetchedAt = 0;
+    state.heatmap.generation = state.history.generation;
+    state.heatmap.freshness = "unavailable";
+    state.heatmap.loading = false;
     state.heatmap.error = null;
     state.heatmap.playbackIndex = null;
     state.heatmap.timelineCacheKey = null;
@@ -5531,7 +5717,10 @@
       heatmapLegendMax.textContent = Number.isFinite(heatmapContext.max) ? activeMetric.format(heatmapContext.max) : "High";
     }
     if (heatmapLegendStatus) {
-      if (state.heatmap.loading) {
+      if (state.heatmap.loading && state.heatmap.freshness === "refreshing") {
+        heatmapLegendStatus.textContent = "Refreshing cached history";
+        heatmapLegendStatus.title = "Cached heat map values remain visible while fresh history is requested.";
+      } else if (state.heatmap.loading) {
         heatmapLegendStatus.textContent = needsHistory ? `Loading ${formatHistoryWindowLabel(currentHeatmapWindowHours())}` : "Loading";
       } else if (needsHistory && state.history.loading && !state.history.checked) {
         heatmapLegendStatus.textContent = "Checking history";
@@ -5539,6 +5728,9 @@
       } else if (needsHistory && !isHistoryAvailable()) {
         heatmapLegendStatus.textContent = "History unavailable";
         heatmapLegendStatus.title = state.history.detail || "The history sidecar is not available.";
+      } else if (state.heatmap.error && state.heatmap.freshness === "stale") {
+        heatmapLegendStatus.textContent = "Stale history - refresh failed";
+        heatmapLegendStatus.title = state.heatmap.error;
       } else if (state.heatmap.error) {
         heatmapLegendStatus.textContent = "History unavailable";
         heatmapLegendStatus.title = state.heatmap.error;
@@ -7414,6 +7606,29 @@
       .join("");
   }
 
+  function historyFreshnessNote(freshness) {
+    if (!freshness?.state) {
+      return "";
+    }
+    const fetchedAt = Number(freshness.fetchedAt) > 0
+      ? formatTimestamp(new Date(Number(freshness.fetchedAt)).toISOString())
+      : "an unknown time";
+    if (freshness.state === "fresh") {
+      return `History data is fresh. Fetched at ${fetchedAt}.`;
+    }
+    if (freshness.state === "refreshing") {
+      return `Refreshing cached history from ${fetchedAt}.`;
+    }
+    if (freshness.state === "stale") {
+      const errorDetail = freshness.error ? ` Refresh failed: ${freshness.error}.` : "";
+      return `Stale cached history from ${fetchedAt}.${errorDetail}`;
+    }
+    if (freshness.state === "unavailable") {
+      return "History data is unavailable.";
+    }
+    return "";
+  }
+
   function renderHistoryPanel() {
     if (!detailHistoryPanel || !historyToggleButton) {
       return;
@@ -7462,13 +7677,13 @@
     const payload = getCachedHistoryPayload(historyTarget);
     detailHistorySummary.textContent = payload?.available ? buildHistorySummary(payload, windowHours, referenceTimestampMs) : "";
 
-    if (state.history.panelLoading) {
+    if (state.history.panelLoading && !payload) {
       detailHistoryLoading.classList.remove("hidden");
       detailHistorySummary.textContent = "Loading history...";
       return;
     }
 
-    if (state.history.panelError) {
+    if (state.history.panelError && !payload) {
       detailHistoryError.textContent = state.history.panelError;
       detailHistoryError.classList.remove("hidden");
       detailHistorySummary.textContent = "History backend reachable, but this slot query failed.";
@@ -7487,7 +7702,18 @@
     }
 
     detailHistoryContent.classList.remove("hidden");
-    const historyNote = buildHistoryNoteText(payload, windowHours, referenceTimestampMs);
+    if (state.history.panelLoading) {
+      detailHistoryLoading.classList.remove("hidden");
+      detailHistorySummary.textContent = "Refreshing cached history...";
+    }
+    if (state.history.panelError) {
+      detailHistoryError.textContent = `Cached history is stale. Refresh failed: ${state.history.panelError}`;
+      detailHistoryError.classList.remove("hidden");
+    }
+    const historyNote = [
+      historyFreshnessNote(state.history.panelFreshness),
+      buildHistoryNoteText(payload, windowHours, referenceTimestampMs),
+    ].filter(Boolean).join(" ");
     if (detailHistoryNote) {
       detailHistoryNote.textContent = historyNote;
       detailHistoryNote.classList.toggle("hidden", !historyNote);
@@ -7564,11 +7790,15 @@
     state.history.statusRefreshPromise = (async () => {
       try {
         const payload = await fetchJson("/api/history/status");
+        const generationChanged = updateHistoryStatusGeneration(payload);
         state.history.checked = true;
         state.history.available = Boolean(payload.available);
         state.history.detail = payload.detail || null;
         state.history.counts = payload.counts || {};
         state.history.collector = payload.collector || {};
+        if (generationChanged && state.history.panelOpen) {
+          void loadHistoryForSelectedSlot(false);
+        }
       } catch (error) {
         state.history.checked = true;
         state.history.available = false;
@@ -7608,28 +7838,50 @@
       renderHistoryPanel();
       return;
     }
-    if (!force && getCachedHistoryPayload(historyTarget)) {
+    const cachedEntry = getLiveHistoryCacheEntry(cacheKey);
+    const panelCacheWasMarkedStale = (
+      state.history.panelFreshness?.state === "stale"
+      && state.history.panelFreshness?.fetchedAt === cachedEntry?.fetchedAt
+    );
+    if (!force && cachedEntry?.freshness === "fresh" && !panelCacheWasMarkedStale) {
       state.history.panelLoading = false;
       state.history.panelError = null;
+      state.history.panelFreshness = {
+        state: "fresh",
+        fetchedAt: cachedEntry.fetchedAt,
+      };
       renderHistoryPanel();
       return;
     }
 
     state.history.panelLoading = true;
     state.history.panelError = null;
+    state.history.panelFreshness = cachedEntry?.payload
+      ? { state: "refreshing", fetchedAt: cachedEntry.fetchedAt }
+      : null;
     renderHistoryPanel();
 
     try {
-      const payload = await fetchJson(fetchUrl);
+      await fetchLiveHistoryPayload({ slot, cacheKey, fetchUrl });
       const activeTarget = getSelectedHistoryTarget();
       if (requestToken !== state.history.panelRequestToken || !activeTarget || cacheKey !== activeTarget.cacheKey) {
         return;
       }
-      state.history.slotCache[cacheKey] = payload;
+      const refreshedEntry = getLiveHistoryCacheEntry(cacheKey);
+      state.history.panelFreshness = refreshedEntry
+        ? { state: "fresh", fetchedAt: refreshedEntry.fetchedAt }
+        : { state: "unavailable" };
     } catch (error) {
       const activeTarget = getSelectedHistoryTarget();
       if (requestToken === state.history.panelRequestToken && activeTarget?.cacheKey === cacheKey) {
         state.history.panelError = error.message || String(error);
+        state.history.panelFreshness = cachedEntry?.payload
+          ? {
+              state: "stale",
+              fetchedAt: cachedEntry.fetchedAt,
+              error: state.history.panelError,
+            }
+          : { state: "unavailable", error: state.history.panelError };
       }
     } finally {
       const activeTarget = getSelectedHistoryTarget();
@@ -8952,6 +9204,7 @@
         perfRun.inventoryResponseAt = uiPerfNow();
       }
       applySnapshot(snapshot);
+      invalidateHistoryCaches();
       renderAll();
       void fetchStorageViewRuntime(force, true);
       if (state.sasFabric.open) {
@@ -8991,6 +9244,9 @@
       }
       if (refreshToken === state.latestRefreshToken) {
         state.storageViewsRuntimeLoading = false;
+        markHistoryCachesStale(error);
+        renderHistoryPanel();
+        renderHeatmapControls();
         renderStorageViewsRuntime();
         setStatus(`Refresh failed: ${error.message || error}`, "error");
       }
@@ -9053,6 +9309,7 @@
         body: JSON.stringify(payload),
       });
       applySnapshot(result.snapshot);
+      invalidateHistoryCaches();
       state.mappingFormScopeKey = null;
       renderAll();
       scheduleSmartPrefetch();
@@ -9078,6 +9335,7 @@
       setStatus(`Clearing mapping for slot ${slot.slot_label}...`);
       const result = await sendScopedRequest(`/api/slots/${slot.slot}/mapping`, { method: "DELETE" });
       applySnapshot(result.snapshot);
+      invalidateHistoryCaches();
       state.mappingFormScopeKey = null;
       renderAll();
       scheduleSmartPrefetch();
@@ -9125,6 +9383,7 @@
         body: JSON.stringify(bundle),
       });
       applySnapshot(result.snapshot);
+      invalidateHistoryCaches();
       state.mappingFormScopeKey = null;
       renderAll();
       scheduleSmartPrefetch();

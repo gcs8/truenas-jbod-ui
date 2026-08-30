@@ -120,6 +120,7 @@ test("overlapping manual, selection, and auto refreshes schedule exactly one nex
     URLSearchParams,
     fetchJson() { return requests[requestIndex++].promise; },
     applySnapshot() {},
+    invalidateHistoryCaches() {},
     renderAll() {},
     fetchStorageViewRuntime() { return Promise.resolve(); },
     fetchSasFabric() { return Promise.resolve(); },
@@ -135,6 +136,9 @@ test("overlapping manual, selection, and auto refreshes schedule exactly one nex
     scheduleSmartPrefetch() {},
     ensureHeatmapData() {},
     maybeFinalizeUiPerfRun() {},
+    markHistoryCachesStale() {},
+    renderHistoryPanel() {},
+    renderHeatmapControls() {},
     renderStorageViewsRuntime() {},
     scheduleAutoRefresh() { scheduled += 1; },
   });
@@ -152,6 +156,66 @@ test("overlapping manual, selection, and auto refreshes schedule exactly one nex
 
   assert.equal(state.refreshesInFlight, 0);
   assert.equal(scheduled, 1);
+});
+
+test("successful inventory refresh invalidates history before render and a failed refresh preserves it", async () => {
+  const state = {
+    snapshotMode: false,
+    latestRefreshToken: 0,
+    refreshesInFlight: 0,
+    selectedSystemId: "system-a",
+    selectedEnclosureId: "enclosure-a",
+    storageViewsRuntimeLoading: false,
+    sasFabric: { open: false },
+    history: { configured: false },
+    uiPerf: { currentRun: null },
+  };
+  const events = [];
+  let shouldFail = false;
+  const { fn: refreshSnapshot } = loadFunction(APP_SOURCE, "refreshSnapshot", {
+    state,
+    cancelAutoRefreshTimer() {},
+    beginUiPerfRun() { return null; },
+    refreshStatusMessage() { return "refreshing"; },
+    setStatus() {},
+    buildSelectionParams() { return new URLSearchParams(); },
+    URLSearchParams,
+    async fetchJson() {
+      if (shouldFail) throw new Error("inventory unavailable");
+      return { selected_system_id: "system-a" };
+    },
+    applySnapshot() { events.push("apply"); },
+    invalidateHistoryCaches() { events.push("invalidate"); },
+    renderAll() { events.push("render"); },
+    fetchStorageViewRuntime() { return Promise.resolve(); },
+    fetchSasFabric() { return Promise.resolve(); },
+    waitForNextPaint() { return Promise.resolve(); },
+    uiPerfNow() { return 0; },
+    archiveUiPerfRun() {},
+    renderUiPerfPanel() {},
+    refreshHistoryStatus() { return Promise.resolve(); },
+    completeUiPerfHistory() {},
+    setUiPerfSmartPending() {},
+    candidateSlotsForSmartPrefetch() { return []; },
+    currentSmartPrefetchScopeKey() { return "scope"; },
+    scheduleSmartPrefetch() {},
+    ensureHeatmapData() {},
+    maybeFinalizeUiPerfRun() {},
+    markHistoryCachesStale(error) { events.push(`stale:${error.message || error}`); },
+    renderHistoryPanel() {},
+    renderHeatmapControls() {},
+    renderStorageViewsRuntime() {},
+    scheduleAutoRefresh() {},
+  });
+
+  await refreshSnapshot(true);
+  assert.deepEqual(events.slice(0, 3), ["apply", "invalidate", "render"]);
+
+  events.length = 0;
+  shouldFail = true;
+  await refreshSnapshot(true);
+  assert.equal(events.includes("invalidate"), false);
+  assert.deepEqual(events, ["stale:inventory unavailable"]);
 });
 
 test("mapping draft survives repeated renders for the same selected slot", () => {
@@ -220,6 +284,7 @@ test("successful mapping save renders the authoritative snapshot instead of the 
   const state = { snapshotMode: false, selectedSlot: 7, mappingFormScopeKey: "system|enc||7" };
   let renderedScopeKey = "not-rendered";
   let appliedSnapshot = null;
+  const events = [];
   class FakeFormData {
     get(name) {
       return name === "serial" ? "operator draft" : null;
@@ -234,8 +299,9 @@ test("successful mapping save renders the authoritative snapshot instead of the 
     async sendScopedRequest() {
       return { snapshot: { marker: "server-normalized" } };
     },
-    applySnapshot(snapshot) { appliedSnapshot = snapshot; },
-    renderAll() { renderedScopeKey = state.mappingFormScopeKey; },
+    applySnapshot(snapshot) { appliedSnapshot = snapshot; events.push("apply"); },
+    invalidateHistoryCaches() { events.push("invalidate"); },
+    renderAll() { renderedScopeKey = state.mappingFormScopeKey; events.push("render"); },
     scheduleSmartPrefetch() {},
   });
 
@@ -244,12 +310,34 @@ test("successful mapping save renders the authoritative snapshot instead of the 
   assert.deepEqual(appliedSnapshot, { marker: "server-normalized" });
   assert.equal(state.mappingFormScopeKey, null);
   assert.equal(renderedScopeKey, null);
+  assert.deepEqual(events, ["apply", "invalidate", "render"]);
+});
+
+test("successful mapping clear invalidates history before render", async () => {
+  const state = { snapshotMode: false, selectedSlot: 7, mappingFormScopeKey: "system|enc||7" };
+  const events = [];
+  const { fn: clearMapping } = loadFunction(APP_SOURCE, "clearMapping", {
+    state,
+    window: { confirm: () => true },
+    getSlotById() { return { slot: 7, slot_label: "07" }; },
+    setStatus() {},
+    async sendScopedRequest() { return { snapshot: { marker: "cleared" } }; },
+    applySnapshot() { events.push("apply"); },
+    invalidateHistoryCaches() { events.push("invalidate"); },
+    renderAll() { events.push("render"); },
+    scheduleSmartPrefetch() {},
+  });
+
+  await clearMapping();
+
+  assert.deepEqual(events, ["apply", "invalidate", "render"]);
 });
 
 test("mapping import invalidates the selected draft before rendering imported state", async () => {
   const state = { snapshotMode: false, mappingFormScopeKey: "system|enc||7" };
   let renderedScopeKey = "not-rendered";
   let appliedSnapshot = null;
+  const events = [];
   const mappingImportFile = { value: "selected-file" };
   const { fn: importMappingsFromFile } = loadFunction(APP_SOURCE, "importMappingsFromFile", {
     state,
@@ -258,8 +346,9 @@ test("mapping import invalidates the selected draft before rendering imported st
     async sendScopedRequest() {
       return { snapshot: { marker: "imported" }, imported: 1 };
     },
-    applySnapshot(snapshot) { appliedSnapshot = snapshot; },
-    renderAll() { renderedScopeKey = state.mappingFormScopeKey; },
+    applySnapshot(snapshot) { appliedSnapshot = snapshot; events.push("apply"); },
+    invalidateHistoryCaches() { events.push("invalidate"); },
+    renderAll() { renderedScopeKey = state.mappingFormScopeKey; events.push("render"); },
     scheduleSmartPrefetch() {},
   });
 
@@ -272,6 +361,7 @@ test("mapping import invalidates the selected draft before rendering imported st
   assert.equal(state.mappingFormScopeKey, null);
   assert.equal(renderedScopeKey, null);
   assert.equal(mappingImportFile.value, "");
+  assert.deepEqual(events, ["apply", "invalidate", "render"]);
 });
 
 test("stale history failure cannot clear the newer request state", async () => {
@@ -284,6 +374,9 @@ test("stale history failure cannot clear the newer request state", async () => {
       panelLoading: false,
       panelError: null,
       panelRequestToken: 0,
+      panelFreshness: null,
+      generation: 0,
+      inFlight: {},
       slotCache: {},
     },
   };
@@ -291,9 +384,18 @@ test("stale history failure cannot clear the newer request state", async () => {
     state,
     getSelectedHistoryTarget() { return activeTarget; },
     isHistoryAvailable() { return true; },
-    getCachedHistoryPayload() { return null; },
+    getLiveHistoryCacheEntry() { return null; },
     renderHistoryPanel() {},
-    fetchJson(url) { return url === "/history/1" ? oldRequest.promise : newRequest.promise; },
+    async fetchLiveHistoryPayload(target) {
+      const payload = await (target.fetchUrl === "/history/1" ? oldRequest.promise : newRequest.promise);
+      state.history.slotCache[target.cacheKey] = {
+        payload,
+        fetchedAt: 1,
+        lastAccessedAt: 1,
+        generation: state.history.generation,
+      };
+      return payload;
+    },
   });
 
   const oldLoad = loadHistoryForSelectedSlot(true);
@@ -309,7 +411,7 @@ test("stale history failure cannot clear the newer request state", async () => {
   await newLoad;
   assert.equal(state.history.panelError, null);
   assert.equal(state.history.panelLoading, false);
-  assert.deepEqual(state.history.slotCache["slot-2"], { samples: ["new"] });
+  assert.deepEqual(state.history.slotCache["slot-2"].payload, { samples: ["new"] });
 });
 
 test("cached history selection invalidates an older in-flight request", async () => {
@@ -321,16 +423,29 @@ test("cached history selection invalidates an older in-flight request", async ()
       panelLoading: false,
       panelError: null,
       panelRequestToken: 0,
-      slotCache: { "slot-2": { samples: ["cached"] } },
+      panelFreshness: null,
+      generation: 0,
+      inFlight: {},
+      slotCache: {
+        "slot-2": {
+          payload: { samples: ["cached"] },
+          fetchedAt: 1,
+          lastAccessedAt: 1,
+          generation: 0,
+        },
+      },
     },
   };
   const { fn: loadHistoryForSelectedSlot } = loadFunction(APP_SOURCE, "loadHistoryForSelectedSlot", {
     state,
     getSelectedHistoryTarget() { return activeTarget; },
     isHistoryAvailable() { return true; },
-    getCachedHistoryPayload(target) { return state.history.slotCache[target.cacheKey] || null; },
+    getLiveHistoryCacheEntry(target) {
+      const entry = state.history.slotCache[target];
+      return entry ? { ...entry, freshness: "fresh" } : null;
+    },
     renderHistoryPanel() {},
-    fetchJson() { return oldRequest.promise; },
+    fetchLiveHistoryPayload() { return oldRequest.promise; },
   });
 
   const oldLoad = loadHistoryForSelectedSlot(true);
