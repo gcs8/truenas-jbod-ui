@@ -11,6 +11,9 @@
   and operator tuning guidance.
 - Added scope-aware mapping-health summaries with matched, empty, unmatched, and
   unknown bay counts plus mapping-source and snapshot-time caveats.
+- Made the dedicated Storage Fabric status reflect stale inventory/source
+  caches, trusted-topology fallback, enabled source failures, and actionable
+  warnings instead of reporting every available payload as healthy.
 - Added glyph and pattern status cues, polite status announcements, keyboard-
   operable evidence disclosures, collapsed Fabric diagnostics, and clearer
   derived-attention and temperature guidance.

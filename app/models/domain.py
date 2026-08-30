@@ -24,6 +24,16 @@ def preserve_optional_secret(value: str | None, *, max_length: int) -> str | Non
     return str(value)[:max_length]
 
 
+CacheState = Literal[
+    "hit",
+    "stale-hit",
+    "hit-after-wait",
+    "miss",
+    "forced-refresh",
+    "trusted-fallback",
+]
+
+
 class SlotState(str, Enum):
     healthy = "healthy"
     empty = "empty"
@@ -390,6 +400,8 @@ class SasFabricSnapshot(BaseModel):
     selected_enclosure_id: str | None = None
     selected_enclosure_label: str | None = None
     generated_at: datetime = Field(default_factory=utcnow)
+    snapshot_cache_state: CacheState = "miss"
+    source_cache_state: CacheState = "miss"
     nodes: list[SasFabricNode] = Field(default_factory=list)
     links: list[SasFabricLink] = Field(default_factory=list)
     traces: list[SasFabricTrace] = Field(default_factory=list)

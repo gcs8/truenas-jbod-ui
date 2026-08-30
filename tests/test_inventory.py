@@ -25,6 +25,7 @@ from app.models.domain import (
     ManualMapping,
     MappingBundle,
     MultipathView,
+    SasFabricSnapshot,
     SlotState,
     SlotView,
     SmartSummaryView,
@@ -8511,6 +8512,132 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
 
 
 class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sas_fabric_snapshot_reports_stale_inventory_and_source_cache_states(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            stale_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_id=system.id,
+                selected_system_platform="core",
+            )
+            stale_bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=False,
+                warnings=[],
+                sources={},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+            service._cache["__default__"] = stale_snapshot
+            service._cache_until["__default__"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._source_bundle = stale_bundle
+            service._source_bundle_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._schedule_background_snapshot_refresh = MagicMock()
+            service._schedule_background_source_bundle_refresh = MagicMock()
+
+            with patch(
+                "app.services.inventory.build_sas_fabric_snapshot",
+                return_value=SasFabricSnapshot(available=True),
+            ):
+                fabric = await service.get_sas_fabric_snapshot()
+
+            self.assertEqual(fabric.snapshot_cache_state, "stale-hit")
+            self.assertEqual(fabric.source_cache_state, "stale-hit")
+            payload = fabric.model_dump(mode="json")
+            self.assertEqual(payload["snapshot_cache_state"], "stale-hit")
+            self.assertEqual(payload["source_cache_state"], "stale-hit")
+
+    async def test_sas_fabric_snapshot_reports_trusted_topology_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="quantastor-lab", truenas=TrueNASConfig(platform="quantastor"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            trusted_snapshot = InventorySnapshot(
+                slots=[
+                    SlotView(
+                        slot=0,
+                        slot_label="00",
+                        row_index=0,
+                        column_index=0,
+                        device_name="disk0",
+                        pool_name="pool-a",
+                        vdev_name="mirror-0",
+                    )
+                ],
+                refresh_interval_seconds=30,
+                selected_system_id=system.id,
+                selected_system_platform="quantastor",
+                selected_enclosure_id="node-a",
+                platform_context={"topology_complete": True},
+            )
+            incomplete_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_id=system.id,
+                selected_system_platform="quantastor",
+                selected_enclosure_id="node-a",
+                platform_context={"topology_complete": False},
+            )
+            source_bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    systems=[],
+                    disks=[],
+                    pools=[],
+                    pool_devices=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=False,
+                warnings=[],
+                sources={},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+            service._cache["node-a"] = trusted_snapshot
+            service._cache_until["node-a"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._source_bundle = source_bundle
+            service._source_bundle_until = datetime.now(timezone.utc) + timedelta(seconds=30)
+            service._build_snapshot = AsyncMock(return_value=incomplete_snapshot)
+
+            with patch(
+                "app.services.inventory.build_sas_fabric_snapshot",
+                return_value=SasFabricSnapshot(available=True),
+            ):
+                fabric = await service.get_sas_fabric_snapshot(
+                    force_refresh=True,
+                    selected_enclosure_id="node-a",
+                )
+
+            self.assertEqual(fabric.snapshot_cache_state, "trusted-fallback")
+            self.assertEqual(fabric.source_cache_state, "hit")
+            payload = fabric.model_dump(mode="json")
+            self.assertEqual(payload["snapshot_cache_state"], "trusted-fallback")
+            self.assertEqual(payload["source_cache_state"], "hit")
+
     async def test_get_snapshot_can_return_stale_cache_while_refresh_runs_in_background(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()

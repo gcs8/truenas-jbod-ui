@@ -3196,6 +3196,60 @@
     elements.lastUpdated.textContent = formatTimestamp(state.snapshot.last_updated || fabric.generated_at);
   }
 
+  function fabricTrustStatus(fabric, statusBase) {
+    const traceCount = Array.isArray(fabric?.traces) ? fabric.traces.length : 0;
+    const traceLabel = `${traceCount} ${traceCount === 1 ? "trace" : "traces"}`;
+    const selectionLabel = fabric?.selected_enclosure_label || fabric?.system_label || "current selection";
+    const snapshotCacheState = String(fabric?.snapshot_cache_state || "miss");
+    const sourceCacheState = String(fabric?.source_cache_state || "miss");
+    const retainedStates = new Set(["stale-hit", "trusted-fallback"]);
+    const retainedReasons = [];
+    if (retainedStates.has(snapshotCacheState)) {
+      retainedReasons.push(
+        snapshotCacheState === "trusted-fallback" ? "last trusted inventory topology" : "stale inventory snapshot",
+      );
+    }
+    if (retainedStates.has(sourceCacheState)) {
+      retainedReasons.push("stale source evidence");
+    }
+    if (retainedReasons.length) {
+      return {
+        chipTone: "partial",
+        suffix: "STALE",
+        statusTone: "error",
+        message: `Showing retained ${statusBase.toLowerCase()} evidence from ${retainedReasons.join(" and ")}. Loaded ${traceLabel} for ${selectionLabel}.`,
+      };
+    }
+
+    const failedSources = Object.entries(fabric?.sources || {})
+      .filter(([, source]) => source?.enabled && source.ok === false)
+      .map(([name]) => String(name).toUpperCase());
+    const actionableWarnings = (Array.isArray(fabric?.warnings) ? fabric.warnings : [])
+      .filter((warning) => !isSasFabricEnrichmentWarning(warning));
+    if (failedSources.length || actionableWarnings.length) {
+      const details = [];
+      if (failedSources.length) {
+        details.push(`Failed sources: ${failedSources.join(", ")}.`);
+      }
+      if (actionableWarnings.length) {
+        details.push(String(actionableWarnings[0]));
+      }
+      return {
+        chipTone: "partial",
+        suffix: "PARTIAL",
+        statusTone: "error",
+        message: `Loaded ${traceLabel} for ${selectionLabel} with partial evidence. ${details.join(" ")}`,
+      };
+    }
+
+    return {
+      chipTone: "ok",
+      suffix: "OK",
+      statusTone: "info",
+      message: `Loaded ${traceLabel} for ${selectionLabel}.`,
+    };
+  }
+
   function renderStatus() {
     const fabric = state.fabric;
     const copy = fabricViewCopy(fabric);
@@ -3217,10 +3271,11 @@
       elements.statusText.textContent = list(fabric.warnings)[0] || "Storage Fabric is not available for this system.";
       elements.statusText.dataset.tone = "error";
     } else if (fabric) {
-      className += " ok";
-      text = `${copy.statusBase} OK`;
-      elements.statusText.textContent = `Loaded ${list(fabric.traces).length} traces for ${fabric.selected_enclosure_label || fabric.system_label || "current selection"}.`;
-      elements.statusText.dataset.tone = "info";
+      const trustStatus = fabricTrustStatus(fabric, copy.statusBase);
+      className += ` ${trustStatus.chipTone}`;
+      text = `${copy.statusBase} ${trustStatus.suffix}`;
+      elements.statusText.textContent = trustStatus.message;
+      elements.statusText.dataset.tone = trustStatus.statusTone;
     } else {
       elements.statusText.textContent = "Ready.";
       elements.statusText.dataset.tone = "info";
