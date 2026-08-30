@@ -1,5 +1,13 @@
 const { test, expect } = require("@playwright/test");
 
+const liveApplianceQaEnabled = process.env.PLAYWRIGHT_LIVE_APPLIANCE_QA === "1";
+
+test.beforeAll(() => {
+  if (!liveApplianceQaEnabled) {
+    throw new Error("Live appliance QA requires PLAYWRIGHT_LIVE_APPLIANCE_QA=1.");
+  }
+});
+
 async function gotoApp(page) {
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await expect(page.locator("#system-select")).toBeVisible();

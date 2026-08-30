@@ -10,6 +10,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_DIR = ROOT / ".github" / "workflows"
 CI_WORKFLOW = WORKFLOW_DIR / "ci.yml"
+ADMIN_CLEANROOM_CONFIG = ROOT / "qa" / "fixtures" / "admin-cleanroom-config.yaml"
+ADMIN_CLEANROOM_SPEC = ROOT / "qa" / "admin-operations.spec.js"
+LIVE_UI_SPEC = ROOT / "qa" / "ui-switching.spec.js"
+LIVE_ESXI_SPEC = ROOT / "qa" / "esxi-smoke.spec.js"
 SMOKE_CONFIG = ROOT / "tests" / "fixtures" / "ci-smoke-config.yaml"
 SMOKE_COMPOSE = ROOT / "tests" / "fixtures" / "ci-smoke.compose.yml"
 EXTERNAL_ACTION_RE = re.compile(
@@ -67,6 +71,50 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn('"dependency_status": "unknown"', workflow_text)
         self.assertIn('"cache_state": "empty"', workflow_text)
 
+    def test_ci_runs_admin_browser_qa_against_cleanroom_fixture_without_skips(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        config = yaml.safe_load(self.read(ADMIN_CLEANROOM_CONFIG))
+        spec = self.read(ADMIN_CLEANROOM_SPEC)
+
+        job = workflow["jobs"]["admin-browser-cleanroom"]
+        commands = "\n".join(str(step.get("run", "")) for step in job["steps"])
+        browser_step = next(
+            step
+            for step in job["steps"]
+            if step.get("name") == "Run admin browser checks against the clean-room fixture"
+        )
+        self.assertEqual(config["systems"], [])
+        self.assertFalse(config["app"]["release_check_enabled"])
+        self.assertFalse(config["app"]["startup_warm_cache_enabled"])
+        self.assertFalse(config["app"]["startup_warm_smart_enabled"])
+        self.assertEqual(
+            browser_step["env"]["APP_CONFIG_PATH"],
+            "${{ github.workspace }}/qa/fixtures/admin-cleanroom-config.yaml",
+        )
+        self.assertIn("npm ci --ignore-scripts", commands)
+        self.assertIn("npx playwright test qa/admin-operations.spec.js", commands)
+        self.assertIn("http://127.0.0.1:8082/healthz", commands)
+        self.assertIn("git status --short", commands)
+        self.assertNotIn("test.skip", spec)
+
+    def test_appliance_browser_specs_are_explicit_and_portable(self) -> None:
+        contributing = self.read(ROOT / "CONTRIBUTING.md")
+        ui_spec = self.read(LIVE_UI_SPEC)
+        esxi_spec = self.read(LIVE_ESXI_SPEC)
+
+        for spec in (ui_spec, esxi_spec):
+            self.assertIn("PLAYWRIGHT_LIVE_APPLIANCE_QA", spec)
+            self.assertIn("Live appliance QA requires", spec)
+        self.assertNotRegex(
+            ui_spec,
+            r"orderedSystemCandidates\(systems,\s*\[\s*currentSystem\s*,",
+        )
+        self.assertNotRegex(ui_spec, r"20\d{2}-\d{2}-\d{2}T")
+        self.assertIn(
+            "PLAYWRIGHT_LIVE_APPLIANCE_QA=1 npx playwright test qa/ui-switching.spec.js qa/esxi-smoke.spec.js",
+            contributing,
+        )
+
     def test_external_actions_are_sha_pinned_with_version_comments(self) -> None:
         unpinned: list[str] = []
         uncommented: list[str] = []
@@ -85,7 +133,7 @@ class CIWorkflowContractTests(unittest.TestCase):
                 if match.group("version") is None:
                     uncommented.append(f"{workflow_path.name}: {action}")
 
-        self.assertEqual(action_count, 25)
+        self.assertEqual(action_count, 28)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -120,6 +168,7 @@ class CIWorkflowContractTests(unittest.TestCase):
             "Production container smoke",
             "JavaScript syntax and npm lock",
             "Checked-in public demo artifact",
+            "Admin clean-room browser QA",
         ):
             self.assertIn(required_check, contributing)
         self.assertIn("Coverage is report-only", contributing)

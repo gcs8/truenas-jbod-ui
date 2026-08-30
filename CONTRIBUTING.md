@@ -299,7 +299,15 @@ Browser smoke:
 ```bash
 npm ci
 npm run qa:ui:install
-npx playwright test
+npx playwright test qa/public-demo.spec.js
+PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 npx playwright test qa/admin-operations.spec.js
+```
+
+The switching and ESXi suites are live-appliance contracts, not portable fixture
+tests. Run them only against an intentionally configured stack:
+
+```bash
+PLAYWRIGHT_LIVE_APPLIANCE_QA=1 npx playwright test qa/ui-switching.spec.js qa/esxi-smoke.spec.js
 ```
 
 If using non-default URLs, pass explicit base URLs:
@@ -346,6 +354,7 @@ for `main` after the workflow changes are available:
 - `Production container smoke`
 - `JavaScript syntax and npm lock`
 - `Checked-in public demo artifact`
+- `Admin clean-room browser QA`
 
 Coverage is report-only. CodeQL is report-only until repository branch
 protection explicitly makes it required. Publish workflows are release gates,

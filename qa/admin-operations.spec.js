@@ -1,5 +1,7 @@
 const { test, expect } = require("@playwright/test");
 
+const browserErrors = new WeakMap();
+
 test.use({
   baseURL: process.env.PLAYWRIGHT_ADMIN_BASE_URL || "http://127.0.0.1:8082",
 });
@@ -10,6 +12,23 @@ async function gotoAdmin(page) {
   await expect(page.locator("#backup-path-list")).toBeVisible();
   await expect(page.locator("#debug-path-list")).toBeVisible();
 }
+
+test.beforeEach(async ({ page }) => {
+  const errors = [];
+  browserErrors.set(page, errors);
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      errors.push(`console:${message.text()}`);
+    }
+  });
+  page.on("pageerror", (error) => {
+    errors.push(`page:${error.message}`);
+  });
+});
+
+test.afterEach(async ({ page }) => {
+  expect(browserErrors.get(page) || []).toEqual([]);
+});
 
 test.describe("admin sidecar smoke", () => {
   test("operations view exposes backup, debug, and demo-builder controls", async ({ page }) => {
@@ -98,6 +117,48 @@ test.describe("admin sidecar smoke", () => {
     await expect(page.locator("#setup-ssh-commands")).toHaveValue(/\/opt\/lsi\/storcli64\/storcli64 \/c0\/eall\/sall show all J/);
   });
 
+  test("manual SSH and BMC fields do not resurrect connection defaults", async ({ page }) => {
+    await gotoAdmin(page);
+
+    const sshEnabled = page.locator("#setup-ssh-enabled");
+    const sshUser = page.locator("#setup-ssh-user");
+    await sshEnabled.check();
+    await expect(sshUser).toHaveValue("jbodmap");
+    await sshUser.fill("");
+    await sshEnabled.uncheck();
+    await sshEnabled.check();
+    await expect(sshUser).toHaveValue("");
+
+    await page.locator("#setup-truenas-host").fill("https://api.example.test");
+    await page.locator("#setup-bmc-enabled").check();
+    await expect(page.locator("#setup-bmc-host")).toHaveValue("");
+  });
+
+  test("admin view and profile controls are keyboard operable with visible focus", async ({ page }) => {
+    await gotoAdmin(page);
+
+    const builderButton = page.locator('[data-admin-view-button="builder"]');
+    await builderButton.focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator('[data-admin-view-panel="builder"]')).toBeVisible();
+
+    const profileCard = page.locator("#profile-catalog .profile-card").nth(1);
+    await expect(profileCard).toBeVisible();
+    await profileCard.focus();
+    await expect.poll(() => profileCard.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return `${style.outlineStyle}:${style.outlineWidth}`;
+    })).not.toBe("none:0px");
+    await page.keyboard.press("Enter");
+    await expect(profileCard).toHaveAttribute("aria-pressed", "true");
+    await expect(profileCard).toBeFocused();
+
+    const operationsButton = page.locator('[data-admin-view-button="operations"]');
+    await operationsButton.focus();
+    await page.keyboard.press("Space");
+    await expect(page.locator('[data-admin-view-panel="operations"]')).toBeVisible();
+  });
+
   async function expectTopLoaderPreviewGeometry(selector, page) {
     const previewGrid = page.locator(selector);
     await expect(previewGrid).toHaveAttribute("data-face-style", "top-loader");
@@ -111,7 +172,7 @@ test.describe("admin sidecar smoke", () => {
     await gotoAdmin(page);
 
     const topLoaderOption = page.locator('#setup-profile option[value="supermicro-cse-946-top-60"]');
-    test.skip((await topLoaderOption.count()) === 0, "Need the built-in Supermicro CSE-946 top-loader profile.");
+    await expect(topLoaderOption).toHaveCount(1);
 
     await page.locator("#setup-profile").selectOption("supermicro-cse-946-top-60");
 
@@ -127,10 +188,7 @@ test.describe("admin sidecar smoke", () => {
     const topLoaderAddOption = page.locator(
       '#setup-storage-view-template option[value="profile:supermicro-cse-946-top-60"]'
     );
-    test.skip(
-      (await topLoaderAddOption.count()) === 0,
-      "Need the top-loader profile available as an addable saved chassis view."
-    );
+    await expect(topLoaderAddOption).toHaveCount(1);
 
     await page.locator("#setup-storage-view-template").selectOption("profile:supermicro-cse-946-top-60");
     await page.locator("#setup-storage-view-add-button").click();
