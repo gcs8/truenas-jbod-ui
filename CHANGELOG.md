@@ -20,7 +20,7 @@
   verification, listing, and extraction.
 - Raised the bounded FULL-backup member and expanded-size ceilings for history
   databases above 1 GiB, with matching admin and one-shot backup memory limits
-  and a bounded 10-minute 7z operation budget.
+  and a bounded 10-minute, single-thread 7z operation profile.
 - Added versioned starter Prometheus alert rules for required-service uptime,
   collector freshness and failures, retry-backoff exhaustion, SMART failure
   evidence, and sustained high disk temperature, with bounded aggregate metrics

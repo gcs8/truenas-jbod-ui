@@ -1195,6 +1195,27 @@ class SystemBackupServiceTests(unittest.TestCase):
     def test_7z_timeout_allows_restore_grade_full_history_archives(self) -> None:
         self.assertGreaterEqual(SEVEN_ZIP_TIMEOUT_SECONDS, 600)
 
+    def test_7z_export_uses_memory_bounded_compression_profile(self) -> None:
+        archive_path = self.temp_dir / "bounded.7z"
+        success = subprocess.CompletedProcess(
+            args=["7z"],
+            returncode=0,
+            stdout="Everything is Ok",
+            stderr="",
+        )
+
+        with patch.object(self.backup_service, "_run_7z_command", return_value=success) as run_7z:
+            self.backup_service._build_7z_archive_to_path(
+                [],
+                b"{}",
+                archive_path,
+            )
+
+        command = run_7z.call_args.args[0]
+        self.assertIn("-mx=5", command)
+        self.assertIn("-mmt=1", command)
+        self.assertNotIn("-mx=9", command)
+
     def test_7z_prompt_channel_keeps_passphrase_out_of_process_argv(self) -> None:
         fake_7z = self.temp_dir / "fake-7z-prompt.py"
         fake_7z.write_text(

@@ -2619,8 +2619,9 @@ class SystemBackupService:
                 "-t7z",
                 "-y",
                 "-bd",
-                "-mx=9",
+                "-mx=5",
                 "-m0=lzma2",
+                "-mmt=1",
                 str(archive_path),
                 *sorted(top_level_entries),
             ]
