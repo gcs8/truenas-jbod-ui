@@ -4,7 +4,6 @@ import asyncio
 import base64
 import json
 import logging
-import ssl
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit, urlunsplit

@@ -1,0 +1,20 @@
+name: truenas-jbod-ui-ci-smoke
+
+services:
+  enclosure-ui:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      APP_CONFIG_PATH: /app/config/config.yaml
+      HISTORY_BACKEND_URL: ""
+      ADMIN_SERVICE_URL: ""
+    ports:
+      - "18080:8000"
+    volumes:
+      - ./ci-smoke-config.yaml:/app/config/config.yaml:ro
+    tmpfs:
+      - /app/data
+      - /app/logs
+      - /run/ssh
+    restart: "no"

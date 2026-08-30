@@ -187,7 +187,7 @@ async def refresh_history(mode: str = Query(default="fast")) -> dict[str, object
             },
             status_code=409,
         )
-    except Exception as exc:  # noqa: BLE001 - report manual collection failures as structured API errors.
+    except Exception:  # noqa: BLE001 - report manual collection failures as structured API errors.
         logger.exception("Manual history %s refresh failed", normalized_mode)
         failure_detail = f"History {normalized_mode} refresh failed; see service logs."
         collector.last_error = failure_detail

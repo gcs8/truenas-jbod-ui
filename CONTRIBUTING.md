@@ -334,6 +334,24 @@ Release/full validation includes, as applicable:
 Do not push a release tag until the release wrap evidence table has every
 pre-tag gate recorded as `Pass` or justified `N/A`.
 
+## CI blocking policy
+
+The following pull-request checks are release-blocking and should be required
+for `main` after the workflow changes are available:
+
+- `Diff hygiene`
+- `Python compile and unittest (3.12)`
+- `Python compile and unittest (3.14)`
+- `Bounded Ruff`
+- `Production container smoke`
+- `JavaScript syntax and npm lock`
+- `Checked-in public demo artifact`
+
+Coverage is report-only. CodeQL is report-only until repository branch
+protection explicitly makes it required. Publish workflows are release gates,
+not ordinary pull-request checks. If a check name changes, update branch
+protection and this list together after the new workflow has run successfully.
+
 ## High-Risk File Rules
 
 Treat these files as high-risk:
