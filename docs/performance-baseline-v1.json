@@ -18,8 +18,8 @@
       "history_cache_entries": 1,
       "render_cache_entries": 1,
       "zip_cache_entries": 0,
-      "export_html_bytes": 2258324,
-      "logical_retained_bytes": 2758038,
+      "export_html_bytes": 2262569,
+      "logical_retained_bytes": 2762283,
       "thresholds": {
         "inventory_response_bytes": 98304,
         "scope_history_response_bytes": 655360,
@@ -42,8 +42,8 @@
       "history_cache_entries": 1,
       "render_cache_entries": 1,
       "zip_cache_entries": 0,
-      "export_html_bytes": 5279368,
-      "logical_retained_bytes": 8186793,
+      "export_html_bytes": 5283613,
+      "logical_retained_bytes": 8191038,
       "thresholds": {
         "inventory_response_bytes": 524288,
         "scope_history_response_bytes": 3145728,

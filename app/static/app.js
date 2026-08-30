@@ -4622,7 +4622,7 @@
         label: "Attention Score",
         shortLabel: "Score",
         fixedRange: [0, 100],
-        value: (entry, entries) => computeAttentionScore(entry, entries),
+        value: (entry, entries, evaluation) => computeAttentionScore(entry, entries, evaluation),
         format: (value) => `${Math.round(value)}`,
       },
       {
@@ -4939,9 +4939,9 @@
     return prepared;
   }
 
-  function nearestPreparedTimelineSample(samples, timestampMs) {
+  function nearestPreparedTimelineSampleIndex(samples, timestampMs) {
     if (!Number.isFinite(timestampMs) || !Array.isArray(samples) || !samples.length) {
-      return null;
+      return -1;
     }
     let low = 0;
     let high = samples.length - 1;
@@ -4956,9 +4956,14 @@
     const candidate = samples[low];
     const previous = low > 0 ? samples[low - 1] : null;
     if (previous && Math.abs(previous.timestampMs - timestampMs) <= Math.abs(candidate.timestampMs - timestampMs)) {
-      return previous;
+      return low - 1;
     }
-    return candidate;
+    return low;
+  }
+
+  function nearestPreparedTimelineSample(samples, timestampMs) {
+    const index = nearestPreparedTimelineSampleIndex(samples, timestampMs);
+    return index >= 0 ? samples[index] : null;
   }
 
   function heatmapTimelineSampleValue(entry, metricName, timestampMs) {
@@ -4978,15 +4983,7 @@
     if (!Number.isFinite(timestampMs) || samples.length < 2) {
       return null;
     }
-    let selectedIndex = -1;
-    let selectedDistance = Number.POSITIVE_INFINITY;
-    samples.forEach((sample, index) => {
-      const distance = Math.abs(sample.timestampMs - timestampMs);
-      if (distance < selectedDistance) {
-        selectedIndex = index;
-        selectedDistance = distance;
-      }
-    });
+    const selectedIndex = nearestPreparedTimelineSampleIndex(samples, timestampMs);
     if (selectedIndex <= 0) {
       return null;
     }
@@ -5112,18 +5109,66 @@
     return entry?.storageViewSlot?.slot_label || entry?.slot?.slot_label || `Slot ${entry?.key || "?"}`;
   }
 
+  function heatmapTemperatureAverage(entries, evaluation = null) {
+    const values = entries
+      .map((candidate) => heatmapMetricNumber(candidate, "temperature_c", candidate.slot?.temperature_c, evaluation))
+      .filter((candidateValue) => Number.isFinite(candidateValue));
+    return values.length
+      ? values.reduce((sum, candidateValue) => sum + candidateValue, 0) / values.length
+      : null;
+  }
+
+  function buildAttentionScoreContext(entries) {
+    const temperatureValues = [];
+    const annualizedWrites = [];
+    entries.forEach((entry) => {
+      const temperature = heatmapSmartNumber(entry, "temperature_c", entry.slot?.temperature_c);
+      if (Number.isFinite(temperature)) {
+        temperatureValues.push(temperature);
+      }
+      const write = heatmapSmartNumber(entry, "annualized_bytes_written");
+      if (Number.isFinite(write) && write > 0) {
+        annualizedWrites.push({ entry, value: write });
+      }
+    });
+    annualizedWrites.sort((left, right) => left.value - right.value);
+    const annualizedWriteIndexByEntry = new Map();
+    annualizedWrites.forEach((item, index) => annualizedWriteIndexByEntry.set(item.entry, index));
+    return {
+      temperatureAverage: temperatureValues.length
+        ? temperatureValues.reduce((sum, value) => sum + value, 0) / temperatureValues.length
+        : null,
+      annualizedWrites,
+      annualizedWriteIndexByEntry,
+    };
+  }
+
+  function attentionPeerWriteMedian(entry, context) {
+    const values = context?.annualizedWrites || [];
+    const removedIndex = context?.annualizedWriteIndexByEntry?.get(entry);
+    const removesValue = Number.isInteger(removedIndex);
+    const peerCount = values.length - (removesValue ? 1 : 0);
+    if (peerCount < 3) {
+      return null;
+    }
+    let medianIndex = Math.floor(peerCount / 2);
+    if (removesValue && removedIndex <= medianIndex) {
+      medianIndex += 1;
+    }
+    return values[medianIndex]?.value ?? null;
+  }
+
   function computeTemperatureDelta(entry, entries, evaluation = null) {
     const value = heatmapMetricNumber(entry, "temperature_c", entry.slot?.temperature_c, evaluation);
     if (!Number.isFinite(value)) {
       return null;
     }
-    const values = entries
-      .map((candidate) => heatmapMetricNumber(candidate, "temperature_c", candidate.slot?.temperature_c, evaluation))
-      .filter((candidateValue) => Number.isFinite(candidateValue));
-    if (!values.length) {
+    const average = Object.prototype.hasOwnProperty.call(evaluation || {}, "temperatureAverage")
+      ? evaluation.temperatureAverage
+      : heatmapTemperatureAverage(entries, evaluation);
+    if (!Number.isFinite(average)) {
       return null;
     }
-    const average = values.reduce((sum, candidateValue) => sum + candidateValue, 0) / values.length;
     return value - average;
   }
 
@@ -5135,7 +5180,7 @@
     return Math.min(highCap, numeric >= highStep ? highCap : lowStep);
   }
 
-  function computeAttentionScore(entry, entries) {
+  function computeAttentionScore(entry, entries, evaluation = null) {
     if (!entry || !heatmapEntryOccupied(entry)) {
       return { value: null, reasons: [] };
     }
@@ -5186,7 +5231,10 @@
       reasons.push(`${Math.round(temperature)} C`);
     }
 
-    const tempDelta = computeTemperatureDelta(entry, entries);
+    const attentionContext = evaluation?.annualizedWrites
+      ? evaluation
+      : buildAttentionScoreContext(entries);
+    const tempDelta = computeTemperatureDelta(entry, entries, attentionContext);
     if (Number.isFinite(tempDelta) && tempDelta >= 8) {
       score += 12;
       reasons.push(`${roundHeatmapValue(tempDelta)} C over view avg`);
@@ -5254,13 +5302,8 @@
     }
 
     const annualizedWrite = heatmapSmartNumber(entry, "annualized_bytes_written");
-    const peerWrites = entries
-      .filter((candidate) => candidate !== entry)
-      .map((candidate) => heatmapSmartNumber(candidate, "annualized_bytes_written"))
-      .filter((value) => Number.isFinite(value) && value > 0)
-      .sort((left, right) => left - right);
-    if (Number.isFinite(annualizedWrite) && peerWrites.length >= 3) {
-      const median = peerWrites[Math.floor(peerWrites.length / 2)];
+    const median = attentionPeerWriteMedian(entry, attentionContext);
+    if (Number.isFinite(annualizedWrite) && Number.isFinite(median)) {
       if (median > 0 && annualizedWrite >= median * 4) {
         score += 15;
         reasons.push("write pace high vs peers");
@@ -5340,6 +5383,11 @@
       playbackTimestampMs,
       playbackTimeline,
     };
+    if (metric.id === "attention_score") {
+      Object.assign(evaluation, buildAttentionScoreContext(entries));
+    } else if (metric.id === "temperature_delta_c") {
+      evaluation.temperatureAverage = heatmapTemperatureAverage(entries, evaluation);
+    }
     const records = new Map();
     const numericValues = [];
 
@@ -5934,7 +5982,40 @@
 
   function passesFilter(slot) {
     if (!state.search) return true;
-    return (slot.search_text || "").includes(state.search);
+    return String(slot.search_text || "").toLowerCase().includes(state.search);
+  }
+
+  function gridTileMatchesFilter(tile) {
+    const slotNumber = Number(tile?.dataset?.slot);
+    if (!Number.isInteger(slotNumber)) {
+      return !state.search;
+    }
+    const selectedView = getSelectedStorageViewRuntime();
+    if (selectedView) {
+      const storageViewSlot = (selectedView.slots || [])
+        .find((slot) => Number(slot.slot_index) === slotNumber);
+      if (!storageViewSlot) {
+        return !state.search;
+      }
+      const liveSlot = getLiveBackedStorageViewSlot(selectedView, storageViewSlot);
+      return liveSlot ? passesFilter(liveSlot) : storageViewRuntimeMatchesFilter(storageViewSlot);
+    }
+    const liveSlot = getSlotById(slotNumber);
+    return liveSlot ? passesFilter(liveSlot) : !state.search;
+  }
+
+  function refreshGridFilterState() {
+    grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
+      tile.classList.toggle("filtered-out", !gridTileMatchesFilter(tile));
+    });
+  }
+
+  function refreshGridTileAriaLabel(slotNumber, label) {
+    grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
+      if (Number(tile.dataset.slot) === Number(slotNumber)) {
+        tile.setAttribute("aria-label", label);
+      }
+    });
   }
 
   function hideSlotTooltip() {
@@ -8984,6 +9065,14 @@
     }
   }
 
+  function setSelectOptionsIfChanged(select, optionsHtml) {
+    if (!select || select.innerHTML === optionsHtml) {
+      return false;
+    }
+    select.innerHTML = optionsHtml;
+    return true;
+  }
+
   function setBarWidthIfChanged(node, percent) {
     const width = `${Math.round(Math.max(0, Math.min(1, Number(percent) || 0)) * 100)}%`;
     if (node && node.style.width !== width) {
@@ -9110,12 +9199,13 @@
     const snapshotNavigationAvailable = state.snapshotMode && (visibleEnclosures.length + storageViews.length > 1);
 
     if (systemSelect) {
-      systemSelect.innerHTML = systems
+      const systemOptions = systems
         .map((system) => {
           const selected = system.id === state.selectedSystemId ? " selected" : "";
           return `<option value="${escapeHtml(system.id)}"${selected}>${escapeHtml(system.label)}</option>`;
         })
         .join("");
+      setSelectOptionsIfChanged(systemSelect, systemOptions);
       if (state.selectedSystemId) {
         systemSelect.value = state.selectedSystemId;
       }
@@ -9123,8 +9213,9 @@
     }
 
     if (enclosureSelect) {
+      let enclosureOptionsHtml;
       if (!visibleEnclosures.length && !storageViews.length) {
-        enclosureSelect.innerHTML = '<option value="">Auto-selected</option>';
+        enclosureOptionsHtml = '<option value="">Auto-selected</option>';
       } else {
         const enclosureOptions = visibleEnclosures
           .map((enclosure) => `<option value="enclosure:${escapeHtml(enclosure.id)}">${escapeHtml(selectorLabelForEnclosureOption(enclosure))}</option>`)
@@ -9137,12 +9228,13 @@
           .filter((view) => !isSavedChassisView(view))
           .map((view) => `<option value="view:${escapeHtml(view.id)}">${escapeHtml(selectorLabelForStorageViewOption(view))}</option>`)
           .join("");
-        enclosureSelect.innerHTML = [
+        enclosureOptionsHtml = [
           enclosureOptions ? `<optgroup label="Live Enclosures">${enclosureOptions}</optgroup>` : "",
           savedChassisViewOptions ? `<optgroup label="Saved Chassis Views">${savedChassisViewOptions}</optgroup>` : "",
           virtualStorageViewOptions ? `<optgroup label="Virtual Storage Views">${virtualStorageViewOptions}</optgroup>` : "",
         ].filter(Boolean).join("");
       }
+      setSelectOptionsIfChanged(enclosureSelect, enclosureOptionsHtml);
       const selectedValue = state.selectedStorageViewRuntimeId
         ? `view:${state.selectedStorageViewRuntimeId}`
         : (currentLiveEnclosureId() ? `enclosure:${currentLiveEnclosureId()}` : "");
@@ -9237,7 +9329,6 @@
         return;
       }
       applyStorageViewRuntime(payload);
-      renderAll();
       if (!quiet) {
         setStatus(`Loaded ${Array.isArray(payload.views) ? payload.views.length : 0} storage view${Array.isArray(payload.views) && payload.views.length === 1 ? "" : "s"} for ${payload.system_label || payload.system_id || "the selected system"}.`);
       }
@@ -9666,8 +9757,9 @@
     if (state.hoveredSlot === slot.slot) {
       refreshHoveredTooltip();
     }
+    refreshGridTileAriaLabel(slot.slot, slotTooltip(slot, getSmartSummaryEntry(slot)));
     if (state.heatmap.enabled) {
-      renderGrid();
+      refreshHeatmapTileOverlays();
     }
   }
 
@@ -9691,8 +9783,10 @@
     if (state.selectedStorageViewRuntimeId === view.id && state.hoveredSlot === slot.slot_index) {
       refreshHoveredTooltip();
     }
+    let requestScope = null;
     try {
       const params = buildSelectionParams();
+      requestScope = params.toString();
       const scopedUrl = params.toString()
         ? `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart?${params.toString()}`
         : `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart`;
@@ -9714,14 +9808,28 @@
       };
     }
 
+    if (
+      requestScope === null
+      || state.selectedStorageViewRuntimeId !== view.id
+      || buildSelectionParams().toString() !== requestScope
+    ) {
+      return;
+    }
+
     if (state.selectedStorageViewRuntimeId === view.id && state.selectedSlot === slot.slot_index) {
       renderDetail();
     }
     if (state.selectedStorageViewRuntimeId === view.id && state.hoveredSlot === slot.slot_index) {
       refreshHoveredTooltip();
     }
+    const liveSlot = getLiveBackedStorageViewSlot(view, slot);
+    const smartEntry = getStorageViewSmartSummaryEntry(view, slot) || (liveSlot ? getSmartSummaryEntry(liveSlot) : null);
+    refreshGridTileAriaLabel(
+      slot.slot_index,
+      liveSlot ? slotTooltip(liveSlot, smartEntry) : buildStorageViewRuntimeTooltip(slot, view)
+    );
     if (state.heatmap.enabled) {
-      renderGrid();
+      refreshHeatmapTileOverlays();
     }
   }
 
@@ -9784,7 +9892,7 @@
 
   searchBox.addEventListener("input", (event) => {
     state.search = event.target.value.trim().toLowerCase();
-    renderGrid();
+    refreshGridFilterState();
   });
 
   refreshButton.addEventListener("click", () => refreshSnapshot(true, "manual-refresh"));

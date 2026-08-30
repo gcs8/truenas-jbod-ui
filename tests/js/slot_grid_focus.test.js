@@ -178,3 +178,57 @@ test("grid rebuild moves focus to search when no slot remains visible", () => {
 
   assert.equal(searchFocused, true);
 });
+
+test("search filtering toggles existing tiles without rebuilding the grid", () => {
+  const makeTile = (slot) => {
+    const classes = new Set();
+    return {
+      dataset: { slot: String(slot) },
+      classList: {
+        contains(name) { return classes.has(name); },
+        toggle(name, force) {
+          if (force) classes.add(name);
+          else classes.delete(name);
+        },
+      },
+      classes,
+    };
+  };
+  const first = makeTile(1);
+  const second = makeTile(2);
+  const state = { search: "archive" };
+  const refreshGridFilterState = loadFunction("refreshGridFilterState", {
+    grid: { querySelectorAll() { return [first, second]; } },
+    gridTileMatchesFilter(tile) { return tile.dataset.slot === "2"; },
+  });
+
+  refreshGridFilterState();
+
+  assert.equal(first.classes.has("filtered-out"), true);
+  assert.equal(second.classes.has("filtered-out"), false);
+  const inputHandler = APP_SOURCE.slice(
+    APP_SOURCE.indexOf('searchBox.addEventListener("input"'),
+    APP_SOURCE.indexOf('refreshButton.addEventListener("click"'),
+  );
+  assert.match(inputHandler, /refreshGridFilterState\(\)/);
+  assert.doesNotMatch(inputHandler, /renderGrid\(\)/);
+  assert.equal(state.search, "archive");
+});
+
+test("live slot search compares normalized text case-insensitively", () => {
+  const passesFilter = loadFunction("passesFilter", {
+    state: { search: "m06000000" },
+  });
+
+  assert.equal(passesFilter({ search_text: "Bay 001 M06000000" }), true);
+  assert.equal(passesFilter({ search_text: "Bay 002 M06000001" }), false);
+});
+
+test("SMART completion refreshes heatmap overlays without rebuilding tiles", () => {
+  for (const name of ["ensureSmartSummary", "ensureStorageViewSmartSummary"]) {
+    const source = functionSource(APP_SOURCE, name);
+    assert.match(source, /refreshGridTileAriaLabel\(/, `${name} must update the existing tile label`);
+    assert.match(source, /refreshHeatmapTileOverlays\(\)/, `${name} must refresh overlays in place`);
+    assert.doesNotMatch(source, /renderGrid\(\)/, `${name} must preserve tile identity`);
+  }
+});

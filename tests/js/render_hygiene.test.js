@@ -159,6 +159,47 @@ test("both syncLocation implementations route through the changed-URL guard", ()
   assert.doesNotMatch(functionSource(FABRIC_SOURCE, "syncLocation"), /history\.replaceState/);
 });
 
+test("unchanged select options do not rebuild an open native selector", () => {
+  const select = { writes: 0, _html: '<option value="a">A</option>' };
+  Object.defineProperty(select, "innerHTML", {
+    get() { return this._html; },
+    set(value) {
+      this.writes += 1;
+      this._html = value;
+    },
+  });
+  const { fns } = loadFunctions(APP_SOURCE, ["setSelectOptionsIfChanged"]);
+
+  assert.equal(fns.setSelectOptionsIfChanged(select, '<option value="a">A</option>'), false);
+  assert.equal(select.writes, 0);
+  assert.equal(fns.setSelectOptionsIfChanged(select, '<option value="b">B</option>'), true);
+  assert.equal(select.writes, 1);
+  assert.match(functionSource(APP_SOURCE, "renderSelectors"), /setSelectOptionsIfChanged\(/);
+  assert.match(functionSource(FABRIC_SOURCE, "renderSelectors"), /setSelectOptionsIfChanged\(/);
+});
+
+test("Fabric mode controls use button-group semantics without fake tabs", () => {
+  const template = fs.readFileSync(path.join(ROOT, "app/templates/sas_fabric.html"), "utf8");
+  const groupLine = template.split("\n").find((line) => line.includes('class="fabric-mode-tabs"'));
+  assert.ok(groupLine);
+  assert.match(groupLine, /role="group"/);
+  assert.doesNotMatch(groupLine, /role="tablist"/);
+  assert.equal((template.match(/data-fabric-mode=/g) || []).length, 4);
+  assert.equal((template.match(/aria-pressed=/g) || []).length, 4);
+});
+
+test("dynamic panels announce status nodes instead of rebuilt panel contents", () => {
+  const template = fs.readFileSync(path.join(ROOT, "app/templates/index.html"), "utf8");
+  const perfPanel = template.split("\n").find((line) => line.includes('id="ui-perf-panel"'));
+  const perfSummary = template.split("\n").find((line) => line.includes('id="ui-perf-summary"'));
+  const fabricPanel = template.split("\n").find((line) => line.includes('id="sas-fabric-panel"'));
+  const fabricStatus = template.split("\n").find((line) => line.includes('id="sas-fabric-status"'));
+  assert.doesNotMatch(perfPanel, /aria-live/);
+  assert.match(perfSummary, /aria-live="polite"/);
+  assert.doesNotMatch(fabricPanel, /aria-live/);
+  assert.match(fabricStatus, /aria-live="polite"/);
+});
+
 test("SES enclosure nodes on a disk path are matched per node against the slot being rendered", () => {
   const { fns } = loadFunctions(FABRIC_SOURCE, ["sesNodeTouchesSlot", "sortedSlots", "list"]);
   const ses = (id, slots) => ({ id, kind: "ses-enclosure", related_slots: slots });

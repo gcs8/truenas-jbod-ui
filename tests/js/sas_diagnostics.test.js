@@ -43,8 +43,8 @@ function functionSource(source, name) {
   assert.fail(`function ${name} must have a complete body`);
 }
 
-function loadFunctions(names) {
-  const sandbox = vm.createContext({});
+function loadFunctions(names, context = {}) {
+  const sandbox = vm.createContext({ ...context });
   const code = names.map((name) => functionSource(FABRIC_SOURCE, name)).join("\n");
   const exportsCode = names.map((name) => `this.__loaded_${name} = ${name};`).join("\n");
   vm.runInContext(`${code}\n${exportsCode}`, sandbox);
@@ -76,12 +76,12 @@ test("diagnostic rows use the canonical event table and never revive an unbounde
 
 test("diagnostic UI labels bounded rows as a recent sample instead of a full table", () => {
   const panel = functionSource(FABRIC_SOURCE, "renderDiagnosticEvidencePanel");
-  const controls = functionSource(FABRIC_SOURCE, "renderDiagnosticTableControls");
+  const status = functionSource(FABRIC_SOURCE, "renderDiagnosticTableStatus");
 
   assert.match(panel, /Recent event sample/);
   assert.doesNotMatch(panel, /Full event table/);
-  assert.match(controls, /sampled events/);
-  assert.match(controls, /newest .* shipped/i);
+  assert.match(status, /sampled events/);
+  assert.match(status, /newest .* shipped/i);
 });
 
 test("diagnostic controls distinguish shipped samples from total events", () => {
@@ -93,6 +93,8 @@ test("diagnostic controls distinguish shipped samples from total events", () => 
     "diagnosticEventTypeLabel",
     "diagnosticSeverityLabel",
     "diagnosticConfidenceLabel",
+    "renderDiagnosticTableStatus",
+    "renderDiagnosticTablePagination",
     "renderDiagnosticTableControls",
   ]);
   const base = {
@@ -134,4 +136,50 @@ test("generic SAS formatters keep legacy decoded records hidden", () => {
 
   assert.match(mainFormatter, /"decoded_records"/);
   assert.match(fabricFormatter, /"decoded_records"/);
+});
+
+test("diagnostic filtering updates table subregions without replacing the input", () => {
+  const input = { value: "timeout" };
+  const status = { innerHTML: "old status" };
+  const pagination = { innerHTML: "old pages" };
+  const body = { innerHTML: "old rows" };
+  const details = {
+    querySelector(selector) {
+      return {
+        "[data-fabric-diagnostic-status]": status,
+        "[data-fabric-diagnostic-pagination]": pagination,
+        "tbody": body,
+      }[selector] || null;
+    },
+  };
+  const document = {
+    querySelector(selector) {
+      assert.match(selector, /data-fabric-diagnostic-table-key/);
+      return details;
+    },
+  };
+  const state = {
+    diagnosticPayloads: { table_a: { event_count: 2 } },
+    diagnosticTables: { table_a: { filter: "timeout", page: 1 } },
+  };
+  const { refreshDiagnosticTable } = loadFunctions(["refreshDiagnosticTable"], {
+    state,
+    document,
+    diagnosticTableState: () => state.diagnosticTables.table_a,
+    diagnosticTablePresentation: () => ({ tableRows: [{ id: "event-a" }] }),
+    renderDiagnosticTableStatus: () => "new status",
+    renderDiagnosticTablePagination: () => "new pages",
+    renderDiagnosticTableRows: () => "new rows",
+  });
+
+  assert.equal(refreshDiagnosticTable("table_a"), true);
+  assert.equal(status.innerHTML, "new status");
+  assert.equal(pagination.innerHTML, "new pages");
+  assert.equal(body.innerHTML, "new rows");
+  assert.equal(input.value, "timeout", "the existing search input must remain untouched");
+
+  const source = fs.readFileSync(path.join(ROOT, "app/static/sas_fabric_view.js"), "utf8");
+  const inputHandler = source.slice(source.indexOf('document.addEventListener("input"'), source.indexOf('document.addEventListener("change"'));
+  assert.match(inputHandler, /refreshDiagnosticTable\(key\)/);
+  assert.doesNotMatch(inputHandler, /\brender\(\)/);
 });

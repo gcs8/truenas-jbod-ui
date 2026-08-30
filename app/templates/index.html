@@ -202,14 +202,14 @@
     <div class="status-text" id="status-text">Ready.</div>
   </section>
 
-  <section id="ui-perf-panel" class="panel ui-perf-panel hidden" aria-live="polite">
+  <section id="ui-perf-panel" class="panel ui-perf-panel hidden">
     <div class="panel-header compact">
       <div>
         <h2>UI Timing</h2>
         <p class="subtle">Browser-side switch and render timing for the current page.</p>
       </div>
     </div>
-    <div id="ui-perf-summary" class="ui-perf-summary muted">Browser timing is idle.</div>
+    <div id="ui-perf-summary" class="ui-perf-summary muted" aria-live="polite">Browser timing is idle.</div>
     <div id="ui-perf-recent" class="ui-perf-recent"></div>
   </section>
 
@@ -342,7 +342,7 @@
         </div>
       </section>
 
-      <section id="sas-fabric-panel" class="panel sas-fabric-panel hidden" aria-live="polite">
+      <section id="sas-fabric-panel" class="panel sas-fabric-panel hidden">
         <div class="panel-header compact">
           <div>
             <h2>Storage Fabric</h2>
@@ -354,7 +354,7 @@
             </button>
           </div>
         </div>
-        <div id="sas-fabric-status" class="warning-item muted compact">
+        <div id="sas-fabric-status" class="warning-item muted compact" aria-live="polite">
           Open topology to load the current Storage Fabric.
         </div>
         <div class="sas-fabric-layout">
