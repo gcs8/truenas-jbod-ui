@@ -25,6 +25,12 @@ from app.services.inventory import InventoryService
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailStore
+from app.services.snapshot_export import (
+    EXPORT_HISTORY_CACHE,
+    EXPORT_RENDER_CACHE,
+    EXPORT_ZIP_CACHE,
+    SnapshotExportService,
+)
 from app.services.truenas_ws import TrueNASRawData
 
 
@@ -117,6 +123,56 @@ class MetricsRouteTests(unittest.TestCase):
 
         paths = {getattr(route, "path", None) for route in app.routes}
         self.assertNotIn("/metrics", paths)
+
+
+class SnapshotExportMetricsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        EXPORT_HISTORY_CACHE.clear()
+        EXPORT_RENDER_CACHE.clear()
+        EXPORT_ZIP_CACHE.clear()
+
+    def test_snapshot_export_metrics_publish_bounded_cache_outcomes_and_sizes(self) -> None:
+        app = FastAPI()
+        service_name = "test-snapshot-export-cache"
+        settings = Settings()
+        object.__setattr__(settings.app, "export_cache_max_bytes", 5)
+
+        with patch.dict("os.environ", {"METRICS_ENABLED": "true", "METRICS_PATH": "/metrics"}, clear=False):
+            install_metrics(app, service_name="test-scrape", version="0.0.0-test")
+            exporter = SnapshotExportService(
+                settings,
+                AsyncMock(),
+                AsyncMock(),
+                metrics_service_name=service_name,
+            )
+            exporter._store_cached_value(EXPORT_HISTORY_CACHE, "history-key", b"123")
+            self.assertEqual(exporter._get_cached_value(EXPORT_HISTORY_CACHE, "history-key"), b"123")
+            self.assertIsNone(exporter._get_cached_value(EXPORT_HISTORY_CACHE, "missing"))
+            exporter._store_cached_value(EXPORT_RENDER_CACHE, "render-key", b"1234")
+            exporter._store_cached_value(EXPORT_ZIP_CACHE, "zip-key", b"123456")
+
+        metrics_text = response_body(asyncio.run(invoke_asgi(app, "/metrics")))
+
+        self.assertIn("truenas_jbod_ui_snapshot_export_cache_requests_total", metrics_text)
+        self.assertIn(f'service="{service_name}"', metrics_text)
+        self.assertIn('cache="history"', metrics_text)
+        self.assertIn('cache_state="hit"', metrics_text)
+        self.assertIn('cache_state="miss"', metrics_text)
+        self.assertIn("truenas_jbod_ui_snapshot_export_cache_evictions_total", metrics_text)
+        self.assertIn('reason="bytes"', metrics_text)
+        self.assertIn("truenas_jbod_ui_snapshot_export_cache_rejections_total", metrics_text)
+        self.assertIn('cache="zip"', metrics_text)
+        self.assertIn('reason="oversized"', metrics_text)
+        self.assertRegex(
+            metrics_text,
+            rf'truenas_jbod_ui_snapshot_export_cache_entries\{{cache="render",service="{service_name}"\}} 1\.0',
+        )
+        self.assertRegex(
+            metrics_text,
+            rf'truenas_jbod_ui_snapshot_export_cache_bytes\{{cache="render",service="{service_name}"\}} 4\.0',
+        )
+        for forbidden in ("history-key", "render-key", "zip-key", "123456"):
+            self.assertNotIn(forbidden, metrics_text)
 
 
 class HistoryMetricsTests(unittest.TestCase):

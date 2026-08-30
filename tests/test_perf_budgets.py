@@ -204,12 +204,15 @@ class ModeledPerfFixtureTests(unittest.TestCase):
                 first = asyncio.run(exporter.build_enclosure_snapshot_html(**arguments))
                 second = asyncio.run(exporter.build_enclosure_snapshot_html(**arguments))
                 html_bytes = first.html.encode("utf-8")
-                retained_bytes = len(html_bytes) + len(compact_json_bytes(first.history_cache))
-                retained_bytes += sum(len(entry.value) for entry in EXPORT_ZIP_CACHE.values())
+                history_cache_bytes = sum(entry.size_bytes for entry in EXPORT_HISTORY_CACHE.values())
+                render_cache_bytes = sum(entry.size_bytes for entry in EXPORT_RENDER_CACHE.values())
+                zip_cache_bytes = sum(entry.size_bytes for entry in EXPORT_ZIP_CACHE.values())
+                retained_bytes = history_cache_bytes + render_cache_bytes + zip_cache_bytes
 
                 self.assertIs(first, second)
                 self.assertLessEqual(len(html_bytes), html_byte_budgets[slot_count])
                 self.assertLessEqual(retained_bytes, retained_byte_budgets[slot_count])
+                self.assertLessEqual(retained_bytes, exporter.settings.app.export_cache_max_bytes)
                 self.assertEqual(history_backend.status_calls, 1)
                 self.assertEqual(history_backend.scope_history_calls, 1)
                 self.assertEqual(history_backend.slot_history_calls, 0)
@@ -230,7 +233,7 @@ class ModeledPerfFixtureTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         baseline = json.loads((ROOT / "docs" / "performance-baseline-v1.json").read_text(encoding="utf-8"))
-        self.assertEqual(baseline["schema_version"], 1)
+        self.assertEqual(baseline["schema_version"], 2)
         self.assertEqual(baseline["fixture_version"], FIXTURE_VERSION)
         self.assertTrue(baseline["modeled"])
         self.assertEqual(baseline["wall_clock_policy"], "report-only")
@@ -248,8 +251,13 @@ class ModeledPerfFixtureTests(unittest.TestCase):
             "render_calls",
             "zip_build_calls",
             "history_cache_entries",
+            "history_cache_bytes",
             "render_cache_entries",
+            "render_cache_bytes",
             "zip_cache_entries",
+            "zip_cache_bytes",
+            "export_cache_total_bytes",
+            "export_cache_max_bytes",
             "export_html_bytes",
             "logical_retained_bytes",
             "thresholds",
@@ -262,6 +270,11 @@ class ModeledPerfFixtureTests(unittest.TestCase):
             self.assertEqual(case["history_scope_calls"], 1)
             self.assertEqual(case["history_slot_calls"], 0)
             self.assertEqual(case["zip_build_calls"], 0)
+            self.assertEqual(
+                case["export_cache_total_bytes"],
+                case["history_cache_bytes"] + case["render_cache_bytes"] + case["zip_cache_bytes"],
+            )
+            self.assertLessEqual(case["export_cache_total_bytes"], case["export_cache_max_bytes"])
             self.assertNotIn("duration_budget_ms", case)
 
     def test_performance_budget_docs_define_modeled_scope_and_refresh_policy(self) -> None:
@@ -278,9 +291,39 @@ class ModeledPerfFixtureTests(unittest.TestCase):
             "#55",
             "#48",
             "#56",
+            "shared 32 mib",
+            "oversized entries are returned but not cached",
+            "snapshot_export_cache_bytes",
+            "python scripts/benchmark_snapshot_export_cache.py",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, documentation)
+
+    def test_report_only_snapshot_export_cache_benchmark_uses_modeled_fixture(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/benchmark_snapshot_export_cache.py",
+                "--slots",
+                "60",
+                "--iterations",
+                "1",
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["policy"], "report-only")
+        self.assertEqual(payload["iterations"], 1)
+        self.assertEqual(list(payload["cases"]), ["60"])
+        case = payload["cases"]["60"]
+        self.assertEqual(case["slot_count"], 60)
+        self.assertGreaterEqual(case["elapsed_ms"], 0)
+        self.assertLessEqual(case["export_cache_total_bytes"], case["export_cache_max_bytes"])
 
     def test_python_ci_checks_the_deterministic_performance_baseline(self) -> None:
         workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))

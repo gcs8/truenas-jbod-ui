@@ -25,7 +25,7 @@ BASELINE_PATH = ROOT / "docs" / "performance-baseline-v1.json"
 
 def build_baseline() -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "fixture_version": FIXTURE_VERSION,
         "modeled": True,
         "wall_clock_policy": "report-only",

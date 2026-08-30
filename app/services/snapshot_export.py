@@ -20,6 +20,12 @@ from starlette.templating import Jinja2Templates
 
 from app import __version__
 from app.config import Settings
+from app.metrics import (
+    observe_snapshot_export_cache_eviction,
+    observe_snapshot_export_cache_rejection,
+    observe_snapshot_export_cache_request,
+    observe_snapshot_export_cache_size,
+)
 from app.models.domain import InventorySnapshot, StorageViewRuntimePayload
 from app.perf import add_perf_metadata, perf_stage
 from app.services.history_backend import HistoryBackendClient
@@ -93,12 +99,21 @@ class PackagedSnapshotExport:
 @dataclass(slots=True)
 class SnapshotExportCacheEntry:
     stored_at_monotonic: float
+    last_access_sequence: int
+    size_bytes: int
     value: Any
 
 
 EXPORT_HISTORY_CACHE: OrderedDict[str, SnapshotExportCacheEntry] = OrderedDict()
 EXPORT_RENDER_CACHE: OrderedDict[str, SnapshotExportCacheEntry] = OrderedDict()
 EXPORT_ZIP_CACHE: OrderedDict[str, SnapshotExportCacheEntry] = OrderedDict()
+EXPORT_CACHE_ACCESS_SEQUENCE = 0
+
+
+def _next_export_cache_access_sequence() -> int:
+    global EXPORT_CACHE_ACCESS_SEQUENCE
+    EXPORT_CACHE_ACCESS_SEQUENCE += 1
+    return EXPORT_CACHE_ACCESS_SEQUENCE
 
 
 class SnapshotExportTooLargeError(RuntimeError):
@@ -350,11 +365,13 @@ class SnapshotExportService:
         templates: Jinja2Templates,
         *,
         size_limit_bytes: int = DEFAULT_EXPORT_SIZE_LIMIT_BYTES,
+        metrics_service_name: str = "enclosure-ui",
     ) -> None:
         self.settings = settings
         self.history_backend = history_backend
         self.templates = templates
         self.size_limit_bytes = size_limit_bytes
+        self.metrics_service_name = metrics_service_name
         self._history_cache = EXPORT_HISTORY_CACHE
         self._render_cache = EXPORT_RENDER_CACHE
         self._zip_cache = EXPORT_ZIP_CACHE
@@ -1363,6 +1380,7 @@ class SnapshotExportService:
 
             task.add_done_callback(cleanup)
         else:
+            self._observe_cache_request(self._zip_cache, "pending-hit")
             add_perf_metadata(
                 snapshot_export_zip_cache="pending-hit",
                 snapshot_export_zip_cache_entries=len(self._zip_cache),
@@ -1391,7 +1409,120 @@ class SnapshotExportService:
         return (
             self.settings.app.export_cache_ttl_seconds > 0
             and self.settings.app.export_cache_max_entries > 0
+            and self.settings.app.export_cache_max_bytes > 0
         )
+
+    def _named_caches(self) -> tuple[tuple[str, OrderedDict[str, SnapshotExportCacheEntry]], ...]:
+        return (
+            ("history", self._history_cache),
+            ("render", self._render_cache),
+            ("zip", self._zip_cache),
+        )
+
+    def _cache_name(self, cache: OrderedDict[str, SnapshotExportCacheEntry]) -> str:
+        for cache_name, candidate in self._named_caches():
+            if cache is candidate:
+                return cache_name
+        raise ValueError("Unknown snapshot-export cache")
+
+    @staticmethod
+    def _compact_json_size_bytes(value: Any) -> int:
+        return len(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        )
+
+    @classmethod
+    def _cache_value_size_bytes(cls, value: Any) -> int:
+        if isinstance(value, bytes):
+            return len(value)
+        if isinstance(value, (bytearray, memoryview)):
+            return len(value)
+        if isinstance(value, str):
+            return len(value.encode("utf-8"))
+        if isinstance(value, RenderedSnapshotExport):
+            return sum(
+                (
+                    value.size_bytes,
+                    len(value.cache_key.encode("utf-8")),
+                    len(value.filename.encode("utf-8")),
+                    cls._compact_json_size_bytes(value.snapshot.model_dump(mode="json")),
+                    cls._compact_json_size_bytes(value.history_cache),
+                    cls._compact_json_size_bytes(value.smart_summary_cache),
+                    cls._compact_json_size_bytes(value.export_meta),
+                    cls._compact_json_size_bytes(value.history_summary),
+                )
+            )
+        return cls._compact_json_size_bytes(value)
+
+    def _cache_total_size_bytes(self) -> int:
+        return sum(
+            entry.size_bytes
+            for _cache_name, cache in self._named_caches()
+            for entry in cache.values()
+        )
+
+    @staticmethod
+    def _cache_size_bytes(cache: OrderedDict[str, SnapshotExportCacheEntry]) -> int:
+        return sum(entry.size_bytes for entry in cache.values())
+
+    def _observe_cache_states(self) -> None:
+        metadata: dict[str, int] = {
+            "snapshot_export_cache_total_bytes": self._cache_total_size_bytes(),
+        }
+        for cache_name, cache in self._named_caches():
+            size_bytes = self._cache_size_bytes(cache)
+            observe_snapshot_export_cache_size(
+                service_name=self.metrics_service_name,
+                cache_name=cache_name,
+                entries=len(cache),
+                size_bytes=size_bytes,
+            )
+            metadata[f"snapshot_export_{cache_name}_cache_entries"] = len(cache)
+            metadata[f"snapshot_export_{cache_name}_cache_bytes"] = size_bytes
+        add_perf_metadata(**metadata)
+
+    def _observe_cache_request(
+        self,
+        cache: OrderedDict[str, SnapshotExportCacheEntry],
+        cache_state: str,
+    ) -> None:
+        observe_snapshot_export_cache_request(
+            service_name=self.metrics_service_name,
+            cache_name=self._cache_name(cache),
+            cache_state=cache_state,
+        )
+
+    def _observe_cache_eviction(
+        self,
+        cache: OrderedDict[str, SnapshotExportCacheEntry],
+        reason: str,
+    ) -> None:
+        observe_snapshot_export_cache_eviction(
+            service_name=self.metrics_service_name,
+            cache_name=self._cache_name(cache),
+            reason=reason,
+        )
+
+    def _observe_cache_rejection(
+        self,
+        cache: OrderedDict[str, SnapshotExportCacheEntry],
+        reason: str,
+    ) -> None:
+        observe_snapshot_export_cache_rejection(
+            service_name=self.metrics_service_name,
+            cache_name=self._cache_name(cache),
+            reason=reason,
+        )
+
+    def _clear_all_caches(self) -> None:
+        for _cache_name, cache in self._named_caches():
+            cache.clear()
 
     def _get_cached_value(
         self,
@@ -1399,13 +1530,20 @@ class SnapshotExportService:
         cache_key: str,
     ) -> Any | None:
         if not self._cache_enabled():
-            cache.clear()
+            self._clear_all_caches()
+            self._observe_cache_request(cache, "disabled")
+            self._observe_cache_states()
             return None
-        self._evict_stale_cache_entries(cache)
+        self._evict_all_stale_cache_entries()
         entry = cache.get(cache_key)
         if entry is None:
+            self._observe_cache_request(cache, "miss")
+            self._observe_cache_states()
             return None
+        entry.last_access_sequence = _next_export_cache_access_sequence()
         cache.move_to_end(cache_key)
+        self._observe_cache_request(cache, "hit")
+        self._observe_cache_states()
         return entry.value
 
     def _store_cached_value(
@@ -1413,31 +1551,73 @@ class SnapshotExportService:
         cache: OrderedDict[str, SnapshotExportCacheEntry],
         cache_key: str,
         value: Any,
-    ) -> None:
+    ) -> bool:
         if not self._cache_enabled():
-            return
-        self._evict_stale_cache_entries(cache)
+            self._clear_all_caches()
+            self._observe_cache_states()
+            return False
+        self._evict_all_stale_cache_entries()
+        size_bytes = self._cache_value_size_bytes(value)
+        if size_bytes > self.settings.app.export_cache_max_bytes:
+            self._observe_cache_rejection(cache, "oversized")
+            self._observe_cache_states()
+            return False
+        cache.pop(cache_key, None)
         cache[cache_key] = SnapshotExportCacheEntry(
             stored_at_monotonic=time.monotonic(),
+            last_access_sequence=_next_export_cache_access_sequence(),
+            size_bytes=size_bytes,
             value=value,
         )
         cache.move_to_end(cache_key)
         while len(cache) > self.settings.app.export_cache_max_entries:
             cache.popitem(last=False)
+            self._observe_cache_eviction(cache, "entries")
+        self._evict_to_shared_byte_budget()
+        self._observe_cache_states()
+        return cache_key in cache
 
-    def _evict_stale_cache_entries(self, cache: OrderedDict[str, SnapshotExportCacheEntry]) -> None:
+    def _evict_to_shared_byte_budget(self) -> None:
+        max_bytes = self.settings.app.export_cache_max_bytes
+        while self._cache_total_size_bytes() > max_bytes:
+            candidates = [
+                (entry.last_access_sequence, cache_name, cache_key, cache)
+                for cache_name, cache in self._named_caches()
+                for cache_key, entry in cache.items()
+            ]
+            if not candidates:
+                return
+            _sequence, _cache_name, cache_key, cache = min(
+                candidates,
+                key=lambda candidate: (candidate[0], candidate[1], candidate[2]),
+            )
+            cache.pop(cache_key, None)
+            self._observe_cache_eviction(cache, "bytes")
+
+    def _evict_all_stale_cache_entries(self) -> None:
+        now = time.monotonic()
+        for _cache_name, cache in self._named_caches():
+            self._evict_stale_cache_entries(cache, now=now)
+
+    def _evict_stale_cache_entries(
+        self,
+        cache: OrderedDict[str, SnapshotExportCacheEntry],
+        *,
+        now: float | None = None,
+    ) -> None:
         if not self._cache_enabled():
-            cache.clear()
+            self._clear_all_caches()
             return
         ttl_seconds = self.settings.app.export_cache_ttl_seconds
-        now = time.monotonic()
+        observed_at = time.monotonic() if now is None else now
         stale_keys = [
             key
             for key, entry in cache.items()
-            if now - entry.stored_at_monotonic > ttl_seconds
+            if observed_at - entry.stored_at_monotonic > ttl_seconds
         ]
         for key in stale_keys:
             cache.pop(key, None)
+            self._observe_cache_eviction(cache, "ttl")
 
     @staticmethod
     def _build_snapshot_signature(snapshot: InventorySnapshot) -> str:

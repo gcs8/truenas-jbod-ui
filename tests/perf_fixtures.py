@@ -569,8 +569,10 @@ def measure_modeled_perf_case(slot_count: int) -> dict[str, Any]:
     if first is not second:
         raise AssertionError("Modeled warm export did not reuse the render cache")
     html_bytes = first.html.encode("utf-8")
-    logical_retained_bytes = len(html_bytes) + len(_compact_json_bytes(first.history_cache))
-    logical_retained_bytes += sum(len(entry.value) for entry in EXPORT_ZIP_CACHE.values())
+    history_cache_bytes = sum(entry.size_bytes for entry in EXPORT_HISTORY_CACHE.values())
+    render_cache_bytes = sum(entry.size_bytes for entry in EXPORT_RENDER_CACHE.values())
+    zip_cache_bytes = sum(entry.size_bytes for entry in EXPORT_ZIP_CACHE.values())
+    export_cache_total_bytes = history_cache_bytes + render_cache_bytes + zip_cache_bytes
 
     return {
         "slot_count": slot_count,
@@ -584,9 +586,14 @@ def measure_modeled_perf_case(slot_count: int) -> dict[str, Any]:
         "render_calls": render_calls,
         "zip_build_calls": zip_build_calls,
         "history_cache_entries": len(EXPORT_HISTORY_CACHE),
+        "history_cache_bytes": history_cache_bytes,
         "render_cache_entries": len(EXPORT_RENDER_CACHE),
+        "render_cache_bytes": render_cache_bytes,
         "zip_cache_entries": len(EXPORT_ZIP_CACHE),
+        "zip_cache_bytes": zip_cache_bytes,
+        "export_cache_total_bytes": export_cache_total_bytes,
+        "export_cache_max_bytes": exporter.settings.app.export_cache_max_bytes,
         "export_html_bytes": len(html_bytes),
-        "logical_retained_bytes": logical_retained_bytes,
+        "logical_retained_bytes": export_cache_total_bytes,
         "thresholds": dict(MODELED_THRESHOLDS[slot_count]),
     }
