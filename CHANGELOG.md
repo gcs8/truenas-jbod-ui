@@ -2,6 +2,10 @@
 
 ## Unreleased - 0.22.0-dev
 
+- Added versioned starter Prometheus alert rules for required-service uptime,
+  collector freshness and failures, retry-backoff exhaustion, SMART failure
+  evidence, and sustained high disk temperature, with bounded aggregate metrics
+  and operator tuning guidance.
 - Added scope-aware mapping-health summaries with matched, empty, unmatched, and
   unknown bay counts plus mapping-source and snapshot-time caveats.
 - Added glyph and pattern status cues, polite status announcements, keyboard-
