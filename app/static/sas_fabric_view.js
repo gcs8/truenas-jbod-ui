@@ -1786,10 +1786,6 @@
     if (tableRows.length) {
       return tableRows;
     }
-    const decodedRows = list(diagnostics?.decoded_records);
-    if (decodedRows.length) {
-      return decodedRows;
-    }
     return list(diagnostics?.recent_events);
   }
 
@@ -1998,8 +1994,10 @@
     return `
       <div class="fabric-diagnostic-table-controls">
         <div class="fabric-diagnostic-table-status">
-          <strong>${escapeHtml(`Showing ${formatValue(start)}-${formatValue(end)} of ${formatValue(filteredTotal)} individual events`)}</strong>
-          <small>${escapeHtml(hasFilter ? `${formatValue(total)} total before filter` : "Rows are not deduped; grouped counts are shown above; newest first.")}</small>
+          <strong>${escapeHtml(`Showing ${formatValue(start)}-${formatValue(end)} of ${formatValue(filteredTotal)} sampled events`)}</strong>
+          <small>${escapeHtml(hasFilter
+            ? `${formatValue(filteredTotal)} matches in the shipped sample; ${formatValue(total)} total events.`
+            : `${formatValue(total)} total events; newest ${formatValue(filteredTotal)} shipped. Filters apply only to this sample.`)}</small>
           ${hasSourceTimestamps ? "" : '<small>No source timestamps in this dmesg slice; Time / Order falls back to event order.</small>'}
         </div>
         <label>
@@ -2065,6 +2063,7 @@
     const table = diagnostics.event_table || {};
     const tablePageSize = Math.max(1, Math.min(Number(table.page_size || 25), 100));
     const tableTotal = Number(table.total_count || eventRows.length || 0);
+    const sampleCount = Number(table.sample_count || eventRows.length || 0);
     const tableKey = diagnosticTableKey(diagnostics);
     const tableState = diagnosticTableState(tableKey);
     const orderedTableRows = [...eventRows].reverse();
@@ -2109,7 +2108,7 @@
         ` : ""}
         ${eventRows.length ? `
           <details class="fabric-diagnostic-raw"${tableState.open ? " open" : ""} data-fabric-diagnostic-table-key="${escapeHtml(tableKey)}">
-            <summary>Full event table (${escapeHtml(formatValue(tableTotal))})</summary>
+            <summary>Recent event sample (${escapeHtml(formatValue(sampleCount))} of ${escapeHtml(formatValue(tableTotal))})</summary>
             ${renderDiagnosticTableControls({
               key: tableKey,
               page: tableState.page,

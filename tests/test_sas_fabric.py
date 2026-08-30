@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,11 @@ from app.models.domain import (
 )
 from app.services.inventory import InventoryService
 from app.services.parsers import canonicalize_ssh_command
+from app.services.sas_diagnostics.decoder import (
+    MAX_DIAGNOSTIC_COLLECTION_ITEMS,
+    MAX_DIAGNOSTIC_TEXT_LENGTH,
+    bound_diagnostic_value,
+)
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.sas_fabric import (
     CORE_DMIDECODE_SLOT_COMMAND,
@@ -367,7 +373,8 @@ Adapter     Chip           Board Name        Firmware
         self.assertIn("NAK received", target["operator_summary"])
         ioc_event = next(event for event in target["recent_events"] if event["event_type"] == "ioc_terminated")
         self.assertNotIn("decoded", ioc_event)
-        ioc_record = next(record for record in target["decoded_records"] if record["event_type"] == "ioc_terminated")
+        records = target["event_table"]["rows"]
+        ioc_record = next(record for record in records if record["event_type"] == "ioc_terminated")
         self.assertEqual(ioc_record["family"], "sas_transport")
         self.assertIn("Wrong relative offset or frame length", ioc_record["label"])
         self.assertEqual(ioc_record["decode_confidence"], "vendor-reference-partial")
@@ -378,7 +385,7 @@ Adapter     Chip           Board Name        Firmware
             ioc_record["decoded"]["lsi_loginfo"]["sub_code_symbol"],
             "PL_LOGINFO_SUB_CODE_WRONG_REL_OFF_OR_FRAME_LENGTH",
         )
-        cdb_record = next(record for record in target["decoded_records"] if record["event_type"] == "cdb")
+        cdb_record = next(record for record in records if record["event_type"] == "cdb")
         self.assertEqual(cdb_record["operation"], "WRITE(16)")
         self.assertEqual(cdb_record["decode_confidence"], "standard")
         self.assertEqual(cdb_record["decode_source"], "t10_scsi_operation_codes")
@@ -386,7 +393,7 @@ Adapter     Chip           Board Name        Firmware
         self.assertEqual(cdb_record["direction"], "write")
         self.assertEqual(cdb_record["lba"], 6264052064)
         self.assertEqual(cdb_record["transfer_blocks"], 248)
-        sense_record = next(record for record in target["decoded_records"] if record["event_type"] == "scsi_sense")
+        sense_record = next(record for record in records if record["event_type"] == "scsi_sense")
         self.assertEqual(sense_record["family"], "sas_protocol")
         self.assertEqual(sense_record["decode_confidence"], "standard")
         self.assertEqual(sense_record["decode_source"], "t10_scsi_asc_ascq")
@@ -394,7 +401,219 @@ Adapter     Chip           Board Name        Firmware
         self.assertEqual(sense_record["likely_layer"], "SAS path, cable, expander, or target port")
         self.assertEqual(target["event_table"]["total_count"], 5)
         self.assertEqual(target["event_table"]["page_size"], 25)
-        self.assertEqual(target["event_table"]["rows"][0]["event_id"], target["decoded_records"][0]["event_id"])
+        self.assertEqual(target["event_table"]["rows"][0]["event_id"], "mpr-dmesg-0001")
+
+    def test_mpr_event_tables_ship_only_a_bounded_recent_sample(self) -> None:
+        events = parse_mpr_dmesg_events(
+            "\n".join(
+                f"mpr0: Controller reported scsi ioc terminated tgt 180 SMID {index} loginfo 31120302"
+                for index in range(40)
+            )
+        )
+
+        for summary in (
+            events["by_controller"]["mpr0"],
+            events["by_controller_target"]["mpr0:180"],
+        ):
+            table = summary["event_table"]
+            self.assertNotIn("decoded_records", summary)
+            self.assertEqual(table["total_count"], 40)
+            self.assertEqual(table["sample_count"], 25)
+            self.assertEqual(table["sample_limit"], 25)
+            self.assertEqual(table["sample_kind"], "recent")
+            self.assertTrue(table["truncated"])
+            self.assertEqual(len(table["rows"]), 25)
+            self.assertEqual(table["rows"][0]["event_id"], "mpr-dmesg-0016")
+            self.assertEqual(table["rows"][-1]["event_id"], "mpr-dmesg-0040")
+
+    def test_mpr_event_tables_bound_controller_device_and_target_scopes(self) -> None:
+        events = parse_mpr_dmesg_events(
+            "\n".join(
+                f"(da1:mpr0:0:180:0): Retrying command event-{index}"
+                for index in range(40)
+            )
+        )
+
+        for summary in (
+            events["by_controller"]["mpr0"],
+            events["by_device"]["da1"],
+            events["by_controller_target"]["mpr0:180"],
+        ):
+            table = summary["event_table"]
+            self.assertEqual(table["total_count"], 40)
+            self.assertEqual(table["sample_count"], 25)
+            self.assertTrue(table["truncated"])
+            self.assertEqual(table["rows"][0]["event_id"], "mpr-dmesg-0016")
+            self.assertEqual(table["rows"][-1]["event_id"], "mpr-dmesg-0040")
+
+    def test_mpr_event_table_boundaries_report_sample_semantics(self) -> None:
+        empty = parse_mpr_dmesg_events("")
+        self.assertEqual(empty["event_count"], 0)
+        self.assertEqual(empty["by_controller"], {})
+
+        for event_count, expected_first, expected_truncated in (
+            (25, "mpr-dmesg-0001", False),
+            (26, "mpr-dmesg-0002", True),
+        ):
+            with self.subTest(event_count=event_count):
+                events = parse_mpr_dmesg_events(
+                    "\n".join(
+                        f"mpr0: Controller reported scsi ioc terminated tgt 180 SMID {index} loginfo 31120302"
+                        for index in range(event_count)
+                    )
+                )
+                table = events["by_controller"]["mpr0"]["event_table"]
+
+                self.assertEqual(table["total_count"], event_count)
+                self.assertEqual(table["sample_count"], min(event_count, 25))
+                self.assertEqual(table["sample_limit"], 25)
+                self.assertEqual(table["sample_kind"], "recent")
+                self.assertEqual(table["truncated"], expected_truncated)
+                self.assertEqual(table["rows"][0]["event_id"], expected_first)
+                self.assertEqual(table["rows"][-1]["event_id"], f"mpr-dmesg-{event_count:04d}")
+
+    def test_mpr_event_payload_bounds_oversized_text(self) -> None:
+        oversized_suffix = "X" * 8_000
+        events = parse_mpr_dmesg_events(
+            "\n".join(
+                f"(da{index % 32}:mpr0:0:{index % 64}:0): Retrying command {oversized_suffix}"
+                for index in range(400)
+            )
+        )
+
+        serialized = json.dumps(events, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        self.assertLessEqual(len(serialized), 2 * 1024 * 1024)
+        for scope_name in ("by_controller", "by_device", "by_controller_target"):
+            for summary in events[scope_name].values():
+                for row in summary["event_table"]["rows"]:
+                    self.assertLessEqual(len(str(row.get("message") or "")), MAX_DIAGNOSTIC_TEXT_LENGTH)
+                    self.assertLessEqual(len(str(row.get("raw_line") or "")), MAX_DIAGNOSTIC_TEXT_LENGTH)
+                    self.assertLessEqual(len(str(row.get("label") or "")), MAX_DIAGNOSTIC_TEXT_LENGTH)
+
+    def test_diagnostic_value_bounds_nested_collection_cardinality(self) -> None:
+        bounded = bound_diagnostic_value({
+            "items": [f"item-{index}" for index in range(100)],
+            "mapping": {f"key-{index}": index for index in range(100)},
+        })
+
+        self.assertEqual(len(bounded["items"]), MAX_DIAGNOSTIC_COLLECTION_ITEMS)
+        self.assertEqual(len(bounded["mapping"]), MAX_DIAGNOSTIC_COLLECTION_ITEMS)
+
+    def test_core_snapshot_serializes_one_bounded_controller_event_sample(self) -> None:
+        event_output = "\n".join(
+            f"mpr0: Controller reported scsi ioc terminated tgt 180 SMID {index} loginfo 31120302"
+            for index in range(40)
+        )
+        system = SystemConfig(
+            id="archive-core",
+            label="The Archive",
+            truenas=TrueNASConfig(platform="core"),
+        )
+        snapshot = InventorySnapshot(
+            slots=[],
+            refresh_interval_seconds=30,
+            selected_system_id="archive-core",
+            selected_system_label="The Archive",
+            selected_system_platform="core",
+        )
+
+        fabric = build_sas_fabric_snapshot(
+            system=system,
+            snapshot=snapshot,
+            ssh_outputs={
+                "sudo -n /usr/sbin/mprutil show adapters": MPR_ADAPTERS,
+                CORE_MPR_DMESG_EVENTS_COMMAND: event_output,
+            },
+        )
+
+        controller = next(item for item in fabric.controllers if item["name"] == "mpr0")
+        controller_node = next(node for node in fabric.nodes if node.id == "controller:mpr0")
+        diagnostics = controller_node.metrics["kernel_diagnostics"]
+        serialized = json.loads(fabric.model_dump_json())
+        serialized_text = json.dumps(serialized, sort_keys=True)
+        self.assertNotIn("kernel_diagnostics", controller)
+        self.assertNotIn("kernel_diagnostics", controller_node.raw)
+        self.assertNotIn('"decoded_records"', serialized_text)
+        self.assertEqual(diagnostics["event_table"]["total_count"], 40)
+        self.assertEqual(len(diagnostics["event_table"]["rows"]), 25)
+        self.assertEqual(serialized_text.count('"event_id": "mpr-dmesg-0040"'), 1)
+
+    def test_core_snapshot_bounds_controller_and_mapped_member_diagnostics(self) -> None:
+        oversized_suffix = "X" * 8_000
+        event_output = "\n".join(
+            f"(da60:mpr0:0:180:0): Retrying command {oversized_suffix}"
+            for _index in range(400)
+        )
+        slot = SlotView(
+            slot=0,
+            slot_label="00",
+            row_index=0,
+            column_index=0,
+            present=True,
+            state=SlotState.healthy,
+            device_name="da60",
+            raw_status={"enclosure_id": "50030480090c4f7f", "ses_slot_number": 1},
+            multipath=MultipathView(
+                name="mpath0",
+                device_name="multipath/disk0",
+                members=[MultipathMember(device_name="da60", state="FAIL", controller_label="mpr0")],
+            ),
+        )
+        snapshot = InventorySnapshot(
+            slots=[slot],
+            refresh_interval_seconds=30,
+            selected_system_id="archive-core",
+            selected_system_label="The Archive",
+            selected_system_platform="core",
+            selected_enclosure_id="enc-60",
+            selected_enclosure_label="60 Bay",
+        )
+        system = SystemConfig(
+            id="archive-core",
+            label="The Archive",
+            truenas=TrueNASConfig(platform="core"),
+        )
+
+        fabric = build_sas_fabric_snapshot(
+            system=system,
+            snapshot=snapshot,
+            ssh_outputs={
+                "sudo -n /usr/sbin/mprutil show adapters": MPR_ADAPTERS,
+                "sudo -n /usr/sbin/mprutil -u 0 show adapter": MPR0_ADAPTER,
+                "sudo -n /usr/sbin/mprutil -u 0 show expanders": MPR0_EXPANDERS,
+                "sudo -n /usr/sbin/mprutil -u 0 show enclosures": MPR0_ENCLOSURES,
+                "sudo -n /usr/sbin/mprutil -u 0 show devices": MPR0_DEVICES,
+                CORE_MPR_DMESG_EVENTS_COMMAND: event_output,
+            },
+        )
+
+        serialized = fabric.model_dump(mode="json")
+        event_tables: list[dict[str, object]] = []
+
+        def collect_event_tables(value: object) -> None:
+            if isinstance(value, dict):
+                table = value.get("event_table")
+                if isinstance(table, dict):
+                    event_tables.append(table)
+                for nested in value.values():
+                    collect_event_tables(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    collect_event_tables(nested)
+
+        collect_event_tables(serialized)
+        serialized_bytes = json.dumps(serialized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        self.assertEqual(len(event_tables), 2)
+        for table in event_tables:
+            self.assertEqual(table["total_count"], 400)
+            rows = table["rows"]
+            self.assertIsInstance(rows, list)
+            assert isinstance(rows, list)
+            self.assertEqual(len(rows), 25)
+        self.assertNotIn(b"decoded_records", serialized_bytes)
+        self.assertLessEqual(len(serialized_bytes), 256 * 1024)
 
     def test_parse_mpr_dmesg_events_decodes_lsi_loginfo_open_failure_details(self) -> None:
         events = parse_mpr_dmesg_events(
@@ -408,7 +627,7 @@ mpr0: Controller reported scsi ioc terminated tgt 181 SMID 142 loginfo 31110e05
         controller = events["by_controller"]["mpr0"]
         decoded_by_loginfo = {
             record["loginfo"]: record["decoded"]
-            for record in controller["decoded_records"]
+            for record in controller["event_table"]["rows"]
             if record.get("loginfo")
         }
 
@@ -515,8 +734,8 @@ Jun  7 10:39:05 truenas mpr0: Controller reported scsi ioc terminated tgt 12 SMI
         self.assertEqual(controller["sense_counts"]["Connection lost"], 1)
         self.assertEqual(controller["sense_counts"]["ACK/NAK timeout"], 1)
         self.assertFalse(any("decoded" in event for event in controller["recent_events"]))
-        self.assertEqual(controller["event_table"]["schema_version"], 1)
-        self.assertEqual(controller["event_table"]["total_count"], len(controller["decoded_records"]))
+        self.assertEqual(controller["event_table"]["schema_version"], 2)
+        self.assertEqual(controller["event_table"]["sample_count"], len(controller["event_table"]["rows"]))
         self.assertEqual([finding["severity"] for finding in controller["top_findings"][:4]], ["error", "error", "error", "error"])
         self.assertGreaterEqual(controller["top_findings"][0]["count"], controller["top_findings"][1]["count"])
         self.assertTrue(controller["top_findings"][0]["fingerprint"])
@@ -533,7 +752,7 @@ Jun  7 10:39:05 truenas mpr0: Controller reported scsi ioc terminated tgt 12 SMI
         self.assertEqual(service_action["service_action"], "0x10")
         self.assertEqual(service_action["service_action_label"], "READ CAPACITY(16)")
 
-        timeout_sense = next(record for record in target_181["decoded_records"] if record.get("asc") == "4b,3")
+        timeout_sense = next(record for record in target_181["event_table"]["rows"] if record.get("asc") == "4b,3")
         self.assertEqual(timeout_sense["asc_label"], "ACK/NAK timeout")
         self.assertEqual(timeout_sense["family"], "timeout")
 
@@ -639,7 +858,7 @@ mpr0: Controller reported scsi ioc terminated tgt 182 SMID 142 loginfo 30030200
 
         decoded_by_loginfo = {
             record["loginfo"]: record
-            for record in events["by_controller"]["mpr0"]["decoded_records"]
+            for record in events["by_controller"]["mpr0"]["event_table"]["rows"]
             if record.get("loginfo")
         }
 
@@ -723,7 +942,7 @@ mpr0: Controller reported scsi ioc terminated tgt 187 SMID 147 loginfo 32010035
 
         decoded_by_loginfo = {
             record["loginfo"]: record
-            for record in events["by_controller"]["mpr0"]["decoded_records"]
+            for record in events["by_controller"]["mpr0"]["event_table"]["rows"]
             if record.get("loginfo")
         }
 

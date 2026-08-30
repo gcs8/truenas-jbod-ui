@@ -22,6 +22,7 @@ from app.services.sas_diagnostics import (
     new_mpr_event_summary,
     record_mpr_event_summary,
 )
+from app.services.sas_diagnostics.decoder import bound_diagnostic_value
 from app.services.parsers import canonicalize_ssh_command, normalize_text
 
 
@@ -431,7 +432,7 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
         event_id = f"mpr-dmesg-{len(recent_events) + 1:04d}"
         event["event_id"] = event_id
         decoded_record = make_decoded_event_record(event, event_id=event_id, sequence=len(recent_events))
-        recent_events.append(event)
+        recent_events.append(bound_diagnostic_value(event))
         record_mpr_event_summary(summaries["by_controller"][event["controller"]], event, decoded_record)
         if event.get("device"):
             record_mpr_event_summary(summaries["by_device"][event["device"]], event, decoded_record)
@@ -789,7 +790,6 @@ def _build_core_mpr_fabric_snapshot(
             "path_counts": counts,
             "related_slots": related_slots,
             "iocfacts": iocfacts,
-            "kernel_diagnostics": controller_diagnostics,
         }
         controllers.append(controller)
         add_node(
@@ -2782,9 +2782,12 @@ def _add_mpr_member_trace_context(
     except (TypeError, ValueError):
         unit = -1
     evidence = _mpr_evidence(unit, "devices")
-    diagnostic_summary = device_context.get("diagnostics") or _diagnostics_for_member_device(
-        diagnostics or {},
-        member_device_name,
+    diagnostic_summary = _diagnostic_metric_summary(
+        device_context.get("diagnostics")
+        or _diagnostics_for_member_device(
+            diagnostics or {},
+            member_device_name,
+        )
     )
     enc_handle = str(device_context.get("enclosure_handle") or "")
     enclosure_id = trace_index.get("enclosures", {}).get((controller_id, enc_handle))
@@ -2956,10 +2959,17 @@ def _diagnostic_metric_summary(summary: dict[str, Any] | None) -> dict[str, Any]
         "top_findings": summary.get("top_findings") or [],
         "primary_fault": summary.get("primary_fault"),
         "operator_summary": summary.get("operator_summary"),
-        "recent_events": summary.get("recent_events") or [],
-        "decoded_records": summary.get("decoded_records") or [],
         "event_table": summary.get("event_table")
-        or {"schema_version": 1, "total_count": 0, "page_size": 25, "rows": []},
+        or {
+            "schema_version": 2,
+            "total_count": 0,
+            "page_size": 25,
+            "sample_count": 0,
+            "sample_limit": 25,
+            "sample_kind": "recent",
+            "truncated": False,
+            "rows": [],
+        },
     }
 
 
