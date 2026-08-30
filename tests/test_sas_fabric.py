@@ -294,6 +294,51 @@ Adapter     Chip           Board Name        Firmware
         self.assertEqual(sysctl_locations["mpr0"]["pci_parent"], "pci15")
         self.assertEqual(sysctl_locations["mpr1"]["acpi_handle"], r"\_SB_.PCI1.QR3C.H000")
 
+    def test_core_snapshot_parses_pci_inventory_sources_once(self) -> None:
+        system = SystemConfig(
+            id="archive-core",
+            label="The Archive",
+            truenas=TrueNASConfig(platform="core"),
+        )
+        snapshot = InventorySnapshot(
+            slots=[],
+            refresh_interval_seconds=30,
+            selected_system_id="archive-core",
+            selected_system_label="The Archive",
+            selected_system_platform="core",
+        )
+
+        with (
+            patch(
+                "app.services.sas_fabric.parse_pciconf_sas_controllers",
+                wraps=parse_pciconf_sas_controllers,
+            ) as parse_pciconf,
+            patch(
+                "app.services.sas_fabric.parse_dmidecode_slots",
+                wraps=parse_dmidecode_slots,
+            ) as parse_dmidecode,
+            patch(
+                "app.services.sas_fabric.parse_mpr_sysctl_locations",
+                wraps=parse_mpr_sysctl_locations,
+            ) as parse_sysctl,
+        ):
+            fabric = build_sas_fabric_snapshot(
+                system=system,
+                snapshot=snapshot,
+                ssh_outputs={
+                    CORE_PCICONF_LV_COMMAND: PCICONF_MPR_OUTPUT,
+                    CORE_DMIDECODE_SLOT_COMMAND: DMIDECODE_SLOT_OUTPUT,
+                    CORE_MPR_SYSCTL_LOCATION_COMMAND: MPR_SYSCTL_LOCATIONS,
+                },
+            )
+
+        self.assertEqual(parse_pciconf.call_count, 1)
+        self.assertEqual(parse_dmidecode.call_count, 1)
+        self.assertEqual(parse_sysctl.call_count, 1)
+        self.assertEqual(fabric.raw["pci_controllers"][0]["pci_address"], "0000:82:00.0")
+        self.assertEqual(fabric.raw["pcie_slots"][0]["designation"], "CPU2 SLOT1 PCI-E 3.0 X8")
+        self.assertEqual(fabric.raw["mpr_sysctl_locations"]["mpr1"]["pci_parent"], "pci16")
+
     def test_parse_mpr_devices_keeps_bus_target_when_reported(self) -> None:
         devices = parse_mpr_devices(MPR0_DEVICES_WITH_BUS_TARGET)
 
