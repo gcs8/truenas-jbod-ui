@@ -234,6 +234,39 @@ reason to expose it. Use a tunnel, reverse proxy, or set
 Use [[History and Snapshot Export|History-and-Snapshot-Export]] for the visual
 walkthrough.
 
+Automatic history permission repair is **disabled by default**. The sidecar
+does not silently widen `history/`, the SQLite database, or its WAL/SHM files.
+Prefer fixing the host directory's owner and group deliberately. Before a
+migration, stop history and record the current contract:
+
+```bash
+docker compose --profile history stop enclosure-history
+stat -c '%U:%G %a %n' history history/history.db 2>/dev/null || true
+```
+
+If a one-time in-container mode repair is required, set these values in `.env`:
+
+```dotenv
+HISTORY_PERMISSION_REPAIR_ENABLED=true
+HISTORY_SHARED_DIR_MODE=0770
+HISTORY_SHARED_FILE_MODE=0660
+```
+
+Modes use octal digits. Configured modes are not world-writable. Start history, verify
+the recorded paths and `/healthz`, then set
+`HISTORY_PERMISSION_REPAIR_ENABLED=false` and recreate the sidecar so later
+read-only failures remain visible instead of triggering another chmod:
+
+```bash
+docker compose --profile history up -d enclosure-history
+stat -c '%U:%G %a %n' history history/history.db
+curl -fsS http://127.0.0.1:8081/healthz
+```
+
+To **roll back**, stop the sidecar, disable repair, restore the owner/group and
+modes recorded before migration, restore the previous image tag if needed, and
+recreate `enclosure-history`. Do not use `0777` or `0666` as a workaround.
+
 ## Optional Admin Sidecar
 
 Turn on admin when you want guided setup, storage-view editing, backup/restore,
