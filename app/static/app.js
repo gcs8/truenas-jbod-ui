@@ -231,6 +231,7 @@
   const heatmapLegendMin = document.getElementById("heatmap-legend-min");
   const heatmapLegendMax = document.getElementById("heatmap-legend-max");
   const heatmapLegendStatus = document.getElementById("heatmap-legend-status");
+  const heatmapMetricContext = document.getElementById("heatmap-metric-context");
   const sasFabricToggleButton = document.getElementById("sas-fabric-toggle-button");
   const sasFabricViewLink = document.getElementById("sas-fabric-view-link");
   const sasFabricPanel = document.getElementById("sas-fabric-panel");
@@ -279,6 +280,8 @@
   const summaryMappedSlotCount = document.getElementById("summary-mapped-slot-count");
   const summaryManualMappingCount = document.getElementById("summary-manual-mapping-count");
   const summarySshSlotHintCount = document.getElementById("summary-ssh-slot-hint-count");
+  const mappingHealthSummary = document.getElementById("mapping-health-summary");
+  const mappingHealthEvidence = document.getElementById("mapping-health-evidence");
   const storageViewsPanel = document.getElementById("storage-views-panel");
   const storageViewsSummary = document.getElementById("storage-views-summary");
   const storageViewList = document.getElementById("storage-view-list");
@@ -4646,7 +4649,7 @@
     return [
       {
         id: "attention_score",
-        label: "Attention Score",
+        label: "Derived Attention Score",
         shortLabel: "Score",
         fixedRange: [0, 100],
         value: (entry, entries, evaluation) => computeAttentionScore(entry, entries, evaluation),
@@ -4654,7 +4657,7 @@
       },
       {
         id: "temperature_c",
-        label: "Temperature",
+        label: "Temperature (C)",
         shortLabel: "Temp",
         historyMetrics: ["temperature_c"],
         value: (entry, _entries, evaluation) => heatmapMetricNumber(entry, "temperature_c", entry.slot?.temperature_c, evaluation),
@@ -4662,7 +4665,7 @@
       },
       {
         id: "temperature_delta_c",
-        label: "Temp vs View Avg",
+        label: "Temperature vs View Average (C)",
         shortLabel: "Delta",
         historyMetrics: ["temperature_c"],
         value: (entry, entries, evaluation) => computeTemperatureDelta(entry, entries, evaluation),
@@ -4795,6 +4798,19 @@
         format: (value) => Math.round(value).toLocaleString(),
       },
     ];
+  }
+
+  function heatmapMetricContextText(metricId) {
+    if (metricId === "attention_score") {
+      return "Higher scores combine relative temperature, errors, and write load; inspect the selected bay before acting.";
+    }
+    if (metricId === "temperature_c") {
+      return "Degrees Celsius. Use the drive vendor's warning and critical thresholds when available.";
+    }
+    if (metricId === "temperature_delta_c") {
+      return "Degrees Celsius relative to the current view average. Compare peer bays, then use vendor thresholds before acting.";
+    }
+    return "Values come from the selected snapshot and optional history window.";
   }
 
   function heatmapMetricDefinition(metricId = state.heatmap.metric) {
@@ -5738,6 +5754,10 @@
     }
     if (heatmapMetricField) {
       heatmapMetricField.classList.toggle("hidden", !state.heatmap.enabled);
+    }
+    if (heatmapMetricContext) {
+      heatmapMetricContext.textContent = heatmapMetricContextText(metric.id);
+      heatmapMetricContext.classList.toggle("hidden", !state.heatmap.enabled);
     }
     if (heatmapTimeframeField) {
       heatmapTimeframeField.classList.toggle("hidden", !state.heatmap.enabled || !needsHistory);
@@ -8892,6 +8912,82 @@
     syncLocation();
   }
 
+  function mappingHealthScope(snapshot, selectedView) {
+    if (selectedView) {
+      const slots = (Array.isArray(selectedView.slots) ? selectedView.slots : []).map((slot) => ({
+        slot: slot.slot_index,
+        state: slot.state || (slot.occupied ? "matched" : "empty"),
+        mapping_source: slot.source || "unknown",
+      }));
+      const layoutCount = (Array.isArray(selectedView.slot_layout) ? selectedView.slot_layout : [])
+        .flat()
+        .filter((slot) => Number.isInteger(slot)).length;
+      return {
+        label: selectedView.label || selectedView.id || "Selected storage view",
+        slots,
+        layoutSlotCount: Number(selectedView.slot_count) || layoutCount || slots.length,
+        lastUpdated: snapshot?.last_updated || null,
+      };
+    }
+    return {
+      label: snapshot?.selected_enclosure_label || "Selected enclosure",
+      slots: Array.isArray(snapshot?.slots) ? snapshot.slots : [],
+      layoutSlotCount: Number(snapshot?.layout_slot_count) || 0,
+      lastUpdated: snapshot?.last_updated || null,
+    };
+  }
+
+  function summarizeMappingHealth(slots, layoutSlotCount) {
+    const counts = { matched: 0, empty: 0, unmatched: 0, unknown: 0 };
+    (Array.isArray(slots) ? slots : []).forEach((slot) => {
+      const slotState = String(slot?.state || "unknown").toLowerCase();
+      if (slotState === "empty") {
+        counts.empty += 1;
+      } else if (slotState === "unmapped") {
+        counts.unmatched += 1;
+      } else if (slotState === "unknown") {
+        counts.unknown += 1;
+      } else {
+        counts.matched += 1;
+      }
+    });
+    const counted = counts.matched + counts.empty + counts.unmatched + counts.unknown;
+    const total = Math.max(Number(layoutSlotCount) || 0, counted);
+    counts.unknown += Math.max(0, total - counted);
+    const populated = counts.matched + counts.unmatched;
+    let headline;
+    if (counts.unmatched > 0) {
+      headline = `${counts.unmatched} populated bay${counts.unmatched === 1 ? "" : "s"} need${counts.unmatched === 1 ? "s" : ""} mapping.`;
+    } else if (counts.unknown > 0) {
+      headline = `${counts.unknown} bay${counts.unknown === 1 ? " has" : "s have"} unknown mapping state.`;
+    } else if (populated > 0) {
+      headline = `All ${populated} populated bay${populated === 1 ? " is" : "s are"} matched.`;
+    } else {
+      headline = "No populated bays are reported in this view.";
+    }
+    return { ...counts, populated, total, headline };
+  }
+
+  function mappingHealthEvidenceNote(slots, lastUpdatedValue) {
+    const labels = {
+      api: "API",
+      ssh: "SSH/SES",
+      bmc: "BMC",
+      manual: "saved mapping",
+      modeled: "modeled fixture",
+      inventory_candidate: "inventory match",
+      snapshot_slot: "enclosure snapshot",
+      scale_sg_ses: "SCALE SG/SES",
+      "live-derived-core-demo": "sanitized demo fixture",
+    };
+    const sources = Array.from(new Set((Array.isArray(slots) ? slots : [])
+      .map((slot) => String(slot?.mapping_source || "").trim())
+      .filter((source) => source && source !== "unknown" && source !== "empty" && source !== "placeholder")
+      .map((source) => labels[source] || source.replaceAll("_", " "))));
+    const sourceText = sources.length ? sources.join(" and ") : "unknown mapping source";
+    return `Evidence: ${sourceText}. Snapshot: ${lastUpdatedValue || "time unavailable"}.`;
+  }
+
   function renderSummary() {
     const summary = state.snapshot.summary || {};
     summaryDiskCount.textContent = String(summary.disk_count ?? 0);
@@ -8900,6 +8996,15 @@
     summaryMappedSlotCount.textContent = String(summary.mapped_slot_count ?? 0);
     summaryManualMappingCount.textContent = String(summary.manual_mapping_count ?? 0);
     summarySshSlotHintCount.textContent = String(summary.ssh_slot_hint_count ?? 0);
+    const healthScope = mappingHealthScope(state.snapshot, getSelectedStorageViewRuntime());
+    const health = summarizeMappingHealth(healthScope.slots, healthScope.layoutSlotCount);
+    if (mappingHealthSummary) {
+      mappingHealthSummary.textContent = `${healthScope.label}: ${health.headline} ${health.matched} matched, ${health.empty} empty, ${health.unmatched} unmatched, ${health.unknown} unknown.`;
+      mappingHealthSummary.dataset.tone = health.unmatched > 0 ? "warning" : health.unknown > 0 ? "unknown" : "ok";
+    }
+    if (mappingHealthEvidence) {
+      mappingHealthEvidence.textContent = mappingHealthEvidenceNote(healthScope.slots, healthScope.lastUpdated);
+    }
   }
 
   function renderViewChrome() {
@@ -10107,6 +10212,18 @@
       clearSelectedSlot();
     });
   }
+  function selectStorageViewRuntimeFromCard(nextViewId) {
+    if (nextViewId !== state.selectedStorageViewRuntimeId && !confirmMappingDraftDiscard()) {
+      return false;
+    }
+    state.selectedStorageViewRuntimeId = nextViewId;
+    resetHeatmapHistoryCache();
+    renderStorageViewsRuntime();
+    renderGrid();
+    renderSummary();
+    ensureHeatmapData();
+    return true;
+  }
   if (storageViewList) {
     storageViewList.addEventListener("click", (event) => {
       const button = event.target.closest("[data-storage-view-runtime-id]");
@@ -10114,14 +10231,7 @@
         return;
       }
       const nextViewId = button.dataset.storageViewRuntimeId || "";
-      if (nextViewId !== state.selectedStorageViewRuntimeId && !confirmMappingDraftDiscard()) {
-        return;
-      }
-      state.selectedStorageViewRuntimeId = nextViewId;
-      resetHeatmapHistoryCache();
-      renderStorageViewsRuntime();
-      renderGrid();
-      ensureHeatmapData();
+      selectStorageViewRuntimeFromCard(nextViewId);
     });
   }
   autoRefreshToggle.addEventListener("change", (event) => {

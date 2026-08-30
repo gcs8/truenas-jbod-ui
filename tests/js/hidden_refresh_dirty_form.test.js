@@ -442,7 +442,6 @@ test("system, enclosure, and saved-view navigation guard dirty calibration draft
   for (const [marker, length] of [
     ['systemSelect.addEventListener("change"', 500],
     ['enclosureSelect.addEventListener("change"', 500],
-    ['storageViewList.addEventListener("click"', 500],
   ]) {
     const start = APP_SOURCE.indexOf(marker);
     assert.notEqual(start, -1, `${marker} must exist`);
@@ -452,4 +451,19 @@ test("system, enclosure, and saved-view navigation guard dirty calibration draft
       `${marker} must guard dirty mapping navigation`
     );
   }
+
+  const cardHandlerStart = APP_SOURCE.indexOf('storageViewList.addEventListener("click"');
+  assert.notEqual(cardHandlerStart, -1, "saved-view card handler must exist");
+  assert.match(
+    APP_SOURCE.slice(cardHandlerStart, cardHandlerStart + 500),
+    /selectStorageViewRuntimeFromCard\(nextViewId\)/,
+    "saved-view cards must use the guarded scope transition"
+  );
+  const guardedHelperStart = APP_SOURCE.indexOf("function selectStorageViewRuntimeFromCard(");
+  assert.notEqual(guardedHelperStart, -1, "saved-view guarded transition must exist");
+  assert.match(
+    APP_SOURCE.slice(guardedHelperStart, guardedHelperStart + 500),
+    /confirmMappingDraftDiscard\(\)/,
+    "saved-view guarded transition must protect dirty mapping navigation"
+  );
 });

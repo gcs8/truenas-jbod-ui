@@ -5,7 +5,7 @@ const os = require("os");
 const path = require("path");
 const { pathToFileURL } = require("url");
 
-function buildOfflineSnapshotFixture() {
+function buildOfflineSnapshotFixture({ redactSensitive = false } = {}) {
   const repoRoot = path.resolve(__dirname, "..");
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-offline-snapshot-"));
   const outputPath = path.join(tempDir, "offline-history.html");
@@ -34,6 +34,7 @@ async def main():
         history_window_hours=24,
         history_panel_open=True,
         io_chart_mode="total",
+        redact_sensitive=${redactSensitive ? "True" : "False"},
     )
     pathlib.Path(sys.argv[1]).write_text(rendered.html, encoding="utf-8")
 
@@ -272,6 +273,82 @@ test("offline snapshot renders preloaded slot history without a live backend", a
   await expect(page.locator("#history-metric-grid")).toContainText("37 C");
 });
 
+test("offline snapshot exposes mapping health without color-only cues", async ({ page }) => {
+  const snapshotPath = buildOfflineSnapshotFixture({ redactSensitive: true });
+  const consoleErrors = [];
+  const failedRequests = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+  page.on("requestfailed", (request) => failedRequests.push(request.url()));
+
+  await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+
+  const health = page.locator("#mapping-health-summary");
+  await expect(health).toHaveAttribute("role", "status");
+  await expect(health).toHaveAttribute("aria-live", "polite");
+  await expect(health).toContainText(/matched/);
+  await expect(page.locator("#mapping-health-evidence")).toContainText(/Evidence:.*Snapshot:/);
+  await expect(page.locator("#status-text")).toHaveAttribute("role", "status");
+  await expect(page.locator("#status-text")).toHaveAttribute("aria-live", "polite");
+
+  const evidence = page.locator(".summary-disclosure");
+  await expect(evidence).not.toHaveAttribute("open", "");
+  const evidenceSummary = evidence.locator(":scope > summary");
+  await evidenceSummary.focus();
+  await expect(evidenceSummary).toBeFocused();
+  await evidenceSummary.press("Enter");
+  await expect(evidence).toHaveAttribute("open", "");
+
+  await expect(page.locator(".legend-item")).toHaveCount(6);
+  await expect(page.locator(".swatch.healthy")).toHaveText("✓");
+  await expect(page.locator(".swatch.empty")).toHaveText("○");
+  await expect(page.locator(".swatch.fault")).toHaveText("!");
+  await expect(page.locator(".swatch.unknown")).toHaveText("?");
+
+  const tileCue = await page.locator("#slot-grid .slot-tile").first().evaluate((tile) =>
+    window.getComputedStyle(tile, "::after").content
+  );
+  expect(tileCue).not.toBe("none");
+  expect(tileCue).not.toBe("normal");
+
+  await page.locator("#heatmap-toggle-button").click();
+  await expect(page.locator('#heatmap-metric-select option[value="attention_score"]')).toHaveText("Derived Attention Score");
+  await expect(page.locator("#heatmap-metric-context")).toContainText("relative temperature, errors, and write load");
+  await page.locator("#heatmap-metric-select").selectOption("temperature_c");
+  await expect(page.locator("#heatmap-metric-context")).toContainText("Degrees Celsius");
+  await expect(page.locator("#heatmap-metric-context")).toContainText("vendor's warning and critical thresholds");
+
+  await page.emulateMedia({ forcedColors: "active" });
+  const forcedColorCue = await page.locator("#slot-grid .slot-tile").first().evaluate((tile) => {
+    const style = window.getComputedStyle(tile, "::after");
+    return { content: style.content, borderStyle: style.borderStyle };
+  });
+  expect(forcedColorCue.content).not.toBe("none");
+  expect(["solid", "dotted", "double", "dashed"]).toContain(forcedColorCue.borderStyle);
+
+  const privacyRuleCounts = await page.locator("body").evaluate((body) => {
+    const text = body.innerText;
+    return {
+      privateEndpoints: (text.match(/\b(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/g) || []).length,
+      hostPaths: (text.match(/(?:\/home\/|\/mnt\/|[A-Z]:\\Users\\)/g) || []).length,
+      credentialAssignments: (text.match(/\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S+/gi) || []).length,
+      longBareHex: (text.match(/\b[0-9a-f]{48,}\b/gi) || []).length,
+    };
+  });
+  expect(privacyRuleCounts).toEqual({
+    privateEndpoints: 0,
+    hostPaths: 0,
+    credentialAssignments: 0,
+    longBareHex: 0,
+  });
+
+  expect(failedRequests).toEqual([]);
+  expect(consoleErrors).toEqual([]);
+});
+
 test("offline top-loader snapshot keeps exported row geometry", async ({ page }) => {
   const snapshotPath = buildOfflineTopLoaderSnapshotFixture();
 
@@ -305,6 +382,7 @@ test("offline snapshot can navigate preloaded storage views without a live backe
   await expect(selector).toBeEnabled();
   await selector.selectOption("view:boot-doms");
   await expect(page.locator("#enclosure-panel-title")).toContainText("Boot SATADOMs");
+  await expect(page.locator("#mapping-health-summary")).toContainText("Boot SATADOMs:");
   await page.locator('#slot-grid .slot-tile[data-slot="0"]').click();
   await expect(page.locator("#detail-kv-grid")).toContainText("SATADOM");
   await expect(page.locator("#detail-kv-grid")).toContainText("41 C");

@@ -2,6 +2,11 @@
 
 ## Unreleased - 0.22.0-dev
 
+- Added scope-aware mapping-health summaries with matched, empty, unmatched, and
+  unknown bay counts plus mapping-source and snapshot-time caveats.
+- Added glyph and pattern status cues, polite status announcements, keyboard-
+  operable evidence disclosures, collapsed Fabric diagnostics, and clearer
+  derived-attention and temperature guidance.
 - Fixed the public-demo Storage Fabric action so static snapshots open their
   in-page topology while live deployments preserve configured URL subpaths.
 - Made the checked-in demo's sanitized, frozen capture time and artifact app
