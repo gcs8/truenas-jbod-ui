@@ -23,6 +23,11 @@ EXPECTED_MEMORY_LIMITS = {
     "enclosure-admin": "${ADMIN_MEM_LIMIT:-1g}",
     "enclosure-backup": "${BACKUP_MEM_LIMIT:-1g}",
 }
+EXPECTED_HISTORY_PERMISSION_ENV = {
+    "HISTORY_PERMISSION_REPAIR_ENABLED": "${HISTORY_PERMISSION_REPAIR_ENABLED:-false}",
+    "HISTORY_SHARED_DIR_MODE": "${HISTORY_SHARED_DIR_MODE:-0770}",
+    "HISTORY_SHARED_FILE_MODE": "${HISTORY_SHARED_FILE_MODE:-0660}",
+}
 
 
 class ContainerResourceContractTests(unittest.TestCase):
@@ -141,6 +146,27 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("HISTORY_MEM_LIMIT=1g", example_lines)
         self.assertIn("ADMIN_MEM_LIMIT=1g", example_lines)
         self.assertIn("BACKUP_MEM_LIMIT=1g", example_lines)
+
+    def test_history_permission_repair_is_explicit_and_documented(self) -> None:
+        for compose_name in COMPOSE_FILES:
+            compose = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))
+            environment = compose["services"]["enclosure-history"]["environment"]
+            with self.subTest(compose=compose_name):
+                for env_name, expected_value in EXPECTED_HISTORY_PERMISSION_ENV.items():
+                    self.assertEqual(environment.get(env_name), expected_value)
+
+        env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("HISTORY_PERMISSION_REPAIR_ENABLED=false", env_example)
+        self.assertIn("HISTORY_SHARED_DIR_MODE=0770", env_example)
+        self.assertIn("HISTORY_SHARED_FILE_MODE=0660", env_example)
+
+        deployment_doc = (REPO_ROOT / "wiki" / "Docker-and-GHCR-Deployment.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("disabled by default", deployment_doc)
+        self.assertIn("not world-writable", deployment_doc)
+        self.assertIn("HISTORY_PERMISSION_REPAIR_ENABLED", deployment_doc)
+        self.assertIn("roll back", deployment_doc)
 
     def test_scheduled_backup_service_is_one_shot_non_networked_and_has_no_docker_socket(self) -> None:
         for compose_name in COMPOSE_FILES:

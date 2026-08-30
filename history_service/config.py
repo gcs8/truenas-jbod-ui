@@ -34,6 +34,9 @@ class HistorySettings(BaseModel):
     release_check_interval_seconds: int = 86400
     release_check_timeout_seconds: float = 5.0
     sqlite_path: str = Field(default_factory=_default_history_sqlite_path)
+    permission_repair_enabled: bool = False
+    shared_dir_mode: int = Field(default=0o770, ge=0, le=0o777)
+    shared_file_mode: int = Field(default=0o660, ge=0, le=0o777)
     backup_dir: str = Field(default_factory=_default_history_backup_dir)
     backup_retention_count: int = 28
     backup_interval_seconds: int = 3600
@@ -59,6 +62,13 @@ class HistorySettings(BaseModel):
 
     @model_validator(mode="after")
     def align_backup_paths(self) -> "HistorySettings":
+        for label, mode in (
+            ("shared directory", self.shared_dir_mode),
+            ("shared file", self.shared_file_mode),
+        ):
+            if mode & 0o002:
+                raise ValueError(f"History {label} mode must not be world-writable.")
+
         default_sqlite_path = _default_history_sqlite_path()
         default_backup_dir = _default_history_backup_dir()
         default_long_term_backup_dir = _default_history_long_term_backup_dir()
@@ -84,6 +94,9 @@ ENV_OVERRIDES: dict[str, str] = {
     "RELEASE_CHECK_INTERVAL_SECONDS": "release_check_interval_seconds",
     "RELEASE_CHECK_TIMEOUT_SECONDS": "release_check_timeout_seconds",
     "HISTORY_SQLITE_PATH": "sqlite_path",
+    "HISTORY_PERMISSION_REPAIR_ENABLED": "permission_repair_enabled",
+    "HISTORY_SHARED_DIR_MODE": "shared_dir_mode",
+    "HISTORY_SHARED_FILE_MODE": "shared_file_mode",
     "HISTORY_BACKUP_DIR": "backup_dir",
     "HISTORY_BACKUP_RETENTION_COUNT": "backup_retention_count",
     "HISTORY_BACKUP_INTERVAL_SECONDS": "backup_interval_seconds",
@@ -108,6 +121,8 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_RETENTION_MAX_BATCHES_PER_RUN": "retention_max_batches_per_run",
 }
 
+PERMISSION_MODE_ENV_VARS = frozenset({"HISTORY_SHARED_DIR_MODE", "HISTORY_SHARED_FILE_MODE"})
+
 
 def _parse_scalar(value: str) -> Any:
     stripped = value.strip()
@@ -121,6 +136,15 @@ def _parse_scalar(value: str) -> Any:
         return stripped
 
 
+def _parse_permission_mode(value: str) -> int:
+    normalized = value.strip().lower()
+    if normalized.startswith("0o"):
+        normalized = normalized[2:]
+    if not normalized or any(character not in "01234567" for character in normalized):
+        raise ValueError("History permission modes must use octal digits.")
+    return int(normalized, 8)
+
+
 @lru_cache
 def get_history_settings() -> HistorySettings:
     payload = HistorySettings().model_dump()
@@ -128,7 +152,9 @@ def get_history_settings() -> HistorySettings:
         raw_value = os.getenv(env_name)
         if raw_value is None:
             continue
-        payload[field_name] = _parse_scalar(raw_value)
+        payload[field_name] = (
+            _parse_permission_mode(raw_value) if env_name in PERMISSION_MODE_ENV_VARS else _parse_scalar(raw_value)
+        )
 
     settings = HistorySettings.model_validate(payload)
     Path(settings.sqlite_path).parent.mkdir(parents=True, exist_ok=True)

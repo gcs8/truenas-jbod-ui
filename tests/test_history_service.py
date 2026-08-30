@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import sqlite3
@@ -16,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from history_service import main as history_main
 from history_service.collector import HistoryCollectionStopping, HistoryCollector, ScopeSnapshot
-from history_service.config import HistorySettings
+from history_service.config import HistorySettings, get_history_settings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
 from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
 
@@ -254,6 +255,63 @@ class HistoryDomainTests(unittest.TestCase):
 
 
 class HistoryConfigTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        get_history_settings.cache_clear()
+
+    def test_permission_repair_is_disabled_with_group_scoped_modes_by_default(self) -> None:
+        settings = HistorySettings()
+
+        self.assertIs(getattr(settings, "permission_repair_enabled", None), False)
+        self.assertEqual(getattr(settings, "shared_dir_mode", None), 0o770)
+        self.assertEqual(getattr(settings, "shared_file_mode", None), 0o660)
+
+    def test_permission_repair_settings_reject_world_writable_modes(self) -> None:
+        with self.assertRaisesRegex(ValueError, "world-writable"):
+            HistorySettings(shared_dir_mode=0o777)
+        with self.assertRaisesRegex(ValueError, "world-writable"):
+            HistorySettings(shared_file_mode=0o666)
+
+    def test_permission_repair_environment_modes_parse_as_octal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(
+                os.environ,
+                {
+                    "HISTORY_SQLITE_PATH": str(Path(temp_dir) / "history.db"),
+                    "HISTORY_PERMISSION_REPAIR_ENABLED": "true",
+                    "HISTORY_SHARED_DIR_MODE": "0750",
+                    "HISTORY_SHARED_FILE_MODE": "0640",
+                },
+            ):
+                get_history_settings.cache_clear()
+                settings = get_history_settings()
+
+        self.assertTrue(settings.permission_repair_enabled)
+        self.assertEqual(settings.shared_dir_mode, 0o750)
+        self.assertEqual(settings.shared_file_mode, 0o640)
+
+    def test_history_store_factory_forwards_permission_settings(self) -> None:
+        settings = HistorySettings(
+            sqlite_path="/tmp/history-policy-test.db",
+            permission_repair_enabled=True,
+            shared_dir_mode=0o750,
+            shared_file_mode=0o640,
+        )
+        factory = getattr(history_main, "build_history_store", None)
+        if not callable(factory):
+            self.fail("history_service.main does not expose build_history_store")
+
+        sentinel = object()
+        with patch.object(history_main, "HistoryStore", return_value=sentinel) as constructor:
+            result = factory(settings)
+
+        self.assertIs(result, sentinel)
+        constructor.assert_called_once_with(
+            settings.sqlite_path,
+            permission_repair_enabled=True,
+            shared_dir_mode=0o750,
+            shared_file_mode=0o640,
+        )
+
     def test_history_settings_default_request_timeout_allows_slow_live_inventory(self) -> None:
         self.assertEqual(HistorySettings().request_timeout_seconds, 45)
 
@@ -617,6 +675,666 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
 
 class HistoryStoreTests(unittest.TestCase):
+    def test_default_store_does_not_widen_existing_database_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "history"
+            root.mkdir(mode=0o750)
+            db_path = root / "history.db"
+            db_path.write_bytes(b"")
+            db_path.chmod(0o640)
+
+            HistoryStore(str(db_path))
+
+            self.assertEqual(root.stat().st_mode & 0o777, 0o750)
+            self.assertEqual(db_path.stat().st_mode & 0o777, 0o640)
+
+    def test_default_store_does_not_rewrite_promoted_backup_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            source_path = root / "source.sqlite3"
+            source_path.write_bytes(b"synthetic-backup")
+            source_path.chmod(0o600)
+            target_path = root / "long-term" / "history.sqlite3"
+
+            store._refresh_backup_copy(source_path, target_path)
+
+            self.assertEqual(target_path.stat().st_mode & 0o777, 0o600)
+
+    def test_default_backup_replacement_preserves_existing_target_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            backup_root = root / "backups"
+            backup_root.mkdir()
+            snapshot_label = "2030-01-02T03:04:05+00:00"
+            target_path = backup_root / "history-20300102T030405Z.sqlite3"
+            target_path.write_bytes(b"previous-backup")
+            target_path.chmod(0o600)
+
+            backup_path = store.create_backup(backup_root, snapshot_label=snapshot_label)
+
+            self.assertEqual(backup_path, target_path)
+            self.assertEqual(target_path.stat().st_mode & 0o777, 0o600)
+
+    def test_default_restore_replacement_preserves_existing_database_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            backup_path = store.create_backup(root / "backups", snapshot_label="2030-01-02T03:04:05+00:00")
+            if backup_path is None:
+                self.fail("Expected restore source backup to be created")
+            store.file_path.chmod(0o600)
+
+            store.restore_backup(backup_path)
+
+            self.assertEqual(store.file_path.stat().st_mode & 0o777, 0o600)
+
+    def test_failed_restore_publication_preserves_live_sqlite_family(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            backup_path = store.create_backup(root / "backups", snapshot_label="2030-01-02T03:04:05+00:00")
+            if backup_path is None:
+                self.fail("Expected a backup path")
+            main_before = store.file_path.read_bytes()
+            wal_path = Path(f"{store.file_path}-wal")
+            shm_path = Path(f"{store.file_path}-shm")
+            wal_path.write_bytes(b"synthetic-wal")
+            shm_path.write_bytes(b"synthetic-shm")
+
+            with (
+                patch.object(store, "_rename_at2", side_effect=OSError(errno.ENOSYS, "unsupported")),
+                self.assertRaises(OSError),
+            ):
+                store.restore_backup(backup_path)
+
+            self.assertEqual(store.file_path.read_bytes(), main_before)
+            self.assertEqual(wal_path.read_bytes(), b"synthetic-wal")
+            self.assertEqual(shm_path.read_bytes(), b"synthetic-shm")
+
+    def test_backup_replacement_uses_private_empty_staging_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            backup_root = root / "backups"
+
+            backup_path = store.create_backup(backup_root, snapshot_label="2030-01-02T03:04:05+00:00")
+
+            self.assertIsNotNone(backup_path)
+            replacement_root = backup_root / f".history-replacement-{os.geteuid()}"
+            self.assertEqual(replacement_root.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(list(replacement_root.iterdir()), [])
+
+    def test_default_promotion_replacement_preserves_existing_target_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            source_path = root / "source.sqlite3"
+            source_path.write_bytes(b"replacement-backup")
+            source_path.chmod(0o644)
+            target_path = root / "long-term" / "history.sqlite3"
+            target_path.parent.mkdir()
+            target_path.write_bytes(b"previous-backup")
+            target_path.chmod(0o600)
+
+            store._refresh_backup_copy(source_path, target_path)
+
+            self.assertEqual(target_path.stat().st_mode & 0o777, 0o600)
+
+    def test_opt_in_backup_replacement_applies_configured_file_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(
+                str(root / "history.db"),
+                permission_repair_enabled=True,
+                shared_dir_mode=0o750,
+                shared_file_mode=0o640,
+            )
+            backup_root = root / "backups"
+            backup_root.mkdir()
+            target_path = backup_root / "history-20300102T030405Z.sqlite3"
+            target_path.write_bytes(b"previous-backup")
+            target_path.chmod(0o600)
+
+            backup_path = store.create_backup(backup_root, snapshot_label="2030-01-02T03:04:05+00:00")
+
+            self.assertEqual(backup_path, target_path)
+            self.assertEqual(target_path.stat().st_mode & 0o777, 0o640)
+
+    def test_default_replacement_mode_preservation_refuses_target_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            temp_path = root / "replacement.tmp"
+            temp_path.write_bytes(b"replacement")
+            target_path = root / "target.sqlite3"
+            target_path.write_bytes(b"target")
+            victim_path = root / "victim.sqlite3"
+            victim_path.write_bytes(b"victim")
+            victim_path.chmod(0o600)
+            real_open = os.open
+            swapped = False
+
+            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
+                nonlocal swapped
+                if Path(path) == target_path and not swapped:
+                    swapped = True
+                    target_path.unlink()
+                    target_path.symlink_to(victim_path)
+                return real_open(path, flags)
+
+            with (
+                patch("history_service.store.os.open", side_effect=swap_before_open),
+                self.assertRaises((OSError, ValueError)),
+            ):
+                store._preserve_existing_target_mode(temp_path, target_path)
+
+            self.assertTrue(swapped)
+            self.assertEqual(victim_path.stat().st_mode & 0o777, 0o600)
+
+    def test_default_replacement_mode_preservation_refuses_temp_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            target_path = root / "target.sqlite3"
+            target_path.write_bytes(b"target")
+            target_path.chmod(0o600)
+            temp_path = root / "replacement.tmp"
+            temp_path.write_bytes(b"replacement")
+            victim_path = root / "victim.sqlite3"
+            victim_path.write_bytes(b"victim")
+            victim_path.chmod(0o644)
+            real_open = os.open
+            swapped = False
+
+            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
+                nonlocal swapped
+                if Path(path) == temp_path and not swapped:
+                    swapped = True
+                    temp_path.unlink()
+                    temp_path.symlink_to(victim_path)
+                return real_open(path, flags)
+
+            with (
+                patch("history_service.store.os.open", side_effect=swap_before_open),
+                self.assertRaises((OSError, ValueError)),
+            ):
+                store._preserve_existing_target_mode(temp_path, target_path)
+
+            self.assertTrue(swapped)
+            self.assertEqual(victim_path.stat().st_mode & 0o777, 0o644)
+
+    def test_default_replacement_mode_preservation_refuses_temp_inode_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            target_path = root / "target.sqlite3"
+            target_path.write_bytes(b"target")
+            target_path.chmod(0o600)
+            temp_path = root / "replacement.tmp"
+            temp_path.write_bytes(b"replacement")
+            replacement_path = root / "replacement-raced.tmp"
+            replacement_path.write_bytes(b"raced")
+            real_open = os.open
+            swapped = False
+
+            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
+                nonlocal swapped
+                if Path(path) == temp_path and not swapped:
+                    swapped = True
+                    temp_path.unlink()
+                    replacement_path.replace(temp_path)
+                return real_open(path, flags)
+
+            with (
+                patch("history_service.store.os.open", side_effect=swap_before_open),
+                self.assertRaisesRegex(ValueError, "changed temporary path"),
+            ):
+                store._preserve_existing_target_mode(temp_path, target_path)
+
+            self.assertTrue(swapped)
+            self.assertEqual(temp_path.read_bytes(), b"raced")
+
+    def test_default_replacement_publisher_leaves_one_sided_temp_swap_generations_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            target_path = root / "target.sqlite3"
+            target_path.write_bytes(b"original-target")
+            target_path.chmod(0o600)
+            temp_path = root / "replacement.tmp"
+            temp_path.write_bytes(b"expected-replacement")
+            injected_path = root / "injected.tmp"
+            injected_path.write_bytes(b"injected-replacement")
+            injected_path.chmod(0o644)
+            real_rename_at2 = store._rename_at2
+            swapped = False
+            publisher = getattr(store, "_publish_replacement", None)
+
+            def swap_after_validation(source: Path, destination: Path, *, flags: int) -> None:
+                nonlocal swapped
+                if source == temp_path and not swapped:
+                    swapped = True
+                    temp_path.unlink()
+                    os.replace(injected_path, temp_path)
+                real_rename_at2(source, destination, flags=flags)
+
+            self.assertTrue(callable(publisher))
+            if not callable(publisher):
+                return
+            with (
+                patch.object(store, "_rename_at2", side_effect=swap_after_validation),
+                self.assertRaisesRegex(ValueError, "changed temporary path"),
+            ):
+                publisher(temp_path, target_path)
+
+            self.assertTrue(swapped)
+            self.assertEqual(target_path.read_bytes(), b"injected-replacement")
+            self.assertEqual(temp_path.read_bytes(), b"original-target")
+            self.assertEqual(temp_path.stat().st_mode & 0o777, 0o600)
+
+    def test_default_replacement_publisher_does_not_publish_when_target_vanishes_during_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            target_path = root / "target.sqlite3"
+            target_path.write_bytes(b"original-target")
+            temp_path = root / "replacement.tmp"
+            temp_path.write_bytes(b"expected-replacement")
+            real_open_stable = store._open_stable_regular_file
+            removed = False
+
+            def remove_target_before_open(path: Path, *, role: str) -> tuple[int, os.stat_result]:
+                nonlocal removed
+                if path == target_path and not removed:
+                    target_path.unlink()
+                    removed = True
+                return real_open_stable(path, role=role)
+
+            with (
+                patch.object(store, "_open_stable_regular_file", side_effect=remove_target_before_open),
+                self.assertRaisesRegex(ValueError, "changed target path"),
+            ):
+                store._publish_replacement(temp_path, target_path)
+
+            self.assertTrue(removed)
+            self.assertFalse(target_path.exists())
+            self.assertEqual(temp_path.read_bytes(), b"expected-replacement")
+
+    def test_renameat2_exchange_swaps_two_regular_paths_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_path = root / "first.sqlite3"
+            second_path = root / "second.sqlite3"
+            first_path.write_bytes(b"first")
+            second_path.write_bytes(b"second")
+
+            HistoryStore._rename_at2(first_path, second_path, flags=2)
+
+            self.assertEqual(first_path.read_bytes(), b"second")
+            self.assertEqual(second_path.read_bytes(), b"first")
+
+    def test_replacement_exchange_leaves_one_sided_target_swap_generations_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            target_path = root / "target.sqlite3"
+            target_path.write_bytes(b"original-target")
+            temp_path = root / "replacement.tmp"
+            temp_path.write_bytes(b"expected-replacement")
+            displaced_original = root / "displaced-original.sqlite3"
+            injected_path = root / "injected.sqlite3"
+            injected_path.write_bytes(b"concurrent-target")
+            real_rename_at2 = store._rename_at2
+            swapped = False
+
+            def replace_target_then_rename(source: Path, target: Path, *, flags: int) -> None:
+                nonlocal swapped
+                if flags == 2 and not swapped:
+                    target_path.replace(displaced_original)
+                    injected_path.replace(target_path)
+                    swapped = True
+                real_rename_at2(source, target, flags=flags)
+
+            with (
+                patch.object(store, "_rename_at2", side_effect=replace_target_then_rename),
+                self.assertRaisesRegex(ValueError, "changed target path"),
+            ):
+                store._publish_replacement(temp_path, target_path)
+
+            self.assertTrue(swapped)
+            self.assertEqual(target_path.read_bytes(), b"expected-replacement")
+            self.assertEqual(temp_path.read_bytes(), b"concurrent-target")
+            self.assertEqual(displaced_original.read_bytes(), b"original-target")
+
+    def test_replacement_noreplace_preserves_target_that_appears_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            target_path = root / "target.sqlite3"
+            temp_path = root / "replacement.tmp"
+            temp_path.write_bytes(b"expected-replacement")
+            real_rename_at2 = store._rename_at2
+            appeared = False
+
+            def create_target_then_rename(source: Path, target: Path, *, flags: int) -> None:
+                nonlocal appeared
+                if flags == 1 and not appeared:
+                    target_path.write_bytes(b"concurrent-target")
+                    appeared = True
+                real_rename_at2(source, target, flags=flags)
+
+            with (
+                patch.object(store, "_rename_at2", side_effect=create_target_then_rename),
+                self.assertRaisesRegex(ValueError, "changed target path"),
+            ):
+                store._publish_replacement(temp_path, target_path)
+
+            self.assertTrue(appeared)
+            self.assertEqual(target_path.read_bytes(), b"concurrent-target")
+
+    def test_replacement_noreplace_does_not_unlink_target_swapped_after_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            target_path = root / "target.sqlite3"
+            temp_path = root / "replacement.tmp"
+            temp_path.write_bytes(b"expected-replacement")
+            displaced_published = root / "displaced-published.sqlite3"
+            injected_path = root / "injected.sqlite3"
+            injected_path.write_bytes(b"concurrent-target")
+            real_rename_at2 = store._rename_at2
+            swapped = False
+
+            def swap_after_rename(source: Path, target: Path, *, flags: int) -> None:
+                nonlocal swapped
+                real_rename_at2(source, target, flags=flags)
+                if flags == 1 and not swapped:
+                    target_path.replace(displaced_published)
+                    injected_path.replace(target_path)
+                    swapped = True
+
+            with (
+                patch.object(store, "_rename_at2", side_effect=swap_after_rename),
+                self.assertRaisesRegex(ValueError, "changed published path"),
+            ):
+                store._publish_replacement(temp_path, target_path)
+
+            self.assertTrue(swapped)
+            self.assertEqual(target_path.read_bytes(), b"concurrent-target")
+            self.assertEqual(displaced_published.read_bytes(), b"expected-replacement")
+
+    def test_replacement_uses_and_closes_original_mkstemp_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            descriptor, temp_name = tempfile.mkstemp(dir=root)
+            temp_path = Path(temp_name)
+            os.write(descriptor, b"expected-replacement")
+            temp_path.unlink()
+            temp_path.write_bytes(b"substituted-temp")
+            target_path = root / "target.sqlite3"
+
+            with self.assertRaisesRegex(ValueError, "changed temporary path"):
+                store._publish_replacement(
+                    temp_path,
+                    target_path,
+                    temp_descriptor=descriptor,
+                )
+
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+            self.assertFalse(target_path.exists())
+            self.assertEqual(temp_path.read_bytes(), b"substituted-temp")
+
+    def test_replacement_cleanup_failure_still_closes_all_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            target_path = root / "target.sqlite3"
+            target_path.write_bytes(b"original-target")
+            descriptor, temp_name = tempfile.mkstemp(dir=root)
+            temp_path = Path(temp_name)
+            os.write(descriptor, b"expected-replacement")
+            real_close = os.close
+            closed_descriptors: list[int] = []
+
+            def observe_close(fd: int) -> None:
+                closed_descriptors.append(fd)
+                real_close(fd)
+
+            with (
+                patch.object(store, "_unlink_owned_path", create=True, side_effect=OSError("cleanup failed")),
+                patch("history_service.store.os.close", side_effect=observe_close),
+                self.assertRaisesRegex(OSError, "cleanup failed"),
+            ):
+                store._publish_replacement(
+                    temp_path,
+                    target_path,
+                    temp_descriptor=descriptor,
+                )
+
+            self.assertIn(descriptor, closed_descriptors)
+            self.assertGreaterEqual(len(closed_descriptors), 2)
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "requires procfs descriptor paths")
+    def test_default_replacement_mode_preservation_only_changes_unpublished_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            target_path = root / "target.sqlite3"
+            target_path.write_bytes(b"original-target")
+            target_path.chmod(0o600)
+            temp_path = root / "replacement.tmp"
+            temp_path.write_bytes(b"expected-replacement")
+            temp_path.chmod(0o644)
+            real_fchmod = os.fchmod
+            changed_paths: list[tuple[Path, int]] = []
+            publisher = getattr(store, "_publish_replacement", None)
+
+            def observe_fchmod(fd: int, mode: int) -> None:
+                changed_paths.append((Path(os.readlink(f"/proc/self/fd/{fd}")), mode))
+                real_fchmod(fd, mode)
+
+            self.assertTrue(callable(publisher))
+            if not callable(publisher):
+                return
+            with patch("history_service.store.os.fchmod", side_effect=observe_fchmod):
+                publisher(temp_path, target_path)
+
+            self.assertEqual(changed_paths, [(temp_path, 0o600)])
+            self.assertEqual(target_path.read_bytes(), b"expected-replacement")
+            self.assertEqual(target_path.stat().st_mode & 0o777, 0o600)
+
+    def test_opt_in_permission_repair_applies_exact_modes_to_new_shared_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            history_root = root / "history"
+            backup_root = root / "backups"
+            long_term_root = root / "long-term"
+            previous_umask = os.umask(0o022)
+            try:
+                store = HistoryStore(
+                    str(history_root / "history.db"),
+                    permission_repair_enabled=True,
+                    shared_dir_mode=0o770,
+                    shared_file_mode=0o660,
+                )
+                backup_path = store.create_backup(
+                    backup_root,
+                    snapshot_label="2030-01-02T03:04:05+00:00",
+                    long_term_backup_dir=long_term_root,
+                    weekly_retention_count=1,
+                )
+            finally:
+                os.umask(previous_umask)
+
+            if backup_path is None:
+                self.fail("Expected a backup path")
+            weekly_paths = list((long_term_root / "weekly").glob("*.sqlite3"))
+            self.assertEqual(len(weekly_paths), 1)
+            for path in (history_root, backup_root, long_term_root, long_term_root / "weekly"):
+                with self.subTest(path=path):
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o770)
+            for path in (store.file_path, backup_path, weekly_paths[0]):
+                with self.subTest(path=path):
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o660)
+
+    def test_opt_in_permission_repair_applies_exact_configured_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "history"
+            root.mkdir(mode=0o777)
+            db_path = root / "history.db"
+            db_path.write_bytes(b"")
+            db_path.chmod(0o666)
+
+            try:
+                HistoryStore(
+                    str(db_path),
+                    permission_repair_enabled=True,
+                    shared_dir_mode=0o750,
+                    shared_file_mode=0o640,
+                )
+            except TypeError as exc:
+                self.fail(f"HistoryStore does not expose configured repair modes: {exc}")
+
+            self.assertEqual(root.stat().st_mode & 0o777, 0o750)
+            self.assertEqual(db_path.stat().st_mode & 0o777, 0o640)
+
+    def test_opt_in_permission_repair_rejects_world_writable_modes(self) -> None:
+        cases = (
+            (0o777, 0o660),
+            (0o770, 0o666),
+        )
+        for shared_dir_mode, shared_file_mode in cases:
+            with (
+                self.subTest(dir_mode=shared_dir_mode, file_mode=shared_file_mode),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                with self.assertRaisesRegex(ValueError, "world-writable"):
+                    HistoryStore(
+                        str(Path(temp_dir) / "history.db"),
+                        permission_repair_enabled=True,
+                        shared_dir_mode=shared_dir_mode,
+                        shared_file_mode=shared_file_mode,
+                    )
+
+    def test_opt_in_permission_repair_refuses_symlinked_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            real_path = root / "real-history.db"
+            real_path.write_bytes(b"")
+            real_path.chmod(0o600)
+            symlink_path = root / "history.db"
+            symlink_path.symlink_to(real_path)
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                HistoryStore(str(symlink_path), permission_repair_enabled=True)
+
+            self.assertEqual(real_path.stat().st_mode & 0o777, 0o600)
+
+    def test_opt_in_permission_repair_does_not_follow_late_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            store.permission_repair_enabled = True
+            store.shared_file_mode = 0o640
+            target_path = root / "repair-target"
+            target_path.write_bytes(b"target")
+            target_path.chmod(0o600)
+            victim_path = root / "victim"
+            victim_path.write_bytes(b"victim")
+            victim_path.chmod(0o600)
+            real_open = os.open
+            swapped = False
+
+            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
+                nonlocal swapped
+                if Path(path) == target_path and not swapped:
+                    swapped = True
+                    target_path.unlink()
+                    target_path.symlink_to(victim_path)
+                return real_open(path, flags)
+
+            with (
+                patch("history_service.store.os.open", side_effect=swap_before_open),
+                self.assertRaises((OSError, ValueError)),
+            ):
+                store._normalize_shared_path_permissions(target_path)
+
+            self.assertTrue(swapped)
+            self.assertTrue(target_path.is_symlink())
+            self.assertEqual(victim_path.stat().st_mode & 0o777, 0o600)
+
+    def test_opt_in_permission_repair_refuses_non_regular_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            store.permission_repair_enabled = True
+            fifo_path = root / "repair-fifo"
+            os.mkfifo(fifo_path)
+
+            with self.assertRaisesRegex(ValueError, "non-regular"):
+                store._normalize_shared_path_permissions(fifo_path)
+
+    def test_opt_in_permission_repair_refuses_inode_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            store.permission_repair_enabled = True
+            target_path = root / "repair-target"
+            target_path.write_bytes(b"original")
+            replacement_path = root / "replacement"
+            replacement_path.write_bytes(b"replacement")
+            real_open = os.open
+            swapped = False
+
+            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
+                nonlocal swapped
+                if Path(path) == target_path and not swapped:
+                    swapped = True
+                    target_path.unlink()
+                    replacement_path.replace(target_path)
+                return real_open(path, flags)
+
+            with (
+                patch("history_service.store.os.open", side_effect=swap_before_open),
+                self.assertRaisesRegex(ValueError, "changed path"),
+            ):
+                store._normalize_shared_path_permissions(target_path)
+
+            self.assertTrue(swapped)
+            self.assertEqual(target_path.read_bytes(), b"replacement")
+
+    def test_opt_in_permission_repair_refuses_type_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            store.permission_repair_enabled = True
+            target_path = root / "repair-target"
+            target_path.write_bytes(b"original")
+            real_open = os.open
+            swapped = False
+
+            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
+                nonlocal swapped
+                if Path(path) == target_path and not swapped:
+                    swapped = True
+                    target_path.unlink()
+                    os.mkfifo(target_path)
+                return real_open(path, flags)
+
+            with (
+                patch("history_service.store.os.open", side_effect=swap_before_open),
+                self.assertRaisesRegex(ValueError, "non-regular"),
+            ):
+                store._normalize_shared_path_permissions(target_path)
+
+            self.assertTrue(swapped)
+
     @staticmethod
     def _metric_sample(observed_at: str, value: int, *, slot: int = 5) -> MetricSample:
         return MetricSample(
@@ -3020,6 +3738,18 @@ class HistoryStoreTests(unittest.TestCase):
         repair.assert_called_once()
         working_connection.execute.assert_called_once()
         working_connection.commit.assert_called_once()
+
+    def test_readonly_database_repair_is_disabled_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = HistoryStore(str(Path(temp_dir) / "history.db"))
+
+            with patch.object(store, "_normalize_database_permissions") as normalize:
+                repaired = store._attempt_readonly_database_repair(
+                    sqlite3.OperationalError("attempt to write a readonly database")
+                )
+
+            self.assertFalse(repaired)
+            normalize.assert_not_called()
 
     def test_connect_uses_an_explicit_bounded_timeout(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

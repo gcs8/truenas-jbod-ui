@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import logging
 import os
+import secrets
 import shutil
 import sqlite3
 import stat
 import threading
 import time
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,13 +19,17 @@ from typing import Any, Callable
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
 
 logger = logging.getLogger(__name__)
-SQLITE_SHARED_DIR_MODE = 0o777
-SQLITE_SHARED_FILE_MODE = 0o666
+SQLITE_SHARED_DIR_MODE = 0o770
+SQLITE_SHARED_FILE_MODE = 0o660
 SQLITE_TEMP_STORE = "MEMORY"
 SQLITE_CACHE_SIZE_KIB = 16384
 SQLITE_CONNECT_TIMEOUT_SECONDS = 5.0
 SQLITE_WRITE_LOCK_RETRY_ATTEMPTS = 2
 SQLITE_WRITE_LOCK_RETRY_DELAY_SECONDS = 0.05
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+RENAME_EXCHANGE = 2
+PRIVATE_REPLACEMENT_DIR_PREFIX = ".history-replacement-"
 # PRAGMA user_version marker: once the disk-identity backfill has run against a database
 # it is recorded here so later service starts (in every container sharing the file) skip
 # the full-table UPDATE scans. Writers populate disk_identity_key on insert, so the
@@ -279,10 +286,25 @@ class HistoryStore:
         file_path: str,
         *,
         recover_unreadable_database: bool = True,
+        permission_repair_enabled: bool = False,
+        shared_dir_mode: int = SQLITE_SHARED_DIR_MODE,
+        shared_file_mode: int = SQLITE_SHARED_FILE_MODE,
     ) -> None:
         self.file_path = Path(file_path)
         self.recover_unreadable_database = bool(recover_unreadable_database)
+        self.permission_repair_enabled = bool(permission_repair_enabled)
+        self.shared_dir_mode = int(shared_dir_mode)
+        self.shared_file_mode = int(shared_file_mode)
+        for label, mode in (
+            ("shared directory", self.shared_dir_mode),
+            ("shared file", self.shared_file_mode),
+        ):
+            if mode < 0 or mode > 0o777:
+                raise ValueError(f"History {label} mode must be between 0000 and 0777.")
+            if mode & 0o002:
+                raise ValueError(f"History {label} mode must not be world-writable.")
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._normalize_shared_path_permissions(self.file_path.parent, is_dir=True)
         self._lock = threading.Lock()
         self._journal_mode_lock = threading.Lock()
         self._journal_mode_identity: tuple[int, int] | None = None
@@ -341,10 +363,10 @@ class HistoryStore:
     def _initialize(self) -> None:
         self._normalize_database_permissions()
         try:
-            self._initialize_schema()
+            self._initialize_schema_and_permissions()
         except sqlite3.OperationalError as exc:
             if self._is_readonly_database_error(exc) and self._attempt_readonly_database_repair(exc):
-                self._initialize_schema()
+                self._initialize_schema_and_permissions()
                 return
             if (
                 not self.recover_unreadable_database
@@ -358,7 +380,7 @@ class HistoryStore:
                 broken_path,
                 exc,
             )
-            self._initialize_schema()
+            self._initialize_schema_and_permissions()
         except sqlite3.Error as exc:
             if (
                 not self.recover_unreadable_database
@@ -372,7 +394,11 @@ class HistoryStore:
                 broken_path,
                 exc,
             )
-            self._initialize_schema()
+            self._initialize_schema_and_permissions()
+
+    def _initialize_schema_and_permissions(self) -> None:
+        self._initialize_schema()
+        self._normalize_database_permissions()
 
     def _initialize_schema(self) -> None:
         with closing(self._connect()) as connection:
@@ -504,18 +530,31 @@ class HistoryStore:
     ) -> Path | None:
         backup_root = Path(backup_dir)
         backup_root.mkdir(parents=True, exist_ok=True)
+        self._normalize_shared_path_permissions(backup_root, is_dir=True)
         backup_name = f"{self.file_path.stem}-{self._backup_stamp(snapshot_label)}.sqlite3"
         final_path = backup_root / backup_name
-        temp_path = backup_root / f"{backup_name}.tmp"
+        temp_fd, temp_path = self._create_private_replacement_file(
+            backup_root,
+            prefix=f".{backup_name}.",
+            suffix=".tmp",
+        )
+        temp_metadata = os.fstat(temp_fd)
 
         with self._lock:
             try:
-                with closing(self._connect()) as source_connection, closing(sqlite3.connect(temp_path)) as backup_connection:
+                with closing(self._connect()) as source_connection, closing(
+                    sqlite3.connect(f"/proc/self/fd/{temp_fd}")
+                ) as backup_connection:
+                    backup_connection.execute("PRAGMA journal_mode=MEMORY")
                     source_connection.backup(backup_connection)
                     backup_connection.commit()
-                self._normalize_shared_path_permissions(temp_path)
-                temp_path.replace(final_path)
-                self._normalize_shared_path_permissions(final_path)
+                publish_descriptor = temp_fd
+                temp_fd = None
+                self._publish_replacement(
+                    temp_path,
+                    final_path,
+                    temp_descriptor=publish_descriptor,
+                )
                 self._prune_backup_snapshots(backup_root, retention_count)
                 try:
                     self._promote_long_term_backups(
@@ -528,8 +567,9 @@ class HistoryStore:
                 except Exception as exc:  # noqa: BLE001 - best-effort archival path should not break local backup rotation.
                     logger.warning("History long-term backup promotion failed for %s: %s", final_path, exc)
             finally:
-                if temp_path.exists():
-                    temp_path.unlink(missing_ok=True)
+                if temp_fd is not None:
+                    os.close(temp_fd)
+                self._discard_owned_path(temp_path, temp_metadata)
 
         return final_path
 
@@ -548,21 +588,40 @@ class HistoryStore:
         if not source.exists():
             raise FileNotFoundError(f"Backup source {source} does not exist.")
 
-        temp_path = self.file_path.with_suffix(f"{self.file_path.suffix}.restore")
-        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._normalize_shared_path_permissions(self.file_path.parent, is_dir=True)
+        temp_fd, temp_path = self._create_private_replacement_file(
+            self.file_path.parent,
+            prefix=f".{self.file_path.name}.",
+            suffix=".restore",
+        )
+        temp_metadata = os.fstat(temp_fd)
 
         with self._lock:
-            with closing(sqlite3.connect(source)) as source_connection, closing(sqlite3.connect(temp_path)) as restore_connection:
-                source_connection.backup(restore_connection)
-                restore_connection.commit()
-            self._normalize_shared_path_permissions(temp_path)
+            try:
+                with closing(sqlite3.connect(source)) as source_connection, closing(
+                    sqlite3.connect(f"/proc/self/fd/{temp_fd}")
+                ) as restore_connection:
+                    restore_connection.execute("PRAGMA journal_mode=MEMORY")
+                    source_connection.backup(restore_connection)
+                    restore_connection.commit()
 
-            for suffix in ("-shm", "-wal"):
-                Path(f"{self.file_path}{suffix}").unlink(missing_ok=True)
-            temp_path.replace(self.file_path)
-            self._normalize_database_permissions()
-            self._journal_mode_identity = None
-            self._initialize_schema()
+                publish_descriptor = temp_fd
+                temp_fd = None
+                self._publish_replacement(
+                    temp_path,
+                    self.file_path,
+                    temp_descriptor=publish_descriptor,
+                )
+                for suffix in ("-shm", "-wal"):
+                    Path(f"{self.file_path}{suffix}").unlink(missing_ok=True)
+                self._normalize_database_permissions()
+                self._journal_mode_identity = None
+                self._initialize_schema()
+            finally:
+                if temp_fd is not None:
+                    os.close(temp_fd)
+                self._discard_owned_path(temp_path, temp_metadata)
 
     @staticmethod
     def _backup_stamp(snapshot_label: str | None) -> str:
@@ -607,6 +666,7 @@ class HistoryStore:
         observed_at = self._parse_snapshot_label(snapshot_label)
         long_term_root = Path(long_term_backup_dir)
         long_term_root.mkdir(parents=True, exist_ok=True)
+        self._normalize_shared_path_permissions(long_term_root, is_dir=True)
 
         if weekly_retention_count > 0:
             iso_year, iso_week, _ = observed_at.isocalendar()
@@ -627,17 +687,28 @@ class HistoryStore:
                 monthly_retention_count,
             )
 
-    @staticmethod
-    def _refresh_backup_copy(source_backup_path: Path, target_path: Path) -> None:
+    def _refresh_backup_copy(self, source_backup_path: Path, target_path: Path) -> None:
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = target_path.parent / f"{target_path.name}.tmp"
+        self._normalize_shared_path_permissions(target_path.parent, is_dir=True)
+        temp_fd, temp_path = self._create_private_replacement_file(
+            target_path.parent,
+            prefix=f".{target_path.name}.",
+            suffix=".tmp",
+        )
+        temp_metadata = os.fstat(temp_fd)
         try:
-            shutil.copy2(source_backup_path, temp_path)
-            HistoryStore._normalize_shared_path_permissions(temp_path)
-            temp_path.replace(target_path)
-            HistoryStore._normalize_shared_path_permissions(target_path)
+            self._copy_file_to_descriptor(source_backup_path, temp_fd)
+            publish_descriptor = temp_fd
+            temp_fd = None
+            self._publish_replacement(
+                temp_path,
+                target_path,
+                temp_descriptor=publish_descriptor,
+            )
         finally:
-            temp_path.unlink(missing_ok=True)
+            if temp_fd is not None:
+                os.close(temp_fd)
+            self._discard_owned_path(temp_path, temp_metadata)
 
     @staticmethod
     def _prune_named_backups(backup_root: Path, pattern: str, retention_count: int) -> None:
@@ -2323,6 +2394,14 @@ class HistoryStore:
                     raise
 
     def _attempt_readonly_database_repair(self, exc: sqlite3.OperationalError) -> bool:
+        if not self.permission_repair_enabled:
+            logger.warning(
+                "History database %s is readonly and automatic permission repair is disabled; "
+                "fix host ownership/modes or explicitly enable bounded repair. Error: %s",
+                self.file_path,
+                exc,
+            )
+            return False
         logger.warning(
             "History database %s became readonly; attempting local permission repair before retrying. Error: %s",
             self.file_path,
@@ -2340,32 +2419,399 @@ class HistoryStore:
         return True
 
     def _normalize_database_permissions(self) -> None:
+        if not self.permission_repair_enabled:
+            return
         self._normalize_shared_path_permissions(self.file_path.parent, is_dir=True)
         self._normalize_shared_path_permissions(self.file_path)
         for suffix in ("-shm", "-wal"):
             self._normalize_shared_path_permissions(Path(f"{self.file_path}{suffix}"))
 
-    @staticmethod
-    def _normalize_shared_path_permissions(path: Path, *, is_dir: bool | None = None) -> None:
-        if not path.exists():
+    def _normalize_shared_path_permissions(self, path: Path, *, is_dir: bool | None = None) -> None:
+        if not self.permission_repair_enabled:
             return
+        try:
+            initial_metadata = path.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(initial_metadata.st_mode):
+            raise ValueError(f"History permission repair refuses symlink path {path}.")
         if is_dir is None:
-            is_dir = path.is_dir()
+            is_dir = stat.S_ISDIR(initial_metadata.st_mode)
+        expected_type = stat.S_ISDIR if is_dir else stat.S_ISREG
+        if not expected_type(initial_metadata.st_mode):
+            raise ValueError(f"History permission repair refuses non-regular path {path}.")
 
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        if is_dir:
+            flags |= getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(path, flags)
         try:
-            current_mode = stat.S_IMODE(path.stat().st_mode)
-        except OSError:
-            return
+            opened_metadata = os.fstat(descriptor)
+            if not expected_type(opened_metadata.st_mode):
+                raise ValueError(f"History permission repair refuses non-regular path {path}.")
+            if (opened_metadata.st_dev, opened_metadata.st_ino) != (
+                initial_metadata.st_dev,
+                initial_metadata.st_ino,
+            ):
+                raise ValueError(f"History permission repair refuses changed path {path}.")
 
-        target_mode = SQLITE_SHARED_DIR_MODE if is_dir else SQLITE_SHARED_FILE_MODE
-        normalized_mode = current_mode | target_mode
-        if normalized_mode == current_mode:
-            return
+            current_mode = stat.S_IMODE(opened_metadata.st_mode)
+            target_mode = self.shared_dir_mode if is_dir else self.shared_file_mode
+            if target_mode != current_mode:
+                os.fchmod(descriptor, target_mode)
+        finally:
+            os.close(descriptor)
 
+    def _publish_replacement(
+        self,
+        temp_path: Path,
+        target_path: Path,
+        *,
+        temp_descriptor: int | None = None,
+    ) -> None:
+        with ExitStack() as descriptor_stack:
+            if temp_descriptor is None:
+                temp_descriptor, temp_metadata = self._open_stable_regular_file(
+                    temp_path,
+                    role="temporary",
+                )
+                descriptor_stack.callback(os.close, temp_descriptor)
+            else:
+                descriptor_stack.callback(os.close, temp_descriptor)
+                temp_metadata = os.fstat(temp_descriptor)
+                if not stat.S_ISREG(temp_metadata.st_mode):
+                    raise ValueError(f"History replacement refuses non-regular temporary path {temp_path}.")
+            if not self._path_matches_metadata(temp_path, temp_metadata):
+                raise ValueError(f"History replacement refuses changed temporary path {temp_path}.")
+
+            try:
+                initial_target_metadata = target_path.lstat()
+            except FileNotFoundError:
+                initial_target_metadata = None
+
+            target_descriptor: int | None = None
+            target_metadata: os.stat_result | None = None
+            if initial_target_metadata is not None:
+                if not stat.S_ISREG(initial_target_metadata.st_mode):
+                    raise ValueError(f"History replacement refuses non-regular target path {target_path}.")
+                try:
+                    target_descriptor, target_metadata = self._open_stable_regular_file(
+                        target_path,
+                        role="target",
+                    )
+                except FileNotFoundError as exc:
+                    raise ValueError(f"History replacement refuses changed target path {target_path}.") from exc
+                descriptor_stack.callback(os.close, target_descriptor)
+                if (target_metadata.st_dev, target_metadata.st_ino) != (
+                    initial_target_metadata.st_dev,
+                    initial_target_metadata.st_ino,
+                ):
+                    raise ValueError(f"History replacement refuses changed target path {target_path}.")
+
+            target_mode = self.shared_file_mode if self.permission_repair_enabled else None
+            if target_metadata is not None and not self.permission_repair_enabled:
+                target_mode = stat.S_IMODE(target_metadata.st_mode)
+            if target_mode is not None and stat.S_IMODE(temp_metadata.st_mode) != target_mode:
+                os.fchmod(temp_descriptor, target_mode)
+                temp_metadata = os.fstat(temp_descriptor)
+            if not self._path_matches_metadata(temp_path, temp_metadata):
+                raise ValueError(f"History replacement refuses changed temporary path {temp_path}.")
+
+            if target_metadata is None:
+                self._publish_absent_target(temp_path, target_path, temp_metadata, target_mode)
+                return
+            self._exchange_existing_target(
+                temp_path,
+                target_path,
+                temp_metadata,
+                target_metadata,
+                target_mode,
+            )
+
+    @staticmethod
+    def _open_stable_regular_file(path: Path, *, role: str) -> tuple[int, os.stat_result]:
+        initial_metadata = path.lstat()
+        if not stat.S_ISREG(initial_metadata.st_mode):
+            raise ValueError(f"History replacement refuses non-regular {role} path {path}.")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = os.open(path, flags)
         try:
-            os.chmod(path, normalized_mode)
+            opened_metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(opened_metadata.st_mode):
+                raise ValueError(f"History replacement refuses non-regular {role} path {path}.")
+            if (opened_metadata.st_dev, opened_metadata.st_ino) != (
+                initial_metadata.st_dev,
+                initial_metadata.st_ino,
+            ):
+                raise ValueError(f"History replacement refuses changed {role} path {path}.")
+            return descriptor, opened_metadata
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _rename_at2(source_path: Path, target_path: Path, *, flags: int) -> None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(errno.ENOSYS, "renameat2 is unavailable")
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            AT_FDCWD,
+            os.fsencode(source_path),
+            AT_FDCWD,
+            os.fsencode(target_path),
+            flags,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number), source_path, target_path)
+
+    def _publish_absent_target(
+        self,
+        temp_path: Path,
+        target_path: Path,
+        temp_metadata: os.stat_result,
+        target_mode: int | None,
+    ) -> None:
+        try:
+            self._rename_at2(temp_path, target_path, flags=RENAME_NOREPLACE)
         except OSError as exc:
-            logger.debug("Unable to normalize permissions for %s: %s", path, exc)
+            if exc.errno == errno.EEXIST:
+                self._discard_owned_path(temp_path, temp_metadata)
+                raise ValueError(f"History replacement refuses changed target path {target_path}.") from exc
+            raise
+        try:
+            published_metadata = target_path.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError(f"History replacement refuses changed published path {target_path}.") from exc
+        if not self._metadata_identity_matches(published_metadata, temp_metadata):
+            raise ValueError(f"History replacement refuses changed published path {target_path}.")
+        if target_mode is not None and stat.S_IMODE(published_metadata.st_mode) != target_mode:
+            self._unlink_owned_path(target_path, temp_metadata)
+            raise ValueError(f"History replacement refuses changed temporary mode for {temp_path}.")
+
+    def _exchange_existing_target(
+        self,
+        temp_path: Path,
+        target_path: Path,
+        temp_metadata: os.stat_result,
+        target_metadata: os.stat_result,
+        target_mode: int | None,
+    ) -> None:
+        self._rename_at2(temp_path, target_path, flags=RENAME_EXCHANGE)
+        try:
+            published_metadata = target_path.lstat()
+            displaced_metadata = temp_path.lstat()
+            if not self._metadata_identity_matches(published_metadata, temp_metadata):
+                raise ValueError(f"History replacement refuses changed temporary path {temp_path}.")
+            if not self._metadata_identity_matches(displaced_metadata, target_metadata):
+                raise ValueError(f"History replacement refuses changed target path {target_path}.")
+            if target_mode is not None and stat.S_IMODE(published_metadata.st_mode) != target_mode:
+                raise ValueError(f"History replacement refuses changed temporary mode for {temp_path}.")
+            self._unlink_owned_path(temp_path, target_metadata)
+        except Exception:
+            self._rollback_exchange(
+                temp_path,
+                target_path,
+                temp_metadata,
+                target_metadata,
+            )
+            raise
+
+    def _rollback_exchange(
+        self,
+        temp_path: Path,
+        target_path: Path,
+        temp_metadata: os.stat_result,
+        target_metadata: os.stat_result,
+    ) -> None:
+        target_is_published_temp = self._path_matches_metadata(target_path, temp_metadata)
+        temp_is_displaced_target = self._path_matches_metadata(temp_path, target_metadata)
+        if not target_is_published_temp or not temp_is_displaced_target:
+            return
+        self._rename_at2(target_path, temp_path, flags=RENAME_EXCHANGE)
+        self._discard_owned_path(temp_path, temp_metadata)
+
+    @staticmethod
+    def _metadata_identity_matches(current: os.stat_result, expected: os.stat_result) -> bool:
+        return stat.S_ISREG(current.st_mode) and (current.st_dev, current.st_ino) == (
+            expected.st_dev,
+            expected.st_ino,
+        )
+
+    @classmethod
+    def _path_matches_metadata(cls, path: Path, expected: os.stat_result) -> bool:
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            return False
+        return cls._metadata_identity_matches(current, expected)
+
+    @classmethod
+    def _unlink_owned_path(cls, path: Path, expected: os.stat_result) -> None:
+        parent_descriptor = cls._open_private_cleanup_directory(path.parent)
+        try:
+            try:
+                current = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if not cls._metadata_identity_matches(current, expected):
+                raise ValueError(f"History replacement refuses changed cleanup path {path}.")
+            os.unlink(path.name, dir_fd=parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+
+    @classmethod
+    def _discard_owned_path(cls, path: Path, expected: os.stat_result) -> None:
+        parent_descriptor = cls._open_private_cleanup_directory(path.parent)
+        try:
+            try:
+                current = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if cls._metadata_identity_matches(current, expected):
+                os.unlink(path.name, dir_fd=parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+
+    @staticmethod
+    def _create_private_replacement_file(
+        parent: Path,
+        *,
+        prefix: str,
+        suffix: str,
+    ) -> tuple[int, Path]:
+        replacement_root = parent / f"{PRIVATE_REPLACEMENT_DIR_PREFIX}{os.geteuid()}"
+        try:
+            replacement_root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        directory_descriptor = HistoryStore._open_private_cleanup_directory(replacement_root)
+        try:
+            for _ in range(32):
+                name = f"{prefix}{secrets.token_hex(8)}{suffix}"
+                flags = (
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                try:
+                    descriptor = os.open(name, flags, 0o600, dir_fd=directory_descriptor)
+                except FileExistsError:
+                    continue
+                return descriptor, replacement_root / name
+            raise FileExistsError("Unable to allocate a private history replacement path.")
+        finally:
+            os.close(directory_descriptor)
+
+    @staticmethod
+    def _open_private_cleanup_directory(path: Path) -> int:
+        initial_metadata = path.lstat()
+        if not stat.S_ISDIR(initial_metadata.st_mode) or stat.S_IMODE(initial_metadata.st_mode) != 0o700:
+            raise ValueError(f"History replacement refuses non-private cleanup directory {path}.")
+        if initial_metadata.st_uid != os.geteuid():
+            raise ValueError(f"History replacement refuses foreign cleanup directory {path}.")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | os.O_DIRECTORY
+        descriptor = os.open(path, flags)
+        try:
+            opened_metadata = os.fstat(descriptor)
+            if (opened_metadata.st_dev, opened_metadata.st_ino) != (
+                initial_metadata.st_dev,
+                initial_metadata.st_ino,
+            ):
+                raise ValueError(f"History replacement refuses changed cleanup directory {path}.")
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _copy_file_to_descriptor(source_path: Path, descriptor: int) -> None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.ftruncate(descriptor, 0)
+        with source_path.open("rb") as source, os.fdopen(os.dup(descriptor), "wb") as destination:
+            shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+
+    def _preserve_existing_target_mode(self, temp_path: Path, target_path: Path) -> None:
+        if self.permission_repair_enabled:
+            return
+        target_mode = self._stable_regular_file_mode(target_path)
+        if target_mode is None:
+            return
+
+        initial_metadata = temp_path.lstat()
+        if not stat.S_ISREG(initial_metadata.st_mode):
+            raise ValueError(f"History replacement refuses non-regular temporary path {temp_path}.")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = os.open(temp_path, flags)
+        try:
+            opened_metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(opened_metadata.st_mode):
+                raise ValueError(f"History replacement refuses non-regular temporary path {temp_path}.")
+            if (opened_metadata.st_dev, opened_metadata.st_ino) != (
+                initial_metadata.st_dev,
+                initial_metadata.st_ino,
+            ):
+                raise ValueError(f"History replacement refuses changed temporary path {temp_path}.")
+            if stat.S_IMODE(opened_metadata.st_mode) != target_mode:
+                os.fchmod(descriptor, target_mode)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _stable_regular_file_mode(path: Path) -> int | None:
+        try:
+            initial_metadata = path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(initial_metadata.st_mode):
+            raise ValueError(f"History replacement refuses non-regular target path {path}.")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = os.open(path, flags)
+        try:
+            opened_metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(opened_metadata.st_mode):
+                raise ValueError(f"History replacement refuses non-regular target path {path}.")
+            if (opened_metadata.st_dev, opened_metadata.st_ino) != (
+                initial_metadata.st_dev,
+                initial_metadata.st_ino,
+            ):
+                raise ValueError(f"History replacement refuses changed target path {path}.")
+            return stat.S_IMODE(opened_metadata.st_mode)
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _empty_cleanup_summary() -> dict[str, Any]:

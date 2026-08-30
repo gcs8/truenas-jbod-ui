@@ -18,7 +18,7 @@ from app.logging_config import configure_service_logging
 from app.metrics import install_metrics
 from app.services.release_status import ReleaseStatusService
 from history_service.collector import HistoryCollectionAlreadyRunning, HistoryCollector
-from history_service.config import get_history_settings
+from history_service.config import HistorySettings, get_history_settings
 from history_service.store import HistoryStore
 
 configure_service_logging(
@@ -26,8 +26,19 @@ configure_service_logging(
     log_format=os.getenv("LOG_FORMAT", "text"),
     service_name="enclosure-history",
 )
+
+
+def build_history_store(settings: HistorySettings) -> HistoryStore:
+    return HistoryStore(
+        settings.sqlite_path,
+        permission_repair_enabled=settings.permission_repair_enabled,
+        shared_dir_mode=settings.shared_dir_mode,
+        shared_file_mode=settings.shared_file_mode,
+    )
+
+
 settings = get_history_settings()
-store = HistoryStore(settings.sqlite_path)
+store = build_history_store(settings)
 collector = HistoryCollector(settings, store)
 logger = logging.getLogger(__name__)
 refresh_lock = asyncio.Lock()
