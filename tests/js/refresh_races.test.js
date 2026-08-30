@@ -285,6 +285,7 @@ test("successful mapping save renders the authoritative snapshot instead of the 
   let renderedScopeKey = "not-rendered";
   let appliedSnapshot = null;
   const events = [];
+  let sentPayload = null;
   class FakeFormData {
     get(name) {
       return name === "serial" ? "operator draft" : null;
@@ -294,9 +295,10 @@ test("successful mapping save renders the authoritative snapshot instead of the 
     state,
     FormData: FakeFormData,
     mappingForm: {},
-    getSlotById() { return { slot: 7, slot_label: "07" }; },
+    getSlotById() { return { slot: 7, slot_label: "07", mapping_revision: "a".repeat(64) }; },
     setStatus() {},
-    async sendScopedRequest() {
+    async sendScopedRequest(_url, options) {
+      sentPayload = JSON.parse(options.body);
       return { snapshot: { marker: "server-normalized" } };
     },
     applySnapshot(snapshot) { appliedSnapshot = snapshot; events.push("apply"); },
@@ -308,6 +310,7 @@ test("successful mapping save renders the authoritative snapshot instead of the 
   await saveMapping({ preventDefault() {} });
 
   assert.deepEqual(appliedSnapshot, { marker: "server-normalized" });
+  assert.equal(sentPayload.expected_revision, "a".repeat(64));
   assert.equal(state.mappingFormScopeKey, null);
   assert.equal(renderedScopeKey, null);
   assert.deepEqual(events, ["apply", "invalidate", "render"]);
@@ -319,7 +322,9 @@ test("successful mapping clear invalidates history before render", async () => {
   const { fn: clearMapping } = loadFunction(APP_SOURCE, "clearMapping", {
     state,
     window: { confirm: () => true },
-    getSlotById() { return { slot: 7, slot_label: "07" }; },
+    getSlotById() {
+      return { slot: 7, slot_label: "07", mapping_clear_revision: "a".repeat(64) };
+    },
     setStatus() {},
     async sendScopedRequest() { return { snapshot: { marker: "cleared" } }; },
     applySnapshot() { events.push("apply"); },
@@ -333,17 +338,123 @@ test("successful mapping clear invalidates history before render", async () => {
   assert.deepEqual(events, ["apply", "invalidate", "render"]);
 });
 
-test("mapping import invalidates the selected draft before rendering imported state", async () => {
+test("mapping clear sends the selected slot scope revision", async () => {
+  const state = { snapshotMode: false, selectedSlot: 7, mappingFormScopeKey: "system|enc||7" };
+  let requestedUrl = null;
+  const { fn: clearMapping } = loadFunction(APP_SOURCE, "clearMapping", {
+    state,
+    window: { confirm: () => true },
+    getSlotById() {
+      return {
+        slot: 7,
+        slot_label: "07",
+        mapping_revision: "a".repeat(64),
+        mapping_clear_revision: "b".repeat(64),
+      };
+    },
+    setStatus() {},
+    async sendScopedRequest(url) {
+      requestedUrl = url;
+      return { snapshot: { marker: "cleared" } };
+    },
+    applySnapshot() {},
+    renderAll() {},
+    scheduleSmartPrefetch() {},
+  });
+
+  await clearMapping();
+
+  assert.equal(
+    requestedUrl,
+    `/api/slots/7/mapping?expected_revision=${"b".repeat(64)}`,
+  );
+});
+
+test("mapping mutations without a scope revision fail closed before any request", async () => {
+  const state = { snapshotMode: false, selectedSlot: 7 };
+  const statuses = [];
+  let requestCount = 0;
+  let confirmCount = 0;
+  class FakeFormData {
+    get() { return null; }
+  }
+  const context = {
+    state,
+    FormData: FakeFormData,
+    mappingForm: {},
+    window: { confirm() { confirmCount += 1; return true; } },
+    getSlotById() { return { slot: 7, slot_label: "07" }; },
+    setStatus(message) { statuses.push(message); },
+    async sendScopedRequest() { requestCount += 1; return { snapshot: {} }; },
+    applySnapshot() {},
+    renderAll() {},
+    scheduleSmartPrefetch() {},
+  };
+  const { fn: saveMapping } = loadFunction(APP_SOURCE, "saveMapping", context);
+  const { fn: clearMapping } = loadFunction(APP_SOURCE, "clearMapping", context);
+
+  await saveMapping({ preventDefault() {} });
+  await clearMapping();
+
+  assert.equal(requestCount, 0);
+  assert.equal(confirmCount, 0);
+  assert.equal(statuses.length, 2);
+  assert.ok(statuses.every((message) => message.includes("Refresh inventory")));
+});
+
+test("mapping import preview lists every exact scope and slot classification", () => {
+  const { fn: mappingImportPreviewMessage } = loadFunction(APP_SOURCE, "mappingImportPreviewMessage", {});
+  const message = mappingImportPreviewMessage({
+    additions: [{ enclosure_id: "enc-a", slot: 1, incoming: { serial: "ADD" } }],
+    updates: [{
+      enclosure_id: "enc-a",
+      slot: 2,
+      changes: { serial: { from: "OLD", to: "NEW" } },
+    }],
+    removals: [{ enclosure_id: "enc-b", slot: 3, current: { serial: "REMOVE" } }],
+    unchanged: [{ enclosure_id: null, slot: 4 }],
+  });
+
+  assert.match(message, /Add \(1\): enc-a slot 1.*serial=ADD/);
+  assert.match(message, /Update \(1\): enc-a slot 2.*serial: OLD → NEW/);
+  assert.match(message, /Remove \(1\): enc-b slot 3.*serial=REMOVE/);
+  assert.match(message, /Unchanged \(1\): default enclosure slot 4/);
+  assert.match(message, /rejected if the active mapping scope changes/i);
+});
+
+test("mapping import previews and confirms the exact diff before rendering imported state", async () => {
   const state = { snapshotMode: false, mappingFormScopeKey: "system|enc||7" };
   let renderedScopeKey = "not-rendered";
   let appliedSnapshot = null;
   const events = [];
+  let confirmationText = null;
+  const requests = [];
   const mappingImportFile = { value: "selected-file" };
   const { fn: importMappingsFromFile } = loadFunction(APP_SOURCE, "importMappingsFromFile", {
     state,
     mappingImportFile,
+    window: {
+      confirm(message) {
+        confirmationText = message;
+        return true;
+      },
+    },
     setStatus() {},
-    async sendScopedRequest() {
+    mappingImportPreviewMessage(preview) {
+      return `Add ${preview.additions.length}; update ${preview.updates.length}; remove ${preview.removals.length}; unchanged ${preview.unchanged.length}`;
+    },
+    async sendScopedRequest(url, options) {
+      requests.push({ url, body: JSON.parse(options.body) });
+      if (url.endsWith("/preview")) {
+        return {
+          revision: "a".repeat(64),
+          import_digest: "b".repeat(64),
+          additions: [{ slot: 1 }],
+          updates: [{ slot: 2 }],
+          removals: [{ slot: 3 }],
+          unchanged: [{ slot: 4 }],
+        };
+      }
       return { snapshot: { marker: "imported" }, imported: 1 };
     },
     applySnapshot(snapshot) { appliedSnapshot = snapshot; events.push("apply"); },
@@ -354,14 +465,70 @@ test("mapping import invalidates the selected draft before rendering imported st
 
   await importMappingsFromFile({
     name: "mappings.json",
-    async text() { return "{}"; },
+    async text() { return '{"schema_version":1,"mappings":[]}'; },
   });
 
+  assert.deepEqual(requests[0], {
+    url: "/api/mappings/import/preview",
+    body: { schema_version: 1, mappings: [] },
+  });
+  assert.deepEqual(requests[1], {
+    url: "/api/mappings/import",
+    body: {
+      bundle: { schema_version: 1, mappings: [] },
+      expected_revision: "a".repeat(64),
+      import_digest: "b".repeat(64),
+      confirmed: true,
+    },
+  });
+  assert.match(confirmationText, /Add 1; update 1; remove 1; unchanged 1/);
   assert.deepEqual(appliedSnapshot, { marker: "imported" });
   assert.equal(state.mappingFormScopeKey, null);
   assert.equal(renderedScopeKey, null);
   assert.equal(mappingImportFile.value, "");
   assert.deepEqual(events, ["apply", "invalidate", "render"]);
+});
+
+test("canceling a mapping import preview performs no write and clears the file input", async () => {
+  const state = { snapshotMode: false, mappingFormScopeKey: "system|enc||7" };
+  const requests = [];
+  const statuses = [];
+  let applied = false;
+  const mappingImportFile = { value: "selected-file" };
+  const { fn: importMappingsFromFile } = loadFunction(APP_SOURCE, "importMappingsFromFile", {
+    state,
+    mappingImportFile,
+    window: { confirm: () => false },
+    mappingImportPreviewMessage: () => "preview",
+    setStatus(message) { statuses.push(message); },
+    async sendScopedRequest(url) {
+      requests.push(url);
+      if (url.endsWith("/preview")) {
+        return {
+          revision: "a".repeat(64),
+          import_digest: "b".repeat(64),
+          additions: [],
+          updates: [],
+          removals: [],
+          unchanged: [],
+        };
+      }
+      return { snapshot: {}, imported: 0 };
+    },
+    applySnapshot() { applied = true; },
+    renderAll() {},
+    scheduleSmartPrefetch() {},
+  });
+
+  await importMappingsFromFile({
+    name: "mappings.json",
+    async text() { return '{"mappings":[]}'; },
+  });
+
+  assert.deepEqual(requests, ["/api/mappings/import/preview"]);
+  assert.equal(applied, false);
+  assert.equal(statuses.at(-1), "Mapping import canceled after preview.");
+  assert.equal(mappingImportFile.value, "");
 });
 
 test("stale history failure cannot clear the newer request state", async () => {
