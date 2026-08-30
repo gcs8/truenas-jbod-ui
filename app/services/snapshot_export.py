@@ -820,6 +820,7 @@ class SnapshotExportService:
 
             context = {
                 "request": request,
+                "sas_fabric_view_url": "#sas-fabric-panel",
                 "snapshot": snapshot_for_export,
                 "storage_view_runtime": storage_view_runtime_for_export
                 or StorageViewRuntimePayload(

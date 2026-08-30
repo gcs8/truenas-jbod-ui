@@ -53,7 +53,7 @@ class FakeHistoryBackend:
         return {"counts": {}, "collector": {}}
 
 
-def build_request(path: str = "/") -> Request:
+def build_request(path: str = "/", *, root_path: str = "") -> Request:
     request = Request(
         {
             "type": "http",
@@ -66,15 +66,18 @@ def build_request(path: str = "/") -> Request:
             "headers": [],
             "client": ("127.0.0.1", 1234),
             "server": ("testserver", 80),
-            "root_path": "",
+            "root_path": root_path,
             "app": None,
         }
     )
-    request.scope["app"] = type(
-        "FakeApp",
-        (),
-        {"url_path_for": lambda _, name, **params: URLPath(f"/static/{params['path']}")},
-    )()
+    class FakeApp:
+        @staticmethod
+        def url_path_for(name: str, **params: str) -> URLPath:
+            if name == "sas_fabric_view":
+                return URLPath("/sas-fabric")
+            return URLPath(f"/static/{params['path']}")
+
+    request.scope["app"] = FakeApp()
     return request
 
 
@@ -250,6 +253,24 @@ class MainViewBootstrapTests(unittest.TestCase):
         self.assertNotIn(chr(0x2028), script_body)
         self.assertNotIn(chr(0x2029), script_body)
 
+    def test_live_storage_fabric_route_preserves_root_path(self) -> None:
+        snapshot = build_hostile_snapshot()
+        runtime = StorageViewRuntimePayload(system_id="system-a", system_label="System A", views=[])
+        context = build_index_context(
+            request=build_request("/", root_path="/truenas-jbod-ui"),
+            snapshot=snapshot,
+            storage_view_runtime=runtime,
+            settings=Settings(),
+            history_configured=False,
+        )
+
+        html = templates.get_template("index.html").render(context)
+        bootstrap = extract_bootstrap_object(html, "window.APP_BOOTSTRAP =")
+
+        self.assertEqual(context["sas_fabric_view_url"], "/truenas-jbod-ui/sas-fabric")
+        self.assertEqual(bootstrap["sasFabricViewUrl"], "/truenas-jbod-ui/sas-fabric")
+        self.assertIn('id="sas-fabric-view-link" href="/truenas-jbod-ui/sas-fabric"', html)
+
 
 class StorageFabricBootstrapTests(unittest.TestCase):
     def test_fabric_bootstrap_survives_hostile_values(self) -> None:
@@ -302,6 +323,8 @@ class SnapshotExportBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         bootstrap = extract_bootstrap_object(rendered.html, "window.APP_BOOTSTRAP =")
         self.assertTrue(bootstrap["snapshotMode"])
+        self.assertEqual(bootstrap["sasFabricViewUrl"], "#sas-fabric-panel")
+        self.assertIn('id="sas-fabric-view-link" href="#sas-fabric-panel"', rendered.html)
         self.assertEqual(bootstrap["snapshot"]["selected_system_label"], HOSTILE_TEXT)
         self.assertEqual(bootstrap["snapshot"]["slots"][0]["model"], HOSTILE_TEXT)
         self.assertEqual(bootstrap["preloadedSmartSummariesBySlot"]["0"]["model"], HOSTILE_TEXT)

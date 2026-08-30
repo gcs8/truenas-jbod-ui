@@ -58,4 +58,7 @@ npx playwright test qa/public-demo.spec.js
 
 The GitHub Pages workflow deploys this directory as-is. GitHub-hosted runners
 smoke-test the checked-in `public-demo/index.html` file rather than rebuilding
-from live data.
+from live data. A release or `main` publication therefore preserves the exact
+committed capture time and artifact app version. Regeneration is an explicit
+maintainer step that requires trusted local ignored history input, followed by
+review of the artifact diff, publishability check, and browser smoke test.

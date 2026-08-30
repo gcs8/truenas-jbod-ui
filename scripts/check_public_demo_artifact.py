@@ -29,7 +29,11 @@ SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 REQUIRED_MARKERS: tuple[str, ...] = (
-    "Frozen Offline Artifact",
+    "Frozen Sanitized Snapshot",
+    "Artifact app v",
+    "Capture time",
+    'id="sas-fabric-view-link" href="#sas-fabric-panel"',
+    'sasFabricViewUrl: "#sas-fabric-panel"',
     "Live-derived CORE 60-bay sample",
     "Scrambled IDs",
     "4x NVMe Carrier Card",

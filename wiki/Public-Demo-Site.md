@@ -94,14 +94,17 @@ GitHub-hosted runners do not rebuild the demo from live source data. The Pages
 workflow smoke-tests the checked-in artifact by setting
 `PUBLIC_DEMO_ARTIFACT=public-demo/index.html`, runs the publishability checker,
 uploads `public-demo/`, and deploys it through GitHub Pages on `main` or manual
-workflow dispatch.
+workflow dispatch. Publication intentionally preserves the committed capture
+time and artifact app version. A maintainer regenerates the artifact only from
+trusted local ignored history input, then reviews and commits that new capture.
 
 ## Published Version
 
 1. The local build script generates `public-demo/index.html` from scrubbed
    live-derived TN Core source data.
 2. The checked-in artifact loads directly in the browser and reuses the normal
-   enclosure, slot detail, storage-view, and heat-map interaction patterns.
+   enclosure, slot detail, storage-view, heat-map, and in-page Storage Fabric
+   interaction patterns.
 3. Live-only controls are hidden or disabled by snapshot mode.
 4. `.github/workflows/publish-public-demo.yml` checks the artifact, runs the
    static Playwright smoke, uploads `public-demo/`, and deploys with GitHub

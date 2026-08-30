@@ -70,7 +70,9 @@ test("public demo static artifact is explorable without a live backend", async (
   await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });
 
   const selector = page.locator("#enclosure-select");
-  await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Offline Artifact");
+  await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Sanitized Snapshot");
+  await expect(page.locator(".snapshot-banner-facts")).toContainText("Artifact app v");
+  await expect(page.locator(".snapshot-banner-meta")).toContainText("Capture time");
   await expect(page.locator(".snapshot-banner-facts")).toContainText("60 visible bays");
   await expect(page.locator(".snapshot-banner-facts")).toContainText("2 saved/virtual views");
   await expect(page.locator(".snapshot-banner-meta")).toContainText("Scrambled IDs");
@@ -78,6 +80,12 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator("#system-setup-button")).toHaveCount(0);
   await expect(page.locator("#export-snapshot-button")).toHaveCount(0);
   await expect(page.locator("#status-text")).toContainText("Frozen offline snapshot loaded");
+
+  const storageFabricAction = page.locator("#sas-fabric-view-link");
+  await expect(storageFabricAction).toHaveAttribute("href", "#sas-fabric-panel");
+  await storageFabricAction.click();
+  await expect(page.locator("#sas-fabric-panel")).toBeVisible();
+  await expect(page).toHaveURL(/#sas-fabric-panel$/);
 
   await expect(selector).toBeEnabled();
   await expect(page.locator("#chassis-shell")).toHaveAttribute("data-face-style", "top-loader");
