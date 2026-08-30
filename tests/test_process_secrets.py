@@ -77,22 +77,32 @@ class ProcessSecretSettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             config_path = temp_path / "config" / "config.yaml"
-            secret_values = {
-                "TRUENAS_API_KEY": b"  api-key  \r\n",
-                "TRUENAS_API_PASSWORD": b" password with spaces \n",
-                "SSH_PASSWORD": b"ssh-pass\n",
-                "SSH_SUDO_PASSWORD": b"sudo-pass",
-            }
             environment = {
                 "APP_CONFIG_PATH": str(config_path),
                 "TRUENAS_API_USER": "direct-api-user",
             }
-            for env_name, value in secret_values.items():
-                secret_path = temp_path / env_name.lower()
-                secret_path.write_bytes(value)
-                secret_path.chmod(0o600)
-                environment[env_name] = "direct-value-must-not-win"
-                environment[f"{env_name}_FILE"] = str(secret_path)
+            api_key_path = temp_path / "truenas-api-key"
+            api_key_path.write_text("  api-key  \r\n", encoding="utf-8")
+            api_password_path = temp_path / "truenas-api-password"
+            api_password_path.write_text(" password with spaces \n", encoding="utf-8")
+            ssh_password_path = temp_path / "ssh-password"
+            ssh_password_path.write_text("ssh-pass\n", encoding="utf-8")
+            sudo_password_path = temp_path / "ssh-sudo-password"
+            sudo_password_path.write_text("sudo-pass", encoding="utf-8")
+            for fixture_path in (api_key_path, api_password_path, ssh_password_path, sudo_password_path):
+                fixture_path.chmod(0o600)
+            environment.update(
+                {
+                    "TRUENAS_API_KEY": "direct-value-must-not-win",
+                    "TRUENAS_API_KEY_FILE": str(api_key_path),
+                    "TRUENAS_API_PASSWORD": "direct-value-must-not-win",
+                    "TRUENAS_API_PASSWORD_FILE": str(api_password_path),
+                    "SSH_PASSWORD": "direct-value-must-not-win",
+                    "SSH_PASSWORD_FILE": str(ssh_password_path),
+                    "SSH_SUDO_PASSWORD": "direct-value-must-not-win",
+                    "SSH_SUDO_PASSWORD_FILE": str(sudo_password_path),
+                }
+            )
 
             with patch.dict("os.environ", environment, clear=True):
                 get_settings.cache_clear()
