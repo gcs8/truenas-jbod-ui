@@ -8,8 +8,10 @@ const vm = require("node:vm");
 
 const SCRIPT_PATH = path.resolve(__dirname, "../../admin_service/static/admin.js");
 const STYLE_PATH = path.resolve(__dirname, "../../admin_service/static/admin.css");
+const TEMPLATE_PATH = path.resolve(__dirname, "../../admin_service/templates/base.html");
 const SOURCE = fs.readFileSync(SCRIPT_PATH, "utf8");
 const STYLES = fs.readFileSync(STYLE_PATH, "utf8");
+const TEMPLATE = fs.readFileSync(TEMPLATE_PATH, "utf8");
 
 function sourceBetween(startMarker, endMarker) {
   const start = SOURCE.indexOf(startMarker);
@@ -82,6 +84,46 @@ function collectSetupPayload({ sshUser = "", bmcEnabled = false, bmcHost = "" } 
 test("cleared SSH user remains intentionally blank in the setup payload", () => {
   const payload = collectSetupPayload({ sshUser: "" });
   assert.equal(payload.ssh_user, null);
+});
+
+test("bootstrap rejects a deliberately blank service user", () => {
+  const collectBootstrapSource = sourceBetween(
+    "  function collectBootstrapPayload()",
+    "\n  function collectEsxiHostPrepInstallPayload"
+  );
+  const elements = sparseElements({
+    setupBootstrapHost: { value: "host.example.test" },
+    setupBootstrapUser: { value: "root" },
+    setupBootstrapInstallSudo: { checked: true },
+  });
+  const { collectBootstrapPayload } = loadFunctions(
+    [collectBootstrapSource],
+    ["collectBootstrapPayload"],
+    {
+      bootstrapEnabledForSession: () => true,
+      collectBootstrapSudoCommands: () => [],
+      collectSetupPayload: () => ({
+        platform: "core",
+        ssh_enabled: true,
+        ssh_host: "host.example.test",
+        ssh_port: 22,
+        ssh_user: null,
+        ssh_known_hosts_path: "/app/data/known_hosts",
+        ssh_strict_host_key_checking: true,
+      }),
+      elements,
+      normalizeConnectionHost: (value) => String(value || "").trim(),
+      platformSupportsBootstrap: () => true,
+      resolveBootstrapServiceKey: () => ({
+        service_key_name: "id_truenas",
+        service_key_path: null,
+        service_public_key: null,
+      }),
+      suggestedConnectionHost: () => "host.example.test",
+    }
+  );
+
+  assert.throws(() => collectBootstrapPayload(), /SSH user.*required/i);
 });
 
 test("disabled BMC access does not persist a stale host", () => {
@@ -183,6 +225,10 @@ test("admin stylesheet has one hidden utility and visible keyboard focus", () =>
   assert.match(STYLES, /\.profile-card:focus-visible/);
   assert.doesNotMatch(STYLES, /\.runtime-card-status\.is-running/);
   assert.doesNotMatch(STYLES, /\.runtime-card-status\.is-stopped/);
+});
+
+test("admin page uses an inline favicon without a failing network request", () => {
+  assert.match(TEMPLATE, /<link\s+rel="icon"\s+href="data:[^"]*">/);
 });
 
 test("countdown ticks reuse the existing release-note link", () => {

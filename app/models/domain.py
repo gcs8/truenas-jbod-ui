@@ -1023,7 +1023,7 @@ class SystemSetupRequest(BaseModel):
         if self.ssh_enabled and not self.ssh_user:
             raise ValueError("An SSH user is required when SSH enrichment is enabled.")
         if self.bmc_enabled and not self.bmc_host:
-            self.bmc_host = primary_host
+            raise ValueError("A BMC host is required when BMC access is enabled.")
         if self.bmc_enabled and not self.bmc_username:
             raise ValueError("A BMC username is required when BMC access is enabled.")
         if self.bmc_enabled and not self.bmc_password:

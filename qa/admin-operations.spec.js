@@ -151,6 +151,7 @@ test.describe("admin sidecar smoke", () => {
     })).not.toBe("none:0px");
     await page.keyboard.press("Enter");
     await expect(profileCard).toHaveAttribute("aria-pressed", "true");
+    await expect(profileCard).toBeFocused();
 
     const operationsButton = page.locator('[data-admin-view-button="operations"]');
     await operationsButton.focus();

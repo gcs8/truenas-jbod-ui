@@ -4836,6 +4836,9 @@
     if (!setupPayload.ssh_enabled) {
       throw new Error("Enable SSH enrichment first so the final service-account details are defined.");
     }
+    if (!setupPayload.ssh_user) {
+      throw new Error("An SSH user is required before running the one-time bootstrap.");
+    }
     const bootstrapHost =
       normalizeConnectionHost(elements.setupBootstrapHost?.value) || setupPayload.ssh_host || suggestedConnectionHost();
     if (!bootstrapHost) {
@@ -4852,7 +4855,7 @@
       bootstrap_known_hosts_path: setupPayload.ssh_known_hosts_path || "/app/data/known_hosts",
       bootstrap_strict_host_key_checking: Boolean(setupPayload.ssh_strict_host_key_checking),
       timeout_seconds: 15,
-      service_user: setupPayload.ssh_user || "jbodmap",
+      service_user: setupPayload.ssh_user,
       service_shell: "/bin/sh",
       install_sudo_rules: Boolean(elements.setupBootstrapInstallSudo?.checked),
       sudo_commands: collectBootstrapSudoCommands(),
@@ -6574,7 +6577,11 @@
       state.selectedProfileId = card.dataset.profileId || "";
       elements.setupProfile.value = state.selectedProfileId;
       renderProfilePreview();
-      renderProfileCatalog();
+      elements.profileCatalog.querySelectorAll("[data-profile-id]").forEach((profileCard) => {
+        const selected = profileCard.dataset.profileId === state.selectedProfileId;
+        profileCard.classList.toggle("is-selected", selected);
+        profileCard.setAttribute("aria-pressed", String(selected));
+      });
       renderProfileBuilder();
       renderStorageViews();
     });

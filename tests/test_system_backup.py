@@ -2864,6 +2864,18 @@ class SecretWhitespaceModelTests(unittest.TestCase):
         self.assertEqual(payload.truenas_host, "10.13.0.20")
         self.assertEqual(payload.bmc_host, "10.13.0.20")
 
+    def test_system_setup_request_requires_explicit_bmc_host_when_enabled(self) -> None:
+        with self.assertRaisesRegex(ValueError, "BMC host"):
+            SystemSetupRequest(
+                label="Archive CORE",
+                platform="core",
+                truenas_host="https://api.example.test",
+                bmc_enabled=True,
+                bmc_host=None,
+                bmc_username="ADMIN",
+                bmc_password="secret",
+            )
+
     def test_bootstrap_request_preserves_secret_whitespace(self) -> None:
         payload = SystemSetupBootstrapRequest(
             host="archive-core.local",
