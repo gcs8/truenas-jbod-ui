@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,54 @@ EXPECTED_MEMORY_LIMITS = {
 
 
 class ContainerResourceContractTests(unittest.TestCase):
+    def test_env_example_only_names_tracked_or_generated_compose_files(self) -> None:
+        env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        compose_references = set(re.findall(r"\b(docker-compose(?:\.[\w-]+)?\.ya?ml)\b", env_example))
+
+        self.assertTrue(compose_references)
+        for compose_reference in compose_references:
+            with self.subTest(compose=compose_reference):
+                if compose_reference == "docker-compose.override.yml":
+                    self.assertTrue((REPO_ROOT / f"{compose_reference}.example").is_file())
+                else:
+                    self.assertIn(compose_reference, COMPOSE_FILES)
+
+    def test_dockerfile_is_the_single_owner_of_the_ui_healthcheck(self) -> None:
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        instructions: list[str] = []
+        pending = ""
+        for raw_line in dockerfile.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            pending = f"{pending} {stripped}".strip()
+            if pending.endswith("\\"):
+                pending = pending[:-1].rstrip()
+                continue
+            instructions.append(pending)
+            pending = ""
+        self.assertFalse(pending)
+        healthchecks = [item for item in instructions if item.startswith("HEALTHCHECK ")]
+        self.assertEqual(
+            healthchecks,
+            [
+                "HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 "
+                "CMD python -c \"import urllib.request; "
+                "urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=4)\""
+            ],
+        )
+
+        for compose_name in COMPOSE_FILES:
+            compose = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))
+            services = compose["services"]
+            with self.subTest(compose=compose_name, service="enclosure-ui"):
+                self.assertNotIn("healthcheck", services["enclosure-ui"])
+            for sidecar_name in ("enclosure-history", "enclosure-admin"):
+                with self.subTest(compose=compose_name, service=sidecar_name):
+                    self.assertIn("healthcheck", services[sidecar_name])
+            with self.subTest(compose=compose_name, service="enclosure-backup"):
+                self.assertEqual(services["enclosure-backup"].get("healthcheck"), {"disable": True})
+
     def test_all_compose_services_have_env_overridable_memory_limits(self) -> None:
         for compose_name in COMPOSE_FILES:
             compose = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))
