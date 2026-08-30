@@ -50,6 +50,7 @@
     selectionTrail: [],
     expandedSlotLists: {},
     diagnosticTables: {},
+    diagnosticPayloads: {},
     smartSummaries: {},
     smartRequests: {},
     aliasEditObjectId: null,
@@ -87,6 +88,14 @@
 
   function list(value) {
     return Array.isArray(value) ? value : [];
+  }
+
+  function setSelectOptionsIfChanged(select, optionsHtml) {
+    if (!select || select.innerHTML === optionsHtml) {
+      return false;
+    }
+    select.innerHTML = optionsHtml;
+    return true;
   }
 
   function escapeHtml(value) {
@@ -1954,6 +1963,25 @@
     return buttons.join("");
   }
 
+  function renderDiagnosticTableStatus({ start, end, total, filteredTotal, hasFilter, hasSourceTimestamps }) {
+    return `
+      <strong>${escapeHtml(`Showing ${formatValue(start)}-${formatValue(end)} of ${formatValue(filteredTotal)} sampled events`)}</strong>
+      <small>${escapeHtml(hasFilter
+        ? `${formatValue(filteredTotal)} matches in the shipped sample; ${formatValue(total)} total events.`
+        : `${formatValue(total)} total events; newest ${formatValue(filteredTotal)} shipped. Filters apply only to this sample.`)}</small>
+      ${hasSourceTimestamps ? "" : '<small>No source timestamps in this dmesg slice; Time / Order falls back to event order.</small>'}
+    `;
+  }
+
+  function renderDiagnosticTablePagination({ key, page, pageCount, pageSize }) {
+    return `
+      <button type="button" data-fabric-diagnostic-page="prev" data-fabric-diagnostic-key="${escapeHtml(key)}" aria-label="Previous event page" title="Previous event page"${page <= 1 ? " disabled" : ""}>&lt;</button>
+      ${renderDiagnosticPageButtons(key, page, pageCount)}
+      <button type="button" data-fabric-diagnostic-page="next" data-fabric-diagnostic-key="${escapeHtml(key)}" aria-label="Next event page" title="Next event page"${page >= pageCount ? " disabled" : ""}>&gt;</button>
+      <span>${escapeHtml(`Page ${formatValue(page)} of ${formatValue(pageCount)} / ${formatValue(pageSize)} per page`)}</span>
+    `;
+  }
+
   function renderDiagnosticTableControls({
     key,
     page,
@@ -1993,12 +2021,8 @@
     ].join("");
     return `
       <div class="fabric-diagnostic-table-controls">
-        <div class="fabric-diagnostic-table-status">
-          <strong>${escapeHtml(`Showing ${formatValue(start)}-${formatValue(end)} of ${formatValue(filteredTotal)} sampled events`)}</strong>
-          <small>${escapeHtml(hasFilter
-            ? `${formatValue(filteredTotal)} matches in the shipped sample; ${formatValue(total)} total events.`
-            : `${formatValue(total)} total events; newest ${formatValue(filteredTotal)} shipped. Filters apply only to this sample.`)}</small>
-          ${hasSourceTimestamps ? "" : '<small>No source timestamps in this dmesg slice; Time / Order falls back to event order.</small>'}
+        <div class="fabric-diagnostic-table-status" data-fabric-diagnostic-status>
+          ${renderDiagnosticTableStatus({ start, end, total, filteredTotal, hasFilter, hasSourceTimestamps })}
         </div>
         <label>
           <span>Filter</span>
@@ -2016,11 +2040,8 @@
           <span>Evidence</span>
           <select data-fabric-diagnostic-confidence-key="${escapeHtml(key)}">${confidenceSelectOptions}</select>
         </label>
-        <div class="fabric-diagnostic-pagination" aria-label="Diagnostic event pages">
-          <button type="button" data-fabric-diagnostic-page="prev" data-fabric-diagnostic-key="${escapeHtml(key)}" aria-label="Previous event page" title="Previous event page"${page <= 1 ? " disabled" : ""}>&lt;</button>
-          ${renderDiagnosticPageButtons(key, page, pageCount)}
-          <button type="button" data-fabric-diagnostic-page="next" data-fabric-diagnostic-key="${escapeHtml(key)}" aria-label="Next event page" title="Next event page"${page >= pageCount ? " disabled" : ""}>&gt;</button>
-          <span>${escapeHtml(`Page ${formatValue(page)} of ${formatValue(pageCount)} / ${formatValue(pageSize)} per page`)}</span>
+        <div class="fabric-diagnostic-pagination" data-fabric-diagnostic-pagination aria-label="Diagnostic event pages">
+          ${renderDiagnosticTablePagination({ key, page, pageCount, pageSize })}
         </div>
       </div>
     `;
@@ -2054,27 +2075,81 @@
     `;
   }
 
+  function diagnosticTablePresentation(diagnostics, tableState) {
+    const eventRows = diagnosticEventRows(diagnostics);
+    const table = diagnostics.event_table || {};
+    const pageSize = Math.max(1, Math.min(Number(table.page_size || 25), 100));
+    const total = Number(table.total_count || eventRows.length || 0);
+    const filteredRows = filteredDiagnosticEventRows([...eventRows].reverse(), tableState);
+    const pageCount = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+    tableState.page = Math.max(1, Math.min(Number(tableState.page || 1), pageCount));
+    const pageStartIndex = (tableState.page - 1) * pageSize;
+    const tableRows = filteredRows.slice(pageStartIndex, pageStartIndex + pageSize);
+    return {
+      key: diagnosticTableKey(diagnostics),
+      page: tableState.page,
+      pageCount,
+      pageSize,
+      start: filteredRows.length ? pageStartIndex + 1 : 0,
+      end: pageStartIndex + tableRows.length,
+      total,
+      filteredTotal: filteredRows.length,
+      filter: tableState.filter,
+      type: tableState.type,
+      severity: tableState.severity,
+      confidence: tableState.confidence,
+      typeOptions: diagnosticEventTypeOptions(eventRows),
+      severityOptions: diagnosticSeverityOptions(eventRows),
+      confidenceOptions: diagnosticConfidenceOptions(eventRows),
+      hasSourceTimestamps: eventRows.some((event) => event?.timestamp || event?.timestamp_raw),
+      hasFilter: Boolean(
+        String(tableState.filter || "").trim()
+        || tableState.type !== "all"
+        || tableState.severity !== "all"
+        || tableState.confidence !== "all"
+      ),
+      eventRows,
+      tableRows,
+    };
+  }
+
+  function renderDiagnosticTableRows(presentation) {
+    return presentation.tableRows.length
+      ? presentation.tableRows.map(renderDiagnosticTableRow).join("")
+      : '<tr><td colspan="7">No events match the current filter.</td></tr>';
+  }
+
+  function refreshDiagnosticTable(key) {
+    const diagnostics = state.diagnosticPayloads[key];
+    const details = document.querySelector(`[data-fabric-diagnostic-table-key="${key}"]`);
+    if (!diagnostics || !details) {
+      return false;
+    }
+    const presentation = diagnosticTablePresentation(diagnostics, diagnosticTableState(key));
+    const status = details.querySelector("[data-fabric-diagnostic-status]");
+    const pagination = details.querySelector("[data-fabric-diagnostic-pagination]");
+    const body = details.querySelector("tbody");
+    if (!status || !pagination || !body) {
+      return false;
+    }
+    status.innerHTML = renderDiagnosticTableStatus(presentation);
+    pagination.innerHTML = renderDiagnosticTablePagination(presentation);
+    body.innerHTML = renderDiagnosticTableRows(presentation);
+    return true;
+  }
+
   function renderDiagnosticEvidencePanel(diagnostics, scopeLabel = "") {
     if (!diagnostics || typeof diagnostics !== "object" || !Number(diagnostics.event_count || 0)) {
       return "";
     }
-    const eventRows = diagnosticEventRows(diagnostics);
-    const events = eventRows.slice(-5).reverse();
     const table = diagnostics.event_table || {};
-    const tablePageSize = Math.max(1, Math.min(Number(table.page_size || 25), 100));
-    const tableTotal = Number(table.total_count || eventRows.length || 0);
-    const sampleCount = Number(table.sample_count || eventRows.length || 0);
     const tableKey = diagnosticTableKey(diagnostics);
     const tableState = diagnosticTableState(tableKey);
-    const orderedTableRows = [...eventRows].reverse();
-    const filteredTableRows = filteredDiagnosticEventRows(orderedTableRows, tableState);
-    const pageCount = Math.max(1, Math.ceil(filteredTableRows.length / tablePageSize));
-    tableState.page = Math.max(1, Math.min(Number(tableState.page || 1), pageCount));
-    const pageStartIndex = (tableState.page - 1) * tablePageSize;
-    const tableRows = filteredTableRows.slice(pageStartIndex, pageStartIndex + tablePageSize);
-    const visibleStart = filteredTableRows.length ? pageStartIndex + 1 : 0;
-    const visibleEnd = pageStartIndex + tableRows.length;
-    const hasSourceTimestamps = eventRows.some((event) => event?.timestamp || event?.timestamp_raw);
+    const presentation = diagnosticTablePresentation(diagnostics, tableState);
+    const eventRows = presentation.eventRows;
+    const events = eventRows.slice(-5).reverse();
+    const sampleCount = Number(table.sample_count || eventRows.length || 0);
+    state.diagnosticPayloads[tableKey] = diagnostics;
     const layers = diagnosticLikelyLayers(diagnostics);
     const summary = diagnostics.operator_summary || diagnosticSummary(diagnostics);
     const panelImpact = diagnosticPanelImpact(eventRows);
@@ -2108,31 +2183,14 @@
         ` : ""}
         ${eventRows.length ? `
           <details class="fabric-diagnostic-raw"${tableState.open ? " open" : ""} data-fabric-diagnostic-table-key="${escapeHtml(tableKey)}">
-            <summary>Recent event sample (${escapeHtml(formatValue(sampleCount))} of ${escapeHtml(formatValue(tableTotal))})</summary>
-            ${renderDiagnosticTableControls({
-              key: tableKey,
-              page: tableState.page,
-              pageCount,
-              pageSize: tablePageSize,
-              start: visibleStart,
-              end: visibleEnd,
-              total: tableTotal,
-              filteredTotal: filteredTableRows.length,
-              filter: tableState.filter,
-              type: tableState.type,
-              severity: tableState.severity,
-              confidence: tableState.confidence,
-              typeOptions: diagnosticEventTypeOptions(eventRows),
-              severityOptions: diagnosticSeverityOptions(eventRows),
-              confidenceOptions: diagnosticConfidenceOptions(eventRows),
-              hasSourceTimestamps,
-            })}
+            <summary>Recent event sample (${escapeHtml(formatValue(sampleCount))} of ${escapeHtml(formatValue(presentation.total))})</summary>
+            ${renderDiagnosticTableControls(presentation)}
             <div class="fabric-diagnostic-table-wrap">
               <table class="fabric-diagnostic-table">
                 <thead>
                   <tr><th>Time / Order</th><th>Impact</th><th>Type</th><th>Finding</th><th>Scope</th><th>Code</th><th>Evidence</th></tr>
                 </thead>
-                <tbody>${tableRows.length ? tableRows.map(renderDiagnosticTableRow).join("") : '<tr><td colspan="7">No events match the current filter.</td></tr>'}</tbody>
+                <tbody>${renderDiagnosticTableRows(presentation)}</tbody>
               </table>
             </div>
           </details>
@@ -3101,19 +3159,21 @@
   function renderSelectors() {
     const systems = list(state.snapshot.systems);
     const enclosures = list(state.snapshot.enclosures);
-    elements.systemSelect.innerHTML = systems.map((system) => {
+    const systemOptions = systems.map((system) => {
       const selected = system.id === state.selectedSystemId ? " selected" : "";
       return `<option value="${escapeHtml(system.id)}"${selected}>${escapeHtml(system.label || system.id)}</option>`;
     }).join("");
+    setSelectOptionsIfChanged(elements.systemSelect, systemOptions);
     elements.systemSelect.value = state.selectedSystemId || "";
     elements.systemSelect.disabled = systems.length <= 1 || state.loading;
 
-    elements.enclosureSelect.innerHTML = enclosures.length
+    const enclosureOptions = enclosures.length
       ? enclosures.map((enclosure) => {
         const selected = enclosure.id === state.selectedEnclosureId ? " selected" : "";
         return `<option value="${escapeHtml(enclosure.id)}"${selected}>${escapeHtml(enclosure.label || enclosure.id)}</option>`;
       }).join("")
       : '<option value="">Auto-selected</option>';
+    setSelectOptionsIfChanged(elements.enclosureSelect, enclosureOptions);
     elements.enclosureSelect.value = state.selectedEnclosureId || "";
     elements.enclosureSelect.disabled = enclosures.length <= 1 || state.loading;
   }
@@ -3287,6 +3347,7 @@
 
   function renderMap() {
     const fabric = state.fabric;
+    state.diagnosticPayloads = {};
     if (!fabric) {
       elements.mapPanel.innerHTML = '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
       renderFocusStrip(null);
@@ -3492,7 +3553,7 @@
         tableState.page = Math.max(1, Number(action) || 1);
       }
       tableState.open = true;
-      render();
+      refreshDiagnosticTable(key);
       return;
     }
     const expandButton = target.closest("[data-fabric-expand-slots]");
@@ -3565,17 +3626,7 @@
     tableState.filter = target.value || "";
     tableState.page = 1;
     tableState.open = true;
-    const selectionStart = target.selectionStart;
-    render();
-    window.requestAnimationFrame(() => {
-      const nextInput = document.querySelector(`[data-fabric-diagnostic-filter-key="${key}"]`);
-      if (nextInput instanceof HTMLInputElement) {
-        nextInput.focus();
-        if (Number.isInteger(selectionStart)) {
-          nextInput.setSelectionRange(selectionStart, selectionStart);
-        }
-      }
-    });
+    refreshDiagnosticTable(key);
   });
 
   document.addEventListener("change", (event) => {
@@ -3597,7 +3648,7 @@
     }
     tableState.page = 1;
     tableState.open = true;
-    render();
+    refreshDiagnosticTable(key);
   });
 
   document.addEventListener("toggle", (event) => {

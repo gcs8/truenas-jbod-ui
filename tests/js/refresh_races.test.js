@@ -218,6 +218,31 @@ test("successful inventory refresh invalidates history before render and a faile
   assert.deepEqual(events, ["stale:inventory unavailable"]);
 });
 
+test("storage-view refresh renders loading state once and completion once", async () => {
+  const state = {
+    snapshotMode: false,
+    storageViewsRuntimeRequestToken: 0,
+    storageViewsRuntimeLoading: false,
+  };
+  const events = [];
+  const { fn: fetchStorageViewRuntime } = loadFunction(APP_SOURCE, "fetchStorageViewRuntime", {
+    state,
+    renderStorageViewsRuntime() { events.push("loading-panel"); },
+    renderSelectors() { events.push("loading-selectors"); },
+    buildSelectionParams() { return new URLSearchParams(); },
+    URLSearchParams,
+    async fetchJson() { return { system_id: "system-a", views: [] }; },
+    applyStorageViewRuntime() { events.push("apply"); },
+    renderAll() { events.push("complete"); },
+    setStatus() {},
+  });
+
+  await fetchStorageViewRuntime();
+
+  assert.deepEqual(events, ["loading-panel", "loading-selectors", "apply", "complete"]);
+  assert.equal(state.storageViewsRuntimeLoading, false);
+});
+
 test("mapping draft survives repeated renders for the same selected slot", () => {
   const state = {
     selectedSystemId: "system-a",
@@ -678,6 +703,108 @@ test("dedicated fabric refresh ignores a response for an older selection", async
 
   assert.equal(state.selectedSystemId, "system-b");
   assert.deepEqual(state.fabric, { system_id: "system-b", marker: "new" });
+});
+
+test("storage-view SMART completion cannot mutate a different active view", async () => {
+  const request = deferred();
+  const presentationEvents = [];
+  const view = { id: "view-a" };
+  const slot = { slot_index: 5 };
+  const state = {
+    snapshotMode: false,
+    selectedStorageViewRuntimeId: "view-a",
+    selectedSlot: null,
+    hoveredSlot: null,
+    smartSummaries: {},
+    smartSummaryGeneration: 0,
+    heatmap: { enabled: true },
+  };
+  const cacheKey = `${view.id}:${slot.slot_index}`;
+  const { fn: ensureStorageViewSmartSummary } = loadFunction(
+    APP_SOURCE,
+    "ensureStorageViewSmartSummary",
+    {
+      state,
+      getStorageViewSmartCacheKey: () => cacheKey,
+      isSmartEntryCurrent: () => false,
+      isSmartEntryInFlight: () => false,
+      refreshHoveredTooltip() { presentationEvents.push("tooltip"); },
+      buildSelectionParams: () => new URLSearchParams(),
+      URLSearchParams,
+      encodeURIComponent,
+      fetchJson: () => request.promise,
+      renderDetail() { presentationEvents.push("detail"); },
+      getLiveBackedStorageViewSlot: () => null,
+      getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,
+      getSmartSummaryEntry: () => null,
+      slotTooltip: () => "live label",
+      buildStorageViewRuntimeTooltip: (_slot, activeView) => `${activeView.id}:slot-5`,
+      refreshGridTileAriaLabel(slotIndex, label) {
+        presentationEvents.push(`aria:${slotIndex}:${label}:${state.selectedStorageViewRuntimeId}`);
+      },
+      refreshHeatmapTileOverlays() { presentationEvents.push("heatmap"); },
+    }
+  );
+
+  const load = ensureStorageViewSmartSummary(view, slot);
+  state.selectedStorageViewRuntimeId = "view-b";
+  request.resolve({ available: true, temperature_c: 31 });
+  await load;
+
+  assert.deepEqual(presentationEvents, []);
+  assert.equal(state.smartSummaries[cacheKey].data.temperature_c, 31);
+});
+
+test("storage-view SMART completion cannot mutate the same view ID in a different system", async () => {
+  const request = deferred();
+  const presentationEvents = [];
+  const view = { id: "shared-view" };
+  const slot = { slot_index: 5 };
+  const state = {
+    snapshotMode: false,
+    selectedSystemId: "system-a",
+    selectedStorageViewRuntimeId: "shared-view",
+    selectedSlot: 5,
+    hoveredSlot: 5,
+    smartSummaries: {},
+    smartSummaryGeneration: 0,
+    heatmap: { enabled: true },
+  };
+  const cacheKey = "system-a:shared-view:5";
+  const { fn: ensureStorageViewSmartSummary } = loadFunction(
+    APP_SOURCE,
+    "ensureStorageViewSmartSummary",
+    {
+      state,
+      getStorageViewSmartCacheKey: () => cacheKey,
+      isSmartEntryCurrent: () => false,
+      isSmartEntryInFlight: () => false,
+      refreshHoveredTooltip() { presentationEvents.push("tooltip"); },
+      buildSelectionParams() {
+        return new URLSearchParams({ system_id: state.selectedSystemId });
+      },
+      URLSearchParams,
+      encodeURIComponent,
+      fetchJson: () => request.promise,
+      renderDetail() { presentationEvents.push("detail"); },
+      getLiveBackedStorageViewSlot: () => null,
+      getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,
+      getSmartSummaryEntry: () => null,
+      slotTooltip: () => "live label",
+      buildStorageViewRuntimeTooltip: () => "stale system-a label",
+      refreshGridTileAriaLabel() { presentationEvents.push("aria"); },
+      refreshHeatmapTileOverlays() { presentationEvents.push("heatmap"); },
+    }
+  );
+
+  const load = ensureStorageViewSmartSummary(view, slot);
+  presentationEvents.length = 0;
+  state.selectedSystemId = "system-b";
+  request.resolve({ available: true, temperature_c: 32 });
+  await load;
+
+  assert.deepEqual(presentationEvents, []);
+  assert.equal(state.smartSummaries[cacheKey].data.temperature_c, 32);
 });
 
 for (const [label, source] of [["main UI", APP_SOURCE], ["dedicated fabric", FABRIC_SOURCE]]) {
