@@ -20,6 +20,8 @@ from app.services.sas_diagnostics.scsi import (
 
 
 DEFAULT_EVENT_TABLE_PAGE_SIZE = 25
+MAX_DIAGNOSTIC_TEXT_LENGTH = 384
+MAX_DIAGNOSTIC_COLLECTION_ITEMS = 64
 
 FREEBSD_ERRNO_SOURCE = {
     "name": "FreeBSD intro(2) errno list",
@@ -157,7 +159,29 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
     fingerprint = _finding_fingerprint(record)
     if fingerprint:
         record["fingerprint"] = fingerprint
-    return {key: value for key, value in record.items() if value is not None}
+    return {
+        key: bound_diagnostic_value(value)
+        for key, value in record.items()
+        if value is not None
+    }
+
+
+def bound_diagnostic_value(value: Any) -> Any:
+    if isinstance(value, str):
+        if len(value) <= MAX_DIAGNOSTIC_TEXT_LENGTH:
+            return value
+        return f"{value[: MAX_DIAGNOSTIC_TEXT_LENGTH - 3]}..."
+    if isinstance(value, dict):
+        return {
+            key: bound_diagnostic_value(item)
+            for key, item in list(value.items())[:MAX_DIAGNOSTIC_COLLECTION_ITEMS]
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            bound_diagnostic_value(item)
+            for item in list(value)[:MAX_DIAGNOSTIC_COLLECTION_ITEMS]
+        ]
+    return value
 
 
 def record_mpr_event_summary(summary: dict[str, Any], event: dict[str, Any], record: dict[str, Any]) -> None:
@@ -191,7 +215,7 @@ def record_mpr_event_summary(summary: dict[str, Any], event: dict[str, Any], rec
     if operation:
         summary["operation_counts"][operation] += 1
     compact_event = {
-        key: value
+        key: bound_diagnostic_value(value)
         for key, value in event.items()
         if key
         in {
@@ -219,6 +243,7 @@ def finalize_mpr_event_summary(summary: dict[str, Any]) -> dict[str, Any]:
     top_findings = _top_mpr_findings(summary)
     primary_fault = top_findings[0] if top_findings else None
     decoded_records = list(summary["decoded_records"])
+    sampled_records = decoded_records[-DEFAULT_EVENT_TABLE_PAGE_SIZE:]
     return {
         "event_count": summary["event_count"],
         "error_count": summary["error_count"],
@@ -236,12 +261,15 @@ def finalize_mpr_event_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "primary_fault": primary_fault,
         "operator_summary": _mpr_operator_summary(summary, primary_fault),
         "recent_events": list(summary["recent_events"]),
-        "decoded_records": decoded_records,
         "event_table": {
-            "schema_version": 1,
+            "schema_version": 2,
             "total_count": len(decoded_records),
             "page_size": DEFAULT_EVENT_TABLE_PAGE_SIZE,
-            "rows": decoded_records,
+            "sample_count": len(sampled_records),
+            "sample_limit": DEFAULT_EVENT_TABLE_PAGE_SIZE,
+            "sample_kind": "recent",
+            "truncated": len(sampled_records) < len(decoded_records),
+            "rows": sampled_records,
         },
     }
 
