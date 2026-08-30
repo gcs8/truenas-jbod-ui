@@ -8,6 +8,10 @@ app:
   sg_ses_device_cache_ttl_seconds: 300
   # Legacy compatibility fallback for older deployments that still set APP_CACHE_TTL.
   cache_ttl_seconds: 10
+  export_cache_ttl_seconds: 60
+  export_cache_max_entries: 8
+  # Shared logical payload-byte ceiling across history, rendered HTML, and ZIP export caches.
+  export_cache_max_bytes: 33554432
   log_level: INFO
   debug: false
   verify_ssl: true

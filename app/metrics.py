@@ -226,6 +226,36 @@ SMART_SUMMARY_REQUESTS_TOTAL = Counter(
     labelnames=("service", "system_id", "platform", "cache_state"),
     namespace=METRICS_NAMESPACE,
 )
+SNAPSHOT_EXPORT_CACHE_REQUESTS_TOTAL = Counter(
+    "snapshot_export_cache_requests_total",
+    "Snapshot-export cache lookups by cache and outcome.",
+    labelnames=("service", "cache", "cache_state"),
+    namespace=METRICS_NAMESPACE,
+)
+SNAPSHOT_EXPORT_CACHE_EVICTIONS_TOTAL = Counter(
+    "snapshot_export_cache_evictions_total",
+    "Snapshot-export cache evictions by cache and reason.",
+    labelnames=("service", "cache", "reason"),
+    namespace=METRICS_NAMESPACE,
+)
+SNAPSHOT_EXPORT_CACHE_REJECTIONS_TOTAL = Counter(
+    "snapshot_export_cache_rejections_total",
+    "Snapshot-export cache entries rejected before retention.",
+    labelnames=("service", "cache", "reason"),
+    namespace=METRICS_NAMESPACE,
+)
+SNAPSHOT_EXPORT_CACHE_ENTRIES = Gauge(
+    "snapshot_export_cache_entries",
+    "Current snapshot-export cache entries.",
+    labelnames=("service", "cache"),
+    namespace=METRICS_NAMESPACE,
+)
+SNAPSHOT_EXPORT_CACHE_BYTES = Gauge(
+    "snapshot_export_cache_bytes",
+    "Current logical payload bytes retained by a snapshot-export cache.",
+    labelnames=("service", "cache"),
+    namespace=METRICS_NAMESPACE,
+)
 
 
 def metrics_enabled() -> bool:
@@ -592,6 +622,65 @@ def observe_smart_summary_request(
         platform=_normalize_metric_label(platform),
         cache_state=_normalize_metric_label(cache_state),
     ).inc()
+
+
+def observe_snapshot_export_cache_request(
+    *,
+    service_name: str,
+    cache_name: str,
+    cache_state: str,
+) -> None:
+    if not metrics_enabled():
+        return
+    SNAPSHOT_EXPORT_CACHE_REQUESTS_TOTAL.labels(
+        service=service_name,
+        cache=cache_name,
+        cache_state=cache_state,
+    ).inc()
+
+
+def observe_snapshot_export_cache_eviction(
+    *,
+    service_name: str,
+    cache_name: str,
+    reason: str,
+) -> None:
+    if not metrics_enabled():
+        return
+    SNAPSHOT_EXPORT_CACHE_EVICTIONS_TOTAL.labels(
+        service=service_name,
+        cache=cache_name,
+        reason=reason,
+    ).inc()
+
+
+def observe_snapshot_export_cache_rejection(
+    *,
+    service_name: str,
+    cache_name: str,
+    reason: str,
+) -> None:
+    if not metrics_enabled():
+        return
+    SNAPSHOT_EXPORT_CACHE_REJECTIONS_TOTAL.labels(
+        service=service_name,
+        cache=cache_name,
+        reason=reason,
+    ).inc()
+
+
+def observe_snapshot_export_cache_size(
+    *,
+    service_name: str,
+    cache_name: str,
+    entries: int,
+    size_bytes: int,
+) -> None:
+    if not metrics_enabled():
+        return
+    labels = {"service": service_name, "cache": cache_name}
+    SNAPSHOT_EXPORT_CACHE_ENTRIES.labels(**labels).set(max(0, int(entries)))
+    SNAPSHOT_EXPORT_CACHE_BYTES.labels(**labels).set(max(0, int(size_bytes)))
 
 
 def _set_build_info(service_name: str, version: str) -> None:

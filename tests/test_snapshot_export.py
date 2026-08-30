@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from starlette.datastructures import URLPath
 from starlette.requests import Request
 
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.main import templates
 from app.models.domain import (
     EnclosureOption,
@@ -565,6 +567,95 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         EXPORT_RENDER_CACHE.clear()
         EXPORT_ZIP_CACHE.clear()
 
+    @staticmethod
+    def cache_settings(*, max_bytes: int, max_entries: int = 8, ttl_seconds: int = 60) -> Settings:
+        settings = Settings()
+        object.__setattr__(settings.app, "export_cache_max_bytes", max_bytes)
+        settings.app.export_cache_max_entries = max_entries
+        settings.app.export_cache_ttl_seconds = ttl_seconds
+        return settings
+
+    def test_export_cache_default_has_a_shared_byte_budget(self) -> None:
+        self.assertEqual(Settings().app.export_cache_max_bytes, 32 * 1024 * 1024)
+
+    def test_export_cache_shared_byte_budget_accepts_environment_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            "os.environ",
+            {
+                "APP_CONFIG_PATH": str(Path(temp_dir) / "config.yaml"),
+                "APP_EXPORT_CACHE_MAX_BYTES": "12345",
+            },
+            clear=False,
+        ):
+            get_settings.cache_clear()
+            try:
+                settings = get_settings()
+            finally:
+                get_settings.cache_clear()
+
+        self.assertEqual(settings.app.export_cache_max_bytes, 12345)
+
+    def test_export_cache_global_lru_evicts_the_oldest_accessed_payload(self) -> None:
+        exporter = SnapshotExportService(
+            self.cache_settings(max_bytes=10),
+            FakeHistoryBackend(),
+            templates,
+        )
+
+        self.assertTrue(exporter._store_cached_value(EXPORT_HISTORY_CACHE, "history", b"1111"))
+        self.assertTrue(exporter._store_cached_value(EXPORT_RENDER_CACHE, "render", b"2222"))
+        self.assertEqual(exporter._get_cached_value(EXPORT_HISTORY_CACHE, "history"), b"1111")
+        self.assertTrue(exporter._store_cached_value(EXPORT_ZIP_CACHE, "zip", b"3333"))
+
+        self.assertIn("history", EXPORT_HISTORY_CACHE)
+        self.assertNotIn("render", EXPORT_RENDER_CACHE)
+        self.assertIn("zip", EXPORT_ZIP_CACHE)
+        self.assertEqual(exporter._cache_total_size_bytes(), 8)
+        self.assertEqual(EXPORT_HISTORY_CACHE["history"].size_bytes, 4)
+        self.assertEqual(EXPORT_ZIP_CACHE["zip"].size_bytes, 4)
+
+    def test_export_cache_entry_limit_remains_per_cache(self) -> None:
+        exporter = SnapshotExportService(
+            self.cache_settings(max_bytes=100, max_entries=2),
+            FakeHistoryBackend(),
+            templates,
+        )
+
+        exporter._store_cached_value(EXPORT_HISTORY_CACHE, "one", b"1")
+        exporter._store_cached_value(EXPORT_HISTORY_CACHE, "two", b"22")
+        exporter._store_cached_value(EXPORT_HISTORY_CACHE, "three", b"333")
+
+        self.assertEqual(list(EXPORT_HISTORY_CACHE), ["two", "three"])
+        self.assertEqual(exporter._cache_total_size_bytes(), 5)
+
+    def test_export_cache_ttl_eviction_releases_accounted_bytes(self) -> None:
+        exporter = SnapshotExportService(
+            self.cache_settings(max_bytes=100, ttl_seconds=5),
+            FakeHistoryBackend(),
+            templates,
+        )
+        with patch("app.services.snapshot_export.time.monotonic", return_value=100.0):
+            exporter._store_cached_value(EXPORT_HISTORY_CACHE, "history", b"12345")
+
+        with patch("app.services.snapshot_export.time.monotonic", return_value=106.0):
+            self.assertIsNone(exporter._get_cached_value(EXPORT_HISTORY_CACHE, "history"))
+
+        self.assertEqual(exporter._cache_total_size_bytes(), 0)
+
+    def test_oversized_export_cache_entry_is_returned_but_not_retained(self) -> None:
+        exporter = SnapshotExportService(
+            self.cache_settings(max_bytes=5),
+            FakeHistoryBackend(),
+            templates,
+        )
+        self.assertTrue(exporter._store_cached_value(EXPORT_HISTORY_CACHE, "existing", b"12"))
+
+        self.assertFalse(exporter._store_cached_value(EXPORT_ZIP_CACHE, "oversized", b"123456"))
+
+        self.assertEqual(EXPORT_HISTORY_CACHE["existing"].value, b"12")
+        self.assertNotIn("oversized", EXPORT_ZIP_CACHE)
+        self.assertEqual(exporter._cache_total_size_bytes(), 2)
+
     async def test_service_builds_self_contained_html_snapshot(self) -> None:
         snapshot = build_snapshot()
         exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
@@ -871,6 +962,45 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(build_calls, 1)
         self.assertIs(first_result, second_result)
         self.assertEqual(len(exporter._zip_cache), 1)
+        self.assertEqual(exporter._zip_build_tasks, {})
+
+    async def test_concurrent_oversized_zip_requests_share_build_without_retaining_bytes(self) -> None:
+        settings = self.cache_settings(max_bytes=1)
+        exporter = SnapshotExportService(settings, FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=build_snapshot(),
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            io_chart_mode="total",
+        )
+        html_bytes = rendered.html.encode("utf-8")
+        started = threading.Event()
+        release = threading.Event()
+        build_calls = 0
+
+        def controlled_builder(_html_filename: str, _html_content: bytes) -> bytes:
+            nonlocal build_calls
+            build_calls += 1
+            started.set()
+            if not release.wait(timeout=1):
+                raise AssertionError("Concurrent oversized ZIP test did not release compression")
+            return b"oversized-zip"
+
+        exporter._build_zip_archive = controlled_builder  # type: ignore[method-assign]
+        first = asyncio.create_task(exporter._build_zip_archive_cached(rendered, html_bytes))
+        self.assertTrue(await asyncio.to_thread(started.wait, 0.5))
+        second = asyncio.create_task(exporter._build_zip_archive_cached(rendered, html_bytes))
+        await asyncio.sleep(0)
+        release.set()
+
+        first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertEqual(first_result, b"oversized-zip")
+        self.assertIs(first_result, second_result)
+        self.assertEqual(build_calls, 1)
+        self.assertEqual(len(exporter._zip_cache), 0)
         self.assertEqual(exporter._zip_build_tasks, {})
 
     async def test_estimate_allows_snapshot_to_keep_smart_details_and_oversize_override(self) -> None:
