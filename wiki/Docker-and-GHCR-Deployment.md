@@ -65,6 +65,59 @@ Open:
 http://your-docker-host:8080
 ```
 
+## Optional Non-Root Runtime
+
+The base Compose file keeps the existing root-compatible deployment contract.
+To opt the UI and history services into numeric UID/GID `10001:10001`, download
+`docker-compose.nonroot.yml` and `scripts/prepare_nonroot_bind_mounts.py` from
+the same release ref as the base file. The admin sidecar remains root because
+it writes configuration and controls the raw Docker socket. The one-shot backup
+service keeps its separate `1000:1000` primary identity and receives only the
+supplemental app-data group `10001` while this overlay is active.
+
+Stop the stack before changing ownership. Run the helper once without
+`--apply`. It inspects only the `config` directory inode,
+`config/config.yaml`, `config/ssh/**`, `config/tls/**`, `data/**`,
+`history/**`, and `logs/**`. It deliberately leaves
+`config/backup-secrets/**`, `backups/**`, and `backup-status/**` owned by the
+backup identity. It refuses missing-path symlinks, special files, stale
+replacement artifacts, more than 100,000 entries, or an apply larger than the
+process descriptor budget:
+
+```bash
+docker compose down
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
+```
+
+Apply opens and inode-checks every selected entry before its first ownership
+change, keeps those descriptors open through verification, and restores the
+original owners and modes if a later change fails. Selected directories become
+`0770`; selected regular files become `0660`. This lets the app identity write
+its runtime state and lets the backup service read selected app data through
+its supplemental group. Backup passphrases remain under the separate backup
+identity with their existing private modes.
+
+Then start with the explicit overlay:
+
+```bash
+docker compose -f compose.yaml -f docker-compose.nonroot.yml pull
+docker compose -f compose.yaml -f docker-compose.nonroot.yml up -d
+docker compose -f compose.yaml -f docker-compose.nonroot.yml exec enclosure-ui id
+```
+
+The UI mounts `config` read-only in this mode. After any admin-sidecar restore,
+leave UI/history stopped, rerun the helper preflight and apply step, then restart
+with the overlay. This is the ownership interlock for root-created restored
+files. If the helper reports that rollback was incomplete, do not start any
+profile; preserve the full backup and inspect the named host paths first.
+
+To roll back the runtime identity, stop the stack and recreate it with only
+`compose.yaml`. Do not recursively change ownership back unless an older image
+actually requires it; first verify the root-compatible stack is healthy. Keep
+the pre-migration ownership listing and a full encrypted backup until the
+non-root deployment has passed operator acceptance.
+
 ## Optional File-Backed Secrets
 
 The base Compose file keeps `.env` compatibility. For service-scoped secret

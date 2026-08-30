@@ -13,8 +13,8 @@ services:
       - "18080:8000"
     volumes:
       - ./ci-smoke-config.yaml:/app/config/config.yaml:ro
+      - ${CI_SMOKE_DATA_DIR:?CI_SMOKE_DATA_DIR is required}:/app/data
+      - ${CI_SMOKE_LOG_DIR:?CI_SMOKE_LOG_DIR is required}:/app/logs
     tmpfs:
-      - /app/data
-      - /app/logs
-      - /run/ssh
+      - /run/ssh:uid=10001,gid=10001,mode=0750
     restart: "no"

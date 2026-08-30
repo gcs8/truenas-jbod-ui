@@ -15,6 +15,33 @@ Remote binding remains supported. The default `0.0.0.0:8082` publication assumes
 
 Auto-stop limits exposure time, but it is not authentication. The Docker socket and writable configuration mounts make reachability the authorization boundary in this mode.
 
+## Docker socket authority
+
+The runtime client deliberately uses only these Docker API operations for the
+configured application container names:
+
+- `GET /containers/json?all=1`
+- `POST /containers/{name}/start`
+- `POST /containers/{name}/stop`
+- `POST /containers/{name}/restart`
+
+That narrow client behavior does not make a raw Docker socket narrow. A process
+that can send arbitrary requests to the mounted socket has root-equivalent
+authority over the Docker host. The Compose files therefore mount the socket
+only into the explicitly started, explicitly root `enclosure-admin` service;
+UI, history, and one-shot backup services receive no socket.
+
+A generic Docker socket proxy was evaluated but is not enabled by default.
+Method/category switches broad enough to permit container start, stop, and
+restart also expose operations beyond this client's four routes. Such a proxy
+does not enforce the configured container-name allowlist and would provide
+misleading isolation. A custom allowlisting proxy would need to validate the
+HTTP method, exact path, configured container name, and query parameters before
+forwarding each request. Until that separately reviewed boundary exists, treat
+admin compromise as Docker-host compromise and rely on explicit profile start,
+auto-stop, authentication/network restrictions, and the absence of the socket
+from every other service.
+
 ## Basic authentication mode
 
 Use built-in Basic authentication when the clients that can reach the admin port are broader than the trusted-operator population:

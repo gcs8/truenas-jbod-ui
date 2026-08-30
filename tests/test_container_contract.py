@@ -9,7 +9,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILES = ("docker-compose.yml", "docker-compose.dev.yml")
-SUPPORTED_COMPOSE_FILES = (*COMPOSE_FILES, "docker-compose.secrets.yml")
+SUPPORTED_COMPOSE_FILES = (*COMPOSE_FILES, "docker-compose.secrets.yml", "docker-compose.nonroot.yml")
 EXPECTED_COMPOSE_SECRETS = {
     "truenas_api_key": "TRUENAS_API_KEY_FILE",
     "truenas_api_password": "TRUENAS_API_PASSWORD_FILE",
@@ -31,6 +31,71 @@ EXPECTED_HISTORY_PERMISSION_ENV = {
 
 
 class ContainerResourceContractTests(unittest.TestCase):
+    def test_nonroot_runtime_is_an_explicit_overlay_with_root_compatible_base(self) -> None:
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
+            with self.subTest(compose=compose_name):
+                self.assertEqual(services["enclosure-ui"]["user"], "0:0")
+                self.assertEqual(services["enclosure-history"]["user"], "0:0")
+                self.assertEqual(services["enclosure-admin"]["user"], "0:0")
+                self.assertEqual(
+                    services["enclosure-backup"]["user"],
+                    "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
+                )
+
+        overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(overlay["services"]),
+            {"enclosure-ui", "enclosure-history", "enclosure-backup"},
+        )
+        self.assertEqual(overlay["services"]["enclosure-ui"]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
+        self.assertEqual(
+            overlay["services"]["enclosure-history"]["user"],
+            "${APP_UID:-10001}:${APP_GID:-10001}",
+        )
+        self.assertIn("./config:/app/config:ro", overlay["services"]["enclosure-ui"]["volumes"])
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("ARG APP_UID=10001", dockerfile)
+        self.assertIn("ARG APP_GID=10001", dockerfile)
+        self.assertIn("USER app", dockerfile)
+
+    def test_nonroot_overlay_preserves_backup_identity_with_app_data_group(self) -> None:
+        overlay = yaml.safe_load(
+            (REPO_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8")
+        )
+
+        backup = overlay["services"]["enclosure-backup"]
+        self.assertNotIn("user", backup)
+        self.assertEqual(backup["group_add"], ["${APP_GID:-10001}"])
+
+    def test_nonroot_migration_helper_is_bounded_no_follow_and_dry_run_by_default(self) -> None:
+        helper = (REPO_ROOT / "scripts/prepare_nonroot_bind_mounts.py").read_text(encoding="utf-8")
+        self.assertIn('APP_RECURSIVE_ROOTS = ("data", "history", "logs")', helper)
+        self.assertIn('APP_CONFIG_PATHS = ("config.yaml", "ssh", "tls")', helper)
+        self.assertIn("resource.getrlimit(resource.RLIMIT_NOFILE)", helper)
+        self.assertIn("apply_ownership", helper)
+        self.assertIn("follow_symlinks=False", helper)
+        self.assertIn("O_NOFOLLOW", helper)
+        self.assertIn('action="store_true"', helper)
+        self.assertIn("stale replacement artifact", helper)
+
+    def test_container_smoke_uses_real_owned_bind_mounts_for_nonroot_paths(self) -> None:
+        fixture = (REPO_ROOT / "tests/fixtures/ci-smoke.compose.yml").read_text(encoding="utf-8")
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("${CI_SMOKE_DATA_DIR:?CI_SMOKE_DATA_DIR is required}:/app/data", fixture)
+        self.assertIn("${CI_SMOKE_LOG_DIR:?CI_SMOKE_LOG_DIR is required}:/app/logs", fixture)
+        self.assertIn('"18080:8000"', fixture)
+        self.assertNotIn("- /app/data", fixture)
+        self.assertIn("install -d -m 0770 -o 10001 -g 10001", workflow)
+        self.assertIn("assert os.getuid() == 10001", workflow)
+        self.assertIn("assert os.getgid() == 10001", workflow)
+        self.assertIn("data_probe.write_text", workflow)
+        self.assertIn("log_probe.write_text", workflow)
+        self.assertIn("docker run --rm -i --user 1000:1000 --group-add 10001", workflow)
+        self.assertGreaterEqual(workflow.count("docker run --rm -i"), 2)
+        self.assertIn("backup_identity_and_group_access=ok", workflow)
+        self.assertIn("ui_backup_secret_access=denied", workflow)
+
     def test_env_example_only_names_tracked_or_generated_compose_files(self) -> None:
         env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
         compose_references = set(re.findall(r"\b(docker-compose(?:\.[\w-]+)?\.ya?ml)\b", env_example))
