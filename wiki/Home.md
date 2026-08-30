@@ -116,12 +116,12 @@ setup notes.
 
 ## Current Version
 
-`0.21.2` is the current published patch after the Storage Fabric expansion. It
-keeps the post-publish history-noise hotfix on top of `0.21.0` and adds
-admin-state credential redaction hardening: CORE keeps the deep HBA/SAS
-diagnostic path, SCALE/Linux, Quantastor, ESXi, and BMC-backed systems keep
-read-only source-labeled maps where evidence exists, and richer platform-native
-Storage Fabric enrichment plus performance guardrails move into `0.22.x`.
+`0.22.0` is the current release candidate. It adds deterministic 60-slot and
+347-slot performance budgets, bounded browser/export caches, safer backup and
+admin operations, opt-in non-root deployment, immutable digest deployment with
+rollback receipts, broader CI, starter Prometheus alerts, and clearer
+Storage Fabric/mapping evidence states. `0.21.2` remains the latest published
+release until the `v0.22.0` tag and GitHub release are published.
 
 The public demo from `0.19.0` remains a static GitHub Pages sample data
 experience, not a hosted copy of the live Docker app. Open

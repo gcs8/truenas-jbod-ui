@@ -1,7 +1,8 @@
 # Roadmap
 
-This file tracks the current intended release direction after the published
-`v0.21.2` patch and the reopen to `0.22.0-dev`.
+This file tracks the current intended release direction at the `v0.22.0`
+release candidate. `v0.21.2` remains the latest published release until the
+`v0.22.0` tag and GitHub release are published.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -21,26 +22,29 @@ remaining part of the active docs set.
 
 ## Current Snapshot
 
-`v0.21.2` is the current published patch after the Storage Fabric expansion on
-top of the `v0.20.x` SAS/Storage Fabric foundation. It keeps the `v0.21.1`
-post-publish history-noise hotfix and adds admin-state credential redaction
-hardening before the `0.22.0-dev` cycle:
+`v0.22.0` closes the practical performance, deployment, CI, backup, and
+operator-trust cycle that followed `v0.21.2`:
 
-- the dedicated fabric surface now presents as `Storage Fabric`
-- CORE keeps the deep SAS/HBA/expander diagnostic path
-- SCALE/Linux can render Linux SES-backed Storage Fabric maps when SG evidence
-  is present
-- Quantastor, ESXi, generic Linux, and BMC/IPMI maps stay read-only and
-  source-labeled instead of claiming CORE-equivalent SAS detail
-- Disk Path clickability, first-click stability, SCALE identity reuse,
-  public-demo spare grouping, SSH fanout controls, restore-grade release
-  evidence, the `v0.21.1` presence-flap history-noise fix, and the `v0.21.2`
-  admin-state redaction hardening are covered by the `0.21.x` validation gate
+- runtime deployment can be pinned to an immutable GHCR digest with a private
+  receipt, convergence checks, and rollback evidence
+- non-root runtime support remains opt-in, with bounded ownership and permission
+  controls for persistent paths
+- deterministic 60-slot and 347-slot budgets cover inventory, history, export,
+  cache, and query paths
+- browser history and export caches are bounded by age, entry count, and bytes
+- mapping, backup, restore, history, admin runtime, and diagnostics paths have
+  stronger integrity and resource controls
+- Storage Fabric, mapping-health, and degraded-evidence states use clearer
+  source, freshness, partial, and non-color cues
+- CI covers Python 3.12 and 3.14, container health, browser QA, public artifacts,
+  Ruff, dependency checks, and CodeQL
 
-The active `0.22.0-dev` cycle should stay practical and incremental:
+The next development lane begins only after the v0.22.0 image, development QA,
+production deployment, and post-release reopen gates are complete. It should
+stay practical and incremental:
 
-- defer richer platform-native Storage Fabric enrichment and performance
-  guardrails to `0.22.x`
+- keep richer platform-native Storage Fabric enrichment in small validated
+  slices
 - keep weaker SAS/backplane/platform inferences visibly labeled instead of
   turning them into fake certainty
 

@@ -1,7 +1,20 @@
 # Changelog
 
-## Unreleased - 0.22.0-dev
+## v0.22.0 - 2026-08-30
 
+- Added a digest-pinned deployment transaction with private receipts, runtime
+  convergence checks, automatic rollback, and explicit later rollback.
+- Added opt-in non-root runtime support, bounded ownership migration, safer
+  history permission publication, and scoped file-backed secret handling while
+  keeping the default root deployment compatible.
+- Added deterministic 60-slot and 347-slot performance budgets and reduced
+  inventory SSH fanout, slot-detail reloads, browser cache growth, grid rebuilds,
+  and snapshot-export memory/copy work.
+- Expanded release-blocking CI across Python 3.12 and 3.14, Ruff, container
+  health, JavaScript/npm integrity, admin browser QA, public-demo checks, and
+  SHA-pinned GitHub Actions, with CodeQL on Python and JavaScript.
+- Hardened mapping import concurrency, admin runtime convergence, backup/archive
+  boundaries, history lifecycle/retention, and diagnostic payload bounds.
 - Kept portable encrypted 7z backup passphrases out of child-process arguments
   by supplying them through a bounded private terminal prompt for export,
   verification, listing, and extraction.
