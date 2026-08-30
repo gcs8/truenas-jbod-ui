@@ -190,6 +190,18 @@ jobs:
       - name: Build production image and verify cache-only health
         run: |
           set -euo pipefail
+          smoke_root="${RUNNER_TEMP}/truenas-jbod-ui-bind-smoke"
+          export CI_SMOKE_DATA_DIR="${smoke_root}/data"
+          export CI_SMOKE_LOG_DIR="${smoke_root}/logs"
+          shared_probe_dir="${smoke_root}/shared"
+          backup_secret_dir="${smoke_root}/backup-secrets"
+          sudo install -d -m 0770 -o 10001 -g 10001 "$CI_SMOKE_DATA_DIR" "$CI_SMOKE_LOG_DIR"
+          sudo install -d -m 0770 -o 10001 -g 10001 "$shared_probe_dir"
+          sudo install -d -m 0700 -o 1000 -g 1000 "$backup_secret_dir"
+          sudo install -m 0660 -o 10001 -g 10001 /dev/null "$shared_probe_dir/app-data"
+          sudo install -m 0600 -o 1000 -g 1000 /dev/null "$backup_secret_dir/passphrase"
+          printf 'shared' | sudo tee "$shared_probe_dir/app-data" >/dev/null
+          printf 'synthetic-test-value' | sudo tee "$backup_secret_dir/passphrase" >/dev/null
           trap 'docker compose -f tests/fixtures/ci-smoke.compose.yml down --volumes --remove-orphans' EXIT
           docker compose -f tests/fixtures/ci-smoke.compose.yml up -d --build --wait --wait-timeout 90
           python - <<'PY'
@@ -212,6 +224,49 @@ jobs:
               "warnings": [],
               "cache_state": "empty",
           }
+          PY
+          container_id="$(docker compose -f tests/fixtures/ci-smoke.compose.yml ps -q enclosure-ui)"
+          docker exec -i "$container_id" python - <<'PY'
+          import os
+          from pathlib import Path
+
+          assert os.getuid() == 10001
+          assert os.getgid() == 10001
+          data_probe = Path("/app/data/nonroot-smoke")
+          log_probe = Path("/app/logs/nonroot-smoke")
+          data_probe.write_text("ok", encoding="utf-8")
+          log_probe.write_text("ok", encoding="utf-8")
+          assert data_probe.read_text(encoding="utf-8") == "ok"
+          assert log_probe.read_text(encoding="utf-8") == "ok"
+          data_probe.unlink()
+          log_probe.unlink()
+          PY
+          image_id="$(docker inspect --format '{{.Image}}' "$container_id")"
+          docker run --rm -i --user 1000:1000 --group-add 10001 \
+            -v "$shared_probe_dir:/probe/shared:ro" \
+            -v "$backup_secret_dir:/probe/backup-secrets:ro" \
+            "$image_id" python - <<'PY'
+          import os
+          from pathlib import Path
+
+          assert os.getuid() == 1000
+          assert os.getgid() == 1000
+          assert 10001 in os.getgroups()
+          assert Path("/probe/shared/app-data").read_text(encoding="utf-8") == "shared"
+          assert Path("/probe/backup-secrets/passphrase").read_text(encoding="utf-8") == "synthetic-test-value"
+          print("backup_identity_and_group_access=ok")
+          PY
+          docker run --rm -i \
+            -v "$backup_secret_dir:/probe/backup-secrets:ro" \
+            "$image_id" python - <<'PY'
+          from pathlib import Path
+
+          try:
+              Path("/probe/backup-secrets/passphrase").read_text(encoding="utf-8")
+          except PermissionError:
+              print("ui_backup_secret_access=denied")
+          else:
+              raise AssertionError("UI identity read the backup-only passphrase")
           PY
 
   admin-browser-cleanroom:

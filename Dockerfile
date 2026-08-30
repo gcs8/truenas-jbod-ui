@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+ARG APP_UID=10001
+ARG APP_GID=10001
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -19,7 +22,8 @@ COPY history_service /app/history_service
 COPY admin_service /app/admin_service
 COPY config/config.example.yaml /app/config/config.example.yaml
 
-RUN addgroup --system app && adduser --system --ingroup app app \
+RUN groupadd --gid "$APP_GID" app \
+    && useradd --uid "$APP_UID" --gid app --no-create-home --shell /usr/sbin/nologin app \
     && mkdir -p /app/config /app/data /app/history /app/logs /run/ssh \
     && chown -R app:app /app /run/ssh
 
