@@ -2,6 +2,9 @@
 
 ## Unreleased - 0.22.0-dev
 
+- Kept portable encrypted 7z backup passphrases out of child-process arguments
+  by supplying them through a bounded private terminal prompt for export,
+  verification, listing, and extraction.
 - Added versioned starter Prometheus alert rules for required-service uptime,
   collector freshness and failures, retry-backoff exhaustion, SMART failure
   evidence, and sustained high disk temperature, with bounded aggregate metrics
