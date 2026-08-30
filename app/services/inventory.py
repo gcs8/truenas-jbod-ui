@@ -10,12 +10,13 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Literal
+from typing import Any, Generic, Iterable, Literal, TypeVar
 from urllib.parse import urlsplit
 
 from app import __version__
 from app.config import Settings, StorageViewConfig, SystemConfig
 from app.models.domain import (
+    CacheState,
     EnclosureOption,
     InventorySnapshot,
     InventorySummary,
@@ -106,6 +107,7 @@ from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData, TrueNASWebs
 
 SmartCacheKey = tuple[str, str, str, int, tuple[str, ...]]
 SmartCacheGenerationToken = tuple[int, int]
+CacheValueT = TypeVar("CacheValueT")
 
 # Expired SMART cache entries stay resident (and stale-servable) for a grace
 # window past their TTL so one slot's lookup cannot destroy the stale-serve
@@ -327,6 +329,12 @@ class DiskRecord:
     lookup_keys: set[str]
 
 
+@dataclass(frozen=True, slots=True)
+class CacheResult(Generic[CacheValueT]):
+    value: CacheValueT
+    cache_state: CacheState
+
+
 @dataclass(slots=True)
 class InventorySourceBundle:
     raw_data: TrueNASRawData
@@ -462,6 +470,19 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
         allow_stale_cache: bool = False,
     ) -> InventorySnapshot:
+        result = await self._get_snapshot_result(
+            force_refresh=force_refresh,
+            selected_enclosure_id=selected_enclosure_id,
+            allow_stale_cache=allow_stale_cache,
+        )
+        return result.value
+
+    async def _get_snapshot_result(
+        self,
+        force_refresh: bool = False,
+        selected_enclosure_id: str | None = None,
+        allow_stale_cache: bool = False,
+    ) -> CacheResult[InventorySnapshot]:
         cache_key = selected_enclosure_id or "__default__"
         cached = self._cache.get(cache_key)
         cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
@@ -469,12 +490,12 @@ class InventoryService:
         if not force_refresh and cached and now < cache_until:
             add_perf_metadata(snapshot_cache="hit", snapshot_cache_key=cache_key)
             self._observe_inventory_snapshot_request("hit")
-            return cached
+            return CacheResult(cached, "hit")
         if not force_refresh and allow_stale_cache and cached:
             add_perf_metadata(snapshot_cache="stale-hit", snapshot_cache_key=cache_key)
             self._observe_inventory_snapshot_request("stale-hit")
             self._schedule_background_snapshot_refresh(cache_key, selected_enclosure_id)
-            return cached
+            return CacheResult(cached, "stale-hit")
 
         async with self._get_snapshot_lock(cache_key):
             cached = self._cache.get(cache_key)
@@ -483,9 +504,9 @@ class InventoryService:
             if not force_refresh and cached and now < cache_until:
                 add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
                 self._observe_inventory_snapshot_request("hit-after-wait")
-                return cached
+                return CacheResult(cached, "hit-after-wait")
 
-            refresh_trigger = "forced-refresh" if force_refresh else "miss"
+            refresh_trigger: CacheState = "forced-refresh" if force_refresh else "miss"
             add_perf_metadata(
                 snapshot_cache=refresh_trigger,
                 snapshot_cache_key=cache_key,
@@ -511,16 +532,16 @@ class InventoryService:
                         "Preserving previously trusted snapshot for %s because the refreshed topology is incomplete.",
                         cache_key,
                     )
-                    return cached
+                    return CacheResult(cached, "trusted-fallback")
                 self._observe_inventory_snapshot_request(refresh_trigger)
-                return snapshot
+                return CacheResult(snapshot, refresh_trigger)
             self._cache[cache_key] = snapshot
             self._cache_until[cache_key] = utcnow() + timedelta(
                 seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
             )
             self._observe_inventory_cache_metrics()
             self._observe_inventory_snapshot_request(refresh_trigger)
-            return snapshot
+            return CacheResult(snapshot, refresh_trigger)
 
     async def get_sas_fabric_snapshot(
         self,
@@ -528,15 +549,17 @@ class InventoryService:
         force_refresh: bool = False,
         selected_enclosure_id: str | None = None,
     ) -> SasFabricSnapshot:
-        snapshot = await self.get_snapshot(
+        snapshot_result = await self._get_snapshot_result(
             force_refresh=force_refresh,
             selected_enclosure_id=selected_enclosure_id,
             allow_stale_cache=not force_refresh,
         )
-        source_bundle = await self._get_inventory_source_bundle(
+        source_bundle_result = await self._get_inventory_source_bundle_result(
             force_refresh=False,
             allow_stale_cache=True,
         )
+        snapshot = snapshot_result.value
+        source_bundle = source_bundle_result.value
         aliases = (
             self.sas_fabric_alias_store.list_aliases(
                 self.system.id,
@@ -545,7 +568,7 @@ class InventoryService:
             if self.sas_fabric_alias_store is not None
             else []
         )
-        return build_sas_fabric_snapshot(
+        fabric = build_sas_fabric_snapshot(
             system=self.system,
             snapshot=snapshot,
             ssh_outputs=source_bundle.ssh_outputs,
@@ -553,6 +576,12 @@ class InventoryService:
             warnings=source_bundle.warnings,
             command_failures=source_bundle.ssh_failure_details,
             aliases=aliases,
+        )
+        return fabric.model_copy(
+            update={
+                "snapshot_cache_state": snapshot_result.cache_state,
+                "source_cache_state": source_bundle_result.cache_state,
+            }
         )
 
     def save_sas_fabric_alias(
@@ -1313,25 +1342,37 @@ class InventoryService:
         force_refresh: bool = False,
         allow_stale_cache: bool = False,
     ) -> InventorySourceBundle:
+        result = await self._get_inventory_source_bundle_result(
+            force_refresh=force_refresh,
+            allow_stale_cache=allow_stale_cache,
+        )
+        return result.value
+
+    async def _get_inventory_source_bundle_result(
+        self,
+        *,
+        force_refresh: bool = False,
+        allow_stale_cache: bool = False,
+    ) -> CacheResult[InventorySourceBundle]:
         now = utcnow()
         if not force_refresh and self._source_bundle is not None and now < self._source_bundle_until:
             add_perf_metadata(inventory_source_cache="hit", system_id=self.system.id)
             self._observe_inventory_source_bundle_request("hit")
-            return self._source_bundle
+            return CacheResult(self._source_bundle, "hit")
         if not force_refresh and allow_stale_cache and self._source_bundle is not None:
             add_perf_metadata(inventory_source_cache="stale-hit", system_id=self.system.id)
             self._observe_inventory_source_bundle_request("stale-hit")
             self._schedule_background_source_bundle_refresh()
-            return self._source_bundle
+            return CacheResult(self._source_bundle, "stale-hit")
 
         async with self._source_bundle_lock:
             now = utcnow()
             if not force_refresh and self._source_bundle is not None and now < self._source_bundle_until:
                 add_perf_metadata(inventory_source_cache="hit-after-wait", system_id=self.system.id)
                 self._observe_inventory_source_bundle_request("hit-after-wait")
-                return self._source_bundle
+                return CacheResult(self._source_bundle, "hit-after-wait")
 
-            refresh_trigger = "forced-refresh" if force_refresh else "miss"
+            refresh_trigger: CacheState = "forced-refresh" if force_refresh else "miss"
             if force_refresh:
                 self._sg_ses_device_cache.clear()
             add_perf_metadata(
@@ -1350,7 +1391,7 @@ class InventoryService:
                 duration_seconds=time.perf_counter() - build_started,
             )
             self._observe_inventory_source_bundle_request(refresh_trigger)
-            return bundle
+            return CacheResult(bundle, refresh_trigger)
 
     def _schedule_background_source_bundle_refresh(self) -> None:
         existing = self._source_bundle_refresh_task
