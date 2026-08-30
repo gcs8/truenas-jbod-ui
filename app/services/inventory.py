@@ -67,7 +67,6 @@ from app.services.sas_fabric import (
     CORE_DMIDECODE_SLOT_OPTIONAL_COMMAND,
     CORE_MPR_DMESG_EVENTS_COMMAND,
     CORE_MPR_SYSCTL_LOCATION_COMMAND,
-    CORE_PCICONF_LV_COMMAND,
     CORE_PCICONF_LV_OPTIONAL_COMMAND,
     build_core_mprutil_unit_commands,
     build_sas_fabric_snapshot,
@@ -6986,7 +6985,7 @@ class InventoryService:
             target["phy_identifier"] = ses_candidate.get("phy_identifier")
         if ses_candidate.get("target_port_protocol"):
             target["target_port_protocol"] = ses_candidate.get("target_port_protocol")
-        for field in (
+        for field_name in (
             "ses_predicted_failure",
             "ses_disabled",
             "ses_hot_spare",
@@ -6994,8 +6993,8 @@ class InventoryService:
             "ses_fault_sensed",
             "ses_fault_requested",
         ):
-            if field in ses_candidate:
-                target[field] = ses_candidate.get(field)
+            if field_name in ses_candidate:
+                target[field_name] = ses_candidate.get(field_name)
         if isinstance(ses_candidate.get("identify_active"), bool):
             target["identify_active"] = bool(target.get("identify_active")) or ses_candidate.get("identify_active")
         if isinstance(ses_candidate.get("present"), bool):

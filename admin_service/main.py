@@ -1007,7 +1007,7 @@ def create_app() -> FastAPI:
                     "summary": purge_summary,
                     "detail": purge_detail,
                 }
-            except Exception as exc:  # noqa: BLE001 - config delete already succeeded, so surface purge failure as warning payload.
+            except Exception:  # noqa: BLE001 - config delete already succeeded, so surface purge failure as warning payload.
                 logger.exception("History purge failed after deleting saved system %s", system_id)
                 history_purge = {
                     "requested": True,
