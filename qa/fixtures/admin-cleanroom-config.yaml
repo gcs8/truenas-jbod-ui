@@ -1,0 +1,37 @@
+app:
+  release_check_enabled: false
+  startup_warm_cache_enabled: false
+  startup_warm_smart_enabled: false
+  log_level: WARNING
+  debug: false
+
+truenas:
+  host: http://127.0.0.1:9
+  api_key: ""
+  platform: core
+  verify_ssl: true
+  timeout_seconds: 1
+
+ssh:
+  enabled: false
+
+history:
+  service_url: ""
+
+admin:
+  service_url: ""
+
+systems: []
+
+layout:
+  slot_count: 1
+  rows: 1
+  columns: 1
+
+paths:
+  runtime_overrides_file: /tmp/truenas-jbod-ui-admin-cleanroom/runtime-overrides.yaml
+  profile_file: /tmp/truenas-jbod-ui-admin-cleanroom/profiles.yaml
+  mapping_file: /tmp/truenas-jbod-ui-admin-cleanroom/slot_mappings.json
+  sas_fabric_alias_file: /tmp/truenas-jbod-ui-admin-cleanroom/sas_fabric_aliases.json
+  log_file: /tmp/truenas-jbod-ui-admin-cleanroom/app.log
+  slot_detail_cache_file: /tmp/truenas-jbod-ui-admin-cleanroom/slot_detail_cache.json

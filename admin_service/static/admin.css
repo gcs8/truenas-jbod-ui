@@ -177,6 +177,11 @@ h3 {
   opacity: 0.55;
 }
 
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+
 .button.secondary {
   background: rgba(18, 32, 48, 0.8);
   color: var(--text);
@@ -443,8 +448,7 @@ h3 {
 .runtime-card-copy,
 .action-note,
 .file-label,
-.profile-meta,
-.profile-card p {
+.profile-meta {
   color: var(--muted);
   line-height: 1.5;
 }
@@ -461,20 +465,10 @@ h3 {
   font-size: 0.88rem;
 }
 
-.runtime-card-status.is-running {
-  color: #d8ffeb;
-  border-color: rgba(119, 221, 173, 0.28);
-}
-
 .runtime-card-status.is-normal {
   color: #d8ffeb;
   border-color: rgba(119, 221, 173, 0.28);
   background: rgba(119, 221, 173, 0.08);
-}
-
-.runtime-card-status.is-stopped {
-  color: #ffe1cb;
-  border-color: rgba(255, 204, 115, 0.24);
 }
 
 .runtime-card-status.is-needs-restart {
@@ -1614,11 +1608,16 @@ h3 {
 }
 
 .profile-card {
+  appearance: none;
+  width: 100%;
   border-radius: 16px;
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  font: inherit;
   padding: 14px;
   cursor: pointer;
+  text-align: left;
   transition: border-color 140ms ease, transform 140ms ease, background 140ms ease;
 }
 
@@ -1629,9 +1628,26 @@ h3 {
   background: rgba(113, 210, 255, 0.06);
 }
 
-.profile-card p {
-  margin: 8px 0 0;
+.profile-card:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(113, 210, 255, 0.2);
+}
+
+.profile-card-title,
+.profile-card-description {
+  display: block;
+}
+
+.profile-card-title {
+  font-size: 1.08rem;
+  font-weight: 700;
+}
+
+.profile-card-description {
+  margin-top: 8px;
   font-size: 0.92rem;
+  color: var(--muted);
+  line-height: 1.5;
 }
 
 .profile-meta {
@@ -1646,10 +1662,6 @@ h3 {
   border: 1px solid var(--line);
   padding: 5px 8px;
   font-size: 0.78rem;
-}
-
-.hidden {
-  display: none !important;
 }
 
 .runtime-panel .subtle,
@@ -1681,10 +1693,6 @@ h3 {
 .pill.is-default {
   border-color: rgba(119, 221, 173, 0.24);
   color: #d9ffe8;
-}
-
-.hidden {
-  display: none !important;
 }
 
 @media (max-width: 1180px) {

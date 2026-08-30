@@ -1,5 +1,13 @@
 const { test, expect } = require("@playwright/test");
 
+const liveApplianceQaEnabled = process.env.PLAYWRIGHT_LIVE_APPLIANCE_QA === "1";
+
+test.beforeAll(() => {
+  if (!liveApplianceQaEnabled) {
+    throw new Error("Live appliance QA requires PLAYWRIGHT_LIVE_APPLIANCE_QA=1.");
+  }
+});
+
 const SYSTEM_SETTLE_TIMEOUT_MS = Number.parseInt(
   process.env.PLAYWRIGHT_SYSTEM_SETTLE_TIMEOUT_MS || "90000",
   10
@@ -107,13 +115,7 @@ async function switchEnclosure(page, value) {
 async function findSystemWithMultipleEnclosures(page) {
   const systems = await getSelectValues(page, "#system-select");
   const currentSystem = await page.locator("#system-select").inputValue();
-  const candidates = orderedSystemCandidates(systems, [
-    currentSystem,
-    "qsosn-ha",
-    "unvr",
-    "unvr-pro",
-    "demo-builder-lab",
-  ]);
+  const candidates = orderedSystemCandidates(systems, [currentSystem]);
   let fallback = null;
 
   for (const systemId of candidates) {
@@ -135,14 +137,7 @@ async function findSystemWithMultipleEnclosures(page) {
 async function selectSystemWithHeatmapValues(page) {
   const systems = await getSelectValues(page, "#system-select");
   const currentSystem = await page.locator("#system-select").inputValue();
-  const candidates = orderedSystemCandidates(systems, [
-    currentSystem,
-    "unvr",
-    "qsosn-ha",
-    "ipmi-ft-1",
-    "esxi-ft-node-2",
-    "esxi-ft-node-3",
-  ]);
+  const candidates = orderedSystemCandidates(systems, [currentSystem]);
 
   for (const systemId of candidates) {
     if ((await page.locator("#system-select").inputValue()) !== systemId) {
@@ -282,6 +277,7 @@ test.describe("browser qa smoke", () => {
 
   test("heat map mode colors slots and uses bounded history for rate metrics", async ({ page }) => {
     const scopeRequests = [];
+    const lastSuccessAt = new Date(Date.now() - 60_000).toISOString();
     await page.route("**/api/history/status", async (route) => {
       await route.fulfill({
         status: 200,
@@ -291,7 +287,7 @@ test.describe("browser qa smoke", () => {
           available: true,
           detail: null,
           counts: { tracked_slots: 4, metric_sample_count: 16 },
-          collector: { last_success_at: "2026-05-15T12:00:00Z" },
+          collector: { last_success_at: lastSuccessAt },
           scopes: [],
         }),
       });
@@ -434,6 +430,8 @@ test.describe("browser qa smoke", () => {
   test("history sidecar exposes fast and full refresh actions", async ({ page }) => {
     const historyBaseURL = process.env.PLAYWRIGHT_HISTORY_BASE_URL || "http://127.0.0.1:8081";
     const modes = [];
+    const lastCollectionAt = new Date(Date.now() - 60_000).toISOString();
+    const nextCollectionAt = new Date(Date.now() + 10 * 60_000).toISOString();
 
     await page.route("**/api/history/refresh?mode=*", async (route) => {
       const url = new URL(route.request().url());
@@ -459,15 +457,15 @@ test.describe("browser qa smoke", () => {
             collector_running: true,
             collection_running: true,
             collection_kind: "background",
-            collection_activity: "collecting SMART metrics for Archive CORE / Front Shelf (1/2)",
+            collection_activity: "collecting SMART metrics for Fixture System / Fixture Shelf (1/2)",
             collection_elapsed_seconds: 42,
-            last_inventory_at: "2026-05-15T04:20:49.054763+00:00",
+            last_inventory_at: lastCollectionAt,
             last_collection_duration_seconds: 508,
             last_collection_inventory_forced: true,
             background_backoff_seconds_remaining: 0,
             source_base_url: "http://enclosure-ui:8000",
             sqlite_path: "/app/history/history.db",
-            next_collection_at: "2026-05-15T04:34:17+00:00",
+            next_collection_at: nextCollectionAt,
           },
           database_size_bytes: 484569088,
         }),
@@ -481,12 +479,12 @@ test.describe("browser qa smoke", () => {
           collector: {
             collector_running: true,
             collection_running: false,
-            last_inventory_at: "2026-05-15T04:20:49.054763+00:00",
-            last_fast_metrics_at: "2026-05-15T04:20:49.054763+00:00",
-            last_slow_metrics_at: "2026-05-15T04:20:49.054763+00:00",
+            last_inventory_at: lastCollectionAt,
+            last_fast_metrics_at: lastCollectionAt,
+            last_slow_metrics_at: lastCollectionAt,
             last_collection_duration_seconds: 508,
             last_collection_inventory_forced: true,
-            next_collection_at: "2026-05-15T04:34:17+00:00",
+            next_collection_at: nextCollectionAt,
             background_backoff_seconds_remaining: 0,
             source_base_url: "http://enclosure-ui:8000",
             sqlite_path: "/app/history/history.db",
@@ -502,12 +500,12 @@ test.describe("browser qa smoke", () => {
           },
           scopes: [
             {
-              system_label: "Archive CORE",
-              enclosure_label: "Front 24 Bay",
+              system_label: "Fixture System",
+              enclosure_label: "Fixture Shelf",
               tracked_slots: 24,
               event_count: null,
               metric_sample_count: null,
-              last_seen_at: "2026-05-15T04:20:49.054763+00:00",
+              last_seen_at: lastCollectionAt,
             },
           ],
         }),
@@ -529,7 +527,7 @@ test.describe("browser qa smoke", () => {
     await page.evaluate(() => window.__HISTORY_DASHBOARD_POLL?.pollOverviewStatus());
     await expect(page.locator("#tracked-slots-value")).toContainText("227");
     await expect(page.locator("#db-size-value")).toContainText("462.1 MiB");
-    await expect(page.locator("#tracked-scopes-body")).toContainText("Front 24 Bay");
+    await expect(page.locator("#tracked-scopes-body")).toContainText("Fixture Shelf");
 
     await page.locator("#history-refresh-fast").click();
     await expect(page.locator("#history-refresh-status")).toContainText("History fast refresh completed.");

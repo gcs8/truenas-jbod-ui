@@ -62,6 +62,7 @@
     loadedSystemId: null,
     sshCommandsAutoPlatform: null,
     sshUserAutoPlatform: null,
+    sshUserEdited: false,
     sshKeysLoading: false,
     selectedEsxiHostPrepToken:
       (Array.isArray(bootstrap.esxi_host_prep?.staged_packages) && bootstrap.esxi_host_prep.staged_packages[0]?.token)
@@ -532,15 +533,19 @@
       const releaseStatus = state.releaseStatus || {};
       const summary = String(releaseStatus.summary || "Checking releases...");
       const latestUrl = safeHttpUrl(releaseStatus.latest_url);
-      elements.releaseNote.textContent = summary;
       elements.releaseNote.className = `hero-stat-note is-${releaseStatus.status || "unknown"}`;
       if (latestUrl) {
-        const link = document.createElement("a");
+        const currentChild = elements.releaseNote.firstElementChild;
+        const link = currentChild?.tagName === "A" ? currentChild : document.createElement("a");
         link.href = latestUrl;
         link.target = "_blank";
         link.rel = "noopener";
         link.textContent = summary;
-        elements.releaseNote.replaceChildren(link);
+        if (link !== currentChild) {
+          elements.releaseNote.replaceChildren(link);
+        }
+      } else if (elements.releaseNote.firstElementChild || elements.releaseNote.textContent !== summary) {
+        elements.releaseNote.textContent = summary;
       }
     }
     if (elements.adminOriginLink) {
@@ -2250,18 +2255,18 @@
           Number(profile.reference_count || 0) > 0 ? `${profile.reference_count} refs` : null,
         ].filter(Boolean);
         return `
-          <article class="${classes.join(" ")}" data-profile-id="${escapeHtml(profile.id)}">
-            <div class="profile-card-header">
-              <div>
-                <h3>${escapeHtml(profile.label)}</h3>
-                <p>${escapeHtml(profile.summary || "Reusable enclosure layout profile.")}</p>
-              </div>
+          <button class="${classes.join(" ")}" data-profile-id="${escapeHtml(profile.id)}" type="button" aria-pressed="${profile.id === activeId}">
+            <span class="profile-card-header">
+              <span>
+                <span class="profile-card-title">${escapeHtml(profile.label)}</span>
+                <span class="profile-card-description">${escapeHtml(profile.summary || "Reusable enclosure layout profile.")}</span>
+              </span>
               <span class="badge">${escapeHtml(profile.id)}</span>
-            </div>
-            <div class="profile-meta">
+            </span>
+            <span class="profile-meta">
               ${meta.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
-            </div>
-          </article>
+            </span>
+          </button>
         `;
       })
       .join("");
@@ -3611,6 +3616,7 @@
     }
     elements.setupSshUser.value = recommendedSshUserForPlatform(platform);
     state.sshUserAutoPlatform = String(platform || "core").toLowerCase();
+    state.sshUserEdited = false;
   }
 
   function syncPlatformHelp() {
@@ -3666,9 +3672,6 @@
     document.querySelectorAll("[data-bmc-field]").forEach((field) => {
       field.disabled = !enabled;
     });
-    if (enabled && elements.setupBmcHost && !elements.setupBmcHost.value.trim()) {
-      elements.setupBmcHost.value = suggestedConnectionHost();
-    }
     if (elements.setupBmcHelp) {
       if (ipmiOnly) {
         elements.setupBmcHelp.textContent = enabled
@@ -3707,6 +3710,9 @@
     }
     const platform = elements.setupPlatform.value || "core";
     const currentValue = String(elements.setupSshUser.value || "").trim();
+    if (!force && state.sshUserEdited) {
+      return;
+    }
     if (!force && currentValue) {
       const previousPlatform = state.sshUserAutoPlatform;
       if (!previousPlatform || previousPlatform === String(platform).toLowerCase()) {
@@ -4291,6 +4297,7 @@
     state.haNodes = [];
     state.haNodesLoading = false;
     state.sshUserAutoPlatform = null;
+    state.sshUserEdited = false;
     state.storageViews = [];
     resetStorageViewCandidateState();
     resetLiveEnclosureState();
@@ -4526,6 +4533,7 @@
     }
     if (elements.setupSshUser) {
       elements.setupSshUser.value = system.ssh_user || "";
+      state.sshUserEdited = true;
       state.sshUserAutoPlatform =
         String(system.ssh_user || "").trim() === recommendedSshUserForPlatform(system.platform || "core")
           ? String(system.platform || "core").toLowerCase()
@@ -4643,7 +4651,7 @@
       : (elements.setupSshKeyPath?.value?.trim() || null);
     const bmcHost = normalizeConnectionHost(elements.setupBmcHost?.value) || null;
     const bmcEnabled = setupPlatformUsesBmcOnlyHost(platform) || Boolean(elements.setupBmcEnabled?.checked);
-    const sshUser = elements.setupSshUser?.value?.trim() || (sshEnabled ? recommendedSshUserForPlatform() : null);
+    const sshUser = elements.setupSshUser?.value?.trim() || null;
     const normalizedSystemId = elements.setupSystemId?.value?.trim() || null;
     const loadedSystem = isEditingLoadedSystem() ? getSystemById(state.loadedSystemId) : null;
     const apiHost = elements.setupTruenasHost?.value?.trim() || "";
@@ -4689,7 +4697,7 @@
       ssh_timeout_seconds: Number(loadedSystem?.ssh_timeout_seconds) || 15,
       ssh_commands: collectSetupCommands(),
       bmc_enabled: bmcEnabled,
-      bmc_host: bmcHost,
+      bmc_host: bmcEnabled ? bmcHost : null,
       bmc_username: elements.setupBmcUsername?.value?.trim() || null,
       bmc_password: collectSecretField(elements.setupBmcPassword, loadedSystem, "bmc_password_configured", "bmc_password", {
         preserve: preserveRedactedSecrets,
@@ -6721,6 +6729,8 @@
       scheduleSudoersPreviewRefresh();
     });
     elements.setupSshUser?.addEventListener("input", () => {
+      state.sshUserEdited = true;
+      state.sshUserAutoPlatform = null;
       scheduleSudoersPreviewRefresh();
     });
     elements.setupBootstrapEnabled?.addEventListener("change", () => {
