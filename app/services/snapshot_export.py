@@ -668,6 +668,23 @@ class SnapshotExportService:
             str(view_id): {str(slot_index): summary for slot_index, summary in slot_cache.items()}
             for view_id, slot_cache in (storage_view_smart_summary_cache or {}).items()
         }
+        redactor = None
+        if redact_sensitive:
+            redactor = SnapshotRedactor(
+                snapshot,
+                raw_history_cache,
+                base_smart_summary_cache,
+                extra_snapshots=list(live_enclosure_snapshots_for_render.values()),
+                extra_payloads=[
+                    {
+                        enclosure_id: live_snapshot.model_dump(mode="json")
+                        for enclosure_id, live_snapshot in live_enclosure_snapshots_for_render.items()
+                    },
+                    base_live_enclosure_smart_summary_cache,
+                    storage_view_runtime.model_dump(mode="json") if storage_view_runtime is not None else {},
+                    base_storage_view_smart_summary_cache,
+                ],
+            )
         template = self.templates.env.get_template("index.html")
         rendered_candidate: RenderedSnapshotExport | None = None
         for strategy in self._build_downsampling_strategies():
@@ -695,22 +712,7 @@ class SnapshotExportService:
             live_enclosure_snapshots_for_export = dict(live_enclosure_snapshots_for_render)
             storage_view_runtime_for_export = storage_view_runtime
             snapshot_for_export = snapshot
-            if redact_sensitive:
-                redactor = SnapshotRedactor(
-                    snapshot,
-                    history_cache_for_export,
-                    smart_summary_cache_for_export,
-                    extra_snapshots=list(live_enclosure_snapshots_for_render.values()),
-                    extra_payloads=[
-                        {
-                            enclosure_id: live_snapshot.model_dump(mode="json")
-                            for enclosure_id, live_snapshot in live_enclosure_snapshots_for_render.items()
-                        },
-                        live_enclosure_smart_summary_cache_for_export,
-                        storage_view_runtime.model_dump(mode="json") if storage_view_runtime is not None else {},
-                        storage_view_smart_summary_cache_for_export,
-                    ],
-                )
+            if redactor is not None:
                 snapshot_for_export = redactor.redact_snapshot(snapshot)
                 history_cache_for_export = redactor.redact_history_cache(history_cache_for_export)
                 history_cache_for_export = self._rekey_history_cache(history_cache_for_export)

@@ -6,6 +6,7 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from starlette.datastructures import URLPath
@@ -30,6 +31,7 @@ from app.services.snapshot_export import (
     EXPORT_RENDER_CACHE,
     EXPORT_ZIP_CACHE,
     SnapshotExportService,
+    SnapshotRedactor,
 )
 
 
@@ -1088,6 +1090,39 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("rollups", rendered.export_meta["downsampling_note"])
         self.assertLess(rendered.export_meta["metric_sample_count"], 288 * 5)
         self.assertLessEqual(rendered.export_meta["event_count"], 10)
+
+    async def test_redacted_oversized_export_builds_one_redactor_for_all_strategies(self) -> None:
+        snapshot = build_snapshot()
+        exporter = SnapshotExportService(
+            Settings(),
+            DenseHistoryBackend(),
+            templates,
+            size_limit_bytes=1,
+        )  # type: ignore[arg-type]
+        redactor_init_count = 0
+
+        class CountingSnapshotRedactor(SnapshotRedactor):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                nonlocal redactor_init_count
+                redactor_init_count += 1
+                super().__init__(*args, **kwargs)
+
+        with patch("app.services.snapshot_export.SnapshotRedactor", CountingSnapshotRedactor):
+            rendered = await exporter.build_enclosure_snapshot_html(
+                request=build_request(),
+                snapshot=snapshot,
+                smart_summary_cache=build_smart_summary_cache(),
+                selected_slot=0,
+                history_window_hours=24,
+                io_chart_mode="total",
+                redact_sensitive=True,
+            )
+
+        self.assertGreater(rendered.size_bytes, exporter.size_limit_bytes)
+        self.assertEqual(redactor_init_count, 1)
+        self.assertIn("...3456", rendered.html)
+        self.assertNotIn("ABC123456", rendered.html)
+        self.assertNotIn("192.168.1.174", rendered.html)
 
     async def test_history_drawer_only_opens_when_exported_open(self) -> None:
         snapshot = build_snapshot()
