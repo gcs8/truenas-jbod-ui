@@ -2072,6 +2072,43 @@ sys.stdout.flush()
         with self.assertRaisesRegex(ValueError, "too many members"):
             self.backup_service._collect_file_specs(members)
 
+    def test_file_export_accepts_restore_grade_history_database_size(self) -> None:
+        history_size = 1_200 * 1024 * 1024
+        companion_state_size = 64 * 1024 * 1024
+        members = [
+            BundleMember(
+                key="history-db",
+                group_key=HISTORY_DB_KEY,
+                archive_path="history/history.sqlite3",
+                source_path=str(self.temp_dir / "history.sqlite3"),
+                present=True,
+                content=None,
+            ),
+            BundleMember(
+                key="companion-state",
+                group_key=CONFIG_FILE_KEY,
+                archive_path="config/state.bin",
+                source_path=str(self.temp_dir / "state.bin"),
+                present=True,
+                content=None,
+            ),
+        ]
+
+        with patch.object(
+            type(self.backup_service),
+            "_bundle_member_size_and_digest",
+            side_effect=[
+                (history_size, "a" * 64),
+                (companion_state_size, "b" * 64),
+            ],
+        ):
+            files = self.backup_service._collect_file_specs(members)
+
+        self.assertEqual(
+            [item["size_bytes"] for item in files],
+            [history_size, companion_state_size],
+        )
+
     def test_tar_file_export_counts_physical_pax_headers(self) -> None:
         members = [
             BundleMember(

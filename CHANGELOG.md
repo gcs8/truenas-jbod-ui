@@ -18,6 +18,8 @@
 - Kept portable encrypted 7z backup passphrases out of child-process arguments
   by supplying them through a bounded private terminal prompt for export,
   verification, listing, and extraction.
+- Raised the bounded FULL-backup member and expanded-size ceilings for history
+  databases above 1 GiB, with matching admin and one-shot backup memory limits.
 - Added versioned starter Prometheus alert rules for required-service uptime,
   collector freshness and failures, retry-backoff exhaustion, SMART failure
   evidence, and sustained high disk temperature, with bounded aggregate metrics

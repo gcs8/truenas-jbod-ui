@@ -20,7 +20,7 @@ Date: `2026-08-30`
 - Mapping health now separates matched, empty, unmatched, and unknown bays and uses non-color cues.
 - Storage Fabric now labels retained evidence as `STALE`, enabled source failures or materially limited evidence as `PARTIAL`, and complete healthy evidence as `OK`.
 - Admin runtime actions wait for observed convergence, classify unavailable health correctly, and always release controls after failures or cancellation.
-- Backup and restore paths have stronger archive, manifest, size, integrity, and transactional rollback checks. Portable encrypted 7z passphrases no longer appear in child-process arguments.
+- Backup and restore paths have stronger archive, manifest, size, integrity, and transactional rollback checks. Portable encrypted 7z passphrases no longer appear in child-process arguments, and bounded FULL backups now support history databases above 1 GiB.
 - History retention, adoption/remap, permission publication, derived keys, and degraded-topology handling are covered by stronger lifecycle tests.
 - Diagnostic payloads and event samples are byte/count bounded, and the checked-in public demo has explicit route, freshness, and size gates.
 
