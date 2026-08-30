@@ -52,6 +52,12 @@ function resolvePublicDemoArtifact() {
   );
 }
 
+function resolveSlotFocusArtifact() {
+  return process.env.SLOT_FOCUS_ARTIFACT
+    ? resolveArtifactPath(process.env.SLOT_FOCUS_ARTIFACT)
+    : null;
+}
+
 test("public demo static artifact is explorable without a live backend", async ({ page }) => {
   const demoPath = resolvePublicDemoArtifact();
   const consoleErrors = [];
@@ -113,4 +119,100 @@ test("public demo static artifact is explorable without a live backend", async (
 
   await expect(page.locator("#refresh-button")).toBeDisabled();
   expect(consoleErrors).toEqual([]);
+});
+
+test("slot keyboard selection preserves the focused tile DOM identity", async ({ page }) => {
+  const demoPath = resolveSlotFocusArtifact();
+  test.skip(!demoPath, "Set SLOT_FOCUS_ARTIFACT to a current-source synthetic snapshot.");
+  await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });
+
+  const tile = page.locator("#slot-grid .slot-tile:not(.filtered-out)").first();
+  await expect(tile).toBeVisible();
+  const originalTile = await tile.elementHandle();
+  expect(originalTile).toBeTruthy();
+
+  await tile.focus();
+  await page.keyboard.press("Enter");
+
+  await expect(tile).toHaveClass(/selected/);
+  await expect(tile).toHaveAttribute("aria-pressed", "true");
+  expect(await originalTile.evaluate((node) => node.isConnected && document.activeElement === node)).toBeTruthy();
+
+  await page.keyboard.press("Space");
+  await expect(tile).not.toHaveClass(/selected/);
+  await expect(tile).toHaveAttribute("aria-pressed", "false");
+  expect(await originalTile.evaluate((node) => node.isConnected && document.activeElement === node)).toBeTruthy();
+});
+
+test("slot grid arrow navigation moves visible focus", async ({ page }) => {
+  const demoPath = resolveSlotFocusArtifact();
+  test.skip(!demoPath, "Set SLOT_FOCUS_ARTIFACT to a current-source synthetic snapshot.");
+  await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });
+
+  const tiles = page.locator("#slot-grid .slot-tile:not(.filtered-out)");
+  expect(await tiles.count()).toBeGreaterThan(1);
+  const firstSlot = await tiles.first().getAttribute("data-slot");
+  await tiles.first().focus();
+
+  const focusStyle = await tiles.first().evaluate((node) => {
+    const style = getComputedStyle(node);
+    return { outlineStyle: style.outlineStyle, outlineWidth: style.outlineWidth };
+  });
+  expect(focusStyle.outlineStyle).not.toBe("none");
+  expect(Number.parseFloat(focusStyle.outlineWidth)).toBeGreaterThan(0);
+
+  await page.keyboard.press("ArrowRight");
+  const activeSlot = await page.evaluate(() => document.activeElement?.dataset?.slot || null);
+  expect(activeSlot).not.toBe(firstSlot);
+  expect(activeSlot).toBeTruthy();
+
+  await page.keyboard.press("Tab");
+  const tabSlot = await page.evaluate(() => document.activeElement?.dataset?.slot || null);
+  expect(tabSlot).toBeTruthy();
+  expect(tabSlot).not.toBe(activeSlot);
+});
+
+test("delegated slot hover preserves identify state and tooltip behavior", async ({ page }) => {
+  const demoPath = resolveSlotFocusArtifact();
+  test.skip(!demoPath, "Set SLOT_FOCUS_ARTIFACT to a current-source synthetic snapshot.");
+  await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });
+
+  const identifyTile = page.locator("#slot-grid .slot-tile.state-identify:not(.filtered-out)").first();
+  await expect(identifyTile).toBeVisible();
+  await identifyTile.hover();
+
+  await expect(identifyTile).toHaveClass(/state-identify/);
+  await expect(page.locator("#slot-tooltip")).toHaveAttribute("aria-hidden", "false");
+
+  await page.mouse.move(0, 0);
+  await expect(page.locator("#slot-tooltip")).toHaveAttribute("aria-hidden", "true");
+});
+
+test("slot grid rebuild restores focus to the same visible slot", async ({ page }) => {
+  const demoPath = resolveSlotFocusArtifact();
+  test.skip(!demoPath, "Set SLOT_FOCUS_ARTIFACT to a current-source synthetic snapshot.");
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });
+
+  const tile = page.locator("#slot-grid .slot-tile:not(.filtered-out)").first();
+  await expect(tile).toBeVisible();
+  const slotNumber = await tile.getAttribute("data-slot");
+  await tile.focus();
+
+  const focusTransition = await page.evaluate(() => {
+    const search = document.getElementById("search-box");
+    const before = document.activeElement?.dataset?.slot || null;
+    search.value = "";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    return {
+      before,
+      after: document.activeElement?.dataset?.slot || null,
+      activeTag: document.activeElement?.tagName || null,
+    };
+  });
+
+  expect(pageErrors).toEqual([]);
+  expect(focusTransition).toEqual({ before: slotNumber, after: slotNumber, activeTag: "BUTTON" });
+  await expect(page.locator(`#slot-grid .slot-tile[data-slot="${slotNumber}"]`)).toBeVisible();
 });

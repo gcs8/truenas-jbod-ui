@@ -228,6 +228,37 @@ test.describe("browser qa smoke", () => {
     }
   });
 
+  test("manual refresh restores focus to the same slot", async ({ page }) => {
+    test.setTimeout(SYSTEM_SETTLE_TIMEOUT_MS + 30_000);
+    await gotoApp(page);
+    const tile = page.locator("#slot-grid .slot-tile:not(.filtered-out)").first();
+    test.skip((await tile.count()) === 0, "Need at least one visible slot tile.");
+    const slotNumber = await tile.getAttribute("data-slot");
+    const previousRunId = (await latestUiPerfRun(page))?.id || null;
+    await tile.focus();
+
+    const inventoryResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return url.pathname === "/api/inventory" && url.searchParams.get("force") === "true";
+    });
+    await page.evaluate(() => document.getElementById("refresh-button").click());
+    await inventoryResponse;
+    await expect(page.locator("#status-text")).toContainText("Inventory updated", {
+      timeout: SYSTEM_SETTLE_TIMEOUT_MS,
+    });
+    await waitForRefreshToSettle(page, "manual-refresh", previousRunId);
+    if (await uiPerfEnabled(page)) {
+      const run = await latestUiPerfRun(page);
+      expect(run?.reason).toBe("manual-refresh");
+      expect(run?.status).toBe("done");
+      expect(run?.id).not.toBe(previousRunId);
+    }
+
+    await expect.poll(() => page.evaluate(() => document.activeElement?.dataset?.slot || null), {
+      timeout: SYSTEM_SETTLE_TIMEOUT_MS,
+    }).toBe(slotNumber);
+  });
+
   test("refresh timing strip shows cache TTLs and auto-refresh state", async ({ page }) => {
     await gotoApp(page);
 
