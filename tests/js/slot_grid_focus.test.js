@@ -88,6 +88,7 @@ test("slot selection updates targeted domains without rebuilding the grid", () =
   };
   const selectSlot = loadFunction("selectSlot", {
     state,
+    confirmMappingDraftDiscard: () => true,
     syncSasFabricTraceToSlot(slot) { calls.push(`sync:${slot}`); },
     refreshGridSelectionState() { calls.push("grid-state"); },
     renderSasFabric() { calls.push("fabric"); },
@@ -110,6 +111,7 @@ test("clearing selection updates targeted domains without rebuilding the grid", 
   };
   const clearSelectedSlot = loadFunction("clearSelectedSlot", {
     state,
+    confirmMappingDraftDiscard: () => true,
     clearSasFabricBaySelection() { calls.push("clear-fabric-selection"); },
     refreshGridSelectionState() { calls.push("grid-state"); },
     renderSasFabric() { calls.push("fabric"); },

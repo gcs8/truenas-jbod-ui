@@ -84,6 +84,7 @@
     selectedSystemId: bootstrap.snapshot?.selected_system_id || null,
     selectedEnclosureId: bootstrap.snapshot?.selected_enclosure_id || null,
     mappingFormScopeKey: null,
+    mappingFormDirty: false,
     snapshotReuseCache: {},
     search: "",
     autoRefresh: snapshotMode ? false : true,
@@ -1807,16 +1808,23 @@
   function selectSasFabricTrace(traceId, { syncSlot = true } = {}) {
     const trace = sasFabricTraceById(traceId);
     if (!trace) {
-      return;
+      return false;
+    }
+    const slots = sasFabricSortedSlots(trace.slots);
+    const nextSlot = syncSlot && trace.kind === "bay" && slots.length === 1
+      ? slots[0]
+      : null;
+    if (nextSlot !== null && nextSlot !== state.selectedSlot && !confirmMappingDraftDiscard()) {
+      return false;
     }
     state.sasFabric.selectedTraceId = trace.id;
     state.sasFabric.selectedNodeId = null;
-    const slots = sasFabricSortedSlots(trace.slots);
-    if (syncSlot && trace.kind === "bay" && slots.length === 1) {
-      state.selectedSlot = slots[0];
+    if (nextSlot !== null) {
+      state.selectedSlot = nextSlot;
       state.history.panelError = null;
     }
     renderAll();
+    return true;
   }
 
   function selectSasFabricNode(nodeId) {
@@ -1830,10 +1838,9 @@
 
   function selectSasFabricSlot(slotNumber) {
     if (!Number.isInteger(slotNumber)) {
-      return;
+      return false;
     }
-    syncSasFabricTraceToSlot(slotNumber);
-    selectSlot(slotNumber);
+    return selectSlot(slotNumber);
   }
 
   function sasFabricSelectionTouchesNode(nodeId) {
@@ -8173,16 +8180,55 @@
     ].join("|");
   }
 
+  function mappingEditorHasUnsavedChanges() {
+    return Boolean(
+      state.mappingFormDirty
+      && mappingForm
+      && !mappingForm.classList.contains("hidden")
+    );
+  }
+
+  function markMappingFormDirty() {
+    if (state.mappingFormDirty) {
+      return;
+    }
+    state.mappingFormDirty = true;
+    scheduleAutoRefresh();
+    renderTimingSurfaces();
+  }
+
+  function confirmMappingDraftDiscard() {
+    if (!mappingEditorHasUnsavedChanges()) {
+      return true;
+    }
+    if (!window.confirm("Discard unsaved calibration edits and change selection?")) {
+      setStatus("Selection change canceled. Unsaved calibration edits were kept.");
+      return false;
+    }
+    state.mappingFormScopeKey = null;
+    state.mappingFormDirty = false;
+    if (state.refreshesInFlight === 0) {
+      scheduleAutoRefresh();
+    }
+    renderTimingSurfaces();
+    return true;
+  }
+
   function syncMappingFormForSlot(slot) {
     const scopeKey = mappingFormScopeKey(slot);
     if (state.mappingFormScopeKey === scopeKey) {
       return;
     }
+    const wasDirty = state.mappingFormDirty;
     mappingForm.serial.value = slot.serial || "";
     mappingForm.device_name.value = slot.device_name || "";
     mappingForm.gptid.value = slot.gptid || "";
     mappingForm.notes.value = slot.notes || "";
     state.mappingFormScopeKey = scopeKey;
+    state.mappingFormDirty = false;
+    if (wasDirty && state.refreshesInFlight === 0) {
+      scheduleAutoRefresh();
+    }
   }
 
   function renderLiveSlotDetail(slot, options = {}) {
@@ -9146,6 +9192,17 @@
       setBarWidthIfChanged(refreshCountdownBar, 0);
       return;
     }
+    const pauseReason = autoRefreshPauseReason();
+    if (pauseReason === "hidden") {
+      setTextIfChanged(refreshCountdownLabel, "Auto refresh paused while tab is hidden");
+      setBarWidthIfChanged(refreshCountdownBar, 0);
+      return;
+    }
+    if (pauseReason === "mapping") {
+      setTextIfChanged(refreshCountdownLabel, "Auto refresh paused for unsaved calibration edits");
+      setBarWidthIfChanged(refreshCountdownBar, 0);
+      return;
+    }
     if (!state.timerDueAt || !state.timerDelayMs) {
       setTextIfChanged(refreshCountdownLabel, `Next refresh: ${formatRefreshInterval(state.refreshIntervalSeconds)}`);
       setBarWidthIfChanged(refreshCountdownBar, 0);
@@ -9176,11 +9233,7 @@
     }
     state.timingTickId = window.setInterval(timingTick, 1000);
     if (typeof document !== "undefined") {
-      document.addEventListener("visibilitychange", () => {
-        if (!document.hidden) {
-          renderTimingSurfaces();
-        }
-      });
+      document.addEventListener("visibilitychange", handleAutoRefreshVisibilityChange);
     }
   }
 
@@ -9263,21 +9316,29 @@
   }
 
   function selectSlot(slotNumber) {
+    if (state.selectedSlot !== slotNumber && !confirmMappingDraftDiscard()) {
+      return false;
+    }
     state.selectedSlot = slotNumber;
     state.history.panelError = null;
     syncSasFabricTraceToSlot(slotNumber);
     refreshGridSelectionState();
     renderSasFabric();
     renderDetail();
+    return true;
   }
 
   function clearSelectedSlot() {
+    if (state.selectedSlot !== null && !confirmMappingDraftDiscard()) {
+      return false;
+    }
     state.selectedSlot = null;
     state.history.panelError = null;
     clearSasFabricBaySelection();
     refreshGridSelectionState();
     renderSasFabric();
     renderDetail();
+    return true;
   }
 
   async function fetchJson(url, options = {}) {
@@ -9415,6 +9476,7 @@
     const refreshToken = ++state.latestRefreshToken;
     state.refreshesInFlight += 1;
     cancelAutoRefreshTimer();
+    const mappingDraftAtStart = Boolean(state.mappingFormDirty);
     const perfRun = beginUiPerfRun(reason, {
       systemId: state.selectedSystemId,
       enclosureId: state.selectedEnclosureId,
@@ -9428,6 +9490,13 @@
         if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
           archiveUiPerfRun(perfRun, "superseded");
         }
+        return;
+      }
+      if (!mappingDraftAtStart && state.mappingFormDirty) {
+        if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
+          archiveUiPerfRun(perfRun, "mapping-draft");
+        }
+        setStatus("Refresh response deferred because calibration edits started while it was running.");
         return;
       }
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
@@ -9692,14 +9761,20 @@
     mappingForm.serial.value = slot.serial || "";
     mappingForm.device_name.value = slot.device_name || "";
     mappingForm.gptid.value = slot.gptid || "";
+    markMappingFormDirty();
   }
 
   function resetMappingForm() {
+    const wasDirty = state.mappingFormDirty;
     mappingForm.serial.value = "";
     mappingForm.device_name.value = "";
     mappingForm.gptid.value = "";
     mappingForm.notes.value = "";
     state.mappingFormScopeKey = null;
+    state.mappingFormDirty = false;
+    if (wasDirty && state.refreshesInFlight === 0) {
+      scheduleAutoRefresh();
+    }
   }
 
   function setMappingFormEnabled(enabled) {
@@ -9848,6 +9923,37 @@
     }
   }
 
+  function autoRefreshPauseReason() {
+    if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+      return "hidden";
+    }
+    if (mappingEditorHasUnsavedChanges()) {
+      return "mapping";
+    }
+    return null;
+  }
+
+  function handleAutoRefreshVisibilityChange() {
+    if (document.visibilityState !== "visible") {
+      cancelAutoRefreshTimer();
+      renderTimingSurfaces();
+      return;
+    }
+    scheduleAutoRefresh();
+  }
+
+  async function requestManualRefresh() {
+    if (
+      mappingEditorHasUnsavedChanges()
+      && !window.confirm("Refresh now? Unsaved calibration edits may be replaced if the selected slot changes.")
+    ) {
+      setStatus("Manual refresh canceled. Unsaved calibration edits were kept.");
+      return false;
+    }
+    await refreshSnapshot(true, "manual-refresh");
+    return true;
+  }
+
   function cancelAutoRefreshTimer() {
     if (state.timerId) {
       window.clearTimeout(state.timerId);
@@ -9864,6 +9970,11 @@
     if (state.snapshotMode || !state.autoRefresh) {
       return;
     }
+    if (autoRefreshPauseReason()) {
+      renderTimingSurfaces();
+      ensureTimingTick();
+      return;
+    }
     const waitMs = Math.max(1000, Number.isFinite(delayMs) ? delayMs : state.refreshIntervalSeconds * 1000);
     state.timerScheduledAt = Date.now();
     state.timerDueAt = state.timerScheduledAt + waitMs;
@@ -9876,6 +9987,10 @@
       state.timerDueAt = 0;
       state.timerDelayMs = 0;
       renderTimingSurfaces();
+      if (autoRefreshPauseReason()) {
+        scheduleAutoRefresh();
+        return;
+      }
       if (state.refreshesInFlight > 0) {
         scheduleAutoRefresh();
         return;
@@ -9895,10 +10010,17 @@
     refreshGridFilterState();
   });
 
-  refreshButton.addEventListener("click", () => refreshSnapshot(true, "manual-refresh"));
+  refreshButton.addEventListener("click", () => {
+    void requestManualRefresh();
+  });
   if (systemSelect) {
     systemSelect.addEventListener("change", async (event) => {
-      state.selectedSystemId = event.target.value || null;
+      const nextSystemId = event.target.value || null;
+      if (nextSystemId !== state.selectedSystemId && !confirmMappingDraftDiscard()) {
+        renderSelectors();
+        return;
+      }
+      state.selectedSystemId = nextSystemId;
       state.selectedEnclosureId = null;
       state.storageViewsRuntime = {
         system_id: state.selectedSystemId,
@@ -9918,6 +10040,13 @@
   if (enclosureSelect) {
     enclosureSelect.addEventListener("change", async (event) => {
       const rawValue = event.target.value || "";
+      const currentValue = state.selectedStorageViewRuntimeId
+        ? `view:${state.selectedStorageViewRuntimeId}`
+        : (currentLiveEnclosureId() ? `enclosure:${currentLiveEnclosureId()}` : "");
+      if (rawValue !== currentValue && !confirmMappingDraftDiscard()) {
+        renderSelectors();
+        return;
+      }
       clearSelectedSlot();
       resetHeatmapHistoryCache();
       if (rawValue.startsWith("view:")) {
@@ -9964,7 +10093,11 @@
       if (!button) {
         return;
       }
-      state.selectedStorageViewRuntimeId = button.dataset.storageViewRuntimeId || "";
+      const nextViewId = button.dataset.storageViewRuntimeId || "";
+      if (nextViewId !== state.selectedStorageViewRuntimeId && !confirmMappingDraftDiscard()) {
+        return;
+      }
+      state.selectedStorageViewRuntimeId = nextViewId;
       resetHeatmapHistoryCache();
       renderStorageViewsRuntime();
       renderGrid();
@@ -9984,6 +10117,8 @@
     setStatus(`Auto-refresh interval set to ${formatRefreshInterval(state.refreshIntervalSeconds)}.`);
   });
   mappingForm.addEventListener("submit", saveMapping);
+  mappingForm.addEventListener("input", markMappingFormDirty);
+  mappingForm.addEventListener("change", markMappingFormDirty);
   clearMappingButton.addEventListener("click", clearMapping);
   prefillMappingButton.addEventListener("click", prefillMapping);
   if (exportMappingsButton) {
