@@ -2161,41 +2161,43 @@
       ["Operations", formatCountMap(diagnostics.operation_counts)],
     ].filter(([, value]) => value);
     return `
-      <div class="fabric-diagnostic-evidence impact-${escapeHtml(panelImpact)}">
-        <div class="fabric-diagnostic-evidence-head">
+      <details class="fabric-diagnostic-evidence impact-${escapeHtml(panelImpact)}">
+        <summary class="fabric-diagnostic-evidence-head">
           <span class="fabric-stage-title">Fault Evidence</span>
           <strong>${escapeHtml(summary || `${diagnostics.event_count} kernel events`)}</strong>
           ${scopeLabel ? `<small>Path leg: ${escapeHtml(scopeLabel)}</small>` : ""}
           ${layers ? `<small>Likely layer: ${escapeHtml(layers)}</small>` : ""}
+        </summary>
+        <div class="fabric-diagnostic-evidence-body">
+          ${renderDiagnosticImpactSummary(eventRows)}
+          <div class="fabric-diagnostic-chips">
+            ${diagnosticFindingChips(diagnostics)}
+          </div>
+          ${events.length ? `<ol class="fabric-diagnostic-events">${events.map(renderDiagnosticEvent).join("")}</ol>` : ""}
+          ${rawRows.length ? `
+            <details class="fabric-diagnostic-raw">
+              <summary>Raw decoded buckets</summary>
+              <div>
+                ${rawRows.map(([label, value]) => `<span><em>${escapeHtml(label)}</em>${escapeHtml(formatValue(value))}</span>`).join("")}
+              </div>
+            </details>
+          ` : ""}
+          ${eventRows.length ? `
+            <details class="fabric-diagnostic-raw"${tableState.open ? " open" : ""} data-fabric-diagnostic-table-key="${escapeHtml(tableKey)}">
+              <summary>Recent event sample (${escapeHtml(formatValue(sampleCount))} of ${escapeHtml(formatValue(presentation.total))})</summary>
+              ${renderDiagnosticTableControls(presentation)}
+              <div class="fabric-diagnostic-table-wrap">
+                <table class="fabric-diagnostic-table">
+                  <thead>
+                    <tr><th>Time / Order</th><th>Impact</th><th>Type</th><th>Finding</th><th>Scope</th><th>Code</th><th>Evidence</th></tr>
+                  </thead>
+                  <tbody>${renderDiagnosticTableRows(presentation)}</tbody>
+                </table>
+              </div>
+            </details>
+          ` : ""}
         </div>
-        ${renderDiagnosticImpactSummary(eventRows)}
-        <div class="fabric-diagnostic-chips">
-          ${diagnosticFindingChips(diagnostics)}
-        </div>
-        ${events.length ? `<ol class="fabric-diagnostic-events">${events.map(renderDiagnosticEvent).join("")}</ol>` : ""}
-        ${rawRows.length ? `
-          <details class="fabric-diagnostic-raw">
-            <summary>Raw decoded buckets</summary>
-            <div>
-              ${rawRows.map(([label, value]) => `<span><em>${escapeHtml(label)}</em>${escapeHtml(formatValue(value))}</span>`).join("")}
-            </div>
-          </details>
-        ` : ""}
-        ${eventRows.length ? `
-          <details class="fabric-diagnostic-raw"${tableState.open ? " open" : ""} data-fabric-diagnostic-table-key="${escapeHtml(tableKey)}">
-            <summary>Recent event sample (${escapeHtml(formatValue(sampleCount))} of ${escapeHtml(formatValue(presentation.total))})</summary>
-            ${renderDiagnosticTableControls(presentation)}
-            <div class="fabric-diagnostic-table-wrap">
-              <table class="fabric-diagnostic-table">
-                <thead>
-                  <tr><th>Time / Order</th><th>Impact</th><th>Type</th><th>Finding</th><th>Scope</th><th>Code</th><th>Evidence</th></tr>
-                </thead>
-                <tbody>${renderDiagnosticTableRows(presentation)}</tbody>
-              </table>
-            </div>
-          </details>
-        ` : ""}
-      </div>
+      </details>
     `;
   }
 
