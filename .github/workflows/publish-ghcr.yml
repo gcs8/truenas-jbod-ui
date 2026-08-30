@@ -121,6 +121,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -136,3 +137,22 @@ jobs:
             org.opencontainers.image.version=${{ steps.prep.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Record immutable image digest
+        shell: bash
+        env:
+          PUBLISHED_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PUBLISHED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Build output did not contain a valid sha256 manifest digest."
+            exit 1
+          fi
+          {
+            echo "### Immutable manifest digest"
+            echo
+            printf -- '- Image: `%s@%s`\n' "$IMAGE_NAME" "$PUBLISHED_DIGEST"
+            printf -- '- Source revision: `%s`\n' "$GITHUB_SHA"
+            echo
+            echo "Registry tags are mutable pointers. Deploy the image reference above for immutable activation and rollback evidence."
+          } >> "$GITHUB_STEP_SUMMARY"

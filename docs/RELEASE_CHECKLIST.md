@@ -48,14 +48,17 @@ using this shape:
 | Restored Linux QA perf harnesses | yes | artifact path and summary | Pass/Blocked/N/A | reason |
 | Snapshot/export/offline artifact gate | yes | command and browser smoke | Pass/Blocked/N/A | reason |
 | Docs/wiki/public-demo gate | yes | changed files, URLs, workflow runs | Pass/Blocked/N/A | reason |
-| GHCR publish verification | yes | workflow URL and digest | Pass/Blocked/N/A | reason |
-| Deployment refresh/sniff tests | yes | local/Linux/prod URLs or commands | Pass/Blocked/N/A | reason |
+| GHCR publish verification | yes | workflow URL, full `name@sha256` image reference, and exact source revision | Pass/Blocked/N/A | reason |
+| Deployment refresh/sniff tests | yes | validated private deployment receipt, exact Compose project/file/profile/service contract, pre-update rollback digest, running container image IDs, health/restart evidence, and rollback result | Pass/Blocked/N/A | reason |
 | Post-release reopen | yes | branch, commit, version | Pass/Blocked/N/A | reason |
 
 The wrap must also include the exact version, release commit, tag, GitHub
-release URL when published, GHCR digest when published, public demo workflow or
-Pages URL when applicable, external wiki commit when applicable, and any known
-deviations from the checklist.
+release URL when published, full `name@sha256` image reference and exact source
+revision when published, pre-update rollback digest, running container image IDs,
+validated private deployment-receipt result, exact Compose project/file/profile/service
+contract, health and restart evidence, rollback result, public demo workflow or Pages URL
+when applicable, external wiki commit when applicable, and any known deviations
+from the checklist.
 
 Before tagging, run the pre-tag release-wrap validator against the target
 version:
