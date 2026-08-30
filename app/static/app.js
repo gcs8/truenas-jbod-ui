@@ -6073,15 +6073,185 @@
     };
   }
 
+  function focusedGridSlotKey() {
+    const activeElement = document.activeElement;
+    if (!activeElement || !grid.contains(activeElement)) {
+      return null;
+    }
+    return activeElement.closest?.(".slot-tile[data-slot]")?.dataset?.slot || null;
+  }
+
+  function visibleGridTiles() {
+    return Array.from(grid.querySelectorAll(".slot-tile[data-slot]"))
+      .filter((tile) => !tile.classList.contains("filtered-out") && !tile.disabled);
+  }
+
+  function restoreGridFocus(slotKey) {
+    if (slotKey === null || slotKey === undefined) {
+      return;
+    }
+    const matchingTile = Array.from(grid.querySelectorAll(".slot-tile[data-slot]"))
+      .find((tile) => tile.dataset.slot === String(slotKey) && !tile.classList.contains("filtered-out") && !tile.disabled);
+    const fallbackTile = visibleGridTiles()[0] || null;
+    const recoveryTarget = searchBox?.isConnected && !searchBox.disabled ? searchBox : null;
+    (matchingTile || fallbackTile || recoveryTarget)?.focus({ preventScroll: true });
+  }
+
+  function fabricSlotNumberForGridTile(tile) {
+    const renderedSlotNumber = Number(tile?.dataset?.slot);
+    if (!Number.isInteger(renderedSlotNumber)) {
+      return null;
+    }
+    const selectedStorageView = getSelectedStorageViewRuntime();
+    if (!selectedStorageView) {
+      return renderedSlotNumber;
+    }
+    const storageViewSlot = getSelectedStorageViewRuntimeSlot(renderedSlotNumber);
+    const liveSlot = getLiveBackedStorageViewSlot(selectedStorageView, storageViewSlot);
+    return Number.isInteger(liveSlot?.slot) ? liveSlot.slot : null;
+  }
+
+  function refreshGridSelectionState() {
+    const peerContext = getSelectedPeerContext();
+    const fabricSlots = sasFabricSelectedSlotSet();
+    grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
+      const slotNumber = Number(tile.dataset.slot);
+      const selected = state.selectedSlot === slotNumber;
+      tile.classList.toggle("selected", selected);
+      tile.setAttribute("aria-pressed", selected ? "true" : "false");
+
+      const peerHighlighted = !selected && peerContext.active && peerContext.peerSlots.has(slotNumber);
+      tile.classList.toggle("peer-highlight", peerHighlighted);
+      tile.classList.toggle("peer-dimmed", !selected && peerContext.active && !peerHighlighted);
+
+      const fabricSlotNumber = fabricSlotNumberForGridTile(tile);
+      const fabricContextActive = fabricSlots.size > 0 && Number.isInteger(fabricSlotNumber);
+      const fabricHighlighted = fabricContextActive && fabricSlots.has(fabricSlotNumber);
+      tile.classList.toggle("fabric-highlight", fabricHighlighted);
+      tile.classList.toggle("fabric-dimmed", fabricContextActive && !fabricHighlighted);
+      if (fabricHighlighted) {
+        tile.classList.remove("peer-dimmed");
+      }
+    });
+  }
+
+  function delegatedLiveSlot(tile) {
+    if (getSelectedStorageViewRuntime() || getSelectedProfile()?.face_style === "nvme-carrier") {
+      return null;
+    }
+    const slotNumber = Number(tile?.dataset?.slot);
+    if (!Number.isInteger(slotNumber)) {
+      return null;
+    }
+    return getSlotById(slotNumber) || {
+      slot: slotNumber,
+      slot_label: formatSlotLabel(slotNumber),
+      state: "unknown",
+    };
+  }
+
+  function delegatedLiveTile(event) {
+    const tile = event.target?.closest?.(".slot-tile[data-slot]") || null;
+    return tile && grid.contains(tile) && delegatedLiveSlot(tile) ? tile : null;
+  }
+
+  function bindDelegatedLiveGridInteractions() {
+    grid.addEventListener("mouseover", (event) => {
+      const tile = delegatedLiveTile(event);
+      if (!tile || tile.contains(event.relatedTarget)) {
+        return;
+      }
+      const slot = delegatedLiveSlot(tile);
+      state.hoveredSlot = slot.slot;
+      refreshHoveredTooltip(tile);
+      positionSlotTooltip(event.clientX, event.clientY);
+      void ensureSmartSummary(slot);
+    });
+    grid.addEventListener("mousemove", (event) => {
+      const tile = delegatedLiveTile(event);
+      if (tile && state.hoveredSlot === Number(tile.dataset.slot)) {
+        positionSlotTooltip(event.clientX, event.clientY);
+      }
+    });
+    grid.addEventListener("mouseout", (event) => {
+      const tile = delegatedLiveTile(event);
+      if (!tile || tile.contains(event.relatedTarget)) {
+        return;
+      }
+      if (state.hoveredSlot === Number(tile.dataset.slot)) {
+        state.hoveredSlot = null;
+      }
+      hideSlotTooltip();
+    });
+    grid.addEventListener("focusin", (event) => {
+      const tile = delegatedLiveTile(event);
+      if (!tile) {
+        return;
+      }
+      const slot = delegatedLiveSlot(tile);
+      state.hoveredSlot = slot.slot;
+      refreshHoveredTooltip(tile);
+      positionSlotTooltipFromElement(tile);
+      void ensureSmartSummary(slot);
+    });
+    grid.addEventListener("focusout", (event) => {
+      const tile = delegatedLiveTile(event);
+      if (!tile || tile.contains(event.relatedTarget)) {
+        return;
+      }
+      if (state.hoveredSlot === Number(tile.dataset.slot)) {
+        state.hoveredSlot = null;
+      }
+      hideSlotTooltip();
+    });
+    grid.addEventListener("click", (event) => {
+      const tile = delegatedLiveTile(event);
+      if (!tile) {
+        return;
+      }
+      const slotNumber = Number(tile.dataset.slot);
+      if (state.selectedSlot === slotNumber) {
+        clearSelectedSlot();
+      } else {
+        selectSlot(slotNumber);
+      }
+    });
+    grid.addEventListener("keydown", (event) => {
+      const tile = delegatedLiveTile(event);
+      if (!tile || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+        return;
+      }
+      const tiles = visibleGridTiles();
+      const currentIndex = tiles.indexOf(tile);
+      if (currentIndex < 0) {
+        return;
+      }
+      const delta = event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 1;
+      const nextTile = tiles[currentIndex + delta];
+      if (!nextTile) {
+        return;
+      }
+      event.preventDefault();
+      nextTile.focus({ preventScroll: true });
+    });
+  }
+
   function renderGrid() {
+    const focusedSlotKeyBeforeRender = focusedGridSlotKey();
+    const finishGridRender = () => {
+      refreshGridSelectionState();
+      restoreGridFocus(focusedSlotKeyBeforeRender);
+    };
     const selectedStorageView = getSelectedStorageViewRuntime();
     if (selectedStorageView) {
       renderStorageViewGrid(selectedStorageView);
+      finishGridRender();
       return;
     }
     const selectedProfile = getSelectedProfile();
     if (selectedProfile?.face_style === "nvme-carrier") {
       renderLiveNvmeCarrierGrid(selectedProfile);
+      finishGridRender();
       return;
     }
     hideSlotTooltip();
@@ -6135,49 +6305,14 @@
       }
       tile.dataset.slot = String(slot.slot);
       tile.setAttribute("aria-label", slotTooltip(slot, getSmartSummaryEntry(slot)));
+      tile.setAttribute("aria-pressed", state.selectedSlot === slot.slot ? "true" : "false");
       tile.innerHTML = buildLiveSlotTileMarkup(slot);
       applyHeatmapToTile(tile, heatmapContext, slot.slot);
-      tile.addEventListener("mouseenter", (event) => {
-        state.hoveredSlot = slot.slot;
-        refreshHoveredTooltip(tile);
-        positionSlotTooltip(event.clientX, event.clientY);
-        void ensureSmartSummary(slot);
-      });
-      tile.addEventListener("mousemove", (event) => {
-        if (state.hoveredSlot === slot.slot) {
-          positionSlotTooltip(event.clientX, event.clientY);
-        }
-      });
-      tile.addEventListener("mouseleave", () => {
-        if (state.hoveredSlot === slot.slot) {
-          state.hoveredSlot = null;
-        }
-        hideSlotTooltip();
-      });
-      tile.addEventListener("focus", () => {
-        state.hoveredSlot = slot.slot;
-        refreshHoveredTooltip(tile);
-        positionSlotTooltipFromElement(tile);
-        void ensureSmartSummary(slot);
-      });
-      tile.addEventListener("blur", () => {
-        if (state.hoveredSlot === slot.slot) {
-          state.hoveredSlot = null;
-        }
-        hideSlotTooltip();
-      });
-      tile.addEventListener("click", (event) => {
-        event.stopPropagation();
-        if (state.selectedSlot === slot.slot) {
-          clearSelectedSlot();
-          return;
-        }
-        selectSlot(slot.slot);
-      });
       container.appendChild(tile);
     };
 
     renderChassisRows(layoutRows, geometry, appendTile);
+    finishGridRender();
   }
 
   function kvRow(label, value, copyable = false) {
@@ -9039,14 +9174,18 @@
     state.selectedSlot = slotNumber;
     state.history.panelError = null;
     syncSasFabricTraceToSlot(slotNumber);
-    renderAll();
+    refreshGridSelectionState();
+    renderSasFabric();
+    renderDetail();
   }
 
   function clearSelectedSlot() {
     state.selectedSlot = null;
     state.history.panelError = null;
     clearSasFabricBaySelection();
-    renderAll();
+    refreshGridSelectionState();
+    renderSasFabric();
+    renderDetail();
   }
 
   async function fetchJson(url, options = {}) {
@@ -9640,6 +9779,8 @@
   function resetTimer() {
     scheduleAutoRefresh();
   }
+
+  bindDelegatedLiveGridInteractions();
 
   searchBox.addEventListener("input", (event) => {
     state.search = event.target.value.trim().toLowerCase();
