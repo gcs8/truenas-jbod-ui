@@ -28,6 +28,10 @@ including data `raidz2` groups, the spare bay, special mirror members, matching
 empty bays, the `4x NVMe Carrier Card`, and `Boot SATADOMs`. It opens with no
 bay selected and preserves a 7-day history window.
 
+The page labels the committed capture time and artifact app version. GitHub
+Pages deploys that checked-in deterministic artifact unchanged. It does not
+regenerate from live or local history during a release publication.
+
 Public demo:
 
 - https://gcs8.github.io/truenas-jbod-ui/

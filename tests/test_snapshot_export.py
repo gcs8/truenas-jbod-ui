@@ -680,7 +680,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("preloadedSmartSummariesBySlot", rendered.html)
         self.assertIn("33105", rendered.html)
         self.assertIn("Frozen Offline Artifact", rendered.html)
-        self.assertIn("App v", rendered.html)
+        self.assertIn("Artifact app v", rendered.html)
         self.assertIn("metric samples", rendered.html)
         self.assertIn("SMART summaries", rendered.html)
         self.assertIn("events", rendered.html)

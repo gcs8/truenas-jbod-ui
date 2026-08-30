@@ -4,6 +4,7 @@
 {% set profile = snapshot.selected_profile %}
 {% set release_status_payload = release_status if release_status is defined and release_status else {} %}
 {% set release_note = release_status_payload.summary if release_status_payload and release_status_payload.summary else "Checking releases..." %}
+{% set snapshot_is_sanitized = snapshot_mode and (snapshot_export_meta.redaction == "partial" or snapshot_export_meta.redaction_label == "Scrambled IDs") %}
 <div class="app-shell">
   <header class="topbar">
     <div>
@@ -60,14 +61,14 @@
   {% if snapshot_mode %}
   <section class="panel snapshot-banner">
     <div class="snapshot-banner-copy">
-      <div class="snapshot-banner-badge">Frozen Offline Artifact</div>
-      <p class="eyebrow">Offline Snapshot</p>
+      <div class="snapshot-banner-badge">{% if snapshot_is_sanitized %}Frozen Sanitized Snapshot{% else %}Frozen Offline Artifact{% endif %}</div>
+      <p class="eyebrow">{% if snapshot_export_meta.redaction_label == "Scrambled IDs" %}Public Demo Artifact{% else %}Offline Snapshot{% endif %}</p>
       <h2>Explorable Enclosure Snapshot</h2>
       <p class="subtle">
-        Frozen point-in-time enclosure snapshot. Live actions are disabled, but you can still search, click slots, and inspect preloaded history offline.
+        {% if snapshot_is_sanitized %}Frozen, sanitized point-in-time snapshot. This is not live data. You can search, click slots, and inspect preloaded history offline.{% else %}Frozen point-in-time enclosure snapshot. Live actions are disabled, but you can still search, click slots, and inspect preloaded history offline.{% endif %}
       </p>
       <div class="snapshot-banner-facts">
-        <span class="snapshot-banner-fact">App v{{ snapshot_export_meta.app_version or "unknown" }}</span>
+        <span class="snapshot-banner-fact">Artifact app v{{ snapshot_export_meta.app_version or "unknown" }}</span>
         <span class="snapshot-banner-fact">{{ snapshot_export_meta.visible_bay_count or snapshot.layout_slot_count or (snapshot.slots | length) }} visible bays</span>
         {% if snapshot_export_meta.enclosure_count and snapshot_export_meta.enclosure_count > 1 %}
         <span class="snapshot-banner-fact">{{ snapshot_export_meta.enclosure_count }} live enclosures</span>
@@ -93,7 +94,7 @@
         <span class="summary-note">history view preserved</span>
       </div>
       <div class="summary-card compact">
-        <span class="summary-label">Generated</span>
+        <span class="summary-label">Capture time</span>
         <span class="summary-value" id="snapshot-generated-value">{{ snapshot_export_meta.generated_at or snapshot.last_updated }}</span>
         <span class="summary-note" id="snapshot-generated-note">re-rendered in viewer local time</span>
       </div>
@@ -265,7 +266,7 @@
             <button class="button secondary small" id="sas-fabric-toggle-button" type="button" aria-expanded="false">
               Topology
             </button>
-            <a class="button secondary small" id="sas-fabric-view-link" href="/sas-fabric">
+            <a class="button secondary small" id="sas-fabric-view-link" href="{{ sas_fabric_view_url }}">
               Storage Fabric
             </a>
             <div id="heatmap-controls" class="heatmap-controls hidden">
@@ -609,6 +610,7 @@
     slotCount: {{ snapshot.layout_slot_count or settings.layout.slot_count }},
     historyConfigured: {{ history_configured | tojson }},
     snapshotMode: {{ snapshot_mode | tojson }},
+    sasFabricViewUrl: {{ sas_fabric_view_url | tojson }},
     snapshotExportMeta: {{ snapshot_export_meta_json | script_json_text }},
     preloadedHistoryBySlot: {{ preloaded_history_json | script_json_text }},
     preloadedSmartSummariesBySlot: {{ preloaded_smart_summary_json | script_json_text }},

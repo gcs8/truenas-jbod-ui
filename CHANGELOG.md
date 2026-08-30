@@ -2,6 +2,11 @@
 
 ## Unreleased - 0.22.0-dev
 
+- Fixed the public-demo Storage Fabric action so static snapshots open their
+  in-page topology while live deployments preserve configured URL subpaths.
+- Made the checked-in demo's sanitized, frozen capture time and artifact app
+  version explicit, and documented that Pages publishes the committed capture
+  without regenerating from private history.
 - Added raw and gzip size budgets to the checked-in public-demo artifact gate so
   future payload growth fails visibly instead of only printing byte counts.
 - Aligned the public-demo publish workflow with the existing hosted-Chrome

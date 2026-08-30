@@ -1667,7 +1667,27 @@
     if (!sasFabricViewLink) {
       return;
     }
-    sasFabricViewLink.href = buildScopedUrl("/sas-fabric");
+    const baseUrl = String(bootstrap.sasFabricViewUrl || sasFabricViewLink.getAttribute("href") || "/sas-fabric");
+    sasFabricViewLink.href = state.snapshotMode ? baseUrl : buildScopedUrl(baseUrl);
+  }
+
+  function openSasFabricPanel() {
+    state.sasFabric.open = true;
+    renderAll();
+    if (sasFabricPanel) {
+      sasFabricPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    if (!state.snapshotMode) {
+      void fetchSasFabric(false, true);
+    }
+  }
+
+  function handleSasFabricViewLinkClick() {
+    if (!state.snapshotMode) {
+      return true;
+    }
+    openSasFabricPanel();
+    return true;
   }
 
   function sasFabricList(value) {
@@ -10390,15 +10410,16 @@
   }
   if (sasFabricToggleButton) {
     sasFabricToggleButton.addEventListener("click", () => {
-      state.sasFabric.open = !state.sasFabric.open;
-      renderAll();
       if (state.sasFabric.open) {
-        if (sasFabricPanel) {
-          sasFabricPanel.scrollIntoView({ behavior: "smooth", block: "start" });
-        }
-        void fetchSasFabric(false, true);
+        state.sasFabric.open = false;
+        renderAll();
+      } else {
+        openSasFabricPanel();
       }
     });
+  }
+  if (sasFabricViewLink) {
+    sasFabricViewLink.addEventListener("click", handleSasFabricViewLinkClick);
   }
   if (sasFabricRefreshButton) {
     sasFabricRefreshButton.addEventListener("click", () => {

@@ -1196,6 +1196,11 @@ def build_index_context(
     initial_history_panel_open_json: str = "false",
     initial_history_io_chart_mode_json: str = '"total"',
 ) -> dict[str, object]:
+    sas_fabric_view_url = (
+        "#sas-fabric-panel"
+        if snapshot_mode
+        else request.url_for("sas_fabric_view").path
+    )
     return {
         "request": request,
         "snapshot": snapshot,
@@ -1207,6 +1212,7 @@ def build_index_context(
         "app_version": app_version,
         "release_status": release_status or {},
         "snapshot_mode": snapshot_mode,
+        "sas_fabric_view_url": sas_fabric_view_url,
         "snapshot_export_meta": snapshot_export_meta or {},
         "snapshot_export_meta_json": snapshot_export_meta_json,
         "preloaded_history_json": preloaded_history_json,

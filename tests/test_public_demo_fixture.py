@@ -45,7 +45,11 @@ class PublicDemoArtifactTests(unittest.TestCase):
         demo_dir.mkdir(parents=True, exist_ok=True)
         marker_html = "\n".join(
             (
-                "Frozen Offline Artifact",
+                "Frozen Sanitized Snapshot",
+                "Artifact app v0.0.0-test",
+                "Capture time",
+                'id="sas-fabric-view-link" href="#sas-fabric-panel"',
+                'sasFabricViewUrl: "#sas-fabric-panel"',
                 "Live-derived CORE 60-bay sample",
                 "Scrambled IDs",
                 "4x NVMe Carrier Card",
@@ -134,7 +138,11 @@ class PublicDemoArtifactTests(unittest.TestCase):
         html = artifact_path.read_text(encoding="utf-8")
 
         for marker in (
-            "Frozen Offline Artifact",
+            "Frozen Sanitized Snapshot",
+            "Artifact app v0.21.0-dev",
+            "Capture time",
+            PUBLIC_DEMO_GENERATED_AT.isoformat(),
+            'id="sas-fabric-view-link" href="#sas-fabric-panel"',
             "Live-derived CORE 60-bay sample",
             "Scrambled IDs",
             "4x NVMe Carrier Card",
@@ -217,7 +225,10 @@ class PublicDemoFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(PUBLIC_DEMO_HISTORY_WINDOW_HOURS, 168)
         self.assertIn("preloadedSnapshotsByEnclosure", first_html)
         self.assertIn("preloadedStorageViewSmartSummaries", first_html)
-        self.assertIn("Frozen Offline Artifact", first_html)
+        self.assertIn("Frozen Sanitized Snapshot", first_html)
+        self.assertIn("Artifact app v", first_html)
+        self.assertIn("Capture time", first_html)
+        self.assertIn('id="sas-fabric-view-link" href="#sas-fabric-panel"', first_html)
         self.assertNotIn('src="/static/app.js"', first_html)
         self.assertNotIn('href="/static/style.css"', first_html)
         self.assertNotIn("/static/images/hyper-m2-gen3-card.png", first_html)
