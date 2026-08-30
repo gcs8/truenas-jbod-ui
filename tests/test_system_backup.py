@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 import tracemalloc
@@ -1190,6 +1191,53 @@ class SystemBackupServiceTests(unittest.TestCase):
                 self.backup_service._run_7z_command(["l", "bundle.7z"])
         self.assertTrue(process.killed)
 
+    def test_7z_prompt_channel_keeps_passphrase_out_of_process_argv(self) -> None:
+        fake_7z = self.temp_dir / "fake-7z-prompt.py"
+        fake_7z.write_text(
+            f"""#!{sys.executable}
+import os
+import sys
+import termios
+
+if not os.isatty(0):
+    raise SystemExit(3)
+attributes = termios.tcgetattr(0)
+attributes[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, attributes)
+sys.stdout.write("Enter password (will not be echoed):")
+sys.stdout.flush()
+if not sys.stdin.readline().endswith("\\n"):
+    raise SystemExit(4)
+sys.stdout.write("\\nEverything is Ok\\n")
+sys.stdout.flush()
+""",
+            encoding="utf-8",
+        )
+        fake_7z.chmod(0o700)
+        passphrase = "synthetic prompt secret   "
+
+        with patch("history_service.system_backup.SEVEN_ZIP_BINARY", str(fake_7z)):
+            result = self.backup_service._run_7z_command(
+                ["l", "bundle.7z"],
+                passphrase=passphrase,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn(passphrase, result.args)
+        self.assertNotIn(passphrase, result.stdout)
+        self.assertNotIn(passphrase, result.stderr)
+        self.assertIn("Everything is Ok", result.stdout)
+
+    def test_7z_prompt_channel_rejects_line_breaks_before_process_start(self) -> None:
+        with patch("history_service.system_backup.subprocess.Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "line breaks"):
+                self.backup_service._run_7z_command(
+                    ["l", "bundle.7z"],
+                    passphrase="synthetic\nsecret",
+                )
+
+        popen.assert_not_called()
+
     def test_directory_member_paths_reject_absolute_and_traversal_entries(self) -> None:
         invalid_paths = [
             "/tmp/outside.key",
@@ -1659,16 +1707,17 @@ class SystemBackupServiceTests(unittest.TestCase):
         args: list[str],
         *,
         cwd: Path | None = None,
+        passphrase: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = args[0]
-        passphrase = None
+        argv_passphrase = None
         output_dir: Path | None = None
         archive_path: Path | None = None
         members: list[str] = []
 
         for raw_arg in args[1:]:
             if raw_arg.startswith("-p"):
-                passphrase = raw_arg[2:]
+                argv_passphrase = raw_arg[2:]
                 continue
             if raw_arg.startswith("-o"):
                 output_dir = self._resolve_fake_7z_path(raw_arg[2:], cwd)
@@ -1679,6 +1728,8 @@ class SystemBackupServiceTests(unittest.TestCase):
                 archive_path = self._resolve_fake_7z_path(raw_arg, cwd)
             else:
                 members.append(raw_arg)
+
+        effective_passphrase = passphrase if passphrase is not None else argv_passphrase
 
         if archive_path is None:
             raise AssertionError(f"Missing archive path for fake 7z command: {args}")
@@ -1694,7 +1745,7 @@ class SystemBackupServiceTests(unittest.TestCase):
                 elif member_path.is_file():
                     relative_path = member_path.relative_to(cwd or member_path.parent)
                     files[str(relative_path).replace("\\", "/")] = member_path.read_bytes()
-            archive_path.write_bytes(self._encode_fake_7z_archive(files, passphrase))
+            archive_path.write_bytes(self._encode_fake_7z_archive(files, effective_passphrase))
             return subprocess.CompletedProcess(
                 ["7z", *args],
                 0,
@@ -1705,7 +1756,7 @@ class SystemBackupServiceTests(unittest.TestCase):
         payload = self._decode_fake_7z_archive(archive_path)
         expected_passphrase_token = payload.get("passphrase_kdf")
         archive_encrypted = bool(payload.get("encrypted"))
-        supplied_passphrase_token = self._fake_7z_passphrase_token(passphrase)
+        supplied_passphrase_token = self._fake_7z_passphrase_token(effective_passphrase)
         if archive_encrypted and supplied_passphrase_token != expected_passphrase_token:
             return subprocess.CompletedProcess(
                 ["7z", *args],
@@ -2088,6 +2139,47 @@ class SystemBackupServiceTests(unittest.TestCase):
                 self.assertTrue(result["encrypted"])
                 self.assertEqual(result["packaging"], "7z")
                 self.assertEqual(result["system_count"], 1)
+
+    def test_encrypted_backup_keeps_passphrase_out_of_every_7z_argument(self) -> None:
+        expected_passphrase = "synthetic portable passphrase   "
+        observed_commands: list[tuple[list[str], str | None]] = []
+
+        def fake_7z_command(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            passphrase: str | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertFalse(any(expected_passphrase in arg for arg in args))
+            observed_commands.append((list(args), passphrase))
+            return self._fake_7z_command(
+                args,
+                cwd=cwd,
+                passphrase=passphrase,
+            )
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=fake_7z_command,
+            ):
+                artifact = self.backup_service.export_bundle(
+                    encrypt=True,
+                    passphrase=expected_passphrase,
+                    packaging="7z",
+                )
+                result = self.backup_service.import_bundle(
+                    artifact.content,
+                    passphrase=expected_passphrase,
+                )
+
+        self.assertEqual([args[0] for args, _ in observed_commands], ["a", "l", "l", "x"])
+        self.assertTrue(
+            all(prompt_passphrase == expected_passphrase for _, prompt_passphrase in observed_commands)
+        )
+        self.assertTrue(result["encrypted"])
 
     def test_encrypted_backup_preserves_passphrase_whitespace_exactly(self) -> None:
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):

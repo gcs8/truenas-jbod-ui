@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import select
 import shutil
 import sqlite3
 import stat
@@ -14,6 +15,7 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import time
 import uuid
 import zipfile
 import zlib
@@ -2370,13 +2372,17 @@ class SystemBackupService:
             )
             return
         if packaging == "7z":
+            command = [
+                "l",
+                "-slt",
+                str(archive_path),
+            ]
+            prompt_passphrase = passphrase if passphrase else None
+            if prompt_passphrase is None:
+                command.append("-p")
             list_result = self._run_7z_command(
-                [
-                    "l",
-                    "-slt",
-                    str(archive_path),
-                    f"-p{passphrase or ''}",
-                ]
+                command,
+                passphrase=prompt_passphrase,
             )
             self._raise_for_7z_failure(
                 list_result,
@@ -2620,8 +2626,12 @@ class SystemBackupService:
             ]
             if passphrase is not None:
                 command.insert(4, "-mhe=on")
-                command.insert(4, f"-p{passphrase}")
-            result = self._run_7z_command(command, cwd=staging_dir)
+                command.insert(4, "-p")
+            result = self._run_7z_command(
+                command,
+                cwd=staging_dir,
+                passphrase=passphrase,
+            )
             self._raise_for_7z_failure(
                 result,
                 "Portable 7z backup export failed.",
@@ -2709,13 +2719,17 @@ class SystemBackupService:
             archive_path.write_bytes(archive_bytes)
             extract_dir.mkdir(parents=True, exist_ok=True)
 
+            prompt_passphrase = passphrase if passphrase else None
+            list_command = [
+                "l",
+                "-slt",
+                str(archive_path),
+            ]
+            if prompt_passphrase is None:
+                list_command.append("-p")
             list_result = self._run_7z_command(
-                [
-                    "l",
-                    "-slt",
-                    str(archive_path),
-                    f"-p{passphrase or ''}",
-                ]
+                list_command,
+                passphrase=prompt_passphrase,
             )
             self._raise_for_7z_failure(
                 list_result,
@@ -2736,15 +2750,18 @@ class SystemBackupService:
             )
             encrypted = "Encrypted = +" in list_result.stdout or "7zAES" in list_result.stdout
 
+            extract_command = [
+                "x",
+                str(archive_path),
+                f"-o{extract_dir}",
+                "-y",
+                "-bd",
+            ]
+            if prompt_passphrase is None:
+                extract_command.append("-p")
             extract_result = self._run_7z_command(
-                [
-                    "x",
-                    str(archive_path),
-                    f"-o{extract_dir}",
-                    "-y",
-                    "-bd",
-                    f"-p{passphrase or ''}",
-                ]
+                extract_command,
+                passphrase=prompt_passphrase,
             )
             self._raise_for_7z_failure(
                 extract_result,
@@ -3707,9 +3724,16 @@ class SystemBackupService:
         args: list[str],
         *,
         cwd: Path | None = None,
+        passphrase: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
             command = [SEVEN_ZIP_BINARY, *args]
+            if passphrase is not None:
+                return self._run_7z_prompt_command(
+                    command,
+                    cwd=cwd,
+                    passphrase=passphrase,
+                )
             process = subprocess.Popen(
                 command,
                 cwd=str(cwd) if cwd is not None else None,
@@ -3781,6 +3805,78 @@ class SystemBackupService:
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise ValueError("Portable 7z backup operation timed out.") from exc
+
+    @staticmethod
+    def _run_7z_prompt_command(
+        command: list[str],
+        *,
+        cwd: Path | None,
+        passphrase: str,
+    ) -> subprocess.CompletedProcess[str]:
+        if "\n" in passphrase or "\r" in passphrase:
+            raise ValueError("Portable 7z backup passphrases cannot contain line breaks.")
+        try:
+            import errno
+            import pty
+        except ImportError as exc:  # pragma: no cover - production images are Linux-based.
+            raise ValueError("Portable encrypted 7z backup support requires a POSIX terminal.") from exc
+
+        master_fd, slave_fd = pty.openpty()
+        process: subprocess.Popen[bytes] | None = None
+        output = bytearray()
+        prompt_seen = False
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd) if cwd is not None else None,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                close_fds=True,
+            )
+            os.close(slave_fd)
+            slave_fd = -1
+            deadline = time.monotonic() + SEVEN_ZIP_TIMEOUT_SECONDS
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    process.kill()
+                    process.wait()
+                    raise subprocess.TimeoutExpired(command, SEVEN_ZIP_TIMEOUT_SECONDS)
+                ready, _, _ = select.select([master_fd], [], [], min(remaining, 0.1))
+                if ready:
+                    try:
+                        chunk = os.read(master_fd, ARCHIVE_READ_CHUNK_BYTES)
+                    except OSError as exc:
+                        if exc.errno == errno.EIO:
+                            break
+                        raise
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    if len(output) > MAX_7Z_COMMAND_OUTPUT_BYTES:
+                        process.kill()
+                        process.wait()
+                        raise ValueError("Portable 7z backup command output exceeded its byte limit.")
+                    if not prompt_seen and b"Enter password" in output:
+                        os.write(master_fd, passphrase.encode("utf-8") + b"\n")
+                        prompt_seen = True
+                if process.poll() is not None and not ready:
+                    break
+            returncode = process.wait(timeout=max(deadline - time.monotonic(), 0.001))
+            return subprocess.CompletedProcess(
+                command,
+                returncode,
+                stdout=output.decode("utf-8", errors="replace"),
+                stderr="",
+            )
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            if slave_fd >= 0:
+                os.close(slave_fd)
+            os.close(master_fd)
 
     @staticmethod
     def _raise_for_7z_failure(

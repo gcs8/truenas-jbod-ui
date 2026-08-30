@@ -47,6 +47,11 @@ Selecting any locked path forces encrypted portable `.7z` export. That keeps
 secret material out of plaintext bundles while still letting the admin import
 path restore those same selected files later.
 
+The admin service supplies the 7z passphrase through a private, bounded terminal
+prompt. It does not place the passphrase in the 7z process arguments or command
+output. Passphrases may include spaces, including trailing spaces, but cannot
+contain carriage returns or line feeds because the 7z prompt is line-oriented.
+
 ## Optional scheduled state backups
 
 Scheduled backups use a separate one-shot container. The container has no
