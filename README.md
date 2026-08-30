@@ -81,6 +81,10 @@ docker compose up -d
 
 Optional services from the published image:
 
+Before starting the admin profile, read the
+[Admin Trust Boundary](docs/ADMIN_TRUST_BOUNDARY.md). Its default network mode
+assumes every client that can reach port `8082` is a trusted operator.
+
 ```bash
 docker compose --profile history up -d
 docker compose --profile admin up -d enclosure-admin
@@ -105,6 +109,13 @@ git clone https://github.com/gcs8/truenas-jbod-ui.git
 cd truenas-jbod-ui
 cp .env.example .env
 cp config/config.example.yaml config/config.yaml
+```
+
+Edit `.env` before the first start; values in `.env` override matching YAML settings.
+Replace the example connection values there, or remove an environment value when
+you intend `config/config.yaml` to own that setting.
+
+```bash
 docker compose -f docker-compose.dev.yml up -d --build
 ```
 

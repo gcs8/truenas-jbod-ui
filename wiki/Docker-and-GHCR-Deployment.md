@@ -432,6 +432,13 @@ recreate `enclosure-history`. Do not use `0777` or `0666` as a workaround.
 Turn on admin when you want guided setup, storage-view editing, backup/restore,
 runtime controls, or the profile builder:
 
+Before starting it, read the
+[Admin trust boundary](../docs/ADMIN_TRUST_BOUNDARY.md). The default network
+mode has no application login and treats every client that can reach port
+`8082` as a trusted operator. The mounted Docker socket gives the sidecar
+host-level container authority. Restrict network reachability to trusted
+operators. Auto-stop limits exposure; it is not authentication.
+
 ```bash
 docker compose --profile admin pull
 docker compose --profile admin up -d enclosure-admin
@@ -538,7 +545,13 @@ git clone https://github.com/gcs8/truenas-jbod-ui.git
 cd truenas-jbod-ui
 cp .env.example .env
 cp config/config.example.yaml config/config.yaml
+```
 
+Edit `.env` before the first start; values in `.env` override matching YAML settings.
+Replace the example connection values there, or remove an environment value when
+you intend `config/config.yaml` to own that setting.
+
+```bash
 docker compose -f docker-compose.dev.yml up -d --build
 docker compose -f docker-compose.dev.yml --profile history up -d --build
 docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin

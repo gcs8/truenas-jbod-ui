@@ -23,6 +23,13 @@ runtime service rather than a dev-only helper.
 Use the same folder you created in [[Quick Start|Quick-Start]], where
 `compose.yaml` and `.env` live.
 
+Before starting the sidecar, read the
+[Admin trust boundary](../docs/ADMIN_TRUST_BOUNDARY.md). The default network
+mode has no application login and treats every client that can reach port
+`8082` as a trusted operator. The mounted Docker socket gives the sidecar
+host-level container authority. Restrict network reachability to trusted
+operators. Auto-stop limits exposure; it is not authentication.
+
 If the main UI is already running and you only want to add the admin sidecar:
 
 ```bash
