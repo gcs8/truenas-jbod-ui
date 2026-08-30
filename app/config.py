@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.secret_files import load_secret_environment_value
 
 
 def _standard_runtime_config_path() -> Path:
@@ -112,6 +114,8 @@ class PerfConfig(BaseModel):
 
 
 class TrueNASConfig(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     host: str = "https://truenas.local"
     api_key: str = ""
     api_user: str = ""
@@ -137,6 +141,8 @@ class HANodeConfig(BaseModel):
 
 
 class SSHConfig(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     enabled: bool = False
     host: str = ""
     extra_hosts: list[str] = Field(default_factory=list)
@@ -182,6 +188,8 @@ class SSHConfig(BaseModel):
 
 
 class BMCConfig(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     enabled: bool = False
     host: str = ""
     username: str = ""
@@ -389,6 +397,8 @@ class AdminSurfaceConfig(BaseModel):
 
 
 class SystemConfig(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     id: str = "default"
     label: str | None = None
     truenas: TrueNASConfig = Field(default_factory=TrueNASConfig)
@@ -400,6 +410,8 @@ class SystemConfig(BaseModel):
 
 
 class Settings(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     app: AppConfig = Field(default_factory=AppConfig)
     perf: PerfConfig = Field(default_factory=PerfConfig)
     truenas: TrueNASConfig = Field(default_factory=TrueNASConfig)
@@ -486,6 +498,18 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "PATH_LOG_FILE": ("paths", "log_file"),
     "PATH_PROFILE_FILE": ("paths", "profile_file"),
     "PATH_SLOT_DETAIL_CACHE_FILE": ("paths", "slot_detail_cache_file"),
+}
+FILE_SECRET_ENV_OVERRIDES = frozenset(
+    {
+        "TRUENAS_API_KEY",
+        "TRUENAS_API_PASSWORD",
+        "SSH_PASSWORD",
+        "SSH_SUDO_PASSWORD",
+    }
+)
+EXACT_STRING_ENV_OVERRIDES = FILE_SECRET_ENV_OVERRIDES | {
+    "TRUENAS_API_USER",
+    "SSH_USER",
 }
 
 
@@ -959,10 +983,17 @@ def get_settings() -> Settings:
     merged = _deep_merge(merged, runtime_overrides)
 
     for env_name, target_path in ENV_OVERRIDES.items():
-        raw_value = os.getenv(env_name)
+        raw_value = (
+            load_secret_environment_value(env_name)
+            if env_name in FILE_SECRET_ENV_OVERRIDES
+            else os.getenv(env_name)
+        )
         if raw_value is None:
             continue
-        _set_path_value(merged, target_path, _parse_scalar(raw_value))
+        parsed_value = (
+            raw_value if env_name in EXACT_STRING_ENV_OVERRIDES else _parse_scalar(raw_value)
+        )
+        _set_path_value(merged, target_path, parsed_value)
     _apply_legacy_cache_ttl_compat(merged, yaml_config, runtime_overrides)
 
     merged = _apply_config_path_relative_defaults(

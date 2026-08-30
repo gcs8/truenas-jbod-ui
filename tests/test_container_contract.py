@@ -9,6 +9,14 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILES = ("docker-compose.yml", "docker-compose.dev.yml")
+SUPPORTED_COMPOSE_FILES = (*COMPOSE_FILES, "docker-compose.secrets.yml")
+EXPECTED_COMPOSE_SECRETS = {
+    "truenas_api_key": "TRUENAS_API_KEY_FILE",
+    "truenas_api_password": "TRUENAS_API_PASSWORD_FILE",
+    "ssh_password": "SSH_PASSWORD_FILE",
+    "ssh_sudo_password": "SSH_SUDO_PASSWORD_FILE",
+    "admin_auth_password": "ADMIN_AUTH_PASSWORD_FILE",
+}
 EXPECTED_MEMORY_LIMITS = {
     "enclosure-ui": "${APP_MEM_LIMIT:-1g}",
     "enclosure-history": "${HISTORY_MEM_LIMIT:-1g}",
@@ -28,7 +36,55 @@ class ContainerResourceContractTests(unittest.TestCase):
                 if compose_reference == "docker-compose.override.yml":
                     self.assertTrue((REPO_ROOT / f"{compose_reference}.example").is_file())
                 else:
-                    self.assertIn(compose_reference, COMPOSE_FILES)
+                    self.assertIn(compose_reference, SUPPORTED_COMPOSE_FILES)
+
+    def test_secret_overlay_grants_only_required_service_scoped_files(self) -> None:
+        overlay_path = REPO_ROOT / "docker-compose.secrets.yml"
+        self.assertTrue(overlay_path.is_file())
+        overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
+        services = overlay["services"]
+        self.assertEqual(set(services), {"enclosure-ui", "enclosure-admin"})
+        self.assertEqual(set(overlay["secrets"]), set(EXPECTED_COMPOSE_SECRETS))
+
+        ui_secret_names = set(services["enclosure-ui"]["secrets"])
+        admin_secret_names = set(services["enclosure-admin"]["secrets"])
+        self.assertEqual(ui_secret_names, set(EXPECTED_COMPOSE_SECRETS) - {"admin_auth_password"})
+        self.assertEqual(admin_secret_names, set(EXPECTED_COMPOSE_SECRETS))
+
+        for secret_name, env_name in EXPECTED_COMPOSE_SECRETS.items():
+            with self.subTest(secret=secret_name):
+                self.assertEqual(
+                    services["enclosure-admin"]["environment"][env_name],
+                    f"/run/secrets/{secret_name}",
+                )
+                source = overlay["secrets"][secret_name]["file"]
+                self.assertTrue(str(source).startswith("./secrets/"))
+        for secret_name in ui_secret_names:
+            env_name = EXPECTED_COMPOSE_SECRETS[secret_name]
+            self.assertEqual(
+                services["enclosure-ui"]["environment"][env_name],
+                f"/run/secrets/{secret_name}",
+            )
+
+        for compose_name in COMPOSE_FILES:
+            base_compose = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))
+            bind_roots: set[Path] = set()
+            for service in base_compose["services"].values():
+                for volume in service.get("volumes", []):
+                    if isinstance(volume, str) and volume.startswith("./") and ":" in volume:
+                        bind_roots.add((REPO_ROOT / volume.split(":", 1)[0]).resolve())
+            for secret in overlay["secrets"].values():
+                source_path = (REPO_ROOT / secret["file"]).resolve()
+                for bind_root in bind_roots:
+                    with self.subTest(
+                        compose=compose_name,
+                        source=source_path.name,
+                        bind_root=bind_root.name,
+                    ):
+                        self.assertFalse(source_path == bind_root or bind_root in source_path.parents)
+
+        gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("secrets/*", gitignore.splitlines())
 
     def test_dockerfile_is_the_single_owner_of_the_ui_healthcheck(self) -> None:
         dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")

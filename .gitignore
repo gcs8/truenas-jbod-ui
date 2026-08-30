@@ -9,6 +9,7 @@ config/ssh/*
 !config/ssh/.gitkeep
 config/tls/*
 config/backup-secrets/*
+secrets/*
 data/slot_mappings.json
 data/sas_fabric_aliases.json
 data/slot_detail_cache.json

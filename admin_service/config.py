@@ -8,6 +8,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from app.secret_files import load_secret_environment_value
+
 
 class AdminSettings(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
@@ -69,6 +71,7 @@ ENV_OVERRIDES: dict[str, str] = {
     "ADMIN_CLEAN_BACKUP_TARGETS_JSON": "clean_backup_targets",
     "ADMIN_HOST_PREP_TEMP_DIR": "host_prep_temp_dir",
 }
+FILE_SECRET_ENV_OVERRIDES = frozenset({"ADMIN_AUTH_PASSWORD"})
 
 
 def _parse_scalar(value: str):
@@ -90,7 +93,11 @@ def _parse_scalar(value: str):
 def get_admin_settings() -> AdminSettings:
     payload = AdminSettings().model_dump()
     for env_name, field_name in ENV_OVERRIDES.items():
-        raw_value = os.getenv(env_name)
+        raw_value = (
+            load_secret_environment_value(env_name)
+            if env_name in FILE_SECRET_ENV_OVERRIDES
+            else os.getenv(env_name)
+        )
         if raw_value is None:
             continue
         payload[field_name] = (
