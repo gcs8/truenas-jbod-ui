@@ -23,12 +23,6 @@ services:
       - ./backup-status:/app/backup-status:ro
     restart: unless-stopped
     mem_limit: ${APP_MEM_LIMIT:-1g}
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=4)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
 
   enclosure-history:
     profiles:
@@ -152,3 +146,5 @@ services:
       - ./config/backup-secrets:/run/backup-secrets:ro
     restart: "no"
     mem_limit: ${BACKUP_MEM_LIMIT:-1g}
+    healthcheck:
+      disable: true
