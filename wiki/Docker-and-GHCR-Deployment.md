@@ -37,6 +37,7 @@ curl -fsSL \
 Create a minimal `.env` for one TrueNAS system:
 
 ```bash
+umask 077
 cat > .env <<'EOF'
 APP_PORT=8080
 JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:latest
@@ -48,6 +49,7 @@ TRUENAS_VERIFY_SSL=false
 
 SSH_ENABLED=false
 EOF
+chmod 600 .env
 ```
 
 Then pull and start:
@@ -62,6 +64,51 @@ Open:
 ```text
 http://your-docker-host:8080
 ```
+
+## Optional File-Backed Secrets
+
+The base Compose file keeps `.env` compatibility. For service-scoped secret
+files, download `docker-compose.secrets.yml` from the same release ref as the
+base Compose file and create its ignored source directory:
+
+```bash
+umask 077
+mkdir -p secrets
+$EDITOR secrets/truenas_api_key
+$EDITOR secrets/truenas_api_password
+$EDITOR secrets/ssh_password
+$EDITOR secrets/ssh_sudo_password
+$EDITOR secrets/admin_auth_password
+chmod 600 secrets/*
+```
+
+Create all five files before applying the overlay. An unused optional secret
+may be an empty private file. Do not set a blank `_FILE` path: that is treated
+as a startup error. The overlay mounts only the four appliance/SSH files into
+the UI and all five into admin; history and scheduled backup receive none.
+
+Supported variables are `TRUENAS_API_KEY_FILE`,
+`TRUENAS_API_PASSWORD_FILE`, `SSH_PASSWORD_FILE`,
+`SSH_SUDO_PASSWORD_FILE`, and `ADMIN_AUTH_PASSWORD_FILE`. A file-backed value
+takes precedence over its direct environment value. The loader rejects
+symlinks, non-regular or group/world-writable files, invalid UTF-8, NUL,
+and values larger than 64 KiB. It preserves whitespace except one final LF or
+CRLF.
+
+Start with both Compose files:
+
+```bash
+docker compose -f compose.yaml -f docker-compose.secrets.yml pull
+docker compose -f compose.yaml -f docker-compose.secrets.yml up -d
+```
+
+This compatibility path applies only to the top-level single-system process
+variables. It does not externalize saved multi-system or BMC credentials from
+`config/config.yaml`. Keep that file and admin-generated backups protected.
+
+To roll back, stop the stack, omit `docker-compose.secrets.yml`, restore the
+matching direct values in `.env`, confirm `chmod 600 .env`, and recreate the
+same profiles. The base Compose file is unchanged by the overlay.
 
 ## What Stays On Your Host
 

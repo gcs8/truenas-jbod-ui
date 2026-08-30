@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
@@ -122,6 +123,28 @@ class AdminAuthenticationTests(unittest.TestCase):
             self.assertEqual(settings.auth_password.get_secret_value(), "true")
         finally:
             get_admin_settings.cache_clear()
+
+    def test_auth_password_file_overrides_direct_environment_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            password_path = temp_path / "admin-password"
+            password_path.write_bytes(b" file-pass \r\n")
+            password_path.chmod(0o600)
+            environment = {
+                "ADMIN_AUTH_MODE": "basic",
+                "ADMIN_AUTH_USERNAME": "direct-user",
+                "ADMIN_AUTH_PASSWORD": "direct-password-must-not-win",
+                "ADMIN_AUTH_PASSWORD_FILE": str(password_path),
+            }
+            get_admin_settings.cache_clear()
+            try:
+                with patch.dict("os.environ", environment, clear=True):
+                    settings = get_admin_settings()
+                self.assertEqual(settings.auth_username, "direct-user")
+                assert settings.auth_password is not None
+                self.assertEqual(settings.auth_password.get_secret_value(), " file-pass ")
+            finally:
+                get_admin_settings.cache_clear()
 
     def test_basic_auth_comparison_accepts_only_exact_credentials(self) -> None:
         settings = AdminSettings(
