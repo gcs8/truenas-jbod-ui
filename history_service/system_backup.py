@@ -216,11 +216,15 @@ MAX_BACKUP_ARCHIVE_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_COUNT = 1024
 MAX_ARCHIVE_MEMBER_BYTES = 1536 * 1024 * 1024
 MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES = 4 * 1024 * 1024 * 1024
+MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES = 6 * 1024 * 1024 * 1024
 MAX_ARCHIVE_COMPRESSION_RATIO = 200
 MAX_ARCHIVE_METADATA_BYTES = 8 * 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_7Z_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
 ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024
+
+ExtractedMember = bytes | Path
 
 
 @dataclass(slots=True)
@@ -281,7 +285,7 @@ class _ImportActivationTransaction:
 
     def __init__(
         self,
-        extracted_members: dict[str, bytes],
+        extracted_members: dict[str, ExtractedMember],
         *,
         history_store: HistoryStore | None = None,
     ) -> None:
@@ -306,7 +310,10 @@ class _ImportActivationTransaction:
                 staged_path = self.staging_root / hashlib.sha256(
                     member_key.encode("utf-8")
                 ).hexdigest()
-                self._write_staged_bytes(staged_path, content)
+                if isinstance(content, Path):
+                    self._copy_staged_file(staged_path, content)
+                else:
+                    self._write_staged_bytes(staged_path, content)
                 self._staged_members[member_key] = staged_path
             self._fsync_directory(self.staging_root)
             self._fsync_directory(self.rollback_root)
@@ -733,6 +740,16 @@ class _ImportActivationTransaction:
             handle.flush()
             os.fsync(handle.fileno())
 
+    @classmethod
+    def _copy_staged_file(cls, target_path: Path, source_path: Path) -> None:
+        source_metadata = source_path.stat(follow_symlinks=False)
+        if source_path.is_symlink() or not stat.S_ISREG(source_metadata.st_mode):
+            raise ValueError("Backup bundle extracted member is not a regular file.")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_path, target_path, follow_symlinks=False)
+        target_path.chmod(cls._MISSING_FILE_MODE)
+        cls._fsync_file(target_path)
+
     @staticmethod
     def _path_exists(path: Path) -> bool:
         return path.exists() or path.is_symlink()
@@ -1158,29 +1175,33 @@ class SystemBackupService:
             archive_bytes,
             passphrase=passphrase,
         )
-        if not archive_meta.get("encrypted"):
-            raise ValueError("Scheduled backup encryption could not be verified.")
-        group_entries = self._manifest_group_entries(manifest)
-        selected_groups = [
-            key
-            for key, entry in group_entries.items()
-            if self._manifest_group_selected(entry)
-        ]
-        if set(selected_groups) != set(expected_groups) or len(selected_groups) != len(expected_groups):
-            raise ValueError("Scheduled backup selected groups do not match its configuration.")
-        self._validate_manifest_member_metadata(manifest, extracted)
-        self._preflight_selected_group_members(manifest, group_entries, extracted)
-        self._preflight_import_members(manifest, group_entries, extracted)
-        absent_groups = [
-            key
-            for key in expected_groups
-            if not self._manifest_group_present(group_entries.get(key))
-        ]
-        return {
-            "manifest": manifest,
-            "selected_groups": selected_groups,
-            "absent_groups": absent_groups,
-        }
+        cleanup_root = archive_meta.pop("_cleanup_root", None)
+        try:
+            if not archive_meta.get("encrypted"):
+                raise ValueError("Scheduled backup encryption could not be verified.")
+            group_entries = self._manifest_group_entries(manifest)
+            selected_groups = [
+                key
+                for key, entry in group_entries.items()
+                if self._manifest_group_selected(entry)
+            ]
+            if set(selected_groups) != set(expected_groups) or len(selected_groups) != len(expected_groups):
+                raise ValueError("Scheduled backup selected groups do not match its configuration.")
+            self._validate_manifest_member_metadata(manifest, extracted)
+            self._preflight_selected_group_members(manifest, group_entries, extracted)
+            self._preflight_import_members(manifest, group_entries, extracted)
+            absent_groups = [
+                key
+                for key in expected_groups
+                if not self._manifest_group_present(group_entries.get(key))
+            ]
+            return {
+                "manifest": manifest,
+                "selected_groups": selected_groups,
+                "absent_groups": absent_groups,
+            }
+        finally:
+            self._cleanup_extracted_archive(cleanup_root)
 
     @staticmethod
     def _scheduled_backup_key(passphrase: str, salt: bytes) -> bytes:
@@ -1382,33 +1403,40 @@ class SystemBackupService:
             content,
             passphrase=passphrase,
         )
-        group_entries = self._manifest_group_entries(manifest)
-        self._validate_manifest_member_metadata(manifest, extracted)
-        self._preflight_selected_group_members(manifest, group_entries, extracted)
-        self._preflight_import_members(manifest, group_entries, extracted)
+        cleanup_root = archive_meta.pop("_cleanup_root", None)
         try:
-            with _ImportActivationTransaction(
-                extracted,
-                history_store=self.store,
-            ) as transaction:
-                result = self._activate_import_bundle(
-                    manifest,
+            group_entries = self._manifest_group_entries(manifest)
+            self._validate_manifest_member_metadata(manifest, extracted)
+            self._preflight_selected_group_members(manifest, group_entries, extracted)
+            self._preflight_import_members(manifest, group_entries, extracted)
+            try:
+                with _ImportActivationTransaction(
                     extracted,
-                    group_entries,
-                    detected_packaging,
-                    archive_meta,
-                    transaction,
-                )
-                transaction.commit()
-                return result
-        except Exception:
-            get_settings.cache_clear()
-            raise
+                    history_store=self.store,
+                ) as transaction:
+                    extraction_root = cleanup_root
+                    cleanup_root = None
+                    self._cleanup_extracted_archive(extraction_root)
+                    result = self._activate_import_bundle(
+                        manifest,
+                        extracted,
+                        group_entries,
+                        detected_packaging,
+                        archive_meta,
+                        transaction,
+                    )
+                    transaction.commit()
+                    return result
+            except Exception:
+                get_settings.cache_clear()
+                raise
+        finally:
+            self._cleanup_extracted_archive(cleanup_root)
 
     def _activate_import_bundle(
         self,
         manifest: dict[str, Any],
-        extracted: dict[str, bytes],
+        extracted: dict[str, ExtractedMember],
         group_entries: dict[str, dict[str, Any]],
         detected_packaging: ArchivePackaging,
         archive_meta: dict[str, Any],
@@ -1556,13 +1584,26 @@ class SystemBackupService:
         get_settings.cache_clear()
         return get_settings()
 
+    @staticmethod
+    def _cleanup_extracted_archive(cleanup_root: Any) -> None:
+        if cleanup_root is None:
+            return
+        root = Path(cleanup_root)
+        if root.exists():
+            try:
+                shutil.rmtree(root)
+            except OSError as exc:
+                raise RuntimeError(
+                    "Backup bundle extraction workspace cleanup failed."
+                ) from exc
+
     def _preflight_import_members(
         self,
         manifest: dict[str, Any],
         group_entries: dict[str, dict[str, Any]],
-        extracted_members: dict[str, bytes],
+        extracted_members: dict[str, ExtractedMember],
     ) -> None:
-        validators = {
+        validators: dict[str, Any] = {
             CONFIG_FILE_KEY: self._validate_config_member,
             RUNTIME_OVERRIDES_FILE_KEY: self._validate_runtime_overrides_member,
             PROFILE_FILE_KEY: self._validate_profile_member,
@@ -1584,7 +1625,11 @@ class SystemBackupService:
             if member_key not in extracted_members:
                 raise ValueError(f"Backup bundle is missing the selected {group_key} member.")
             try:
-                validator(extracted_members[member_key])
+                content = extracted_members[member_key]
+                if group_key == HISTORY_DB_KEY:
+                    self._validate_history_member(content)
+                else:
+                    validator(self._extracted_member_bytes(content))
             except (UnicodeError, yaml.YAMLError, json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as exc:
                 raise ValueError(
                     f"Backup bundle selected {group_key} member is invalid."
@@ -1594,7 +1639,7 @@ class SystemBackupService:
         self,
         manifest: dict[str, Any],
         group_entries: dict[str, dict[str, Any]],
-        extracted_members: dict[str, bytes],
+        extracted_members: dict[str, ExtractedMember],
     ) -> None:
         for group_key, group_entry in group_entries.items():
             if not self._manifest_group_selected(group_entry):
@@ -1632,7 +1677,7 @@ class SystemBackupService:
     def _validate_manifest_member_metadata(
         self,
         manifest: dict[str, Any],
-        extracted_members: dict[str, bytes],
+        extracted_members: dict[str, ExtractedMember],
     ) -> None:
         seen_keys: set[str] = set()
         seen_paths: set[str] = set()
@@ -1663,7 +1708,7 @@ class SystemBackupService:
                     raise ValueError(
                         f"Backup bundle member {archive_path} has invalid size metadata."
                     )
-                if len(content) != expected_size:
+                if self._extracted_member_size(content) != expected_size:
                     raise ValueError(
                         f"Backup bundle member {archive_path} size does not match its manifest."
                     )
@@ -1675,10 +1720,32 @@ class SystemBackupService:
                     raise ValueError(
                         f"Backup bundle member {archive_path} has invalid SHA-256 metadata."
                     )
-                if hashlib.sha256(content).hexdigest() != digest:
+                if self._extracted_member_sha256(content) != digest:
                     raise ValueError(
                         f"Backup bundle member {archive_path} SHA-256 does not match its manifest."
                     )
+
+    @staticmethod
+    def _extracted_member_bytes(content: ExtractedMember) -> bytes:
+        if isinstance(content, bytes):
+            return content
+        return content.read_bytes()
+
+    @staticmethod
+    def _extracted_member_size(content: ExtractedMember) -> int:
+        if isinstance(content, bytes):
+            return len(content)
+        return content.stat(follow_symlinks=False).st_size
+
+    @staticmethod
+    def _extracted_member_sha256(content: ExtractedMember) -> str:
+        if isinstance(content, bytes):
+            return hashlib.sha256(content).hexdigest()
+        digest = hashlib.sha256()
+        with content.open("rb", buffering=0) as source:
+            while chunk := source.read(ARCHIVE_READ_CHUNK_BYTES):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     @staticmethod
     def _load_yaml_mapping(content: bytes) -> dict[str, Any]:
@@ -1750,10 +1817,13 @@ class SystemBackupService:
             SlotDetailCacheEntry.model_validate(entry)
 
     @staticmethod
-    def _validate_history_member(content: bytes) -> None:
+    def _validate_history_member(content: ExtractedMember) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            candidate_path = Path(temp_dir) / "history.sqlite3"
-            candidate_path.write_bytes(content)
+            if isinstance(content, Path):
+                candidate_path = content
+            else:
+                candidate_path = Path(temp_dir) / "history.sqlite3"
+                candidate_path.write_bytes(content)
             database_uri = f"{candidate_path.resolve().as_uri()}?mode=ro"
             with closing(sqlite3.connect(database_uri, uri=True)) as connection:
                 rows = connection.execute("PRAGMA quick_check").fetchall()
@@ -2275,6 +2345,10 @@ class SystemBackupService:
         bundle_members: list[BundleMember],
         extra_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        member_limit, expanded_limit = self._expanded_limits_for_packaging(packaging)
+        large_member_group_keys = (
+            frozenset({HISTORY_DB_KEY}) if packaging == "7z" else frozenset()
+        )
         manifest = {
             "schema_version": BUNDLE_SCHEMA_VERSION,
             "format": format_name,
@@ -2291,7 +2365,12 @@ class SystemBackupService:
                 for system in app_settings.systems
             ],
             "groups": self._collect_group_specs(bundle_groups),
-            "files": self._collect_file_specs(bundle_members),
+            "files": self._collect_file_specs(
+                bundle_members,
+                member_limit=member_limit,
+                expanded_limit=expanded_limit,
+                large_member_group_keys=large_member_group_keys,
+            ),
         }
         if extra_fields:
             manifest.update(extra_fields)
@@ -2314,17 +2393,29 @@ class SystemBackupService:
         ]
 
     @classmethod
-    def _collect_file_specs(cls, bundle_members: list[BundleMember]) -> list[dict[str, Any]]:
+    def _collect_file_specs(
+        cls,
+        bundle_members: list[BundleMember],
+        *,
+        member_limit: int = MAX_ARCHIVE_MEMBER_BYTES,
+        expanded_limit: int = MAX_ARCHIVE_EXPANDED_BYTES,
+        large_member_group_keys: frozenset[str] = frozenset(),
+    ) -> list[dict[str, Any]]:
         if len(bundle_members) + 1 > MAX_ARCHIVE_MEMBER_COUNT:
             raise ValueError("Backup bundle archive contains too many members.")
         manifest_files: list[dict[str, Any]] = []
         expanded_total = 0
         for member in bundle_members:
             size_bytes, digest = cls._bundle_member_size_and_digest(member)
-            if size_bytes > MAX_ARCHIVE_MEMBER_BYTES:
+            effective_member_limit = (
+                member_limit
+                if member.group_key in large_member_group_keys
+                else min(member_limit, MAX_ARCHIVE_MEMBER_BYTES)
+            )
+            if size_bytes > effective_member_limit:
                 raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
             expanded_total += size_bytes
-            if expanded_total > MAX_ARCHIVE_EXPANDED_BYTES:
+            if expanded_total > expanded_limit:
                 raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
             manifest_files.append(
                 {
@@ -2337,6 +2428,15 @@ class SystemBackupService:
                 }
             )
         return manifest_files
+
+    @staticmethod
+    def _expanded_limits_for_packaging(packaging: ArchivePackaging) -> tuple[int, int]:
+        if packaging == "7z":
+            return (
+                MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+                MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+            )
+        return MAX_ARCHIVE_MEMBER_BYTES, MAX_ARCHIVE_EXPANDED_BYTES
 
     def _validate_export_archive(
         self,
@@ -2397,6 +2497,8 @@ class SystemBackupService:
             self._validate_7z_listed_entries(
                 listed_entries,
                 archive_size=archive_size,
+                member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+                expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
             )
             return
         raise ValueError(f"Unsupported backup packaging '{packaging}'.")
@@ -2644,7 +2746,7 @@ class SystemBackupService:
         archive_bytes: bytes,
         *,
         passphrase: str | None = None,
-    ) -> tuple[dict[str, Any], dict[str, bytes], ArchivePackaging, dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, ExtractedMember], ArchivePackaging, dict[str, Any]]:
         if archive_bytes.startswith(ENCRYPTED_BACKUP_MAGIC):
             decrypted = self._decrypt_scheduled_archive(archive_bytes, passphrase)
             manifest, extracted, packaging, archive_meta = self._read_archive(decrypted)
@@ -2712,9 +2814,9 @@ class SystemBackupService:
         archive_bytes: bytes,
         *,
         passphrase: str | None = None,
-    ) -> tuple[dict[str, Any], dict[str, bytes], ArchivePackaging, dict[str, Any]]:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir)
+    ) -> tuple[dict[str, Any], dict[str, ExtractedMember], ArchivePackaging, dict[str, Any]]:
+        temp_root = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-7z-import-"))
+        try:
             archive_path = temp_root / "bundle.7z"
             extract_dir = temp_root / "extract"
             archive_path.write_bytes(archive_bytes)
@@ -2739,7 +2841,12 @@ class SystemBackupService:
                 reading_archive=True,
             )
             listed_entries = self._seven_zip_listed_entries(list_result.stdout, archive_path)
-            self._validate_7z_listed_entries(listed_entries, archive_size=len(archive_bytes))
+            self._validate_7z_listed_entries(
+                listed_entries,
+                archive_size=len(archive_bytes),
+                member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+                expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+            )
             listed_paths = [entry["Path"] for entry in listed_entries]
             listed_file_paths = [
                 entry["Path"]
@@ -2750,6 +2857,55 @@ class SystemBackupService:
                 listed_paths
             )
             encrypted = "Encrypted = +" in list_result.stdout or "7zAES" in list_result.stdout
+
+            manifest_entries = [
+                entry
+                for entry in listed_entries
+                if not self._is_7z_directory_entry(entry)
+                and self._normalize_archive_member_path(entry["Path"]) == "manifest.json"
+            ]
+            if len(manifest_entries) != 1:
+                raise ValueError("Backup bundle is missing manifest.json.")
+            manifest_entry = manifest_entries[0]
+            if int(manifest_entry["Size"]) > MAX_MANIFEST_BYTES:
+                raise ValueError("Backup bundle manifest exceeds its size limit.")
+
+            manifest_extract_command = [
+                "x",
+                str(archive_path),
+                f"-o{extract_dir}",
+                "-y",
+                "-bd",
+            ]
+            if prompt_passphrase is None:
+                manifest_extract_command.append("-p")
+            manifest_extract_command.append("manifest.json")
+            manifest_extract_result = self._run_7z_command(
+                manifest_extract_command,
+                passphrase=prompt_passphrase,
+            )
+            self._raise_for_7z_failure(
+                manifest_extract_result,
+                "Backup bundle 7z manifest could not be extracted.",
+                passphrase=passphrase,
+                reading_archive=True,
+            )
+
+            manifest_path = extract_dir / "manifest.json"
+            if not manifest_path.exists():
+                raise ValueError("Backup bundle is missing manifest.json.")
+            self._validate_extracted_7z_tree(extract_dir, [manifest_entry])
+            if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
+                raise ValueError("Backup bundle manifest exceeds its size limit.")
+            manifest = self._load_manifest(manifest_path.read_bytes())
+            self._validate_manifest_before_extraction(
+                manifest,
+                member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+                expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+                large_member_group_keys=frozenset({HISTORY_DB_KEY}),
+            )
+            self._validate_supported_physical_archive_paths(listed_file_paths, manifest)
+            self._validate_7z_listing_against_manifest(listed_entries, manifest)
 
             extract_command = [
                 "x",
@@ -2770,18 +2926,20 @@ class SystemBackupService:
                 passphrase=passphrase,
                 reading_archive=True,
             )
-
-            manifest_path = extract_dir / "manifest.json"
-            if not manifest_path.exists():
-                raise ValueError("Backup bundle is missing manifest.json.")
             self._validate_extracted_7z_tree(extract_dir, listed_entries)
-            if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
-                raise ValueError("Backup bundle manifest exceeds its size limit.")
-            manifest = self._load_manifest(manifest_path.read_bytes())
-            self._validate_manifest_before_extraction(manifest)
-            self._validate_supported_physical_archive_paths(listed_file_paths, manifest)
             extracted = self._extract_manifest_directory_members(extract_dir, manifest)
-            return manifest, extracted, "7z", {"encrypted": encrypted}
+            return manifest, extracted, "7z", {
+                "encrypted": encrypted,
+                "_cleanup_root": temp_root,
+            }
+        except Exception:
+            try:
+                shutil.rmtree(temp_root)
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    "Backup bundle 7z workspace cleanup failed."
+                ) from cleanup_error
+            raise
 
     @staticmethod
     def _load_manifest(manifest_bytes: bytes) -> dict[str, Any]:
@@ -2808,7 +2966,45 @@ class SystemBackupService:
         return manifest
 
     @classmethod
-    def _validate_manifest_before_extraction(cls, manifest: dict[str, Any]) -> None:
+    def _is_declared_history_manifest_member(
+        cls,
+        manifest: dict[str, Any],
+        *,
+        key: str,
+        group_key: str,
+        archive_path: str,
+    ) -> bool:
+        history_metadata = BACKUP_GROUP_METADATA[HISTORY_DB_KEY]
+        if (
+            key != HISTORY_DB_KEY
+            or group_key != HISTORY_DB_KEY
+            or archive_path != history_metadata["archive_root"]
+        ):
+            return False
+        history_groups = [
+            group
+            for group in manifest.get("groups", [])
+            if isinstance(group, dict) and group.get("key") == HISTORY_DB_KEY
+        ]
+        if len(history_groups) != 1:
+            return False
+        history_group = history_groups[0]
+        return (
+            history_group.get("archive_root") == history_metadata["archive_root"]
+            and history_group.get("selected") is True
+            and history_group.get("present") is True
+            and history_group.get("restore_mode") == history_metadata["restore_mode"]
+        )
+
+    @classmethod
+    def _validate_manifest_before_extraction(
+        cls,
+        manifest: dict[str, Any],
+        *,
+        member_limit: int = MAX_ARCHIVE_MEMBER_BYTES,
+        expanded_limit: int = MAX_ARCHIVE_EXPANDED_BYTES,
+        large_member_group_keys: frozenset[str] = frozenset(),
+    ) -> None:
         schema_version = manifest.get("schema_version")
         if type(schema_version) is not int or schema_version != BUNDLE_SCHEMA_VERSION:
             raise ValueError(f"Unsupported backup schema version {schema_version!r}.")
@@ -2858,6 +3054,17 @@ class SystemBackupService:
             seen_keys.add(key)
             seen_paths.add(archive_path)
 
+            declared_history_member = cls._is_declared_history_manifest_member(
+                manifest,
+                key=key,
+                group_key=str(raw_entry.get("group_key") or "").strip(),
+                archive_path=archive_path,
+            )
+            if raw_entry.get("group_key") == HISTORY_DB_KEY and not declared_history_member:
+                raise ValueError(
+                    "Backup bundle history member does not match its declared backup group."
+                )
+
             expected_size = raw_entry.get("size_bytes")
             if expected_size is not None:
                 if (
@@ -2868,12 +3075,20 @@ class SystemBackupService:
                     raise ValueError(
                         f"Backup bundle member {archive_path} has invalid size metadata."
                     )
-                if expected_size > MAX_ARCHIVE_MEMBER_BYTES:
+                effective_member_limit = (
+                    member_limit
+                    if (
+                        declared_history_member
+                        and HISTORY_DB_KEY in large_member_group_keys
+                    )
+                    else min(member_limit, MAX_ARCHIVE_MEMBER_BYTES)
+                )
+                if expected_size > effective_member_limit:
                     raise ValueError(
                         f"Backup bundle member {archive_path} exceeds its expanded byte limit."
                     )
                 declared_total += expected_size
-                if declared_total > MAX_ARCHIVE_EXPANDED_BYTES:
+                if declared_total > expanded_limit:
                     raise ValueError(
                         "Backup bundle manifest members exceed the expanded byte limit."
                     )
@@ -2891,6 +3106,8 @@ class SystemBackupService:
         entries: list[tuple[int, int]],
         *,
         compressed_total: int | None = None,
+        member_limit: int = MAX_ARCHIVE_MEMBER_BYTES,
+        expanded_limit: int = MAX_ARCHIVE_EXPANDED_BYTES,
     ) -> None:
         if len(entries) > MAX_ARCHIVE_MEMBER_COUNT:
             raise ValueError("Backup bundle archive contains too many members.")
@@ -2899,7 +3116,7 @@ class SystemBackupService:
         for compressed_size, expanded_size in entries:
             if compressed_size < 0 or expanded_size < 0:
                 raise ValueError("Backup bundle archive contains invalid member size metadata.")
-            if expanded_size > MAX_ARCHIVE_MEMBER_BYTES:
+            if expanded_size > member_limit:
                 raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
             if (
                 compressed_total is None
@@ -2908,7 +3125,7 @@ class SystemBackupService:
                 raise ValueError("Backup bundle archive member compression ratio exceeds its limit.")
             expanded_total += expanded_size
             declared_compressed_total += compressed_size
-            if expanded_total > MAX_ARCHIVE_EXPANDED_BYTES:
+            if expanded_total > expanded_limit:
                 raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
         ratio_denominator = (
             declared_compressed_total
@@ -3236,6 +3453,8 @@ class SystemBackupService:
         entries: list[dict[str, str]],
         *,
         archive_size: int,
+        member_limit: int = MAX_ARCHIVE_MEMBER_BYTES,
+        expanded_limit: int = MAX_ARCHIVE_EXPANDED_BYTES,
     ) -> None:
         declared: list[tuple[int, int]] = []
         materialized_paths: set[str] = set()
@@ -3274,7 +3493,75 @@ class SystemBackupService:
                         "Backup bundle archive member compression ratio exceeds its limit."
                     )
             declared.append((packed_size, expanded_size))
-        cls._validate_declared_archive_limits(declared, compressed_total=archive_size)
+        cls._validate_declared_archive_limits(
+            declared,
+            compressed_total=archive_size,
+            member_limit=member_limit,
+            expanded_limit=expanded_limit,
+        )
+
+    @classmethod
+    def _validate_7z_listing_against_manifest(
+        cls,
+        entries: list[dict[str, str]],
+        manifest: dict[str, Any],
+    ) -> None:
+        manifest_entries = {
+            cls._normalize_archive_member_path(str(entry["archive_path"])): entry
+            for entry in manifest.get("files", [])
+            if isinstance(entry, dict) and entry.get("archive_path")
+        }
+        listed_payload_paths: set[str] = set()
+        non_history_total = 0
+        for listed_entry in entries:
+            if cls._is_7z_directory_entry(listed_entry):
+                continue
+            archive_path = cls._normalize_archive_member_path(listed_entry["Path"])
+            expanded_size = int(listed_entry["Size"])
+            if archive_path == "manifest.json":
+                non_history_total += expanded_size
+                continue
+
+            manifest_entry = manifest_entries.get(archive_path)
+            if manifest_entry is None:
+                raise ValueError(
+                    "Backup bundle archive contains a member not declared in its manifest."
+                )
+            listed_payload_paths.add(archive_path)
+            is_history_member = cls._is_declared_history_manifest_member(
+                manifest,
+                key=str(manifest_entry.get("key") or "").strip(),
+                group_key=str(manifest_entry.get("group_key") or "").strip(),
+                archive_path=archive_path,
+            )
+            if manifest_entry.get("group_key") == HISTORY_DB_KEY and not is_history_member:
+                raise ValueError(
+                    "Backup bundle history member does not match its declared backup group."
+                )
+            member_limit = (
+                MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES
+                if is_history_member
+                else MAX_ARCHIVE_MEMBER_BYTES
+            )
+            if expanded_size > member_limit:
+                raise ValueError(
+                    "Backup bundle archive member exceeds its expanded byte limit."
+                )
+
+            expected_size = manifest_entry.get("size_bytes")
+            if expected_size is not None and expanded_size != expected_size:
+                raise ValueError(
+                    "Backup bundle archive member size does not match its manifest."
+                )
+            if not is_history_member:
+                non_history_total += expanded_size
+
+        if listed_payload_paths != set(manifest_entries):
+            raise ValueError("Backup bundle archive members do not match its manifest.")
+        if non_history_total > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ValueError(
+                "Backup bundle non-history members exceed the expanded byte limit."
+            )
 
     @staticmethod
     def _is_7z_directory_entry(entry: dict[str, str]) -> bool:
@@ -3326,8 +3613,8 @@ class SystemBackupService:
         self,
         archive: zipfile.ZipFile,
         manifest: dict[str, Any],
-    ) -> dict[str, bytes]:
-        extracted: dict[str, bytes] = {}
+    ) -> dict[str, ExtractedMember]:
+        extracted: dict[str, ExtractedMember] = {}
         for entry in self._manifest_file_entries(manifest):
             try:
                 extracted[entry["key"]] = archive.read(entry["archive_path"])
@@ -3339,8 +3626,8 @@ class SystemBackupService:
         self,
         archive: tarfile.TarFile,
         manifest: dict[str, Any],
-    ) -> dict[str, bytes]:
-        extracted: dict[str, bytes] = {}
+    ) -> dict[str, ExtractedMember]:
+        extracted: dict[str, ExtractedMember] = {}
         for entry in self._manifest_file_entries(manifest):
             extracted[entry["key"]] = self._read_tar_member(archive, entry["archive_path"])
         return extracted
@@ -3349,8 +3636,8 @@ class SystemBackupService:
         self,
         extract_dir: Path,
         manifest: dict[str, Any],
-    ) -> dict[str, bytes]:
-        extracted: dict[str, bytes] = {}
+    ) -> dict[str, ExtractedMember]:
+        extracted: dict[str, ExtractedMember] = {}
         for entry in self._manifest_file_entries(manifest):
             member_path = self._safe_child_path(
                 extract_dir,
@@ -3359,7 +3646,7 @@ class SystemBackupService:
             )
             if not member_path.exists():
                 raise ValueError(f"Backup bundle is missing {entry['archive_path']}.")
-            extracted[entry["key"]] = member_path.read_bytes()
+            extracted[entry["key"]] = member_path
         return extracted
 
     @staticmethod
@@ -3512,7 +3799,7 @@ class SystemBackupService:
         group_key: str,
         manifest: dict[str, Any],
         group_entries: dict[str, dict[str, Any]],
-        extracted_members: dict[str, bytes],
+        extracted_members: dict[str, ExtractedMember],
         target_path: Path,
         restored_paths: list[str],
         transaction: _ImportActivationTransaction | None = None,
@@ -3526,7 +3813,10 @@ class SystemBackupService:
             if member_key not in extracted_members:
                 raise ValueError(f"Backup bundle is missing the selected {group_key} member.")
             if transaction is None:
-                self._write_bytes_atomic(target_path, extracted_members[member_key])
+                self._write_bytes_atomic(
+                    target_path,
+                    self._extracted_member_bytes(extracted_members[member_key]),
+                )
             else:
                 transaction.activate_file(target_path, member_key)
             restored_paths.append(str(target_path))
@@ -3541,7 +3831,7 @@ class SystemBackupService:
         group_key: str,
         manifest: dict[str, Any],
         group_entries: dict[str, dict[str, Any]],
-        extracted_members: dict[str, bytes],
+        extracted_members: dict[str, ExtractedMember],
         target_dir: Path,
         restored_paths: list[str],
         transaction: _ImportActivationTransaction | None = None,
@@ -3571,7 +3861,10 @@ class SystemBackupService:
         if transaction is None:
             self._remove_tree_if_exists(target_dir)
             for member_key, target_path in restore_targets:
-                self._write_bytes_atomic(target_path, extracted_members[member_key])
+                self._write_bytes_atomic(
+                    target_path,
+                    self._extracted_member_bytes(extracted_members[member_key]),
+                )
         else:
             transaction.activate_directory(target_dir, transaction_members)
         restored_paths.extend(str(target_path) for _member_key, target_path in restore_targets)

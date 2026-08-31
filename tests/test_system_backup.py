@@ -62,6 +62,8 @@ from history_service.system_backup import (
     KNOWN_HOSTS_KEY,
     MAX_BACKUP_ARCHIVE_BYTES,
     MAX_ARCHIVE_MEMBER_COUNT,
+    MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+    MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
     SystemBackupService,
     _ImportActivationTransaction,
 )
@@ -569,6 +571,7 @@ class SystemBackupServiceTests(unittest.TestCase):
             groups.append(
                 {
                     "key": group_key,
+                    "archive_root": archive_path,
                     "selected": True,
                     "present": True,
                     "restore_mode": metadata["restore_mode"],
@@ -1575,6 +1578,391 @@ sys.stdout.flush()
         finally:
             opened_connections[0].close()
 
+    def test_restore_limits_cover_production_sized_history_database(self) -> None:
+        production_history_bytes = 3_240_521_728
+
+        self.assertGreaterEqual(
+            MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+            production_history_bytes,
+        )
+        self.assertGreaterEqual(
+            MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+            production_history_bytes + 1024 * 1024 * 1024,
+        )
+
+    def test_file_backed_limit_is_only_available_to_history_manifest_member(self) -> None:
+        member = {
+            "key": "oversized",
+            "group_key": CONFIG_FILE_KEY,
+            "archive_path": "config/config.yaml",
+            "size_bytes": 3_240_521_728,
+            "sha256": "a" * 64,
+        }
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [member],
+        }
+
+        with self.assertRaisesRegex(ValueError, "expanded byte limit"):
+            self.backup_service._validate_manifest_before_extraction(
+                manifest,
+                member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+                expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+                large_member_group_keys=frozenset({HISTORY_DB_KEY}),
+            )
+
+        history_metadata = BACKUP_GROUP_METADATA[HISTORY_DB_KEY]
+        member.update(
+            {
+                "key": HISTORY_DB_KEY,
+                "group_key": HISTORY_DB_KEY,
+                "archive_path": str(history_metadata["archive_root"]),
+            }
+        )
+        manifest["groups"] = [
+            {
+                "key": HISTORY_DB_KEY,
+                "archive_root": history_metadata["archive_root"],
+                "selected": True,
+                "present": True,
+                "restore_mode": history_metadata["restore_mode"],
+            }
+        ]
+        self.backup_service._validate_manifest_before_extraction(
+            manifest,
+            member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+            expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+            large_member_group_keys=frozenset({HISTORY_DB_KEY}),
+        )
+
+    def _assert_7z_oversized_manifest_member_rejected_before_payload_extraction(
+        self,
+        *,
+        manifest: dict[str, object],
+        archive_path: str,
+        expected_error: str,
+    ) -> None:
+        oversized_size = 3_240_521_728
+        manifest_bytes = json.dumps(manifest).encode("utf-8")
+        payload_extraction_started = False
+
+        def fake_7z_preflight(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            passphrase: str | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, passphrase
+            nonlocal payload_extraction_started
+            if args[0] == "l":
+                return subprocess.CompletedProcess(
+                    ["7z", *args],
+                    0,
+                    stdout="\n".join(
+                        [
+                            f"Path = {Path(args[2]).name}",
+                            "Type = 7z",
+                            "Method = LZMA2:12",
+                            "",
+                            "Path = manifest.json",
+                            f"Size = {len(manifest_bytes)}",
+                            f"Packed Size = {len(manifest_bytes)}",
+                            "Encrypted = -",
+                            "",
+                            f"Path = {archive_path}",
+                            f"Size = {oversized_size}",
+                            f"Packed Size = {oversized_size}",
+                            "Encrypted = -",
+                        ]
+                    ),
+                    stderr="",
+                )
+            if args[0] == "x":
+                selected_members = [
+                    argument
+                    for argument in args[2:]
+                    if not argument.startswith("-")
+                ]
+                if selected_members != ["manifest.json"]:
+                    payload_extraction_started = True
+                    raise AssertionError(
+                        "7z payload extraction started before manifest policy validation"
+                    )
+                output_dir = next(
+                    Path(argument[2:])
+                    for argument in args
+                    if argument.startswith("-o")
+                )
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "manifest.json").write_bytes(manifest_bytes)
+                return subprocess.CompletedProcess(
+                    ["7z", *args],
+                    0,
+                    stdout="Everything is Ok\n",
+                    stderr="",
+                )
+            raise AssertionError(f"Unexpected fake 7z command: {args}")
+
+        with (
+            patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=fake_7z_preflight,
+            ),
+            patch(
+                "history_service.system_backup.MAX_ARCHIVE_COMPRESSION_RATIO",
+                oversized_size,
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, expected_error):
+                self.backup_service._read_7z_archive(SEVEN_ZIP_SIGNATURE)
+
+        self.assertFalse(payload_extraction_started)
+
+    def test_7z_rejects_oversized_non_history_member_before_payload_extraction(self) -> None:
+        archive_path = "config/config.yaml"
+        self._assert_7z_oversized_manifest_member_rejected_before_payload_extraction(
+            manifest={
+                "schema_version": BUNDLE_SCHEMA_VERSION,
+                "format": BUNDLE_FORMAT,
+                "packaging": "7z",
+                "groups": [],
+                "files": [
+                    {
+                        "key": CONFIG_FILE_KEY,
+                        "group_key": CONFIG_FILE_KEY,
+                        "archive_path": archive_path,
+                        "size_bytes": 1,
+                        "sha256": "a" * 64,
+                    }
+                ],
+            },
+            archive_path=archive_path,
+            expected_error="expanded byte limit",
+        )
+
+    def test_7z_rejects_forged_history_group_before_payload_extraction(self) -> None:
+        archive_path = "config/not-history.yaml"
+        self._assert_7z_oversized_manifest_member_rejected_before_payload_extraction(
+            manifest={
+                "schema_version": BUNDLE_SCHEMA_VERSION,
+                "format": BUNDLE_FORMAT,
+                "packaging": "7z",
+                "groups": [],
+                "files": [
+                    {
+                        "key": "forged-history",
+                        "group_key": HISTORY_DB_KEY,
+                        "archive_path": archive_path,
+                        "size_bytes": 3_240_521_728,
+                        "sha256": "a" * 64,
+                    }
+                ],
+            },
+            archive_path=archive_path,
+            expected_error="declared backup group",
+        )
+
+    def test_7z_rejects_noncanonical_history_member_before_payload_extraction(self) -> None:
+        archive_path = "config/not-history.yaml"
+        history_metadata = BACKUP_GROUP_METADATA[HISTORY_DB_KEY]
+        self._assert_7z_oversized_manifest_member_rejected_before_payload_extraction(
+            manifest={
+                "schema_version": BUNDLE_SCHEMA_VERSION,
+                "format": BUNDLE_FORMAT,
+                "packaging": "7z",
+                "groups": [
+                    {
+                        "key": HISTORY_DB_KEY,
+                        "archive_root": history_metadata["archive_root"],
+                        "selected": True,
+                        "present": True,
+                        "restore_mode": history_metadata["restore_mode"],
+                    }
+                ],
+                "files": [
+                    {
+                        "key": "forged-history",
+                        "group_key": HISTORY_DB_KEY,
+                        "archive_path": archive_path,
+                        "size_bytes": 3_240_521_728,
+                        "sha256": "a" * 64,
+                    }
+                ],
+            },
+            archive_path=archive_path,
+            expected_error="declared backup group",
+        )
+
+    def test_7z_listing_allows_production_sized_history_member(self) -> None:
+        history_size = 3_240_521_728 + 4096
+        history_metadata = BACKUP_GROUP_METADATA[HISTORY_DB_KEY]
+        manifest = {
+            "groups": [
+                {
+                    "key": HISTORY_DB_KEY,
+                    "archive_root": history_metadata["archive_root"],
+                    "selected": True,
+                    "present": True,
+                    "restore_mode": history_metadata["restore_mode"],
+                }
+            ],
+            "files": [
+                {
+                    "key": HISTORY_DB_KEY,
+                    "group_key": HISTORY_DB_KEY,
+                    "archive_path": "history/history.sqlite3",
+                    "size_bytes": history_size,
+                }
+            ]
+        }
+        listed_entries = [
+            {"Path": "manifest.json", "Size": "1", "Packed Size": "1"},
+            {
+                "Path": "history/history.sqlite3",
+                "Size": str(history_size),
+                "Packed Size": str(history_size),
+            },
+        ]
+
+        self.backup_service._validate_7z_listing_against_manifest(
+            listed_entries,
+            manifest,
+        )
+
+    def test_7z_listing_keeps_legacy_non_history_expanded_limit(self) -> None:
+        member_size = system_backup_module.MAX_ARCHIVE_EXPANDED_BYTES // 2 + 1
+        manifest = {
+            "files": [
+                {
+                    "key": "config-a",
+                    "group_key": CONFIG_FILE_KEY,
+                    "archive_path": "config/a.yaml",
+                    "size_bytes": member_size,
+                },
+                {
+                    "key": "config-b",
+                    "group_key": CONFIG_FILE_KEY,
+                    "archive_path": "config/b.yaml",
+                    "size_bytes": member_size,
+                },
+            ]
+        }
+        listed_entries = [
+            {"Path": "manifest.json", "Size": "1", "Packed Size": "1"},
+            {
+                "Path": "config/a.yaml",
+                "Size": str(member_size),
+                "Packed Size": str(member_size),
+            },
+            {
+                "Path": "config/b.yaml",
+                "Size": str(member_size),
+                "Packed Size": str(member_size),
+            },
+        ]
+
+        with self.assertRaisesRegex(ValueError, "non-history members"):
+            self.backup_service._validate_7z_listing_against_manifest(
+                listed_entries,
+                manifest,
+            )
+
+    def test_file_backed_export_limit_is_only_available_to_history_member(self) -> None:
+        member = BundleMember(
+            key="oversized",
+            group_key=CONFIG_FILE_KEY,
+            archive_path="config/config.yaml",
+            source_path="synthetic",
+            present=True,
+            content=b"",
+        )
+        production_history_bytes = 3_240_521_728
+
+        with patch.object(
+            SystemBackupService,
+            "_bundle_member_size_and_digest",
+            return_value=(production_history_bytes, "a" * 64),
+        ):
+            with self.assertRaisesRegex(ValueError, "expanded byte limit"):
+                self.backup_service._collect_file_specs(
+                    [member],
+                    member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+                    expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+                    large_member_group_keys=frozenset({HISTORY_DB_KEY}),
+                )
+
+            member.group_key = HISTORY_DB_KEY
+            files = self.backup_service._collect_file_specs(
+                [member],
+                member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+                expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+                large_member_group_keys=frozenset({HISTORY_DB_KEY}),
+            )
+
+        self.assertEqual(files[0]["size_bytes"], production_history_bytes)
+
+    def test_history_member_validation_accepts_file_backed_large_database(self) -> None:
+        candidate_path = self.temp_dir / "large-history.sqlite3"
+        shutil.copyfile(self.history_db_path, candidate_path)
+        candidate_path.write_bytes(candidate_path.read_bytes())
+        production_history_bytes = 3_240_521_728
+        candidate_size = ((production_history_bytes // 4096) + 1) * 4096
+        with candidate_path.open("r+b") as candidate:
+            candidate.truncate(candidate_size)
+
+        self.assertGreater(candidate_path.stat().st_size, production_history_bytes)
+
+        with patch.object(
+            Path,
+            "read_bytes",
+            side_effect=AssertionError("large history member must stay file-backed"),
+        ):
+            SystemBackupService._validate_history_member(candidate_path)
+
+    def test_manifest_metadata_hashes_file_backed_member_without_read_bytes(self) -> None:
+        member_path = self.temp_dir / "file-backed-hash.bin"
+        member_path.write_bytes(b"file-backed-hash")
+        manifest = {
+            "files": [
+                {
+                    "key": "member",
+                    "group_key": HISTORY_DB_KEY,
+                    "archive_path": "history/history.sqlite3",
+                    "size_bytes": member_path.stat().st_size,
+                    "sha256": hashlib.sha256(b"file-backed-hash").hexdigest(),
+                }
+            ]
+        }
+
+        with patch.object(
+            Path,
+            "read_bytes",
+            side_effect=AssertionError("file-backed digest must stream"),
+        ):
+            self.backup_service._validate_manifest_member_metadata(
+                manifest,
+                {"member": member_path},
+            )
+
+    def test_activation_stages_file_backed_member_without_byte_materialization(self) -> None:
+        source_path = self.temp_dir / "file-backed-member.bin"
+        source_path.write_bytes(b"file-backed")
+
+        with patch.object(
+            _ImportActivationTransaction,
+            "_write_staged_bytes",
+            side_effect=AssertionError("file-backed member must use file copy"),
+        ):
+            transaction = _ImportActivationTransaction({"member": source_path})
+
+        try:
+            self.assertEqual(transaction._staged_member("member").read_bytes(), b"file-backed")
+        finally:
+            transaction._cleanup_root()
+
     def test_import_rejects_duplicate_physical_zip_member_paths(self) -> None:
         content = b'{"slot_mappings": {}}'
         archive_path = str(BACKUP_GROUP_METADATA[MAPPING_FILE_KEY]["archive_root"])
@@ -1827,7 +2215,10 @@ sys.stdout.flush()
             if output_dir is None:
                 raise AssertionError(f"Missing extract directory for fake 7z command: {args}")
             output_dir.mkdir(parents=True, exist_ok=True)
+            selected_members = set(members)
             for relative_path, content in stored_files.items():
+                if selected_members and relative_path not in selected_members:
+                    continue
                 target_path = output_dir / Path(relative_path)
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 target_path.write_bytes(content)
@@ -1887,6 +2278,107 @@ sys.stdout.flush()
                         self.assertIn("archive-core:enc-a:0", restored_slot_detail["slot_details"])
                         self.assertEqual(counts["tracked_slots"], 1)
                         self.assertEqual(counts["metric_sample_count"], 1)
+
+    def test_encrypted_7z_import_keeps_history_file_backed_and_cleans_extraction_root(self) -> None:
+        passphrase = "file-backed import passphrase"
+        validated_paths: list[Path] = []
+        real_validate_history = SystemBackupService._validate_history_member
+
+        def record_history_path(content: bytes | Path) -> None:
+            self.assertIsInstance(content, Path)
+            assert isinstance(content, Path)
+            validated_paths.append(content)
+            real_validate_history(content)
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=self._fake_7z_command,
+            ),
+            patch.object(
+                self.backup_service,
+                "_validate_history_member",
+                side_effect=record_history_path,
+            ),
+        ):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_bundle(
+                encrypt=True,
+                passphrase=passphrase,
+                packaging="7z",
+                included_paths=[HISTORY_DB_KEY],
+            )
+            result = self.backup_service.import_bundle(
+                artifact.content,
+                passphrase=passphrase,
+            )
+
+        self.assertTrue(result["restored_history_database"])
+        self.assertEqual(len(validated_paths), 1)
+        extraction_root = next(
+            parent
+            for parent in validated_paths[0].parents
+            if parent.name.startswith("truenas-jbod-ui-7z-import-")
+        )
+        self.assertFalse(extraction_root.exists())
+
+    def test_7z_read_failure_fails_closed_when_workspace_cleanup_fails(self) -> None:
+        archive = self._encode_fake_7z_archive(
+            {"manifest.json": b"{}"},
+            "correct passphrase",
+        )
+
+        with (
+            patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=self._fake_7z_command,
+            ),
+            patch(
+                "history_service.system_backup.shutil.rmtree",
+                side_effect=OSError("synthetic cleanup failure"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"):
+                self.backup_service.import_bundle(
+                    archive,
+                    passphrase="wrong passphrase",
+                )
+
+    def test_7z_import_workspace_cleanup_failure_precedes_activation(self) -> None:
+        passphrase = "cleanup ordering passphrase"
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=self._fake_7z_command,
+            ),
+        ):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_bundle(
+                encrypt=True,
+                passphrase=passphrase,
+                packaging="7z",
+                included_paths=[HISTORY_DB_KEY],
+            )
+            with (
+                patch.object(
+                    self.backup_service,
+                    "_cleanup_extracted_archive",
+                    side_effect=RuntimeError("Backup bundle extraction workspace cleanup failed."),
+                ),
+                patch.object(self.backup_service, "_activate_import_bundle") as activate,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"):
+                    self.backup_service.import_bundle(
+                        artifact.content,
+                        passphrase=passphrase,
+                    )
+
+        activate.assert_not_called()
 
     def test_export_without_history_does_not_create_history_snapshot(self) -> None:
         with (
@@ -2237,7 +2729,13 @@ sys.stdout.flush()
                     passphrase=expected_passphrase,
                 )
 
-        self.assertEqual([args[0] for args, _ in observed_commands], ["a", "l", "l", "x"])
+        self.assertEqual(
+            [args[0] for args, _ in observed_commands],
+            ["a", "l", "l", "x", "x"],
+        )
+        extract_commands = [args for args, _ in observed_commands if args[0] == "x"]
+        self.assertIn("manifest.json", extract_commands[0])
+        self.assertNotIn("manifest.json", extract_commands[1])
         self.assertTrue(
             all(prompt_passphrase == expected_passphrase for _, prompt_passphrase in observed_commands)
         )

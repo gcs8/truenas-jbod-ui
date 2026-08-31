@@ -1,8 +1,8 @@
 # Roadmap
 
-This file tracks the current intended release direction at the `v0.22.0`
-release candidate. `v0.21.2` remains the latest published release until the
-`v0.22.0` tag and GitHub release are published.
+This file tracks the current intended release direction at the `v0.22.1`
+maintenance candidate. `v0.22.0` is the latest published release until the
+`v0.22.1` tag and GitHub release are published.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -22,8 +22,10 @@ remaining part of the active docs set.
 
 ## Current Snapshot
 
-`v0.22.0` closes the practical performance, deployment, CI, backup, and
-operator-trust cycle that followed `v0.21.2`:
+`v0.22.0` closed the practical performance, deployment, CI, backup, and
+operator-trust cycle that followed `v0.21.2`. `v0.22.1` is a narrow backup
+restore patch that keeps large 7z history members file-backed through
+validation and transactional staging:
 
 - runtime deployment can be pinned to an immutable GHCR digest with a private
   receipt, convergence checks, and rollback evidence
@@ -39,7 +41,7 @@ operator-trust cycle that followed `v0.21.2`:
 - CI covers Python 3.12 and 3.14, container health, browser QA, public artifacts,
   Ruff, dependency checks, and CodeQL
 
-The next development lane begins only after the v0.22.0 image, development QA,
+The next development lane begins only after the v0.22.1 image, development QA,
 production deployment, and post-release reopen gates are complete. It should
 stay practical and incremental:
 

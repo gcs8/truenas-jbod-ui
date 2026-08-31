@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.22.1 - 2026-08-30
+
+- Kept encrypted 7z restore members file-backed through manifest hashing,
+  SQLite validation, and transactional staging so FULL backups with history
+  databases above 3 GiB do not load the database into Python memory.
+- Added a 4 GiB history-member limit and 6 GiB expanded-archive limit only for
+  file-backed 7z history restores. ZIP, TAR, and non-history members retain the
+  existing limits.
+- Made 7z extraction-workspace cleanup fail closed and added regressions for a
+  production-sized history database, chunked hashing, file-copy staging,
+  encrypted restore, and cleanup.
+
 ## v0.22.0 - 2026-08-30
 
 - Added a digest-pinned deployment transaction with private receipts, runtime
