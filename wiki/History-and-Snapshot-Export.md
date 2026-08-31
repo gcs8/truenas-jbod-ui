@@ -48,6 +48,28 @@ If you later mount a separate disk or NFS path for longer-lived copies, point
 `HISTORY_LONG_TERM_BACKUP_DIR` there and keep the short-term local path in
 place.
 
+Long-horizon deployments can use one writable hot database plus immutable
+segments. Configure it only after the offline migration publishes a complete
+catalog:
+
+```dotenv
+HISTORY_SQLITE_PATH=/app/history/history.db
+HISTORY_SEGMENT_CATALOG_PATH=/app/history/segments/catalog.json
+```
+
+Mount the whole history directory into every history/admin/backup container.
+Do not bind-mount only the SQLite file. If the catalog is missing, invalid,
+digest-mismatched, or recovery-pending, history reads fail visibly instead of
+falling back to hot-only data.
+
+Segmented queries merge slot events, raw/hourly/daily metrics, disk-followed
+history, scope history, counts, and summaries across databases. They do not use
+SQLite `ATTACH`. A query selects at most 32 segments and 5,000 rows; broader
+requests fail rather than silently omitting older history.
+
+Migration, recovery, and rollback commands are documented in
+[Segmented history v2](../docs/SEGMENTED_HISTORY_V2.md).
+
 ## History Sidecar Dashboard
 
 Open the history sidecar directly when you want to see what the collector is

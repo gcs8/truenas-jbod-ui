@@ -109,6 +109,8 @@ the final release-wrap validator:
     `.\.venv\Scripts\python.exe -m unittest tests.test_admin_service tests.test_account_bootstrap tests.test_system_backup -v`
   - history/performance/export:
     `.\.venv\Scripts\python.exe -m unittest tests.test_history_service tests.test_perf tests.test_perf_harness tests.test_snapshot_export -v`
+  - segmented history migration/query/backup:
+    `.\.venv\Scripts\python.exe -m unittest tests.test_segment_migration tests.test_segment_sealer tests.test_segmented_history_reader tests.test_segmented_history tests.test_system_backup -v`
   - release/version behavior:
     `.\.venv\Scripts\python.exe -m unittest tests.test_release_status -v`
 - run Python syntax/compile coverage for changed Python plus shared app/test
@@ -159,6 +161,18 @@ the final release-wrap validator:
     history, and admin health plus `Runtime Control` cards showing aligned
     running versions after startup or sidecar restarts
 - run the Linux QA Docker restore release gate before ship/no-ship:
+  - for a segmented-history release, first complete an encrypted schema-v2
+    export/mutation/import/query drill with historical data larger than the
+    production history database. Verify hot-plus-segment counts, disk-followed
+    history, scope history, catalog digests, and rollback preservation
+  - prove broad queries fail when they exceed the 32-segment selection limit;
+    never accept a plausible partial result
+  - verify every history/admin/backup container mounts the whole history
+    directory, not a file bind mount of `history.db`
+  - stop the disposable development history stack after the drill and preserve
+    only sanitized receipts
+  - immediately before the one production deployment, take and verify a fresh
+    encrypted FULL backup through the admin sidecar
   - export a full backup from the long-running local Windows Docker admin API,
     not by copying host folders. Use the default restore-grade path set:
     `config_file`, `runtime_overrides_file`, `profile_file`, `mapping_file`,

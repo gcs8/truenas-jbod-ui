@@ -32,7 +32,10 @@ def main() -> int:
         history_settings = get_history_settings()
         backup_service = SystemBackupService(
             history_settings,
-            HistoryStore(history_settings.sqlite_path),
+            HistoryStore(
+                history_settings.sqlite_path,
+                segment_catalog_path=history_settings.segment_catalog_path,
+            ),
         )
         runner = ScheduledBackupRunner(
             backup_service,

@@ -57,6 +57,9 @@ contain carriage returns or line feeds because the 7z prompt is line-oriented.
 Scheduled backups use a separate one-shot container. The container has no
 published port, network, or Docker socket. A host timer starts it, so the
 privileged admin sidecar keeps its default one-hour auto-stop boundary.
+New scheduled archives use encrypted portable `.7z` and file-backed validation,
+including segmented history. Existing `.tar.zst.enc` scheduled archives remain
+recognized for retention and bounded compatibility restore.
 
 Create a private passphrase file under `config/backup-secrets` and make it
 readable only by its owner. The Compose files mount that directory read-only at
@@ -126,18 +129,29 @@ text, or passphrase-file path.
 
 History SQLite already has its own snapshot schedule. Include `history_db` here
 only when you intentionally want the larger archive and have sized the backup
-destination accordingly. The one-shot container mounts the history directory
-writable because SQLite's backup path may need normal database lifecycle access;
-it does not stop or control the running history service.
+destination accordingly. The one-shot container mounts the whole history
+directory writable. Do not file-bind only `history.db`; segmented locking rejects
+database-file mount points.
 
-The restore-grade archive contract accepts a history database up to 1.5 GiB and
-up to 2 GiB of expanded members in total. The admin and one-shot backup services
-therefore default to a 3 GiB container memory ceiling. Operators can lower those
-overrides for small installations, but a FULL backup or restore must keep enough
-headroom for the selected history snapshot. Each 7z create, verify, list, or
-extract operation remains bounded to 10 minutes. Archive creation uses normal
-compression with one worker thread so it stays inside the documented container
-memory ceiling on large history databases.
+Hot-only deployments export backup schema 1. A deployment configured with
+`HISTORY_SEGMENT_CATALOG_PATH` exports schema 2. Schema 2 includes the hot
+database, every immutable segment, and the complete generation catalog. Import
+validates every member and stages the hot file and segment directory as one
+rollback-capable transaction.
+
+Each immutable segment is limited to 1.5 GiB. The current query path selects at
+most 32 segments and returns at most 5,000 rows. A broad request fails instead of
+returning partial history. FULL backup and restore must have temporary-disk and
+archive headroom for the hot file plus all selected segments. Each 7z create,
+verify, list, or extract operation remains bounded to 10 minutes. Archive
+creation uses normal compression with one worker thread.
+
+The native scheduled `.tar.zst.enc` path supports schema 2 and uses the same
+staged restore contract. Schema 2 restore requires the target to configure
+`HISTORY_SEGMENT_CATALOG_PATH`.
+
+See [Segmented history v2](../docs/SEGMENTED_HISTORY_V2.md) for migration,
+recovery, rollback, catalog, and release-gate details.
 
 ## Restore Pattern
 

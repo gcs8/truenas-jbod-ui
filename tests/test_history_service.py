@@ -13,12 +13,15 @@ from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from history_service import main as history_main
+from history_service import migration_lock
 from history_service.collector import HistoryCollectionStopping, HistoryCollector, ScopeSnapshot
 from history_service.config import HistorySettings, get_history_settings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
+from history_service.migration_lock import history_lock_path, history_write_lock
 from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
 
 
@@ -265,6 +268,20 @@ class HistoryConfigTests(unittest.TestCase):
         self.assertEqual(getattr(settings, "shared_dir_mode", None), 0o770)
         self.assertEqual(getattr(settings, "shared_file_mode", None), 0o660)
 
+    def test_blank_segment_catalog_environment_keeps_hot_only_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(
+                os.environ,
+                {
+                    "HISTORY_SQLITE_PATH": str(Path(temp_dir) / "history.db"),
+                    "HISTORY_SEGMENT_CATALOG_PATH": "",
+                },
+            ):
+                get_history_settings.cache_clear()
+                settings = get_history_settings()
+
+        self.assertIsNone(settings.segment_catalog_path)
+
     def test_permission_repair_settings_reject_world_writable_modes(self) -> None:
         with self.assertRaisesRegex(ValueError, "world-writable"):
             HistorySettings(shared_dir_mode=0o777)
@@ -292,6 +309,7 @@ class HistoryConfigTests(unittest.TestCase):
     def test_history_store_factory_forwards_permission_settings(self) -> None:
         settings = HistorySettings(
             sqlite_path="/tmp/history-policy-test.db",
+            segment_catalog_path="/tmp/history-segments/catalog.json",
             permission_repair_enabled=True,
             shared_dir_mode=0o750,
             shared_file_mode=0o640,
@@ -307,6 +325,7 @@ class HistoryConfigTests(unittest.TestCase):
         self.assertIs(result, sentinel)
         constructor.assert_called_once_with(
             settings.sqlite_path,
+            segment_catalog_path="/tmp/history-segments/catalog.json",
             permission_repair_enabled=True,
             shared_dir_mode=0o750,
             shared_file_mode=0o640,
@@ -675,6 +694,90 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
 
 class HistoryStoreTests(unittest.TestCase):
+    def test_shared_lock_rejects_database_file_mount_points(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mounted_directory = root / "mounted"
+            mounted_directory.mkdir()
+            canonical_database_path = mounted_directory / "history.db"
+            canonical_database_path.write_bytes(b"")
+            alias_directory = root / "alias"
+            alias_directory.symlink_to(mounted_directory, target_is_directory=True)
+            database_path = alias_directory / "history.db"
+
+            def identify_canonical_mount(path: Path) -> bool:
+                self.assertEqual(path, canonical_database_path)
+                return True
+
+            with patch.object(
+                migration_lock,
+                "_database_path_is_mount_point",
+                side_effect=identify_canonical_mount,
+            ):
+                with self.assertRaisesRegex(ValueError, "mount"):
+                    with history_write_lock(database_path, blocking=False):
+                        self.fail("File-mounted database entered the shared lock")
+
+    def test_shared_lock_converges_when_socket_keys_differ_for_the_same_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "history.db"
+            addresses = iter((b"\0history-lock-alias-a", b"\0history-lock-alias-b"))
+
+            with patch.object(migration_lock, "_history_lock_address", side_effect=lambda _path: next(addresses)):
+                with history_write_lock(database_path, blocking=False):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "migration"):
+                        with history_write_lock(database_path, blocking=False):
+                            self.fail("Directory-alias lock owner entered")
+
+    def test_shared_lock_cannot_split_brain_after_legacy_lock_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "history.db"
+
+            with history_write_lock(database_path, blocking=False):
+                legacy_lock_path = history_lock_path(database_path)
+                legacy_lock_path.unlink(missing_ok=True)
+                with self.assertRaisesRegex(sqlite3.OperationalError, "migration"):
+                    with history_write_lock(database_path, blocking=False):
+                        self.fail("Second migration lock owner entered")
+
+    def test_store_initialization_rejects_while_migration_owns_shared_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "history.db"
+
+            with history_write_lock(database_path, blocking=False):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "migration"):
+                    HistoryStore(str(database_path), recover_unreadable_database=False)
+
+            self.assertFalse(database_path.exists())
+
+    def test_restore_backup_rejects_while_migration_owns_shared_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"), recover_unreadable_database=False)
+            backup_path = store.create_backup(root / "backups")
+            if backup_path is None:
+                self.fail("Expected a backup path")
+            original_bytes = store.file_path.read_bytes()
+
+            with history_write_lock(store.file_path, blocking=False):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "migration"):
+                    store.restore_backup(backup_path)
+
+            self.assertEqual(store.file_path.read_bytes(), original_bytes)
+
+    def test_journal_mode_setup_rejects_while_migration_owns_shared_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = HistoryStore(
+                str(Path(temp_dir) / "history.db"),
+                recover_unreadable_database=False,
+            )
+            store._journal_mode_identity = None
+
+            with history_write_lock(store.file_path, blocking=False):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "migration"):
+                    connection = store._connect()
+                    connection.close()
+
     def test_default_store_does_not_widen_existing_database_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "history"
@@ -3682,10 +3785,10 @@ class HistoryStoreTests(unittest.TestCase):
         connect_calls = 0
         original_connect = store._connect
 
-        def counting_connect() -> sqlite3.Connection:
+        def counting_connect(**kwargs: Any) -> sqlite3.Connection:
             nonlocal connect_calls
             connect_calls += 1
-            return original_connect()
+            return original_connect(**kwargs)
 
         with patch.object(store, "_connect", counting_connect):
             store.record_slot_updates(updates)
@@ -4386,10 +4489,10 @@ class HistoryCollectorTests(unittest.TestCase):
         connect_calls = 0
         original_connect = store._connect
 
-        def counting_connect() -> sqlite3.Connection:
+        def counting_connect(**kwargs: Any) -> sqlite3.Connection:
             nonlocal connect_calls
             connect_calls += 1
-            return original_connect()
+            return original_connect(**kwargs)
 
         with patch.object(store, "_connect", counting_connect):
             collector._record_slot_changes(second_pass, "2026-04-16T22:10:00+00:00")

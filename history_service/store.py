@@ -17,6 +17,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
+from history_service.migration_lock import history_write_lock
+from history_service.segment_catalog import (
+    MIGRATION_PENDING_MARKER,
+    activation_pending_path,
+    path_entry_exists,
+)
+from history_service.segment_reader import MAX_HISTORY_QUERY_LIMIT, SegmentedHistoryReader
 
 logger = logging.getLogger(__name__)
 SQLITE_SHARED_DIR_MODE = 0o770
@@ -289,8 +296,14 @@ class HistoryStore:
         permission_repair_enabled: bool = False,
         shared_dir_mode: int = SQLITE_SHARED_DIR_MODE,
         shared_file_mode: int = SQLITE_SHARED_FILE_MODE,
+        segment_catalog_path: str | Path | None = None,
     ) -> None:
         self.file_path = Path(file_path)
+        self.segment_catalog_path = (
+            Path(segment_catalog_path).absolute()
+            if segment_catalog_path is not None
+            else None
+        )
         self.recover_unreadable_database = bool(recover_unreadable_database)
         self.permission_repair_enabled = bool(permission_repair_enabled)
         self.shared_dir_mode = int(shared_dir_mode)
@@ -308,9 +321,49 @@ class HistoryStore:
         self._lock = threading.Lock()
         self._journal_mode_lock = threading.Lock()
         self._journal_mode_identity: tuple[int, int] | None = None
-        self._initialize()
+        self._segment_reader_lock = threading.Lock()
+        self._segment_reader_identity: tuple[int, int, int, int] | None = None
+        self._segment_reader_cache: SegmentedHistoryReader | None = None
+        with history_write_lock(self.file_path, blocking=False):
+            self._initialize(migration_lock_held=True)
 
-    def _connect(self) -> sqlite3.Connection:
+    def _segmented_reader(self) -> SegmentedHistoryReader | None:
+        if self.segment_catalog_path is None:
+            return None
+        if path_entry_exists(activation_pending_path(self.file_path)):
+            raise ValueError("Segmented history activation is pending.")
+        pending_path = self.segment_catalog_path.parent / MIGRATION_PENDING_MARKER
+        if path_entry_exists(pending_path):
+            raise ValueError("Segmented history migration recovery is pending.")
+        with self._segment_reader_lock:
+            if path_entry_exists(pending_path):
+                raise ValueError("Segmented history migration recovery is pending.")
+            metadata = os.stat(self.segment_catalog_path, follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("Segmented history catalog must be a regular file.")
+            identity = (
+                int(metadata.st_dev),
+                int(metadata.st_ino),
+                int(metadata.st_size),
+                int(metadata.st_mtime_ns),
+            )
+            if self._segment_reader_cache is not None and identity == self._segment_reader_identity:
+                return self._segment_reader_cache
+            reader = SegmentedHistoryReader.from_catalog(
+                hot_path=self.file_path,
+                catalog_path=self.segment_catalog_path,
+            )
+            self._segment_reader_cache = reader
+            self._segment_reader_identity = identity
+            return reader
+
+    def _require_unsegmented_operation(self, operation: str) -> None:
+        if self.segment_catalog_path is not None:
+            raise ValueError(
+                f"History {operation} is unavailable while segmented history is active."
+            )
+
+    def _connect(self, *, migration_lock_held: bool = False) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.file_path,
             timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
@@ -319,13 +372,28 @@ class HistoryStore:
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
             connection.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_SIZE_KIB}")
-            self._ensure_journal_mode(connection)
+            self._ensure_journal_mode(connection, migration_lock_held=migration_lock_held)
         except sqlite3.Error:
             connection.close()
             raise
         return connection
 
-    def _ensure_journal_mode(self, connection: sqlite3.Connection) -> None:
+    def _ensure_journal_mode(self, connection: sqlite3.Connection, *, migration_lock_held: bool = False) -> None:
+        if migration_lock_held:
+            self._ensure_journal_mode_locked(connection)
+            return
+        try:
+            stat_result = self.file_path.stat()
+            identity = (int(stat_result.st_dev), int(stat_result.st_ino))
+        except FileNotFoundError:
+            identity = None
+        with self._journal_mode_lock:
+            if identity is not None and identity == self._journal_mode_identity:
+                return
+        with history_write_lock(self.file_path, blocking=False):
+            self._ensure_journal_mode_locked(connection)
+
+    def _ensure_journal_mode_locked(self, connection: sqlite3.Connection) -> None:
         try:
             stat_result = self.file_path.stat()
             identity = (int(stat_result.st_dev), int(stat_result.st_ino))
@@ -348,6 +416,9 @@ class HistoryStore:
             self._journal_mode_identity = identity
 
     def database_size_bytes(self) -> int:
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return segmented_reader.database_size_bytes()
         total = 0
         for path in (
             self.file_path,
@@ -360,13 +431,13 @@ class HistoryStore:
                 continue
         return total
 
-    def _initialize(self) -> None:
+    def _initialize(self, *, migration_lock_held: bool = False) -> None:
         self._normalize_database_permissions()
         try:
-            self._initialize_schema_and_permissions()
+            self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
         except sqlite3.OperationalError as exc:
             if self._is_readonly_database_error(exc) and self._attempt_readonly_database_repair(exc):
-                self._initialize_schema_and_permissions()
+                self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
                 return
             if (
                 not self.recover_unreadable_database
@@ -380,7 +451,7 @@ class HistoryStore:
                 broken_path,
                 exc,
             )
-            self._initialize_schema_and_permissions()
+            self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
         except sqlite3.Error as exc:
             if (
                 not self.recover_unreadable_database
@@ -394,14 +465,14 @@ class HistoryStore:
                 broken_path,
                 exc,
             )
-            self._initialize_schema_and_permissions()
+            self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
 
-    def _initialize_schema_and_permissions(self) -> None:
-        self._initialize_schema()
+    def _initialize_schema_and_permissions(self, *, migration_lock_held: bool = False) -> None:
+        self._initialize_schema(migration_lock_held=migration_lock_held)
         self._normalize_database_permissions()
 
-    def _initialize_schema(self) -> None:
-        with closing(self._connect()) as connection:
+    def _initialize_schema(self, *, migration_lock_held: bool = False) -> None:
+        with closing(self._connect(migration_lock_held=migration_lock_held)) as connection:
             connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
             connection.executescript(SCHEMA)
             self._ensure_slot_state_columns(connection)
@@ -528,6 +599,7 @@ class HistoryStore:
         weekly_retention_count: int = 0,
         monthly_retention_count: int = 0,
     ) -> Path | None:
+        self._require_unsegmented_operation("v1 backup")
         backup_root = Path(backup_dir)
         backup_root.mkdir(parents=True, exist_ok=True)
         self._normalize_shared_path_permissions(backup_root, is_dir=True)
@@ -583,7 +655,7 @@ class HistoryStore:
         latest = max(snapshots, key=lambda candidate: candidate.stat().st_mtime)
         return datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc)
 
-    def restore_backup(self, source_path: str | Path) -> None:
+    def _restore_backup_locked(self, source_path: str | Path) -> None:
         source = Path(source_path)
         if not source.exists():
             raise FileNotFoundError(f"Backup source {source} does not exist.")
@@ -617,11 +689,16 @@ class HistoryStore:
                     Path(f"{self.file_path}{suffix}").unlink(missing_ok=True)
                 self._normalize_database_permissions()
                 self._journal_mode_identity = None
-                self._initialize_schema()
+                self._initialize_schema(migration_lock_held=True)
             finally:
                 if temp_fd is not None:
                     os.close(temp_fd)
                 self._discard_owned_path(temp_path, temp_metadata)
+
+    def restore_backup(self, source_path: str | Path) -> None:
+        self._require_unsegmented_operation("v1 restore")
+        with history_write_lock(self.file_path, blocking=False):
+            self._restore_backup_locked(source_path)
 
     @staticmethod
     def _backup_stamp(snapshot_label: str | None) -> str:
@@ -1359,6 +1436,14 @@ class HistoryStore:
         slot: int,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return segmented_reader.list_slot_events(
+                system_id,
+                enclosure_id,
+                slot,
+                limit=limit,
+            )
         enclosure_key = enclosure_id or ""
         with closing(self._connect()) as connection:
             rows = connection.execute(
@@ -1382,6 +1467,16 @@ class HistoryStore:
         limit: int = 500,
         since: str | None = None,
     ) -> list[dict[str, Any]]:
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return segmented_reader.list_metric_samples(
+                system_id,
+                enclosure_id,
+                slot,
+                metric_name=metric_name,
+                limit=limit,
+                since=since,
+            )
         enclosure_key = enclosure_id or ""
         base_where_clauses = ["system_id = ?", "enclosure_key = ?", "slot = ?"]
         base_parameters: list[Any] = [system_id, enclosure_key, slot]
@@ -1422,6 +1517,14 @@ class HistoryStore:
         limit: int = 500,
         since: str | None = None,
     ) -> list[dict[str, Any]]:
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return segmented_reader.list_disk_metric_samples(
+                disk_identity_key,
+                metric_name=metric_name,
+                limit=limit,
+                since=since,
+            )
         normalized_identity_key = disk_identity_key.strip()
         if not normalized_identity_key:
             return []
@@ -1547,7 +1650,17 @@ class HistoryStore:
         disk_identity_key: str,
         *,
         since: str | None = None,
+        limit: int = MAX_HISTORY_QUERY_LIMIT,
     ) -> list[dict[str, Any]]:
+        if type(limit) is not int or not 1 <= limit <= MAX_HISTORY_QUERY_LIMIT:
+            raise ValueError("History query limit is invalid.")
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return segmented_reader.list_disk_metric_homes(
+                disk_identity_key,
+                since=since,
+                limit=limit,
+            )
         normalized_identity_key = disk_identity_key.strip()
         if not normalized_identity_key:
             return []
@@ -1619,9 +1732,10 @@ class HistoryStore:
             ) history
             GROUP BY system_id, enclosure_key, slot
             ORDER BY first_seen_at ASC, last_seen_at ASC, system_id ASC, enclosure_key ASC, slot ASC
+            LIMIT ?
         """
         with closing(self._connect()) as connection:
-            rows = connection.execute(query, parameters).fetchall()
+            rows = connection.execute(query, [*parameters, limit]).fetchall()
         return [dict(row) for row in rows]
 
     def list_followed_metric_samples(
@@ -1635,6 +1749,17 @@ class HistoryStore:
         limit: int = 500,
         since: str | None = None,
     ) -> list[dict[str, Any]]:
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return segmented_reader.list_followed_metric_samples(
+                system_id,
+                enclosure_id,
+                slot,
+                disk_identity_key,
+                metric_name=metric_name,
+                limit=limit,
+                since=since,
+            )
         disk_samples = self.list_disk_metric_samples(
             disk_identity_key,
             metric_name=metric_name,
@@ -1681,6 +1806,16 @@ class HistoryStore:
         metric_limits: dict[str, int] | None = None,
         since: str | None = None,
     ) -> dict[str, Any]:
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return segmented_reader.get_slot_history_bundle(
+                system_id,
+                enclosure_id,
+                slot,
+                event_limit=event_limit,
+                metric_limits=metric_limits,
+                since=since,
+            )
         current = self.get_slot_state(system_id, enclosure_id, slot)
         events = self.list_slot_events(system_id, enclosure_id, slot, limit=event_limit)
         metric_limits = metric_limits or {}
@@ -1886,6 +2021,16 @@ class HistoryStore:
         metric_limits: dict[str, int] | None = None,
         since: str | None = None,
     ) -> dict[int, dict[str, Any]]:
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return segmented_reader.list_scope_history(
+                system_id,
+                enclosure_id,
+                slots=slots,
+                event_limit=event_limit,
+                metric_limits=metric_limits,
+                since=since,
+            )
         enclosure_key = enclosure_id or ""
         slot_numbers = sorted({int(slot) for slot in (slots or [])})
         metric_limits = metric_limits or {}
@@ -2032,6 +2177,11 @@ class HistoryStore:
         return payload_by_slot
 
     def list_scopes(self, *, include_activity_counts: bool = True) -> list[dict[str, Any]]:
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return segmented_reader.list_scopes(
+                include_activity_counts=include_activity_counts,
+            )
         with closing(self._connect()) as connection:
             if not include_activity_counts:
                 rows = connection.execute(
@@ -2101,6 +2251,9 @@ class HistoryStore:
         return [dict(row) for row in rows]
 
     def counts(self) -> dict[str, int]:
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return segmented_reader.counts()
         with closing(self._connect()) as connection:
             tracked_slots = int(connection.execute("SELECT COUNT(*) FROM slot_state_current").fetchone()[0])
             event_count = int(connection.execute("SELECT COUNT(*) FROM slot_events").fetchone()[0])
@@ -2114,6 +2267,13 @@ class HistoryStore:
         }
 
     def estimated_counts(self) -> dict[str, Any]:
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return {
+                **segmented_reader.counts(),
+                "estimated": False,
+                "count_mode": "segmented-exact",
+            }
         with closing(self._connect()) as connection:
             tracked_slots = int(connection.execute("SELECT COUNT(*) FROM slot_state_current").fetchone()[0])
             tracked_counts = {
@@ -2138,10 +2298,14 @@ class HistoryStore:
         normalized_excludes = tuple(
             sorted({system_id.strip() for system_id in exclude_system_ids if system_id and system_id.strip()})
         )
+        segmented_reader = self._segmented_reader()
+        if segmented_reader is not None:
+            return segmented_reader.list_history_system_summaries(normalized_excludes)
         with closing(self._connect()) as connection:
             return self._list_history_system_summaries(connection, exclude_system_ids=normalized_excludes)
 
     def delete_system_history(self, system_id: str) -> dict[str, Any]:
+        self._require_unsegmented_operation("system deletion")
         normalized_system_id = system_id.strip()
         if not normalized_system_id:
             return self._empty_cleanup_summary()
@@ -2154,6 +2318,7 @@ class HistoryStore:
         return self._execute_write(operation)
 
     def purge_orphaned_history(self, valid_system_ids: list[str] | tuple[str, ...]) -> dict[str, Any]:
+        self._require_unsegmented_operation("orphan purge")
         normalized_valid_ids = tuple(
             sorted({system_id.strip() for system_id in valid_system_ids if system_id and system_id.strip()})
         )
@@ -2175,6 +2340,7 @@ class HistoryStore:
         *,
         target_system_label: str | None = None,
     ) -> dict[str, Any]:
+        self._require_unsegmented_operation("system adoption")
         normalized_source_id = source_system_id.strip()
         normalized_target_id = target_system_id.strip()
         normalized_target_label = target_system_label.strip() if target_system_label and target_system_label.strip() else None
@@ -2373,25 +2539,26 @@ class HistoryStore:
         return self._execute_write(operation)
 
     def _execute_write(self, operation: Any) -> Any:
-        with self._lock:
-            readonly_repair_attempted = False
-            lock_retry_count = 0
-            while True:
-                try:
-                    with closing(self._connect()) as connection:
-                        result = operation(connection)
-                        connection.commit()
-                        return result
-                except sqlite3.OperationalError as exc:
-                    if not readonly_repair_attempted and self._is_readonly_database_error(exc):
-                        readonly_repair_attempted = True
-                        if self._attempt_readonly_database_repair(exc):
+        with history_write_lock(self.file_path, blocking=False):
+            with self._lock:
+                readonly_repair_attempted = False
+                lock_retry_count = 0
+                while True:
+                    try:
+                        with closing(self._connect(migration_lock_held=True)) as connection:
+                            result = operation(connection)
+                            connection.commit()
+                            return result
+                    except sqlite3.OperationalError as exc:
+                        if not readonly_repair_attempted and self._is_readonly_database_error(exc):
+                            readonly_repair_attempted = True
+                            if self._attempt_readonly_database_repair(exc):
+                                continue
+                        if self._is_database_locked_error(exc) and lock_retry_count < SQLITE_WRITE_LOCK_RETRY_ATTEMPTS:
+                            lock_retry_count += 1
+                            time.sleep(SQLITE_WRITE_LOCK_RETRY_DELAY_SECONDS * lock_retry_count)
                             continue
-                    if self._is_database_locked_error(exc) and lock_retry_count < SQLITE_WRITE_LOCK_RETRY_ATTEMPTS:
-                        lock_retry_count += 1
-                        time.sleep(SQLITE_WRITE_LOCK_RETRY_DELAY_SECONDS * lock_retry_count)
-                        continue
-                    raise
+                        raise
 
     def _attempt_readonly_database_repair(self, exc: sqlite3.OperationalError) -> bool:
         if not self.permission_repair_enabled:
