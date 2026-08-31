@@ -55,6 +55,7 @@ from history_service.system_backup import (
     RUNTIME_OVERRIDES_FILE_KEY,
     SAS_FABRIC_ALIAS_FILE_KEY,
     SEVEN_ZIP_SIGNATURE,
+    SEVEN_ZIP_TIMEOUT_SECONDS,
     SLOT_DETAIL_FILE_KEY,
     SSH_KEYS_KEY,
     TLS_TRUST_KEY,
@@ -1191,6 +1192,30 @@ class SystemBackupServiceTests(unittest.TestCase):
                 self.backup_service._run_7z_command(["l", "bundle.7z"])
         self.assertTrue(process.killed)
 
+    def test_7z_timeout_allows_restore_grade_full_history_archives(self) -> None:
+        self.assertGreaterEqual(SEVEN_ZIP_TIMEOUT_SECONDS, 600)
+
+    def test_7z_export_uses_memory_bounded_compression_profile(self) -> None:
+        archive_path = self.temp_dir / "bounded.7z"
+        success = subprocess.CompletedProcess(
+            args=["7z"],
+            returncode=0,
+            stdout="Everything is Ok",
+            stderr="",
+        )
+
+        with patch.object(self.backup_service, "_run_7z_command", return_value=success) as run_7z:
+            self.backup_service._build_7z_archive_to_path(
+                [],
+                b"{}",
+                archive_path,
+            )
+
+        command = run_7z.call_args.args[0]
+        self.assertIn("-mx=5", command)
+        self.assertIn("-mmt=1", command)
+        self.assertNotIn("-mx=9", command)
+
     def test_7z_prompt_channel_keeps_passphrase_out_of_process_argv(self) -> None:
         fake_7z = self.temp_dir / "fake-7z-prompt.py"
         fake_7z.write_text(
@@ -2071,6 +2096,43 @@ sys.stdout.flush()
 
         with self.assertRaisesRegex(ValueError, "too many members"):
             self.backup_service._collect_file_specs(members)
+
+    def test_file_export_accepts_restore_grade_history_database_size(self) -> None:
+        history_size = 1_200 * 1024 * 1024
+        companion_state_size = 64 * 1024 * 1024
+        members = [
+            BundleMember(
+                key="history-db",
+                group_key=HISTORY_DB_KEY,
+                archive_path="history/history.sqlite3",
+                source_path=str(self.temp_dir / "history.sqlite3"),
+                present=True,
+                content=None,
+            ),
+            BundleMember(
+                key="companion-state",
+                group_key=CONFIG_FILE_KEY,
+                archive_path="config/state.bin",
+                source_path=str(self.temp_dir / "state.bin"),
+                present=True,
+                content=None,
+            ),
+        ]
+
+        with patch.object(
+            type(self.backup_service),
+            "_bundle_member_size_and_digest",
+            side_effect=[
+                (history_size, "a" * 64),
+                (companion_state_size, "b" * 64),
+            ],
+        ):
+            files = self.backup_service._collect_file_specs(members)
+
+        self.assertEqual(
+            [item["size_bytes"] for item in files],
+            [history_size, companion_state_size],
+        )
 
     def test_tar_file_export_counts_physical_pax_headers(self) -> None:
         members = [

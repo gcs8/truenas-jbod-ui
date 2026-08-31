@@ -210,12 +210,12 @@ ENCRYPTED_BACKUP_TAG_BYTES = 16
 ENCRYPTED_BACKUP_SCRYPT_N = 2**15
 ENCRYPTED_BACKUP_SCRYPT_R = 8
 ENCRYPTED_BACKUP_SCRYPT_P = 1
-SEVEN_ZIP_TIMEOUT_SECONDS = 120
+SEVEN_ZIP_TIMEOUT_SECONDS = 600
 SEVEN_ZIP_BINARY = "7z"
 MAX_BACKUP_ARCHIVE_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_COUNT = 1024
-MAX_ARCHIVE_MEMBER_BYTES = 512 * 1024 * 1024
-MAX_ARCHIVE_EXPANDED_BYTES = 1024 * 1024 * 1024
+MAX_ARCHIVE_MEMBER_BYTES = 1536 * 1024 * 1024
+MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ARCHIVE_COMPRESSION_RATIO = 200
 MAX_ARCHIVE_METADATA_BYTES = 8 * 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -2619,8 +2619,9 @@ class SystemBackupService:
                 "-t7z",
                 "-y",
                 "-bd",
-                "-mx=9",
+                "-mx=5",
                 "-m0=lzma2",
+                "-mmt=1",
                 str(archive_path),
                 *sorted(top_level_entries),
             ]

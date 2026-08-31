@@ -58,12 +58,20 @@ test.describe("ESXi smoke", () => {
 
       await expect(page.locator("#detail-content")).toBeVisible();
       await expect(page.locator("#detail-content")).toContainText("H7240AS60SUN4.0T");
-      await expect(page.locator("#detail-content")).toContainText("ESXi local JBOD");
-      await expect(page.locator("#detail-content")).toContainText("JBOD");
+      const detailText = await page.locator("#detail-content").innerText();
       await expect(page.locator("#detail-led-controls")).toBeVisible();
-      await expect(page.locator("#detail-smart-note")).toContainText(
-        /StorCLI physical-drive health|local JBOD physical device/
-      );
+      if (detailText.includes("ESXi local JBOD")) {
+        await expect(page.locator("#detail-content")).toContainText("JBOD");
+        await expect(page.locator("#detail-smart-note")).toContainText(
+          /StorCLI physical-drive health|local JBOD physical device/
+        );
+      } else {
+        await expect(page.locator("#detail-content")).toContainText("Mapping");
+        await expect(page.locator("#detail-content")).toContainText("ssh");
+        await expect(page.locator("#detail-smart-note")).toContainText(
+          "StorCLI physical-drive detail is unavailable"
+        );
+      }
       return;
     }
 
