@@ -31,6 +31,31 @@ EXPECTED_HISTORY_PERMISSION_ENV = {
 
 
 class ContainerResourceContractTests(unittest.TestCase):
+    def test_history_capable_services_keep_segment_catalog_opt_in(self) -> None:
+        expected = "${HISTORY_SEGMENT_CATALOG_PATH:-}"
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))[
+                "services"
+            ]
+            for service_name in (
+                "enclosure-history",
+                "enclosure-admin",
+                "enclosure-backup",
+            ):
+                with self.subTest(compose=compose_name, service=service_name):
+                    self.assertEqual(
+                        services[service_name]["environment"]["HISTORY_SEGMENT_CATALOG_PATH"],
+                        expected,
+                    )
+
+        env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        active_assignments = [
+            line.strip()
+            for line in env_example.splitlines()
+            if line.strip().startswith("HISTORY_SEGMENT_CATALOG_PATH=")
+        ]
+        self.assertEqual(active_assignments, [])
+
     def test_nonroot_runtime_is_an_explicit_overlay_with_root_compatible_base(self) -> None:
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]

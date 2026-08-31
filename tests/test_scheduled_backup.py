@@ -388,6 +388,54 @@ class ScheduledBackupDeploymentContractTests(unittest.TestCase):
 
         get_history_settings.assert_not_called()
 
+    def test_enabled_one_shot_forwards_segment_catalog_to_history_store(self) -> None:
+        from history_service import scheduled_backup_main
+
+        settings = ScheduledBackupSettings(
+            enabled=True,
+            destination_dir="/tmp/scheduled-destination",
+            status_file="/tmp/scheduled-status.json",
+            retention_count=1,
+            included_groups=["history_db"],
+            passphrase_file="/tmp/scheduled-passphrase",
+        )
+        history_settings = MagicMock(
+            sqlite_path="/tmp/hot.db",
+            segment_catalog_path="/tmp/segments/catalog.json",
+        )
+        runner = MagicMock()
+        runner.run_once.return_value = {
+            "last_size_bytes": 1,
+            "last_retention_removed": 0,
+        }
+
+        with (
+            patch.object(scheduled_backup_main, "configure_service_logging"),
+            patch.object(
+                scheduled_backup_main.ScheduledBackupSettings,
+                "from_environment",
+                return_value=settings,
+            ),
+            patch.object(
+                scheduled_backup_main,
+                "get_history_settings",
+                return_value=history_settings,
+            ),
+            patch.object(scheduled_backup_main, "HistoryStore") as history_store,
+            patch.object(scheduled_backup_main, "SystemBackupService"),
+            patch.object(
+                scheduled_backup_main,
+                "ScheduledBackupRunner",
+                return_value=runner,
+            ),
+        ):
+            self.assertEqual(scheduled_backup_main.main(), 0)
+
+        history_store.assert_called_once_with(
+            "/tmp/hot.db",
+            segment_catalog_path="/tmp/segments/catalog.json",
+        )
+
     def test_runner_module_has_no_network_server_or_docker_control_dependency(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "history_service/scheduled_backup_main.py").read_text(
             encoding="utf-8"

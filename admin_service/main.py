@@ -8,6 +8,7 @@ import logging
 import os
 import shlex
 import signal
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -76,6 +77,7 @@ from history_service.config import get_history_settings
 from history_service.store import HistoryStore
 from history_service.system_backup import (
     MAX_BACKUP_ARCHIVE_BYTES,
+    MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES,
     SystemBackupService,
     default_backup_included_paths,
     default_debug_included_paths,
@@ -235,6 +237,54 @@ async def read_limited_request_body(
     return bytes(body)
 
 
+async def stream_limited_request_body_to_file(
+    request: Request,
+    *,
+    max_bytes: int = MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES,
+) -> Path:
+    raw_content_length = request.headers.get("content-length")
+    if raw_content_length is not None:
+        try:
+            content_length = int(raw_content_length)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Content-Length must be an integer.") from exc
+        if content_length < 0:
+            raise HTTPException(status_code=400, detail="Content-Length must not be negative.")
+        if content_length > max_bytes:
+            raise HTTPException(status_code=413, detail="Backup import request body is too large.")
+
+    workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-admin-import-"))
+    archive_path = workspace / "bundle.archive"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            archive_path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        total = 0
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = None
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(status_code=413, detail="Backup import request body is too large.")
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        return archive_path
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        archive_path.unlink(missing_ok=True)
+        workspace.rmdir()
+        raise
+
+
 SERVICE_STARTED_AT = datetime.now(timezone.utc)
 
 
@@ -249,6 +299,7 @@ def get_history_store() -> HistoryStore:
     return HistoryStore(
         history_settings.sqlite_path,
         recover_unreadable_database=False,
+        segment_catalog_path=history_settings.segment_catalog_path,
     )
 
 
@@ -633,55 +684,61 @@ def create_app() -> FastAPI:
         stop_services: bool = Query(default=True),
         restart_services: bool = Query(default=True),
     ) -> JSONResponse:
-        content = await read_limited_request_body(request)
-        if not content:
-            raise HTTPException(status_code=400, detail="Backup import request body was empty.")
-
+        archive_path = await stream_limited_request_body_to_file(request)
         try:
-            passphrase = decode_optional_secret_header(
-                request.headers.get("X-Backup-Passphrase-Base64")
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if passphrase is None:
-            passphrase = request.headers.get("X-Backup-Passphrase") or None
-        maintenance_service = get_maintenance_service()
-        try:
-            result, maintenance = await asyncio.to_thread(
-                maintenance_service.import_bundle,
-                content,
-                passphrase=passphrase,
-                stop_services=stop_services,
-                restart_services=restart_services,
-            )
-        except (ValueError, DockerRuntimeError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if archive_path.stat().st_size == 0:
+                raise HTTPException(status_code=400, detail="Backup import request body was empty.")
+            try:
+                passphrase = decode_optional_secret_header(
+                    request.headers.get("X-Backup-Passphrase-Base64")
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if passphrase is None:
+                passphrase = request.headers.get("X-Backup-Passphrase") or None
+            maintenance_service = get_maintenance_service()
+            try:
+                result, maintenance = await asyncio.to_thread(
+                    maintenance_service.import_bundle_from_file,
+                    archive_path,
+                    passphrase=passphrase,
+                    stop_services=stop_services,
+                    restart_services=restart_services,
+                )
+            except (ValueError, DockerRuntimeError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        settings = reload_app_settings()
-        runtime_service = get_runtime_service()
-        impacted = tuple(
-            key for key in admin_settings.clean_backup_targets
-            if key in runtime_service.managed_containers
-        )
-        if restart_services:
-            await asyncio.to_thread(runtime_service.clear_restart_required, impacted)
-            if maintenance.restart_failures:
-                # These were stopped for the import and could not be started again;
-                # keep them flagged so the runtime cards do not imply they came back.
-                await asyncio.to_thread(runtime_service.mark_restart_required, tuple(maintenance.restart_failures))
-        else:
-            await asyncio.to_thread(runtime_service.mark_restart_required, impacted)
-        return JSONResponse(
-            {
-                **result,
-                "systems": serialize_systems(settings),
-                "default_system_id": settings.default_system_id,
-                "stopped_containers": maintenance.stopped_containers,
-                "restarted_containers": maintenance.restarted_containers,
-                "restart_failures": dict(maintenance.restart_failures),
-                "runtime": await build_runtime_payload(runtime_service),
-            }
-        )
+            settings = reload_app_settings()
+            runtime_service = get_runtime_service()
+            impacted = tuple(
+                key for key in admin_settings.clean_backup_targets
+                if key in runtime_service.managed_containers
+            )
+            if restart_services:
+                await asyncio.to_thread(runtime_service.clear_restart_required, impacted)
+                if maintenance.restart_failures:
+                    # These were stopped for the import and could not be started again;
+                    # keep them flagged so the runtime cards do not imply they came back.
+                    await asyncio.to_thread(
+                        runtime_service.mark_restart_required,
+                        tuple(maintenance.restart_failures),
+                    )
+            else:
+                await asyncio.to_thread(runtime_service.mark_restart_required, impacted)
+            return JSONResponse(
+                {
+                    **result,
+                    "systems": serialize_systems(settings),
+                    "default_system_id": settings.default_system_id,
+                    "stopped_containers": maintenance.stopped_containers,
+                    "restarted_containers": maintenance.restarted_containers,
+                    "restart_failures": dict(maintenance.restart_failures),
+                    "runtime": await build_runtime_payload(runtime_service),
+                }
+            )
+        finally:
+            archive_path.unlink(missing_ok=True)
+            archive_path.parent.rmdir()
 
     @app.post("/api/admin/esxi-host-prep/upload")
     async def upload_esxi_host_prep_package(

@@ -36,9 +36,9 @@ from app.services.ssh_key_manager import SSHKeyManager
 from app.services.system_setup import PRESERVE_SECRET_SENTINEL, SystemSetupService
 from history_service.scheduled_backup import ScheduledBackupRunner
 from history_service.config import HistorySettings
-from history_service import system_backup as system_backup_module
+from history_service import segment_migration, system_backup as system_backup_module
 from history_service.domain import MetricSample, SlotStateRecord
-from history_service.store import HistoryStore
+from history_service.store import SCHEMA, HistoryStore
 from history_service.system_backup import (
     BACKUP_GROUP_METADATA,
     BUNDLE_FORMAT,
@@ -281,6 +281,266 @@ class SystemBackupServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         get_settings.cache_clear()
 
+    def test_blank_catalog_keeps_v1_reads_and_file_backups_working(self) -> None:
+        settings = HistorySettings(
+            sqlite_path=str(self.history_db_path),
+            segment_catalog_path="",
+            backup_dir=str(self.history_backup_dir),
+            startup_grace_seconds=0,
+        )
+        self.assertIsNone(settings.segment_catalog_path)
+        store = HistoryStore(
+            settings.sqlite_path,
+            recover_unreadable_database=False,
+            segment_catalog_path=settings.segment_catalog_path,
+        )
+        self.assertEqual(store.counts()["metric_sample_count"], 1)
+        service = SystemBackupService(settings, store)
+
+        artifact = service.export_bundle_to_file(
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        try:
+            self.assertEqual(artifact.manifest["schema_version"], 1)
+        finally:
+            artifact.cleanup()
+
+        with patch.object(
+            service,
+            "_run_7z_command",
+            side_effect=self._fake_7z_command,
+        ):
+            scheduled_artifact = service.export_scheduled_bundle_to_file(
+                passphrase="hot-only scheduled backup test passphrase",
+                included_paths=[HISTORY_DB_KEY],
+            )
+        try:
+            self.assertEqual(scheduled_artifact.manifest["schema_version"], 1)
+        finally:
+            scheduled_artifact.cleanup()
+
+    def test_segmented_history_export_emits_schema_v2_hot_and_segment_members(self) -> None:
+        segmented_root = self.temp_dir / "segmented-export"
+        segmented_root.mkdir()
+        source = segmented_root / "history.db"
+        segments_directory = segmented_root / "segments"
+        with sqlite3.connect(source) as connection:
+            connection.executescript(SCHEMA)
+            for event_id, observed_at in (
+                (1, "2025-01-01T00:00:00+00:00"),
+                (2, "2025-01-02T00:00:00+00:00"),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO slot_events (
+                        id, observed_at, system_id, enclosure_key,
+                        slot, slot_label, event_type, details_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        observed_at,
+                        "archive-core",
+                        "enc-a",
+                        1,
+                        "slot-1",
+                        "state_change",
+                        "{}",
+                    ),
+                )
+        segment_migration.migrate_segmented_history(
+            source=source,
+            segments_directory=segments_directory,
+            cutoff="2025-01-02T00:00:00+00:00",
+            key_id="test-key-1",
+            apply=True,
+        )
+        catalog_path = segments_directory / "catalog.json"
+        history_settings = HistorySettings(
+            sqlite_path=str(source),
+            segment_catalog_path=str(catalog_path),
+            backup_dir=str(segmented_root / "backups"),
+            startup_grace_seconds=0,
+        )
+        service = SystemBackupService(
+            history_settings,
+            HistoryStore(
+                str(source),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog_path,
+            ),
+        )
+
+        artifact = service.export_bundle_to_file(
+            encrypt=False,
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        try:
+            self.assertEqual(artifact.manifest["schema_version"], 2)
+            self.assertTrue(artifact.manifest["generation"]["complete"])
+            self.assertEqual(
+                [segment["segment_id"] for segment in artifact.manifest["history_catalog"]["segments"]],
+                ["segment-0001"],
+            )
+            file_keys = {entry["key"] for entry in artifact.manifest["files"]}
+            self.assertEqual(
+                file_keys,
+                {HISTORY_DB_KEY, "history-segment:segment-0001"},
+            )
+            with zipfile.ZipFile(artifact.path) as archive:
+                self.assertEqual(
+                    set(archive.namelist()),
+                    {
+                        "manifest.json",
+                        "history/history.sqlite3",
+                        "history/segments/segment-0001.sqlite3",
+                    },
+                )
+            target_root = self.temp_dir / "segmented-import"
+            target_root.mkdir()
+            target_source = target_root / "history.db"
+            with sqlite3.connect(target_source) as connection:
+                connection.executescript(SCHEMA)
+            target_catalog = target_root / "segments" / "catalog.json"
+            target_settings = HistorySettings(
+                sqlite_path=str(target_source),
+                segment_catalog_path=str(target_catalog),
+                backup_dir=str(target_root / "backups"),
+                startup_grace_seconds=0,
+            )
+            target_store = HistoryStore(
+                str(target_source),
+                recover_unreadable_database=False,
+                segment_catalog_path=target_catalog,
+            )
+            target_service = SystemBackupService(target_settings, target_store)
+            original_target_bytes = target_source.read_bytes()
+
+            with patch.object(
+                _ImportActivationTransaction,
+                "activate_directory",
+                side_effect=RuntimeError("injected segment activation failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected segment activation failure"):
+                    target_service.import_bundle(artifact.path.read_bytes())
+
+            self.assertEqual(target_source.read_bytes(), original_target_bytes)
+            self.assertFalse(target_catalog.exists())
+            self.assertFalse((target_catalog.parent / "segment-0001.sqlite3").exists())
+
+            result = target_service.import_bundle(artifact.path.read_bytes())
+
+            self.assertEqual(result["schema_version"], 2)
+            self.assertTrue(target_catalog.is_file())
+            self.assertTrue((target_catalog.parent / "segment-0001.sqlite3").is_file())
+            self.assertEqual(
+                [event["id"] for event in target_store.list_slot_events("archive-core", "enc-a", 1)],
+                [2, 1],
+            )
+            with sqlite3.connect(source) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO slot_events (
+                        id, observed_at, system_id, enclosure_key,
+                        slot, slot_label, event_type, details_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        3,
+                        "2025-01-03T00:00:00+00:00",
+                        "archive-core",
+                        "enc-a",
+                        1,
+                        "slot-1",
+                        "state_change",
+                        "{}",
+                    ),
+                )
+            successor_artifact = service.export_bundle_to_file(
+                encrypt=False,
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+            visible_during_activation: list[list[int]] = []
+            read_errors: list[str] = []
+
+            def reject_segment_directory(*_args: Any, **_kwargs: Any) -> None:
+                try:
+                    visible_during_activation.append(
+                        [
+                            event["id"]
+                            for event in target_store.list_slot_events(
+                                "archive-core",
+                                "enc-a",
+                                1,
+                            )
+                        ]
+                    )
+                except ValueError as exc:
+                    read_errors.append(str(exc))
+                raise RuntimeError("injected split-generation activation failure")
+
+            try:
+                with patch.object(
+                    _ImportActivationTransaction,
+                    "activate_directory",
+                    side_effect=reject_segment_directory,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "injected split-generation activation failure",
+                    ):
+                        target_service.import_bundle(successor_artifact.path.read_bytes())
+            finally:
+                successor_artifact.cleanup()
+
+            self.assertEqual(visible_during_activation, [])
+            self.assertTrue(any("activation" in error.lower() for error in read_errors))
+            self.assertEqual(
+                [event["id"] for event in target_store.list_slot_events("archive-core", "enc-a", 1)],
+                [2, 1],
+            )
+            with (
+                patch.object(
+                    service,
+                    "_run_7z_command",
+                    side_effect=self._fake_7z_command,
+                ),
+                patch.object(
+                    target_service,
+                    "_run_7z_command",
+                    side_effect=self._fake_7z_command,
+                ),
+            ):
+                encrypted_artifact = service.export_scheduled_bundle_to_file(
+                    passphrase="segmented round trip passphrase",
+                    included_paths=[HISTORY_DB_KEY],
+                )
+                try:
+                    encrypted_result = target_service.import_bundle_from_file(
+                        encrypted_artifact.path,
+                        passphrase="segmented round trip passphrase",
+                    )
+                    self.assertEqual(encrypted_result["schema_version"], 2)
+                    self.assertTrue(encrypted_result["encrypted"])
+                    self.assertEqual(
+                        [
+                            event["id"]
+                            for event in target_store.list_slot_events(
+                                "archive-core",
+                                "enc-a",
+                                1,
+                            )
+                        ],
+                        [3, 2, 1],
+                    )
+                finally:
+                    encrypted_artifact.cleanup()
+        finally:
+            artifact.cleanup()
+
     @staticmethod
     def _fake_7z_passphrase_token(passphrase: str | None) -> str | None:
         if passphrase is None:
@@ -463,14 +723,23 @@ class SystemBackupServiceTests(unittest.TestCase):
         self,
     ) -> None:
         passphrase = "scheduled public preflight passphrase"
-        selected_groups = [MAPPING_FILE_KEY, PROFILE_FILE_KEY]
-        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+        selected_groups = [HISTORY_DB_KEY]
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch("history_service.system_backup.MAX_BACKUP_ARCHIVE_BYTES", 64),
+            patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=self._fake_7z_command,
+            ),
+        ):
             get_settings.cache_clear()
             artifact = self.backup_service.export_scheduled_bundle_to_file(
                 passphrase=passphrase,
                 included_paths=selected_groups,
             )
-            copied = self.temp_dir / "copied-scheduled-backup.tar.zst.enc"
+            self.assertGreater(artifact.path.stat().st_size, 64)
+            copied = self.temp_dir / "copied-scheduled-backup.7z"
             copied.write_bytes(artifact.path.read_bytes())
             try:
                 result = self.backup_service.preflight_scheduled_bundle_file(
@@ -491,7 +760,7 @@ class SystemBackupServiceTests(unittest.TestCase):
                 tampered = bytearray(copied.read_bytes())
                 tampered[len(tampered) // 2] ^= 1
                 copied.write_bytes(tampered)
-                with self.assertRaisesRegex(ValueError, "could not be decrypted"):
+                with self.assertRaises(ValueError):
                     self.backup_service.preflight_scheduled_bundle_file(
                         copied,
                         passphrase=passphrase,
@@ -526,7 +795,7 @@ class SystemBackupServiceTests(unittest.TestCase):
             patch.object(
                 self.backup_service,
                 "_run_7z_command",
-                side_effect=AssertionError("one-shot scheduled backup must not invoke 7z"),
+                side_effect=AssertionError("state-only scheduled backup must not invoke 7z"),
             ),
         ):
             get_settings.cache_clear()
@@ -599,6 +868,49 @@ class SystemBackupServiceTests(unittest.TestCase):
         with patch("history_service.system_backup.MAX_BACKUP_ARCHIVE_BYTES", 4):
             with self.assertRaisesRegex(ValueError, "archive exceeds"):
                 self.backup_service.import_bundle(b"PK123")
+
+    def test_encrypted_file_import_can_exceed_in_memory_archive_limit(self) -> None:
+        passphrase = "file backed archive passphrase"
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch("history_service.system_backup.MAX_BACKUP_ARCHIVE_BYTES", 64),
+            patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=self._fake_7z_command,
+            ),
+        ):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_bundle_to_file(
+                encrypt=True,
+                passphrase=passphrase,
+                included_paths=[MAPPING_FILE_KEY],
+            )
+            try:
+                self.assertGreater(artifact.path.stat().st_size, 64)
+                with self.assertRaisesRegex(ValueError, "file-backed export"):
+                    self.backup_service.export_bundle(
+                        encrypt=True,
+                        passphrase=passphrase,
+                        included_paths=[MAPPING_FILE_KEY],
+                    )
+                with self.assertRaisesRegex(ValueError, "archive exceeds"):
+                    self.backup_service.import_bundle(
+                        artifact.path.read_bytes(),
+                        passphrase=passphrase,
+                    )
+
+                result = self.backup_service.import_bundle_from_file(
+                    artifact.path,
+                    passphrase=passphrase,
+                )
+
+                self.assertEqual(result["schema_version"], 1)
+                self.assertTrue(result["encrypted"])
+                self.assertIn(MAPPING_FILE_KEY, result["included_groups"])
+                self.assertTrue(result["restored_paths"])
+            finally:
+                artifact.cleanup()
 
     def test_zip_member_limit_rejects_before_zipfile_construction(self) -> None:
         manifest = {
@@ -3121,17 +3433,8 @@ sys.stdout.flush()
         shutil.copyfile(source_path, real_path)
         symlink_path = self.temp_dir / "symlink-history.sqlite3"
         symlink_path.symlink_to(real_path)
-        symlink_store = HistoryStore(str(symlink_path))
-        transaction = _ImportActivationTransaction({"history": source_path.read_bytes()})
-
-        with patch.object(symlink_store, "create_backup", wraps=symlink_store.create_backup) as snapshot:
-            with patch.object(symlink_store, "restore_backup", wraps=symlink_store.restore_backup) as restore:
-                with self.assertRaisesRegex(ValueError, "symlink"):
-                    with transaction:
-                        transaction.activate_history(symlink_store, "history")
-
-        snapshot.assert_not_called()
-        restore.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            HistoryStore(str(symlink_path))
         self.assertTrue(symlink_path.is_symlink())
 
     def test_history_rollback_uses_store_snapshot_and_clears_sidecars(self) -> None:

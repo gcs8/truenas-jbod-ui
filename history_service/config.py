@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _history_runtime_root() -> Path:
@@ -34,6 +34,7 @@ class HistorySettings(BaseModel):
     release_check_interval_seconds: int = 86400
     release_check_timeout_seconds: float = 5.0
     sqlite_path: str = Field(default_factory=_default_history_sqlite_path)
+    segment_catalog_path: str | None = None
     permission_repair_enabled: bool = False
     shared_dir_mode: int = Field(default=0o770, ge=0, le=0o777)
     shared_file_mode: int = Field(default=0o660, ge=0, le=0o777)
@@ -59,6 +60,14 @@ class HistorySettings(BaseModel):
     retention_interval_seconds: int = Field(default=3600, ge=1)
     retention_batch_size: int = Field(default=5000, ge=1)
     retention_max_batches_per_run: int = Field(default=20, ge=1)
+
+    @field_validator("segment_catalog_path", mode="before")
+    @classmethod
+    def normalize_optional_segment_catalog_path(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
 
     @model_validator(mode="after")
     def align_backup_paths(self) -> "HistorySettings":
@@ -94,6 +103,7 @@ ENV_OVERRIDES: dict[str, str] = {
     "RELEASE_CHECK_INTERVAL_SECONDS": "release_check_interval_seconds",
     "RELEASE_CHECK_TIMEOUT_SECONDS": "release_check_timeout_seconds",
     "HISTORY_SQLITE_PATH": "sqlite_path",
+    "HISTORY_SEGMENT_CATALOG_PATH": "segment_catalog_path",
     "HISTORY_PERMISSION_REPAIR_ENABLED": "permission_repair_enabled",
     "HISTORY_SHARED_DIR_MODE": "shared_dir_mode",
     "HISTORY_SHARED_FILE_MODE": "shared_file_mode",

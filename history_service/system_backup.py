@@ -19,7 +19,7 @@ import time
 import uuid
 import zipfile
 import zlib
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -41,10 +41,19 @@ from app.config import EnclosureProfileConfig, Settings, _derive_runtime_layout_
 from app.models.domain import ManualMapping, SasFabricAlias
 from app.services.slot_detail_store import SlotDetailCacheEntry
 from history_service.config import HistorySettings
+from history_service.segment_catalog import (
+    HISTORY_SEGMENT_GROUP_KEY,
+    SEGMENTED_BACKUP_SCHEMA_VERSION,
+    activation_pending_path,
+    validate_segmented_manifest,
+)
+from history_service.migration_lock import history_write_lock
+from history_service.segment_reader import SegmentedHistoryReader
 from history_service.store import HistoryStore
 
 
 BUNDLE_SCHEMA_VERSION = 1
+SUPPORTED_BUNDLE_SCHEMA_VERSIONS = frozenset({1, 2})
 BUNDLE_FORMAT = "truenas-jbod-ui-backup"
 DEBUG_BUNDLE_FORMAT = "truenas-jbod-ui-debug-bundle"
 
@@ -55,6 +64,7 @@ MAPPING_FILE_KEY = "mapping_file"
 SAS_FABRIC_ALIAS_FILE_KEY = "sas_fabric_alias_file"
 SLOT_DETAIL_FILE_KEY = "slot_detail_file"
 HISTORY_DB_KEY = "history_db"
+SEGMENTED_CATALOG_STAGING_KEY = "__segmented_history_catalog__"
 SSH_KEYS_KEY = "ssh_keys"
 TLS_TRUST_KEY = "tls_trust"
 KNOWN_HOSTS_KEY = "known_hosts"
@@ -213,6 +223,7 @@ ENCRYPTED_BACKUP_SCRYPT_P = 1
 SEVEN_ZIP_TIMEOUT_SECONDS = 600
 SEVEN_ZIP_BINARY = "7z"
 MAX_BACKUP_ARCHIVE_BYTES = 256 * 1024 * 1024
+MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES = 6 * 1024 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_COUNT = 1024
 MAX_ARCHIVE_MEMBER_BYTES = 1536 * 1024 * 1024
 MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
@@ -271,6 +282,13 @@ class FileBackupArtifact:
 
 
 @dataclass(slots=True)
+class _SegmentedExportSnapshot:
+    hot_path: Path
+    catalog: dict[str, Any]
+    segment_paths: tuple[Path, ...]
+
+
+@dataclass(slots=True)
 class _ImportRollbackEntry:
     target_path: Path
     kind: Literal["missing", "file", "directory", "symlink", "history"]
@@ -305,6 +323,7 @@ class _ImportActivationTransaction:
             else None
         )
         self._committed = False
+        self._rollback_completed = False
         try:
             for member_key, content in sorted(extracted_members.items()):
                 staged_path = self.staging_root / hashlib.sha256(
@@ -341,6 +360,7 @@ class _ImportActivationTransaction:
                     "Import activation rollback cleanup is incomplete; recovery material "
                     f"was preserved at {self.root}: {cleanup_error}"
                 ) from exc
+            self._rollback_completed = True
             return False
 
         if self._committed:
@@ -359,8 +379,21 @@ class _ImportActivationTransaction:
     def commit(self) -> None:
         self._committed = True
 
+    @property
+    def rollback_completed(self) -> bool:
+        return self._rollback_completed
+
     def activate_file(self, target_path: Path, member_key: str) -> None:
-        entry = self._record_target(target_path)
+        self._activate_file(target_path, member_key, allow_history=False)
+
+    def _activate_file(
+        self,
+        target_path: Path,
+        member_key: str,
+        *,
+        allow_history: bool,
+    ) -> None:
+        entry = self._record_target(target_path, allow_history=allow_history)
         staged_path = self._staged_member(member_key)
         self._ensure_parent_hierarchy(target_path.parent)
         file_descriptor, temp_name = tempfile.mkstemp(
@@ -386,6 +419,25 @@ class _ImportActivationTransaction:
             self._fsync_directory(target_path.parent)
         finally:
             self._cleanup_sibling_artifact(temp_path)
+
+    def activate_segmented_history(
+        self,
+        store: HistoryStore,
+        *,
+        hot_member_key: str,
+        segment_members: list[tuple[str, Path]],
+    ) -> None:
+        catalog_path = store.segment_catalog_path
+        if catalog_path is None:
+            raise ValueError("Segmented history catalog target is not configured.")
+        store._segment_reader_cache = None
+        store._segment_reader_identity = None
+        self._activate_file(
+            store.file_path,
+            hot_member_key,
+            allow_history=True,
+        )
+        self.activate_directory(catalog_path.parent, segment_members)
 
     def activate_directory(
         self,
@@ -474,9 +526,14 @@ class _ImportActivationTransaction:
             raise ValueError(f"Backup bundle is missing staged member {member_key!r}.")
         return staged_path
 
-    def _record_target(self, target_path: Path) -> _ImportRollbackEntry:
+    def _record_target(
+        self,
+        target_path: Path,
+        *,
+        allow_history: bool = False,
+    ) -> _ImportRollbackEntry:
         journal_key = self._journal_key(target_path)
-        if self._protected_history_key and self._journal_paths_overlap(
+        if not allow_history and self._protected_history_key and self._journal_paths_overlap(
             journal_key,
             self._protected_history_key,
         ):
@@ -1015,6 +1072,10 @@ class SystemBackupService:
             included_paths=included_paths,
         )
         try:
+            if artifact.path.stat().st_size > MAX_BACKUP_ARCHIVE_BYTES:
+                raise ValueError(
+                    "Backup bundle exceeds the in-memory limit; use the file-backed export API."
+                )
             return BackupArtifact(
                 filename=artifact.filename,
                 content=artifact.path.read_bytes(),
@@ -1062,16 +1123,37 @@ class SystemBackupService:
         normalized_packaging: ArchivePackaging = "7z" if encrypt else requested_packaging
         workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-export-"))
         try:
-            history_snapshot_path = (
-                self._build_history_snapshot_to_directory(workspace / "history-snapshot")
-                if HISTORY_DB_KEY in selected_groups
-                else None
-            )
+            segmented_snapshot: _SegmentedExportSnapshot | None = None
+            history_snapshot_path: Path | None = None
+            if HISTORY_DB_KEY in selected_groups:
+                if self.store.segment_catalog_path is not None:
+                    segmented_snapshot = self._build_segmented_history_snapshot_to_directory(
+                        workspace / "history-snapshot"
+                    )
+                    history_snapshot_path = segmented_snapshot.hot_path
+                else:
+                    history_snapshot_path = self._build_history_snapshot_to_directory(
+                        workspace / "history-snapshot"
+                    )
             bundle_groups, bundle_members = self._collect_backup_bundle(
                 app_settings,
                 history_snapshot_path,
                 selected_groups=selected_groups,
             )
+            if segmented_snapshot is not None:
+                for segment_path in segmented_snapshot.segment_paths:
+                    segment_id = segment_path.stem
+                    bundle_members.append(
+                        BundleMember(
+                            key=f"history-segment:{segment_id}",
+                            group_key=HISTORY_SEGMENT_GROUP_KEY,
+                            archive_path=f"history/segments/{segment_id}.sqlite3",
+                            source_path=None,
+                            present=True,
+                            content=None,
+                            file_path=segment_path,
+                        )
+                    )
             manifest = self._build_manifest(
                 format_name=BUNDLE_FORMAT,
                 app_settings=app_settings,
@@ -1080,6 +1162,48 @@ class SystemBackupService:
                 bundle_groups=bundle_groups,
                 bundle_members=bundle_members,
             )
+            if segmented_snapshot is not None:
+                local_segments = segmented_snapshot.catalog.get("segments")
+                if not isinstance(local_segments, list):
+                    raise ValueError("Segmented history catalog is invalid.")
+                manifest_segments: list[dict[str, Any]] = []
+                for sequence, entry in enumerate(local_segments, start=1):
+                    if not isinstance(entry, dict):
+                        raise ValueError("Segmented history catalog is invalid.")
+                    segment_id = entry.get("segment_id")
+                    manifest_segments.append(
+                        {
+                            **entry,
+                            "sequence": sequence,
+                            "member_key": f"history-segment:{segment_id}",
+                            "archive_path": f"history/segments/{segment_id}.sqlite3",
+                            "schema_version": 1,
+                            "required": True,
+                            "supersedes": list(entry.get("supersedes") or []),
+                        }
+                    )
+                generation_id = segmented_snapshot.catalog.get("generation_id")
+                manifest.update(
+                    {
+                        "schema_version": SEGMENTED_BACKUP_SCHEMA_VERSION,
+                        "generation": {
+                            "generation_id": generation_id,
+                            "complete": True,
+                            "baseline": True,
+                            "parent_generation_id": None,
+                            "min_reader_version": SEGMENTED_BACKUP_SCHEMA_VERSION,
+                        },
+                        "history_catalog": {
+                            "catalog_version": 1,
+                            "hot_member_key": HISTORY_DB_KEY,
+                            "segments": manifest_segments,
+                            "tombstones": list(
+                                segmented_snapshot.catalog.get("tombstones") or []
+                            ),
+                        },
+                    }
+                )
+                validate_segmented_manifest(manifest)
             stem = f"jbod-system-backup-{exported_at.strftime('%Y%m%dT%H%M%SZ')}"
             filename = f"{stem}{ARCHIVE_FILE_SUFFIXES[normalized_packaging]}"
             archive_path = workspace / filename
@@ -1115,25 +1239,47 @@ class SystemBackupService:
     ) -> FileBackupArtifact:
         if not passphrase:
             raise ValueError("A passphrase is required when encryption is enabled.")
-        artifact = self._export_bundle_to_file(
-            encrypt=False,
-            packaging="tar.zst",
-            included_paths=included_paths,
-            encrypted_outer_envelope=True,
+        selected_groups = self._resolve_selected_groups(
+            included_paths,
+            bundle_type="backup",
         )
-        encrypted_path = artifact.path.with_name(f"{artifact.path.name}.enc")
+        uses_file_backed_history = HISTORY_DB_KEY in selected_groups
+        artifact = self._export_bundle_to_file(
+            encrypt=uses_file_backed_history,
+            passphrase=passphrase if uses_file_backed_history else None,
+            packaging="7z" if uses_file_backed_history else "tar.zst",
+            included_paths=included_paths,
+            encrypted_outer_envelope=not uses_file_backed_history,
+        )
+        if not uses_file_backed_history:
+            encrypted_path = artifact.path.with_name(f"{artifact.path.name}.enc")
+            try:
+                self._encrypt_scheduled_archive(
+                    artifact.path,
+                    encrypted_path,
+                    passphrase,
+                )
+                artifact.path.unlink(missing_ok=True)
+                artifact = FileBackupArtifact(
+                    filename=f"{artifact.filename}.enc",
+                    path=encrypted_path,
+                    media_type="application/octet-stream",
+                    manifest=artifact.manifest,
+                    cleanup_root=artifact.cleanup_root,
+                )
+            except Exception:
+                artifact.cleanup()
+                raise
         try:
-            self._encrypt_scheduled_archive(artifact.path, encrypted_path, passphrase)
             verification = self.preflight_scheduled_bundle_file(
-                encrypted_path,
+                artifact.path,
                 passphrase=passphrase,
                 expected_groups=list(included_paths or []),
             )
-            artifact.path.unlink(missing_ok=True)
             return FileBackupArtifact(
-                filename=f"{artifact.filename}.enc",
-                path=encrypted_path,
-                media_type="application/octet-stream",
+                filename=artifact.filename,
+                path=artifact.path,
+                media_type=artifact.media_type,
                 manifest=verification["manifest"],
                 cleanup_root=artifact.cleanup_root,
             )
@@ -1148,31 +1294,8 @@ class SystemBackupService:
         passphrase: str,
         expected_groups: list[str],
     ) -> dict[str, Any]:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(Path(archive_path), flags)
-        except OSError as exc:
-            raise ValueError("Scheduled backup archive could not be opened.") from exc
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_BACKUP_ARCHIVE_BYTES:
-                raise ValueError("Scheduled backup archive exceeds its size or type limits.")
-            chunks: list[bytes] = []
-            remaining = MAX_BACKUP_ARCHIVE_BYTES + 1
-            while remaining > 0:
-                chunk = os.read(descriptor, min(ARCHIVE_READ_CHUNK_BYTES, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            archive_bytes = b"".join(chunks)
-            if len(archive_bytes) > MAX_BACKUP_ARCHIVE_BYTES:
-                raise ValueError("Scheduled backup archive exceeds its size limit.")
-        finally:
-            os.close(descriptor)
-
-        manifest, extracted, _packaging, archive_meta = self._read_archive(
-            archive_bytes,
+        manifest, extracted, _packaging, archive_meta = self._read_archive_file(
+            Path(archive_path),
             passphrase=passphrase,
         )
         cleanup_root = archive_meta.pop("_cleanup_root", None)
@@ -1289,6 +1412,10 @@ class SystemBackupService:
             maintenance_payload=maintenance_payload,
         )
         try:
+            if artifact.path.stat().st_size > MAX_BACKUP_ARCHIVE_BYTES:
+                raise ValueError(
+                    "Debug bundle exceeds the in-memory limit; use the file-backed export API."
+                )
             return BackupArtifact(
                 filename=artifact.filename,
                 content=artifact.path.read_bytes(),
@@ -1394,44 +1521,228 @@ class SystemBackupService:
             shutil.rmtree(workspace, ignore_errors=True)
             raise
 
+    @staticmethod
+    def _create_segmented_activation_marker(
+        store: HistoryStore,
+        manifest: dict[str, Any],
+    ) -> tuple[Path, int, tuple[int, int]]:
+        marker_path = activation_pending_path(store.file_path)
+        generation = manifest.get("generation")
+        generation_id = generation.get("generation_id") if isinstance(generation, dict) else None
+        payload = json.dumps(
+            {
+                "operation": "segmented-restore",
+                "generation_id": generation_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(marker_path, flags, 0o600)
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("Segmented history activation marker write failed.")
+                view = view[written:]
+            os.fsync(descriptor)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ValueError("Segmented history activation marker is invalid.")
+            path_metadata = os.stat(marker_path, follow_symlinks=False)
+            identity = (int(metadata.st_dev), int(metadata.st_ino))
+            if (path_metadata.st_dev, path_metadata.st_ino) != identity:
+                raise ValueError("Segmented history activation marker is invalid.")
+            _ImportActivationTransaction._fsync_directory(marker_path.parent)
+            return marker_path, descriptor, identity
+        except Exception:
+            removed = False
+            try:
+                metadata = os.fstat(descriptor)
+                path_metadata = os.stat(marker_path, follow_symlinks=False)
+                if (
+                    stat.S_ISREG(path_metadata.st_mode)
+                    and (path_metadata.st_dev, path_metadata.st_ino)
+                    == (metadata.st_dev, metadata.st_ino)
+                ):
+                    marker_path.unlink()
+                    removed = True
+            except FileNotFoundError:
+                pass
+            finally:
+                os.close(descriptor)
+            if removed:
+                _ImportActivationTransaction._fsync_directory(marker_path.parent)
+            raise
+
+    @staticmethod
+    def _remove_segmented_activation_marker(
+        marker: tuple[Path, int, tuple[int, int]],
+    ) -> None:
+        marker_path, descriptor, identity = marker
+        try:
+            metadata = os.fstat(descriptor)
+            path_metadata = os.stat(marker_path, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (metadata.st_dev, metadata.st_ino) != identity
+                or (path_metadata.st_dev, path_metadata.st_ino) != identity
+            ):
+                raise RuntimeError("Segmented history activation marker identity changed.")
+            marker_path.unlink()
+            _ImportActivationTransaction._fsync_directory(marker_path.parent)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _close_segmented_activation_marker(
+        marker: tuple[Path, int, tuple[int, int]],
+    ) -> None:
+        os.close(marker[1])
+
     def import_bundle(self, content: bytes, *, passphrase: str | None = None) -> dict[str, Any]:
         if len(content) > MAX_BACKUP_ARCHIVE_BYTES:
             raise ValueError(
                 f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
             )
-        manifest, extracted, detected_packaging, archive_meta = self._read_archive(
-            content,
-            passphrase=passphrase,
+        return self._import_parsed_bundle(
+            self._read_archive(content, passphrase=passphrase)
         )
+
+    def import_bundle_from_file(
+        self,
+        archive_path: str | Path,
+        *,
+        passphrase: str | None = None,
+    ) -> dict[str, Any]:
+        return self._import_parsed_bundle(
+            self._read_archive_file(Path(archive_path), passphrase=passphrase)
+        )
+
+    def _import_parsed_bundle(
+        self,
+        parsed: tuple[
+            dict[str, Any],
+            dict[str, ExtractedMember],
+            ArchivePackaging,
+            dict[str, Any],
+        ],
+    ) -> dict[str, Any]:
+        manifest, extracted, detected_packaging, archive_meta = parsed
         cleanup_root = archive_meta.pop("_cleanup_root", None)
         try:
             group_entries = self._manifest_group_entries(manifest)
             self._validate_manifest_member_metadata(manifest, extracted)
             self._preflight_selected_group_members(manifest, group_entries, extracted)
             self._preflight_import_members(manifest, group_entries, extracted)
+            self._prepare_segmented_history_import(manifest, extracted)
+            segmented_restore = manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
+            lock_context = (
+                history_write_lock(self.store.file_path, blocking=False)
+                if segmented_restore
+                else nullcontext()
+            )
+            transaction = _ImportActivationTransaction(
+                extracted,
+                history_store=self.store,
+            )
+            marker: tuple[Path, int, tuple[int, int]] | None = None
             try:
-                with _ImportActivationTransaction(
-                    extracted,
-                    history_store=self.store,
-                ) as transaction:
-                    extraction_root = cleanup_root
-                    cleanup_root = None
-                    self._cleanup_extracted_archive(extraction_root)
-                    result = self._activate_import_bundle(
-                        manifest,
-                        extracted,
-                        group_entries,
-                        detected_packaging,
-                        archive_meta,
-                        transaction,
-                    )
-                    transaction.commit()
+                with lock_context:
+                    try:
+                        with transaction:
+                            if segmented_restore:
+                                marker = self._create_segmented_activation_marker(
+                                    self.store,
+                                    manifest,
+                                )
+                            extraction_root = cleanup_root
+                            cleanup_root = None
+                            self._cleanup_extracted_archive(extraction_root)
+                            result = self._activate_import_bundle(
+                                manifest,
+                                extracted,
+                                group_entries,
+                                detected_packaging,
+                                archive_meta,
+                                transaction,
+                            )
+                            transaction.commit()
+                    except Exception:
+                        if marker is not None:
+                            if transaction.rollback_completed:
+                                self._remove_segmented_activation_marker(marker)
+                            else:
+                                self._close_segmented_activation_marker(marker)
+                            marker = None
+                        raise
+                    if marker is not None:
+                        self._remove_segmented_activation_marker(marker)
+                        marker = None
                     return result
             except Exception:
                 get_settings.cache_clear()
                 raise
         finally:
             self._cleanup_extracted_archive(cleanup_root)
+
+    def _prepare_segmented_history_import(
+        self,
+        manifest: dict[str, Any],
+        extracted: dict[str, ExtractedMember],
+    ) -> None:
+        if manifest.get("schema_version") != SEGMENTED_BACKUP_SCHEMA_VERSION:
+            return
+        history_catalog = manifest.get("history_catalog")
+        generation = manifest.get("generation")
+        if not isinstance(history_catalog, dict) or not isinstance(generation, dict):
+            raise ValueError("Segmented history manifest is invalid.")
+        manifest_segments = history_catalog.get("segments")
+        if not isinstance(manifest_segments, list):
+            raise ValueError("Segmented history manifest is invalid.")
+        local_segments: list[dict[str, Any]] = []
+        for entry in manifest_segments:
+            if not isinstance(entry, dict):
+                raise ValueError("Segmented history manifest is invalid.")
+            member_key = entry.get("member_key")
+            if not isinstance(member_key, str) or member_key not in extracted:
+                raise ValueError("Segmented history archive is missing a required segment.")
+            self._validate_history_member(extracted[member_key])
+            segment_id = entry.get("segment_id")
+            local_segments.append(
+                {
+                    "segment_id": segment_id,
+                    "file_name": f"{segment_id}.sqlite3",
+                    "sha256": entry.get("sha256"),
+                    "size_bytes": entry.get("size_bytes"),
+                    "coverage_start": entry.get("coverage_start"),
+                    "coverage_end": entry.get("coverage_end"),
+                    "sealed_at": entry.get("sealed_at"),
+                    "key_id": entry.get("key_id"),
+                    "row_counts": entry.get("row_counts"),
+                    "supersedes": list(entry.get("supersedes") or []),
+                }
+            )
+        local_catalog = {
+            "catalog_version": history_catalog.get("catalog_version"),
+            "generation_id": generation.get("generation_id"),
+            "complete": generation.get("complete"),
+            "segments": local_segments,
+            "tombstones": list(history_catalog.get("tombstones") or []),
+        }
+        extracted[SEGMENTED_CATALOG_STAGING_KEY] = json.dumps(
+            local_catalog,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
     def _activate_import_bundle(
         self,
@@ -1546,8 +1857,35 @@ class SystemBackupService:
         if self._manifest_group_selected(history_group):
             history_member = self._first_group_member(manifest, HISTORY_DB_KEY)
             if history_member and history_member["key"] in extracted:
-                transaction.activate_history(self.store, history_member["key"])
+                if manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION:
+                    history_catalog = manifest.get("history_catalog")
+                    if not isinstance(history_catalog, dict):
+                        raise ValueError("Segmented history manifest is invalid.")
+                    manifest_segments = history_catalog.get("segments")
+                    if not isinstance(manifest_segments, list):
+                        raise ValueError("Segmented history manifest is invalid.")
+                    segment_members: list[tuple[str, Path]] = []
+                    for entry in manifest_segments:
+                        if not isinstance(entry, dict):
+                            raise ValueError("Segmented history manifest is invalid.")
+                        segment_id = entry.get("segment_id")
+                        member_key = entry.get("member_key")
+                        if not isinstance(segment_id, str) or not isinstance(member_key, str):
+                            raise ValueError("Segmented history manifest is invalid.")
+                        segment_members.append((member_key, Path(f"{segment_id}.sqlite3")))
+                    segment_members.append(
+                        (SEGMENTED_CATALOG_STAGING_KEY, Path("catalog.json"))
+                    )
+                    transaction.activate_segmented_history(
+                        self.store,
+                        hot_member_key=history_member["key"],
+                        segment_members=segment_members,
+                    )
+                else:
+                    transaction.activate_history(self.store, history_member["key"])
                 restored_paths.append(str(self.store.file_path))
+                if self.store.segment_catalog_path is not None:
+                    restored_paths.append(str(self.store.segment_catalog_path.parent))
                 history_restored = True
             elif self._manifest_group_present(history_group):
                 raise ValueError("Backup bundle is missing the selected history database member.")
@@ -1874,6 +2212,48 @@ class SystemBackupService:
             monthly_retention_count=0,
         )
         return Path(backup_path) if backup_path is not None else None
+
+    def _build_segmented_history_snapshot_to_directory(
+        self,
+        target_dir: Path,
+    ) -> _SegmentedExportSnapshot:
+        catalog_path = self.store.segment_catalog_path
+        if catalog_path is None:
+            raise ValueError("Segmented history catalog is not configured.")
+        target_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+        hot_path = target_dir / "history.sqlite3"
+        segment_root = target_dir / "segments"
+        segment_root.mkdir(mode=0o700)
+        with history_write_lock(self.store.file_path, blocking=False):
+            with self.store._lock:
+                reader = SegmentedHistoryReader.from_catalog(
+                    hot_path=self.store.file_path,
+                    catalog_path=catalog_path,
+                )
+                with closing(self.store._connect(migration_lock_held=True)) as source_connection, closing(
+                    sqlite3.connect(hot_path)
+                ) as snapshot_connection:
+                    snapshot_connection.execute("PRAGMA journal_mode=DELETE")
+                    source_connection.backup(snapshot_connection)
+                    snapshot_connection.commit()
+                os.chmod(hot_path, 0o600)
+                with hot_path.open("rb", buffering=0) as stream:
+                    os.fsync(stream.fileno())
+                staged_segments: list[Path] = []
+                for source_segment in reader.verify_catalog_segments():
+                    target_segment = segment_root / source_segment.name
+                    shutil.copyfile(source_segment, target_segment)
+                    os.chmod(target_segment, 0o600)
+                    with target_segment.open("rb", buffering=0) as stream:
+                        os.fsync(stream.fileno())
+                    staged_segments.append(target_segment)
+                _ImportActivationTransaction._fsync_directory(segment_root)
+                _ImportActivationTransaction._fsync_directory(target_dir)
+                return _SegmentedExportSnapshot(
+                    hot_path=hot_path,
+                    catalog=dict(reader.catalog_payload()),
+                    segment_paths=tuple(staged_segments),
+                )
 
     def _resolve_selected_groups(
         self,
@@ -2447,9 +2827,14 @@ class SystemBackupService:
         passphrase: str | None,
     ) -> None:
         archive_size = archive_path.stat().st_size
-        if archive_size > MAX_BACKUP_ARCHIVE_BYTES:
+        archive_limit = (
+            MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES
+            if packaging == "7z"
+            else MAX_BACKUP_ARCHIVE_BYTES
+        )
+        if archive_size > archive_limit:
             raise ValueError(
-                f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
+                f"Backup bundle archive exceeds the {archive_limit}-byte input limit."
             )
         if packaging == "zip":
             try:
@@ -2782,6 +3167,7 @@ class SystemBackupService:
                     manifest_bytes = archive.read(manifest_member)
                     manifest = self._load_manifest(manifest_bytes)
                     self._validate_manifest_before_extraction(manifest)
+                    self._validate_restore_schema_support(manifest)
                     self._validate_supported_physical_archive_paths(physical_paths, manifest)
                     extracted = self._extract_manifest_zip_members(archive, manifest)
             except zipfile.BadZipFile as exc:
@@ -2803,23 +3189,94 @@ class SystemBackupService:
                 )
                 manifest = self._load_manifest(self._read_tar_member(archive, "manifest.json"))
                 self._validate_manifest_before_extraction(manifest)
+                self._validate_restore_schema_support(manifest)
                 self._validate_supported_physical_archive_paths(physical_paths, manifest)
                 extracted = self._extract_manifest_tar_members(archive, manifest)
         except tarfile.TarError as exc:
             raise ValueError("Backup bundle TAR archive is corrupted.") from exc
         return manifest, extracted, packaging, {"encrypted": False}
 
-    def _read_7z_archive(
+    def _read_archive_file(
         self,
-        archive_bytes: bytes,
+        archive_path: Path,
         *,
         passphrase: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, ExtractedMember], ArchivePackaging, dict[str, Any]]:
-        temp_root = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-7z-import-"))
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            archive_path = temp_root / "bundle.7z"
+            descriptor = os.open(archive_path, flags)
+        except OSError as exc:
+            raise ValueError("Backup bundle archive could not be opened.") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_size > MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES
+            ):
+                raise ValueError("Backup bundle archive exceeds its size or type limits.")
+            prefix = os.pread(descriptor, len(SEVEN_ZIP_SIGNATURE), 0)
+            if prefix.startswith(SEVEN_ZIP_SIGNATURE):
+                workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-file-import-"))
+                private_archive = workspace / "bundle.7z"
+                try:
+                    with os.fdopen(os.dup(descriptor), "rb", closefd=True) as source, private_archive.open(
+                        "xb"
+                    ) as destination:
+                        source.seek(0)
+                        shutil.copyfileobj(source, destination, length=ARCHIVE_READ_CHUNK_BYTES)
+                        destination.flush()
+                        os.fsync(destination.fileno())
+                    private_archive.chmod(0o600)
+                    return self._read_7z_archive(
+                        archive_path=private_archive,
+                        passphrase=passphrase,
+                        workspace=workspace,
+                    )
+                except Exception:
+                    shutil.rmtree(workspace, ignore_errors=True)
+                    raise
+            if metadata.st_size > MAX_BACKUP_ARCHIVE_BYTES:
+                raise ValueError(
+                    "Large file-backed backup imports require portable 7z packaging."
+                )
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            remaining = metadata.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(ARCHIVE_READ_CHUNK_BYTES, remaining))
+                if not chunk:
+                    raise ValueError("Backup bundle archive is truncated.")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return self._read_archive(b"".join(chunks), passphrase=passphrase)
+        finally:
+            os.close(descriptor)
+
+    def _read_7z_archive(
+        self,
+        archive_bytes: bytes | None = None,
+        *,
+        archive_path: Path | None = None,
+        passphrase: str | None = None,
+        workspace: Path | None = None,
+    ) -> tuple[dict[str, Any], dict[str, ExtractedMember], ArchivePackaging, dict[str, Any]]:
+        if (archive_bytes is None) == (archive_path is None):
+            raise ValueError("Exactly one 7z archive source is required.")
+        temp_root = (
+            Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-7z-import-"))
+            if workspace is None
+            else workspace
+        )
+        try:
+            if archive_path is None:
+                archive_path = temp_root / "bundle.7z"
+                archive_path.write_bytes(archive_bytes or b"")
+                archive_size = len(archive_bytes or b"")
+            else:
+                archive_path = Path(archive_path).absolute()
+                archive_size = archive_path.stat(follow_symlinks=False).st_size
             extract_dir = temp_root / "extract"
-            archive_path.write_bytes(archive_bytes)
             extract_dir.mkdir(parents=True, exist_ok=True)
 
             prompt_passphrase = passphrase if passphrase else None
@@ -2843,7 +3300,7 @@ class SystemBackupService:
             listed_entries = self._seven_zip_listed_entries(list_result.stdout, archive_path)
             self._validate_7z_listed_entries(
                 listed_entries,
-                archive_size=len(archive_bytes),
+                archive_size=archive_size,
                 member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
                 expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
             )
@@ -2904,6 +3361,7 @@ class SystemBackupService:
                 expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
                 large_member_group_keys=frozenset({HISTORY_DB_KEY}),
             )
+            self._validate_restore_schema_support(manifest)
             self._validate_supported_physical_archive_paths(listed_file_paths, manifest)
             self._validate_7z_listing_against_manifest(listed_entries, manifest)
 
@@ -2965,6 +3423,11 @@ class SystemBackupService:
             raise ValueError("Backup bundle manifest is not valid JSON.")
         return manifest
 
+    @staticmethod
+    def _validate_restore_schema_support(manifest: dict[str, Any]) -> None:
+        if manifest.get("schema_version") not in SUPPORTED_BUNDLE_SCHEMA_VERSIONS:
+            raise ValueError("Backup bundle schema is not supported for restore.")
+
     @classmethod
     def _is_declared_history_manifest_member(
         cls,
@@ -3006,10 +3469,15 @@ class SystemBackupService:
         large_member_group_keys: frozenset[str] = frozenset(),
     ) -> None:
         schema_version = manifest.get("schema_version")
-        if type(schema_version) is not int or schema_version != BUNDLE_SCHEMA_VERSION:
+        if (
+            type(schema_version) is not int
+            or schema_version not in SUPPORTED_BUNDLE_SCHEMA_VERSIONS
+        ):
             raise ValueError(f"Unsupported backup schema version {schema_version!r}.")
         if manifest.get("format") != BUNDLE_FORMAT:
             raise ValueError("Backup bundle format is not recognized.")
+        if schema_version == SEGMENTED_BACKUP_SCHEMA_VERSION:
+            validate_segmented_manifest(manifest)
 
         for collection_name in ("groups", "files"):
             collection = manifest.get(collection_name, [])
