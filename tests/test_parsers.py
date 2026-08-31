@@ -8,6 +8,7 @@ from app.services.parsers import (
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
     parse_camcontrol_devlist,
+    parse_enclosure_sysfs_map,
     parse_esxcli_smart_get,
     parse_gmultipath_list,
     parse_lsscsi_devices,
@@ -1716,3 +1717,151 @@ class AtaSelfTestLifetimeTests(unittest.TestCase):
 
         self.assertEqual(summary["last_test_lifetime_hours"], 43104)
         self.assertEqual(summary["last_test_age_hours"], 6)
+
+
+class EnclosureSysfsAndDegradedAesTests(unittest.TestCase):
+    SHARED_ADDRESS_AES = """
+  EXAMPLE  SATAJBOD          0100
+  Primary enclosure logical identifier (hex): 5eeeeeee00000084
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 0
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5eeeeeee00000084
+          SAS address: 0x5eeeeeee00000084
+      Element index: 1  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 1
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5eeeeeee00000084
+          SAS address: 0x5eeeeeee00000084
+      Element index: 2  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 2
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5eeeeeee00000084
+          SAS address: 0x5aaaaaaa00000d05
+      Element index: 3  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 3
+        phy index: 0
+          SAS device type: no SAS device attached
+          attached SAS address: 0x5eeeeeee00000084
+          SAS address: 0x5eeeeeee00000084
+""".strip()
+
+    def test_canonicalize_enclosure_sysfs_map_command(self) -> None:
+        command = (
+            "for c in /sys/class/enclosure/*/*; do "
+            '[ -f "$c/slot" ] || continue; printf x; done'
+        )
+        self.assertEqual(canonicalize_ssh_command(command), "enclosure sysfs map")
+
+    def test_parse_enclosure_sysfs_map_reads_slots_and_devices(self) -> None:
+        output = "\n".join(
+            [
+                "13:0:0:0|sg84 |0|0|sdaa",
+                "13:0:0:0|sg84 |1|1|sdab sdbb",
+                "13:0:0:0|sg84 |5|5|",
+                "2:0:0:0|sg2 |-1|7|sdy",
+                "1:0:0:0|sg1 |-1|SLOT 01|sdx",
+                "not a mapping line",
+                "3:0:0:0|ses0 |0|0|sdz",
+            ]
+        )
+
+        mapping = parse_enclosure_sysfs_map(output)
+
+        self.assertEqual(mapping["sg84"][0], ["sdaa"])
+        # Multipath shelves expose one component per path device.
+        self.assertEqual(mapping["sg84"][1], ["sdab", "sdbb"])
+        # Empty bays carry no bound block device and must not create entries.
+        self.assertNotIn(5, mapping["sg84"])
+        # A missing slot attribute falls back to numeric component names only.
+        self.assertEqual(mapping["sg2"][7], ["sdy"])
+        self.assertNotIn("sg1", mapping)
+        # Only sg nodes join back to sg_ses evidence.
+        self.assertNotIn("ses0", mapping)
+
+    def test_parse_ssh_outputs_disables_shared_aes_addresses_and_uses_sysfs_slots(self) -> None:
+        sysfs_output = "\n".join(
+            [
+                "13:0:0:0|sg84 |0|0|sdaa",
+                "13:0:0:0|sg84 |1|1|sdab",
+                "13:0:0:0|sg84 |2|2|sdac",
+            ]
+        )
+
+        parsed = parse_ssh_outputs(
+            {
+                "sudo -n /usr/bin/sg_ses -p aes /dev/sg84": self.SHARED_ADDRESS_AES,
+                "for c in /sys/class/enclosure/*/*; do printf x; done": sysfs_output,
+            },
+            4,
+            None,
+            None,
+        )
+
+        candidates = parsed.ses_slot_candidates
+        # Shared expander addresses cannot identify a bay, so the hint is
+        # demoted to display-only evidence instead of a match key.
+        self.assertIsNone(candidates[0].get("sas_address_hint"))
+        self.assertTrue(candidates[0]["sas_address_degraded"])
+        self.assertEqual(candidates[0]["shared_sas_address"], "5eeeeeee00000084")
+        self.assertIsNone(candidates[1].get("sas_address_hint"))
+        # The unique per-drive address keeps working as a match key.
+        self.assertEqual(candidates[2]["sas_address_hint"], "5aaaaaaa00000d05")
+        self.assertFalse(candidates[2]["sas_address_degraded"])
+        # The kernel enclosure-driver bindings provide the per-bay device hints.
+        self.assertEqual(candidates[0]["device_names"], ["sdaa"])
+        self.assertEqual(candidates[1]["device_names"], ["sdab"])
+        self.assertEqual(parsed.ses_slot_to_device[0], "sdaa")
+        # A bay with no attached device must not read as populated just
+        # because the expander stamped its own address into the descriptor.
+        self.assertFalse(candidates[3]["present"])
+        self.assertTrue(
+            any("shared SAS address" in warning for warning in parsed.ses_selected_meta.get("warnings") or [])
+        )
+
+    def test_parse_ssh_outputs_keeps_unique_aes_addresses_unflagged(self) -> None:
+        output = """
+  EXAMPLE  SASJBOD           0100
+  Primary enclosure logical identifier (hex): 5eeeeeee00000024
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 0
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5eeeeeee00000024
+          SAS address: 0x5aaaaaaa00000a01
+      Element index: 1  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 1
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5eeeeeee00000024
+          SAS address: 0x5aaaaaaa00000a02
+""".strip()
+
+        parsed = parse_ssh_outputs(
+            {"sudo -n /usr/bin/sg_ses -p aes /dev/sg26": output},
+            2,
+            None,
+            None,
+        )
+
+        candidates = parsed.ses_slot_candidates
+        self.assertEqual(candidates[0]["sas_address_hint"], "5aaaaaaa00000a01")
+        self.assertEqual(candidates[1]["sas_address_hint"], "5aaaaaaa00000a02")
+        self.assertFalse(candidates[0]["sas_address_degraded"])
+        self.assertIsNone(candidates[0].get("shared_sas_address"))
+        self.assertEqual(parsed.ses_selected_meta.get("warnings"), [])

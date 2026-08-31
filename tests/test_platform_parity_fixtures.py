@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
-from app.services.inventory import InventoryService
+from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, InventoryService
 from app.services.mapping_store import MappingStore
 from app.services.parsers import parse_ssh_outputs, parse_storcli_physical_drives
 from app.services.profile_registry import (
@@ -225,6 +225,79 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_controller["c1"]["slot_key"], "252:7")
         self.assertEqual(by_controller["c1"]["serial"], "ZC1PARITY")
         self.assertEqual(by_controller["c1"]["firmware"], "SN03")
+
+
+
+    async def test_scale_shared_sata_aes_uses_enclosure_driver_mapping(self) -> None:
+        """
+        Issue #119: SATA-heavy shelves whose expander stamps one shared SAS
+        address into every AES descriptor must not stay unmapped (or worse,
+        map wrong). The kernel enclosure-driver bindings provide the per-bay
+        device names, and the shared address is demoted to display evidence.
+        """
+
+        disks = [
+            {"devname": "sdaa", "name": "sdaa", "serial": "SYNTHSATA001", "model": "EXAMPLE-HDD", "lunid": "5bbbbbbb00001000"},
+            {"devname": "sdab", "name": "sdab", "serial": "SYNTHSATA002", "model": "EXAMPLE-HDD", "lunid": "5bbbbbbb00001002"},
+            {"devname": "sdac", "name": "sdac", "serial": "SYNTHSATA003", "model": "EXAMPLE-HDD", "lunid": "5bbbbbbb00002000"},
+            {"devname": "sdad", "name": "sdad", "serial": "SYNTHSATA004", "model": "EXAMPLE-HDD", "lunid": "5bbbbbbb00003000"},
+            {"devname": "sdae", "name": "sdae", "serial": "SYNTHSAS0005", "model": "EXAMPLE-SAS", "lunid": "5aaaaaaa00000d04"},
+        ]
+
+        class DummyScaleClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                return TrueNASRawData(
+                    enclosures=[],
+                    disks=disks,
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="shared-sata-scale",
+                label="Shared SATA SCALE",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.11", user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(settings, system, DummyScaleClient(), AsyncMock(), temp_dir)
+            ses_overlay = parse_ssh_outputs(
+                {
+                    "sudo -n /usr/bin/sg_ses -p aes /dev/sg84": fixture_text("scale_shared_sata_aes.txt"),
+                    LINUX_ENCLOSURE_SYSFS_MAP_COMMAND: fixture_text("scale_shared_sata_sysfs.txt"),
+                },
+                6,
+                None,
+                None,
+            )
+            service._tag_ses_overlay(ses_overlay, "10.0.0.11")
+            service._fetch_scale_ses_overlay = AsyncMock(return_value=(ses_overlay, []))
+
+            snapshot = await service.get_snapshot()
+
+            slots_by_number = {slot.slot: slot for slot in snapshot.slots}
+            # The kernel enclosure-driver bindings map every SATA bay even
+            # though AES reports the expander's address for all of them.
+            self.assertEqual(slots_by_number[0].device_name, "sdaa")
+            self.assertEqual(slots_by_number[1].device_name, "sdab")
+            self.assertEqual(slots_by_number[2].device_name, "sdac")
+            self.assertEqual(slots_by_number[3].device_name, "sdad")
+            self.assertEqual(slots_by_number[4].device_name, "sdae")
+            # Adjacent-lunid disks must never swap slots via shifted aliases.
+            self.assertEqual(slots_by_number[0].serial, "SYNTHSATA001")
+            self.assertEqual(slots_by_number[1].serial, "SYNTHSATA002")
+            # The shared address is not presented as a per-bay SAS address.
+            self.assertIsNone(slots_by_number[0].sas_address)
+            self.assertIsNone(slots_by_number[1].sas_address)
+            # The empty bay stays empty instead of ghosting as populated.
+            self.assertFalse(slots_by_number[5].present)
+            self.assertIsNone(slots_by_number[5].device_name)
+            self.assertTrue(
+                any("shared SAS address" in warning for warning in snapshot.warnings),
+                snapshot.warnings,
+            )
 
 
 if __name__ == "__main__":
