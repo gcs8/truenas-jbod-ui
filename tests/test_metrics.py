@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -287,6 +290,48 @@ class HistoryMetricsTests(unittest.TestCase):
 
 
 class ScheduledBackupMetricsTests(unittest.TestCase):
+    def test_metrics_module_imports_with_valid_scheduled_backup_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_file = Path(temp_dir) / "scheduled-backup.json"
+            status_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "enabled": True,
+                        "included_groups": ["history_db"],
+                        "success_count": 1,
+                        "failure_count": 0,
+                        "last_attempt_at": "2030-01-01T03:04:05+00:00",
+                        "last_success_at": "2030-01-01T03:04:05+00:00",
+                        "last_failure_at": None,
+                        "last_size_bytes": 12345,
+                        "last_sha256": "a" * 64,
+                        "last_artifact_name": (
+                            "jbod-scheduled-backup-20300101T030405Z-1234abcd.tar.zst.enc"
+                        ),
+                        "last_absent_groups": [],
+                        "last_retention_removed": 0,
+                        "last_error_code": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_file.chmod(0o600)
+            result = subprocess.run(
+                [sys.executable, "-c", "import app.metrics"],
+                cwd=Path(__file__).resolve().parents[1],
+                env={
+                    **os.environ,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "SCHEDULED_BACKUP_STATUS_FILE": str(status_file),
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_scheduled_backup_metrics_reject_malformed_durable_status(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             status_file = Path(temp_dir) / "scheduled-backup.json"

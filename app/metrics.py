@@ -579,10 +579,6 @@ class ScheduledBackupStatusCollector:
         yield last_error
 
 
-SCHEDULED_BACKUP_STATUS_COLLECTOR = ScheduledBackupStatusCollector()
-REGISTRY.register(SCHEDULED_BACKUP_STATUS_COLLECTOR)
-
-
 def observe_inventory_snapshot_request(
     *,
     service_name: str,
@@ -798,3 +794,7 @@ def _route_label(request: Request) -> str:
     if isinstance(route_path, str) and route_path:
         return route_path
     return "unmatched"
+
+
+SCHEDULED_BACKUP_STATUS_COLLECTOR = ScheduledBackupStatusCollector()
+REGISTRY.register(SCHEDULED_BACKUP_STATUS_COLLECTOR)
