@@ -59,4 +59,4 @@ Review fixture and baseline changes together. Do not raise a ceiling only to mak
 
 ## Deferred work
 
-Issue #36 owns zero-rebuild slot selection and focus preservation. Issue #55 owns parser and SAS diagnostic payload budgets. Issues #48 and #56 own browser history-cache and refresh behavior. This budget suite must not add permissive baselines for those unfinished paths.
+The originally deferred paths have since shipped and closed: #36 (zero-rebuild slot selection and focus preservation), #55 (parser and SAS diagnostic payload bounds), and #48/#56 (browser history-cache and refresh behavior) all landed in the v0.22 performance cycle. The standing rule remains: this budget suite must not add permissive baselines to paper over a regression in any of them.

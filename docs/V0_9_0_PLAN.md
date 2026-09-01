@@ -1,5 +1,10 @@
 # v0.9.0 Plan
 
+> **Historical record.** This document describes a completed or superseded
+> cycle and is preserved for archaeology. Do not treat its plans, action
+> items, hosts, or version framing as current guidance - see
+> `docs/ROADMAP.md` and `CHANGELOG.md` for live state.
+
 Planning baseline for the first stabilization-focused release after `0.8.0`.
 
 ## Goal

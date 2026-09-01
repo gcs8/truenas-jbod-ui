@@ -1,5 +1,10 @@
 # v0.20.1 Platform Parity Plan
 
+> **Historical record.** This document describes a completed or superseded
+> cycle and is preserved for archaeology. Do not treat its plans, action
+> items, hosts, or version framing as current guidance - see
+> `docs/ROADMAP.md` and `CHANGELOG.md` for live state.
+
 Status: planning slice started on 2026-05-20; first Storage Fabric
 implementation bite completed on 2026-05-20
 Branch: `codex/v0.20.1-kickoff-2026-05-20-post-0.20.0`

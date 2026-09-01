@@ -27,10 +27,13 @@ If you want the runtime selector mental model, use:
 
 ## Built-In Profiles Right Now
 
-- `supermicro-cse-946-top-60`
-- `supermicro-ssg-6048r-front-24`
-- `supermicro-ssg-6048r-rear-12`
-- `supermicro-sys-2029gp-tr-right-nvme-2`
+Seventeen built-in profiles ship today: the validated hardware profiles
+(Supermicro CSE-946 60-bay, SSG-6048R front/rear, SYS-2029GP NVMe carrier,
+SSG-2028R shared front, AOC-SLG4-2H8M2 carrier, FatTwin front/rear, UniFi
+UNVR and UNVR Pro) plus seven `generic-*` geometry-first profiles from 12 to
+106 bays. The authoritative, always-current list with IDs and layouts lives in
+[`docs/PROFILE_AUTHORING.md`](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/PROFILE_AUTHORING.md)
+and in `app/services/profile_registry.py`.
 
 ## Where Custom Profiles Live
 

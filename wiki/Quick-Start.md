@@ -115,7 +115,7 @@ docker compose up -d
 If you pin a version, edit `JBOD_UI_IMAGE` in `.env` first:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.18.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.1
 ```
 
 Then run:

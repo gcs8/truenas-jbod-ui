@@ -1,5 +1,10 @@
 # v0.21.x Code Quality Pitstop Plan
 
+> **Historical record.** This document describes a completed or superseded
+> cycle and is preserved for archaeology. Do not treat its plans, action
+> items, hosts, or version framing as current guidance - see
+> `docs/ROADMAP.md` and `CHANGELOG.md` for live state.
+
 Status: release-prep summary for `v0.21.0`; near-term rails, CI, backup hardening, public-demo, and Storage Fabric seam work landed, with deeper module splits and enrichment deferred.
 
 `0.21.x` should be a maintenance and confidence cycle. Treat it as a deliberate

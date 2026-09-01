@@ -1,5 +1,10 @@
 # v0.20.1 Release Candidate QA
 
+> **Historical record.** This document describes a completed or superseded
+> cycle and is preserved for archaeology. Do not treat its plans, action
+> items, hosts, or version framing as current guidance - see
+> `docs/ROADMAP.md` and `CHANGELOG.md` for live state.
+
 Status: draft release gate for `0.20.1`.
 
 Use this as the release-specific addendum to `docs/RELEASE_CHECKLIST.md`.

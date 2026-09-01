@@ -192,7 +192,7 @@ That tracks the newest published stable image.
 If you want slower, more deliberate updates, select a release tag first:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.18.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.1
 ```
 
 Useful tag shapes:
@@ -200,7 +200,7 @@ Useful tag shapes:
 | Tag | Use it when |
 | --- | --- |
 | `latest` | you want the newest stable published image |
-| `v0.18.0` | you want the image currently labeled with that GitHub release |
+| `v0.22.1` | you want the image currently labeled with that GitHub release |
 | `0.18.0` | you want the same stable release without the `v` prefix |
 | `dev` | you are testing the current development image and accept churn |
 
@@ -252,7 +252,7 @@ set -euo pipefail
 cd /docker-local/truenas-jbod-ui
 release_revision='REPLACE_WITH_40_HEX_SOURCE_REVISION'
 expected_image='REPLACE_WITH_WORKFLOW_IMMUTABLE_IMAGE'
-candidate_tag='ghcr.io/gcs8/truenas-jbod-ui:v0.18.0'
+candidate_tag='ghcr.io/gcs8/truenas-jbod-ui:v0.22.1'
 python3 scripts/update_immutable_deployment.py update . \
   --project-name truenas-jbod-ui \
   --source-revision "$release_revision" \

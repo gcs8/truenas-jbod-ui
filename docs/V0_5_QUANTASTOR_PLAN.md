@@ -1,5 +1,10 @@
 # v0.5.0 Quantastor Plan
 
+> **Historical record.** This document describes a completed or superseded
+> cycle and is preserved for archaeology. Do not treat its plans, action
+> items, hosts, or version framing as current guidance - see
+> `docs/ROADMAP.md` and `CHANGELOG.md` for live state.
+
 Execution plan and completion record for the first OSNexus Quantastor release
 line.
 

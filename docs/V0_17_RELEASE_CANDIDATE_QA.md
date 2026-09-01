@@ -1,5 +1,10 @@
 # v0.17.0 Release-Candidate QA Plan
 
+> **Historical record.** This document describes a completed or superseded
+> cycle and is preserved for archaeology. Do not treat its plans, action
+> items, hosts, or version framing as current guidance - see
+> `docs/ROADMAP.md` and `CHANGELOG.md` for live state.
+
 This is the slow, comprehensive validation pass to run before pushing
 `0.17.0` to GitHub / GHCR.
 

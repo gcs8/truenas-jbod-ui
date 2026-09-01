@@ -37,7 +37,7 @@ If you pin a tag:
 Example:
 
 ```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.18.0
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.1
 ```
 
 ```bash

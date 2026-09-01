@@ -1,5 +1,10 @@
 # v0.3.x Plan
 
+> **Historical record.** This document describes a completed or superseded
+> cycle and is preserved for archaeology. Do not treat its plans, action
+> items, hosts, or version framing as current guidance - see
+> `docs/ROADMAP.md` and `CHANGELOG.md` for live state.
+
 This file is the execution plan for the `0.3.x` line after `v0.3.1`.
 
 Use this file as the working source of truth for what remains in the current

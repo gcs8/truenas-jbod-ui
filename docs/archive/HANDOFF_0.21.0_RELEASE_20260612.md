@@ -1,3 +1,7 @@
+> **Archived session handoff (2026-06-12).** This was live agent-session
+> state for the v0.21.0/v0.21.1 cut and is long superseded. Do not run its
+> pickup commands or probe the hosts it names.
+
 # v0.21.x Release Handoff - final as of 2026-06-12T18:25Z
 
 This handoff is for the next Hermes/Codex session continuing the `gcs8/truenas-jbod-ui` `v0.21.0` release. It supersedes the earlier notes in this file: the first Linux QA attempts used incomplete/sanitized data and must not be treated as release evidence.

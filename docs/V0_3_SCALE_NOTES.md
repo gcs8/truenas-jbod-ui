@@ -1,5 +1,10 @@
 # v0.3 SCALE Notes
 
+> **Historical record.** This document describes a completed or superseded
+> cycle and is preserved for archaeology. Do not treat its plans, action
+> items, hosts, or version framing as current guidance - see
+> `docs/ROADMAP.md` and `CHANGELOG.md` for live state.
+
 ## Target System
 
 - Chassis: `Supermicro SSG-6048R-E1CR36L`
@@ -41,6 +46,11 @@ Not working yet:
 ## Live Findings
 
 ### API Deprecation Watch
+
+> **Resolved.** The app is websocket-only (`/websocket`,
+> `auth.login_with_api_key`) with no `/api/v2.0` callers, so the REST-removal
+> item below is closed; the alert source was another integration on the same
+> host. Nothing here is an open follow-up.
 
 On `2026-04-14`, the SCALE host reported this alert:
 

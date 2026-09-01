@@ -137,7 +137,10 @@ What was validated on the tested UNVR and UNVR Pro units:
 What is still missing:
 
 - a documented per-disk Protect API endpoint for slot inventory
-- a validated SES/LED path across the family
+
+Identify LED control is no longer missing across the family: the regular UNVR
+has a validated vendor-local SSH LED path, and the UNVR Pro carries the same
+path marked experimental.
 
 The current built-in profile is:
 

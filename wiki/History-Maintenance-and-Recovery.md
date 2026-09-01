@@ -3,6 +3,13 @@
 This page is the operator guide for cleaning up saved history when a system is
 deleted, renamed, or rebuilt under a new `system_id`.
 
+> **Segmented-history deployments:** once segmented long-horizon history is
+> active, v1-only history backup/restore and the system-wide delete, purge,
+> and adopt operations on this page **fail closed** by design. See
+> `docs/SEGMENTED_HISTORY_V2.md` and the segmented-history section of
+> [[Advanced Configuration|Advanced-Configuration]] before attempting a
+> destructive cleanup on a migrated deployment.
+
 The admin maintenance area now exposes the safe paths directly:
 
 ![Admin maintenance bundle and history tools](images/admin-maintenance-v0.18.0.png)

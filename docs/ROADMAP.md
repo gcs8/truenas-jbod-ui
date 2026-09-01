@@ -1,8 +1,10 @@
 # Roadmap
 
-This file tracks the current intended release direction at the `v0.22.1`
-maintenance candidate. `v0.22.0` is the latest published release until the
-`v0.22.1` tag and GitHub release are published.
+This file tracks the current intended release direction. `v0.22.1` is the
+latest published release (tagged 2026-08-31); post-`v0.22.1` development has
+begun on `main` with segmented long-horizon history (#122), with later-
+generation rotation tracked in #124. Per-release detail from `v0.15` onward
+lives in `CHANGELOG.md` rather than in per-version sections here.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -41,9 +43,9 @@ validation and transactional staging:
 - CI covers Python 3.12 and 3.14, container health, browser QA, public artifacts,
   Ruff, dependency checks, and CodeQL
 
-The next development lane begins only after the v0.22.1 image, development QA,
-production deployment, and post-release reopen gates are complete. It should
-stay practical and incremental:
+The post-v0.22.1 development lane is now open (segmented history #122 merged;
+rotation continues in #124, and the 2026-08-31 grooming audit backlog lives in
+issues #125-#151). It should stay practical and incremental:
 
 - keep richer platform-native Storage Fabric enrichment in small validated
   slices
@@ -320,7 +322,8 @@ Primary outcomes:
 
 Current notes:
 
-- [`docs/V0_11_0_PLAN.md`](./V0_11_0_PLAN.md)
+- the `V0_11_0_PLAN.md` working notes were retired from the repo and are
+  preserved maintainer-locally (gitignored `artifacts/deferred-docs/`)
 
 Current status:
 

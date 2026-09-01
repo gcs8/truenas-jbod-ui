@@ -1,5 +1,10 @@
 # v0.2 Roadmap Notes
 
+> **Historical record.** This document describes a completed or superseded
+> cycle and is preserved for archaeology. Do not treat its plans, action
+> items, hosts, or version framing as current guidance - see
+> `docs/ROADMAP.md` and `CHANGELOG.md` for live state.
+
 This file tracks the intended direction for the next iteration without changing
 the expectations of the `v0.1.0` release.
 

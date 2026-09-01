@@ -50,6 +50,8 @@ Optional fields:
   - `top-loader`
   - `front-drive`
   - `rear-drive`
+  - `unifi-drive`
+  - `nvme-carrier`
 - `latch_edge`: tray-release edge used for visual polish:
   - `bottom`
   - `right`
@@ -239,6 +241,9 @@ The selection order is:
 - `supermicro-ssg-6048r-rear-12`
 - `supermicro-sys-2029gp-tr-right-nvme-2`
 - `supermicro-ssg-2028r-shared-front-24`
+- `supermicro-aoc-slg4-2h8m2`
+- `supermicro-fat-twin-front-6`
+- `supermicro-fat-twin-rear-2`
 - `ubiquiti-unvr-front-4`
 - `ubiquiti-unvr-pro-front-7`
 - `generic-front-24-1x24`

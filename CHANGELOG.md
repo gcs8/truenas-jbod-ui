@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added segmented long-horizon history: hot-database plus sealed-segment
+  storage with migration, catalog validation, segment-aware reads and
+  backups, and fail-closed v1-only maintenance operations while segmentation
+  is active (#122). Later-generation rotation continues in #124.
+
 ## v0.22.1 - 2026-08-30
 
 - Kept encrypted 7z restore members file-backed through manifest hashing,

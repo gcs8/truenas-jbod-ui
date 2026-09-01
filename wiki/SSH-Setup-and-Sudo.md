@@ -52,7 +52,7 @@ For ESXi specifically, password-only auth is a normal supported case:
 ```yaml
 ssh:
   enabled: true
-  host: truenas-core-a.example.local
+  host: esxi-host-a.example.local
   user: root
   key_path: ""
   password: "your-esxi-root-password"
