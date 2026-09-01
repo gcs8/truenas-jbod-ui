@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-import json
 import os
 import platform
-import stat
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from fastapi import FastAPI, Request
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, Counter, Gauge, Histogram, Info, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from starlette.responses import Response
 
-from history_service.scheduled_backup import validate_scheduled_backup_status
+from history_service.scheduled_backup import read_scheduled_backup_status
 
 METRICS_NAMESPACE = "truenas_jbod_ui"
 DEFAULT_METRICS_PATH = "/metrics"
@@ -483,36 +480,12 @@ def observe_history_retention_run(
 
 
 class ScheduledBackupStatusCollector:
-    _MAX_STATUS_BYTES = 64 * 1024
-
     @classmethod
     def _read_status(cls) -> dict[str, object] | None:
         raw_path = str(os.getenv("SCHEDULED_BACKUP_STATUS_FILE", "")).strip()
         if not raw_path:
             return None
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(Path(raw_path), flags)
-        except OSError:
-            return None
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > cls._MAX_STATUS_BYTES:
-                return None
-            content = os.read(descriptor, cls._MAX_STATUS_BYTES + 1)
-        finally:
-            os.close(descriptor)
-        try:
-            payload = json.loads(content)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, dict):
-            return None
-        try:
-            validate_scheduled_backup_status(payload)
-        except ValueError:
-            return None
-        return payload
+        return read_scheduled_backup_status(raw_path)
 
     def collect(self):
         status = self._read_status()
@@ -577,10 +550,6 @@ class ScheduledBackupStatusCollector:
         )
         last_error.add_metric([service_name], 1 if status.get("last_error_code") else 0)
         yield last_error
-
-
-SCHEDULED_BACKUP_STATUS_COLLECTOR = ScheduledBackupStatusCollector()
-REGISTRY.register(SCHEDULED_BACKUP_STATUS_COLLECTOR)
 
 
 def observe_inventory_snapshot_request(
@@ -798,3 +767,7 @@ def _route_label(request: Request) -> str:
     if isinstance(route_path, str) and route_path:
         return route_path
     return "unmatched"
+
+
+SCHEDULED_BACKUP_STATUS_COLLECTOR = ScheduledBackupStatusCollector()
+REGISTRY.register(SCHEDULED_BACKUP_STATUS_COLLECTOR)

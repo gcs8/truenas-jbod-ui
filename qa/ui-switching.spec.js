@@ -119,7 +119,7 @@ async function findSystemWithMultipleEnclosures(page) {
   let fallback = null;
 
   for (const systemId of candidates) {
-    if (systemId !== currentSystem) {
+    if ((await page.locator("#system-select").inputValue()) !== systemId) {
       await switchSystem(page, systemId);
     }
     const enclosures = await getSelectValues(page, "#enclosure-select");
@@ -130,6 +130,9 @@ async function findSystemWithMultipleEnclosures(page) {
     if (!fallback && enclosures.length > 1) {
       fallback = { systemId, enclosures };
     }
+  }
+  if (fallback && (await page.locator("#system-select").inputValue()) !== fallback.systemId) {
+    await switchSystem(page, fallback.systemId);
   }
   return fallback;
 }
@@ -208,6 +211,7 @@ async function findLiveBackedSavedChassisTarget(page, predicate = () => true, op
 
 test.describe("browser qa smoke", () => {
   test("page loads and exposes the main switching chrome", async ({ page }) => {
+    test.setTimeout(SYSTEM_SETTLE_TIMEOUT_MS + 30_000);
     await gotoApp(page);
 
     await expect(page.locator("#system-select")).toBeVisible();
@@ -576,14 +580,18 @@ test.describe("browser qa smoke", () => {
     const target = result.enclosures.find((value) => value !== current);
     test.skip(!target, "Need a second enclosure option for the selected system.");
 
+    const previousRun = await latestUiPerfRun(page);
     await switchEnclosure(page, target);
     await expect(page.locator("#enclosure-select")).toHaveValue(target);
 
     if (await uiPerfEnabled(page)) {
       const latest = await latestUiPerfRun(page);
-      if (latest) {
+      if (latest && isLiveEnclosureValue(target)) {
         expect(latest.reason).toBe("enclosure-switch");
         expect(latest.status).toBe("done");
+        expect(latest.id).not.toBe(previousRun?.id);
+      } else if (latest) {
+        expect(latest.id).toBe(previousRun?.id);
       }
     }
   });

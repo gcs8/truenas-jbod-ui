@@ -69,8 +69,12 @@ file.
 ```bash
 BACKUP_UID=$(id -u)
 BACKUP_GID=$(id -g)
-install -d -m 0700 config/backup-secrets backups backups/scheduled backup-status
-install -m 0600 /dev/null config/backup-secrets/scheduled-backup-passphrase
+APP_GID=10001
+sudo install -d -o "$BACKUP_UID" -g "$BACKUP_GID" -m 0700 \
+  config/backup-secrets backups backups/scheduled
+sudo install -d -o "$BACKUP_UID" -g "$APP_GID" -m 2750 backup-status
+sudo install -o "$BACKUP_UID" -g "$BACKUP_GID" -m 0600 /dev/null \
+  config/backup-secrets/scheduled-backup-passphrase
 read -rsp 'Scheduled backup passphrase: ' BACKUP_PASSPHRASE
 printf '%s' "$BACKUP_PASSPHRASE" > config/backup-secrets/scheduled-backup-passphrase
 unset BACKUP_PASSPHRASE
@@ -85,14 +89,19 @@ SCHEDULED_BACKUP_ENABLED=true
 SCHEDULED_BACKUP_DIR=/app/backups/scheduled
 SCHEDULED_BACKUP_STATUS_FILE=/app/backup-status/scheduled-backup.json
 SCHEDULED_BACKUP_RETENTION_COUNT=14
-SCHEDULED_BACKUP_INCLUDED_GROUPS_JSON=["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file"]
+SCHEDULED_BACKUP_INCLUDED_GROUPS_JSON=["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db"]
 SCHEDULED_BACKUP_PASSPHRASE_FILE=/run/backup-secrets/scheduled-backup-passphrase
+HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS=129600
 ```
 
 Replace `1000` with the numeric values printed by `id -u` and `id -g` above.
-The Compose service runs as that host identity so it can traverse the `0700`
-directories, read the `0600` passphrase, and write backup and status files
-without running as root.
+Set `APP_GID` to the numeric app group used by `docker-compose.nonroot.yml`.
+The backup container keeps its host identity and receives `APP_GID` as both an
+explicit validation value and a supplemental group. The setgid `2750` status
+directory makes atomic status replacements inherit that exact group.
+Status files use `0640`, so the non-root UI and history services can read backup
+evidence but cannot alter it. Archives and the passphrase remain private `0600`
+files.
 
 Run one backup manually before enabling a timer:
 
@@ -102,7 +111,8 @@ docker compose --profile backup run --rm enclosure-backup
 
 The runner creates private `0600` files in the destination, verifies the copied
 archive through the normal restore preflight, publishes without overwriting an
-existing name, and prunes only files matching its owned filename contract. It
+existing name, publishes shared-read-only `0640` status under the prepared
+`2750` directory, and prunes only files matching its owned filename contract. It
 publishes `.tar.zst.enc` bundles. The inner archive is the validated system
 backup format. The outer envelope uses AES-256-GCM with a per-file salt and
 nonce. Import the file through the normal admin restore path and supply the same
@@ -127,11 +137,20 @@ exposes run counts, last success, last failure, age, size, and failure state.
 Metric labels never contain the destination, artifact name, group names, error
 text, or passphrase-file path.
 
-History SQLite already has its own snapshot schedule. Include `history_db` here
-only when you intentionally want the larger archive and have sized the backup
-destination accordingly. The one-shot container mounts the whole history
-directory writable. Do not file-bind only `history.db`; segmented locking rejects
-database-file mount points.
+Hot-only history has its own single-SQLite snapshot schedule. Segmented history
+does not use that snapshot because it cannot represent the catalog and immutable
+segments. Its hot-data retention remains blocked until the status file records a
+recent successful encrypted FULL backup that includes `history_db`. The default
+maximum age is 129600 seconds, or 36 hours, which allows the daily timer and its
+random delay to complete. A successful status also requires a positive run
+count, archive size, digest, and owned artifact name. Missing, stale, failed,
+artifact-incomplete, or history-excluding status fails closed without pruning
+hot rows.
+
+The one-shot container mounts the whole history directory writable. Do not
+file-bind only `history.db`; segmented locking rejects database-file mount
+points. Size the backup destination and temporary workspace for the hot database
+plus every active segment.
 
 Hot-only deployments export backup schema 1. A deployment configured with
 `HISTORY_SEGMENT_CATALOG_PATH` exports schema 2. Schema 2 includes the hot

@@ -165,6 +165,10 @@ the final release-wrap validator:
     export/mutation/import/query drill with historical data larger than the
     production history database. Verify hot-plus-segment counts, disk-followed
     history, scope history, catalog digests, and rollback preservation
+  - run the scheduled FULL backup with `history_db`, verify its private durable
+    status, and prove segmented hot retention stays blocked for missing, stale,
+    failed, malformed, or history-excluding status before proving one recent
+    successful status authorizes a bounded retention pass
   - prove broad queries fail when they exceed the 32-segment selection limit;
     never accept a plausible partial result
   - verify every history/admin/backup container mounts the whole history

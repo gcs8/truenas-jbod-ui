@@ -26,6 +26,8 @@ _MAX_PASSPHRASE_BYTES = 512
 _MAX_STATUS_BYTES = 64 * 1024
 _COPY_CHUNK_BYTES = 1024 * 1024
 _STATUS_SCHEMA_VERSION = 1
+_SHARED_STATUS_DIRECTORY_MODE = 0o2750
+_SHARED_STATUS_FILE_MODE = 0o640
 _STATUS_FIELDS = {
     "schema_version",
     "enabled",
@@ -66,6 +68,7 @@ def validate_scheduled_backup_status(
         value = payload.get(key)
         if type(value) is not int or value < 0:
             raise ValueError("Scheduled backup status is invalid.")
+    success_count = payload["success_count"]
     size_bytes = payload.get("last_size_bytes")
     if size_bytes is not None and (type(size_bytes) is not int or size_bytes < 0):
         raise ValueError("Scheduled backup status is invalid.")
@@ -91,6 +94,23 @@ def validate_scheduled_backup_status(
         not isinstance(artifact_name, str) or _ARCHIVE_NAME.fullmatch(artifact_name) is None
     ):
         raise ValueError("Scheduled backup status is invalid.")
+    success_evidence = (
+        payload.get("last_success_at"),
+        size_bytes,
+        digest,
+        artifact_name,
+    )
+    if success_count == 0:
+        if any(value is not None for value in success_evidence):
+            raise ValueError("Scheduled backup status is invalid.")
+    elif (
+        success_evidence[0] is None
+        or type(size_bytes) is not int
+        or size_bytes <= 0
+        or digest is None
+        or artifact_name is None
+    ):
+        raise ValueError("Scheduled backup status is invalid.")
     absent_groups = payload.get("last_absent_groups")
     if (
         not isinstance(absent_groups, list)
@@ -107,6 +127,38 @@ def validate_scheduled_backup_status(
         raise ValueError("Scheduled backup status is invalid.")
 
 
+def read_scheduled_backup_status(path: str | Path) -> dict[str, Any] | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(Path(path), flags)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or metadata.st_size > _MAX_STATUS_BYTES
+        ):
+            return None
+        content = os.read(descriptor, _MAX_STATUS_BYTES + 1)
+        if len(content) > _MAX_STATUS_BYTES or os.read(descriptor, 1):
+            return None
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        validate_scheduled_backup_status(payload)
+    except ValueError:
+        return None
+    return payload
+
+
 class ScheduledBackupSettings(BaseModel):
     enabled: bool = False
     destination_dir: str | None = None
@@ -114,6 +166,7 @@ class ScheduledBackupSettings(BaseModel):
     retention_count: int = 0
     included_groups: list[str] = Field(default_factory=list)
     passphrase_file: str | None = None
+    app_gid: int | None = None
 
     @model_validator(mode="after")
     def validate_enabled_settings(self) -> ScheduledBackupSettings:
@@ -132,6 +185,8 @@ class ScheduledBackupSettings(BaseModel):
             raise ValueError("Scheduled backup included groups must be unique.")
         if not str(self.passphrase_file or "").strip():
             raise ValueError("Scheduled backups require an explicit passphrase file reference.")
+        if type(self.app_gid) is not int or self.app_gid <= 0:
+            raise ValueError("Scheduled backups require a positive application group ID.")
         self.destination_dir = str(self.destination_dir).strip()
         self.status_file = str(self.status_file).strip()
         self.included_groups = groups
@@ -160,6 +215,11 @@ class ScheduledBackupSettings(BaseModel):
             retention_count = int(raw_retention)
         except ValueError as exc:
             raise ValueError("SCHEDULED_BACKUP_RETENTION_COUNT must be an integer.") from exc
+        raw_app_gid = str(os.getenv("APP_GID", "")).strip()
+        try:
+            app_gid = int(raw_app_gid) if raw_app_gid else None
+        except ValueError as exc:
+            raise ValueError("APP_GID must be an integer.") from exc
         return cls(
             enabled=enabled,
             destination_dir=os.getenv("SCHEDULED_BACKUP_DIR"),
@@ -167,6 +227,7 @@ class ScheduledBackupSettings(BaseModel):
             retention_count=retention_count,
             included_groups=groups,
             passphrase_file=os.getenv("SCHEDULED_BACKUP_PASSPHRASE_FILE"),
+            app_gid=app_gid,
         )
 
 
@@ -180,6 +241,7 @@ class ScheduledBackupRunner:
         passphrase_file: str | Path,
         included_groups: list[str] | tuple[str, ...],
         retention_count: int,
+        app_gid: int,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.backup_service = backup_service
@@ -188,6 +250,7 @@ class ScheduledBackupRunner:
         self.passphrase_file = Path(passphrase_file)
         self.included_groups = tuple(included_groups)
         self.retention_count = int(retention_count)
+        self.app_gid = int(app_gid)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def _now(self) -> datetime:
@@ -207,9 +270,34 @@ class ScheduledBackupRunner:
         ):
             raise ValueError(f"Scheduled backup {label} must be a private directory.")
 
+    @staticmethod
+    def _ensure_shared_status_directory(path: Path, *, app_gid: int) -> os.stat_result:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise ValueError(
+                "Scheduled backup shared status directory must be pre-created."
+            ) from exc
+        process_groups = {os.getegid(), *os.getgroups()}
+        if (
+            type(app_gid) is not int
+            or app_gid <= 0
+            or not stat.S_ISDIR(metadata.st_mode)
+            or path.is_symlink()
+            or stat.S_IMODE(metadata.st_mode) != _SHARED_STATUS_DIRECTORY_MODE
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_gid != app_gid
+            or app_gid not in process_groups
+        ):
+            raise ValueError(
+                "Scheduled backup shared status directory must be owned by the backup "
+                "user, use an accessible application group, and have mode 2750."
+            )
+        return metadata
+
     def _ensure_directories(self) -> None:
         self._ensure_private_directory(self.destination_dir, label="destination")
-        self._ensure_private_directory(self.status_file.parent, label="status directory")
+        self._ensure_shared_status_directory(self.status_file.parent, app_gid=self.app_gid)
 
     def _read_passphrase(self) -> str:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -344,8 +432,21 @@ class ScheduledBackupRunner:
                 | os.O_EXCL
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
+                _SHARED_STATUS_FILE_MODE,
             )
+            os.fchmod(descriptor, _SHARED_STATUS_FILE_MODE)
+            status_directory = self._ensure_shared_status_directory(
+                self.status_file.parent,
+                app_gid=self.app_gid,
+            )
+            temporary_metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(temporary_metadata.st_mode)
+                or temporary_metadata.st_uid != os.geteuid()
+                or temporary_metadata.st_gid != status_directory.st_gid
+                or stat.S_IMODE(temporary_metadata.st_mode) != _SHARED_STATUS_FILE_MODE
+            ):
+                raise RuntimeError("Scheduled backup status ownership could not be established.")
             with os.fdopen(descriptor, "wb") as stream:
                 descriptor = None
                 stream.write(content)

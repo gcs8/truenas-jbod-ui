@@ -24,6 +24,30 @@ HISTORY_SPEC.loader.exec_module(run_history_perf_harness)
 
 
 class PerfHarnessTests(unittest.TestCase):
+    def test_mapping_import_confirmation_uses_preview_revision_and_digest(self) -> None:
+        bundle = {"schema_version": 1, "mappings": []}
+        preview = {
+            "revision": "a" * 64,
+            "import_digest": "b" * 64,
+        }
+
+        confirmation = run_perf_harness.build_mapping_import_confirmation(bundle, preview)
+
+        self.assertEqual(
+            confirmation,
+            {
+                "bundle": bundle,
+                "expected_revision": "a" * 64,
+                "import_digest": "b" * 64,
+                "confirmed": True,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "preview"):
+            run_perf_harness.build_mapping_import_confirmation(
+                bundle,
+                {"revision": "invalid", "import_digest": "b" * 64},
+            )
+
     def test_request_metrics_retain_response_bytes_and_payload_counts(self) -> None:
         response = run_perf_harness.ApiResponse(
             data={

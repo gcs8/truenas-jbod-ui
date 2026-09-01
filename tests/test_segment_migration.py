@@ -15,6 +15,70 @@ from history_service.store import SCHEMA, HistoryStore
 
 
 class SegmentedHistoryMigrationCliTests(unittest.TestCase):
+    def test_dry_run_refuses_legacy_schema_without_creating_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_legacy_source_database(source)
+            original_bytes = source.read_bytes()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "initialize it once through the current history service",
+            ):
+                segment_migration.migrate_segmented_history(
+                    source=source,
+                    segments_directory=segments_directory,
+                    cutoff="2025-01-02T00:00:00+00:00",
+                    key_id="test-key-1",
+                )
+
+            self.assertEqual(source.read_bytes(), original_bytes)
+            self.assertFalse(segments_directory.exists())
+
+    def test_apply_refuses_legacy_schema_without_creating_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_legacy_source_database(source)
+            original_bytes = source.read_bytes()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "initialize it once through the current history service",
+            ):
+                segment_migration.migrate_segmented_history(
+                    source=source,
+                    segments_directory=segments_directory,
+                    cutoff="2025-01-02T00:00:00+00:00",
+                    key_id="test-key-1",
+                    apply=True,
+                )
+
+            self.assertEqual(source.read_bytes(), original_bytes)
+            self.assertFalse(segments_directory.exists())
+
+    def test_dry_run_current_schema_creates_no_sqlite_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_source_database(source)
+
+            receipt = segment_migration.migrate_segmented_history(
+                source=source,
+                segments_directory=segments_directory,
+                cutoff="2025-01-02T00:00:00+00:00",
+                key_id="test-key-1",
+            )
+
+            self.assertFalse(receipt["apply"])
+            self.assertFalse(segments_directory.exists())
+            for suffix in ("-wal", "-shm", "-journal"):
+                self.assertFalse(Path(f"{source}{suffix}").exists())
+
     def test_migration_partitions_mixed_offset_rows_exactly_once_by_absolute_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1013,3 +1077,11 @@ class SegmentedHistoryMigrationCliTests(unittest.TestCase):
                         observed_at,
                     ),
                 )
+
+    @staticmethod
+    def _create_legacy_source_database(path: Path) -> None:
+        with sqlite3.connect(path) as connection:
+            connection.executescript(SCHEMA)
+            connection.execute("DROP TABLE metric_rollups")
+            connection.execute("DROP TABLE history_table_counts")
+            connection.execute("DROP TABLE history_maintenance_state")
