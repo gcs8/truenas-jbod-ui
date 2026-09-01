@@ -4125,6 +4125,51 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(slot_view.gptid, "gptid/example")
             self.assertEqual(slot_view.persistent_id_label, "GPTID")
 
+    def test_resolver_prefers_ses_device_name_over_the_bare_slot_bucket(self) -> None:
+        # Every disk is indexed under (None, slot) as well as (enclosure_id,
+        # slot); TrueNAS disk.query payloads carry no enclosure id the
+        # extractor recognises, so that bucket is last-writer-wins across all
+        # shelves. It used to outrank the SES device name observed in the bay
+        # (issue #164).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="archive-core", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            ssh_data = ParsedSSHData()
+            head_disk, jbod_disk = service._build_disk_records(
+                [
+                    {"name": "da10", "devname": "da10", "identifier": "{serial}HEAD-5", "serial": "HEAD-5", "slot": 6},
+                    {"name": "da11", "devname": "da11", "identifier": "{serial}JBOD-5", "serial": "JBOD-5", "slot": 6},
+                ],
+                ssh_data,
+                {},
+                {},
+            )
+            self.assertEqual((head_disk.slot, head_disk.enclosure_id), (5, None))
+            self.assertEqual((jbod_disk.slot, jbod_disk.enclosure_id), (5, None))
+
+            disks_by_key: dict[str, DiskRecord] = {}
+            disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
+            for disk in (head_disk, jbod_disk):
+                for key in disk.lookup_keys:
+                    disks_by_key[key] = disk
+                disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
+                disks_by_slot[(None, disk.slot)] = disk
+
+            def resolve(raw_slot_status: dict[str, object]) -> str | None:
+                resolved = service._resolve_disk_for_slot(
+                    5, "jbod", None, disks_by_key, disks_by_slot, {}, raw_slot_status, ssh_data
+                )
+                return resolved.device_name if resolved else None
+
+            # SES saw da10 in this bay; the bare slot bucket holds da11 (listed last).
+            self.assertEqual(resolve({"device_names": ["da10"]}), "da10")
+            # Without SES evidence the bare bucket still breaks the tie.
+            self.assertEqual(resolve({}), "da11")
+            # An exact (enclosure_id, slot) match keeps outranking the device name.
+            disks_by_slot[("jbod", 5)] = jbod_disk
+            self.assertEqual(resolve({"device_names": ["da10"]}), "da11")
+
     def test_attach_mapping_revisions_includes_effective_fallback_clear_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
