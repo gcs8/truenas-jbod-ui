@@ -3247,6 +3247,11 @@ button.fabric-trace-crumb:hover {
 }
 
 .chassis-shell[data-face-style="drawer"] {
+  /* Top-down view of vertically mounted drives: each bay is a tall, narrow
+     tray, so the face owns its proportions instead of the drive-scale ones. */
+  --slot-bay-width: 118px;
+  --slot-bay-aspect: 0.46 / 1;
+  --slot-grid-gap: 12px;
   background:
     linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0) 10%),
     linear-gradient(180deg, #4d545c 0%, #1d242b 3%, #12171c 100%);
@@ -3381,7 +3386,7 @@ button.fabric-trace-crumb:hover {
   align-content: center;
 }
 
-.chassis-shell[data-drive-scale="3.5"]:not([data-face-style="unifi-drive"]) {
+.chassis-shell[data-drive-scale="3.5"]:not([data-face-style="unifi-drive"]):not([data-face-style="drawer"]) {
   --slot-bay-width: 164px;
   --slot-bay-aspect: 0.76 / 1;
   --service-zone-min-height: 118px;
@@ -3389,7 +3394,7 @@ button.fabric-trace-crumb:hover {
   --slot-grid-gap: 18px;
 }
 
-.chassis-shell[data-drive-scale="2.5"]:not([data-face-style="unifi-drive"]) {
+.chassis-shell[data-drive-scale="2.5"]:not([data-face-style="unifi-drive"]):not([data-face-style="drawer"]) {
   --slot-bay-width: 132px;
   --slot-bay-aspect: 0.84 / 1;
   --service-zone-min-height: 92px;
@@ -3780,6 +3785,19 @@ button.fabric-trace-crumb:hover {
 .chassis-shell[data-latch-edge="left"] .slot-tile {
   padding: 10px 8px 10px 30px;
   border-radius: 12px 8px 8px 12px;
+}
+
+.chassis-shell[data-face-style="drawer"] .row-slots {
+  justify-items: stretch;
+}
+
+.chassis-shell[data-face-style="drawer"] .row-group {
+  justify-self: stretch;
+}
+
+.chassis-shell[data-face-style="drawer"] .slot-tile,
+.chassis-shell[data-face-style="drawer"] .slot-gap {
+  width: 100%;
 }
 
 .chassis-shell[data-face-style="unifi-drive"] .row-slots {
