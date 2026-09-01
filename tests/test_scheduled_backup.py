@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 from history_service.scheduled_backup import (
     ScheduledBackupRunner,
     ScheduledBackupSettings,
+    read_scheduled_backup_status,
 )
 from history_service.system_backup import FileBackupArtifact
 
@@ -84,6 +85,55 @@ class ScheduledBackupSettingsTests(unittest.TestCase):
             passphrase_file="/run/backup-secrets/passphrase",
         )
         self.assertTrue(settings.enabled)
+
+
+class ScheduledBackupStatusReaderTests(unittest.TestCase):
+    @staticmethod
+    def _status() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "enabled": True,
+            "included_groups": ["config_file", "history_db"],
+            "success_count": 1,
+            "failure_count": 0,
+            "last_attempt_at": "2030-01-02T03:04:05+00:00",
+            "last_success_at": "2030-01-02T03:04:05+00:00",
+            "last_failure_at": None,
+            "last_size_bytes": 123,
+            "last_sha256": "a" * 64,
+            "last_artifact_name": "jbod-scheduled-backup-20300102T030405Z-00000001.7z",
+            "last_absent_groups": [],
+            "last_retention_removed": 0,
+            "last_error_code": None,
+        }
+
+    def test_reader_accepts_private_valid_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "scheduled-backup.json"
+            path.write_text(json.dumps(self._status()), encoding="utf-8")
+            path.chmod(0o600)
+
+            self.assertEqual(read_scheduled_backup_status(path), self._status())
+
+    def test_reader_fails_closed_for_unsafe_or_unbounded_status_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "scheduled-backup.json"
+            path.write_text(json.dumps(self._status()), encoding="utf-8")
+            path.chmod(0o622)
+            self.assertIsNone(read_scheduled_backup_status(path))
+
+            path.unlink()
+            target = root / "actual.json"
+            target.write_text(json.dumps(self._status()), encoding="utf-8")
+            target.chmod(0o600)
+            path.symlink_to(target)
+            self.assertIsNone(read_scheduled_backup_status(path))
+
+            path.unlink()
+            path.write_bytes(b"{" + b" " * (64 * 1024))
+            path.chmod(0o600)
+            self.assertIsNone(read_scheduled_backup_status(path))
 
 
 class ScheduledBackupRunnerTests(unittest.TestCase):

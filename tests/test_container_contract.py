@@ -31,6 +31,23 @@ EXPECTED_HISTORY_PERMISSION_ENV = {
 
 
 class ContainerResourceContractTests(unittest.TestCase):
+    def test_history_reads_scheduled_backup_status_for_segmented_retention(self) -> None:
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))[
+                "services"
+            ]
+            history = services["enclosure-history"]
+            with self.subTest(compose=compose_name):
+                self.assertEqual(
+                    history["environment"]["SCHEDULED_BACKUP_STATUS_FILE"],
+                    "${SCHEDULED_BACKUP_STATUS_FILE:-}",
+                )
+                self.assertEqual(
+                    history["environment"]["HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS"],
+                    "${HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS:-129600}",
+                )
+                self.assertIn("./backup-status:/app/backup-status:ro", history["volumes"])
+
     def test_history_capable_services_keep_segment_catalog_opt_in(self) -> None:
         expected = "${HISTORY_SEGMENT_CATALOG_PATH:-}"
         for compose_name in COMPOSE_FILES:
