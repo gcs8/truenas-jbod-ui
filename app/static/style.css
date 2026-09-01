@@ -3248,10 +3248,13 @@ button.fabric-trace-crumb:hover {
 
 .chassis-shell[data-face-style="drawer"] {
   /* Top-down view of vertically mounted drives: each bay is a tall, narrow
-     tray, so the face owns its proportions instead of the drive-scale ones. */
+     tray, so the face owns its proportions instead of the drive-scale ones.
+     Trays keep a minimum width and the drawer scrolls inside its bezel when
+     the window cannot fit all fourteen columns. */
   --slot-bay-width: 118px;
   --slot-bay-aspect: 0.46 / 1;
   --slot-grid-gap: 12px;
+  overflow-x: auto;
   background:
     linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0) 10%),
     linear-gradient(180deg, #4d545c 0%, #1d242b 3%, #12171c 100%);
@@ -3793,6 +3796,7 @@ button.fabric-trace-crumb:hover {
 
 .chassis-shell[data-face-style="drawer"] .row-group {
   justify-self: stretch;
+  grid-template-columns: repeat(var(--group-columns, 1), minmax(72px, 1fr));
 }
 
 .chassis-shell[data-face-style="drawer"] .slot-tile,
@@ -3892,8 +3896,13 @@ button.fabric-trace-crumb:hover {
   content: "";
   position: absolute;
   inset: 2px;
+  /* The base .slot-tile::after state chip pins a 20px box and a dark fill;
+     reset them so the ring spans the tile instead of covering the number. */
+  width: auto;
+  height: auto;
   border-radius: 6px 6px 10px 10px;
   border: 2px solid rgba(91, 183, 255, 0.42);
+  background: none;
   pointer-events: none;
 }
 
@@ -3925,8 +3934,11 @@ button.fabric-trace-crumb:hover {
   content: "";
   position: absolute;
   inset: 2px;
+  width: auto;
+  height: auto;
   border-radius: 6px 6px 10px 10px;
   border: 1px solid rgba(76, 216, 164, 0.4);
+  background: none;
   pointer-events: none;
 }
 
