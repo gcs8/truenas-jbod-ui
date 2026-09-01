@@ -1865,3 +1865,67 @@ Additional element status diagnostic page:
         self.assertFalse(candidates[0]["sas_address_degraded"])
         self.assertIsNone(candidates[0].get("shared_sas_address"))
         self.assertEqual(parsed.ses_selected_meta.get("warnings"), [])
+
+    def test_ec_status_condition_codes_leave_presence_undecided(self) -> None:
+        output = """
+  EXAMPLE  SATAJBOD          0100
+Enclosure Status diagnostic page:
+  status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element 0 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: Critical
+      Element 1 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: Noncritical
+      Element 2 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+      Element 3 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+""".strip()
+
+        parsed = parse_sg_ses_enclosure_status(output, "sg_ses ec /dev/sg84")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        # Issue #119's shelf latches Critical onto every EMPTY bay and
+        # Noncritical onto every populated one — condition codes cannot decide
+        # occupancy by themselves.
+        self.assertIsNone(parsed.slots[0].present)
+        self.assertIsNone(parsed.slots[1].present)
+        self.assertIs(parsed.slots[2].present, False)
+        self.assertIs(parsed.slots[3].present, True)
+
+    def test_aes_invalid_descriptor_keeps_bay_in_geometry_as_empty(self) -> None:
+        output = """
+  EXAMPLE  SATAJBOD          0100
+  Primary enclosure logical identifier (hex): 5eeeeeee00000084
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 0
+        phy index: 0
+          SAS device type: no SAS device attached
+          target port for: SATA_device
+          attached SAS address: 0x5eeeeeee00000001
+          SAS address: 0x5eeeeeee00000002
+      Element index: 1  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 2  eiioe=0
+        flagged as invalid (no further information)
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg84")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        # Invalid descriptors (issue #119's empty bays) must not vanish from
+        # the shelf geometry: they fall back to the element index with
+        # low-strength provenance and read as empty.
+        self.assertEqual(sorted(parsed.slots), [0, 1, 2])
+        self.assertIs(parsed.slots[1].present, False)
+        self.assertEqual(parsed.slots[1].slot_number_source, "ses_element_index_invalid_descriptor")
+        self.assertIn("flagged invalid", parsed.slots[1].slot_number_warning or "")
+        # A stronger reported slot number must still win on merge.
+        self.assertIs(parsed.slots[0].present, True)
+        self.assertEqual(parsed.slots[0].slot_number_source, "ses_device_slot_number")

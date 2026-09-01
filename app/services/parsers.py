@@ -647,6 +647,7 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
     source_strength = {
         None: 0,
         "ses_element_id_fallback": 1,
+        "ses_element_index_invalid_descriptor": 1,
         "ses_description": 2,
         "ses_device_slot_number": 2,
     }
@@ -1036,6 +1037,28 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
         if current_slot is None:
             continue
 
+        if stripped.startswith("flagged as invalid"):
+            # SES sets the INVALID bit on additional-element descriptors that
+            # carry no valid device data — issue #119's Dell EN-8435A shelf
+            # does this for every empty bay, so the descriptor has no device
+            # slot number at all. Fall back to the element index with
+            # low-strength provenance (stronger sources still override on
+            # merge) and record the bay as empty instead of dropping it from
+            # the shelf geometry.
+            current_slot.description = f"Element {current_slot.element_id} (invalid AES descriptor)"
+            current_slot.present = False
+            current_slot = _record_ses_slot(
+                enclosure,
+                current_slot,
+                reported_slot_number=current_slot.element_id,
+                source="ses_element_index_invalid_descriptor",
+                warning=(
+                    f"SES AES element {current_slot.element_id} is flagged invalid; "
+                    "using the element index as the bay number."
+                ),
+            )
+            continue
+
         if stripped.startswith("Transport protocol:"):
             current_slot.transport_protocol = normalize_text(stripped.split(":", 1)[1])
             continue
@@ -1177,17 +1200,9 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
             continue
 
         if stripped.startswith("Predicted failure=") and "status:" in stripped:
-            current_slot.status = normalize_text(stripped.split("status:", 1)[1])
-            if current_slot.status:
-                current_slot.present = "not installed" not in current_slot.status.lower()
-            for field_name, attribute in (
-                ("Predicted failure", "predicted_failure"),
-                ("Disabled", "disabled"),
-                ("Hot spare", "hot_spare"),
-            ):
-                match = re.search(rf"{re.escape(field_name)}=(?P<value>[01])", stripped)
-                if match:
-                    setattr(current_slot, attribute, match.group("value") == "1")
+            # Shared with the join parser so the presence semantics of SES
+            # status codes cannot drift between the two pages again.
+            _apply_sg_ses_status_line(current_slot, stripped)
             continue
 
         ident_match = re.search(r"\bIdent=(?P<ident>[01])\b", stripped)
@@ -1327,7 +1342,16 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
 def _apply_sg_ses_status_line(slot: SESMapSlot, line: str) -> None:
     slot.status = normalize_text(line.split("status:", 1)[1])
     if slot.status:
-        slot.present = "not installed" not in slot.status.lower()
+        lowered = slot.status.lower()
+        if "not installed" in lowered or "absent" in lowered:
+            slot.present = False
+        elif lowered.startswith("ok") or "installed" in lowered or "ready" in lowered:
+            slot.present = True
+        # Condition codes such as Critical/Noncritical/Unknown/Unsupported say
+        # nothing about occupancy by themselves — issue #119's shelf latches
+        # Critical onto every EMPTY bay (documented minimum-drive-count rule),
+        # so treating "anything but not installed" as present invented drives.
+        # Those statuses leave presence undecided for stronger evidence.
     for field_name, attribute in (
         ("Predicted failure", "predicted_failure"),
         ("Disabled", "disabled"),
@@ -1845,9 +1869,9 @@ def build_slot_candidates_from_ses_enclosures(
                 or "SES enclosure"
             )
             unmapped_warnings.append(
-                f"{degraded_label}: SES AES reports one shared SAS address across "
+                f"{degraded_label}: SES AES reports shared SAS addresses across "
                 f"{degraded_slot_count} bays (observed with SATA drives behind some expanders), "
-                "so SAS-address slot matching is disabled for this enclosure. Slot mapping uses "
+                "so SAS-address slot matching is disabled for those bays. Slot mapping uses "
                 "Linux enclosure-driver evidence when available."
             )
         if slot_numbers:

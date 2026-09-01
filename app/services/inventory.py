@@ -9156,17 +9156,28 @@ class InventoryService:
         empty = raw_present is False or (
             raw_present is None and not disk and self._status_contains(raw_slot_status, "empty", "not installed", "absent")
         )
+        # When SES explicitly reports the bay empty, only a resolved disk may
+        # override it. Status keywords, identify LEDs, and fault codes can all
+        # legitimately fire on an empty bay (issue #119's shelf latches
+        # Critical onto every empty slot), and used to fabricate a present
+        # drive out of them.
+        ses_says_empty_without_disk = raw_present is False and disk is None
         present = False if quantastor_ses_empty else (
             raw_present is True
             or disk is not None
-            or self._status_contains(raw_slot_status, "ok", "installed", "ready", "present")
-            or identify_active
-            or faulty
+            or (
+                not ses_says_empty_without_disk
+                and (
+                    self._status_contains(raw_slot_status, "ok", "installed", "ready", "present")
+                    or identify_active
+                    or faulty
+                )
+            )
         )
 
         if identify_active:
             state = SlotState.identify
-        elif faulty:
+        elif faulty and not ses_says_empty_without_disk:
             state = SlotState.fault
         elif quantastor_ses_empty or empty:
             state = SlotState.empty
@@ -10171,6 +10182,12 @@ class InventoryService:
     def _health_is_bad(*values: str | None) -> bool:
         bad_keywords = ("fault", "degrad", "fail", "unavail", "offline", "removed", "critical")
         for value in values:
-            if value and any(keyword in value.lower() for keyword in bad_keywords):
+            if not value:
+                continue
+            # SES reports "Noncritical" as a distinct informational code; the
+            # bare substring scan used to read it as critical (issue #119's
+            # shelf reports Noncritical on every populated bay).
+            lowered = value.lower().replace("noncritical", "non-crit-code")
+            if any(keyword in lowered for keyword in bad_keywords):
                 return True
         return False

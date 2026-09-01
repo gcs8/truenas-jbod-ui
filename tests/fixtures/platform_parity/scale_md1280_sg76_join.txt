@@ -1,0 +1,1480 @@
+  DELL      EN-8435A-E6EBD    3535
+  Primary enclosure logical identifier (hex): 5000000000000104
+[0,-1]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+[0,0]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 0
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000079
+      phy identifier: 0x0
+[0,1]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 1
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000080
+      phy identifier: 0x0
+[0,2]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 2
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000081
+      phy identifier: 0x0
+[0,3]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 3
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000082
+      phy identifier: 0x0
+[0,4]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 4
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000083
+      phy identifier: 0x0
+[0,5]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 5
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000084
+      phy identifier: 0x0
+[0,6]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 6
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000085
+      phy identifier: 0x0
+[0,7]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 7
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000086
+      phy identifier: 0x0
+[0,8]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 8
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000087
+      phy identifier: 0x0
+[0,9]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 9
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000088
+      phy identifier: 0x0
+[0,10]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 10
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000089
+      phy identifier: 0x0
+[0,11]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 11
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000090
+      phy identifier: 0x0
+[0,12]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 12
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000091
+      phy identifier: 0x0
+[0,13]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 13
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000078
+      SAS address: 0x5000000000000092
+      phy identifier: 0x0
+[0,14]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 14
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000093
+      SAS address: 0x5000000000000094
+      phy identifier: 0x0
+[0,15]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 15
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000093
+      SAS address: 0x5000000000000095
+      phy identifier: 0x0
+[0,16]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 16
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000093
+      SAS address: 0x5000000000000096
+      phy identifier: 0x0
+[0,17]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 17
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000093
+      SAS address: 0x5000000000000097
+      phy identifier: 0x0
+[0,18]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 18
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000093
+      SAS address: 0x5000000000000098
+      phy identifier: 0x0
+[0,19]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=1, status: Noncritical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 19
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SATA_device
+      attached SAS address: 0x5000000000000093
+      SAS address: 0x5000000000000099
+      phy identifier: 0x0
+[0,20]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 20
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,21]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 21
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,22]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 22
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,23]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 23
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,24]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 24
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,25]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 25
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,26]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 26
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,27]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 27
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,28]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 28
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,29]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 29
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,30]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 30
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,31]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 31
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,32]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 32
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,33]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 33
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,34]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 34
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,35]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 35
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,36]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 36
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,37]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 37
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,38]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 38
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,39]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 39
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,40]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 40
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,41]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 41
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,42]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 42
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,43]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 43
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,44]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 44
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,45]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 45
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,46]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 46
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,47]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 47
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,48]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 48
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,49]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 49
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,50]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 50
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,51]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 51
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,52]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 52
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,53]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 53
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,54]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 54
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,55]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 55
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,56]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 56
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,57]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 57
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,58]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 58
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,59]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 59
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,60]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 60
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,61]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 61
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,62]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 62
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,63]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 63
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,64]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 64
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,65]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 65
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,66]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 66
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,67]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 67
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,68]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 68
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,69]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 69
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,70]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 70
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,71]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 71
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,72]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 72
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,73]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 73
+    phy index: 0
+      SAS device type: end device
+      target port for: SSP
+      attached SAS address: 0x5000000000000100
+      SAS address: 0x5000000000000101
+      phy identifier: 0x0
+[0,74]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 74
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,75]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 75
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,76]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 76
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,77]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 77
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,78]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 78
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,79]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 79
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,80]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 80
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,81]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 81
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,82]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 82
+    phy index: 0
+      SAS device type: no SAS device attached
+[0,83]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    App client bypass B=0, Fault sensed=1, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 1, device slot number: 83
+    phy index: 0
+      SAS device type: no SAS device attached
+[1,-1]  Element type: Power supply
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+TP=74;SN=PMD1006191GAAYQ;F1=0229;F2=021E;F3=0200;VR=03;VC=A5E1A2C0;PN=1006288-03; [1,0]  Element type: Power supply
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    DC overcurrent=0, Hot swap=1, Fail=0, Requested on=0, Off=0
+TP=74;SN=PMD1006191GABAG;F1=0229;F2=021E;F3=0200;VR=03;VC=A5E1A2C0;PN=1006288-03; [1,1]  Element type: Power supply
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    DC overcurrent=0, Hot swap=1, Fail=0, Requested on=0, Off=0
+[2,-1]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Off=0, Actual speed=0 rpm, Fan stopped
+TP=1F;SN=FTL0988059G0V45;CF=01.0E                           ;CC=0x636B4986  ;PN=1002026-04; [2,0]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Do not remove=0, Hot swap=1, Fail=0, Requested on=0
+    Off=0, Actual speed=5460 rpm, Fan at lowest speed
+TP=1F;SN=FTL0988059G0V45;CF=01.0E                           ;CC=0x636B4986  ;PN=1002026-04; [2,1]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Do not remove=0, Hot swap=1, Fail=0, Requested on=0
+    Off=0, Actual speed=5460 rpm, Fan at lowest speed
+TP=1F;SN=FTL0988059G0SLP;CF=01.0E                           ;CC=0x636B4986  ;PN=1002026-04; [2,2]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Do not remove=0, Hot swap=1, Fail=0, Requested on=0
+    Off=0, Actual speed=5460 rpm, Fan at lowest speed
+TP=1F;SN=FTL0988059G0SLP;CF=01.0E                           ;CC=0x636B4986  ;PN=1002026-04; [2,3]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Do not remove=0, Hot swap=1, Fail=0, Requested on=0
+    Off=0, Actual speed=5460 rpm, Fan at lowest speed
+TP=1F;SN=FTL0988059G0W7V;CF=01.0E                           ;CC=0x636B4986  ;PN=1002026-04; [2,4]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Do not remove=0, Hot swap=1, Fail=0, Requested on=0
+    Off=0, Actual speed=5460 rpm, Fan at lowest speed
+TP=1F;SN=FTL0988059G0W7V;CF=01.0E                           ;CC=0x636B4986  ;PN=1002026-04; [2,5]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Do not remove=0, Hot swap=1, Fail=0, Requested on=0
+    Off=0, Actual speed=5460 rpm, Fan at lowest speed
+TP=1F;SN=FTL0988059G0SDN;CF=01.0E                           ;CC=0x636B4986  ;PN=1002026-04; [2,6]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Do not remove=0, Hot swap=1, Fail=0, Requested on=0
+    Off=0, Actual speed=5460 rpm, Fan at lowest speed
+TP=1F;SN=FTL0988059G0SDN;CF=01.0E                           ;CC=0x636B4986  ;PN=1002026-04; [2,7]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Do not remove=0, Hot swap=1, Fail=0, Requested on=0
+    Off=0, Actual speed=5460 rpm, Fan at lowest speed
+TP=1F;SN=FTL0988059G0TQW;CF=01.0E                           ;CC=0x636B4986  ;PN=1002026-04; [2,8]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Do not remove=0, Hot swap=1, Fail=0, Requested on=0
+    Off=0, Actual speed=5460 rpm, Fan at lowest speed
+TP=1F;SN=FTL0988059G0TQW;CF=01.0E                           ;CC=0x636B4986  ;PN=1002026-04; [2,9]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Do not remove=0, Hot swap=1, Fail=0, Requested on=0
+    Off=0, Actual speed=5460 rpm, Fan at lowest speed
+[3,-1]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature: <reserved>
+NM=Ambient                         ;LO=Sp0:0           ; [3,0]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=23 C
+NM=Ambient                         ;LO=Sp2:0           ; [3,1]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=22 C
+NM=Drive Tray                      ;LO=Bp0:0           ; [3,2]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=20 C
+NM=Drive Tray                      ;LO=Bp3:0           ; [3,3]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=20 C
+NM=Drive Tray                      ;LO=Bp1:0           ; [3,4]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=23 C
+NM=Drive Tray                      ;LO=Bp4:0           ; [3,5]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=20 C
+NM=Drive Tray                      ;LO=Bp2:0           ; [3,6]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=24 C
+NM=Drive Tray                      ;LO=Bp5:0           ; [3,7]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=21 C
+NM=Drive Tray                      ;LO=Bp2:1           ; [3,8]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=24 C
+NM=Drive Tray                      ;LO=Bp5:1           ; [3,9]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=21 C
+NM=Sideplane Electronics           ;LO=Sp1:0           ; [3,10]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=35 C
+NM=Sideplane Electronics           ;LO=Sp3:0           ; [3,11]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=33 C
+NM=Sideplane Electronics           ;LO=Sp0:1           ; [3,12]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=41 C
+NM=Sideplane Electronics           ;LO=Sp2:1           ; [3,13]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=38 C
+NM=Sideplane Electronics           ;LO=Sp1:1           ; [3,14]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=37 C
+NM=Sideplane Electronics           ;LO=Sp3:1           ; [3,15]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=37 C
+NM=PCM 1 inlet                     ;LO=PCM0:0          ; [3,16]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=25 C
+NM=PCM 1 hotspot                   ;LO=PCM0:1          ; [3,17]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=34 C
+NM=PCM 2 inlet                     ;LO=PCM1:0          ; [3,18]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=24 C
+NM=PCM 2 hotspot                   ;LO=PCM1:1          ; [3,19]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=34 C
+NM=SBB Can 0                       ;LO=SBB0:0          ; [3,20]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=30 C
+NM=SBB Can 1                       ;LO=SBB1:0          ; [3,21]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Temperature=32 C
+[4,-1]  Element type: Door
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+[4,0]  Element type: Door
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+[4,1]  Element type: Door
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+[5,-1]  Element type: Audible alarm
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+[5,0]  Element type: Audible alarm
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+[6,-1]  Element type: Enclosure services controller electronics
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+TP=CA;SN=IML1005831G8HYD;F1=3535;BL=0503;VR=06;VC=BAA55828;CR=14;FR=01;FC=8AAE700E;PN=1005831-02;FF1=03050235;PC=00176CF8; [6,0]  Element type: Enclosure services controller electronics
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Fail=0, Do not remove=0, Report=1, Hot swap=1
+TP=CA;SN=IML1005831G8HW3;F1=3535;BL=0503;VR=06;VC=BAA55828;CR=14;FR=01;FC=8AAE700E;PN=1005831-02;FF1=03050235;PC=00176CF8; [6,1]  Element type: Enclosure services controller electronics
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Fail=0, Do not remove=0, Report=0, Hot swap=1
+[7,-1]  Element type: Enclosure
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+SN=ENCSERIAL;VR=10;VC=7BE4F602;CR=03;PN=1016008-02;CM=00; [7,0]  Element type: Enclosure
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Warning indication=1, Requested power off duration=0
+[8,-1]  Element type: Voltage sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+    Voltage: 0.00 volts
+NM=NO_NAME                         ;LO=PCM0:0          ; [8,0]  Element type: Voltage sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Voltage: 12.18 volts
+[8,1]  Element type: Voltage sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+    Voltage: 0.00 volts
+NM=NO_NAME                         ;LO=PCM1:0          ; [8,2]  Element type: Voltage sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Voltage: 12.22 volts
+[8,3]  Element type: Voltage sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+    Voltage: 0.00 volts
+[9,-1]  Element type: Current sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+    Current: 0.00 amps
+NM=NO_NAME                         ;LO=PCM0:0          ; [9,0]  Element type: Current sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Current: 12.61 amps
+[9,1]  Element type: Current sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+    Current: 0.00 amps
+NM=NO_NAME                         ;LO=PCM1:0          ; [9,2]  Element type: Current sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Current: 12.77 amps
+[9,3]  Element type: Current sensor
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+    Current: 0.00 amps
+[10,-1]  Element type: SAS expander
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+    Ident=0, Fail=0
+BL=0610;FC=11392236;VR=06;VC=b3b43b57;CR=12;PC=        ;F1=3535;FF1=03050235;SN=BPL0988055G09T1;PN=1002021-03; [10,0]  Element type: SAS expander
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Fail=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 36
+    SAS address: 0x5000000000000093
+    Attached connector; other_element pairs:
+      [0] broken [conn_idx=154]; broken [oth_elem_idx=141]
+      [1] broken [conn_idx=154]; broken [oth_elem_idx=141]
+      [2] broken [conn_idx=154]; broken [oth_elem_idx=141]
+      [3] broken [conn_idx=154]; broken [oth_elem_idx=141]
+      [4] broken [conn_idx=155]; broken [oth_elem_idx=141]
+      [5] broken [conn_idx=155]; broken [oth_elem_idx=141]
+      [6] broken [conn_idx=155]; broken [oth_elem_idx=141]
+      [7] broken [conn_idx=155]; broken [oth_elem_idx=141]
+      [8] no connector; [0,34] etype: Array device slot
+      [9] no connector; [0,37] etype: Array device slot
+      [10] no connector; [0,40] etype: Array device slot
+      [11] no connector; [0,41] etype: Array device slot
+      [12] no connector; [0,38] etype: Array device slot
+      [13] no connector; [0,39] etype: Array device slot
+      [14] no connector; [0,35] etype: Array device slot
+      [15] no connector; [0,36] etype: Array device slot
+      [16] no connector; [0,32] etype: Array device slot
+      [17] no connector; [0,33] etype: Array device slot
+      [18] no connector; [0,29] etype: Array device slot
+      [19] no connector; [0,30] etype: Array device slot
+      [20] no connector; [0,28] etype: Array device slot
+      [21] no connector; [0,31] etype: Array device slot
+      [22] no connector; [0,20] etype: Array device slot
+      [23] no connector; [0,23] etype: Array device slot
+      [24] no connector; [0,26] etype: Array device slot
+      [25] no connector; [0,27] etype: Array device slot
+      [26] no connector; [0,24] etype: Array device slot
+      [27] no connector; [0,25] etype: Array device slot
+      [28] no connector; [0,21] etype: Array device slot
+      [29] no connector; [0,22] etype: Array device slot
+      [30] no connector; [0,18] etype: Array device slot
+      [31] no connector; [0,19] etype: Array device slot
+      [32] no connector; [0,15] etype: Array device slot
+      [33] no connector; [0,16] etype: Array device slot
+      [34] no connector; [0,14] etype: Array device slot
+      [35] no connector; [0,17] etype: Array device slot
+BL=0610;FC=5b0e0477;VR=06;VC=77da916c;CR=12;PC=        ;F1=3535;FF1=03050235;SN=BPL0988055G09T1;PN=1002021-03; [10,1]  Element type: SAS expander
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Fail=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 24
+    SAS address: 0x5000000000000078
+    Attached connector; other_element pairs:
+      [0] broken [conn_idx=156]; broken [oth_elem_idx=141]
+      [1] broken [conn_idx=156]; broken [oth_elem_idx=141]
+      [2] broken [conn_idx=156]; broken [oth_elem_idx=141]
+      [3] broken [conn_idx=156]; broken [oth_elem_idx=141]
+      [4] no connector; broken [oth_elem_idx=141]
+      [5] no connector; broken [oth_elem_idx=141]
+      [6] no connector; broken [oth_elem_idx=141]
+      [7] no connector; broken [oth_elem_idx=141]
+      [8] no connector; broken [oth_elem_idx=141]
+      [9] no connector; broken [oth_elem_idx=141]
+      [10] no connector; [0,6] etype: Array device slot
+      [11] no connector; [0,9] etype: Array device slot
+      [12] no connector; [0,12] etype: Array device slot
+      [13] no connector; [0,13] etype: Array device slot
+      [14] no connector; [0,10] etype: Array device slot
+      [15] no connector; [0,11] etype: Array device slot
+      [16] no connector; [0,7] etype: Array device slot
+      [17] no connector; [0,8] etype: Array device slot
+      [18] no connector; [0,4] etype: Array device slot
+      [19] no connector; [0,5] etype: Array device slot
+      [20] no connector; [0,1] etype: Array device slot
+      [21] no connector; [0,2] etype: Array device slot
+      [22] no connector; [0,0] etype: Array device slot
+      [23] no connector; [0,3] etype: Array device slot
+BL=0610;FC=4a38cab8;VR=06;VC=1aca3c8d;CR=12;PC=        ;F1=3535;FF1=03050235;SN=BPL0988051G08CR;PN=1002019-03; [10,2]  Element type: SAS expander
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unknown
+    Ident=0, Fail=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 0
+    SAS address: 0x5000000000000077
+    Attached connector; other_element pairs:
+BL=0610;FC=7877bbbf;VR=06;VC=7e895978;CR=12;PC=        ;F1=3535;FF1=03050235;SN=BPL0988051G08CR;PN=1002019-03; [10,3]  Element type: SAS expander
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unknown
+    Ident=0, Fail=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 0
+    SAS address: 0x5000000000000077
+    Attached connector; other_element pairs:
+BL=0610;FC=11392236;VR=06;VC=b3b43b57;CR=12;PC=        ;F1=3535;FF1=03050235;SN=BPL0988055G09SV;PN=1002021-03; [10,4]  Element type: SAS expander
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Fail=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 36
+    SAS address: 0x5000000000000100
+    Attached connector; other_element pairs:
+      [0] broken [conn_idx=159]; broken [oth_elem_idx=141]
+      [1] broken [conn_idx=159]; broken [oth_elem_idx=141]
+      [2] broken [conn_idx=159]; broken [oth_elem_idx=141]
+      [3] broken [conn_idx=159]; broken [oth_elem_idx=141]
+      [4] broken [conn_idx=158]; broken [oth_elem_idx=141]
+      [5] broken [conn_idx=158]; broken [oth_elem_idx=141]
+      [6] broken [conn_idx=158]; broken [oth_elem_idx=141]
+      [7] broken [conn_idx=158]; broken [oth_elem_idx=141]
+      [8] no connector; [0,76] etype: Array device slot
+      [9] no connector; [0,79] etype: Array device slot
+      [10] no connector; [0,82] etype: Array device slot
+      [11] no connector; [0,83] etype: Array device slot
+      [12] no connector; [0,80] etype: Array device slot
+      [13] no connector; [0,81] etype: Array device slot
+      [14] no connector; [0,77] etype: Array device slot
+      [15] no connector; [0,78] etype: Array device slot
+      [16] no connector; [0,74] etype: Array device slot
+      [17] no connector; [0,75] etype: Array device slot
+      [18] no connector; [0,71] etype: Array device slot
+      [19] no connector; [0,72] etype: Array device slot
+      [20] no connector; [0,70] etype: Array device slot
+      [21] no connector; [0,73] etype: Array device slot
+      [22] no connector; [0,62] etype: Array device slot
+      [23] no connector; [0,65] etype: Array device slot
+      [24] no connector; [0,68] etype: Array device slot
+      [25] no connector; [0,69] etype: Array device slot
+      [26] no connector; [0,66] etype: Array device slot
+      [27] no connector; [0,67] etype: Array device slot
+      [28] no connector; [0,63] etype: Array device slot
+      [29] no connector; [0,64] etype: Array device slot
+      [30] no connector; [0,60] etype: Array device slot
+      [31] no connector; [0,61] etype: Array device slot
+      [32] no connector; [0,57] etype: Array device slot
+      [33] no connector; [0,58] etype: Array device slot
+      [34] no connector; [0,56] etype: Array device slot
+      [35] no connector; [0,59] etype: Array device slot
+BL=0610;FC=5b0e0477;VR=06;VC=77da916c;CR=12;PC=        ;F1=3535;FF1=03050235;SN=BPL0988055G09SV;PN=1002021-03; [10,5]  Element type: SAS expander
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Fail=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 24
+    SAS address: 0x5000000000000102
+    Attached connector; other_element pairs:
+      [0] broken [conn_idx=157]; broken [oth_elem_idx=141]
+      [1] broken [conn_idx=157]; broken [oth_elem_idx=141]
+      [2] broken [conn_idx=157]; broken [oth_elem_idx=141]
+      [3] broken [conn_idx=157]; broken [oth_elem_idx=141]
+      [4] no connector; broken [oth_elem_idx=141]
+      [5] no connector; broken [oth_elem_idx=141]
+      [6] no connector; broken [oth_elem_idx=141]
+      [7] no connector; broken [oth_elem_idx=141]
+      [8] no connector; broken [oth_elem_idx=141]
+      [9] no connector; broken [oth_elem_idx=141]
+      [10] no connector; [0,48] etype: Array device slot
+      [11] no connector; [0,51] etype: Array device slot
+      [12] no connector; [0,54] etype: Array device slot
+      [13] no connector; [0,55] etype: Array device slot
+      [14] no connector; [0,52] etype: Array device slot
+      [15] no connector; [0,53] etype: Array device slot
+      [16] no connector; [0,49] etype: Array device slot
+      [17] no connector; [0,50] etype: Array device slot
+      [18] no connector; [0,46] etype: Array device slot
+      [19] no connector; [0,47] etype: Array device slot
+      [20] no connector; [0,43] etype: Array device slot
+      [21] no connector; [0,44] etype: Array device slot
+      [22] no connector; [0,42] etype: Array device slot
+      [23] no connector; [0,45] etype: Array device slot
+BL=0610;FC=4a38cab8;VR=06;VC=1aca3c8d;CR=12;PC=        ;F1=3535;FF1=03050235;SN=BPL0988051G08SC;PN=1002019-03; [10,6]  Element type: SAS expander
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unknown
+    Ident=0, Fail=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 0
+    SAS address: 0x5000000000000077
+    Attached connector; other_element pairs:
+BL=0610;FC=7877bbbf;VR=06;VC=7e895978;CR=12;PC=        ;F1=3535;FF1=03050235;SN=BPL0988051G08SC;PN=1002019-03; [10,7]  Element type: SAS expander
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unknown
+    Ident=0, Fail=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 0
+    SAS address: 0x5000000000000077
+    Attached connector; other_element pairs:
+[10,8]  Element type: SAS expander
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unknown
+    Ident=0, Fail=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 0
+    SAS address: 0x5000000000000077
+    Attached connector; other_element pairs:
+[10,9]  Element type: SAS expander
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Fail=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 37
+    SAS address: 0x5000000000000103
+    Attached connector; other_element pairs:
+      [0] broken [conn_idx=147]
+      [1] broken [conn_idx=147]
+      [2] broken [conn_idx=147]
+      [3] broken [conn_idx=147]
+      [4] broken [conn_idx=146]
+      [5] broken [conn_idx=146]
+      [6] broken [conn_idx=146]
+      [7] broken [conn_idx=146]
+      [8] broken [conn_idx=145]
+      [9] broken [conn_idx=145]
+      [10] broken [conn_idx=145]
+      [11] broken [conn_idx=145]
+      [12] broken [conn_idx=159]; broken [oth_elem_idx=136]
+      [13] broken [conn_idx=159]; broken [oth_elem_idx=136]
+      [14] broken [conn_idx=159]; broken [oth_elem_idx=136]
+      [15] broken [conn_idx=159]; broken [oth_elem_idx=136]
+      [16] broken [conn_idx=158]; broken [oth_elem_idx=136]
+      [17] broken [conn_idx=158]; broken [oth_elem_idx=136]
+      [18] broken [conn_idx=158]; broken [oth_elem_idx=136]
+      [19] broken [conn_idx=158]; broken [oth_elem_idx=136]
+      [20] broken [conn_idx=157]; broken [oth_elem_idx=137]
+      [21] broken [conn_idx=157]; broken [oth_elem_idx=137]
+      [22] broken [conn_idx=157]; broken [oth_elem_idx=137]
+      [23] broken [conn_idx=157]; broken [oth_elem_idx=137]
+      [24] broken [conn_idx=156]; broken [oth_elem_idx=133]
+      [25] broken [conn_idx=156]; broken [oth_elem_idx=133]
+      [26] broken [conn_idx=156]; broken [oth_elem_idx=133]
+      [27] broken [conn_idx=156]; broken [oth_elem_idx=133]
+      [28] broken [conn_idx=155]; broken [oth_elem_idx=132]
+      [29] broken [conn_idx=155]; broken [oth_elem_idx=132]
+      [30] broken [conn_idx=155]; broken [oth_elem_idx=132]
+      [31] broken [conn_idx=155]; broken [oth_elem_idx=132]
+      [32] broken [conn_idx=154]; broken [oth_elem_idx=132]
+      [33] broken [conn_idx=154]; broken [oth_elem_idx=132]
+      [34] broken [conn_idx=154]; broken [oth_elem_idx=132]
+      [35] broken [conn_idx=154]; broken [oth_elem_idx=132]
+      [36] no connector; broken [oth_elem_idx=122]
+[11,-1]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+    Ident=0, No information
+    Connector physical link=0x0, Mated=0, Fail=0, OC=0
+WN=5000000000000077; [11,0]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Mini SAS 4x active receptacle (SFF-8088) [max 4 phys]
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=5000000000000077; [11,1]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Mini SAS 4x active receptacle (SFF-8088) [max 4 phys]
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=5000000000000077; [11,2]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Mini SAS 4x active receptacle (SFF-8088) [max 4 phys]
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=500605B00A02A2F1; [11,3]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Mini SAS 4x active receptacle (SFF-8088) [max 4 phys]
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=5000000000000077; [11,4]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Mini SAS 4x active receptacle (SFF-8088) [max 4 phys]
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=5000000000000077; [11,5]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Mini SAS 4x active receptacle (SFF-8088) [max 4 phys]
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A90533F; [11,6]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A90537F; [11,7]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A90537F; [11,8]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A8FE67F; [11,9]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A8FE67F; [11,10]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A8FE63F; [11,11]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A5268FF; [11,12]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A5268FF; [11,13]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A5268BF; [11,14]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A52683F; [11,15]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A52687F; [11,16]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+WN=50050CC11A52687F; [11,17]  Element type: SAS connector
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0, Vendor specific internal connector
+    Connector physical link=0xff, Mated=0, Fail=0, OC=0
+[12,-1]  Element type: vendor specific [0x86]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+    Vendor specific element type, status in hex: 00 00 00 00
+[12,0]  Element type: vendor specific [0x86]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Vendor specific element type, status in hex: 01 00 00 00
+[12,1]  Element type: vendor specific [0x86]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Vendor specific element type, status in hex: 01 00 00 00
+[13,-1]  Element type: vendor specific [0x89]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+    Vendor specific element type, status in hex: 00 00 00 00
+[13,0]  Element type: vendor specific [0x89]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Vendor specific element type, status in hex: 01 00 a3 11
+[13,1]  Element type: vendor specific [0x89]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Vendor specific element type, status in hex: 01 00 a3 11
+[14,-1]  Element type: vendor specific [0x8a]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+    Vendor specific element type, status in hex: 00 00 00 00
+[14,0]  Element type: vendor specific [0x8a]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Vendor specific element type, status in hex: 01 00 00 00
+[15,-1]  Element type: vendor specific [0x8b]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+    Vendor specific element type, status in hex: 00 00 00 00
+[15,0]  Element type: vendor specific [0x8b]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Vendor specific element type, status in hex: 01 0c 00 00
+[15,1]  Element type: vendor specific [0x8b]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Vendor specific element type, status in hex: 01 0c 00 00
+[16,-1]  Element type: vendor specific [0x90]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+    Vendor specific element type, status in hex: 00 00 00 00
+[16,0]  Element type: vendor specific [0x90]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Vendor specific element type, status in hex: 01 10 00 00
+[16,1]  Element type: vendor specific [0x90]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Vendor specific element type, status in hex: 01 10 00 00
+[16,2]  Element type: vendor specific [0x90]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Vendor specific element type, status in hex: 01 10 00 00
+[16,3]  Element type: vendor specific [0x90]
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Vendor specific element type, status in hex: 01 10 00 00
