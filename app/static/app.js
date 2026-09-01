@@ -1501,7 +1501,7 @@
   function flatGroupedColumnTemplate(slotCount, breakpoints) {
     const columns = [];
     for (let index = 0; index < slotCount; index += 1) {
-      columns.push("minmax(0, 1fr)");
+      columns.push("minmax(var(--slot-track-min-width, 0px), 1fr)");
       if (breakpoints.includes(index + 1)) {
         columns.push("10px");
       }

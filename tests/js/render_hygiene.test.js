@@ -227,6 +227,15 @@ test("groupColumnTemplate tolerates a non-array row group list instead of callin
   assert.equal(typeof fns.groupColumnTemplate([[0, 1], [2, 3]], ""), "string");
 });
 
+test("flat top-loader tracks honor the chassis slot width floor", () => {
+  const { fns } = loadFunctions(APP_SOURCE, ["flatGroupedColumnTemplate"]);
+
+  assert.equal(
+    fns.flatGroupedColumnTemplate(3, [2]),
+    "minmax(var(--slot-track-min-width, 0px), 1fr) minmax(var(--slot-track-min-width, 0px), 1fr) 10px minmax(var(--slot-track-min-width, 0px), 1fr)",
+  );
+});
+
 test("history state no longer carries the constant-null ternary", () => {
   assert.doesNotMatch(APP_SOURCE, /detail:\s*snapshotMode\s*\?\s*null\s*:\s*null/);
 });

@@ -3128,6 +3128,18 @@ button.fabric-trace-crumb:hover {
     linear-gradient(180deg, #7e878f 0%, #505962 8%, #1d242b 8.2%, #12171c 100%);
 }
 
+.chassis-shell[data-face-style="generic"],
+.chassis-shell[data-face-style="front-drive"],
+.chassis-shell[data-face-style="rear-drive"],
+.chassis-shell[data-face-style="top-loader"] {
+  --slot-track-min-width: 72px;
+  overflow-x: auto;
+}
+
+.chassis-shell[data-face-style="top-loader"] {
+  --slot-track-min-width: 76px;
+}
+
 .chassis-shell[data-face-style="front-drive"] .service-zone,
 .chassis-shell[data-face-style="rear-drive"] .service-zone {
   grid-template-columns: 1.2fr 0.9fr 1.2fr;
@@ -3462,6 +3474,13 @@ button.fabric-trace-crumb:hover {
   grid-template-columns: repeat(var(--group-columns, 1), minmax(0, 1fr));
   gap: 6px;
   min-width: 0;
+}
+
+.chassis-shell[data-face-style="generic"] .row-group,
+.chassis-shell[data-face-style="front-drive"] .row-group,
+.chassis-shell[data-face-style="rear-drive"] .row-group,
+.chassis-shell[data-face-style="top-loader"] .row-group {
+  grid-template-columns: repeat(var(--group-columns, 1), minmax(var(--slot-track-min-width), 1fr));
 }
 
 .row-group + .row-group {

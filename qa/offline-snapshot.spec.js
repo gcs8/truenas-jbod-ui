@@ -349,6 +349,41 @@ test("offline snapshot exposes mapping health without color-only cues", async ({
   expect(consoleErrors).toEqual([]);
 });
 
+test("offline generic face keeps slot controls separate at narrow desktop widths", async ({ page }) => {
+  const snapshotPath = buildOfflineSnapshotFixture();
+  await page.setViewportSize({ width: 820, height: 1000 });
+
+  await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+
+  const geometry = await page.locator("#chassis-shell").evaluate((shell) => {
+    const tiles = [...shell.querySelectorAll(".slot-tile")];
+    const populated = shell.querySelector('.slot-tile[data-slot="0"]');
+    const led = populated?.querySelector(".slot-status-led");
+    const number = populated?.querySelector(".slot-number");
+    if (!populated || !led || !number || tiles.length === 0) {
+      throw new Error("generic fixture is missing slot geometry controls");
+    }
+    const ledRect = led.getBoundingClientRect();
+    const numberRect = number.getBoundingClientRect();
+    const overlapWidth = Math.max(0, Math.min(ledRect.right, numberRect.right) - Math.max(ledRect.left, numberRect.left));
+    const overlapHeight = Math.max(0, Math.min(ledRect.bottom, numberRect.bottom) - Math.max(ledRect.top, numberRect.top));
+    return {
+      faceStyle: shell.dataset.faceStyle,
+      shellOverflowX: getComputedStyle(shell).overflowX,
+      documentClientWidth: document.documentElement.clientWidth,
+      documentScrollWidth: document.documentElement.scrollWidth,
+      minTileWidth: Math.min(...tiles.map((tile) => tile.getBoundingClientRect().width)),
+      controlsOverlap: overlapWidth > 0 && overlapHeight > 0,
+    };
+  });
+
+  expect(geometry.faceStyle).toBe("generic");
+  expect(geometry.shellOverflowX).toBe("auto");
+  expect(geometry.documentScrollWidth).toBeLessThanOrEqual(geometry.documentClientWidth + 1);
+  expect(geometry.minTileWidth).toBeGreaterThanOrEqual(72);
+  expect(geometry.controlsOverlap).toBe(false);
+});
+
 test("offline top-loader snapshot keeps exported row geometry", async ({ page }) => {
   const snapshotPath = buildOfflineTopLoaderSnapshotFixture();
 
@@ -364,6 +399,42 @@ test("offline top-loader snapshot keeps exported row geometry", async ({ page })
   await expect(page.locator('#slot-grid .slot-tile[data-slot="57"]')).toBeVisible();
   await expect(page.locator("#detail-history-panel")).toBeVisible();
   await expect(page.locator("#history-metric-grid")).toContainText("Temperature");
+});
+
+test("offline top-loader keeps slot controls separate at narrow desktop widths", async ({ page }) => {
+  const snapshotPath = buildOfflineTopLoaderSnapshotFixture();
+  await page.setViewportSize({ width: 820, height: 1000 });
+
+  await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+
+  const geometry = await page.locator("#chassis-shell").evaluate((shell) => {
+    const tiles = [...shell.querySelectorAll(".slot-tile")];
+    const populated = shell.querySelector('.slot-tile[data-slot="57"]');
+    const led = populated?.querySelector(".slot-status-led");
+    const number = populated?.querySelector(".slot-number");
+    if (!populated || !led || !number || tiles.length === 0) {
+      throw new Error("top-loader fixture is missing slot geometry controls");
+    }
+    const ledRect = led.getBoundingClientRect();
+    const numberRect = number.getBoundingClientRect();
+    const overlapWidth = Math.max(0, Math.min(ledRect.right, numberRect.right) - Math.max(ledRect.left, numberRect.left));
+    const overlapHeight = Math.max(0, Math.min(ledRect.bottom, numberRect.bottom) - Math.max(ledRect.top, numberRect.top));
+    return {
+      shellOverflowX: getComputedStyle(shell).overflowX,
+      shellClientWidth: shell.clientWidth,
+      shellScrollWidth: shell.scrollWidth,
+      documentClientWidth: document.documentElement.clientWidth,
+      documentScrollWidth: document.documentElement.scrollWidth,
+      minTileWidth: Math.min(...tiles.map((tile) => tile.getBoundingClientRect().width)),
+      controlsOverlap: overlapWidth > 0 && overlapHeight > 0,
+    };
+  });
+
+  expect(geometry.shellOverflowX).toBe("auto");
+  expect(geometry.shellScrollWidth).toBeGreaterThan(geometry.shellClientWidth);
+  expect(geometry.documentScrollWidth).toBeLessThanOrEqual(geometry.documentClientWidth + 1);
+  expect(geometry.minTileWidth).toBeGreaterThanOrEqual(76);
+  expect(geometry.controlsOverlap).toBe(false);
 });
 
 test("offline snapshot can navigate preloaded storage views without a live backend", async ({ page }) => {
