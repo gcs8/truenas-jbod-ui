@@ -3731,6 +3731,75 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertIn("0:0:0:0", first.lookup_keys)
             self.assertIn("ZC14D9W1".lower(), first.lookup_keys)
 
+    def test_build_linux_disk_records_supports_mmc_and_dasd_and_warns_for_unknown_disks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="generic-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {
+                        "name": "mmcblk0",
+                        "type": "disk",
+                        "path": "/dev/mmcblk0",
+                        "serial": "MMC-SYNTHETIC",
+                        "model": "Synthetic eMMC",
+                        "size": "29.1G",
+                        "tran": "mmc",
+                        "children": [
+                            {
+                                "name": "mmcblk0p1",
+                                "type": "part",
+                                "mountpoint": "/boot",
+                            }
+                        ],
+                    },
+                    {"name": "mmcblk0boot0", "type": "disk", "size": "4M"},
+                    {"name": "mmcblk0rpmb", "type": "disk", "size": "4M"},
+                    {
+                        "name": "dasda",
+                        "type": "disk",
+                        "path": "/dev/dasda",
+                        "serial": "DASD-SYNTHETIC",
+                        "model": "Synthetic DASD",
+                        "size": "10G",
+                        "tran": "ccw",
+                    },
+                    *[
+                        {"name": f"zram{index}", "type": "disk", "size": "2G"}
+                        for index in range(10)
+                    ],
+                    {"name": "loop0", "type": "loop", "size": "64M"},
+                ]
+            )
+            warnings: list[str] = []
+
+            records = service._build_linux_disk_records(ssh_data, warnings=warnings)
+
+            by_name = {record.device_name: record for record in records}
+            self.assertEqual(set(by_name), {"mmcblk0", "dasda"})
+            self.assertEqual(by_name["mmcblk0"].smart_devices, ["mmcblk0"])
+            self.assertEqual(by_name["mmcblk0"].bus, "MMC")
+            self.assertEqual(by_name["dasda"].smart_devices, ["dasda"])
+            self.assertEqual(by_name["dasda"].bus, "CCW")
+            self.assertEqual(
+                warnings,
+                [
+                    "Skipped unrecognized Linux block devices: "
+                    "zram0, zram1, zram2, zram3, zram4, zram5, zram6, zram7 (+2 more)."
+                ],
+            )
+
     def test_build_linux_disk_records_prefers_largest_data_volume_over_boot_and_swap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -3956,6 +4025,12 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                         "tran": "sata",
                         "children": [],
                     },
+                    {
+                        "name": "zram0",
+                        "type": "disk",
+                        "size": "2G",
+                        "children": [],
+                    },
                 ],
                 ubntstorage_disks=[
                     {"node": "sdb", "slot": 1, "healthy": "optimal", "state": "ready", "size": 16000000000000},
@@ -3982,6 +4057,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(slot_views[2].state.value, "empty")
             self.assertEqual(slot_views[2].mapping_source, "ubntstorage")
             self.assertTrue(any("UniFi UNVR Pro LED control is experimental." in warning for warning in warnings))
+            self.assertIn("Skipped unrecognized Linux block devices: zram0.", warnings)
 
     def test_correlate_linux_host_enables_unvr_led_backend_and_gpio_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
