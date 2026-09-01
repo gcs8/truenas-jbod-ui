@@ -212,11 +212,18 @@ SCHEDULED_BACKUP_STATUS_FILE=/app/backup-status/scheduled-backup.json
 HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS=129600
 ```
 
-The Compose history service mounts `backup-status` read-only. The status file
-must be a regular, non-symlink file no larger than 64 KiB and must not be
-group-writable or world-writable. A missing, malformed, stale, failed, or
-history-excluding status blocks retention. A status that selected `history_db`
-but reports it in `last_absent_groups` also blocks retention.
+The Compose history service mounts `backup-status` read-only. For the non-root
+overlay, set `APP_GID` to the numeric application group and prepare that host
+directory as the backup UID and that app GID with exact mode `2750`. The
+one-shot backup writer publishes status as `0640`, verifies that the directory
+and inherited file group equal the configured app GID, and refuses any other
+directory mode or ownership. The status file must be a regular, non-symlink
+file no larger than 64 KiB and must not be group-writable or world-writable. A
+successful record requires a positive success count, archive size, digest, and
+owned artifact name. Missing, unreadable, malformed, artifact-incomplete,
+stale, failed, or history-excluding status blocks retention. A status that
+selected `history_db` but reports it in `last_absent_groups` also blocks
+retention.
 
 The hot database persists each backup authorization as `ready`, `claimed`, or
 `consumed`. A successful bounded pass with `has_more` returns the authorization

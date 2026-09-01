@@ -84,6 +84,10 @@ class ContainerResourceContractTests(unittest.TestCase):
                     services["enclosure-backup"]["user"],
                     "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
                 )
+                self.assertEqual(
+                    services["enclosure-backup"]["environment"]["APP_GID"],
+                    "${APP_GID:-10001}",
+                )
 
         overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8"))
         self.assertEqual(
@@ -109,6 +113,12 @@ class ContainerResourceContractTests(unittest.TestCase):
         backup = overlay["services"]["enclosure-backup"]
         self.assertNotIn("user", backup)
         self.assertEqual(backup["group_add"], ["${APP_GID:-10001}"])
+
+        backup_guide = (
+            REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn('-g "$APP_GID" -m 2750 backup-status', backup_guide)
+        self.assertIn("Status files use `0640`", backup_guide)
 
     def test_nonroot_migration_helper_is_bounded_no_follow_and_dry_run_by_default(self) -> None:
         helper = (REPO_ROOT / "scripts/prepare_nonroot_bind_mounts.py").read_text(encoding="utf-8")

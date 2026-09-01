@@ -776,7 +776,10 @@ class SystemBackupServiceTests(unittest.TestCase):
         original_profile = self.profile_path.read_bytes()
         original_slot_detail = self.slot_detail_path.read_bytes()
         destination = self.temp_dir / "scheduled-destination"
-        status_file = self.temp_dir / "scheduled-status" / "status.json"
+        status_dir = self.temp_dir / "scheduled-status"
+        status_dir.mkdir(mode=0o2750)
+        status_dir.chmod(0o2750)
+        status_file = status_dir / "status.json"
         passphrase_file = self.temp_dir / "scheduled-passphrase"
         passphrase_file.write_text("end to end scheduled passphrase\n", encoding="utf-8")
         passphrase_file.chmod(0o600)
@@ -788,6 +791,7 @@ class SystemBackupServiceTests(unittest.TestCase):
             passphrase_file=passphrase_file,
             included_groups=selected_groups,
             retention_count=3,
+            app_gid=status_dir.stat().st_gid,
         )
 
         with (

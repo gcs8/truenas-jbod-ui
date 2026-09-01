@@ -143,6 +143,7 @@ services:
     network_mode: none
     environment:
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+      APP_GID: ${APP_GID:-10001}
       LOG_FORMAT: ${LOG_FORMAT:-text}
       HISTORY_SQLITE_PATH: /app/history/history.db
       HISTORY_SEGMENT_CATALOG_PATH: ${HISTORY_SEGMENT_CATALOG_PATH:-}
