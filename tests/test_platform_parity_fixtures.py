@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
-from app.services.inventory import InventoryService
+from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, InventoryService
 from app.services.mapping_store import MappingStore
 from app.services.parsers import parse_ssh_outputs, parse_storcli_physical_drives
 from app.services.profile_registry import (
@@ -19,17 +21,13 @@ from app.services.quantastor_api import QuantastorRESTClient
 from app.services.slot_detail_store import SlotDetailStore
 from app.services.truenas_ws import TrueNASRawData
 
-
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "platform_parity"
-
 
 def fixture_text(name: str) -> str:
     return (FIXTURE_DIR / name).read_text(encoding="utf-8")
 
-
 def fixture_json(name: str):
     return json.loads(fixture_text(name))
-
 
 def build_inventory_service(
     settings: Settings,
@@ -48,7 +46,6 @@ def build_inventory_service(
         ProfileRegistry(settings),
         SlotDetailStore(f"{temp_dir}\\slot_detail_cache.json"),
     )
-
 
 class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
     async def test_scale_empty_middleware_rows_can_render_linux_ses_fixture_pack(self) -> None:
@@ -226,6 +223,215 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_controller["c1"]["serial"], "ZC1PARITY")
         self.assertEqual(by_controller["c1"]["firmware"], "SN03")
 
+    async def test_scale_shared_sata_aes_uses_enclosure_driver_mapping(self) -> None:
+        """
+        Issue #119: SATA-heavy shelves whose expander stamps one shared SAS
+        address into every AES descriptor must not stay unmapped (or worse,
+        map wrong). The kernel enclosure-driver bindings provide the per-bay
+        device names, and the shared address is demoted to display evidence.
+        """
+
+        disks = [
+            {"devname": "sdaa", "name": "sdaa", "serial": "SYNTHSATA001", "model": "EXAMPLE-HDD", "lunid": "5bbbbbbb00001000"},
+            {"devname": "sdab", "name": "sdab", "serial": "SYNTHSATA002", "model": "EXAMPLE-HDD", "lunid": "5bbbbbbb00001002"},
+            {"devname": "sdac", "name": "sdac", "serial": "SYNTHSATA003", "model": "EXAMPLE-HDD", "lunid": "5bbbbbbb00002000"},
+            {"devname": "sdad", "name": "sdad", "serial": "SYNTHSATA004", "model": "EXAMPLE-HDD", "lunid": "5bbbbbbb00003000"},
+            {"devname": "sdae", "name": "sdae", "serial": "SYNTHSAS0005", "model": "EXAMPLE-SAS", "lunid": "5aaaaaaa00000d04"},
+        ]
+
+        class DummyScaleClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                return TrueNASRawData(
+                    enclosures=[],
+                    disks=disks,
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="shared-sata-scale",
+                label="Shared SATA SCALE",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.11", user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(settings, system, DummyScaleClient(), AsyncMock(), temp_dir)
+            ses_overlay = parse_ssh_outputs(
+                {
+                    "sudo -n /usr/bin/sg_ses -p aes /dev/sg84": fixture_text("scale_shared_sata_aes.txt"),
+                    LINUX_ENCLOSURE_SYSFS_MAP_COMMAND: fixture_text("scale_shared_sata_sysfs.txt"),
+                },
+                6,
+                None,
+                None,
+            )
+            service._tag_ses_overlay(ses_overlay, "10.0.0.11")
+            service._fetch_scale_ses_overlay = AsyncMock(return_value=(ses_overlay, []))
+
+            snapshot = await service.get_snapshot()
+
+            slots_by_number = {slot.slot: slot for slot in snapshot.slots}
+            # The kernel enclosure-driver bindings map every SATA bay even
+            # though AES reports the expander's address for all of them.
+            self.assertEqual(slots_by_number[0].device_name, "sdaa")
+            self.assertEqual(slots_by_number[1].device_name, "sdab")
+            self.assertEqual(slots_by_number[2].device_name, "sdac")
+            self.assertEqual(slots_by_number[3].device_name, "sdad")
+            self.assertEqual(slots_by_number[4].device_name, "sdae")
+            # Adjacent-lunid disks must never swap slots via shifted aliases.
+            self.assertEqual(slots_by_number[0].serial, "SYNTHSATA001")
+            self.assertEqual(slots_by_number[1].serial, "SYNTHSATA002")
+            # The shared address is not presented as a per-bay SAS address.
+            self.assertIsNone(slots_by_number[0].sas_address)
+            self.assertIsNone(slots_by_number[1].sas_address)
+            # The empty bay stays empty instead of ghosting as populated.
+            self.assertFalse(slots_by_number[5].present)
+            self.assertIsNone(slots_by_number[5].device_name)
+            self.assertTrue(
+                any("shared SAS address" in warning for warning in snapshot.warnings),
+                snapshot.warnings,
+            )
+
+    async def test_scale_md1280_real_captures_map_via_enclosure_driver(self) -> None:
+        """
+        Issue #119 acceptance: real (pseudonymised) captures from the
+        reporter's Dell EN-8435A / MD1280 (Xyratex 5U84) shelves. AES reports
+        per-phy addresses unrelated to the drives, SATA bays claim "no SAS
+        device attached", and every empty bay's descriptor is flagged invalid
+        while the EC page latches Critical onto it. The kernel
+        enclosure-driver map must still resolve every populated bay, empties
+        must stay empty, and the shelf must keep its full 84-bay geometry.
+        """
+
+        probe_output = fixture_text("scale_md1280_sysfs.txt")
+        truth: dict[str, dict[int, str]] = {}
+        for line in probe_output.splitlines():
+            parts = [part.strip() for part in line.split("|")]
+            if len(parts) == 5:
+                truth.setdefault(parts[1], {})[int(parts[2])] = parts[4]
+
+        lsblk = fixture_json("scale_md1280_lsblk.json")["blockdevices"]
+        disks = []
+        for row in lsblk:
+            if row.get("type") not in (None, "disk"):
+                continue
+            wwn = row.get("wwn") or ""
+            disks.append(
+                {
+                    "devname": row.get("name"),
+                    "name": row.get("name"),
+                    "serial": row.get("serial"),
+                    "model": row.get("model") or "FIXTURE-DISK",
+                    "lunid": wwn.removeprefix("0x") if wwn else None,
+                }
+            )
+
+        class DummyScaleClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                return TrueNASRawData(
+                    enclosures=[],
+                    disks=disks,
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="md1280-parity",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.50", user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(settings, system, DummyScaleClient(), AsyncMock(), temp_dir)
+
+            from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND
+            from app.services.parsers import ParsedSSHData
+
+            overlay = ParsedSSHData()
+            logical_by_sg: dict[str, str] = {}
+            for dev in ("sg1", "sg76"):
+                aes_text = fixture_text(f"scale_md1280_{dev}_aes.txt")
+                logical_by_sg[dev] = aes_text.splitlines()[1].split(":", 1)[1].strip()
+                parsed = parse_ssh_outputs(
+                    {
+                        f"sudo -n /usr/bin/sg_ses -p aes /dev/{dev}": aes_text,
+                        f"sudo -n /usr/bin/sg_ses -p ec /dev/{dev}": fixture_text(f"scale_md1280_{dev}_ec.txt"),
+                        f"sudo -n /usr/bin/sg_ses --join --filter /dev/{dev}": fixture_text(f"scale_md1280_{dev}_join.txt"),
+                        LINUX_ENCLOSURE_SYSFS_MAP_COMMAND: probe_output,
+                    },
+                    84,
+                    None,
+                    None,
+                )
+                overlay = service._merge_ses_overlay_data(overlay, parsed)
+            service._tag_ses_overlay(overlay, "192.0.2.50")
+            service._fetch_scale_ses_overlay = AsyncMock(return_value=(overlay, []))
+
+            for dev in ("sg1", "sg76"):
+                snap = await service.get_snapshot(selected_enclosure_id=logical_by_sg[dev])
+                resolved = {slot.slot: slot for slot in snap.slots}
+                gt = truth[dev]
+
+                self.assertEqual(snap.layout_slot_count, 84)
+                selected = next(e for e in snap.enclosures if e.id == logical_by_sg[dev])
+                self.assertEqual(selected.slot_count, 84)
+
+                for slot_number, device in sorted(gt.items()):
+                    view = resolved.get(slot_number)
+                    self.assertIsNotNone(view, f"{dev} slot {slot_number} missing from snapshot")
+                    assert view is not None
+                    self.assertEqual(
+                        view.device_name,
+                        device,
+                        f"{dev} slot {slot_number} resolved {view.device_name!r}, expected {device!r}",
+                    )
+                    self.assertTrue(view.present, f"{dev} slot {slot_number} should be present")
+                    self.assertEqual(str(view.state), "SlotState.healthy")
+
+                empty_views = [view for view in resolved.values() if view.slot not in gt]
+                self.assertEqual(len(empty_views), 84 - len(gt))
+                for view in empty_views:
+                    self.assertFalse(
+                        view.present,
+                        f"{dev} empty slot {view.slot} phantom-present (status={view.raw_status.get('status')!r})"
+                        if hasattr(view, "raw_status")
+                        else f"{dev} empty slot {view.slot} phantom-present",
+                    )
+                    self.assertEqual(str(view.state), "SlotState.empty")
+
+                self.assertFalse(
+                    [w for w in snap.warnings if "shared SAS address" in w],
+                    "per-phy unique addresses must not trip the shared-address guard",
+                )
+
+    def test_scale_md1280_fixture_identifiers_have_deterministic_pseudonyms(self) -> None:
+        rows = fixture_json("scale_md1280_lsblk.json")["blockdevices"]
+        serials = [str(row["serial"]) for row in rows if row.get("serial")]
+        self.assertEqual(len(serials), 105)
+        self.assertEqual(len(set(serials)), 105)
+        self.assertTrue(all(re.fullmatch(r"[A-Z]{6}[0-9]{4}", value) for value in serials))
+
+        wwns = [str(row["wwn"]) for row in rows if row.get("wwn")]
+        standard_sas = [
+            value
+            for value in wwns
+            if re.fullmatch(r"0x[0-9a-fA-F]{16}", value)
+        ]
+        explicit_nvme = [value for value in wwns if value not in standard_sas]
+        self.assertEqual(
+            explicit_nvme,
+            ["FIXTURE-NVME-WWN-001", "FIXTURE-NVME-WWN-002"],
+        )
+        self.assertEqual(len(standard_sas), 102)
+        self.assertEqual(len(set(standard_sas)), 102)
+        sorted_sas = sorted(int(value[2:], 16) for value in standard_sas)
+        self.assertEqual(
+            Counter(right - left for left, right in zip(sorted_sas, sorted_sas[1:])),
+            Counter({1: 91, 7: 9, 103: 1}),
+        )
 
 
     async def test_md1280_enclosure_offers_per_drawer_sub_views(self) -> None:
@@ -295,7 +501,16 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(full.id, "5eeeeeee00000084")
             self.assertEqual((top.slot_count, bottom.slot_count), (42, 42))
 
-            bottom_snap = await service.get_snapshot(selected_enclosure_id=bottom.id)
+            with patch.object(
+                service,
+                "_resolve_disk_for_slot",
+                wraps=service._resolve_disk_for_slot,
+            ) as resolve_disk:
+                bottom_snap = await service.get_snapshot(selected_enclosure_id=bottom.id)
+            self.assertEqual(
+                {call.args[1] for call in resolve_disk.call_args_list},
+                {"5eeeeeee00000084"},
+            )
             slots = sorted(slot.slot for slot in bottom_snap.slots)
             self.assertEqual(slots, list(range(42, 84)))
             self.assertEqual(bottom_snap.layout_slot_count, 42)

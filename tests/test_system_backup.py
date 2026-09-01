@@ -776,7 +776,10 @@ class SystemBackupServiceTests(unittest.TestCase):
         original_profile = self.profile_path.read_bytes()
         original_slot_detail = self.slot_detail_path.read_bytes()
         destination = self.temp_dir / "scheduled-destination"
-        status_file = self.temp_dir / "scheduled-status" / "status.json"
+        status_dir = self.temp_dir / "scheduled-status"
+        status_dir.mkdir(mode=0o2750)
+        status_dir.chmod(0o2750)
+        status_file = status_dir / "status.json"
         passphrase_file = self.temp_dir / "scheduled-passphrase"
         passphrase_file.write_text("end to end scheduled passphrase\n", encoding="utf-8")
         passphrase_file.chmod(0o600)
@@ -788,6 +791,7 @@ class SystemBackupServiceTests(unittest.TestCase):
             passphrase_file=passphrase_file,
             included_groups=selected_groups,
             retention_count=3,
+            app_gid=status_dir.stat().st_gid,
         )
 
         with (
@@ -3810,24 +3814,6 @@ sys.stdout.flush()
         assert row is not None
         self.assertNotIn("ROLLUP-SERIAL-5", row)
         self.assertNotEqual(row[0], "da5")
-
-        scrubbed_bytes = self.backup_service._build_scrubbed_history_snapshot(
-            snapshot_path.read_bytes(),
-            system_backup_module.DebugScrubber(scrub_secrets=False, scrub_disk_identifiers=True),
-        )
-        bytes_path = self.temp_dir / "scrubbed-history-bytes.sqlite3"
-        bytes_path.write_bytes(scrubbed_bytes)
-        scrubbed = sqlite3.connect(bytes_path)
-        try:
-            bytes_row = scrubbed.execute(
-                "SELECT device_name, serial, gptid, disk_identity_key FROM metric_rollups"
-            ).fetchone()
-        finally:
-            scrubbed.close()
-        self.assertIsNotNone(bytes_row)
-        assert bytes_row is not None
-        self.assertNotIn("ROLLUP-SERIAL-5", bytes_row)
-        self.assertNotEqual(bytes_row[0], "da5")
 
     def test_debug_bundle_can_scrub_only_secrets(self) -> None:
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):

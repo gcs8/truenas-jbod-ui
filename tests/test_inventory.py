@@ -35,7 +35,19 @@ from app.models.domain import (
     StorageViewRuntimeView,
     SystemLocatorStatusView,
 )
-from app.services.inventory import DiskRecord, InventoryService, InventorySourceBundle, build_lunid_aliases, infer_slot_count_from_layout, parse_size_to_bytes, resolve_persistent_id
+from app.services.inventory import (
+    DiskRecord,
+    InventoryService,
+    InventorySourceBundle,
+    LINUX_ENCLOSURE_SYSFS_MAP_COMMAND,
+    build_lunid_alias_tiers,
+    build_lunid_aliases,
+    index_disks_by_sas,
+    infer_slot_count_from_layout,
+    lunid_alias_tier_sets,
+    parse_size_to_bytes,
+    resolve_persistent_id,
+)
 from app.services.mapping_store import MappingStore
 from app.services.parsers import (
     LinuxScsiDevice,
@@ -160,6 +172,78 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertIn("5002538b103e5ee0", aliases)
         self.assertIn("5002538b103e5ee1", aliases)
         self.assertIn("5002538b103e5ee2", aliases)
+
+    def test_build_lunid_alias_tiers_splits_exact_identity_from_shifted_neighbors(self) -> None:
+        exact, shifted = build_lunid_alias_tiers("5000c5003e8253a7", "scale")
+
+        self.assertEqual(exact, "5000c5003e8253a7")
+        self.assertEqual(
+            shifted,
+            {
+                "5000c5003e8253a5",
+                "5000c5003e8253a6",
+                "5000c5003e8253a8",
+                "5000c5003e8253a9",
+            },
+        )
+
+    def _make_disk_record(self, device_name: str, lunid: str) -> DiskRecord:
+        return DiskRecord(
+            raw={},
+            device_name=device_name,
+            path_device_name=device_name,
+            multipath_name=None,
+            multipath_member=None,
+            serial=None,
+            model=None,
+            size_bytes=None,
+            identifier=None,
+            health=None,
+            pool_name=None,
+            lunid=lunid,
+            bus=None,
+            temperature_c=None,
+            last_smart_test_type=None,
+            last_smart_test_status=None,
+            last_smart_test_lifetime_hours=None,
+            logical_block_size=None,
+            physical_block_size=None,
+            enclosure_id=None,
+            slot=None,
+            smart_devices=[],
+            lookup_keys=set(),
+        )
+
+    def test_index_disks_by_sas_exact_identity_beats_neighbor_shifted_alias(self) -> None:
+        # Same-batch disks often carry near-sequential lunids. With the wider
+        # scale window, each disk's shifted aliases land on the other disk's
+        # exact identity; the exact identity must always win the lookup.
+        disk_a = self._make_disk_record("sdaa", "5000c5003e825300")
+        disk_b = self._make_disk_record("sdab", "5000c5003e825302")
+
+        index = index_disks_by_sas(
+            (disk, *lunid_alias_tier_sets(disk.lunid, "scale"))
+            for disk in (disk_a, disk_b)
+        )
+
+        self.assertIs(index["5000c5003e825300"], disk_a)
+        self.assertIs(index["5000c5003e825302"], disk_b)
+        # The alias between the two identities is claimed by both disks, so it
+        # must be dropped instead of resolving to whichever disk came last.
+        self.assertNotIn("5000c5003e825301", index)
+        # Unshared shifted aliases keep matching their only claimant.
+        self.assertIs(index["5000c5003e8252fe"], disk_a)
+        self.assertIs(index["5000c5003e825304"], disk_b)
+
+    def test_index_disks_by_sas_keeps_all_aliases_for_a_single_disk(self) -> None:
+        disk = self._make_disk_record("sdaa", "5000c5003e8253a7")
+
+        index = index_disks_by_sas(
+            [(disk, *lunid_alias_tier_sets(disk.lunid, "scale"))]
+        )
+
+        for alias in build_lunid_aliases("5000c5003e8253a7", "scale"):
+            self.assertIs(index[alias], disk)
 
     def test_quantastor_backoff_warnings_are_collapsed_across_cli_and_ses(self) -> None:
         warnings = [
@@ -493,10 +577,12 @@ class InventoryHelpersTests(unittest.TestCase):
 
             commands = service._linux_storage_enrichment_probe_commands(command_results)
 
-            self.assertEqual(len(commands), 1)
+            self.assertEqual(len(commands), 2)
             self.assertIn("nvme list-subsys -o json", commands[0])
             self.assertIn("|| true", commands[0])
             self.assertEqual(canonicalize_ssh_command(commands[0]), "nvme list-subsys -o json")
+            self.assertIn("/sys/class/enclosure", commands[1])
+            self.assertEqual(canonicalize_ssh_command(commands[1]), "enclosure sysfs map")
 
     def test_linux_nvme_subsystem_failure_is_classified_as_enrichment(self) -> None:
         command_results = [
@@ -4480,33 +4566,6 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                     release_planned.set()
                     await asyncio.gather(collection, command)
 
-    async def test_linux_nvme_enrichment_batches_three_commands_in_one_session(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            settings = Settings()
-            system = SystemConfig(
-                id="linux-nvme",
-                truenas=TrueNASConfig(platform="linux"),
-                ssh=SSHConfig(enabled=True, host="192.0.2.20", user="operator"),
-            )
-            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
-            service._run_ssh_command = AsyncMock(
-                return_value=SSHCommandResult(command="legacy", ok=False, exit_code=1)
-            )
-            service._run_ssh_commands = AsyncMock(
-                return_value=[
-                    SSHCommandResult(command=f"command-{index}", ok=False, exit_code=1)
-                    for index in range(3)
-                ]
-            )
-
-            await service._fetch_linux_nvme_enrichment_over_ssh("/dev/nvme0n1", "192.0.2.20")
-
-            service._run_ssh_commands.assert_awaited_once()
-            nvme_batch = service._run_ssh_commands.await_args
-            self.assertIsNotNone(nvme_batch)
-            assert nvme_batch is not None
-            self.assertEqual(len(nvme_batch.args[0]), 3)
-            service._run_ssh_command.assert_not_awaited()
 
     async def test_linux_nvme_smartctl_and_nvme_probes_share_one_host_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4679,6 +4738,54 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(best_host, "192.0.2.50")
             self.assertEqual(failures, ["TrueNAS SCALE SSH SES EC page probe failed."])
 
+    async def test_sg_ses_planned_discovery_respects_optional_ssh_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            probe = SSHProbe(system.ssh)
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                probe,
+                temp_dir,
+            )
+
+            async def fail_startup(commands: list[str]) -> list[SSHCommandResult]:
+                return [
+                    SSHCommandResult(
+                        command=command,
+                        ok=False,
+                        stderr="Error reading SSH protocol banner",
+                        exit_code=255,
+                    )
+                    for command in commands
+                ]
+
+            probe.run_commands = AsyncMock(side_effect=fail_startup)  # type: ignore[method-assign]
+            probe.run_planned_commands = AsyncMock(  # type: ignore[method-assign]
+                side_effect=AssertionError("SG-SES planner must not start during host backoff")
+            )
+
+            first = await service._run_ssh_commands(["first"], "10.0.0.10")
+            devices, overlay, failures = await service._discover_and_fetch_sg_ses_host_overlay(
+                "10.0.0.10",
+                failure_prefix="Quantastor SSH SES",
+            )
+
+            self.assertEqual(probe.run_commands.await_count, 1)
+            self.assertEqual(probe.run_planned_commands.await_count, 0)
+            self.assertIn("Error reading SSH protocol banner", first[0].stderr)
+            self.assertEqual(devices, [])
+            self.assertEqual(overlay.ses_enclosures, [])
+            self.assertEqual(len(failures), 1)
+            self.assertIn("recent connection startup failure", failures[0])
+
     async def test_sg_ses_discovery_and_page_probes_share_one_planned_session(self) -> None:
         class RecordingSSHProbe(SSHProbe):
             def __init__(self, config: SSHConfig) -> None:
@@ -4751,7 +4858,8 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(failures, [])
             self.assertEqual(best_host, "192.0.2.60")
             self.assertEqual(probe.session_count, 1)
-            self.assertEqual(len(probe.commands), 4)
+            self.assertEqual(len(probe.commands), 5)
+            self.assertIn(LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, probe.commands)
 
     async def test_sg_ses_planned_session_serializes_same_host_batches(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7070,48 +7178,6 @@ Enclosure Status diagnostic page:
             self.assertIn("recent connection startup failure", second[0].stderr)
             self.assertEqual(second[0].exit_code, 255)
 
-    async def test_sg_ses_discovery_respects_optional_ssh_backoff_after_startup_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            settings = Settings()
-            system = SystemConfig(
-                id="quantastor-lab",
-                label="Quantastor Lab",
-                truenas=TrueNASConfig(platform="quantastor"),
-                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
-            )
-            probe = SSHProbe(system.ssh)
-            service = build_inventory_service(
-                settings,
-                system,
-                AsyncMock(),
-                probe,
-                temp_dir,
-            )
-
-            async def run_commands(commands: list[str]) -> list[SSHCommandResult]:
-                return [
-                    SSHCommandResult(
-                        command=command,
-                        ok=False,
-                        stderr="Error reading SSH protocol banner",
-                        exit_code=255,
-                    )
-                    for command in commands
-                ]
-
-            probe.run_commands = AsyncMock(side_effect=run_commands)  # type: ignore[method-assign]
-
-            first = await service._run_ssh_commands(["first"], "10.0.0.10")
-            devices, failures = await service._discover_sg_ses_devices(
-                "10.0.0.10",
-                failure_prefix="Quantastor SSH SES",
-            )
-
-            self.assertEqual(probe.run_commands.await_count, 1)
-            self.assertIn("Error reading SSH protocol banner", first[0].stderr)
-            self.assertEqual(devices, [])
-            self.assertEqual(len(failures), 1)
-            self.assertIn("recent connection startup failure", failures[0])
 
     def test_build_quantastor_smart_devices_prefers_by_id_and_sd_paths_over_by_path(self) -> None:
         settings = Settings()
@@ -9497,6 +9563,8 @@ Enclosure Status diagnostic page:
                     return SSHCommandResult(command=command, ok=True, stdout=ec_on_output, stderr="", exit_code=0)
                 if "sg_ses --join --filter" in command:
                     return SSHCommandResult(command=command, ok=False, stdout="", stderr="join unsupported", exit_code=1)
+                if "/sys/class/enclosure" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
                 raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
 
             service._run_ssh_command = AsyncMock(side_effect=run_command)
@@ -9575,6 +9643,8 @@ Enclosure Status diagnostic page:
                     return SSHCommandResult(command=command, ok=True, stdout=ec_output, stderr="", exit_code=0)
                 if "sg_ses --join --filter /dev/sg26" in command:
                     return SSHCommandResult(command=command, ok=False, stdout="", stderr="join unsupported", exit_code=1)
+                if "/sys/class/enclosure" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
                 raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
 
             service._run_ssh_command = AsyncMock(side_effect=run_command)
@@ -9648,6 +9718,8 @@ Enclosure Status diagnostic page:
                     return SSHCommandResult(command=command, ok=True, stdout=ec_output, stderr="", exit_code=0)
                 if "sg_ses --join --filter /dev/sg26" in command:
                     return SSHCommandResult(command=command, ok=False, stdout="", stderr="join unsupported", exit_code=1)
+                if "/sys/class/enclosure" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
                 raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
 
             service._run_ssh_command = AsyncMock(side_effect=run_command)
@@ -9963,6 +10035,42 @@ class ReviewRegressionTests(unittest.TestCase):
 
             self.assertEqual(columns, 0)
             self.assertEqual((slots[0].row_index, slots[0].column_index), (0, 0))
+
+    def test_scale_linux_normal_profile_keeps_slots_missing_from_sparse_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="sparse-scale", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            selected_option = EnclosureOption(
+                id="enc-a",
+                label="Sparse shelf",
+                rows=1,
+                columns=2,
+                slot_count=3,
+                slot_layout=[[0, 2]],
+            )
+            profile = MagicMock()
+            profile.columns = 2
+            profile.slot_layout = [[0, 2]]
+            profile.slot_number_base = None
+            service._build_scale_linux_enclosure_options = MagicMock(return_value=[selected_option])
+            service.profile_registry.resolve_for_enclosure = MagicMock(return_value=profile)
+
+            slots, _enclosures, _meta, _rows, slot_count, _columns = service._correlate_scale_linux(
+                TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ParsedSSHData(),
+                [],
+                selected_enclosure_id="enc-a",
+            )
+
+            self.assertEqual([slot.slot for slot in slots], [0, 1, 2])
+            self.assertEqual(slot_count, 3)
 
     def test_parse_size_to_bytes_binary_suffixes_use_1024(self) -> None:
         self.assertEqual(parse_size_to_bytes("1 GiB"), 1024**3)

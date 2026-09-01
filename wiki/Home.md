@@ -116,11 +116,10 @@ setup notes.
 
 ## Current Version
 
-`0.22.1` is the current maintenance candidate. It keeps encrypted 7z history
-restore members file-backed through verification and transactional activation,
-allowing FULL backup and restore for history databases above 3 GiB without
-loading the database into Python memory. `0.22.0` remains the latest published
-release until the `v0.22.1` tag and GitHub release are published.
+`0.22.2` is the current maintenance candidate. It adds bounded segmented
+history, encrypted schema-v2 FULL backup and restore, scheduled-backup-gated hot
+retention, and the immutable deployment staging fix. `0.22.1` is the latest
+published release until the v0.22.2 release gates pass.
 
 The public demo from `0.19.0` remains a static GitHub Pages sample data
 experience, not a hosted copy of the live Docker app. Open

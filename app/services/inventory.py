@@ -142,6 +142,22 @@ LINUX_NVME_LIST_SUBSYS_COMMAND = (
     "/usr/sbin/nvme list-subsys -o json 2>/dev/null || "
     "/usr/bin/nvme list-subsys -o json 2>/dev/null || true"
 )
+# Reads the kernel enclosure-driver slot bindings without sudo. Every line is
+# `<enclosure scsi id>|<sg name>|<slot attr>|<component name>|<block devices>`,
+# which parse_enclosure_sysfs_map turns into per-bay device hints that keep
+# working when AES pages cannot provide per-bay SAS addresses (issue #119).
+LINUX_ENCLOSURE_SYSFS_MAP_COMMAND = (
+    "for c in /sys/class/enclosure/*/*; do "
+    '[ -f "$c/slot" ] || continue; '
+    'e="${c%/*}"; '
+    "printf '%s|%s|%s|%s|%s\\n' "
+    '"${e##*/}" '
+    "\"$(ls \"$e/device/scsi_generic\" 2>/dev/null | tr '\\n' ' ')\" "
+    "\"$(cat \"$c/slot\" 2>/dev/null)\" "
+    '"${c##*/}" '
+    "\"$(ls \"$c/device/block\" 2>/dev/null | tr '\\n' ' ')\"; "
+    "done"
+)
 STABLE_SLOT_DETAIL_FIELDS = (
     "device_name",
     "smart_device_names",
@@ -248,22 +264,63 @@ def parse_size_to_bytes(value: Any) -> int | None:
     return int(number * (base ** power))
 
 
-def build_lunid_aliases(value: str | None, platform: str) -> set[str]:
-    aliases: set[str] = set()
-    normalized = normalize_hex_identifier(value)
-    if normalized:
-        aliases.add(normalized)
+def build_lunid_alias_tiers(value: str | None, platform: str) -> tuple[str | None, set[str]]:
+    """Split lunid aliases into the exact identity and its shifted neighbors."""
+    exact = normalize_hex_identifier(value)
 
     # CORE shelves have mostly matched on exact lunid or +1 shifted SAS hints.
     # On the user's SCALE host, the rear SSD enclosure exposes AES SAS addresses
     # that can differ from disk.query lunids by up to two hex counts, so we keep
     # the match window intentionally small but a little wider there.
     deltas = (1,) if platform not in {"scale", "quantastor"} else (-2, -1, 1, 2)
+    shifted: set[str] = set()
     for delta in deltas:
-        shifted = shift_hex_identifier(value, delta)
-        if shifted:
-            aliases.add(shifted)
+        candidate = shift_hex_identifier(value, delta)
+        if candidate and candidate != exact:
+            shifted.add(candidate)
+    return exact, shifted
+
+
+def build_lunid_aliases(value: str | None, platform: str) -> set[str]:
+    exact, shifted = build_lunid_alias_tiers(value, platform)
+    aliases = set(shifted)
+    if exact:
+        aliases.add(exact)
     return aliases
+
+
+def lunid_alias_tier_sets(value: str | None, platform: str) -> tuple[set[str], set[str]]:
+    exact, shifted = build_lunid_alias_tiers(value, platform)
+    return ({exact} if exact else set()), shifted
+
+
+def index_disks_by_sas(
+    entries: Iterable[tuple["DiskRecord", set[str], set[str]]],
+) -> dict[str, "DiskRecord"]:
+    """
+    Build the SAS-address lookup with exact identities ranked above shifted
+    aliases.
+
+    Shifted aliases exist because some SATA backplanes report AES addresses a
+    hex count or two away from the disk lunid. Same-batch disks can carry
+    near-sequential lunids, so one disk's shifted alias may land on a
+    neighbor's identity; letting the last writer win would map a slot to the
+    wrong disk. Exact identities always win, and shifted aliases claimed by
+    more than one disk are dropped instead of guessed.
+    """
+    exact_index: dict[str, DiskRecord] = {}
+    shifted_index: dict[str, DiskRecord | None] = {}
+    for disk, exact_aliases, shifted_aliases in entries:
+        for alias in exact_aliases:
+            exact_index[alias] = disk
+        for alias in shifted_aliases:
+            if alias in shifted_index and shifted_index[alias] is not disk:
+                shifted_index[alias] = None
+            else:
+                shifted_index[alias] = disk
+    index = {alias: disk for alias, disk in shifted_index.items() if disk is not None}
+    index.update(exact_index)
+    return index
 
 
 def resolve_persistent_id(*candidates: str | None) -> tuple[str | None, str | None]:
@@ -1615,6 +1672,12 @@ class InventoryService:
                 "context_label": "Linux NVMe subsystem detail",
                 "criticality": "enrichment",
             }
+        if canonical_command == "enclosure sysfs map":
+            return {
+                "context": "storage_fabric_linux_enclosure_map",
+                "context_label": "Linux enclosure driver slot map",
+                "criticality": "enrichment",
+            }
         if canonical_command.startswith("sg_ses join "):
             return {
                 "context": "storage_fabric_sg_ses_join",
@@ -1802,6 +1865,8 @@ class InventoryService:
             commands.append("/usr/bin/lsscsi -g -t")
         if "nvme list-subsys -o json" not in seen_commands:
             commands.append(LINUX_NVME_LIST_SUBSYS_COMMAND)
+        if "enclosure sysfs map" not in seen_commands:
+            commands.append(LINUX_ENCLOSURE_SYSFS_MAP_COMMAND)
         return commands
 
     def _ssh_inventory_enrichment_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
@@ -2995,23 +3060,6 @@ class InventoryService:
             return ("/usr/local/sbin/smartctl", "/usr/sbin/smartctl")
         return ("/usr/sbin/smartctl", "/usr/local/sbin/smartctl")
 
-    async def _fetch_linux_nvme_enrichment_over_ssh(
-        self,
-        device_path: str,
-        host: str | None = None,
-    ) -> SmartSummaryView | None:
-        command_parsers = self._linux_nvme_enrichment_command_parsers(device_path)
-        if not command_parsers:
-            return None
-        results = {
-            result.command: result
-            for result in await self._run_ssh_commands(
-                [command for command, _parser in command_parsers],
-                host,
-            )
-        }
-        return self._parse_linux_nvme_enrichment_results(command_parsers, results)
-
     def _linux_nvme_enrichment_command_parsers(
         self,
         device_path: str,
@@ -3692,15 +3740,16 @@ class InventoryService:
 
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
-        disks_by_sas: dict[str, DiskRecord] = {}
         for disk in disk_records:
             for key in disk.lookup_keys:
                 disks_by_key[key] = disk
             if disk.slot is not None:
                 disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
                 disks_by_slot[(None, disk.slot)] = disk
-            for alias in build_lunid_aliases(disk.lunid, self.system.truenas.platform):
-                disks_by_sas[alias] = disk
+        disks_by_sas = index_disks_by_sas(
+            (disk, *lunid_alias_tier_sets(disk.lunid, self.system.truenas.platform))
+            for disk in disk_records
+        )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
 
         slot_views: list[SlotView] = []
@@ -4448,16 +4497,17 @@ class InventoryService:
 
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
-        disks_by_sas: dict[str, DiskRecord] = {}
         for disk in disk_records:
             for key in disk.lookup_keys:
                 disks_by_key[key] = disk
             if disk.slot is not None:
                 disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
                 disks_by_slot[(None, disk.slot)] = disk
-            if disk.lunid:
-                for alias in build_lunid_aliases(disk.lunid, self.system.truenas.platform):
-                    disks_by_sas[alias] = disk
+        disks_by_sas = index_disks_by_sas(
+            (disk, *lunid_alias_tier_sets(disk.lunid, self.system.truenas.platform))
+            for disk in disk_records
+            if disk.lunid
+        )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
 
         columns = (
@@ -4473,12 +4523,18 @@ class InventoryService:
         )
         slot_count = infer_slot_count_from_layout(layout_rows, slot_count)
         slot_positions = layout_slot_positions(layout_rows)
-        # Render exactly the layout's slots: identical to range(slot_count)
-        # for every whole-shelf profile, and the drawer sub-views list only
-        # their own 42 bays.
-        slots_to_render = sorted(slot_positions) if slot_positions else list(range(slot_count))
-        slot_count = len(slots_to_render)
         mapping_enclosure_id = self._base_enclosure_id(selected_option.id)
+        is_sub_view = mapping_enclosure_id != selected_option.id
+        # Synthetic drawer sub-views render only their own layout slots. Normal
+        # profiles retain the existing range behavior so sparse custom layouts
+        # do not silently remove bays from inventory.
+        slots_to_render = (
+            sorted(slot_positions)
+            if is_sub_view and slot_positions
+            else list(range(slot_count))
+        )
+        if is_sub_view:
+            slot_count = len(slots_to_render)
         slot_views: list[SlotView] = []
 
         for slot in slots_to_render:
@@ -4486,7 +4542,7 @@ class InventoryService:
             mapping = self.mapping_store.get_mapping(self.system.id, mapping_enclosure_id, slot)
             disk = self._resolve_disk_for_slot(
                 slot,
-                selected_option.id,
+                mapping_enclosure_id,
                 mapping,
                 disks_by_key,
                 disks_by_slot,
@@ -4563,15 +4619,15 @@ class InventoryService:
         disk_records = self._build_quantastor_disk_records(raw_data, selected_option.id)
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
-        disks_by_sas: dict[str, DiskRecord] = {}
         for disk in disk_records:
             for key in disk.lookup_keys:
                 disks_by_key[key] = disk
             if disk.slot is not None:
                 disks_by_slot[(selected_option.id, disk.slot)] = disk
                 disks_by_slot[(None, disk.slot)] = disk
-            for alias in self._disk_sas_aliases(disk):
-                disks_by_sas[alias] = disk
+        disks_by_sas = index_disks_by_sas(
+            (disk, *self._disk_sas_alias_tiers(disk)) for disk in disk_records
+        )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
 
         api_topology_members = self._build_quantastor_topology_members(raw_data, disk_records)
@@ -6497,19 +6553,6 @@ class InventoryService:
     def _score_sg_ses_overlay(overlay: ParsedSSHData) -> int:
         return sum(len(enclosure.slots) for enclosure in overlay.ses_enclosures)
 
-    async def _discover_sg_ses_devices(self, host: str, *, failure_prefix: str) -> tuple[list[str], list[str]]:
-        device_discovery = await self._run_optional_ssh_command(self._build_sg_ses_discovery_command(), host)
-        if not device_discovery.ok:
-            detail = normalize_text(device_discovery.stderr) or normalize_text(device_discovery.stdout) or (
-                f"exit {device_discovery.exit_code}"
-            )
-            return [], [f"{failure_prefix} discovery failed on {host}: {detail}"]
-
-        devices = self._parse_sg_ses_discovery_devices(device_discovery.stdout)
-        if not devices:
-            return [], [f"{failure_prefix} discovery found no usable sg_ses devices on {host}."]
-        return devices, []
-
     async def _discover_and_fetch_sg_ses_host_overlay(
         self,
         host: str,
@@ -6531,6 +6574,8 @@ class InventoryService:
                         shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "--join", "--filter", device]),
                     ]
                 )
+            if commands:
+                commands.append(LINUX_ENCLOSURE_SYSFS_MAP_COMMAND)
             return commands
 
         results = await self._run_ssh_planned_commands(
@@ -6589,6 +6634,8 @@ class InventoryService:
             join_command = shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "--join", "--filter", device])
             device_commands[device] = (aes_command, ec_command, join_command)
             commands.extend([aes_command, ec_command, join_command])
+        if device_commands:
+            commands.append(LINUX_ENCLOSURE_SYSFS_MAP_COMMAND)
 
         result_list = (
             list(command_results)
@@ -6618,6 +6665,9 @@ class InventoryService:
             join_result = results_by_command.get(join_command)
             if join_result is not None and join_result.ok:
                 outputs[join_command] = join_result.stdout
+            sysfs_result = results_by_command.get(LINUX_ENCLOSURE_SYSFS_MAP_COMMAND)
+            if sysfs_result is not None and sysfs_result.ok:
+                outputs[LINUX_ENCLOSURE_SYSFS_MAP_COMMAND] = sysfs_result.stdout
 
             parsed = parse_ssh_outputs(outputs, self.settings.layout.slot_count, None, None)
             if not parsed.ses_enclosures:
@@ -9126,17 +9176,28 @@ class InventoryService:
         empty = raw_present is False or (
             raw_present is None and not disk and self._status_contains(raw_slot_status, "empty", "not installed", "absent")
         )
+        # When SES explicitly reports the bay empty, only a resolved disk may
+        # override it. Status keywords, identify LEDs, and fault codes can all
+        # legitimately fire on an empty bay (issue #119's shelf latches
+        # Critical onto every empty slot), and used to fabricate a present
+        # drive out of them.
+        ses_says_empty_without_disk = raw_present is False and disk is None
         present = False if quantastor_ses_empty else (
             raw_present is True
             or disk is not None
-            or self._status_contains(raw_slot_status, "ok", "installed", "ready", "present")
-            or identify_active
-            or faulty
+            or (
+                not ses_says_empty_without_disk
+                and (
+                    self._status_contains(raw_slot_status, "ok", "installed", "ready", "present")
+                    or identify_active
+                    or faulty
+                )
+            )
         )
 
         if identify_active:
             state = SlotState.identify
-        elif faulty:
+        elif faulty and not ses_says_empty_without_disk:
             state = SlotState.fault
         elif quantastor_ses_empty or empty:
             state = SlotState.empty
@@ -9609,12 +9670,6 @@ class InventoryService:
             return None
         return next(iter(details)).rstrip(".")
 
-    async def _run_optional_ssh_command(self, command: str, host: str | None = None) -> SSHCommandResult:
-        results = await self._run_ssh_commands([command], host)
-        if results:
-            return results[0]
-        return SSHCommandResult(command=command, ok=False, stderr="SSH command result missing.", exit_code=255)
-
     @staticmethod
     def _is_ssh_connection_startup_failure(results: list[SSHCommandResult]) -> bool:
         if not results:
@@ -9752,8 +9807,8 @@ class InventoryService:
                 return api_member
         return None
 
-    def _disk_sas_aliases(self, disk: DiskRecord) -> set[str]:
-        aliases = build_lunid_aliases(disk.lunid, self.system.truenas.platform)
+    def _disk_sas_alias_tiers(self, disk: DiskRecord) -> tuple[set[str], set[str]]:
+        sources: list[str | None] = [disk.lunid]
         raw_sources: list[dict[str, Any]] = []
         if isinstance(disk.raw, dict):
             raw_sources.append(disk.raw)
@@ -9764,13 +9819,17 @@ class InventoryService:
 
         for payload in raw_sources:
             for key in ("sasAddress", "portSasAddress", "scsiId", "wwid", "wwn"):
-                aliases.update(
-                    build_lunid_aliases(
-                        str(payload.get(key)) if payload.get(key) is not None else None,
-                        self.system.truenas.platform,
-                    )
-                )
-        return aliases
+                value = payload.get(key)
+                sources.append(str(value) if value is not None else None)
+
+        exact_aliases: set[str] = set()
+        shifted_aliases: set[str] = set()
+        for value in sources:
+            exact, shifted = build_lunid_alias_tiers(value, self.system.truenas.platform)
+            if exact:
+                exact_aliases.add(exact)
+            shifted_aliases.update(shifted)
+        return exact_aliases, shifted_aliases - exact_aliases
 
     def _build_multipath_view(
         self,
@@ -10141,6 +10200,12 @@ class InventoryService:
     def _health_is_bad(*values: str | None) -> bool:
         bad_keywords = ("fault", "degrad", "fail", "unavail", "offline", "removed", "critical")
         for value in values:
-            if value and any(keyword in value.lower() for keyword in bad_keywords):
+            if not value:
+                continue
+            # SES reports "Noncritical" as a distinct informational code; the
+            # bare substring scan used to read it as critical (issue #119's
+            # shelf reports Noncritical on every populated bay).
+            lowered = value.lower().replace("noncritical", "non-crit-code")
+            if any(keyword in lowered for keyword in bad_keywords):
                 return True
         return False

@@ -34,6 +34,7 @@ class FakeRuntime:
         fail_activation: bool = False,
         health: str = "healthy",
         label_config_files: tuple[str, ...] | None = None,
+        require_staged_env: bool = False,
     ) -> None:
         self.root = root
         self.tag_digest = tag_digest
@@ -44,6 +45,8 @@ class FakeRuntime:
             str(root / "compose.yaml"),
             str(root / "docker-compose.nonroot.yml"),
         )
+        self.require_staged_env = require_staged_env
+        self.candidate_env_bytes: bytes | None = None
         self.commands: list[tuple[str, ...]] = []
         self.downloads: list[str] = []
         self.probes: list[str] = []
@@ -79,6 +82,16 @@ class FakeRuntime:
                 raise AssertionError(f"unexpected image ID lookup: {image}")
         if command[:2] == ["docker", "compose"]:
             if "config" in command:
+                compose_paths = [
+                    Path(command[index + 1])
+                    for index, value in enumerate(command)
+                    if value == "-f"
+                ]
+                if self.require_staged_env and any(path.parent != self.root for path in compose_paths):
+                    candidate_env = compose_paths[0].parent / ".env"
+                    if not candidate_env.is_file():
+                        raise deployment.DeploymentError("candidate staging is missing .env")
+                    self.candidate_env_bytes = candidate_env.read_bytes()
                 return ""
             if command[-3:] == ["ps", "--services", "--status"]:
                 raise AssertionError("status value is missing")
@@ -213,6 +226,22 @@ class ImmutableDeploymentTests(unittest.TestCase):
                 self.assertIn("--profile", command)
                 self.assertIn("history", command)
                 self.assertEqual(command.count("-f"), 2)
+
+    def test_candidate_compose_preflight_stages_private_live_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            expected_env = (root / ".env").read_bytes()
+            runtime = FakeRuntime(root, require_staged_env=True)
+
+            result = deployment.update_deployment(
+                self.make_spec(root),
+                run=runtime.run,
+                download=runtime.download,
+                probe=runtime.probe,
+            )
+
+            self.assertEqual(result["status"], "active")
+            self.assertEqual(runtime.candidate_env_bytes, expected_env)
 
     def test_existing_receipt_blocks_rerun_before_commands_or_downloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

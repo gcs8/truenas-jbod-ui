@@ -28,6 +28,7 @@ from history_service.domain import (
     normalize_text,
     utcnow,
 )
+from history_service.scheduled_backup import read_scheduled_backup_status
 from history_service.store import HistoryStore, SlotStateUpdate
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,7 @@ class HistoryCollector:
         self.last_success_at: str | None = None
         self.last_backup_at: str | None = None
         self.last_retention_at: str | None = None
+        self.last_retention_backup_at: str | None = None
         self.last_retention_attempt_at: str | None = None
         self.last_retention_duration_seconds: float | None = None
         self.last_retention_rows_removed: int = 0
@@ -398,49 +400,64 @@ class HistoryCollector:
             self.last_smart_evidence_at = observed_at
 
         backup_succeeded = False
+        retention_backup_at: datetime | None = None
         if collect_fast:
             self.last_fast_metrics_at = observed_at
         if collect_slow:
             self.last_slow_metrics_at = observed_at
             self._raise_if_stopping()
-            try:
-                latest_backup_at = self._latest_backup_at()
-                if not self._backup_due(run_started, latest_backup_at=latest_backup_at):
-                    self._record_collection_stage(
-                        "db.backup.skipped",
-                        0.0,
-                        reason="recent_backup",
-                        interval_seconds=max(0, int(self.settings.backup_interval_seconds or 0)),
-                        latest_backup_at=isoformat_utc(latest_backup_at) if latest_backup_at else None,
-                    )
-                    if latest_backup_at:
-                        self.last_backup_at = isoformat_utc(latest_backup_at)
-                else:
-                    self._set_collection_activity("creating history database backup")
-                    backup_started = time.perf_counter()
-                    self._raise_if_stopping()
-                    backup_path = self.store.create_backup(
-                        self.settings.backup_dir,
-                        snapshot_label=observed_at,
-                        retention_count=self.settings.backup_retention_count,
-                        long_term_backup_dir=self.settings.long_term_backup_dir,
-                        weekly_retention_count=self.settings.weekly_backup_retention_count,
-                        monthly_retention_count=self.settings.monthly_backup_retention_count,
-                    )
-                    self._record_collection_stage(
-                        "db.backup",
-                        time.perf_counter() - backup_started,
-                        backup_created=bool(backup_path),
-                    )
-                    if backup_path:
-                        self.last_backup_at = observed_at
-                        backup_succeeded = True
-            except Exception as exc:  # noqa: BLE001 - keep collection alive even if backup snapshotting fails.
-                logger.warning("History backup snapshot failed: %s", exc)
+            if self.settings.segment_catalog_path is not None:
+                retention_backup_at = self._segmented_backup_at_for_retention(run_started)
+                backup_succeeded = retention_backup_at is not None
+                if retention_backup_at is not None:
+                    self.last_backup_at = isoformat_utc(retention_backup_at)
+                self._record_collection_stage(
+                    "db.backup.skipped",
+                    0.0,
+                    reason="segmented_history_uses_scheduled_full_backup",
+                    scheduled_full_backup_ready=backup_succeeded,
+                )
+            else:
+                try:
+                    latest_backup_at = self._latest_backup_at()
+                    if not self._backup_due(run_started, latest_backup_at=latest_backup_at):
+                        self._record_collection_stage(
+                            "db.backup.skipped",
+                            0.0,
+                            reason="recent_backup",
+                            interval_seconds=max(0, int(self.settings.backup_interval_seconds or 0)),
+                            latest_backup_at=isoformat_utc(latest_backup_at) if latest_backup_at else None,
+                        )
+                        if latest_backup_at:
+                            self.last_backup_at = isoformat_utc(latest_backup_at)
+                    else:
+                        self._set_collection_activity("creating history database backup")
+                        backup_started = time.perf_counter()
+                        self._raise_if_stopping()
+                        backup_path = self.store.create_backup(
+                            self.settings.backup_dir,
+                            snapshot_label=observed_at,
+                            retention_count=self.settings.backup_retention_count,
+                            long_term_backup_dir=self.settings.long_term_backup_dir,
+                            weekly_retention_count=self.settings.weekly_backup_retention_count,
+                            monthly_retention_count=self.settings.monthly_backup_retention_count,
+                        )
+                        self._record_collection_stage(
+                            "db.backup",
+                            time.perf_counter() - backup_started,
+                            backup_created=bool(backup_path),
+                        )
+                        if backup_path:
+                            self.last_backup_at = observed_at
+                            retention_backup_at = run_started
+                            backup_succeeded = True
+                except Exception as exc:  # noqa: BLE001 - collection continues after backup failure.
+                    logger.warning("History backup snapshot failed: %s", exc)
         self._raise_if_stopping()
         self._run_retention_if_due(
             run_started,
             backup_succeeded=backup_succeeded,
+            backup_at=retention_backup_at,
         )
         self.last_success_at = observed_at
         self.last_error = None
@@ -482,6 +499,7 @@ class HistoryCollector:
             "last_success_at": self.last_success_at,
             "last_backup_at": self.last_backup_at,
             "last_retention_at": self.last_retention_at,
+            "last_retention_backup_at": self.last_retention_backup_at,
             "last_retention_attempt_at": self.last_retention_attempt_at,
             "last_retention_duration_seconds": self.last_retention_duration_seconds,
             "last_retention_rows_removed": self.last_retention_rows_removed,
@@ -700,18 +718,67 @@ class HistoryCollector:
             return True
         return False
 
+    def _segmented_backup_at_for_retention(self, now: datetime) -> datetime | None:
+        status_path = self.settings.scheduled_backup_status_file
+        if not status_path:
+            return None
+        status = read_scheduled_backup_status(status_path)
+        if (
+            status is None
+            or status.get("last_error_code") is not None
+            or "history_db" not in status.get("included_groups", [])
+            or "history_db" in status.get("last_absent_groups", [])
+        ):
+            return None
+        raw_success_at = status.get("last_success_at")
+        if not isinstance(raw_success_at, str):
+            return None
+        try:
+            success_at = datetime.fromisoformat(raw_success_at)
+        except ValueError:
+            return None
+        if success_at.tzinfo is None:
+            return None
+        success_at = success_at.astimezone(timezone.utc)
+        normalized_now = now.astimezone(timezone.utc)
+        age = normalized_now - success_at
+        if age < timedelta(0) or age > timedelta(
+            seconds=self.settings.segmented_backup_max_age_seconds
+        ):
+            return None
+        return success_at
+
     def _run_retention_if_due(
         self,
         now: datetime,
         *,
         backup_succeeded: bool,
+        backup_at: datetime | None = None,
     ) -> None:
         if not backup_succeeded or not self._retention_due(now):
             return
+        segmented_claimed = False
+        if self.settings.segment_catalog_path is not None:
+            if backup_at is None:
+                return
+            try:
+                segmented_claimed = self.store.claim_segmented_retention_backup(backup_at)
+            except Exception as exc:  # noqa: BLE001 - authorization failure must fail closed.
+                self.last_retention_error = type(exc).__name__
+                logger.warning(
+                    "History retention authorization failed with %s; skipping retention.",
+                    type(exc).__name__,
+                )
+                return
+            if not segmented_claimed:
+                return
         started = time.perf_counter()
         attempted_at = isoformat_utc(now)
         self.last_retention_attempt_at = attempted_at
+        if backup_at is not None:
+            self.last_retention_backup_at = isoformat_utc(backup_at)
         self._set_collection_activity("pruning and rolling up history")
+        retention_completed = False
         try:
             result = self.store.maintain_retention(
                 now=now,
@@ -723,7 +790,21 @@ class HistoryCollector:
                 max_batches=self.settings.retention_max_batches_per_run,
                 should_continue=lambda: not self._stopping.is_set(),
             )
+            retention_completed = True
+            if segmented_claimed and backup_at is not None:
+                self.store.finish_segmented_retention_backup(
+                    backup_at,
+                    has_more=bool(result.get("has_more")),
+                )
         except Exception as exc:  # noqa: BLE001 - retention failure must not stop collection.
+            if segmented_claimed and not retention_completed and backup_at is not None:
+                try:
+                    self.store.release_segmented_retention_backup(backup_at)
+                except Exception as release_exc:  # noqa: BLE001 - failed release remains fail closed.
+                    logger.warning(
+                        "History retention authorization release failed with %s; a newer backup is required.",
+                        type(release_exc).__name__,
+                    )
             duration = time.perf_counter() - started
             self.last_retention_duration_seconds = round(duration, 3)
             self.last_retention_error = type(exc).__name__

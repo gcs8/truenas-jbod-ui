@@ -2251,13 +2251,6 @@ class SystemBackupService:
             if rows != [("ok",)]:
                 raise ValueError("History database integrity check failed.")
 
-    def _build_history_snapshot(self) -> bytes:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            backup_path = self._build_history_snapshot_to_directory(Path(temp_dir))
-            if backup_path is None:
-                return b""
-            return backup_path.read_bytes()
-
     def _build_history_snapshot_to_directory(self, target_dir: Path) -> Path | None:
         backup_path = self.store.create_backup(
             target_dir,
@@ -3109,29 +3102,6 @@ class SystemBackupService:
             info.size = member.file_path.stat().st_size
             with member.file_path.open("rb") as source:
                 archive.addfile(info, source)
-
-    def _build_tar_archive(self, bundle_members: list[BundleMember], manifest_bytes: bytes) -> bytes:
-        buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w") as archive:
-            self._write_tar_bundle(archive, bundle_members, manifest_bytes)
-        return buffer.getvalue()
-
-    def _build_7z_archive(
-        self,
-        bundle_members: list[BundleMember],
-        manifest_bytes: bytes,
-        *,
-        passphrase: str | None = None,
-    ) -> bytes:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            archive_path = Path(temp_dir) / "bundle.7z"
-            self._build_7z_archive_to_path(
-                bundle_members,
-                manifest_bytes,
-                archive_path,
-                passphrase=passphrase,
-            )
-            return archive_path.read_bytes()
 
     def _build_7z_archive_to_path(
         self,
@@ -4819,34 +4789,6 @@ class SystemBackupService:
         if scrubber.scrub_secrets or scrubber.scrub_disk_identifiers:
             slot_event_rules["details_json"] = scrubber.scrub_json_text
         return slot_state_rules, slot_event_rules, metric_sample_rules, metric_rollup_rules
-
-    def _build_scrubbed_history_snapshot(self, snapshot_bytes: bytes, scrubber: DebugScrubber | None) -> bytes:
-        if scrubber is None or not snapshot_bytes:
-            return snapshot_bytes
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir) / "history-scrub.sqlite3"
-            temp_path.write_bytes(snapshot_bytes)
-            connection = sqlite3.connect(temp_path)
-            try:
-                connection.row_factory = sqlite3.Row
-                (
-                    slot_state_rules,
-                    slot_event_rules,
-                    metric_sample_rules,
-                    metric_rollup_rules,
-                ) = self._history_scrubbing_rules(scrubber)
-                if slot_state_rules:
-                    self._scrub_history_table(connection, "slot_state_current", slot_state_rules)
-                if slot_event_rules:
-                    self._scrub_history_table(connection, "slot_events", slot_event_rules)
-                if metric_sample_rules:
-                    self._scrub_history_table(connection, "metric_samples", metric_sample_rules)
-                if metric_rollup_rules:
-                    self._scrub_history_table(connection, "metric_rollups", metric_rollup_rules)
-                connection.commit()
-            finally:
-                connection.close()
-            return temp_path.read_bytes()
 
     @staticmethod
     def _scrub_history_table(

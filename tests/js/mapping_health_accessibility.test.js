@@ -39,6 +39,12 @@ function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function cssRule(selector) {
+  const match = STYLE.match(new RegExp(`(?:^|\\n)${escapeRegex(selector)}\\s*\\{([\\s\\S]*?)\\}`));
+  assert.ok(match, `missing CSS rule ${selector}`);
+  return match[1];
+}
+
 test("mapping health separates matched empty unmatched and unknown bays", () => {
   const { summarizeMappingHealth } = loadFunctions(APP_SOURCE, ["summarizeMappingHealth"]);
   const result = summarizeMappingHealth([
@@ -173,6 +179,28 @@ test("slot states have glyph legends and patterned high-contrast cues", () => {
   }
   assert.match(STYLE, /@media\s*\(forced-colors:\s*active\)/);
   assert.match(STYLE, /repeating-linear-gradient/);
+});
+
+test("selection and topology rings reset the state-chip geometry", () => {
+  for (const selector of [
+    ".slot-tile.selected::after",
+    ".slot-tile.peer-highlight::after",
+    ".slot-tile.fabric-highlight::after",
+  ]) {
+    const rule = cssRule(selector);
+    assert.match(rule, /width:\s*auto;/);
+    assert.match(rule, /height:\s*auto;/);
+    assert.match(rule, /background:\s*none;/);
+  }
+});
+
+test("drawer faces floor tray widths and own horizontal scrolling", () => {
+  const shell = cssRule('.chassis-shell[data-face-style="drawer"]');
+  assert.match(shell, /overflow-x:\s*auto;/);
+  assert.match(shell, /--slot-bay-aspect:\s*0\.46\s*\/\s*1;/);
+
+  const group = cssRule('.chassis-shell[data-face-style="drawer"] .row-group');
+  assert.match(group, /minmax\(72px,\s*1fr\)/);
 });
 
 test("diagnostic evidence starts collapsed behind an operator summary", () => {

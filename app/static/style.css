@@ -411,109 +411,6 @@ textarea {
   width: min(920px, calc(100vw - 32px));
 }
 
-.system-setup-form {
-  max-height: min(86vh, 980px);
-  overflow: auto;
-}
-
-.setup-section {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 18px;
-  border-radius: 16px;
-  border: 1px solid var(--panel-border);
-  background: rgba(9, 13, 18, 0.58);
-}
-
-.setup-section-header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: start;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.setup-section h3 {
-  margin: 0 0 4px;
-}
-
-.setup-stepper {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.setup-step {
-  display: inline-flex;
-  align-items: center;
-  min-height: 34px;
-  padding: 0 12px;
-  border-radius: 999px;
-  border: 1px solid var(--panel-border);
-  background: rgba(255, 255, 255, 0.03);
-  color: var(--muted);
-  font-size: 0.82rem;
-  font-weight: 600;
-}
-
-.setup-step.is-active {
-  border-color: rgba(83, 163, 255, 0.45);
-  background: rgba(83, 163, 255, 0.12);
-  color: var(--text);
-}
-
-.setup-step.is-complete {
-  border-color: rgba(81, 179, 118, 0.42);
-  color: #cfeedd;
-}
-
-.setup-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 12px;
-}
-
-.setup-step-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.setup-step-panel .field textarea {
-  min-height: 150px;
-}
-
-.setup-key-manager {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 14px;
-  border-radius: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.02);
-}
-
-.setup-key-mode-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.setup-inline-grid {
-  display: grid;
-  grid-template-columns: minmax(220px, 1.75fr) auto;
-  gap: 12px;
-  align-items: end;
-}
-
-.setup-inline-actions {
-  display: flex;
-  align-items: end;
-  justify-content: flex-start;
-  min-height: 100%;
-}
-
 .field input.is-readonly {
   background: rgba(255, 255, 255, 0.04);
 }
@@ -4253,7 +4150,6 @@ button.fabric-trace-crumb:hover {
   color: rgba(198, 212, 226, 0.72);
 }
 
-
 .nvme-carrier-canvas {
   position: relative;
   width: min(100%, 902px);
@@ -6252,15 +6148,4 @@ button.fabric-trace-crumb:hover {
     width: min(100vw - 16px, 920px);
   }
 
-  .setup-section {
-    padding: 16px;
-  }
-
-  .setup-inline-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .setup-inline-actions {
-    align-items: stretch;
-  }
 }
