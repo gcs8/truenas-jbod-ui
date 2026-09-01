@@ -42,6 +42,8 @@ PRIVATE_REPLACEMENT_DIR_PREFIX = ".history-replacement-"
 # the full-table UPDATE scans. Writers populate disk_identity_key on insert, so the
 # backfill only ever has work to do for rows that predate the column.
 DISK_IDENTITY_BACKFILL_USER_VERSION = 1
+SEGMENTED_RETENTION_STATE_NAME = "segmented_retention"
+SEGMENTED_RETENTION_STATES = frozenset({"ready", "claimed", "consumed"})
 
 
 @dataclass(slots=True)
@@ -218,6 +220,12 @@ CREATE TABLE IF NOT EXISTS history_table_counts (
     row_count INTEGER NOT NULL CHECK (row_count >= 0)
 );
 
+CREATE TABLE IF NOT EXISTS history_maintenance_state (
+    name TEXT PRIMARY KEY,
+    backup_at TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('ready', 'claimed', 'consumed'))
+);
+
 CREATE TRIGGER IF NOT EXISTS count_slot_events_insert
 AFTER INSERT ON slot_events BEGIN
     UPDATE history_table_counts
@@ -362,6 +370,105 @@ class HistoryStore:
             raise ValueError(
                 f"History {operation} is unavailable while segmented history is active."
             )
+
+    @staticmethod
+    def _normalize_retention_backup_at(value: datetime | str) -> tuple[datetime, str]:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError("History retention backup timestamp is invalid.") from exc
+        else:
+            raise ValueError("History retention backup timestamp is invalid.")
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("History retention backup timestamp is invalid.")
+        normalized = parsed.astimezone(timezone.utc)
+        return normalized, normalized.isoformat()
+
+    def claim_segmented_retention_backup(self, backup_at: datetime | str) -> bool:
+        candidate, serialized = self._normalize_retention_backup_at(backup_at)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT backup_at, state
+                    FROM history_maintenance_state
+                    WHERE name = ?
+                    """,
+                    (SEGMENTED_RETENTION_STATE_NAME,),
+                ).fetchone()
+                if row is not None:
+                    previous, _ = self._normalize_retention_backup_at(str(row["backup_at"]))
+                    state = str(row["state"])
+                    if state not in SEGMENTED_RETENTION_STATES:
+                        raise ValueError("History retention authorization state is invalid.")
+                    if candidate < previous or (candidate == previous and state != "ready"):
+                        connection.rollback()
+                        return False
+                connection.execute(
+                    """
+                    INSERT INTO history_maintenance_state (name, backup_at, state)
+                    VALUES (?, ?, 'claimed')
+                    ON CONFLICT (name) DO UPDATE SET
+                        backup_at = excluded.backup_at,
+                        state = excluded.state
+                    """,
+                    (SEGMENTED_RETENTION_STATE_NAME, serialized),
+                )
+                connection.commit()
+                return True
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def finish_segmented_retention_backup(
+        self,
+        backup_at: datetime | str,
+        *,
+        has_more: bool,
+    ) -> None:
+        _, serialized = self._normalize_retention_backup_at(backup_at)
+        next_state = "ready" if has_more else "consumed"
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE history_maintenance_state
+                    SET state = ?
+                    WHERE name = ? AND backup_at = ? AND state = 'claimed'
+                    """,
+                    (next_state, SEGMENTED_RETENTION_STATE_NAME, serialized),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("History retention authorization claim changed.")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def release_segmented_retention_backup(self, backup_at: datetime | str) -> None:
+        _, serialized = self._normalize_retention_backup_at(backup_at)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE history_maintenance_state
+                    SET state = 'ready'
+                    WHERE name = ? AND backup_at = ? AND state = 'claimed'
+                    """,
+                    (SEGMENTED_RETENTION_STATE_NAME, serialized),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("History retention authorization claim changed.")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def _connect(self, *, migration_lock_held: bool = False) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -662,15 +769,17 @@ class HistoryStore:
 
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._normalize_shared_path_permissions(self.file_path.parent, is_dir=True)
+        ownership_source = self.file_path if self.file_path.exists() else self.file_path.parent
+        ownership_metadata = os.stat(ownership_source, follow_symlinks=False)
         temp_fd, temp_path = self._create_private_replacement_file(
             self.file_path.parent,
             prefix=f".{self.file_path.name}.",
             suffix=".restore",
         )
         temp_metadata = os.fstat(temp_fd)
-
-        with self._lock:
-            try:
+        try:
+            os.fchown(temp_fd, ownership_metadata.st_uid, ownership_metadata.st_gid)
+            with self._lock:
                 with closing(sqlite3.connect(source)) as source_connection, closing(
                     sqlite3.connect(f"/proc/self/fd/{temp_fd}")
                 ) as restore_connection:
@@ -690,10 +799,10 @@ class HistoryStore:
                 self._normalize_database_permissions()
                 self._journal_mode_identity = None
                 self._initialize_schema(migration_lock_held=True)
-            finally:
-                if temp_fd is not None:
-                    os.close(temp_fd)
-                self._discard_owned_path(temp_path, temp_metadata)
+        finally:
+            if temp_fd is not None:
+                os.close(temp_fd)
+            self._discard_owned_path(temp_path, temp_metadata)
 
     def restore_backup(self, source_path: str | Path) -> None:
         self._require_unsegmented_operation("v1 restore")

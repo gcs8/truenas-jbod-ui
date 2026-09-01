@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.22.2 - 2026-08-31
+
+- Added bounded segmented history with one writable hot SQLite database,
+  immutable digest-checked segments, segment-aware reads, recoverable migration
+  and rollback, and encrypted schema-v2 FULL backup and restore.
+- Made segmented hot retention depend on a recent successful scheduled FULL
+  backup that selected and actually contained `history_db`; missing, stale,
+  failed, malformed, artifact-incomplete, or history-excluding status now blocks
+  pruning. A success requires a positive run count, archive size, digest, and
+  owned artifact name.
+- Persisted backup authorization in the hot SQLite database so completed
+  retention cannot repeat after restart, failed passes and bounded catch-up stay
+  retryable, and interrupted claims require a newer FULL backup.
+- Stopped the history collector from attempting the incompatible legacy
+  single-SQLite snapshot after segmented history is enabled.
+- Made scheduled-backup status readable by the non-root UI and history
+  services without making it writable: the backup UID now requires a setgid
+  `2750` directory owned by the explicitly configured app GID and publishes
+  atomic `0640` status files.
+- Updated the release performance harness to preview mapping imports and submit
+  the required revision/digest confirmation instead of posting a stale raw
+  mapping bundle that the current API rejects with HTTP 422.
+- Fixed immutable deployment candidate validation by staging the private live
+  `.env` beside candidate Compose files before running `docker compose config`.
+- Updated `websockets` to 17.0.1 and `cryptography` to 50.0.0 through the
+  dependency update already present on `main`.
+
 ## v0.22.1 - 2026-08-30
 
 - Kept encrypted 7z restore members file-backed through manifest hashing,
