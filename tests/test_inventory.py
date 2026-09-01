@@ -3941,6 +3941,37 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(slot_view.gptid, "gptid/example")
             self.assertEqual(slot_view.persistent_id_label, "GPTID")
 
+    def test_build_slot_view_does_not_mark_a_not_installed_bay_present(self) -> None:
+        # API candidates carry a status string but never a `present` bool, so
+        # presence used to come from a substring scan where "Not installed"
+        # satisfied "installed" (issue #169).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="archive-core", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+
+            def build(status: str) -> SlotView:
+                return service._build_slot_view(
+                    slot=3,
+                    row_index=0,
+                    column_index=3,
+                    enclosure_meta={"id": None, "label": None, "name": None},
+                    raw_slot_status={"status": status},
+                    disk=None,
+                    mapping=None,
+                    ssh_data=ParsedSSHData(),
+                    api_topology_members={},
+                    api_enclosure_ids=set(),
+                )
+
+            not_installed = build("Not installed")
+            self.assertFalse(not_installed.present)
+            self.assertEqual(not_installed.state, SlotState.empty)
+
+            installed = build("Installed, OK")
+            self.assertTrue(installed.present)
+            self.assertNotEqual(installed.state, SlotState.empty)
+
     def test_attach_mapping_revisions_includes_effective_fallback_clear_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()

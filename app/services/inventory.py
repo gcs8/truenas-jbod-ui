@@ -9219,13 +9219,20 @@ class InventoryService:
         # Critical onto every empty slot), and used to fabricate a present
         # drive out of them.
         ses_says_empty_without_disk = raw_present is False and disk is None
+        # `_status_contains` is a substring scan, so the positive presence
+        # keywords must not fire on a negated status: "Not installed" contains
+        # "installed" and used to mark an API-only empty bay present=True while
+        # its state was already empty (issue #169).
+        status_says_populated = self._status_contains(
+            raw_slot_status, "ok", "installed", "ready", "present"
+        ) and not self._status_contains(raw_slot_status, "not installed", "empty", "absent")
         present = False if quantastor_ses_empty else (
             raw_present is True
             or disk is not None
             or (
                 not ses_says_empty_without_disk
                 and (
-                    self._status_contains(raw_slot_status, "ok", "installed", "ready", "present")
+                    status_says_populated
                     or identify_active
                     or faulty
                 )
