@@ -65,7 +65,16 @@ again.
 ## Offline migration
 
 Stop or otherwise quiesce the history service. Confirm the SQLite main file has
-no `-wal`, `-shm`, or `-journal` sidecar. Use an offset-aware ISO-8601 cutoff.
+no `-wal`, `-shm`, or `-journal` sidecar. Before migrating a database retained
+from an older release, start it once through the current history service and
+stop the service cleanly. That initialization adds the current tables, columns,
+and maintenance triggers. Use an offset-aware ISO-8601 cutoff.
+
+The dry run opens the quiesced source read-only and checks SQLite integrity and
+the current schema before creating the segment directory or any migration
+artifact. An incompatible legacy database is rejected with an instruction to
+initialize it through the current history service. Migration never skips a
+missing history table.
 
 Dry run:
 
@@ -91,13 +100,14 @@ python scripts/migrate_segmented_history.py \
 The apply path:
 
 1. takes the shared history lock;
-2. writes and fsyncs a byte-identical v1 rollback snapshot;
-3. writes the pending journal;
-4. seals and authenticates the immutable segment before publication;
-5. stages the complementary hot database using absolute-time comparisons;
-6. updates the journal before replacing the hot database;
-7. writes and fsyncs the complete catalog;
-8. removes the pending journal last.
+2. verifies source identity, sidecar absence, SQLite integrity, and current schema;
+3. writes and fsyncs a byte-identical v1 rollback snapshot;
+4. writes the pending journal;
+5. seals and authenticates the immutable segment before publication;
+6. stages the complementary hot database using absolute-time comparisons;
+7. updates the journal before replacing the hot database;
+8. writes and fsyncs the complete catalog;
+9. removes the pending journal last.
 
 A committed row cannot silently disappear between segment and hot snapshots.
 Normal history writes, store initialization, WAL setup, and restore replacement
