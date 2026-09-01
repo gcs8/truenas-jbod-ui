@@ -694,6 +694,22 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
 
 class HistoryStoreTests(unittest.TestCase):
+    def test_segmented_retention_claim_is_fail_closed_across_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "history.db"
+            first = HistoryStore(str(db_path))
+            backup_at = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+            self.assertTrue(first.claim_segmented_retention_backup(backup_at))
+
+            restarted = HistoryStore(str(db_path))
+            self.assertFalse(restarted.claim_segmented_retention_backup(backup_at))
+
+            newer_backup_at = backup_at + timedelta(days=1)
+            self.assertTrue(restarted.claim_segmented_retention_backup(newer_backup_at))
+            restarted.release_segmented_retention_backup(newer_backup_at)
+            self.assertTrue(restarted.claim_segmented_retention_backup(newer_backup_at))
+
     def test_shared_lock_rejects_database_file_mount_points(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -4024,6 +4040,226 @@ class HistoryStoreTests(unittest.TestCase):
 
 
 class HistoryCollectorTests(unittest.TestCase):
+    @staticmethod
+    def _scheduled_backup_status(
+        *,
+        success_at: datetime,
+        included_groups: list[str] | None = None,
+        absent_groups: list[str] | None = None,
+        error_code: str | None = None,
+    ) -> dict[str, object]:
+        groups = included_groups or ["config_file", "history_db"]
+        return {
+            "schema_version": 1,
+            "enabled": True,
+            "included_groups": groups,
+            "success_count": 1,
+            "failure_count": 1 if error_code else 0,
+            "last_attempt_at": success_at.isoformat(),
+            "last_success_at": success_at.isoformat(),
+            "last_failure_at": success_at.isoformat() if error_code else None,
+            "last_size_bytes": 123,
+            "last_sha256": "a" * 64,
+            "last_artifact_name": "jbod-scheduled-backup-20300102T030405Z-00000001.7z",
+            "last_absent_groups": list(absent_groups or []),
+            "last_retention_removed": 0,
+            "last_error_code": error_code,
+        }
+
+    def test_segmented_retention_requires_recent_successful_full_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "scheduled-backup.json"
+            now = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
+            settings = HistorySettings(
+                segment_catalog_path=str(Path(temp_dir) / "segments" / "catalog.json"),
+                scheduled_backup_status_file=str(status_path),
+                segmented_backup_max_age_seconds=36 * 3600,
+            )
+            collector = HistoryCollector(settings, MagicMock())
+
+            self.assertIsNone(collector._segmented_backup_at_for_retention(now))
+
+            status_path.write_text(
+                json.dumps(
+                    self._scheduled_backup_status(
+                        success_at=now - timedelta(hours=1),
+                        included_groups=["config_file"],
+                    )
+                ),
+                encoding="utf-8",
+            )
+            status_path.chmod(0o600)
+            self.assertIsNone(collector._segmented_backup_at_for_retention(now))
+
+            status_path.write_text(
+                json.dumps(
+                    self._scheduled_backup_status(
+                        success_at=now - timedelta(hours=1),
+                        absent_groups=["history_db"],
+                    )
+                ),
+                encoding="utf-8",
+            )
+            self.assertIsNone(collector._segmented_backup_at_for_retention(now))
+
+            status_path.write_text(
+                json.dumps(self._scheduled_backup_status(success_at=now - timedelta(hours=37))),
+                encoding="utf-8",
+            )
+            self.assertIsNone(collector._segmented_backup_at_for_retention(now))
+
+            status_path.write_text(
+                json.dumps(
+                    self._scheduled_backup_status(
+                        success_at=now - timedelta(hours=1),
+                        error_code="RuntimeError",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            self.assertIsNone(collector._segmented_backup_at_for_retention(now))
+
+            success_at = now - timedelta(hours=1)
+            status_path.write_text(
+                json.dumps(self._scheduled_backup_status(success_at=success_at)),
+                encoding="utf-8",
+            )
+            self.assertEqual(collector._segmented_backup_at_for_retention(now), success_at)
+
+    @staticmethod
+    def _retention_result(*, has_more: bool) -> dict[str, object]:
+        return {
+            "metric_samples_removed": 0,
+            "events_removed": 0,
+            "hourly_rollups_removed": 0,
+            "daily_rollups_removed": 0,
+            "total_rows_removed": 0,
+            "batches_completed": 1,
+            "has_more": has_more,
+            "interrupted": False,
+        }
+
+    def test_segmented_retention_consumption_survives_collector_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
+            success_at = now - timedelta(hours=1)
+            db_path = Path(temp_dir) / "history.db"
+            settings = HistorySettings(
+                sqlite_path=str(db_path),
+                segment_catalog_path=str(Path(temp_dir) / "segments" / "catalog.json"),
+            )
+            first_store = HistoryStore(str(db_path), segment_catalog_path=settings.segment_catalog_path)
+            first_store.maintain_retention = MagicMock(  # type: ignore[method-assign]
+                return_value=self._retention_result(has_more=False)
+            )
+            HistoryCollector(settings, first_store)._run_retention_if_due(
+                now,
+                backup_succeeded=True,
+                backup_at=success_at,
+            )
+
+            second_store = HistoryStore(str(db_path), segment_catalog_path=settings.segment_catalog_path)
+            second_store.maintain_retention = MagicMock(  # type: ignore[method-assign]
+                return_value=self._retention_result(has_more=False)
+            )
+            HistoryCollector(settings, second_store)._run_retention_if_due(
+                now + timedelta(minutes=5),
+                backup_succeeded=True,
+                backup_at=success_at,
+            )
+
+            first_store.maintain_retention.assert_called_once()  # type: ignore[attr-defined]
+            second_store.maintain_retention.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_segmented_retention_catchup_survives_collector_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
+            success_at = now - timedelta(hours=1)
+            db_path = Path(temp_dir) / "history.db"
+            settings = HistorySettings(
+                sqlite_path=str(db_path),
+                segment_catalog_path=str(Path(temp_dir) / "segments" / "catalog.json"),
+            )
+            first_store = HistoryStore(str(db_path), segment_catalog_path=settings.segment_catalog_path)
+            first_store.maintain_retention = MagicMock(  # type: ignore[method-assign]
+                return_value=self._retention_result(has_more=True)
+            )
+            HistoryCollector(settings, first_store)._run_retention_if_due(
+                now,
+                backup_succeeded=True,
+                backup_at=success_at,
+            )
+
+            second_store = HistoryStore(str(db_path), segment_catalog_path=settings.segment_catalog_path)
+            second_store.maintain_retention = MagicMock(  # type: ignore[method-assign]
+                return_value=self._retention_result(has_more=False)
+            )
+            HistoryCollector(settings, second_store)._run_retention_if_due(
+                now + timedelta(minutes=5),
+                backup_succeeded=True,
+                backup_at=success_at,
+            )
+
+            second_store.maintain_retention.assert_called_once()  # type: ignore[attr-defined]
+
+    def test_segmented_retention_failure_remains_retryable_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
+            success_at = now - timedelta(hours=1)
+            db_path = Path(temp_dir) / "history.db"
+            settings = HistorySettings(
+                sqlite_path=str(db_path),
+                segment_catalog_path=str(Path(temp_dir) / "segments" / "catalog.json"),
+            )
+            first_store = HistoryStore(str(db_path), segment_catalog_path=settings.segment_catalog_path)
+            first_store.maintain_retention = MagicMock(  # type: ignore[method-assign]
+                side_effect=RuntimeError("private database path")
+            )
+            HistoryCollector(settings, first_store)._run_retention_if_due(
+                now,
+                backup_succeeded=True,
+                backup_at=success_at,
+            )
+
+            second_store = HistoryStore(str(db_path), segment_catalog_path=settings.segment_catalog_path)
+            second_store.maintain_retention = MagicMock(  # type: ignore[method-assign]
+                return_value=self._retention_result(has_more=False)
+            )
+            HistoryCollector(settings, second_store)._run_retention_if_due(
+                now + timedelta(minutes=5),
+                backup_succeeded=True,
+                backup_at=success_at,
+            )
+
+            second_store.maintain_retention.assert_called_once()  # type: ignore[attr-defined]
+
+    def test_segmented_slow_collection_never_calls_legacy_sqlite_backup(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                segment_catalog_path=str(temp_dir / "segments" / "catalog.json"),
+                scheduled_backup_status_file=str(temp_dir / "scheduled-backup.json"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        store.create_backup = MagicMock()  # type: ignore[method-assign]
+        store.maintain_retention = MagicMock()  # type: ignore[method-assign]
+        collector.last_fast_metrics_at = collector.started_at
+        collector.last_slow_metrics_at = collector.started_at
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once(force_slow=True))
+
+        store.create_backup.assert_not_called()  # type: ignore[attr-defined]
+        store.maintain_retention.assert_not_called()  # type: ignore[attr-defined]
+        self.assertIn(
+            "db.backup.skipped",
+            [entry["stage"] for entry in collector.status()["collection_stage_timings"]],
+        )
+
     def test_retention_runs_when_due_and_reports_status(self) -> None:
         store = MagicMock()
         store.maintain_retention.return_value = {

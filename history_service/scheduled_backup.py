@@ -107,6 +107,38 @@ def validate_scheduled_backup_status(
         raise ValueError("Scheduled backup status is invalid.")
 
 
+def read_scheduled_backup_status(path: str | Path) -> dict[str, Any] | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(Path(path), flags)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or metadata.st_size > _MAX_STATUS_BYTES
+        ):
+            return None
+        content = os.read(descriptor, _MAX_STATUS_BYTES + 1)
+        if len(content) > _MAX_STATUS_BYTES or os.read(descriptor, 1):
+            return None
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        validate_scheduled_backup_status(payload)
+    except ValueError:
+        return None
+    return payload
+
+
 class ScheduledBackupSettings(BaseModel):
     enabled: bool = False
     destination_dir: str | None = None

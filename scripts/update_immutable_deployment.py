@@ -824,6 +824,7 @@ def update_deployment(
     staging = Path(tempfile.mkdtemp(prefix=".jbod-ui-compose-check-", dir=root))
     os.chmod(staging, 0o700)
     try:
+        _write_private_file(staging / ".env", (root / ".env").read_bytes())
         for item in spec.compose_files:
             _write_private_file(staging / item.live, candidate_files[item.live])
         candidate_prefix = _compose_prefix(

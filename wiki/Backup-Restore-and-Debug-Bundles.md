@@ -85,8 +85,9 @@ SCHEDULED_BACKUP_ENABLED=true
 SCHEDULED_BACKUP_DIR=/app/backups/scheduled
 SCHEDULED_BACKUP_STATUS_FILE=/app/backup-status/scheduled-backup.json
 SCHEDULED_BACKUP_RETENTION_COUNT=14
-SCHEDULED_BACKUP_INCLUDED_GROUPS_JSON=["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file"]
+SCHEDULED_BACKUP_INCLUDED_GROUPS_JSON=["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db"]
 SCHEDULED_BACKUP_PASSPHRASE_FILE=/run/backup-secrets/scheduled-backup-passphrase
+HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS=129600
 ```
 
 Replace `1000` with the numeric values printed by `id -u` and `id -g` above.
@@ -127,11 +128,18 @@ exposes run counts, last success, last failure, age, size, and failure state.
 Metric labels never contain the destination, artifact name, group names, error
 text, or passphrase-file path.
 
-History SQLite already has its own snapshot schedule. Include `history_db` here
-only when you intentionally want the larger archive and have sized the backup
-destination accordingly. The one-shot container mounts the whole history
-directory writable. Do not file-bind only `history.db`; segmented locking rejects
-database-file mount points.
+Hot-only history has its own single-SQLite snapshot schedule. Segmented history
+does not use that snapshot because it cannot represent the catalog and immutable
+segments. Its hot-data retention remains blocked until the status file records a
+recent successful encrypted FULL backup that includes `history_db`. The default
+maximum age is 129600 seconds, or 36 hours, which allows the daily timer and its
+random delay to complete. Missing, stale, failed, or history-excluding status
+fails closed without pruning hot rows.
+
+The one-shot container mounts the whole history directory writable. Do not
+file-bind only `history.db`; segmented locking rejects database-file mount
+points. Size the backup destination and temporary workspace for the hot database
+plus every active segment.
 
 Hot-only deployments export backup schema 1. A deployment configured with
 `HISTORY_SEGMENT_CATALOG_PATH` exports schema 2. Schema 2 includes the hot

@@ -41,6 +41,8 @@ class HistorySettings(BaseModel):
     backup_dir: str = Field(default_factory=_default_history_backup_dir)
     backup_retention_count: int = 28
     backup_interval_seconds: int = 3600
+    scheduled_backup_status_file: str | None = None
+    segmented_backup_max_age_seconds: int = Field(default=36 * 3600, ge=1)
     long_term_backup_dir: str | None = Field(default_factory=_default_history_long_term_backup_dir)
     weekly_backup_retention_count: int = 4
     monthly_backup_retention_count: int = 3
@@ -61,7 +63,7 @@ class HistorySettings(BaseModel):
     retention_batch_size: int = Field(default=5000, ge=1)
     retention_max_batches_per_run: int = Field(default=20, ge=1)
 
-    @field_validator("segment_catalog_path", mode="before")
+    @field_validator("segment_catalog_path", "scheduled_backup_status_file", mode="before")
     @classmethod
     def normalize_optional_segment_catalog_path(cls, value: Any) -> str | None:
         if value is None:
@@ -110,6 +112,8 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_BACKUP_DIR": "backup_dir",
     "HISTORY_BACKUP_RETENTION_COUNT": "backup_retention_count",
     "HISTORY_BACKUP_INTERVAL_SECONDS": "backup_interval_seconds",
+    "SCHEDULED_BACKUP_STATUS_FILE": "scheduled_backup_status_file",
+    "HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS": "segmented_backup_max_age_seconds",
     "HISTORY_LONG_TERM_BACKUP_DIR": "long_term_backup_dir",
     "HISTORY_WEEKLY_BACKUP_RETENTION_COUNT": "weekly_backup_retention_count",
     "HISTORY_MONTHLY_BACKUP_RETENTION_COUNT": "monthly_backup_retention_count",
