@@ -1318,6 +1318,187 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertEqual(topology["c0:252:0"].pool_name, "boot")
             self.assertEqual(topology["c1:252:0"].pool_name, "data")
 
+    def test_live_ses_empty_evidence_demotes_manual_mapping_without_deleting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="linux-host",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            disk = service._build_disk_records(
+                [
+                    {
+                        "name": "sda",
+                        "devname": "sda",
+                        "identifier": "{serial}SER-STALE",
+                        "serial": "SER-STALE",
+                        "model": "Synthetic Disk",
+                    }
+                ],
+                ParsedSSHData(),
+                {},
+                {},
+            )[0]
+            mapping = ManualMapping(
+                system_id=system.id,
+                enclosure_id="enc-a",
+                slot=0,
+                serial="SER-STALE",
+                gptid="gptid/stale",
+                notes="operator calibration",
+            )
+            service.mapping_store.save_mapping(mapping)
+
+            resolution = service._resolve_disk_for_slot(
+                0,
+                "enc-a",
+                mapping,
+                {"ser-stale": disk},
+                {},
+                {},
+                {
+                    "present": False,
+                    "presence_source": "sg_ses_aes",
+                    "ses_device": "/dev/sg4",
+                    "sas_address_hint": "0",
+                },
+                ParsedSSHData(),
+            )
+
+            self.assertIsNone(resolution.disk)
+            self.assertEqual(resolution.source, "ses-empty")
+            self.assertTrue(resolution.stale_manual_mapping)
+            persisted_mapping = service.mapping_store.get_mapping(system.id, "enc-a", 0)
+            self.assertIsNotNone(persisted_mapping)
+            self.assertEqual(persisted_mapping.serial if persisted_mapping else None, "SER-STALE")
+            self.assertEqual(persisted_mapping.gptid if persisted_mapping else None, "gptid/stale")
+            self.assertEqual(persisted_mapping.notes if persisted_mapping else None, "operator calibration")
+
+            slot = service._build_slot_view(
+                slot=0,
+                row_index=0,
+                column_index=0,
+                enclosure_meta={"id": "enc-a", "label": "Shelf", "name": "Shelf"},
+                raw_slot_status={
+                    "present": False,
+                    "presence_source": "sg_ses_aes",
+                    "ses_device": "/dev/sg4",
+                    "sas_address_hint": "0",
+                },
+                disk=resolution.disk,
+                mapping=mapping,
+                ssh_data=ParsedSSHData(),
+                api_topology_members={},
+                api_enclosure_ids=set(),
+                resolution_source=resolution.source,
+                stale_manual_mapping=resolution.stale_manual_mapping,
+            )
+
+            self.assertFalse(slot.present)
+            self.assertEqual(slot.state, SlotState.empty)
+            self.assertIsNone(slot.serial)
+            self.assertIsNone(slot.gptid)
+            self.assertEqual(slot.mapping_source, "ses-empty")
+            self.assertIn("Stale manual mapping", slot.notes or "")
+            self.assertTrue(slot.raw_status["stale_manual_mapping"])
+
+    def test_disk_resolution_reports_the_evidence_tier_that_matched(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="linux-host",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            disk = service._build_disk_records(
+                [
+                    {
+                        "name": "sda",
+                        "devname": "sda",
+                        "identifier": "{serial}SER-A",
+                        "serial": "SER-A",
+                        "gptid": "gptid/disk-a",
+                        "model": "Synthetic Disk",
+                    }
+                ],
+                ParsedSSHData(),
+                {},
+                {},
+            )[0]
+            by_key = {key: disk for key in disk.lookup_keys}
+            by_key.update({"sda": disk, "ser-a": disk, "gptid/disk-a": disk})
+            cases = [
+                (
+                    "manual",
+                    ManualMapping(slot=0, serial="SER-A"),
+                    {},
+                    {},
+                    {},
+                    ParsedSSHData(),
+                    "manual",
+                ),
+                ("api-slot", None, {("enc-a", 0): disk}, {}, {}, ParsedSSHData(), "api-slot"),
+                (
+                    "enclosure-sysfs",
+                    None,
+                    {},
+                    {},
+                    {"device_names": ["sda"], "device_names_source": "enclosure_sysfs"},
+                    ParsedSSHData(),
+                    "enclosure-sysfs",
+                ),
+                ("device-hint", None, {}, {}, {"device_hint": "sda"}, ParsedSSHData(), "device-hint"),
+                ("serial-hint", None, {}, {}, {"serial_hint": "SER-A"}, ParsedSSHData(), "serial-hint"),
+                ("gptid-hint", None, {}, {}, {"gptid_hint": "gptid/disk-a"}, ParsedSSHData(), "gptid-hint"),
+                (
+                    "sas-address",
+                    None,
+                    {},
+                    {"5000000000000001": disk},
+                    {"sas_address_hint": "5000000000000001"},
+                    ParsedSSHData(),
+                    "sas-address",
+                ),
+                (
+                    "ses-slot-map",
+                    None,
+                    {},
+                    {},
+                    {},
+                    ParsedSSHData(ses_slot_to_device={0: "sda"}),
+                    "ses-slot-map",
+                ),
+            ]
+
+            for name, mapping, by_slot, by_sas, raw_status, ssh_data, expected in cases:
+                with self.subTest(name=name):
+                    resolution = service._resolve_disk_for_slot(
+                        0,
+                        "enc-a",
+                        mapping,
+                        by_key,
+                        by_slot,
+                        by_sas,
+                        raw_status,
+                        ssh_data,
+                    )
+                    self.assertIs(resolution.disk, disk)
+                    self.assertEqual(resolution.source, expected)
+                    self.assertFalse(resolution.stale_manual_mapping)
+
     def test_correlate_esxi_host_keeps_aoc_specific_storcli_warning_on_aoc_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             system = SystemConfig(
@@ -3799,7 +3980,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(slot_views[1].device_name, "sda")
             self.assertFalse(slot_views[2].present)
             self.assertEqual(slot_views[2].state.value, "empty")
-            self.assertEqual(slot_views[2].mapping_source, "ssh")
+            self.assertEqual(slot_views[2].mapping_source, "ubntstorage")
             self.assertTrue(any("UniFi UNVR Pro LED control is experimental." in warning for warning in warnings))
 
     def test_correlate_linux_host_enables_unvr_led_backend_and_gpio_state(self) -> None:
@@ -4191,7 +4372,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 resolved = service._resolve_disk_for_slot(
                     5, "jbod", None, disks_by_key, disks_by_slot, {}, raw_slot_status, ssh_data
                 )
-                return resolved.device_name if resolved else None
+                return resolved.disk.device_name if resolved.disk else None
 
             # SES saw da10 in this bay; the bare slot bucket holds da11 (listed last).
             self.assertEqual(resolve({"device_names": ["da10"]}), "da10")
@@ -5849,7 +6030,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(slot0.vdev_name, "member-0")
             self.assertEqual(slot0.vdev_class, "data")
             self.assertIn("active on Node B", slot0.topology_label or "")
-            self.assertEqual(slot0.mapping_source, "api")
+            self.assertEqual(slot0.mapping_source, "api-slot")
             self.assertFalse(slot0.led_supported)
             self.assertIn("REST and CLI identify operations are being rejected", slot0.led_reason or "")
             slot12 = next(slot for slot in snapshot.slots if slot.slot == 12)

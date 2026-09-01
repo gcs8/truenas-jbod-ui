@@ -388,6 +388,13 @@ class DiskRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class DiskResolution:
+    disk: DiskRecord | None
+    source: str
+    stale_manual_mapping: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class CacheResult(Generic[CacheValueT]):
     value: CacheValueT
     cache_state: CacheState
@@ -3802,7 +3809,7 @@ class InventoryService:
             candidate = dict(slot_candidates.get(slot, {}))
             enclosure_id = selected_meta.get("id") or normalize_text(candidate.get("enclosure_id"))
             mapping = self.mapping_store.get_mapping(self.system.id, enclosure_id, slot)
-            disk = self._resolve_disk_for_slot(
+            resolution = self._resolve_disk_for_slot(
                 slot,
                 enclosure_id,
                 mapping,
@@ -3812,6 +3819,9 @@ class InventoryService:
                 candidate,
                 ssh_data,
             )
+            disk = resolution.disk
+            candidate["mapping_resolution_source"] = resolution.source
+            candidate["stale_manual_mapping"] = resolution.stale_manual_mapping
             bmc_disk = self._match_bmc_disk_by_serial(disk, bmc_disks_by_serial)
             if bmc_disk is not None:
                 self._apply_bmc_serial_match_to_raw_slot_status(candidate, bmc_disk, disk)
@@ -4144,7 +4154,7 @@ class InventoryService:
                     }
                 )
             mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
-            disk = self._resolve_disk_for_slot(
+            resolution = self._resolve_disk_for_slot(
                 slot,
                 selected_option.id,
                 mapping,
@@ -4154,6 +4164,13 @@ class InventoryService:
                 raw_slot_status,
                 ssh_data,
             )
+            disk = resolution.disk
+            raw_slot_status["mapping_resolution_source"] = (
+                resolution.source
+                if resolution.source != "unknown"
+                else normalize_text(raw_slot_status.get("mapping_resolution_source")) or "unknown"
+            )
+            raw_slot_status["stale_manual_mapping"] = resolution.stale_manual_mapping
             slot_view = self._build_slot_view(
                 slot=slot,
                 row_index=row_index,
@@ -4336,8 +4353,12 @@ class InventoryService:
                     }
                 )
             mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            resolution = DiskResolution(
+                disk=disk,
+                source="storcli-slot" if disk is not None else "unknown",
+            )
             if mapping and disk is None:
-                disk = self._resolve_disk_for_slot(
+                resolution = self._resolve_disk_for_slot(
                     slot,
                     selected_option.id,
                     mapping,
@@ -4347,6 +4368,9 @@ class InventoryService:
                     raw_slot_status,
                     ssh_data,
                 )
+                disk = resolution.disk
+            raw_slot_status["mapping_resolution_source"] = resolution.source
+            raw_slot_status["stale_manual_mapping"] = resolution.stale_manual_mapping
             slot_view = self._build_slot_view(
                 slot=slot,
                 row_index=row_index,
@@ -4444,8 +4468,12 @@ class InventoryService:
             if disk is not None:
                 self._apply_bmc_drive_to_raw_slot_status(raw_slot_status, disk)
             mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            resolution = DiskResolution(
+                disk=disk,
+                source="bmc-slot" if disk is not None else "unknown",
+            )
             if mapping and disk is None:
-                disk = self._resolve_disk_for_slot(
+                resolution = self._resolve_disk_for_slot(
                     slot,
                     selected_option.id,
                     mapping,
@@ -4455,6 +4483,9 @@ class InventoryService:
                     raw_slot_status,
                     empty_ssh,
                 )
+                disk = resolution.disk
+            raw_slot_status["mapping_resolution_source"] = resolution.source
+            raw_slot_status["stale_manual_mapping"] = resolution.stale_manual_mapping
             slot_view = self._build_slot_view(
                 slot=slot,
                 row_index=row_index,
@@ -4586,7 +4617,7 @@ class InventoryService:
         for slot in slots_to_render:
             candidate = dict(slot_candidates.get(slot, {}))
             mapping = self.mapping_store.get_mapping(self.system.id, mapping_enclosure_id, slot)
-            disk = self._resolve_disk_for_slot(
+            resolution = self._resolve_disk_for_slot(
                 slot,
                 mapping_enclosure_id,
                 mapping,
@@ -4596,6 +4627,9 @@ class InventoryService:
                 candidate,
                 ssh_data,
             )
+            disk = resolution.disk
+            candidate["mapping_resolution_source"] = resolution.source
+            candidate["stale_manual_mapping"] = resolution.stale_manual_mapping
             bmc_disk = self._match_bmc_disk_by_serial(disk, bmc_disks_by_serial)
             if bmc_disk is not None:
                 self._apply_bmc_serial_match_to_raw_slot_status(candidate, bmc_disk, disk)
@@ -4692,7 +4726,7 @@ class InventoryService:
                 "enclosure_name": selected_option.name,
             }
             self._merge_quantastor_ses_candidate(slot_hints, ses_candidate)
-            disk = self._resolve_disk_for_slot(
+            resolution = self._resolve_disk_for_slot(
                 slot,
                 selected_option.id,
                 mapping,
@@ -4702,6 +4736,9 @@ class InventoryService:
                 slot_hints,
                 empty_ssh,
             )
+            disk = resolution.disk
+            slot_hints["mapping_resolution_source"] = resolution.source
+            slot_hints["stale_manual_mapping"] = resolution.stale_manual_mapping
             raw_slot_status = {
                 "present": disk is not None,
                 "status": disk.health if disk else "Empty",
@@ -4718,6 +4755,8 @@ class InventoryService:
                 "disk_raw": disk.raw if disk else None,
             }
             self._merge_quantastor_ses_candidate(raw_slot_status, ses_candidate)
+            raw_slot_status["mapping_resolution_source"] = resolution.source
+            raw_slot_status["stale_manual_mapping"] = resolution.stale_manual_mapping
             bmc_disk = self._match_bmc_disk_by_serial(disk, bmc_disks_by_serial)
             if bmc_disk is not None:
                 self._apply_bmc_serial_match_to_raw_slot_status(raw_slot_status, bmc_disk, disk)
@@ -8081,6 +8120,7 @@ class InventoryService:
                 "status": status,
                 "value": status,
                 "present": present,
+                "mapping_resolution_source": "ubntstorage",
                 "device_names": device_names,
                 "device_hint": device_names[0] if device_names else None,
                 "serial_hint": normalize_text(entry.get("serial")),
@@ -9161,7 +9201,14 @@ class InventoryService:
         disks_by_sas: dict[str, DiskRecord],
         raw_slot_status: dict[str, Any],
         ssh_data: ParsedSSHData,
-    ) -> DiskRecord | None:
+    ) -> DiskResolution:
+        if self._slot_has_live_empty_evidence(raw_slot_status):
+            return DiskResolution(
+                disk=None,
+                source="ses-empty",
+                stale_manual_mapping=mapping is not None,
+            )
+
         if mapping:
             for candidate in (mapping.serial, mapping.gptid, mapping.device_name):
                 if not candidate:
@@ -9169,70 +9216,96 @@ class InventoryService:
                 for key in normalize_lookup_keys(candidate):
                     disk = disks_by_key.get(key)
                     if disk:
-                        return disk
+                        return DiskResolution(disk=disk, source=mapping.source or "manual")
 
         sas_address_hint = normalize_hex_identifier(raw_slot_status.get("sas_address_hint"))
-        raw_present = raw_slot_status.get("present") if isinstance(raw_slot_status.get("present"), bool) else None
-        sas_device_type = normalize_text(raw_slot_status.get("sas_device_type"))
-        quantastor_ses_empty = (
-            self.system.truenas.platform == "quantastor"
-            and (
-                normalize_text(raw_slot_status.get("ses_device"))
-                or (isinstance(raw_slot_status.get("ses_targets"), list) and raw_slot_status.get("ses_targets"))
-            )
-            and (
-                raw_present is False
-                or sas_address_hint == "0"
-                or (sas_device_type and "no sas device attached" in sas_device_type.lower())
-            )
-        )
-
         if self.system.truenas.platform == "quantastor" and sas_address_hint and sas_address_hint != "0":
             hinted = disks_by_sas.get(sas_address_hint)
             if hinted:
-                return hinted
+                return DiskResolution(disk=hinted, source="sas-address")
 
-        if not quantastor_ses_empty:
-            direct = disks_by_slot.get((enclosure_id, slot))
-            if direct:
-                return direct
+        direct = disks_by_slot.get((enclosure_id, slot)) if enclosure_id is not None else None
+        if direct:
+            return DiskResolution(disk=direct, source="api-slot")
 
         for candidate in raw_slot_status.get("device_names", []) or []:
             normalized = normalize_device_name(candidate)
             if normalized:
                 hinted = disks_by_key.get(normalized.lower())
                 if hinted:
-                    return hinted
+                    device_source = normalize_text(raw_slot_status.get("device_names_source"))
+                    source = "enclosure-sysfs" if device_source == "enclosure_sysfs" else "device-name"
+                    return DiskResolution(disk=hinted, source=source)
 
         # The bare (None, slot) bucket is last-writer-wins across every
         # enclosure on the system (TrueNAS disk.query carries no enclosure id
         # the extractor recognises), so it may only break ties after the SES
         # device name observed in this bay has had its say (issue #164).
-        if not quantastor_ses_empty:
-            direct = disks_by_slot.get((None, slot))
-            if direct:
-                return direct
+        direct = disks_by_slot.get((None, slot))
+        if direct:
+            return DiskResolution(disk=direct, source="api-slot-fallback")
 
-        for candidate in (
-            raw_slot_status.get("device_hint"),
-            raw_slot_status.get("serial_hint"),
-            raw_slot_status.get("gptid_hint"),
+        for source, candidate in (
+            ("device-hint", raw_slot_status.get("device_hint")),
+            ("serial-hint", raw_slot_status.get("serial_hint")),
+            ("gptid-hint", raw_slot_status.get("gptid_hint")),
         ):
             for key in normalize_lookup_keys(str(candidate) if candidate is not None else None):
                 hinted = disks_by_key.get(key)
                 if hinted:
-                    return hinted
+                    return DiskResolution(disk=hinted, source=source)
 
         if sas_address_hint:
             hinted = disks_by_sas.get(sas_address_hint)
             if hinted:
-                return hinted
+                return DiskResolution(disk=hinted, source="sas-address")
 
         ssh_device_hint = ssh_data.ses_slot_to_device.get(slot)
         if ssh_device_hint:
-            return disks_by_key.get(ssh_device_hint.lower())
+            hinted = disks_by_key.get(ssh_device_hint.lower())
+            if hinted:
+                return DiskResolution(disk=hinted, source="ses-slot-map")
 
-        return None
+        return DiskResolution(disk=None, source="unknown")
+
+    @staticmethod
+    def _slot_has_live_empty_evidence(raw_slot_status: dict[str, Any]) -> bool:
+        if bool(raw_slot_status.get("presence_conflict")):
+            return False
+        presence_source = normalize_text(raw_slot_status.get("presence_source"))
+        has_ses_evidence = bool(
+            presence_source in {
+                "sesutil_show",
+                "sg_ses_ec",
+                "sesutil_map",
+                "sg_ses_aes",
+                "sg_ses_join",
+            }
+            or normalize_text(raw_slot_status.get("ses_device"))
+            or (
+                isinstance(raw_slot_status.get("ses_targets"), list)
+                and raw_slot_status.get("ses_targets")
+            )
+        )
+        if not has_ses_evidence:
+            return False
+        raw_present = (
+            raw_slot_status.get("present")
+            if isinstance(raw_slot_status.get("present"), bool)
+            else None
+        )
+        if presence_source and raw_present is not None:
+            return raw_present is False
+        sas_address_hint = normalize_hex_identifier(raw_slot_status.get("sas_address_hint"))
+        sas_device_type = normalize_text(raw_slot_status.get("sas_device_type"))
+        return bool(
+            raw_present is False
+            or sas_address_hint == "0"
+            or (
+                sas_device_type
+                and "no sas device attached" in sas_device_type.lower()
+            )
+        )
 
     def _build_slot_view(
         self,
@@ -9246,7 +9319,11 @@ class InventoryService:
         ssh_data: ParsedSSHData,
         api_topology_members: dict[str, Any],
         api_enclosure_ids: set[str],
+        resolution_source: str | None = None,
+        stale_manual_mapping: bool = False,
     ) -> SlotView:
+        resolution_source = resolution_source or normalize_text(raw_slot_status.get("mapping_resolution_source"))
+        stale_manual_mapping = stale_manual_mapping or raw_slot_status.get("stale_manual_mapping") is True
         device_names = raw_slot_status.get("device_names", []) if isinstance(raw_slot_status.get("device_names"), list) else []
         fallback_device = next(
             (normalized for normalized in (normalize_device_name(item) for item in device_names) if normalized),
@@ -9332,19 +9409,23 @@ class InventoryService:
         else:
             state = SlotState.unknown
 
+        identity_mapping = None if stale_manual_mapping else mapping
         serial = disk.serial if disk else normalize_text(raw_slot_status.get("serial_hint"))
-        if not serial and mapping:
-            serial = mapping.serial
+        if not serial and identity_mapping:
+            serial = identity_mapping.serial
         size_bytes = disk.size_bytes if disk else None
         size_human = format_bytes(size_bytes) or normalize_text(raw_slot_status.get("reported_size"))
         notes = mapping.notes if mapping else None
+        if stale_manual_mapping:
+            stale_note = "Stale manual mapping: live SES evidence reports this bay empty."
+            notes = f"{notes}\n{stale_note}" if notes else stale_note
         persistent_id, persistent_id_label = resolve_persistent_id(
             gptid,
             raw_slot_status.get("gptid_hint"),
             disk.identifier if disk else None,
             zpool.raw_path if zpool else None,
             zpool.raw_name if zpool else None,
-            mapping.gptid if mapping else None,
+            identity_mapping.gptid if identity_mapping else None,
         )
         enclosure_id = enclosure_meta.get("id") or normalize_text(raw_slot_status.get("enclosure_id"))
         ses_device = normalize_text(raw_slot_status.get("ses_device"))
@@ -9473,6 +9554,9 @@ class InventoryService:
             else None
         )
         enriched_raw_status = dict(raw_slot_status)
+        if stale_manual_mapping:
+            enriched_raw_status["stale_manual_mapping"] = True
+            enriched_raw_status["stale_manual_mapping_source"] = mapping.source if mapping else "manual"
         if linux_block_summary:
             enriched_raw_status["linux_blockdevice"] = linux_block_summary
             enriched_raw_status["linux_transport"] = linux_block_summary.get("tran")
@@ -9545,8 +9629,10 @@ class InventoryService:
             ssh_ses_element_id=ses_element_id,
             ssh_ses_targets=ses_targets,
             mapping_source=(
-                mapping.source
-                if mapping
+                resolution_source
+                if resolution_source
+                else mapping.source
+                if mapping and disk
                 else "ssh"
                 if ses_device or self.system.truenas.platform in {"linux", "esxi"}
                 else "bmc"
