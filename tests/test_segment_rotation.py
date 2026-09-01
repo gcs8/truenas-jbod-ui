@@ -21,7 +21,7 @@ from history_service.config import HistorySettings
 from history_service.segment_catalog import activation_pending_path
 from history_service.segment_reader import SegmentedHistoryReader
 from history_service.store import SCHEMA, HistoryStore
-from history_service.system_backup import HISTORY_DB_KEY, SystemBackupService
+from history_service.system_backup import HISTORY_DB_KEY, SystemBackupService, _ImportActivationTransaction
 
 
 class SimulatedRotationCrash(BaseException):
@@ -1533,6 +1533,118 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                         "generation-1-sealed",
                     ],
                 )
+            finally:
+                artifact.cleanup()
+
+    def test_hot_sidecar_guard_refuses_each_sqlite_sidecar_and_accepts_a_clean_hot_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            hot_path = Path(temporary_directory) / "history.db"
+            hot_path.write_bytes(b"")
+
+            _ImportActivationTransaction._require_no_hot_sidecars(hot_path)
+
+            for suffix in ("-wal", "-shm", "-journal"):
+                sidecar = Path(f"{hot_path}{suffix}")
+                sidecar.write_bytes(b"stale")
+                try:
+                    with self.assertRaisesRegex(ValueError, "sidecar"):
+                        _ImportActivationTransaction._require_no_hot_sidecars(hot_path)
+                finally:
+                    sidecar.unlink()
+
+            _ImportActivationTransaction._require_no_hot_sidecars(hot_path)
+
+    def test_schema_v2_restore_refuses_a_hot_database_with_live_sidecars(self) -> None:
+        # The v2 restore is a plain file replace. A live WAL left next to the
+        # restored hot file would be replayed over it by the next connection,
+        # and blindly unlinking it would strip the parked original of frames a
+        # rollback needs. The restore must refuse before touching anything
+        # (issue #175).
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_generation_0001(source, segments_directory)
+            self._append_event(source, "generation-2-sealed", "2025-01-02T12:00:00+00:00")
+            self._append_event(source, "generation-2-hot", "2025-01-03T12:00:00+00:00")
+            backup_directory, backup_status_path = self._create_full_backup_evidence(root)
+            rotation = self._rotation_module()
+            rotation.rotate_segmented_history(
+                source=source,
+                segments_directory=segments_directory,
+                cutoff="2025-01-03T00:00:00+00:00",
+                key_id="generation-key-2",
+                scheduled_backup_directory=backup_directory,
+                scheduled_backup_status_path=backup_status_path,
+                apply=True,
+            )
+            catalog_path = segments_directory / "catalog.json"
+            source_settings = HistorySettings(
+                sqlite_path=str(source),
+                segment_catalog_path=str(catalog_path),
+                backup_dir=str(root / "backups"),
+                startup_grace_seconds=0,
+            )
+            source_service = SystemBackupService(
+                source_settings,
+                HistoryStore(
+                    str(source),
+                    recover_unreadable_database=False,
+                    segment_catalog_path=catalog_path,
+                ),
+            )
+
+            artifact = source_service.export_bundle_to_file(
+                encrypt=False,
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+            try:
+                target_root = root / "import-target"
+                target_root.mkdir()
+                target_source = target_root / "history.db"
+                with sqlite3.connect(target_source) as connection:
+                    connection.executescript(SCHEMA)
+                target_catalog = target_root / "segments" / "catalog.json"
+                target_settings = HistorySettings(
+                    sqlite_path=str(target_source),
+                    segment_catalog_path=str(target_catalog),
+                    backup_dir=str(target_root / "backups"),
+                    startup_grace_seconds=0,
+                )
+                target_store = HistoryStore(
+                    str(target_source),
+                    recover_unreadable_database=False,
+                    segment_catalog_path=target_catalog,
+                )
+                target_service = SystemBackupService(target_settings, target_store)
+                original_bytes = target_source.read_bytes()
+                stale_wal = Path(f"{target_source}-wal")
+                stale_shm = Path(f"{target_source}-shm")
+                stale_wal.write_bytes(b"stale-wal")
+                stale_shm.write_bytes(b"stale-shm")
+
+                with self.assertRaisesRegex(ValueError, "sidecar"):
+                    target_service.import_bundle(artifact.path.read_bytes())
+
+                self.assertEqual(target_source.read_bytes(), original_bytes)
+                self.assertEqual(stale_wal.read_bytes(), b"stale-wal")
+                self.assertEqual(stale_shm.read_bytes(), b"stale-shm")
+                self.assertFalse(target_catalog.exists())
+                self.assertFalse(activation_pending_path(target_source).exists())
+                self.assertEqual(
+                    sorted(path.name for path in target_root.iterdir()),
+                    ["history.db", "history.db-shm", "history.db-wal"],
+                )
+
+                stale_wal.unlink()
+                stale_shm.unlink()
+                result = target_service.import_bundle(artifact.path.read_bytes())
+
+                self.assertEqual(result["schema_version"], 2)
+                self.assertFalse(stale_wal.exists())
+                self.assertFalse(stale_shm.exists())
+                self.assertTrue((target_catalog.parent / "segment-0002.sqlite3").is_file())
             finally:
                 artifact.cleanup()
 

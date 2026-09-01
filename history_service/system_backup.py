@@ -45,6 +45,7 @@ from history_service.segment_catalog import (
     HISTORY_SEGMENT_GROUP_KEY,
     SEGMENTED_BACKUP_SCHEMA_VERSION,
     activation_pending_path,
+    path_entry_exists,
     validate_segmented_manifest,
 )
 from history_service.migration_lock import history_write_lock
@@ -437,12 +438,31 @@ class _ImportActivationTransaction:
             raise ValueError("Segmented history catalog target is not configured.")
         store._segment_reader_cache = None
         store._segment_reader_identity = None
+        # The v1 path restores through HistoryStore.restore_backup, which owns
+        # the live WAL/SHM. This path is a plain file replace: a live WAL next
+        # to the restored hot file would be replayed over it by the next
+        # connection, and unlinking it blindly would strip the parked original
+        # of frames a rollback needs. Refuse instead; the write lock held by
+        # import_bundle means any sidecar created after this check is a
+        # reader's empty WAL, which is safe to drop after publication.
+        self._require_no_hot_sidecars(store.file_path)
         self._activate_file(
             store.file_path,
             hot_member_key,
             allow_history=True,
         )
+        for suffix in ("-shm", "-wal"):
+            Path(f"{store.file_path}{suffix}").unlink(missing_ok=True)
         self.activate_directory(catalog_path.parent, segment_members)
+
+    @staticmethod
+    def _require_no_hot_sidecars(hot_path: Path) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            if path_entry_exists(Path(f"{hot_path}{suffix}")):
+                raise ValueError(
+                    "History database has SQLite sidecar state; stop the history service and "
+                    "let it checkpoint (or recover the pending journal) before a segmented restore."
+                )
 
     def activate_directory(
         self,
