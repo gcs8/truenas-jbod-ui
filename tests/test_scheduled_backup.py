@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 from history_service.scheduled_backup import (
     ScheduledBackupRunner,
     ScheduledBackupSettings,
+    read_scheduled_backup_status,
 )
 from history_service.system_backup import FileBackupArtifact
 
@@ -29,6 +30,7 @@ class ScheduledBackupSettingsTests(unittest.TestCase):
         self.assertEqual(settings.retention_count, 0)
         self.assertEqual(settings.included_groups, [])
         self.assertIsNone(settings.passphrase_file)
+        self.assertIsNone(settings.app_gid)
 
         admin_config = (Path(__file__).resolve().parents[1] / "admin_service/config.py").read_text(
             encoding="utf-8"
@@ -74,6 +76,15 @@ class ScheduledBackupSettingsTests(unittest.TestCase):
                 included_groups=["mapping_file", "mapping_file"],
                 passphrase_file="/run/backup-secrets/passphrase",
             )
+        with self.assertRaisesRegex(ValueError, "application group"):
+            ScheduledBackupSettings(
+                enabled=True,
+                destination_dir="/var/backups/jbod",
+                status_file="/var/lib/jbod-backup/status.json",
+                retention_count=7,
+                included_groups=["config_file", "mapping_file"],
+                passphrase_file="/run/backup-secrets/passphrase",
+            )
 
         settings = ScheduledBackupSettings(
             enabled=True,
@@ -82,8 +93,77 @@ class ScheduledBackupSettingsTests(unittest.TestCase):
             retention_count=7,
             included_groups=["config_file", "mapping_file"],
             passphrase_file="/run/backup-secrets/passphrase",
+            app_gid=10001,
         )
         self.assertTrue(settings.enabled)
+        self.assertEqual(settings.app_gid, 10001)
+
+
+class ScheduledBackupStatusReaderTests(unittest.TestCase):
+    @staticmethod
+    def _status() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "enabled": True,
+            "included_groups": ["config_file", "history_db"],
+            "success_count": 1,
+            "failure_count": 0,
+            "last_attempt_at": "2030-01-02T03:04:05+00:00",
+            "last_success_at": "2030-01-02T03:04:05+00:00",
+            "last_failure_at": None,
+            "last_size_bytes": 123,
+            "last_sha256": "a" * 64,
+            "last_artifact_name": "jbod-scheduled-backup-20300102T030405Z-00000001.7z",
+            "last_absent_groups": [],
+            "last_retention_removed": 0,
+            "last_error_code": None,
+        }
+
+    def test_reader_accepts_private_valid_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "scheduled-backup.json"
+            path.write_text(json.dumps(self._status()), encoding="utf-8")
+            path.chmod(0o600)
+
+            self.assertEqual(read_scheduled_backup_status(path), self._status())
+
+    def test_reader_rejects_success_without_complete_artifact_evidence(self) -> None:
+        invalid_updates = (
+            {"success_count": 0},
+            {"last_size_bytes": None},
+            {"last_size_bytes": 0},
+            {"last_sha256": None},
+            {"last_artifact_name": None},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "scheduled-backup.json"
+            for updates in invalid_updates:
+                with self.subTest(updates=updates):
+                    status = self._status()
+                    status.update(updates)
+                    path.write_text(json.dumps(status), encoding="utf-8")
+                    path.chmod(0o600)
+                    self.assertIsNone(read_scheduled_backup_status(path))
+
+    def test_reader_fails_closed_for_unsafe_or_unbounded_status_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "scheduled-backup.json"
+            path.write_text(json.dumps(self._status()), encoding="utf-8")
+            path.chmod(0o622)
+            self.assertIsNone(read_scheduled_backup_status(path))
+
+            path.unlink()
+            target = root / "actual.json"
+            target.write_text(json.dumps(self._status()), encoding="utf-8")
+            target.chmod(0o600)
+            path.symlink_to(target)
+            self.assertIsNone(read_scheduled_backup_status(path))
+
+            path.unlink()
+            path.write_bytes(b"{" + b" " * (64 * 1024))
+            path.chmod(0o600)
+            self.assertIsNone(read_scheduled_backup_status(path))
 
 
 class ScheduledBackupRunnerTests(unittest.TestCase):
@@ -92,6 +172,8 @@ class ScheduledBackupRunnerTests(unittest.TestCase):
         self.destination = self.temp_dir / "destination"
         self.status_dir = self.temp_dir / "status"
         self.status_file = self.status_dir / "scheduled-backup.json"
+        self.status_dir.mkdir(mode=0o2750)
+        self.status_dir.chmod(0o2750)
         self.passphrase_file = self.temp_dir / "passphrase"
         self.passphrase_file.write_text("correct horse battery staple\n", encoding="utf-8")
         self.passphrase_file.chmod(0o600)
@@ -124,6 +206,7 @@ class ScheduledBackupRunnerTests(unittest.TestCase):
             "passphrase_file": self.passphrase_file,
             "included_groups": ["config_file", "mapping_file", "profile_file"],
             "retention_count": 2,
+            "app_gid": self.status_dir.stat().st_gid,
             "clock": lambda: self.now,
         }
         payload.update(overrides)
@@ -168,7 +251,8 @@ class ScheduledBackupRunnerTests(unittest.TestCase):
         self.assertEqual(result["failure_count"], 0)
         persisted = json.loads(self.status_file.read_text(encoding="utf-8"))
         self.assertEqual(persisted, result)
-        self.assertEqual(stat.S_IMODE(self.status_file.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.status_file.stat().st_mode), 0o640)
+        self.assertEqual(self.status_file.stat().st_gid, self.status_dir.stat().st_gid)
         serialized = json.dumps(result, sort_keys=True)
         self.assertNotIn("correct horse battery staple", serialized)
         self.assertNotIn(str(self.passphrase_file), serialized)
@@ -232,10 +316,37 @@ class ScheduledBackupRunnerTests(unittest.TestCase):
         self.backup_service.export_scheduled_bundle_to_file.assert_not_called()
 
         self.destination.chmod(0o700)
-        self.status_dir.mkdir(mode=0o777)
         self.status_dir.chmod(0o777)
         with self.assertRaisesRegex(ValueError, "status directory"):
             self._runner().run_once()
+
+    def test_status_directory_must_be_shared_setgid_and_not_group_writable(self) -> None:
+        for unsafe_mode in (0o700, 0o750, 0o2770):
+            with self.subTest(mode=oct(unsafe_mode)):
+                self.status_dir.chmod(unsafe_mode)
+                with self.assertRaisesRegex(ValueError, "shared status directory"):
+                    self._runner().validate_configuration()
+
+        self.status_dir.chmod(0o2750)
+        self.assertEqual(
+            self._runner().validate_configuration(),
+            "correct horse battery staple",
+        )
+
+    def test_status_directory_requires_the_configured_application_gid(self) -> None:
+        metadata = os.stat_result((stat.S_IFDIR | 0o2750, 0, 0, 1, 2000, 2000, 0, 0, 0, 0))
+        with (
+            patch.object(Path, "lstat", return_value=metadata),
+            patch.object(Path, "is_symlink", return_value=False),
+            patch("history_service.scheduled_backup.os.geteuid", return_value=2000),
+            patch("history_service.scheduled_backup.os.getegid", return_value=2000),
+            patch("history_service.scheduled_backup.os.getgroups", return_value=[10001]),
+            self.assertRaisesRegex(ValueError, "application group"),
+        ):
+            ScheduledBackupRunner._ensure_shared_status_directory(
+                Path("/synthetic/status"),
+                app_gid=10001,
+            )
 
     def test_failure_writes_sanitized_durable_status_and_preserves_last_success(self) -> None:
         runner = self._runner()
@@ -262,7 +373,6 @@ class ScheduledBackupRunnerTests(unittest.TestCase):
         self.assertEqual(len(self._published_archives()), 1)
 
     def test_malformed_durable_status_fails_before_export_and_is_not_overwritten(self) -> None:
-        self.status_file.parent.mkdir(mode=0o700)
         malformed = b'{"schema_version":1,"success_count":"not-an-integer"}\n'
         self.status_file.write_bytes(malformed)
         self.status_file.chmod(0o600)
@@ -398,6 +508,7 @@ class ScheduledBackupDeploymentContractTests(unittest.TestCase):
             retention_count=1,
             included_groups=["history_db"],
             passphrase_file="/tmp/scheduled-passphrase",
+            app_gid=10001,
         )
         history_settings = MagicMock(
             sqlite_path="/tmp/hot.db",
@@ -427,7 +538,7 @@ class ScheduledBackupDeploymentContractTests(unittest.TestCase):
                 scheduled_backup_main,
                 "ScheduledBackupRunner",
                 return_value=runner,
-            ),
+            ) as runner_factory,
         ):
             self.assertEqual(scheduled_backup_main.main(), 0)
 
@@ -435,6 +546,7 @@ class ScheduledBackupDeploymentContractTests(unittest.TestCase):
             "/tmp/hot.db",
             segment_catalog_path="/tmp/segments/catalog.json",
         )
+        self.assertEqual(runner_factory.call_args.kwargs["app_gid"], 10001)
 
     def test_runner_module_has_no_network_server_or_docker_control_dependency(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "history_service/scheduled_backup_main.py").read_text(

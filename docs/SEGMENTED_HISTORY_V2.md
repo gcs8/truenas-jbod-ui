@@ -18,10 +18,11 @@ bind-mount the database file by itself. File mount points are rejected because
 they can create independent lock domains across containers or namespaces.
 
 The initial implementation uses one segment named `segment-0001.sqlite3` and a
-complete catalog named `generation-0001`. Future generation changes use
-`tombstones` and each replacement segment's `supersedes` list. A tombstone is
-valid only when it names an active replacement segment that declares the same
-superseded segment ID.
+complete catalog named `generation-0001`. The schema validates `tombstones` and
+each replacement segment's `supersedes` list, but v0.22.2 does not publish later
+generations automatically. A generation-2 writer still needs a crash-recovery
+journal covering new-segment publication, hot replacement, and catalog
+replacement. Do not infer that protocol from the schema alone.
 
 ## Bounds
 
@@ -200,6 +201,36 @@ The writable hot database continues to receive collector writes. Existing raw,
 event, hourly, and daily retention settings apply to hot data. Immutable
 segments are not edited by retention. Segment compaction or deletion requires a
 new complete generation with validated tombstones and `supersedes` metadata.
+
+In segmented mode, the collector does not call the legacy single-SQLite backup.
+Before it removes or rolls up hot rows, it requires the durable scheduled-backup
+status to prove a recent successful encrypted FULL backup that selected
+`history_db`. Configure both values in `.env`:
+
+```dotenv
+SCHEDULED_BACKUP_STATUS_FILE=/app/backup-status/scheduled-backup.json
+HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS=129600
+```
+
+The Compose history service mounts `backup-status` read-only. For the non-root
+overlay, set `APP_GID` to the numeric application group and prepare that host
+directory as the backup UID and that app GID with exact mode `2750`. The
+one-shot backup writer publishes status as `0640`, verifies that the directory
+and inherited file group equal the configured app GID, and refuses any other
+directory mode or ownership. The status file must be a regular, non-symlink
+file no larger than 64 KiB and must not be group-writable or world-writable. A
+successful record requires a positive success count, archive size, digest, and
+owned artifact name. Missing, unreadable, malformed, artifact-incomplete,
+stale, failed, or history-excluding status blocks retention. A status that
+selected `history_db` but reports it in `last_absent_groups` also blocks
+retention.
+
+The hot database persists each backup authorization as `ready`, `claimed`, or
+`consumed`. A successful bounded pass with `has_more` returns the authorization
+to `ready`; a failed pass is also retryable. A completed pass consumes it. A
+process crash leaves the claim fail-closed so the next pass requires a newer
+successful FULL backup. This durable state prevents a service restart from
+reusing an already consumed backup.
 
 Do not delete old segment files by hand. Do not edit `catalog.json` in place.
 

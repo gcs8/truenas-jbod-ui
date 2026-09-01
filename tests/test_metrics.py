@@ -375,6 +375,7 @@ class ScheduledBackupMetricsTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            status_file.chmod(0o600)
             with patch.dict(
                 "os.environ",
                 {

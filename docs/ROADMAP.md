@@ -1,8 +1,8 @@
 # Roadmap
 
-This file tracks the current intended release direction at the `v0.22.1`
-maintenance candidate. `v0.22.0` is the latest published release until the
-`v0.22.1` tag and GitHub release are published.
+This file tracks the current intended release direction at the `v0.22.2`
+maintenance candidate. `v0.22.1` is the latest published release until the
+v0.22.2 release gates pass.
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -22,10 +22,20 @@ remaining part of the active docs set.
 
 ## Current Snapshot
 
-`v0.22.0` closed the practical performance, deployment, CI, backup, and
-operator-trust cycle that followed `v0.21.2`. `v0.22.1` is a narrow backup
-restore patch that keeps large 7z history members file-backed through
-validation and transactional staging:
+`v0.22.1` closed the large file-backed history restore patch. `v0.22.2` carries
+the bounded long-horizon history architecture and its first lifecycle repair:
+
+- one writable hot SQLite database plus immutable digest-checked segments
+- segment-aware queries with explicit 32-segment and 5,000-row refusal bounds
+- recoverable v1-to-v2 migration and encrypted schema-v2 FULL backup/restore
+- segmented hot retention authorized only by a recent scheduled FULL backup
+  containing `history_db`
+- private `.env` staging during immutable deployment candidate validation
+
+The SATA/AES Linux enclosure mapping in issue #119 and draft PR #121 targets
+v0.22.3 unless real-shelf validation arrives before the v0.22.2 freeze. Automated
+generation-2 segment publication also remains v0.22.3 work because it needs a
+durable crash-recovery protocol for hot, segment, and catalog replacement.
 
 - runtime deployment can be pinned to an immutable GHCR digest with a private
   receipt, convergence checks, and rollback evidence
@@ -41,7 +51,7 @@ validation and transactional staging:
 - CI covers Python 3.12 and 3.14, container health, browser QA, public artifacts,
   Ruff, dependency checks, and CodeQL
 
-The next development lane begins only after the v0.22.1 image, development QA,
+The next development lane begins only after the v0.22.2 image, development QA,
 production deployment, and post-release reopen gates are complete. It should
 stay practical and incremental:
 

@@ -259,6 +259,27 @@ def merge_request_metrics(*metrics: RequestMetrics) -> RequestMetrics:
     )
 
 
+def build_mapping_import_confirmation(
+    bundle: dict[str, Any],
+    preview: dict[str, Any],
+) -> dict[str, Any]:
+    revision = preview.get("revision")
+    import_digest = preview.get("import_digest")
+    if (
+        not isinstance(revision, str)
+        or re.fullmatch(r"[0-9a-f]{64}", revision) is None
+        or not isinstance(import_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", import_digest) is None
+    ):
+        raise ValueError("Mapping import preview did not return valid confirmation digests.")
+    return {
+        "bundle": bundle,
+        "expected_revision": revision,
+        "import_digest": import_digest,
+        "confirmed": True,
+    }
+
+
 def run_timed(name: str, fn: Callable[[], RequestMetrics | None]) -> RunResult:
     started = time.perf_counter()
     metrics = fn() or RequestMetrics()
@@ -716,7 +737,13 @@ def main() -> int:
     def mappings_import_roundtrip() -> RequestMetrics:
         if mappings:
             return RequestMetrics()
-        return build_request_metrics(client.post_json_with_headers("/api/mappings/import", mapping_bundle))
+        preview = client.post_json_with_headers("/api/mappings/import/preview", mapping_bundle)
+        confirmation = build_mapping_import_confirmation(mapping_bundle, preview.data)
+        imported = client.post_json_with_headers("/api/mappings/import", confirmation)
+        return merge_request_metrics(
+            build_request_metrics(preview),
+            build_request_metrics(imported),
+        )
 
     workflows: list[tuple[str, Any]] = [
         ("inventory_force", inventory_force),
