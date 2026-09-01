@@ -45,7 +45,7 @@ validation and transactional staging:
 
 The post-v0.22.1 development lane is now open (segmented history #122 merged;
 rotation continues in #124, and the 2026-08-31 grooming audit backlog lives in
-issues #125-#151). It should stay practical and incremental:
+issues #125-#149). It should stay practical and incremental:
 
 - keep richer platform-native Storage Fabric enrichment in small validated
   slices
