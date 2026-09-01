@@ -4097,7 +4097,7 @@ class InventoryService:
         layout_columns = selected_profile.columns
         slot_positions = layout_slot_positions(layout_rows)
 
-        disk_records = self._build_linux_disk_records(ssh_data)
+        disk_records = self._build_linux_disk_records(ssh_data, warnings=warnings)
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
         for disk in disk_records:
@@ -8457,7 +8457,12 @@ class InventoryService:
                 return match
         return None
 
-    def _build_linux_disk_records(self, ssh_data: ParsedSSHData) -> list[DiskRecord]:
+    def _build_linux_disk_records(
+        self,
+        ssh_data: ParsedSSHData,
+        *,
+        warnings: list[str] | None = None,
+    ) -> list[DiskRecord]:
         controllers: dict[str, dict[str, Any]] = {}
         ubntstorage_by_node: dict[str, dict[str, Any]] = {}
         supports_boot_media = self._supports_linux_boot_media_inventory()
@@ -8563,15 +8568,24 @@ class InventoryService:
                     controller["identifier"] = namespace_identifier
 
         generic_records: list[DiskRecord] = []
+        skipped_unrecognized: list[str] = []
         for blockdevice in ssh_data.linux_blockdevices:
             device_name = normalize_device_name(blockdevice.get("name"))
             if not device_name or extract_nvme_controller_name(device_name):
                 continue
-            is_boot_media = supports_boot_media and self._is_linux_boot_media_device_name(device_name)
-            if not re.match(r"^(sd|hd|vd|xvd)[a-z]+$", device_name) and not is_boot_media:
-                continue
             device_type = normalize_text(blockdevice.get("type"))
             if device_type and device_type.lower() != "disk":
+                continue
+            if re.fullmatch(r"mmcblk\d+(?:boot\d+|rpmb)", device_name):
+                continue
+            is_boot_media = supports_boot_media and self._is_linux_boot_media_device_name(device_name)
+            is_supported_disk = bool(
+                re.fullmatch(r"(?:sd|hd|vd|xvd)[a-z]+", device_name)
+                or re.fullmatch(r"mmcblk\d+", device_name)
+                or re.fullmatch(r"dasd[a-z]+", device_name)
+            )
+            if not is_supported_disk and not is_boot_media:
+                skipped_unrecognized.append(device_name)
                 continue
             vendor_entry = ubntstorage_by_node.get(device_name.lower())
 
@@ -8643,6 +8657,15 @@ class InventoryService:
                     smart_devices=[device_name],
                     lookup_keys=lookup_keys,
                 )
+            )
+
+        if warnings is not None and skipped_unrecognized:
+            names = sorted(set(skipped_unrecognized), key=str.casefold)
+            visible_names = names[:8]
+            remainder = len(names) - len(visible_names)
+            suffix = f" (+{remainder} more)" if remainder else ""
+            warnings.append(
+                f"Skipped unrecognized Linux block devices: {', '.join(visible_names)}{suffix}."
             )
 
         records: list[DiskRecord] = []
