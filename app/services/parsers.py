@@ -11,6 +11,7 @@ from app.services.profile_registry import (
     DELL_MD1280_PROFILE_ID,
     SCALE_SSG_FRONT_24_PROFILE_ID,
     SCALE_SSG_REAR_12_PROFILE_ID,
+    dell_md1280_drawer_slot_layout,
 )
 
 
@@ -1441,25 +1442,17 @@ def _infer_scale_enclosure_profile(
         # Dell EN-8435A enclosure module = MD1280, the Xyratex 5U84 platform
         # (issue #119). Two pull-out drawers of 3x14; SES element index is the
         # 0-based bay number and chassis labels are 1-based. Verified against
-        # the Dell owner's manual: slots 1-42 live in drawer 0, which the
-        # minimum-population rule ("one full, front row in the top drive
-        # drawer" = fill group 1, slots 1-14) places as the physical TOP
-        # drawer, numbered left to right across the front row and then front
-        # to rear. Rendered per the top-loader convention: back row first,
-        # front row at the drawer-pull edge, drawer 0 above drawer 1.
+        # the Dell owner's manual: slots 1-42 live in drawer 0 (the physical
+        # top drawer per the minimum-population rule), and the profile renders
+        # both drawers side by side exactly like the manual's Figure 11 —
+        # drawer 0 left, drawer 1 right, a gap column between, bay numbers
+        # running down each front/middle/back column.
         return (
             DELL_MD1280_PROFILE_ID,
             "Dell MD1280 84 Bay",
-            6,
             14,
-            [
-                list(range(28, 42)),
-                list(range(14, 28)),
-                list(range(0, 14)),
-                list(range(70, 84)),
-                list(range(56, 70)),
-                list(range(42, 56)),
-            ],
+            7,
+            dell_md1280_drawer_slot_layout(),
         )
     if slot_count == 60:
         return None, "60 Bay Shelf", 4, 15, None

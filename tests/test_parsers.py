@@ -1752,15 +1752,17 @@ Additional element status diagnostic page:
 
         self.assertEqual(parsed.profile_id, DELL_MD1280_PROFILE_ID)
         self.assertEqual(parsed.enclosure_label, "Dell MD1280 84 Bay")
-        self.assertEqual(parsed.layout_rows, 6)
-        self.assertEqual(parsed.layout_columns, 14)
+        self.assertEqual(parsed.layout_rows, 14)
+        self.assertEqual(parsed.layout_columns, 7)
         assert parsed.slot_layout is not None
-        self.assertEqual(len(parsed.slot_layout), 6)
-        # Per-drawer top-loader convention: back row first, front row at the
-        # drawer-pull edge; drawer 0 (chassis slots 1-42) above drawer 1.
-        self.assertEqual(parsed.slot_layout[0], list(range(28, 42)))
-        self.assertEqual(parsed.slot_layout[2], list(range(0, 14)))
-        self.assertEqual(parsed.slot_layout[3], list(range(70, 84)))
-        self.assertEqual(parsed.slot_layout[5], list(range(42, 56)))
-        flattened = sorted(slot for row in parsed.slot_layout for slot in row)
+        self.assertEqual(len(parsed.slot_layout), 14)
+        # Side-by-side drawers per the Dell manual's Figure 11: drawer 0
+        # (chassis bays 1-42) as three columns on the left, a gap column,
+        # drawer 1 (43-84) on the right; bay numbers run down each column.
+        self.assertEqual(parsed.slot_layout[0], [0, 14, 28, None, 42, 56, 70])
+        self.assertEqual(parsed.slot_layout[13], [13, 27, 41, None, 55, 69, 83])
+        flattened = sorted(
+            slot for row in parsed.slot_layout for slot in row if slot is not None
+        )
         self.assertEqual(flattened, list(range(84)))
+        self.assertTrue(all(row[3] is None for row in parsed.slot_layout))

@@ -224,6 +224,11 @@ class EnclosureProfileConfig(BaseModel):
     slot_layout: list[list[int | None]] | None = None
     row_groups: list[int] = Field(default_factory=list)
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
+    # Optional per-profile bay-label base. Some chassis silk-screens are
+    # 1-based while their SES device slot numbers are 0-based (the Dell
+    # MD1280 manual: "The physical enclosure enumerates hard drives starting
+    # from 1" while secli/SES start at 0). None inherits layout.slot_number_base.
+    slot_number_base: int | None = None
 
     @field_validator("bay_size", mode="before")
     @classmethod

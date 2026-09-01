@@ -64,6 +64,21 @@ def default_slot_layout(rows: int, columns: int, slot_count: int) -> list[list[i
     ]
 
 
+def dell_md1280_drawer_slot_layout() -> list[list[int | None]]:
+    """
+    Side-by-side drawer view matching the Dell owner's manual Figure 11:
+    drawer 0 (chassis slots 1-42, the physical top drawer) as three columns on
+    the left, a gap column, drawer 1 (43-84) as three columns on the right.
+    Within each drawer the columns run front/middle/back left to right and the
+    fourteen bay numbers run top to bottom, exactly as the manual draws them.
+    """
+
+    return [
+        [row, 14 + row, 28 + row, None, 42 + row, 56 + row, 70 + row]
+        for row in range(14)
+    ]
+
+
 def _built_in_profiles() -> list[EnclosureProfileConfig]:
     return [
         EnclosureProfileConfig(
@@ -91,27 +106,22 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             label="Dell MD1280 84 Bay",
             eyebrow="TrueNAS SCALE / Dell MD1280 (Xyratex 5U84) Drawer View",
             summary=(
-                "Two pull-out drawers of 42 bays each (3 rows by 14 columns), numbered "
-                "front-to-back and left-to-right per the Dell owner's manual; slot "
-                "mapping comes from the Linux enclosure driver because this shelf's "
-                "AES pages cannot identify SATA drives per bay."
+                "Both pull-out drawers side by side as in the Dell owner's manual: "
+                "drawer 0 (bays 1-42, the top drawer) on the left, drawer 1 (43-84) "
+                "on the right, each three columns of fourteen bays numbered down the "
+                "front, middle, and back rows. Bay labels match the 1-based chassis "
+                "silk-screen; slot mapping comes from the Linux enclosure driver "
+                "because this shelf's AES pages cannot identify SATA drives per bay."
             ),
-            panel_title="Drawers Top",
-            edge_label="Drawer fronts / pull edge",
+            panel_title="Drawers 0 + 1 (Top View)",
+            edge_label="Drawer pull direction / chassis front",
             face_style="top-loader",
-            latch_edge="bottom",
+            latch_edge="left",
             bay_size="3.5",
-            rows=6,
-            columns=14,
-            slot_layout=[
-                list(range(28, 42)),
-                list(range(14, 28)),
-                list(range(0, 14)),
-                list(range(70, 84)),
-                list(range(56, 70)),
-                list(range(42, 56)),
-            ],
-            row_groups=[3, 3],
+            rows=14,
+            columns=7,
+            slot_layout=dell_md1280_drawer_slot_layout(),
+            slot_number_base=1,
         ),
         EnclosureProfileConfig(
             id=SCALE_SSG_FRONT_24_PROFILE_ID,
@@ -455,6 +465,7 @@ def _profile_to_view(profile: EnclosureProfileConfig) -> EnclosureProfileView:
         slot_layout=slot_layout,
         row_groups=list(profile.row_groups),
         slot_hints={int(slot): list(hints) for slot, hints in (profile.slot_hints or {}).items()},
+        slot_number_base=profile.slot_number_base,
     )
 
 

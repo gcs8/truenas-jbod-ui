@@ -4430,6 +4430,11 @@ class InventoryService:
         )
         selected_meta = self._merge_enclosure_meta(self._enclosure_option_meta(selected_option), api_selected_meta)
         selected_meta = self._merge_enclosure_meta(selected_meta, ssh_meta)
+        if selected_profile is not None and selected_profile.slot_number_base is not None:
+            # Chassis such as the Dell MD1280 silk-screen their bays 1-based
+            # while SES device slot numbers stay 0-based; the profile carries
+            # the label base so the rendered bay numbers match the metal.
+            selected_meta["slot_number_base"] = selected_profile.slot_number_base
         slot_candidates = merge_slot_candidate_maps(ssh_candidates, api_candidates)
         api_topology_members = parse_pool_query_topology(raw_data.pools)
         api_enclosure_ids: set[str] = set()
@@ -9257,9 +9262,13 @@ class InventoryService:
             )
             enriched_raw_status["transport_address"] = linux_scsi_summary.get("transport_address")
 
+        label_base = enclosure_meta.get("slot_number_base")
+        if not isinstance(label_base, int):
+            label_base = self.settings.layout.slot_number_base
+
         return SlotView(
             slot=slot,
-            slot_label=f"{slot + self.settings.layout.slot_number_base:02d}",
+            slot_label=f"{slot + label_base:02d}",
             row_index=row_index,
             column_index=column_index,
             enclosure_id=enclosure_id,
@@ -9327,7 +9336,7 @@ class InventoryService:
                 filter(
                     None,
                     [
-                        f"{slot + self.settings.layout.slot_number_base:02d}",
+                        f"{slot + label_base:02d}",
                         device_name or "",
                         multipath.device_name if multipath else "",
                         " ".join(member.device_name for member in multipath.members) if multipath else "",
