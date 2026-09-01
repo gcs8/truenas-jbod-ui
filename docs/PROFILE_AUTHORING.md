@@ -237,6 +237,7 @@ The selection order is:
 ## Current Built-In Profiles
 
 - `supermicro-cse-946-top-60`
+- `dell-md1280-drawer-84` (lands with PR #157)
 - `supermicro-ssg-6048r-front-24`
 - `supermicro-ssg-6048r-rear-12`
 - `supermicro-sys-2029gp-tr-right-nvme-2`

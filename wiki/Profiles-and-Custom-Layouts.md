@@ -27,8 +27,8 @@ If you want the runtime selector mental model, use:
 
 ## Built-In Profiles Right Now
 
-Seventeen built-in profiles ship today: the validated hardware profiles
-(Supermicro CSE-946 60-bay, SSG-6048R front/rear, SYS-2029GP NVMe carrier,
+Eighteen built-in profiles ship today: the validated hardware profiles
+(Supermicro CSE-946 60-bay, Dell MD1280 drawer 84-bay, SSG-6048R front/rear, SYS-2029GP NVMe carrier,
 SSG-2028R shared front, AOC-SLG4-2H8M2 carrier, FatTwin front/rear, UniFi
 UNVR and UNVR Pro) plus seven `generic-*` geometry-first profiles from 12 to
 106 bays. The authoritative, always-current list with IDs and layouts lives in
