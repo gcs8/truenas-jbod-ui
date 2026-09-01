@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from app import __version__
 from admin_service.config import AdminSettings
+from admin_service.services.esxi_host_prep import MAX_UPLOAD_BYTES
 from admin_service.main import app as admin_app
 from admin_service.main import annotate_runtime_versions
 from admin_service.main import build_admin_state_payload
@@ -152,6 +153,41 @@ class BackupImportRequestLimitTests(unittest.TestCase):
         finally:
             archive_path.unlink(missing_ok=True)
             archive_path.parent.rmdir()
+
+    def test_cancelled_body_stream_cleans_private_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "cancelled-request"
+            workspace.mkdir()
+            receive_count = 0
+
+            async def receive() -> dict[str, object]:
+                nonlocal receive_count
+                receive_count += 1
+                if receive_count == 1:
+                    return {"type": "http.request", "body": b"abc", "more_body": True}
+                raise asyncio.CancelledError()
+
+            request = Request(
+                {
+                    "type": "http",
+                    "http_version": "1.1",
+                    "method": "POST",
+                    "scheme": "http",
+                    "path": "/api/admin/backup/import",
+                    "raw_path": b"/api/admin/backup/import",
+                    "query_string": b"",
+                    "headers": [(b"host", b"admin.example.test")],
+                    "client": ("127.0.0.1", 12345),
+                    "server": ("admin.example.test", 80),
+                },
+                receive,
+            )
+
+            with patch("admin_service.main.tempfile.mkdtemp", return_value=str(workspace)):
+                with self.assertRaises(asyncio.CancelledError):
+                    asyncio.run(stream_limited_request_body_to_file(request, max_bytes=4))
+
+            self.assertFalse(workspace.exists())
 
 
 class MainAppBoundaryTests(unittest.TestCase):
@@ -2610,8 +2646,11 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
     def test_esxi_host_prep_upload_route_stages_raw_body_and_returns_packages(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/upload")
-        request = MagicMock()
-        request.body = AsyncMock(return_value=b"storcli-bytes")
+        request, receive_probe = make_streaming_request(
+            [b"storcli-", b"bytes"],
+            content_length=len(b"storcli-bytes"),
+        )
+        request.body = AsyncMock(side_effect=AssertionError("request.body() must not be used"))
         host_prep_service = MagicMock()
         host_prep_service.stage_package.return_value = {
             "token": "storcli-1",
@@ -2619,8 +2658,13 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         }
         host_prep_service.list_staged_packages.return_value = [host_prep_service.stage_package.return_value]
 
-        with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
-            response = asyncio.run(route.endpoint(request=request, filename="BCM-vmware-storcli64.zip"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "host-prep-upload"
+            workspace.mkdir()
+            with patch("admin_service.main.tempfile.mkdtemp", return_value=str(workspace)):
+                with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+                    response = asyncio.run(route.endpoint(request=request, filename="BCM-vmware-storcli64.zip"))
+            self.assertFalse(workspace.exists())
 
         payload = json.loads(response.body.decode("utf-8"))
 
@@ -2628,7 +2672,37 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["package"]["token"], "storcli-1")
         self.assertEqual(payload["packages"][0]["filename"], "BCM-vmware-storcli64.zip")
+        self.assertEqual(receive_probe.call_count, 2)
+        request.body.assert_not_called()
         host_prep_service.stage_package.assert_called_once_with("BCM-vmware-storcli64.zip", b"storcli-bytes")
+
+    def test_esxi_host_prep_upload_rejects_declared_oversize_without_reading_stream(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/upload")
+        request, receive_probe = make_streaming_request(
+            [b"ignored"],
+            content_length=MAX_UPLOAD_BYTES + 1,
+        )
+        host_prep_service = MagicMock()
+        host_prep_service.stage_package.return_value = {
+            "token": "should-not-stage",
+            "filename": "BCM-vmware-storcli64.zip",
+        }
+        host_prep_service.list_staged_packages.return_value = []
+
+        with patch("admin_service.main.tempfile.mkdtemp") as make_workspace:
+            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service) as get_service:
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(route.endpoint(request=request, filename="BCM-vmware-storcli64.zip"))
+
+        self.assertEqual(raised.exception.status_code, 413)
+        self.assertEqual(
+            raised.exception.detail,
+            "ESXi host-prep upload request body is too large.",
+        )
+        receive_probe.assert_not_called()
+        make_workspace.assert_not_called()
+        get_service.assert_not_called()
+        host_prep_service.stage_package.assert_not_called()
 
     def test_esxi_host_prep_install_route_returns_install_status_payload(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/install")
