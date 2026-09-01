@@ -50,6 +50,7 @@ Optional fields:
   - `top-loader`
   - `front-drive`
   - `rear-drive`
+  - `drawer` (plain top-down tray field with no service-bay art)
 - `latch_edge`: tray-release edge used for visual polish:
   - `bottom`
   - `right`
