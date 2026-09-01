@@ -1274,15 +1274,17 @@ class AdminStatePayloadTests(unittest.TestCase):
         request.scope["router"] = admin_app.router
         rendered = admin_templates.get_template("index.html").render(
             request=request,
-            admin_bootstrap={
-                "ok": True,
-                "systems": [
-                    {
-                        "id": "script-breakout",
-                        "label": "</script><script>window.__admin_xss = true;</script>",
-                    }
-                ],
-            },
+            admin_bootstrap_json=json.dumps(
+                {
+                    "ok": True,
+                    "systems": [
+                        {
+                            "id": "script-breakout",
+                            "label": "</script><script>window.__admin_xss = true;</script>",
+                        }
+                    ],
+                }
+            ),
         )
 
         self.assertIn("\\u003c/script\\u003e", rendered)
