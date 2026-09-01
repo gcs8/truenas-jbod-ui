@@ -4652,6 +4652,54 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(best_host, "192.0.2.50")
             self.assertEqual(failures, ["TrueNAS SCALE SSH SES EC page probe failed."])
 
+    async def test_sg_ses_planned_discovery_respects_optional_ssh_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            probe = SSHProbe(system.ssh)
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                probe,
+                temp_dir,
+            )
+
+            async def fail_startup(commands: list[str]) -> list[SSHCommandResult]:
+                return [
+                    SSHCommandResult(
+                        command=command,
+                        ok=False,
+                        stderr="Error reading SSH protocol banner",
+                        exit_code=255,
+                    )
+                    for command in commands
+                ]
+
+            probe.run_commands = AsyncMock(side_effect=fail_startup)  # type: ignore[method-assign]
+            probe.run_planned_commands = AsyncMock(  # type: ignore[method-assign]
+                side_effect=AssertionError("SG-SES planner must not start during host backoff")
+            )
+
+            first = await service._run_ssh_commands(["first"], "10.0.0.10")
+            devices, overlay, failures = await service._discover_and_fetch_sg_ses_host_overlay(
+                "10.0.0.10",
+                failure_prefix="Quantastor SSH SES",
+            )
+
+            self.assertEqual(probe.run_commands.await_count, 1)
+            self.assertEqual(probe.run_planned_commands.await_count, 0)
+            self.assertIn("Error reading SSH protocol banner", first[0].stderr)
+            self.assertEqual(devices, [])
+            self.assertEqual(overlay.ses_enclosures, [])
+            self.assertEqual(len(failures), 1)
+            self.assertIn("recent connection startup failure", failures[0])
+
     async def test_sg_ses_discovery_and_page_probes_share_one_planned_session(self) -> None:
         class RecordingSSHProbe(SSHProbe):
             def __init__(self, config: SSHConfig) -> None:
