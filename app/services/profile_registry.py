@@ -6,6 +6,7 @@ from app.config import EnclosureProfileConfig, Settings, SystemConfig, normalize
 from app.models.domain import EnclosureOption, EnclosureProfileView
 
 CORE_CSE_946_PROFILE_ID = "supermicro-cse-946-top-60"
+DELL_MD1280_PROFILE_ID = "dell-md1280-drawer-84"
 SCALE_SSG_FRONT_24_PROFILE_ID = "supermicro-ssg-6048r-front-24"
 SCALE_SSG_REAR_12_PROFILE_ID = "supermicro-ssg-6048r-rear-12"
 LINUX_GPU_SERVER_NVME_PROFILE_ID = "supermicro-sys-2029gp-tr-right-nvme-2"
@@ -84,6 +85,33 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
                 list(range(0, 15)),
             ],
             row_groups=[6, 6, 3],
+        ),
+        EnclosureProfileConfig(
+            id=DELL_MD1280_PROFILE_ID,
+            label="Dell MD1280 84 Bay",
+            eyebrow="TrueNAS SCALE / Dell MD1280 (Xyratex 5U84) Drawer View",
+            summary=(
+                "Two pull-out drawers of 42 bays each (3 rows by 14 columns), numbered "
+                "front-to-back and left-to-right per the Dell owner's manual; slot "
+                "mapping comes from the Linux enclosure driver because this shelf's "
+                "AES pages cannot identify SATA drives per bay."
+            ),
+            panel_title="Drawers Top",
+            edge_label="Drawer fronts / pull edge",
+            face_style="top-loader",
+            latch_edge="bottom",
+            bay_size="3.5",
+            rows=6,
+            columns=14,
+            slot_layout=[
+                list(range(28, 42)),
+                list(range(14, 28)),
+                list(range(0, 14)),
+                list(range(70, 84)),
+                list(range(56, 70)),
+                list(range(42, 56)),
+            ],
+            row_groups=[3, 3],
         ),
         EnclosureProfileConfig(
             id=SCALE_SSG_FRONT_24_PROFILE_ID,

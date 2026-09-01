@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.services.profile_registry import (
+    DELL_MD1280_PROFILE_ID,
     SCALE_SSG_FRONT_24_PROFILE_ID,
     SCALE_SSG_REAR_12_PROFILE_ID,
 )
@@ -1434,6 +1435,26 @@ def _infer_scale_enclosure_profile(
                 [2, 5, 8, 11],
                 [1, 4, 7, 10],
                 [0, 3, 6, 9],
+            ],
+        )
+    if "en-8435" in name:
+        # Dell EN-8435A enclosure module = MD1280, the Xyratex 5U84 platform
+        # (issue #119). Two pull-out drawers of 3x14; SES element index is the
+        # 0-based bay number and chassis labels are 1-based. Row order per
+        # drawer follows the top-loader convention: back row rendered first,
+        # front row at the drawer-pull edge.
+        return (
+            DELL_MD1280_PROFILE_ID,
+            "Dell MD1280 84 Bay",
+            6,
+            14,
+            [
+                list(range(28, 42)),
+                list(range(14, 28)),
+                list(range(0, 14)),
+                list(range(70, 84)),
+                list(range(56, 70)),
+                list(range(42, 56)),
             ],
         )
     if slot_count == 60:

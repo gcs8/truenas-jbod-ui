@@ -1716,3 +1716,51 @@ class AtaSelfTestLifetimeTests(unittest.TestCase):
 
         self.assertEqual(summary["last_test_lifetime_hours"], 43104)
         self.assertEqual(summary["last_test_age_hours"], 6)
+
+
+class DellMd1280ProfileInferenceTests(unittest.TestCase):
+    def test_en8435_enclosure_name_infers_md1280_drawer_profile(self) -> None:
+        output = """
+  DELL      EN-8435A-E6EBD    3535
+  Primary enclosure logical identifier (hex): 5eeeeeee00000084
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 0
+        phy index: 0
+          SAS device type: no SAS device attached
+          target port for: SATA_device
+          attached SAS address: 0x5eeeeeee00000001
+          SAS address: 0x5eeeeeee00000002
+      Element index: 1  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 1
+        phy index: 0
+          SAS device type: no SAS device attached
+          target port for: SATA_device
+          attached SAS address: 0x5eeeeeee00000001
+          SAS address: 0x5eeeeeee00000003
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg1")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        from app.services.profile_registry import DELL_MD1280_PROFILE_ID
+
+        self.assertEqual(parsed.profile_id, DELL_MD1280_PROFILE_ID)
+        self.assertEqual(parsed.enclosure_label, "Dell MD1280 84 Bay")
+        self.assertEqual(parsed.layout_rows, 6)
+        self.assertEqual(parsed.layout_columns, 14)
+        assert parsed.slot_layout is not None
+        self.assertEqual(len(parsed.slot_layout), 6)
+        # Per-drawer top-loader convention: back row first, front row at the
+        # drawer-pull edge; drawer 0 (chassis slots 1-42) above drawer 1.
+        self.assertEqual(parsed.slot_layout[0], list(range(28, 42)))
+        self.assertEqual(parsed.slot_layout[2], list(range(0, 14)))
+        self.assertEqual(parsed.slot_layout[3], list(range(70, 84)))
+        self.assertEqual(parsed.slot_layout[5], list(range(42, 56)))
+        flattened = sorted(slot for row in parsed.slot_layout for slot in row)
+        self.assertEqual(flattened, list(range(84)))
