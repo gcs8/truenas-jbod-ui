@@ -559,7 +559,11 @@ def create_app() -> FastAPI:
             )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        service.invalidate_snapshot_cache(reason="route.set_slot_led", cache_keys=[enclosure_id, None])
+        service.invalidate_physical_enclosure_snapshot_cache(
+            reason="route.set_slot_led",
+            enclosure_id=enclosure_id,
+            invalidate_source_bundle=True,
+        )
         snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": True, "snapshot": snapshot.model_dump(mode="json")})
 
@@ -626,6 +630,7 @@ def create_app() -> FastAPI:
             )
 
         led_warning = None
+        led_changed = False
         if payload.clear_identify_after_save:
             try:
                 await service.set_slot_led(
@@ -634,13 +639,15 @@ def create_app() -> FastAPI:
                     selected_enclosure_id=enclosure_id,
                     invalidate_snapshot=False,
                 )
+                led_changed = True
             except Exception as exc:  # noqa: BLE001 - surface as non-fatal warning.
                 logger.warning("Failed to clear identify LED after saving slot %s mapping: %s", slot, exc)
                 led_warning = "Saved mapping, but failed to clear the identify LED; see application logs."
 
-        service.invalidate_snapshot_cache(
+        service.invalidate_physical_enclosure_snapshot_cache(
             reason="route.save_mapping",
-            cache_keys=[mapping.enclosure_id, None],
+            enclosure_id=mapping.enclosure_id,
+            invalidate_source_bundle=led_changed,
         )
         snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
         return JSONResponse(
@@ -681,7 +688,10 @@ def create_app() -> FastAPI:
                 },
             )
         if cleared:
-            service.invalidate_snapshot_cache(reason="route.clear_mapping", cache_keys=[enclosure_id, None])
+            service.invalidate_physical_enclosure_snapshot_cache(
+                reason="route.clear_mapping",
+                enclosure_id=enclosure_id,
+            )
         snapshot = await service.get_snapshot(force_refresh=cleared, selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": cleared, "snapshot": snapshot.model_dump(mode="json")})
 

@@ -5094,6 +5094,43 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(list(service._smart_cache.values()), [summary_b])
             self.assertEqual(len(service._smart_cache_until), 1)
 
+    async def test_physical_enclosure_invalidation_removes_whole_and_sub_view_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="scale-cache", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            snapshot = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+            expiry = datetime.now(timezone.utc) + timedelta(seconds=30)
+            matching_keys = {
+                "enc-a",
+                "enc-a::dell-md1280-top-drawer",
+                "enc-a::dell-md1280-bottom-drawer",
+                "__default__",
+            }
+            unrelated_key = "enc-b::dell-md1280-top-drawer"
+            for cache_key in matching_keys | {unrelated_key}:
+                service._cache[cache_key] = snapshot
+                service._cache_until[cache_key] = expiry
+
+            matching_smart_keys = {
+                (system.id, "scale", cache_key, 0, ())
+                for cache_key in matching_keys
+            }
+            unrelated_smart_key = (system.id, "scale", unrelated_key, 0, ())
+            for smart_key in matching_smart_keys | {unrelated_smart_key}:
+                service._smart_cache[smart_key] = SmartSummaryView(available=True)
+                service._smart_cache_until[smart_key] = expiry
+
+            service.invalidate_physical_enclosure_snapshot_cache(
+                reason="test.physical.scope",
+                enclosure_id="enc-a::dell-md1280-top-drawer",
+            )
+
+            self.assertEqual(set(service._cache), {unrelated_key})
+            self.assertEqual(set(service._cache_until), {unrelated_key})
+            self.assertEqual(set(service._smart_cache), {unrelated_smart_key})
+            self.assertEqual(set(service._smart_cache_until), {unrelated_smart_key})
+
     async def test_scoped_invalidation_fences_stale_smart_refresh_without_stopping_other_enclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()

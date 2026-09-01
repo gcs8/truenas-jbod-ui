@@ -1361,6 +1361,37 @@ class InventoryService:
         add_perf_metadata(snapshot_cache_invalidated=reason)
         self._observe_inventory_cache_metrics()
 
+    def invalidate_physical_enclosure_snapshot_cache(
+        self,
+        *,
+        reason: str,
+        enclosure_id: str | None,
+        invalidate_source_bundle: bool = False,
+    ) -> None:
+        if not enclosure_id:
+            cache_keys: set[str | None] = {None}
+        else:
+            base_enclosure_id = self._base_enclosure_id(enclosure_id)
+            known_enclosure_keys = (
+                set(self._cache)
+                | set(self._cache_until)
+                | set(self._smart_cache_enclosure_generations)
+                | {key[2] for key in self._smart_cache}
+                | {key[2] for key in self._smart_cache_until}
+                | {key[2] for key in self._smart_refresh_tasks}
+            )
+            cache_keys = {
+                key
+                for key in known_enclosure_keys
+                if key != "__default__" and self._base_enclosure_id(key) == base_enclosure_id
+            }
+            cache_keys.update({base_enclosure_id, enclosure_id, None})
+        self.invalidate_snapshot_cache(
+            reason=reason,
+            cache_keys=cache_keys,
+            invalidate_source_bundle=invalidate_source_bundle,
+        )
+
     def peek_cached_snapshot(self, *, selected_enclosure_id: str | None = None) -> InventorySnapshot | None:
         preferred_keys: list[str] = []
         if selected_enclosure_id:
@@ -2514,9 +2545,9 @@ class InventoryService:
                 or f"LED backend {slot_view.led_backend!r} is not supported for slot {slot:02d}."
             )
         if invalidate_snapshot:
-            self.invalidate_snapshot_cache(
+            self.invalidate_physical_enclosure_snapshot_cache(
                 reason="set_slot_led",
-                cache_keys=[slot_view.enclosure_id, None],
+                enclosure_id=slot_view.enclosure_id,
                 invalidate_source_bundle=True,
             )
 
@@ -2587,7 +2618,10 @@ class InventoryService:
         )
         saved = self.mapping_store.save_mapping(mapping, expected_revision=expected_revision)
         if invalidate_snapshot:
-            self.invalidate_snapshot_cache(reason="save_mapping", cache_keys=[enclosure_id, None])
+            self.invalidate_physical_enclosure_snapshot_cache(
+                reason="save_mapping",
+                enclosure_id=enclosure_id,
+            )
         return saved
 
     async def clear_mapping(
@@ -2608,7 +2642,10 @@ class InventoryService:
             expected_revision=expected_revision,
         )
         if cleared and invalidate_snapshot:
-            self.invalidate_snapshot_cache(reason="clear_mapping", cache_keys=[enclosure_id, None])
+            self.invalidate_physical_enclosure_snapshot_cache(
+                reason="clear_mapping",
+                enclosure_id=enclosure_id,
+            )
         return cleared
 
     async def get_slot_smart_summary(
