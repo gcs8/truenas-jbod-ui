@@ -329,15 +329,6 @@ def _annualize_bytes(
     return int(byte_count * 24 * 365 / power_on_hours)
 
 
-def _annualize_bytes_written(
-    bytes_written: int | None,
-    power_on_hours: int | None,
-    *,
-    minimum_hours: int = 24 * 30,
-) -> int | None:
-    return _annualize_bytes(bytes_written, power_on_hours, minimum_hours=minimum_hours)
-
-
 def _kelvin_to_celsius(value: Any) -> int | None:
     kelvin = _coerce_non_negative_int(value)
     if kelvin is None or kelvin == 0:
@@ -2265,7 +2256,7 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
     if endurance_remaining_percent is None and endurance_used_percent is not None:
         endurance_remaining_percent = max(0, 100 - endurance_used_percent)
     annualized_bytes_read = _annualize_bytes(bytes_read, power_on_hours)
-    annualized_bytes_written = _annualize_bytes_written(bytes_written, power_on_hours)
+    annualized_bytes_written = _annualize_bytes(bytes_written, power_on_hours)
     estimated_lifetime_bytes_written = (
         int(bytes_written * 100 / endurance_used_percent)
         if bytes_written is not None
@@ -2504,7 +2495,7 @@ def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
     media_errors = _coerce_non_negative_int(payload.get("media_errors"))
     unsafe_shutdowns = _coerce_non_negative_int(payload.get("unsafe_shutdowns"))
     annualized_bytes_read = _annualize_bytes(bytes_read, power_on_hours)
-    annualized_bytes_written = _annualize_bytes_written(bytes_written, power_on_hours)
+    annualized_bytes_written = _annualize_bytes(bytes_written, power_on_hours)
     estimated_lifetime_bytes_written = (
         int(bytes_written * 100 / endurance_used_percent)
         if bytes_written is not None
@@ -3255,14 +3246,6 @@ def _first_detail_value(payload: dict[str, Any], *keys: str) -> Any:
     return None
 
 
-def _storcli_int(value: Any) -> int | None:
-    return _coerce_int_like(value)
-
-
-def _storcli_temperature_c(value: Any) -> int | None:
-    return _coerce_int_like(value)
-
-
 def _collect_storcli_drive_details(response_data: dict[str, Any]) -> dict[str, dict[str, Any]]:
     details: dict[str, dict[str, Any]] = {}
     for key, value in response_data.items():
@@ -3330,13 +3313,13 @@ def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
         connected_port = normalize_text(
             str(_first_detail_value(detail, "Connected Port Number(path)", "Connected Port Number", "Port") or "")
         )
-        media_error_count = _storcli_int(
+        media_error_count = _coerce_int_like(
             _first_detail_value(detail, "Media Error Count", "Media Errors", "Media_Error_Count")
         )
-        other_error_count = _storcli_int(
+        other_error_count = _coerce_int_like(
             _first_detail_value(detail, "Other Error Count", "Other Errors", "Other_Error_Count")
         )
-        predictive_failure_count = _storcli_int(
+        predictive_failure_count = _coerce_int_like(
             _first_detail_value(detail, "Predictive Failure Count", "Predictive Failure", "Predictive_Failure_Count")
         )
         smart_alert = normalize_text(
@@ -3372,7 +3355,7 @@ def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
                 "model": normalize_text(str(row.get("Model") or _first_detail_value(detail, "Model Number") or "")),
                 "serial": serial,
                 "firmware": firmware,
-                "temperature_c": _storcli_temperature_c(
+                "temperature_c": _coerce_int_like(
                     _first_detail_value(detail, "Drive Temperature", "Temperature", "Drive Temperature(C)")
                 ),
                 "media_errors": media_error_count,
