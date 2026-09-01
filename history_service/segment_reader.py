@@ -101,9 +101,10 @@ class SegmentedHistoryReader:
         catalog_path: Path,
         max_segments_per_query: int = MAX_SEGMENTS_PER_QUERY,
         allow_pending_recovery: bool = False,
+        allow_pending_activation: bool = False,
     ) -> "SegmentedHistoryReader":
         marker_path = activation_pending_path(hot_path)
-        if path_entry_exists(marker_path):
+        if not allow_pending_activation and path_entry_exists(marker_path):
             raise ValueError("Segmented history activation is pending.")
         catalog_path = cls._require_regular_file(Path(catalog_path), label="segment catalog")
         if not allow_pending_recovery and path_entry_exists(catalog_path.parent / MIGRATION_PENDING_MARKER):
@@ -139,6 +140,7 @@ class SegmentedHistoryReader:
                 raise ValueError("Segmented history catalog is invalid.")
             segment_ids.add(segment_id)
             segment_path = cls._require_regular_file(catalog_path.parent / file_name, label="history segment")
+            cls._require_no_sqlite_sidecars(segment_path)
             size_bytes = entry.get("size_bytes")
             sha256 = entry.get("sha256")
             if (
@@ -175,7 +177,7 @@ class SegmentedHistoryReader:
             hot_path=hot_path,
             segment_paths=(),
             max_segments_per_query=max_segments_per_query,
-            activation_marker_path=marker_path,
+            activation_marker_path=None if allow_pending_activation else marker_path,
         )
         reader.segment_paths = tuple(segment.path for segment in catalog_segments)
         reader._catalog_segments = tuple(catalog_segments)
@@ -190,15 +192,16 @@ class SegmentedHistoryReader:
             raise ValueError(f"Segmented history {label} must be a regular file.")
         return path.absolute()
 
-    @staticmethod
     @contextmanager
     def _read_only_connection(
+        self,
         path: Path,
         *,
         expected_size_bytes: int | None = None,
         expected_sha256: str | None = None,
         immutable: bool = False,
     ) -> Iterator[sqlite3.Connection]:
+        self._require_activation_ready()
         if not immutable:
             connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
             try:
@@ -262,7 +265,18 @@ class SegmentedHistoryReader:
             raise ValueError("Segmented history query limit is invalid.")
         return limit
 
+    @staticmethod
+    def _require_no_sqlite_sidecars(path: Path) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            if path_entry_exists(Path(f"{path}{suffix}")):
+                raise ValueError("Segmented history immutable segment has SQLite sidecar state.")
+
+    def _require_activation_ready(self) -> None:
+        if self.activation_marker_path is not None and path_entry_exists(self.activation_marker_path):
+            raise ValueError("Segmented history activation is pending.")
+
     def _selected_segment_paths(self, *, since: str | None) -> tuple[Path, ...]:
+        self._require_activation_ready()
         if self._catalog_segments is None:
             return self.segment_paths
         since_timestamp = _parse_catalog_timestamp(since) if since is not None else None
@@ -279,12 +293,12 @@ class SegmentedHistoryReader:
 
     @contextmanager
     def _query_connection(self, path: Path) -> Iterator[sqlite3.Connection]:
-        if self.activation_marker_path is not None and path_entry_exists(self.activation_marker_path):
-            raise ValueError("Segmented history activation is pending.")
+        self._require_activation_ready()
         if path == self.hot_path:
             with self._read_only_connection(path) as connection:
                 yield connection
             return
+        self._require_no_sqlite_sidecars(path)
         catalog_segment = next(
             (
                 segment
