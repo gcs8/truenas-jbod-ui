@@ -50,6 +50,124 @@ asyncio.run(main())
   return outputPath;
 }
 
+function buildOfflineLegacyFaceSnapshotFixture(faceStyle) {
+  const supportedFaces = new Set(["generic", "front-drive", "rear-drive"]);
+  if (!supportedFaces.has(faceStyle)) {
+    throw new Error(`Unsupported synthetic legacy face: ${faceStyle}`);
+  }
+  const repoRoot = path.resolve(__dirname, "..");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `jbod-${faceStyle}-snapshot-`));
+  const outputPath = path.join(tempDir, `offline-${faceStyle}.html`);
+  const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
+  const script = `
+import asyncio
+import importlib.util
+import pathlib
+import sys
+
+from app.models.domain import EnclosureProfileView
+
+root = pathlib.Path.cwd()
+spec = importlib.util.spec_from_file_location("snapshot_export_fixtures", root / "tests" / "test_snapshot_export.py")
+module = importlib.util.module_from_spec(spec)
+assert spec is not None and spec.loader is not None
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+async def main():
+    face_style = sys.argv[2]
+    columns = 14
+    layout = [list(range(columns))]
+    profile = EnclosureProfileView(
+        id=f"synthetic-{face_style}-14",
+        label=f"Synthetic {face_style} 14-column face",
+        face_style=face_style,
+        latch_edge="bottom",
+        bay_size="3.5",
+        rows=1,
+        columns=columns,
+        slot_layout=layout,
+    )
+    slots = [
+        module.SlotView(
+            slot=slot_number,
+            slot_label=f"{slot_number:02}",
+            row_index=0,
+            column_index=slot_number,
+            enclosure_id="synthetic-enclosure",
+            enclosure_label="Synthetic Enclosure",
+            present=True,
+            state=module.SlotState.healthy,
+            device_name=f"disk{slot_number}",
+            serial=f"SYNTH{slot_number:04}",
+            model="Synthetic Disk",
+            size_human="1 TB",
+            pool_name="synthetic-pool",
+            vdev_name="synthetic-vdev",
+            health="ONLINE",
+        )
+        for slot_number in range(columns)
+    ]
+    snapshot = module.InventorySnapshot(
+        slots=slots,
+        layout_rows=layout,
+        layout_slot_count=columns,
+        layout_columns=columns,
+        refresh_interval_seconds=30,
+        selected_system_id="synthetic-system",
+        selected_system_label="Synthetic System",
+        selected_enclosure_id="synthetic-enclosure",
+        selected_enclosure_label="Synthetic Enclosure",
+        selected_profile=profile,
+        systems=[module.SystemOption(id="synthetic-system", label="Synthetic System", platform="linux")],
+        enclosures=[
+            module.EnclosureOption(
+                id="synthetic-enclosure",
+                label="Synthetic Enclosure",
+                profile_id=profile.id,
+                rows=profile.rows,
+                columns=profile.columns,
+                slot_count=columns,
+                slot_layout=layout,
+            )
+        ],
+        sources={
+            "api": module.SourceStatus(enabled=True, ok=True, message="Synthetic API fixture"),
+            "ssh": module.SourceStatus(enabled=False, ok=True, message="SSH disabled for synthetic fixture"),
+        },
+        summary=module.InventorySummary(
+            disk_count=columns,
+            pool_count=1,
+            enclosure_count=1,
+            mapped_slot_count=columns,
+            manual_mapping_count=0,
+            ssh_slot_hint_count=0,
+        ),
+    )
+    exporter = module.SnapshotExportService(module.Settings(), module.FakeHistoryBackend(), module.templates)
+    rendered = await exporter.build_enclosure_snapshot_html(
+        request=module.build_request(),
+        snapshot=snapshot,
+        smart_summary_cache={},
+        selected_slot=0,
+        history_window_hours=24,
+        history_panel_open=False,
+        io_chart_mode="total",
+    )
+    pathlib.Path(sys.argv[1]).write_text(rendered.html, encoding="utf-8")
+
+asyncio.run(main())
+`;
+  const result = spawnSync(python, ["-c", script, outputPath, faceStyle], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(`Offline ${faceStyle} snapshot fixture generation failed:\n${result.stdout}\n${result.stderr}`);
+  }
+  return outputPath;
+}
+
 function buildOfflineTopLoaderSnapshotFixture() {
   const repoRoot = path.resolve(__dirname, "..");
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-top-loader-snapshot-"));
@@ -349,6 +467,53 @@ test("offline snapshot exposes mapping health without color-only cues", async ({
   expect(consoleErrors).toEqual([]);
 });
 
+for (const faceStyle of ["generic", "front-drive", "rear-drive"]) {
+  test(`offline ${faceStyle} face keeps slot controls separate at narrow desktop widths`, async ({ page }) => {
+    const snapshotPath = buildOfflineLegacyFaceSnapshotFixture(faceStyle);
+    const consoleErrors = [];
+    page.on("console", (message) => {
+      if (message.type() === "error") {
+        consoleErrors.push(message.text());
+      }
+    });
+    await page.setViewportSize({ width: 820, height: 1000 });
+
+    await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+
+    const geometry = await page.locator("#chassis-shell").evaluate((shell) => {
+      const tiles = [...shell.querySelectorAll(".slot-tile")];
+      const populated = shell.querySelector('.slot-tile[data-slot="0"]');
+      const led = populated?.querySelector(".slot-status-led");
+      const number = populated?.querySelector(".slot-number");
+      if (!populated || !led || !number || tiles.length === 0) {
+        throw new Error("synthetic legacy fixture is missing slot geometry controls");
+      }
+      const ledRect = led.getBoundingClientRect();
+      const numberRect = number.getBoundingClientRect();
+      const overlapWidth = Math.max(0, Math.min(ledRect.right, numberRect.right) - Math.max(ledRect.left, numberRect.left));
+      const overlapHeight = Math.max(0, Math.min(ledRect.bottom, numberRect.bottom) - Math.max(ledRect.top, numberRect.top));
+      return {
+        faceStyle: shell.dataset.faceStyle,
+        shellOverflowX: getComputedStyle(shell).overflowX,
+        shellClientWidth: shell.clientWidth,
+        shellScrollWidth: shell.scrollWidth,
+        documentClientWidth: document.documentElement.clientWidth,
+        documentScrollWidth: document.documentElement.scrollWidth,
+        minTileWidth: Math.min(...tiles.map((tile) => tile.getBoundingClientRect().width)),
+        controlsOverlap: overlapWidth > 0 && overlapHeight > 0,
+      };
+    });
+
+    expect(geometry.faceStyle).toBe(faceStyle);
+    expect(geometry.shellOverflowX).toBe("auto");
+    expect(geometry.shellScrollWidth).toBeGreaterThan(geometry.shellClientWidth);
+    expect(geometry.documentScrollWidth).toBeLessThanOrEqual(geometry.documentClientWidth + 1);
+    expect(geometry.minTileWidth).toBeGreaterThanOrEqual(72);
+    expect(geometry.controlsOverlap).toBe(false);
+    expect(consoleErrors).toEqual([]);
+  });
+}
+
 test("offline top-loader snapshot keeps exported row geometry", async ({ page }) => {
   const snapshotPath = buildOfflineTopLoaderSnapshotFixture();
 
@@ -364,6 +529,42 @@ test("offline top-loader snapshot keeps exported row geometry", async ({ page })
   await expect(page.locator('#slot-grid .slot-tile[data-slot="57"]')).toBeVisible();
   await expect(page.locator("#detail-history-panel")).toBeVisible();
   await expect(page.locator("#history-metric-grid")).toContainText("Temperature");
+});
+
+test("offline top-loader keeps slot controls separate at narrow desktop widths", async ({ page }) => {
+  const snapshotPath = buildOfflineTopLoaderSnapshotFixture();
+  await page.setViewportSize({ width: 820, height: 1000 });
+
+  await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+
+  const geometry = await page.locator("#chassis-shell").evaluate((shell) => {
+    const tiles = [...shell.querySelectorAll(".slot-tile")];
+    const populated = shell.querySelector('.slot-tile[data-slot="57"]');
+    const led = populated?.querySelector(".slot-status-led");
+    const number = populated?.querySelector(".slot-number");
+    if (!populated || !led || !number || tiles.length === 0) {
+      throw new Error("top-loader fixture is missing slot geometry controls");
+    }
+    const ledRect = led.getBoundingClientRect();
+    const numberRect = number.getBoundingClientRect();
+    const overlapWidth = Math.max(0, Math.min(ledRect.right, numberRect.right) - Math.max(ledRect.left, numberRect.left));
+    const overlapHeight = Math.max(0, Math.min(ledRect.bottom, numberRect.bottom) - Math.max(ledRect.top, numberRect.top));
+    return {
+      shellOverflowX: getComputedStyle(shell).overflowX,
+      shellClientWidth: shell.clientWidth,
+      shellScrollWidth: shell.scrollWidth,
+      documentClientWidth: document.documentElement.clientWidth,
+      documentScrollWidth: document.documentElement.scrollWidth,
+      minTileWidth: Math.min(...tiles.map((tile) => tile.getBoundingClientRect().width)),
+      controlsOverlap: overlapWidth > 0 && overlapHeight > 0,
+    };
+  });
+
+  expect(geometry.shellOverflowX).toBe("auto");
+  expect(geometry.shellScrollWidth).toBeGreaterThan(geometry.shellClientWidth);
+  expect(geometry.documentScrollWidth).toBeLessThanOrEqual(geometry.documentClientWidth + 1);
+  expect(geometry.minTileWidth).toBeGreaterThanOrEqual(76);
+  expect(geometry.controlsOverlap).toBe(false);
 });
 
 test("offline snapshot can navigate preloaded storage views without a live backend", async ({ page }) => {

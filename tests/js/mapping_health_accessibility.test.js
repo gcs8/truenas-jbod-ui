@@ -45,6 +45,16 @@ function cssRule(selector) {
   return match[1];
 }
 
+function cssDeclarationsForSelector(selector) {
+  const declarations = [];
+  for (const match of STYLE.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selectors = match[1].split(",").map((value) => value.trim());
+    if (selectors.includes(selector)) declarations.push(match[2]);
+  }
+  assert.notEqual(declarations.length, 0, `missing CSS selector ${selector}`);
+  return declarations.join("\n");
+}
+
 test("mapping health separates matched empty unmatched and unknown bays", () => {
   const { summarizeMappingHealth } = loadFunctions(APP_SOURCE, ["summarizeMappingHealth"]);
   const result = summarizeMappingHealth([
@@ -201,6 +211,24 @@ test("drawer faces floor tray widths and own horizontal scrolling", () => {
 
   const group = cssRule('.chassis-shell[data-face-style="drawer"] .row-group');
   assert.match(group, /minmax\(72px,\s*1fr\)/);
+});
+
+test("legacy chassis faces floor slot widths and own horizontal scrolling", () => {
+  for (const [face, minimum] of Object.entries({
+    generic: "72px",
+    "front-drive": "72px",
+    "rear-drive": "72px",
+    "top-loader": "76px",
+  })) {
+    const shellSelector = `.chassis-shell[data-face-style="${face}"]`;
+    const shell = cssDeclarationsForSelector(shellSelector);
+    const group = cssDeclarationsForSelector(`${shellSelector} .row-group`);
+    assert.match(shell, /overflow-x:\s*auto;/);
+    assert.match(shell, new RegExp(`--slot-track-min-width:\\s*${escapeRegex(minimum)};`));
+    assert.match(group, /minmax\(var\(--slot-track-min-width\),\s*1fr\)/);
+  }
+
+  assert.match(cssRule(".enclosure-face"), /overflow-x:\s*hidden;/);
 });
 
 test("diagnostic evidence starts collapsed behind an operator summary", () => {
