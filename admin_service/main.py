@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import hmac
+import json
 import logging
 import os
 import shlex
@@ -38,6 +39,7 @@ from app.config import (
 )
 from app.logging_config import configure_service_logging
 from app.metrics import install_metrics, metrics_path
+from app.script_json import register_script_json_filters
 from app.models.domain import (
     DebugBundleExportRequest,
     DemoSystemRequest,
@@ -87,6 +89,7 @@ from history_service.system_backup import (
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+register_script_json_filters(templates.env)
 
 
 class TemporaryFileResponse(FileResponse):
@@ -515,7 +518,7 @@ def create_app() -> FastAPI:
             "index.html",
             {
                 "request": request,
-                "admin_bootstrap": bootstrap,
+                "admin_bootstrap_json": json.dumps(bootstrap),
             },
         )
 

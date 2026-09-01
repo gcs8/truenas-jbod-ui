@@ -1274,15 +1274,17 @@ class AdminStatePayloadTests(unittest.TestCase):
         request.scope["router"] = admin_app.router
         rendered = admin_templates.get_template("index.html").render(
             request=request,
-            admin_bootstrap={
-                "ok": True,
-                "systems": [
-                    {
-                        "id": "script-breakout",
-                        "label": "</script><script>window.__admin_xss = true;</script>",
-                    }
-                ],
-            },
+            admin_bootstrap_json=json.dumps(
+                {
+                    "ok": True,
+                    "systems": [
+                        {
+                            "id": "script-breakout",
+                            "label": "</script><script>window.__admin_xss = true;</script>",
+                        }
+                    ],
+                }
+            ),
         )
 
         self.assertIn("\\u003c/script\\u003e", rendered)
@@ -2939,3 +2941,33 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
         self.assertEqual(captured.exception.status_code, 400)
         client_factory.assert_not_called()
+
+
+class AdminBootstrapEmbeddingTests(unittest.TestCase):
+    def test_admin_bootstrap_payload_is_script_safe(self) -> None:
+        payload = {
+            "systems": [
+                {
+                    "id": "lab",
+                    "label": "</script><script>alert(1)</script>",
+                    "note": "line one" + chr(0x2028) + "line two <!-- not a comment",
+                }
+            ]
+        }
+
+        stub_request = SimpleNamespace(
+            url_for=lambda name, **path_params: f"/static/{path_params.get('path', '')}"
+        )
+        rendered = admin_templates.get_template("index.html").render(
+            request=stub_request,
+            admin_bootstrap_json=json.dumps(payload),
+        )
+
+        self.assertIn("window.ADMIN_BOOTSTRAP = {", rendered)
+        self.assertNotIn("</script><script>alert(1)", rendered)
+        self.assertNotIn(chr(0x2028), rendered)
+        self.assertNotIn("<!--", rendered)
+
+        start = rendered.index("window.ADMIN_BOOTSTRAP = ") + len("window.ADMIN_BOOTSTRAP = ")
+        end = rendered.index(";\n", start)
+        self.assertEqual(json.loads(rendered[start:end]), payload)
