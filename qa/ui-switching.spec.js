@@ -119,7 +119,7 @@ async function findSystemWithMultipleEnclosures(page) {
   let fallback = null;
 
   for (const systemId of candidates) {
-    if (systemId !== currentSystem) {
+    if ((await page.locator("#system-select").inputValue()) !== systemId) {
       await switchSystem(page, systemId);
     }
     const enclosures = await getSelectValues(page, "#enclosure-select");
@@ -130,6 +130,9 @@ async function findSystemWithMultipleEnclosures(page) {
     if (!fallback && enclosures.length > 1) {
       fallback = { systemId, enclosures };
     }
+  }
+  if (fallback && (await page.locator("#system-select").inputValue()) !== fallback.systemId) {
+    await switchSystem(page, fallback.systemId);
   }
   return fallback;
 }
