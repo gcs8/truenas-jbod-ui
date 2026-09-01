@@ -9122,7 +9122,7 @@ class InventoryService:
                 return hinted
 
         if not quantastor_ses_empty:
-            direct = disks_by_slot.get((enclosure_id, slot)) or disks_by_slot.get((None, slot))
+            direct = disks_by_slot.get((enclosure_id, slot))
             if direct:
                 return direct
 
@@ -9132,6 +9132,15 @@ class InventoryService:
                 hinted = disks_by_key.get(normalized.lower())
                 if hinted:
                     return hinted
+
+        # The bare (None, slot) bucket is last-writer-wins across every
+        # enclosure on the system (TrueNAS disk.query carries no enclosure id
+        # the extractor recognises), so it may only break ties after the SES
+        # device name observed in this bay has had its say (issue #164).
+        if not quantastor_ses_empty:
+            direct = disks_by_slot.get((None, slot))
+            if direct:
+                return direct
 
         for candidate in (
             raw_slot_status.get("device_hint"),
