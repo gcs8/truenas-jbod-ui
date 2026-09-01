@@ -25,7 +25,6 @@ from admin_service.main import build_admin_state_payload
 from admin_service.main import decode_optional_secret_header
 from admin_service.main import enrich_quantastor_nodes_from_ssh
 from admin_service.main import get_history_store
-from admin_service.main import read_limited_request_body
 from admin_service.main import stream_limited_request_body_to_file
 from admin_service.main import templates as admin_templates
 from app.config import (
@@ -126,7 +125,7 @@ class BackupImportRequestLimitTests(unittest.TestCase):
         request, receive_probe = make_streaming_request([b"ignored"], content_length=5)
 
         with self.assertRaises(HTTPException) as raised:
-            asyncio.run(read_limited_request_body(request, max_bytes=4))
+            asyncio.run(stream_limited_request_body_to_file(request, max_bytes=4))
 
         self.assertEqual(raised.exception.status_code, 413)
         receive_probe.assert_not_called()
@@ -135,7 +134,7 @@ class BackupImportRequestLimitTests(unittest.TestCase):
         request, receive_probe = make_streaming_request([b"abc", b"def"])
 
         with self.assertRaises(HTTPException) as raised:
-            asyncio.run(read_limited_request_body(request, max_bytes=4))
+            asyncio.run(stream_limited_request_body_to_file(request, max_bytes=4))
 
         self.assertEqual(raised.exception.status_code, 413)
         self.assertEqual(receive_probe.call_count, 2)
