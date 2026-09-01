@@ -3059,23 +3059,6 @@ class InventoryService:
             return ("/usr/local/sbin/smartctl", "/usr/sbin/smartctl")
         return ("/usr/sbin/smartctl", "/usr/local/sbin/smartctl")
 
-    async def _fetch_linux_nvme_enrichment_over_ssh(
-        self,
-        device_path: str,
-        host: str | None = None,
-    ) -> SmartSummaryView | None:
-        command_parsers = self._linux_nvme_enrichment_command_parsers(device_path)
-        if not command_parsers:
-            return None
-        results = {
-            result.command: result
-            for result in await self._run_ssh_commands(
-                [command for command, _parser in command_parsers],
-                host,
-            )
-        }
-        return self._parse_linux_nvme_enrichment_results(command_parsers, results)
-
     def _linux_nvme_enrichment_command_parsers(
         self,
         device_path: str,
@@ -6552,19 +6535,6 @@ class InventoryService:
     def _score_sg_ses_overlay(overlay: ParsedSSHData) -> int:
         return sum(len(enclosure.slots) for enclosure in overlay.ses_enclosures)
 
-    async def _discover_sg_ses_devices(self, host: str, *, failure_prefix: str) -> tuple[list[str], list[str]]:
-        device_discovery = await self._run_optional_ssh_command(self._build_sg_ses_discovery_command(), host)
-        if not device_discovery.ok:
-            detail = normalize_text(device_discovery.stderr) or normalize_text(device_discovery.stdout) or (
-                f"exit {device_discovery.exit_code}"
-            )
-            return [], [f"{failure_prefix} discovery failed on {host}: {detail}"]
-
-        devices = self._parse_sg_ses_discovery_devices(device_discovery.stdout)
-        if not devices:
-            return [], [f"{failure_prefix} discovery found no usable sg_ses devices on {host}."]
-        return devices, []
-
     async def _discover_and_fetch_sg_ses_host_overlay(
         self,
         host: str,
@@ -9645,12 +9615,6 @@ class InventoryService:
         if len(details) != 1:
             return None
         return next(iter(details)).rstrip(".")
-
-    async def _run_optional_ssh_command(self, command: str, host: str | None = None) -> SSHCommandResult:
-        results = await self._run_ssh_commands([command], host)
-        if results:
-            return results[0]
-        return SSHCommandResult(command=command, ok=False, stderr="SSH command result missing.", exit_code=255)
 
     @staticmethod
     def _is_ssh_connection_startup_failure(results: list[SSHCommandResult]) -> bool:

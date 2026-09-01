@@ -462,41 +462,6 @@ SAS_PHY_LOG_PARAMETERS = [
     {"code": "0x0004", "name": "PHY reset problem count"},
 ]
 
-SES_ELEMENT_TYPE_LABELS = {
-    0x00: "Unspecified",
-    0x01: "Device slot",
-    0x02: "Power supply",
-    0x03: "Cooling",
-    0x04: "Temperature sensor",
-    0x05: "Door",
-    0x06: "Audible alarm",
-    0x07: "Enclosure services controller electronics",
-    0x08: "SCC controller electronics",
-    0x09: "Nonvolatile cache",
-    0x0B: "Uninterruptible power supply",
-    0x0C: "Display",
-    0x0D: "Key pad entry",
-    0x0E: "Enclosure",
-    0x0F: "SCSI port/transceiver",
-    0x10: "Language",
-    0x11: "Communication port",
-    0x12: "Voltage sensor",
-    0x13: "Current sensor",
-    0x14: "SCSI target port",
-    0x15: "SCSI initiator port",
-    0x17: "Array device slot",
-    0x18: "SAS expander",
-    0x19: "SAS connector",
-}
-
-AES_CONCEPTS = {
-    "descriptor": "Additional Element Status descriptors attach element-specific identity.",
-    "array_device_slot": "Array device AES can carry SAS address, phy, and bay-index hints.",
-    "expander": "Expander AES can connect element identity to the SAS fabric.",
-    "connector": "Connector AES can describe external/internal cable attachment points.",
-}
-
-
 def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
     match = re.search(
         r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>[0-9a-fA-F ]+)",

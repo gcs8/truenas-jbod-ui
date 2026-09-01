@@ -29,6 +29,7 @@ def main() -> int:
         assert settings.destination_dir is not None
         assert settings.status_file is not None
         assert settings.passphrase_file is not None
+        assert settings.app_gid is not None
         history_settings = get_history_settings()
         backup_service = SystemBackupService(
             history_settings,
@@ -44,6 +45,7 @@ def main() -> int:
             passphrase_file=settings.passphrase_file,
             included_groups=settings.included_groups,
             retention_count=settings.retention_count,
+            app_gid=settings.app_gid,
         )
         result = runner.run_once()
         logger.info(

@@ -405,11 +405,16 @@ class _ImportActivationTransaction:
         try:
             os.close(file_descriptor)
             shutil.copyfile(staged_path, temp_path)
+            file_owner = self._existing_owner(
+                target_path if entry.kind == "file" else target_path.parent,
+                directory=entry.kind != "file",
+            )
             file_mode = (
                 target_path.stat(follow_symlinks=False).st_mode & 0o7777
                 if entry.kind == "file"
                 else self._MISSING_FILE_MODE
             )
+            self._apply_owner(temp_path, file_owner)
             temp_path.chmod(file_mode)
             self._fsync_file(temp_path)
             self._park_original(entry)
@@ -454,7 +459,12 @@ class _ImportActivationTransaction:
             )
         )
         self._sibling_artifacts.add(staged_dir)
+        root_owner = self._existing_owner(
+            existing_directory or target_dir.parent,
+            directory=True,
+        )
         root_mode = self._existing_mode(existing_directory, directory=True)
+        self._apply_owner(staged_dir, root_owner)
         staged_dir.chmod(root_mode or self._MISSING_DIRECTORY_MODE)
         try:
             for member_key, relative_path in members:
@@ -470,6 +480,13 @@ class _ImportActivationTransaction:
                         if existing_directory is not None
                         else None
                     )
+                    parent_owner = self._existing_owner(existing_parent, directory=True)
+                    if parent_owner is None:
+                        parent_owner = self._existing_owner(
+                            staged_parent.parent,
+                            directory=True,
+                        )
+                    self._apply_owner(staged_parent, parent_owner)
                     staged_parent.chmod(
                         self._existing_mode(existing_parent, directory=True)
                         or self._MISSING_DIRECTORY_MODE
@@ -480,6 +497,13 @@ class _ImportActivationTransaction:
                     if existing_directory is not None
                     else None
                 )
+                target_owner = self._existing_owner(existing_target, directory=False)
+                if target_owner is None:
+                    target_owner = self._existing_owner(
+                        staged_target.parent,
+                        directory=True,
+                    )
+                self._apply_owner(staged_target, target_owner)
                 staged_target.chmod(
                     self._existing_mode(existing_target, directory=False)
                     or self._MISSING_FILE_MODE
@@ -678,6 +702,7 @@ class _ImportActivationTransaction:
         self._fsync_directory(entry.target_path.parent)
 
     def _ensure_parent_hierarchy(self, parent_path: Path) -> None:
+        self._reject_symlinked_hierarchy(parent_path)
         missing: list[Path] = []
         cursor = parent_path
         while not self._path_exists(cursor):
@@ -687,10 +712,24 @@ class _ImportActivationTransaction:
             cursor = cursor.parent
         for directory in reversed(missing):
             directory.mkdir()
-            directory.chmod(self._MISSING_DIRECTORY_MODE)
             self._created_parents.append(directory)
+            self._apply_owner(
+                directory,
+                self._existing_owner(directory.parent, directory=True),
+            )
+            directory.chmod(self._MISSING_DIRECTORY_MODE)
             self._fsync_directory(directory)
             self._fsync_directory(directory.parent)
+
+    @staticmethod
+    def _reject_symlinked_hierarchy(path: Path) -> None:
+        cursor = path
+        while True:
+            if cursor.is_symlink():
+                raise ValueError("Import target parent hierarchy must not contain symlinks.")
+            if cursor == cursor.parent:
+                return
+            cursor = cursor.parent
 
     def _remove_created_parent_hierarchy(self) -> list[tuple[str, Exception]]:
         failures: list[tuple[str, Exception]] = []
@@ -748,6 +787,22 @@ class _ImportActivationTransaction:
         if not directory and not path.is_file():
             return None
         return path.stat(follow_symlinks=False).st_mode & 0o7777
+
+    @staticmethod
+    def _existing_owner(path: Path | None, *, directory: bool) -> tuple[int, int] | None:
+        if path is None or path.is_symlink():
+            return None
+        if directory and not path.is_dir():
+            return None
+        if not directory and not path.is_file():
+            return None
+        metadata = path.stat(follow_symlinks=False)
+        return int(metadata.st_uid), int(metadata.st_gid)
+
+    @staticmethod
+    def _apply_owner(path: Path, owner: tuple[int, int] | None) -> None:
+        if owner is not None:
+            os.chown(path, owner[0], owner[1], follow_symlinks=False)
 
     @staticmethod
     def _journal_key(target_path: Path) -> str:
@@ -2196,13 +2251,6 @@ class SystemBackupService:
             if rows != [("ok",)]:
                 raise ValueError("History database integrity check failed.")
 
-    def _build_history_snapshot(self) -> bytes:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            backup_path = self._build_history_snapshot_to_directory(Path(temp_dir))
-            if backup_path is None:
-                return b""
-            return backup_path.read_bytes()
-
     def _build_history_snapshot_to_directory(self, target_dir: Path) -> Path | None:
         backup_path = self.store.create_backup(
             target_dir,
@@ -3054,29 +3102,6 @@ class SystemBackupService:
             info.size = member.file_path.stat().st_size
             with member.file_path.open("rb") as source:
                 archive.addfile(info, source)
-
-    def _build_tar_archive(self, bundle_members: list[BundleMember], manifest_bytes: bytes) -> bytes:
-        buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w") as archive:
-            self._write_tar_bundle(archive, bundle_members, manifest_bytes)
-        return buffer.getvalue()
-
-    def _build_7z_archive(
-        self,
-        bundle_members: list[BundleMember],
-        manifest_bytes: bytes,
-        *,
-        passphrase: str | None = None,
-    ) -> bytes:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            archive_path = Path(temp_dir) / "bundle.7z"
-            self._build_7z_archive_to_path(
-                bundle_members,
-                manifest_bytes,
-                archive_path,
-                passphrase=passphrase,
-            )
-            return archive_path.read_bytes()
 
     def _build_7z_archive_to_path(
         self,
@@ -4764,34 +4789,6 @@ class SystemBackupService:
         if scrubber.scrub_secrets or scrubber.scrub_disk_identifiers:
             slot_event_rules["details_json"] = scrubber.scrub_json_text
         return slot_state_rules, slot_event_rules, metric_sample_rules, metric_rollup_rules
-
-    def _build_scrubbed_history_snapshot(self, snapshot_bytes: bytes, scrubber: DebugScrubber | None) -> bytes:
-        if scrubber is None or not snapshot_bytes:
-            return snapshot_bytes
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir) / "history-scrub.sqlite3"
-            temp_path.write_bytes(snapshot_bytes)
-            connection = sqlite3.connect(temp_path)
-            try:
-                connection.row_factory = sqlite3.Row
-                (
-                    slot_state_rules,
-                    slot_event_rules,
-                    metric_sample_rules,
-                    metric_rollup_rules,
-                ) = self._history_scrubbing_rules(scrubber)
-                if slot_state_rules:
-                    self._scrub_history_table(connection, "slot_state_current", slot_state_rules)
-                if slot_event_rules:
-                    self._scrub_history_table(connection, "slot_events", slot_event_rules)
-                if metric_sample_rules:
-                    self._scrub_history_table(connection, "metric_samples", metric_sample_rules)
-                if metric_rollup_rules:
-                    self._scrub_history_table(connection, "metric_rollups", metric_rollup_rules)
-                connection.commit()
-            finally:
-                connection.close()
-            return temp_path.read_bytes()
 
     @staticmethod
     def _scrub_history_table(

@@ -4566,33 +4566,6 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                     release_planned.set()
                     await asyncio.gather(collection, command)
 
-    async def test_linux_nvme_enrichment_batches_three_commands_in_one_session(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            settings = Settings()
-            system = SystemConfig(
-                id="linux-nvme",
-                truenas=TrueNASConfig(platform="linux"),
-                ssh=SSHConfig(enabled=True, host="192.0.2.20", user="operator"),
-            )
-            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
-            service._run_ssh_command = AsyncMock(
-                return_value=SSHCommandResult(command="legacy", ok=False, exit_code=1)
-            )
-            service._run_ssh_commands = AsyncMock(
-                return_value=[
-                    SSHCommandResult(command=f"command-{index}", ok=False, exit_code=1)
-                    for index in range(3)
-                ]
-            )
-
-            await service._fetch_linux_nvme_enrichment_over_ssh("/dev/nvme0n1", "192.0.2.20")
-
-            service._run_ssh_commands.assert_awaited_once()
-            nvme_batch = service._run_ssh_commands.await_args
-            self.assertIsNotNone(nvme_batch)
-            assert nvme_batch is not None
-            self.assertEqual(len(nvme_batch.args[0]), 3)
-            service._run_ssh_command.assert_not_awaited()
 
     async def test_linux_nvme_smartctl_and_nvme_probes_share_one_host_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4764,6 +4737,54 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(selected, overlay)
             self.assertEqual(best_host, "192.0.2.50")
             self.assertEqual(failures, ["TrueNAS SCALE SSH SES EC page probe failed."])
+
+    async def test_sg_ses_planned_discovery_respects_optional_ssh_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-lab",
+                label="Quantastor Lab",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+            )
+            probe = SSHProbe(system.ssh)
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                probe,
+                temp_dir,
+            )
+
+            async def fail_startup(commands: list[str]) -> list[SSHCommandResult]:
+                return [
+                    SSHCommandResult(
+                        command=command,
+                        ok=False,
+                        stderr="Error reading SSH protocol banner",
+                        exit_code=255,
+                    )
+                    for command in commands
+                ]
+
+            probe.run_commands = AsyncMock(side_effect=fail_startup)  # type: ignore[method-assign]
+            probe.run_planned_commands = AsyncMock(  # type: ignore[method-assign]
+                side_effect=AssertionError("SG-SES planner must not start during host backoff")
+            )
+
+            first = await service._run_ssh_commands(["first"], "10.0.0.10")
+            devices, overlay, failures = await service._discover_and_fetch_sg_ses_host_overlay(
+                "10.0.0.10",
+                failure_prefix="Quantastor SSH SES",
+            )
+
+            self.assertEqual(probe.run_commands.await_count, 1)
+            self.assertEqual(probe.run_planned_commands.await_count, 0)
+            self.assertIn("Error reading SSH protocol banner", first[0].stderr)
+            self.assertEqual(devices, [])
+            self.assertEqual(overlay.ses_enclosures, [])
+            self.assertEqual(len(failures), 1)
+            self.assertIn("recent connection startup failure", failures[0])
 
     async def test_sg_ses_discovery_and_page_probes_share_one_planned_session(self) -> None:
         class RecordingSSHProbe(SSHProbe):
@@ -7157,48 +7178,6 @@ Enclosure Status diagnostic page:
             self.assertIn("recent connection startup failure", second[0].stderr)
             self.assertEqual(second[0].exit_code, 255)
 
-    async def test_sg_ses_discovery_respects_optional_ssh_backoff_after_startup_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            settings = Settings()
-            system = SystemConfig(
-                id="quantastor-lab",
-                label="Quantastor Lab",
-                truenas=TrueNASConfig(platform="quantastor"),
-                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
-            )
-            probe = SSHProbe(system.ssh)
-            service = build_inventory_service(
-                settings,
-                system,
-                AsyncMock(),
-                probe,
-                temp_dir,
-            )
-
-            async def run_commands(commands: list[str]) -> list[SSHCommandResult]:
-                return [
-                    SSHCommandResult(
-                        command=command,
-                        ok=False,
-                        stderr="Error reading SSH protocol banner",
-                        exit_code=255,
-                    )
-                    for command in commands
-                ]
-
-            probe.run_commands = AsyncMock(side_effect=run_commands)  # type: ignore[method-assign]
-
-            first = await service._run_ssh_commands(["first"], "10.0.0.10")
-            devices, failures = await service._discover_sg_ses_devices(
-                "10.0.0.10",
-                failure_prefix="Quantastor SSH SES",
-            )
-
-            self.assertEqual(probe.run_commands.await_count, 1)
-            self.assertIn("Error reading SSH protocol banner", first[0].stderr)
-            self.assertEqual(devices, [])
-            self.assertEqual(len(failures), 1)
-            self.assertIn("recent connection startup failure", failures[0])
 
     def test_build_quantastor_smart_devices_prefers_by_id_and_sd_paths_over_by_path(self) -> None:
         settings = Settings()
