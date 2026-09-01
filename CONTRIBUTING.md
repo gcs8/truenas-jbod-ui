@@ -15,36 +15,35 @@ At the start of a work session:
 
 1. Start from the actual repository root. If the repo path is not explicit,
    discover it before reading or editing files.
-2. Read these files when present, in this order:
-   - `AGENTS.md`
-   - `HANDOFF.md`
-   - `TODO.md`
-   - `PLANS.md`
-3. Treat `HANDOFF.md` as the source of truth for current task state.
-4. Treat `TODO.md` as the current open-item queue.
-5. Do not revisit older decisions unless the user or current handoff files say
-   to do so.
-6. Before editing, state the intended scope, likely files, risk tier, and
+2. Read `AGENTS.md`, then this file. `HANDOFF.md`, `TODO.md`, and `PLANS.md`
+   are maintainer-local worktree files that are not tracked here. Read them only
+   when the current worktree provides them; do not search for or create them.
+3. Treat the GitHub issue tracker as the public open-item queue and the active
+   issue or PR thread as the source of truth for its scope. A maintainer-provided
+   local handoff may add private operational context but does not replace live
+   repository and GitHub state.
+4. Do not revisit older decisions unless the user or current issue/PR thread
+   says to do so.
+5. Before editing, state the intended scope, likely files, risk tier, and
    validation tier.
-7. Keep work in small bounded chunks. Finish or explicitly defer one chunk
+6. Keep work in small bounded chunks. Finish or explicitly defer one chunk
    before starting another.
-8. Update `HANDOFF.md` and `TODO.md` as work progresses:
+7. Record material progress in the working issue or PR thread:
    - what changed
    - what was verified
    - what remains open
-   - what was intentionally deferred
+   - what was intentionally deferred, with a tracked follow-up issue rather
+     than only a closure comment
 
-For v0.21 work, also review the relevant planning/checklist docs before code
-changes:
+For release or release-adjacent work, review `docs/RELEASE_CHECKLIST.md` before
+changes. Older cycle plans under `docs/` are historical records, not active
+scope.
 
-- `docs/V0_21_CODE_QUALITY_PITSTOP_PLAN.md`
-- `docs/V0_22_STORAGE_FABRIC_ENRICHMENT_NOTES.md`
-- `docs/RELEASE_CHECKLIST.md` for release or release-adjacent work
+## Standing Maintenance Priorities
 
-## v0.21 Scope
-
-v0.21.x is a maintenance and confidence pitstop after Storage Fabric expansion.
-It is not a feature catch-all.
+These priorities originated during the v0.21 confidence pitstop and remain the
+default posture for maintenance work. Current release state lives in
+`docs/ROADMAP.md` and `CHANGELOG.md`.
 
 Prioritize work that improves operator confidence and future change safety:
 
@@ -69,12 +68,12 @@ The operator contract must remain stable:
 - functional parity means a predictable operator experience, not identical
   feature sets on every platform
 
-## v0.21 Non-Goals
+## Standing Non-Goals For Maintenance Cycles
 
-Do not pull broad feature work into v0.21 unless it fixes a live regression or
-prevents operators from misreading existing data.
+Do not pull broad feature work into a maintenance cycle unless it fixes a live
+regression or prevents operators from misreading existing data.
 
-Defer these to v0.22 or later unless explicitly approved:
+Defer these unless explicitly approved for the current cycle:
 
 - deeper Linux sysfs/SAS/NVMe enrichment
 - new Quantastor HA model changes
@@ -155,7 +154,8 @@ assumptions, cautious backup/import handling, and careful treatment of secrets.
 ## Validation Tiers
 
 Pick the lightest tier that proves the change, then escalate when risk or scope
-requires it. Record exact commands and results in the handoff.
+requires it. Record exact commands and results in the working issue/PR or, for a
+release, its release wrap.
 
 ### Tier 0: Read-Only Orientation
 
@@ -184,8 +184,8 @@ Useful orientation files:
 - `docker-compose.yml`
 - `docker-compose.dev.yml`
 - `.github/workflows/`
-- `docs/V0_21_CODE_QUALITY_PITSTOP_PLAN.md`
-- `docs/V0_22_STORAGE_FABRIC_ENRICHMENT_NOTES.md`
+- `CHANGELOG.md`
+- `docs/ROADMAP.md`
 - `docs/RELEASE_CHECKLIST.md`
 - relevant tests under `tests/` and `qa/`
 
@@ -205,7 +205,15 @@ node --check app/static/sas_fabric_view.js
 node --check admin_service/static/admin.js
 node --check qa/public-demo.spec.js
 git diff --check
+ruff check app admin_service history_service scripts tests --select E4,E7,E9,F
+npm run test:unit
+python scripts/build_perf_baseline.py --check
+promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml
 ```
+
+The last four commands mirror CI gates. The Prometheus rule check applies when
+alert rules change and may be left to CI when the pinned `promtool` binary is
+not available locally.
 
 On Windows, use the project virtualenv interpreter when present, for example:
 
@@ -344,8 +352,7 @@ pre-tag gate recorded as `Pass` or justified `N/A`.
 
 ## CI blocking policy
 
-The following pull-request checks are release-blocking and should be required
-for `main` after the workflow changes are available:
+The following pull-request checks are release-blocking and required for `main`:
 
 - `Diff hygiene`
 - `Python compile and unittest (3.12)`
@@ -563,8 +570,9 @@ secret config, SSH material, or unrelated local data into handoffs.
   or a regression requires it.
 - Keep saved storage views and live enclosures aligned as peer concepts.
 - Keep Storage Fabric read-only and honest about source strength.
-- Capture active state in `HANDOFF.md` when sessions get large.
-- Defer intentionally in `HANDOFF.md` and `TODO.md`; do not leave silent loose
-  ends.
+- Keep the active issue/PR thread current when sessions get large. Update a
+  maintainer-provided local handoff too when one exists.
+- Create tracked follow-up issues for intentional deferrals; do not leave
+  silent loose ends in local-only notes.
 - If a change does not improve operator correctness, supportability, safety, or
-  release confidence, question whether it belongs in v0.21.
+  release confidence, question whether it belongs in the current cycle.

@@ -72,7 +72,8 @@ the final release-wrap validator:
 
 ## Release Gate Order
 
-1. Read this checklist and the current `HANDOFF.md` before doing release work.
+1. Read this checklist, the active release issue/PR, and any maintainer-provided
+   local handoff before doing release work.
 2. Confirm scope, release branch, version, and whether the release is a normal
    feature release, patch, hotfix, docs-only correction, or process correction.
 3. Draft or update the release notes and release wrap before tagging.
@@ -115,16 +116,21 @@ the final release-wrap validator:
     `.\.venv\Scripts\python.exe -m unittest tests.test_release_status -v`
 - run Python syntax/compile coverage for changed Python plus shared app/test
   packages:
-  - `.\.venv\Scripts\python.exe -m compileall app admin_service scripts tests`
+  - `.\.venv\Scripts\python.exe -m compileall app admin_service history_service scripts tests`
 - validate the target release wrap before tagging:
-  - `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version>`
+  - `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --phase pre-tag`
+    (run the no-flag final validator after post-publish evidence exists)
 - run JavaScript syntax gates for app, admin, QA, and changed JS files:
   - `node --check app/static/app.js`
   - `node --check app/static/sas_fabric_view.js`
   - `node --check admin_service/static/admin.js`
   - `node --check qa/public-demo.spec.js`
-- run the browser smoke suite against the live app:
-  - `npx playwright test`
+- run the browser smoke suites. Live-appliance specs require explicit opt-in;
+  a bare `npx playwright test` is not a portable release command:
+  - `npx playwright test qa/public-demo.spec.js qa/offline-snapshot.spec.js`
+  - `PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 npx playwright test qa/admin-operations.spec.js`
+  - `PLAYWRIGHT_LIVE_APPLIANCE_QA=1 npx playwright test qa/ui-switching.spec.js qa/esxi-smoke.spec.js`
+    (only against an intentionally configured live stack)
 - run hygiene checks before interpreting other diffs:
   - `git diff --check`
   - confirm this command emits no CRLF normalization warnings; `.gitattributes`
@@ -377,14 +383,10 @@ the final release-wrap validator:
 - inspect the final commit set with `git log --oneline`
 - make a final release-prep commit if needed
 - preferred repo flow is:
-  - do release work on a `codex/` branch first
-  - push that branch as a safety checkpoint before the cut
-  - when satisfied, switch to `main` and merge locally with a release commit
-    such as `Release v0.10.0`
+  - do release work on a `release/vX.Y.Z` or `hotfix/vX.Y.Z-*` branch
+  - push the branch and open a PR into `main` so all blocking checks run
+  - merge only when every required check passes
   - tag the merged `main` commit, not the side branch tip
-- this repo does not require a PR to cut a release unless we explicitly decide
-  to use one for review
-- merge the release branch into `main` only when satisfied
 - create the annotated release tag after merge
 - before tagging, re-open the release wrap and verify every checklist evidence
   row is complete
@@ -410,14 +412,18 @@ the final release-wrap validator:
   - production deployment
   - confirm the expected tag/digest/version, service health, and the primary UI
     smoke path on each instance
-- if the GitHub plugin is available in Codex, prefer it for GitHub-side actions
-  like PRs, issues, or release-page prep
+- use `gh` or the GitHub UI for GitHub-side actions such as PRs, issues, and
+  release-page preparation
 
 ## After Release
 
 - confirm the pushed tag matches the intended commit
 - confirm the GitHub README renders the new screenshots correctly
 - confirm the wiki publish completed if applicable
+- next-cycle source work may begin before production deployment only in a
+  separate clean worktree after the tag and immutable image are published. Keep
+  the production release lane frozen, and do not mark `Post-release reopen` as
+  `Pass` until deployment evidence and the final release-wrap validator pass.
 - after local, Linux, and production deployments are all current and healthy,
   tear down only the temporary Linux QA restore containers, networks, and
   scratch runtime directories
