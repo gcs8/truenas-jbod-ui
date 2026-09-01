@@ -1183,7 +1183,7 @@
    "path": "/dev/nvme0n1",
    "type": "disk",
    "serial": "SERIAL0104",
-   "wwn": "nvme.144d-5332474d4e58414831313637333758-53616d73756e6720535344203935302050524f203531324742-00000001",
+   "wwn": "FIXTURE-NVME-WWN-001",
    "tran": "nvme",
    "hctl": null,
    "model": "Samsung SSD 950 PRO 512GB"
@@ -1194,7 +1194,7 @@
    "path": "/dev/nvme1n1",
    "type": "disk",
    "serial": "SERIAL0105",
-   "wwn": "eui.5000000000000229",
+   "wwn": "FIXTURE-NVME-WWN-002",
    "tran": "nvme",
    "hctl": null,
    "model": "Samsung SSD 970 EVO 500GB"

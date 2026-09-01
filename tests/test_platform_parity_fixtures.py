@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -404,6 +406,32 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
                     [w for w in snap.warnings if "shared SAS address" in w],
                     "per-phy unique addresses must not trip the shared-address guard",
                 )
+
+    def test_scale_md1280_fixture_identifiers_have_deterministic_pseudonyms(self) -> None:
+        rows = fixture_json("scale_md1280_lsblk.json")["blockdevices"]
+        serials = [str(row["serial"]) for row in rows if row.get("serial")]
+        self.assertEqual(len(serials), 105)
+        self.assertEqual(len(set(serials)), 105)
+        self.assertTrue(all(re.fullmatch(r"[A-Z]{6}[0-9]{4}", value) for value in serials))
+
+        wwns = [str(row["wwn"]) for row in rows if row.get("wwn")]
+        standard_sas = [
+            value
+            for value in wwns
+            if re.fullmatch(r"0x[0-9a-fA-F]{16}", value)
+        ]
+        explicit_nvme = [value for value in wwns if value not in standard_sas]
+        self.assertEqual(
+            explicit_nvme,
+            ["FIXTURE-NVME-WWN-001", "FIXTURE-NVME-WWN-002"],
+        )
+        self.assertEqual(len(standard_sas), 102)
+        self.assertEqual(len(set(standard_sas)), 102)
+        sorted_sas = sorted(int(value[2:], 16) for value in standard_sas)
+        self.assertEqual(
+            Counter(right - left for left, right in zip(sorted_sas, sorted_sas[1:])),
+            Counter({1: 91, 7: 9, 103: 1}),
+        )
 
 if __name__ == "__main__":
     unittest.main()
