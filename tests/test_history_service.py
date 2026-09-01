@@ -833,6 +833,49 @@ class HistoryStoreTests(unittest.TestCase):
 
             self.assertEqual(store.file_path.stat().st_mode & 0o777, 0o600)
 
+    def test_default_restore_replacement_reapplies_existing_database_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            backup_path = store.create_backup(
+                root / "backups",
+                snapshot_label="2030-01-02T03:04:05+00:00",
+            )
+            if backup_path is None:
+                self.fail("Expected restore source backup to be created")
+            expected_owner = (store.file_path.stat().st_uid, store.file_path.stat().st_gid)
+
+            with patch("history_service.store.os.fchown") as fchown:
+                store.restore_backup(backup_path)
+
+            fchown.assert_called_once()
+            self.assertEqual(fchown.call_args.args[1:], expected_owner)
+
+    def test_restore_owner_failure_removes_private_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            backup_path = store.create_backup(
+                root / "backups",
+                snapshot_label="2030-01-02T03:04:05+00:00",
+            )
+            if backup_path is None:
+                self.fail("Expected restore source backup to be created")
+            live_before = store.file_path.read_bytes()
+
+            with (
+                patch(
+                    "history_service.store.os.fchown",
+                    side_effect=PermissionError("injected ownership failure"),
+                ),
+                self.assertRaisesRegex(PermissionError, "injected ownership failure"),
+            ):
+                store.restore_backup(backup_path)
+
+            replacement_root = root / f".history-replacement-{os.geteuid()}"
+            self.assertEqual(store.file_path.read_bytes(), live_before)
+            self.assertEqual(list(replacement_root.iterdir()), [])
+
     def test_failed_restore_publication_preserves_live_sqlite_family(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

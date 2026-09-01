@@ -3437,6 +3437,19 @@ sys.stdout.flush()
             HistoryStore(str(symlink_path))
         self.assertTrue(symlink_path.is_symlink())
 
+    def test_missing_file_under_symlinked_parent_is_rejected(self) -> None:
+        real_parent = self.temp_dir / "real-parent"
+        real_parent.mkdir()
+        symlinked_parent = self.temp_dir / "symlinked-parent"
+        symlinked_parent.symlink_to(real_parent, target_is_directory=True)
+        transaction = _ImportActivationTransaction({"member": b"IMPORTED"})
+
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            with transaction:
+                transaction.activate_file(symlinked_parent / "missing.txt", "member")
+
+        self.assertEqual(list(real_parent.iterdir()), [])
+
     def test_history_rollback_uses_store_snapshot_and_clears_sidecars(self) -> None:
         imported_source_dir = self.temp_dir / "imported-history-source"
         imported_source = self.store.create_backup(imported_source_dir, retention_count=1)
@@ -3538,6 +3551,23 @@ sys.stdout.flush()
         self.assertEqual(list(self.temp_dir.rglob("*.restore-*")), [])
         self.assertEqual(list(self.temp_dir.rglob("*.previous-*")), [])
 
+    def test_parent_ownership_failure_removes_created_parent_hierarchy(self) -> None:
+        hierarchy_root = self.temp_dir / "ownership-failure-parent"
+        target_path = hierarchy_root / "nested" / "live.txt"
+        transaction = _ImportActivationTransaction({"member": b"IMPORTED"})
+
+        with (
+            patch(
+                "history_service.system_backup.os.chown",
+                side_effect=PermissionError("injected ownership failure"),
+            ),
+            self.assertRaisesRegex(PermissionError, "injected ownership failure"),
+        ):
+            with transaction:
+                transaction.activate_file(target_path, "member")
+
+        self.assertFalse(hierarchy_root.exists())
+
     def test_file_staging_descriptor_failure_removes_sibling_artifact(self) -> None:
         target_path = self.temp_dir / "descriptor-live.txt"
         target_path.write_bytes(b"ORIGINAL")
@@ -3590,6 +3620,37 @@ sys.stdout.flush()
         self.assertEqual(nested_target.stat().st_mode & 0o777, 0o710)
         self.assertEqual(existing_key.stat().st_mode & 0o777, 0o600)
 
+    def test_activation_reapplies_existing_file_and_directory_ownership(self) -> None:
+        file_target = self.temp_dir / "owner-file.txt"
+        file_target.write_bytes(b"ORIGINAL")
+        directory_target = self.temp_dir / "owner-directory"
+        nested_target = directory_target / "nested"
+        nested_target.mkdir(parents=True)
+        existing_key = nested_target / "id_key"
+        existing_key.write_bytes(b"ORIGINAL-KEY")
+        expected_owner = (file_target.stat().st_uid, file_target.stat().st_gid)
+        transaction = _ImportActivationTransaction(
+            {"file": b"IMPORTED", "key": b"IMPORTED-KEY"}
+        )
+
+        with patch("history_service.system_backup.os.chown") as chown:
+            with transaction:
+                transaction.activate_file(file_target, "file")
+                transaction.activate_directory(
+                    directory_target,
+                    [("key", Path("nested/id_key"))],
+                )
+                transaction.commit()
+
+        self.assertEqual(len(chown.call_args_list), 4)
+        self.assertTrue(
+            all(
+                call.args[1:] == expected_owner
+                and call.kwargs == {"follow_symlinks": False}
+                for call in chown.call_args_list
+            )
+        )
+
     def test_activation_applies_private_modes_to_missing_targets(self) -> None:
         file_target = self.temp_dir / "missing-file.txt"
         directory_target = self.temp_dir / "missing-directory"
@@ -3609,6 +3670,74 @@ sys.stdout.flush()
         self.assertEqual(directory_target.stat().st_mode & 0o777, 0o700)
         self.assertEqual((directory_target / "nested").stat().st_mode & 0o777, 0o700)
         self.assertEqual((directory_target / "nested/id_key").stat().st_mode & 0o777, 0o600)
+
+    def test_activation_inherits_parent_ownership_for_missing_targets(self) -> None:
+        file_target = self.temp_dir / "missing-owner-file.txt"
+        directory_target = self.temp_dir / "missing-owner-directory"
+        expected_owner = (self.temp_dir.stat().st_uid, self.temp_dir.stat().st_gid)
+        transaction = _ImportActivationTransaction(
+            {"file": b"IMPORTED", "key": b"IMPORTED-KEY"}
+        )
+
+        with patch("history_service.system_backup.os.chown") as chown:
+            with transaction:
+                transaction.activate_file(file_target, "file")
+                transaction.activate_directory(
+                    directory_target,
+                    [("key", Path("nested/id_key"))],
+                )
+                transaction.commit()
+
+        self.assertEqual(len(chown.call_args_list), 4)
+        self.assertTrue(
+            all(
+                call.args[1:] == expected_owner
+                and call.kwargs == {"follow_symlinks": False}
+                for call in chown.call_args_list
+            )
+        )
+
+    def test_activation_inherits_existing_root_owner_for_new_nested_entries(self) -> None:
+        directory_target = self.temp_dir / "partial-owner-directory"
+        directory_target.mkdir()
+        expected_owner = (directory_target.stat().st_uid, directory_target.stat().st_gid)
+        transaction = _ImportActivationTransaction({"key": b"IMPORTED-KEY"})
+
+        with patch("history_service.system_backup.os.chown") as chown:
+            with transaction:
+                transaction.activate_directory(
+                    directory_target,
+                    [("key", Path("new/id_key"))],
+                )
+                transaction.commit()
+
+        self.assertEqual(len(chown.call_args_list), 3)
+        self.assertTrue(
+            all(
+                call.args[1:] == expected_owner
+                and call.kwargs == {"follow_symlinks": False}
+                for call in chown.call_args_list
+            )
+        )
+
+    def test_activation_inherits_owner_for_created_parent_hierarchy(self) -> None:
+        file_target = self.temp_dir / "new" / "nested" / "owner-file.txt"
+        expected_owner = (self.temp_dir.stat().st_uid, self.temp_dir.stat().st_gid)
+        transaction = _ImportActivationTransaction({"file": b"IMPORTED"})
+
+        with patch("history_service.system_backup.os.chown") as chown:
+            with transaction:
+                transaction.activate_file(file_target, "file")
+                transaction.commit()
+
+        self.assertEqual(len(chown.call_args_list), 3)
+        self.assertTrue(
+            all(
+                call.args[1:] == expected_owner
+                and call.kwargs == {"follow_symlinks": False}
+                for call in chown.call_args_list
+            )
+        )
 
     def test_debug_bundle_scrubs_config_and_identifier_fields(self) -> None:
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
