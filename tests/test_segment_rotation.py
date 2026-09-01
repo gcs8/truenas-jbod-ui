@@ -1536,30 +1536,48 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
             finally:
                 artifact.cleanup()
 
-    def test_hot_sidecar_guard_refuses_each_sqlite_sidecar_and_accepts_a_clean_hot_file(self) -> None:
+    def test_hot_checkpoint_guard_refuses_pending_wal_frames_and_folds_them_once_readers_leave(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             hot_path = Path(temporary_directory) / "history.db"
-            hot_path.write_bytes(b"")
+            wal_path = Path(f"{hot_path}-wal")
 
-            _ImportActivationTransaction._require_no_hot_sidecars(hot_path)
+            _ImportActivationTransaction._checkpoint_hot_database(hot_path)  # missing hot file: nothing to do
 
-            for suffix in ("-wal", "-shm", "-journal"):
-                sidecar = Path(f"{hot_path}{suffix}")
-                sidecar.write_bytes(b"stale")
-                try:
-                    with self.assertRaisesRegex(ValueError, "sidecar"):
-                        _ImportActivationTransaction._require_no_hot_sidecars(hot_path)
-                finally:
-                    sidecar.unlink()
+            writer = sqlite3.connect(hot_path)
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("CREATE TABLE t (x INTEGER)")
+            writer.commit()
+            reader = sqlite3.connect(hot_path)
+            try:
+                reader.execute("BEGIN")
+                reader.execute("SELECT count(*) FROM t").fetchone()  # hold a WAL snapshot
+                writer.execute("INSERT INTO t VALUES (1)")
+                writer.commit()
+                self.assertGreater(wal_path.stat().st_size, 0)
 
-            _ImportActivationTransaction._require_no_hot_sidecars(hot_path)
+                with self.assertRaisesRegex(ValueError, "cannot be checkpointed"):
+                    _ImportActivationTransaction._checkpoint_hot_database(hot_path)
+                self.assertGreater(wal_path.stat().st_size, 0)
+
+                reader.rollback()
+            finally:
+                reader.close()
+
+            _ImportActivationTransaction._checkpoint_hot_database(hot_path)
+            self.assertEqual(wal_path.stat().st_size, 0)
+            self.assertEqual(writer.execute("SELECT count(*) FROM t").fetchone()[0], 1)
+            writer.close()
+
+            Path(f"{hot_path}-journal").write_bytes(b"")
+            with self.assertRaisesRegex(ValueError, "rollback journal"):
+                _ImportActivationTransaction._checkpoint_hot_database(hot_path)
 
     def test_schema_v2_restore_refuses_a_hot_database_with_live_sidecars(self) -> None:
-        # The v2 restore is a plain file replace. A live WAL left next to the
-        # restored hot file would be replayed over it by the next connection,
-        # and blindly unlinking it would strip the parked original of frames a
-        # rollback needs. The restore must refuse before touching anything
-        # (issue #175).
+        # The v2 restore is a plain file replace. Committed frames still in the
+        # live WAL would be replayed over the restored hot file by the next
+        # connection, and blindly unlinking the WAL would strip the parked
+        # original of frames a rollback needs. The restore must checkpoint
+        # first and refuse while a reader keeps frames pending (issue #175).
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             source = root / "history.db"
@@ -1618,33 +1636,50 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                     segment_catalog_path=target_catalog,
                 )
                 target_service = SystemBackupService(target_settings, target_store)
-                original_bytes = target_source.read_bytes()
-                stale_wal = Path(f"{target_source}-wal")
-                stale_shm = Path(f"{target_source}-shm")
-                stale_wal.write_bytes(b"stale-wal")
-                stale_shm.write_bytes(b"stale-shm")
+                wal_path = Path(f"{target_source}-wal")
+                reader = sqlite3.connect(target_source)
+                try:
+                    reader.execute("BEGIN")
+                    reader.execute("SELECT count(*) FROM slot_events").fetchone()  # hold a WAL snapshot
+                    target_store._execute_write(
+                        lambda connection: connection.execute(
+                            """
+                            INSERT INTO slot_events (
+                                id, observed_at, system_id, enclosure_key, slot, slot_label, event_type, details_json
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (7, "2025-01-04T00:00:00+00:00", "target-system", "target-enclosure", 1, "slot-1", "live", "{}"),
+                        )
+                    )
+                    self.assertGreater(wal_path.stat().st_size, 0)
 
-                with self.assertRaisesRegex(ValueError, "sidecar"):
-                    target_service.import_bundle(artifact.path.read_bytes())
+                    with self.assertRaisesRegex(ValueError, "cannot be checkpointed"):
+                        target_service.import_bundle(artifact.path.read_bytes())
 
-                self.assertEqual(target_source.read_bytes(), original_bytes)
-                self.assertEqual(stale_wal.read_bytes(), b"stale-wal")
-                self.assertEqual(stale_shm.read_bytes(), b"stale-shm")
-                self.assertFalse(target_catalog.exists())
-                self.assertFalse(activation_pending_path(target_source).exists())
-                self.assertEqual(
-                    sorted(path.name for path in target_root.iterdir()),
-                    ["history.db", "history.db-shm", "history.db-wal"],
-                )
+                    self.assertGreater(wal_path.stat().st_size, 0)
+                    self.assertFalse(target_catalog.exists())
+                    self.assertFalse(activation_pending_path(target_source).exists())
+                    self.assertEqual(
+                        [event["event_type"] for event in target_store.list_slot_events("target-system", "target-enclosure", 1)],
+                        ["live"],
+                    )
+                    reader.rollback()
+                finally:
+                    reader.close()
 
-                stale_wal.unlink()
-                stale_shm.unlink()
                 result = target_service.import_bundle(artifact.path.read_bytes())
 
                 self.assertEqual(result["schema_version"], 2)
-                self.assertFalse(stale_wal.exists())
-                self.assertFalse(stale_shm.exists())
+                self.assertFalse(wal_path.exists())
+                self.assertFalse(Path(f"{target_source}-shm").exists())
                 self.assertTrue((target_catalog.parent / "segment-0002.sqlite3").is_file())
+                self.assertEqual(
+                    [
+                        event["event_type"]
+                        for event in target_store.list_slot_events("synthetic-system", "synthetic-enclosure", 1)
+                    ],
+                    ["generation-2-hot", "generation-2-sealed", "generation-1-hot", "generation-1-sealed"],
+                )
             finally:
                 artifact.cleanup()
 

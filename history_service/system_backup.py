@@ -50,7 +50,7 @@ from history_service.segment_catalog import (
 )
 from history_service.migration_lock import history_write_lock
 from history_service.segment_reader import SegmentedHistoryReader
-from history_service.store import HistoryStore
+from history_service.store import SQLITE_CONNECT_TIMEOUT_SECONDS, HistoryStore
 
 
 BUNDLE_SCHEMA_VERSION = 1
@@ -439,13 +439,14 @@ class _ImportActivationTransaction:
         store._segment_reader_cache = None
         store._segment_reader_identity = None
         # The v1 path restores through HistoryStore.restore_backup, which owns
-        # the live WAL/SHM. This path is a plain file replace: a live WAL next
-        # to the restored hot file would be replayed over it by the next
-        # connection, and unlinking it blindly would strip the parked original
-        # of frames a rollback needs. Refuse instead; the write lock held by
-        # import_bundle means any sidecar created after this check is a
-        # reader's empty WAL, which is safe to drop after publication.
-        self._require_no_hot_sidecars(store.file_path)
+        # the live WAL/SHM. This path is a plain file replace: committed frames
+        # still sitting in the live WAL would be replayed over the restored
+        # image by the next connection, and unlinking the WAL blindly would
+        # strip the parked original of frames a rollback needs. Fold the WAL
+        # into the hot file first and refuse if a reader keeps frames pending;
+        # import_bundle holds the history write lock, so nothing can append
+        # frames between the checkpoint and the replace.
+        self._checkpoint_hot_database(store.file_path)
         self._activate_file(
             store.file_path,
             hot_member_key,
@@ -456,13 +457,22 @@ class _ImportActivationTransaction:
         self.activate_directory(catalog_path.parent, segment_members)
 
     @staticmethod
-    def _require_no_hot_sidecars(hot_path: Path) -> None:
-        for suffix in ("-wal", "-shm", "-journal"):
-            if path_entry_exists(Path(f"{hot_path}{suffix}")):
-                raise ValueError(
-                    "History database has SQLite sidecar state; stop the history service and "
-                    "let it checkpoint (or recover the pending journal) before a segmented restore."
-                )
+    def _checkpoint_hot_database(hot_path: Path) -> None:
+        if path_entry_exists(Path(f"{hot_path}-journal")):
+            raise ValueError(
+                "History database has a rollback journal; recover it before a segmented restore."
+            )
+        if not path_entry_exists(hot_path):
+            return
+        with closing(sqlite3.connect(hot_path, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS)) as connection:
+            row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        busy, pending_frames, _checkpointed = (int(value) for value in row)
+        if busy or pending_frames > 0:
+            raise ValueError(
+                "History database WAL cannot be checkpointed while readers hold it open "
+                f"({max(pending_frames, 0)} frames pending); stop the history service and retry "
+                "the segmented restore."
+            )
 
     def activate_directory(
         self,
