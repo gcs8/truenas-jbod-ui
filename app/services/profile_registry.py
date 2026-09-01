@@ -6,6 +6,9 @@ from app.config import EnclosureProfileConfig, Settings, SystemConfig, normalize
 from app.models.domain import EnclosureOption, EnclosureProfileView
 
 CORE_CSE_946_PROFILE_ID = "supermicro-cse-946-top-60"
+DELL_MD1280_PROFILE_ID = "dell-md1280-drawer-84"
+DELL_MD1280_DRAWER_TOP_PROFILE_ID = "dell-md1280-drawer-top-42"
+DELL_MD1280_DRAWER_BOTTOM_PROFILE_ID = "dell-md1280-drawer-bottom-42"
 SCALE_SSG_FRONT_24_PROFILE_ID = "supermicro-ssg-6048r-front-24"
 SCALE_SSG_REAR_12_PROFILE_ID = "supermicro-ssg-6048r-rear-12"
 LINUX_GPU_SERVER_NVME_PROFILE_ID = "supermicro-sys-2029gp-tr-right-nvme-2"
@@ -63,6 +66,57 @@ def default_slot_layout(rows: int, columns: int, slot_count: int) -> list[list[i
     ]
 
 
+# Enclosures whose inferred profile offers per-drawer sub-views: the base
+# enclosure option keeps the whole-shelf profile and the selector gains one
+# additional option per entry, so the operator can toggle between drawers.
+ENCLOSURE_SUB_VIEW_PROFILE_IDS: dict[str, list[str]] = {
+    DELL_MD1280_PROFILE_ID: [
+        DELL_MD1280_DRAWER_TOP_PROFILE_ID,
+        DELL_MD1280_DRAWER_BOTTOM_PROFILE_ID,
+    ],
+}
+
+
+def dell_md1280_top_drawer_slot_layout() -> list[list[int | None]]:
+    """Top drawer only: chassis bays 1-42, front row at the pull edge."""
+
+    return [
+        list(range(28, 42)),
+        list(range(14, 28)),
+        list(range(0, 14)),
+    ]
+
+
+def dell_md1280_bottom_drawer_slot_layout() -> list[list[int | None]]:
+    """Bottom drawer only: chassis bays 43-84, front row at the pull edge."""
+
+    return [
+        list(range(70, 84)),
+        list(range(56, 70)),
+        list(range(42, 56)),
+    ]
+
+
+def dell_md1280_drawer_slot_layout() -> list[list[int | None]]:
+    """
+    Stacked drawer view matching the physical chassis (deployment manual
+    Figure 6): the top drawer holds chassis bays 1-42 and the bottom drawer
+    43-84, each a band of three 14-bay rows with the front row at the
+    drawer-pull edge. (Dell's own docs disagree about drawer NAMES - the
+    body text calls the top drawer "drawer 0" while both figures label it
+    "drawer 1" - so the profile speaks in bay ranges and positions only.)
+    """
+
+    return [
+        list(range(28, 42)),
+        list(range(14, 28)),
+        list(range(0, 14)),
+        list(range(70, 84)),
+        list(range(56, 70)),
+        list(range(42, 56)),
+    ]
+
+
 def _built_in_profiles() -> list[EnclosureProfileConfig]:
     return [
         EnclosureProfileConfig(
@@ -84,6 +138,67 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
                 list(range(0, 15)),
             ],
             row_groups=[6, 6, 3],
+        ),
+        EnclosureProfileConfig(
+            id=DELL_MD1280_PROFILE_ID,
+            label="Dell MD1280 84 Bay",
+            eyebrow="TrueNAS SCALE / Dell MD1280 (Xyratex 5U84) Drawer View",
+            summary=(
+                "Both pull-out drawers stacked as in the chassis: the top drawer "
+                "holds bays 1-42 and the bottom drawer 43-84, each three rows of "
+                "fourteen with the front row at the drawer-pull edge. Bay labels "
+                "match the 1-based chassis silk-screen; slot mapping comes from "
+                "the Linux enclosure driver because this shelf's AES pages cannot "
+                "identify SATA drives per bay."
+            ),
+            panel_title="Both Drawers (Top View)",
+            edge_label="Drawer fronts / pull edge",
+            face_style="drawer",
+            latch_edge="bottom",
+            bay_size="3.5",
+            rows=6,
+            columns=14,
+            slot_layout=dell_md1280_drawer_slot_layout(),
+            row_groups=[3, 3],
+            slot_number_base=1,
+        ),
+        EnclosureProfileConfig(
+            id=DELL_MD1280_DRAWER_TOP_PROFILE_ID,
+            label="Dell MD1280 Drawer 1-42 (Top)",
+            eyebrow="TrueNAS SCALE / Dell MD1280 Top Drawer",
+            summary=(
+                "Top drive drawer only: chassis bays 1-42 as three rows of fourteen "
+                "with the front row at the drawer-pull edge. Bay labels match the "
+                "1-based chassis silk-screen."
+            ),
+            panel_title="Top Drawer",
+            edge_label="Drawer front / pull edge",
+            face_style="drawer",
+            latch_edge="bottom",
+            bay_size="3.5",
+            rows=3,
+            columns=14,
+            slot_layout=dell_md1280_top_drawer_slot_layout(),
+            slot_number_base=1,
+        ),
+        EnclosureProfileConfig(
+            id=DELL_MD1280_DRAWER_BOTTOM_PROFILE_ID,
+            label="Dell MD1280 Drawer 43-84 (Bottom)",
+            eyebrow="TrueNAS SCALE / Dell MD1280 Bottom Drawer",
+            summary=(
+                "Bottom drive drawer only: chassis bays 43-84 as three rows of "
+                "fourteen with the front row at the drawer-pull edge. Bay labels "
+                "match the 1-based chassis silk-screen."
+            ),
+            panel_title="Bottom Drawer",
+            edge_label="Drawer front / pull edge",
+            face_style="drawer",
+            latch_edge="bottom",
+            bay_size="3.5",
+            rows=3,
+            columns=14,
+            slot_layout=dell_md1280_bottom_drawer_slot_layout(),
+            slot_number_base=1,
         ),
         EnclosureProfileConfig(
             id=SCALE_SSG_FRONT_24_PROFILE_ID,
@@ -427,6 +542,7 @@ def _profile_to_view(profile: EnclosureProfileConfig) -> EnclosureProfileView:
         slot_layout=slot_layout,
         row_groups=list(profile.row_groups),
         slot_hints={int(slot): list(hints) for slot, hints in (profile.slot_hints or {}).items()},
+        slot_number_base=profile.slot_number_base,
     )
 
 

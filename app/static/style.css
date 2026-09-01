@@ -3143,6 +3143,24 @@ button.fabric-trace-crumb:hover {
   min-height: calc(var(--service-zone-min-height, 88px) - 8px);
 }
 
+.chassis-shell[data-face-style="drawer"] {
+  /* Top-down view of vertically mounted drives: each bay is a tall, narrow
+     tray, so the face owns its proportions instead of the drive-scale ones.
+     Trays keep a minimum width and the drawer scrolls inside its bezel when
+     the window cannot fit all fourteen columns. */
+  --slot-bay-width: 118px;
+  --slot-bay-aspect: 0.46 / 1;
+  --slot-grid-gap: 12px;
+  overflow-x: auto;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0) 10%),
+    linear-gradient(180deg, #4d545c 0%, #1d242b 3%, #12171c 100%);
+}
+
+.chassis-shell[data-face-style="drawer"] .service-zone {
+  display: none;
+}
+
 .chassis-shell[data-face-style="unifi-drive"] {
   background:
     linear-gradient(180deg, rgba(255,255,255,0.22), rgba(255,255,255,0) 12%),
@@ -3268,7 +3286,7 @@ button.fabric-trace-crumb:hover {
   align-content: center;
 }
 
-.chassis-shell[data-drive-scale="3.5"]:not([data-face-style="unifi-drive"]) {
+.chassis-shell[data-drive-scale="3.5"]:not([data-face-style="unifi-drive"]):not([data-face-style="drawer"]) {
   --slot-bay-width: 164px;
   --slot-bay-aspect: 0.76 / 1;
   --service-zone-min-height: 118px;
@@ -3276,7 +3294,7 @@ button.fabric-trace-crumb:hover {
   --slot-grid-gap: 18px;
 }
 
-.chassis-shell[data-drive-scale="2.5"]:not([data-face-style="unifi-drive"]) {
+.chassis-shell[data-drive-scale="2.5"]:not([data-face-style="unifi-drive"]):not([data-face-style="drawer"]) {
   --slot-bay-width: 132px;
   --slot-bay-aspect: 0.84 / 1;
   --service-zone-min-height: 92px;
@@ -3669,6 +3687,20 @@ button.fabric-trace-crumb:hover {
   border-radius: 12px 8px 8px 12px;
 }
 
+.chassis-shell[data-face-style="drawer"] .row-slots {
+  justify-items: stretch;
+}
+
+.chassis-shell[data-face-style="drawer"] .row-group {
+  justify-self: stretch;
+  grid-template-columns: repeat(var(--group-columns, 1), minmax(72px, 1fr));
+}
+
+.chassis-shell[data-face-style="drawer"] .slot-tile,
+.chassis-shell[data-face-style="drawer"] .slot-gap {
+  width: 100%;
+}
+
 .chassis-shell[data-face-style="unifi-drive"] .row-slots {
   justify-items: stretch;
 }
@@ -3761,8 +3793,13 @@ button.fabric-trace-crumb:hover {
   content: "";
   position: absolute;
   inset: 2px;
+  /* The base .slot-tile::after state chip pins a 20px box and a dark fill;
+     reset them so the ring spans the tile instead of covering the number. */
+  width: auto;
+  height: auto;
   border-radius: 6px 6px 10px 10px;
   border: 2px solid rgba(91, 183, 255, 0.42);
+  background: none;
   pointer-events: none;
 }
 
@@ -3794,8 +3831,11 @@ button.fabric-trace-crumb:hover {
   content: "";
   position: absolute;
   inset: 2px;
+  width: auto;
+  height: auto;
   border-radius: 6px 6px 10px 10px;
   border: 1px solid rgba(76, 216, 164, 0.4);
+  background: none;
   pointer-events: none;
 }
 
@@ -3857,8 +3897,11 @@ button.fabric-trace-crumb:hover {
   content: "";
   position: absolute;
   inset: 2px;
+  width: auto;
+  height: auto;
   border-radius: 6px 6px 10px 10px;
   border: 1px solid rgba(85, 214, 235, 0.56);
+  background: none;
   pointer-events: none;
 }
 

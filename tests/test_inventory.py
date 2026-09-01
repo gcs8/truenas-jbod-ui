@@ -5094,6 +5094,43 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(list(service._smart_cache.values()), [summary_b])
             self.assertEqual(len(service._smart_cache_until), 1)
 
+    async def test_physical_enclosure_invalidation_removes_whole_and_sub_view_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="scale-cache", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            snapshot = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+            expiry = datetime.now(timezone.utc) + timedelta(seconds=30)
+            matching_keys = {
+                "enc-a",
+                "enc-a::dell-md1280-top-drawer",
+                "enc-a::dell-md1280-bottom-drawer",
+                "__default__",
+            }
+            unrelated_key = "enc-b::dell-md1280-top-drawer"
+            for cache_key in matching_keys | {unrelated_key}:
+                service._cache[cache_key] = snapshot
+                service._cache_until[cache_key] = expiry
+
+            matching_smart_keys = {
+                (system.id, "scale", cache_key, 0, ())
+                for cache_key in matching_keys
+            }
+            unrelated_smart_key = (system.id, "scale", unrelated_key, 0, ())
+            for smart_key in matching_smart_keys | {unrelated_smart_key}:
+                service._smart_cache[smart_key] = SmartSummaryView(available=True)
+                service._smart_cache_until[smart_key] = expiry
+
+            service.invalidate_physical_enclosure_snapshot_cache(
+                reason="test.physical.scope",
+                enclosure_id="enc-a::dell-md1280-top-drawer",
+            )
+
+            self.assertEqual(set(service._cache), {unrelated_key})
+            self.assertEqual(set(service._cache_until), {unrelated_key})
+            self.assertEqual(set(service._smart_cache), {unrelated_smart_key})
+            self.assertEqual(set(service._smart_cache_until), {unrelated_smart_key})
+
     async def test_scoped_invalidation_fences_stale_smart_refresh_without_stopping_other_enclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -10035,6 +10072,42 @@ class ReviewRegressionTests(unittest.TestCase):
 
             self.assertEqual(columns, 0)
             self.assertEqual((slots[0].row_index, slots[0].column_index), (0, 0))
+
+    def test_scale_linux_normal_profile_keeps_slots_missing_from_sparse_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="sparse-scale", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            selected_option = EnclosureOption(
+                id="enc-a",
+                label="Sparse shelf",
+                rows=1,
+                columns=2,
+                slot_count=3,
+                slot_layout=[[0, 2]],
+            )
+            profile = MagicMock()
+            profile.columns = 2
+            profile.slot_layout = [[0, 2]]
+            profile.slot_number_base = None
+            service._build_scale_linux_enclosure_options = MagicMock(return_value=[selected_option])
+            service.profile_registry.resolve_for_enclosure = MagicMock(return_value=profile)
+
+            slots, _enclosures, _meta, _rows, slot_count, _columns = service._correlate_scale_linux(
+                TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ParsedSSHData(),
+                [],
+                selected_enclosure_id="enc-a",
+            )
+
+            self.assertEqual([slot.slot for slot in slots], [0, 1, 2])
+            self.assertEqual(slot_count, 3)
 
     def test_parse_size_to_bytes_binary_suffixes_use_1024(self) -> None:
         self.assertEqual(parse_size_to_bytes("1 GiB"), 1024**3)

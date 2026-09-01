@@ -309,6 +309,7 @@ class EnclosureProfileView(BaseModel):
     slot_layout: list[list[int | None]] = Field(default_factory=list)
     row_groups: list[int] = Field(default_factory=list)
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
+    slot_number_base: int | None = None
 
 
 class InventorySummary(BaseModel):

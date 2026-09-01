@@ -49,6 +49,7 @@ from app.metrics import (
 from app.perf import add_perf_metadata, perf_stage
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import (
+    ENCLOSURE_SUB_VIEW_PROFILE_IDS,
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
     ProfileRegistry,
     SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
@@ -1360,6 +1361,37 @@ class InventoryService:
         add_perf_metadata(snapshot_cache_invalidated=reason)
         self._observe_inventory_cache_metrics()
 
+    def invalidate_physical_enclosure_snapshot_cache(
+        self,
+        *,
+        reason: str,
+        enclosure_id: str | None,
+        invalidate_source_bundle: bool = False,
+    ) -> None:
+        if not enclosure_id:
+            cache_keys: set[str | None] = {None}
+        else:
+            base_enclosure_id = self._base_enclosure_id(enclosure_id)
+            known_enclosure_keys = (
+                set(self._cache)
+                | set(self._cache_until)
+                | set(self._smart_cache_enclosure_generations)
+                | {key[2] for key in self._smart_cache}
+                | {key[2] for key in self._smart_cache_until}
+                | {key[2] for key in self._smart_refresh_tasks}
+            )
+            cache_keys = {
+                key
+                for key in known_enclosure_keys
+                if key != "__default__" and self._base_enclosure_id(key) == base_enclosure_id
+            }
+            cache_keys.update({base_enclosure_id, enclosure_id, None})
+        self.invalidate_snapshot_cache(
+            reason=reason,
+            cache_keys=cache_keys,
+            invalidate_source_bundle=invalidate_source_bundle,
+        )
+
     def peek_cached_snapshot(self, *, selected_enclosure_id: str | None = None) -> InventorySnapshot | None:
         preferred_keys: list[str] = []
         if selected_enclosure_id:
@@ -2513,9 +2545,9 @@ class InventoryService:
                 or f"LED backend {slot_view.led_backend!r} is not supported for slot {slot:02d}."
             )
         if invalidate_snapshot:
-            self.invalidate_snapshot_cache(
+            self.invalidate_physical_enclosure_snapshot_cache(
                 reason="set_slot_led",
-                cache_keys=[slot_view.enclosure_id, None],
+                enclosure_id=slot_view.enclosure_id,
                 invalidate_source_bundle=True,
             )
 
@@ -2586,7 +2618,10 @@ class InventoryService:
         )
         saved = self.mapping_store.save_mapping(mapping, expected_revision=expected_revision)
         if invalidate_snapshot:
-            self.invalidate_snapshot_cache(reason="save_mapping", cache_keys=[enclosure_id, None])
+            self.invalidate_physical_enclosure_snapshot_cache(
+                reason="save_mapping",
+                enclosure_id=enclosure_id,
+            )
         return saved
 
     async def clear_mapping(
@@ -2607,7 +2642,10 @@ class InventoryService:
             expected_revision=expected_revision,
         )
         if cleared and invalidate_snapshot:
-            self.invalidate_snapshot_cache(reason="clear_mapping", cache_keys=[enclosure_id, None])
+            self.invalidate_physical_enclosure_snapshot_cache(
+                reason="clear_mapping",
+                enclosure_id=enclosure_id,
+            )
         return cleared
 
     async def get_slot_smart_summary(
@@ -4464,7 +4502,7 @@ class InventoryService:
             ssh_data.ses_enclosures,
             slot_count,
             self.system.truenas.enclosure_filter,
-            selected_option.id,
+            self._base_enclosure_id(selected_option.id),
         )
         for warning in ssh_meta.get("warnings") or []:
             warning_text = normalize_text(warning)
@@ -4479,6 +4517,11 @@ class InventoryService:
         )
         selected_meta = self._merge_enclosure_meta(self._enclosure_option_meta(selected_option), api_selected_meta)
         selected_meta = self._merge_enclosure_meta(selected_meta, ssh_meta)
+        if selected_profile is not None and selected_profile.slot_number_base is not None:
+            # Chassis such as the Dell MD1280 silk-screen their bays 1-based
+            # while SES device slot numbers stay 0-based; the profile carries
+            # the label base so the rendered bay numbers match the metal.
+            selected_meta["slot_number_base"] = selected_profile.slot_number_base
         slot_candidates = merge_slot_candidate_maps(ssh_candidates, api_candidates)
         api_topology_members = parse_pool_query_topology(raw_data.pools)
         api_enclosure_ids: set[str] = set()
@@ -4517,14 +4560,26 @@ class InventoryService:
         )
         slot_count = infer_slot_count_from_layout(layout_rows, slot_count)
         slot_positions = layout_slot_positions(layout_rows)
+        mapping_enclosure_id = self._base_enclosure_id(selected_option.id)
+        is_sub_view = mapping_enclosure_id != selected_option.id
+        # Synthetic drawer sub-views render only their own layout slots. Normal
+        # profiles retain the existing range behavior so sparse custom layouts
+        # do not silently remove bays from inventory.
+        slots_to_render = (
+            sorted(slot_positions)
+            if is_sub_view and slot_positions
+            else list(range(slot_count))
+        )
+        if is_sub_view:
+            slot_count = len(slots_to_render)
         slot_views: list[SlotView] = []
 
-        for slot in range(slot_count):
+        for slot in slots_to_render:
             candidate = dict(slot_candidates.get(slot, {}))
-            mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            mapping = self.mapping_store.get_mapping(self.system.id, mapping_enclosure_id, slot)
             disk = self._resolve_disk_for_slot(
                 slot,
-                selected_option.id,
+                mapping_enclosure_id,
                 mapping,
                 disks_by_key,
                 disks_by_slot,
@@ -7897,6 +7952,32 @@ class InventoryService:
             option = self._ses_enclosure_to_option(enclosure)
             if option is None:
                 continue
+            # Multi-drawer chassis expose one selectable view per drawer in
+            # addition to the whole-shelf view; the suffixed option id keeps
+            # selector state distinct while _base_enclosure_id maps it back
+            # to the real SES enclosure for candidates and manual mappings.
+            for sub_profile_id in ENCLOSURE_SUB_VIEW_PROFILE_IDS.get(option.profile_id or "", []):
+                sub_profile = self.profile_registry.get(sub_profile_id)
+                if sub_profile is None:
+                    continue
+                sub_slots = [
+                    slot
+                    for row in sub_profile.slot_layout
+                    for slot in row
+                    if slot is not None
+                ]
+                options.append(
+                    EnclosureOption(
+                        id=f"{option.id}::{sub_profile.id}",
+                        label=sub_profile.label,
+                        name=option.name,
+                        profile_id=sub_profile.id,
+                        rows=sub_profile.rows,
+                        columns=sub_profile.columns,
+                        slot_count=len(sub_slots),
+                        slot_layout=copy_layout_rows(sub_profile.slot_layout),
+                    )
+                )
             options.append(option)
 
         return sorted(
@@ -7907,6 +7988,12 @@ class InventoryService:
                 item.label,
             ),
         )
+
+    @staticmethod
+    def _base_enclosure_id(option_id: str | None) -> str | None:
+        if not option_id:
+            return option_id
+        return option_id.split("::", 1)[0]
 
     @staticmethod
     def _enclosure_option_meta(option: EnclosureOption) -> dict[str, str | None]:
@@ -9312,9 +9399,13 @@ class InventoryService:
             )
             enriched_raw_status["transport_address"] = linux_scsi_summary.get("transport_address")
 
+        label_base = enclosure_meta.get("slot_number_base")
+        if not isinstance(label_base, int):
+            label_base = self.settings.layout.slot_number_base
+
         return SlotView(
             slot=slot,
-            slot_label=f"{slot + self.settings.layout.slot_number_base:02d}",
+            slot_label=f"{slot + label_base:02d}",
             row_index=row_index,
             column_index=column_index,
             enclosure_id=enclosure_id,
@@ -9382,7 +9473,7 @@ class InventoryService:
                 filter(
                     None,
                     [
-                        f"{slot + self.settings.layout.slot_number_base:02d}",
+                        f"{slot + label_base:02d}",
                         device_name or "",
                         multipath.device_name if multipath else "",
                         " ".join(member.device_name for member in multipath.members) if multipath else "",

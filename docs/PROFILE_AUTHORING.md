@@ -50,6 +50,7 @@ Optional fields:
   - `top-loader`
   - `front-drive`
   - `rear-drive`
+  - `drawer` (plain top-down tray field with no service-bay art)
 - `latch_edge`: tray-release edge used for visual polish:
   - `bottom`
   - `right`
@@ -60,6 +61,10 @@ Optional fields:
   - `3.5`
   - `2.5`
 - `slot_layout`: explicit row-by-row slot ordering
+- `slot_number_base`: optional bay-label base for chassis whose silk-screen
+  numbering differs from the 0-based SES device slot numbers (the Dell MD1280
+  labels bays 1-84); honored on the SCALE/Linux SES path, and omitted profiles
+  inherit the global `layout.slot_number_base`
 - `row_groups`: per-row grouping hints used to render divider blocks
 - `slot_hints`: per-slot matching hints for SSH-only or generic Linux systems
   that need controller, device, or transport-address correlation

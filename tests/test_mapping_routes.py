@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, Mock, patch
 from app import main as app_main
 from app.models.domain import (
     InventorySnapshot,
+    LedAction,
+    LedRequest,
     ManualMapping,
     MappingBundle,
     MappingImportConfirmation,
@@ -167,6 +169,102 @@ class MappingImportRouteTests(unittest.TestCase):
             selected_enclosure_id="enc-a",
             expected_revision="b" * 64,
             invalidate_snapshot=False,
+        )
+        self.assertEqual(service.invalidate_physical_enclosure_snapshot_cache.call_count, 2)
+        service.invalidate_physical_enclosure_snapshot_cache.assert_any_call(
+            reason="route.save_mapping",
+            enclosure_id="enc-a",
+            invalidate_source_bundle=False,
+        )
+        service.invalidate_physical_enclosure_snapshot_cache.assert_any_call(
+            reason="route.clear_mapping",
+            enclosure_id="enc-a",
+        )
+
+    def test_led_mutation_invalidates_every_view_of_the_physical_enclosure(self) -> None:
+        route = next(
+            route
+            for route in app_main.app.routes
+            if getattr(route, "path", "") == "/api/slots/{slot}/led"
+            and "POST" in (getattr(route, "methods", None) or set())
+        )
+        service = Mock()
+        service.system.id = "system-a"
+        service.system.truenas.platform = "scale"
+        service.set_slot_led = AsyncMock()
+        service.get_snapshot = AsyncMock(
+            return_value=InventorySnapshot(slots=[], refresh_interval_seconds=30)
+        )
+        registry = Mock()
+        registry.get_service.return_value = service
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "ensure_slot_bounds"),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            asyncio.run(
+                route.endpoint(
+                    slot=2,
+                    payload=LedRequest(action=LedAction.identify),
+                    system_id="system-a",
+                    enclosure_id="enc-a::dell-md1280-top-drawer",
+                )
+            )
+
+        service.invalidate_physical_enclosure_snapshot_cache.assert_called_once_with(
+            reason="route.set_slot_led",
+            enclosure_id="enc-a::dell-md1280-top-drawer",
+            invalidate_source_bundle=True,
+        )
+
+    def test_mapping_save_that_clears_identify_invalidates_the_source_bundle(self) -> None:
+        route = next(
+            route
+            for route in app_main.app.routes
+            if getattr(route, "path", "") == "/api/slots/{slot}/mapping"
+            and "POST" in (getattr(route, "methods", None) or set())
+        )
+        service = Mock()
+        service.system.id = "system-a"
+        service.system.truenas.platform = "scale"
+        service.save_mapping = AsyncMock(
+            return_value=ManualMapping(
+                system_id="system-a",
+                enclosure_id="enc-a",
+                slot=2,
+                serial="SANITIZED",
+            )
+        )
+        service.set_slot_led = AsyncMock()
+        service.get_snapshot = AsyncMock(
+            return_value=InventorySnapshot(slots=[], refresh_interval_seconds=30)
+        )
+        registry = Mock()
+        registry.get_service.return_value = service
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "ensure_slot_bounds"),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            asyncio.run(
+                route.endpoint(
+                    slot=2,
+                    payload=MappingRequest(
+                        expected_revision="a" * 64,
+                        serial="SANITIZED",
+                        clear_identify_after_save=True,
+                    ),
+                    system_id="system-a",
+                    enclosure_id="enc-a::dell-md1280-top-drawer",
+                )
+            )
+
+        service.invalidate_physical_enclosure_snapshot_cache.assert_called_once_with(
+            reason="route.save_mapping",
+            enclosure_id="enc-a",
+            invalidate_source_bundle=True,
         )
 
     def test_stale_single_mapping_mutations_return_409_before_side_effects(self) -> None:
