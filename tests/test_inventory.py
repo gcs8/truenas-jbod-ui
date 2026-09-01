@@ -1134,6 +1134,190 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(resolved.topology_label, "ESXi local Enc > slot 252:2 > direct disk")
         self.assertEqual(resolved.health, "ONLINE")
 
+    def test_build_esxi_disk_records_uses_selected_enclosure_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="generic-esxi",
+                truenas=TrueNASConfig(platform="esxi"),
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                esxi_storcli_physical_drives=[
+                    {
+                        "slot_key": "252:0",
+                        "enclosure_id": "252",
+                        "slot": 0,
+                        "controller_id": "c0",
+                        "state": "JBOD",
+                    }
+                ]
+            )
+
+            records = service._build_esxi_disk_records(
+                ssh_data,
+                enclosure_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+            )
+
+            self.assertEqual(records[0].enclosure_id, SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
+
+    def test_build_esxi_topology_members_uses_parsed_virtual_drive_raid_level(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="generic-esxi",
+                truenas=TrueNASConfig(platform="esxi"),
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                esxi_storcli_virtual_drives=[
+                    {
+                        "vd_id": "0",
+                        "name": "data",
+                        "raid": "RAID5",
+                        "physical_drives": [
+                            {"slot_key": "252:0", "enclosure_id": "252", "slot": 0},
+                        ],
+                    }
+                ],
+                esxi_storcli_physical_drives=[
+                    {
+                        "slot_key": "252:0",
+                        "enclosure_id": "252",
+                        "slot": 0,
+                        "controller_id": "c0",
+                        "state": "Onln",
+                    }
+                ],
+            )
+
+            record = service._build_esxi_disk_records(
+                ssh_data,
+                enclosure_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+            )[0]
+            members = service._build_esxi_topology_members([record])
+
+            self.assertEqual(record.raw["virtual_drive_raid_levels"], ["RAID5"])
+            self.assertEqual(members["252:0"].vdev_class, "raid5")
+            self.assertEqual(members["252:0"].topology_label, "data > RAID5 member > slot 252:0")
+
+    def test_build_esxi_topology_members_does_not_invent_unknown_raid_level(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="generic-esxi",
+                truenas=TrueNASConfig(platform="esxi"),
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            record = service._build_esxi_disk_records(
+                ParsedSSHData(
+                    esxi_storcli_physical_drives=[
+                        {
+                            "slot_key": "252:0",
+                            "enclosure_id": "252",
+                            "slot": 0,
+                            "controller_id": "c0",
+                            "state": "Onln",
+                        }
+                    ]
+                ),
+                enclosure_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+            )[0]
+
+            member = service._build_esxi_topology_members([record])["252:0"]
+
+            self.assertEqual(member.vdev_class, "raid")
+            self.assertEqual(member.topology_label, "ESXi local RAID > RAID member > slot 252:0")
+
+    def test_build_esxi_disk_records_qualifies_virtual_membership_by_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="multi-controller-esxi",
+                truenas=TrueNASConfig(platform="esxi"),
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                esxi_storcli_virtual_drives=[
+                    {
+                        "controller_id": "c0",
+                        "vd_id": "0",
+                        "name": "boot",
+                        "raid": "RAID1",
+                        "physical_drives": [
+                            {"controller_id": "c0", "slot_key": "252:0", "slot": 0},
+                        ],
+                    },
+                    {
+                        "controller_id": "c1",
+                        "vd_id": "0",
+                        "name": "data",
+                        "raid": "RAID5",
+                        "physical_drives": [
+                            {"controller_id": "c1", "slot_key": "252:0", "slot": 0},
+                        ],
+                    },
+                ],
+                esxi_storcli_physical_drives=[
+                    {
+                        "controller_id": "c0",
+                        "slot_key": "252:0",
+                        "enclosure_id": "252",
+                        "slot": 0,
+                        "state": "Onln",
+                    },
+                    {
+                        "controller_id": "c1",
+                        "slot_key": "252:0",
+                        "enclosure_id": "252",
+                        "slot": 0,
+                        "state": "Onln",
+                    },
+                ],
+            )
+
+            records = service._build_esxi_disk_records(
+                ssh_data,
+                enclosure_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+            )
+            by_controller = {record.raw["controller_id"]: record for record in records}
+
+            self.assertEqual(by_controller["c0"].pool_name, "boot")
+            self.assertEqual(by_controller["c0"].raw["virtual_drive_raid_levels"], ["RAID1"])
+            self.assertEqual(by_controller["c1"].pool_name, "data")
+            self.assertEqual(by_controller["c1"].raw["virtual_drive_raid_levels"], ["RAID5"])
+            topology = service._build_esxi_topology_members(records)
+            self.assertEqual(topology["c0:252:0"].pool_name, "boot")
+            self.assertEqual(topology["c1:252:0"].pool_name, "data")
+
     def test_correlate_esxi_host_keeps_aoc_specific_storcli_warning_on_aoc_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             system = SystemConfig(
