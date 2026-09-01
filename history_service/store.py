@@ -662,15 +662,17 @@ class HistoryStore:
 
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._normalize_shared_path_permissions(self.file_path.parent, is_dir=True)
+        ownership_source = self.file_path if self.file_path.exists() else self.file_path.parent
+        ownership_metadata = os.stat(ownership_source, follow_symlinks=False)
         temp_fd, temp_path = self._create_private_replacement_file(
             self.file_path.parent,
             prefix=f".{self.file_path.name}.",
             suffix=".restore",
         )
         temp_metadata = os.fstat(temp_fd)
-
-        with self._lock:
-            try:
+        try:
+            os.fchown(temp_fd, ownership_metadata.st_uid, ownership_metadata.st_gid)
+            with self._lock:
                 with closing(sqlite3.connect(source)) as source_connection, closing(
                     sqlite3.connect(f"/proc/self/fd/{temp_fd}")
                 ) as restore_connection:
@@ -690,10 +692,10 @@ class HistoryStore:
                 self._normalize_database_permissions()
                 self._journal_mode_identity = None
                 self._initialize_schema(migration_lock_held=True)
-            finally:
-                if temp_fd is not None:
-                    os.close(temp_fd)
-                self._discard_owned_path(temp_path, temp_metadata)
+        finally:
+            if temp_fd is not None:
+                os.close(temp_fd)
+            self._discard_owned_path(temp_path, temp_metadata)
 
     def restore_backup(self, source_path: str | Path) -> None:
         self._require_unsegmented_operation("v1 restore")
