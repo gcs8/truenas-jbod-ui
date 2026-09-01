@@ -1440,18 +1440,17 @@ def _infer_scale_enclosure_profile(
         )
     if "en-8435" in name:
         # Dell EN-8435A enclosure module = MD1280, the Xyratex 5U84 platform
-        # (issue #119). Two pull-out drawers of 3x14; SES element index is the
-        # 0-based bay number and chassis labels are 1-based. Verified against
-        # the Dell owner's manual: slots 1-42 live in drawer 0 (the physical
-        # top drawer per the minimum-population rule), and the profile renders
-        # both drawers side by side exactly like the manual's Figure 11 —
-        # drawer 0 left, drawer 1 right, a gap column between, bay numbers
-        # running down each front/middle/back column.
+        # (issue #119). Two pull-out drawers of 3x14 stacked in the chassis;
+        # SES element index is the 0-based bay number and chassis labels are
+        # 1-based. Verified against the Dell manuals: bays 1-42 are the top
+        # drawer and 43-84 the bottom drawer (deployment manual Figure 6),
+        # rendered as two three-row bands with each front row at the
+        # drawer-pull edge.
         return (
             DELL_MD1280_PROFILE_ID,
             "Dell MD1280 84 Bay",
+            6,
             14,
-            7,
             dell_md1280_drawer_slot_layout(),
         )
     if slot_count == 60:

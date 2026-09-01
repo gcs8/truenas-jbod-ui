@@ -66,16 +66,21 @@ def default_slot_layout(rows: int, columns: int, slot_count: int) -> list[list[i
 
 def dell_md1280_drawer_slot_layout() -> list[list[int | None]]:
     """
-    Side-by-side drawer view matching the Dell owner's manual Figure 11:
-    drawer 0 (chassis slots 1-42, the physical top drawer) as three columns on
-    the left, a gap column, drawer 1 (43-84) as three columns on the right.
-    Within each drawer the columns run front/middle/back left to right and the
-    fourteen bay numbers run top to bottom, exactly as the manual draws them.
+    Stacked drawer view matching the physical chassis (deployment manual
+    Figure 6): the top drawer holds chassis bays 1-42 and the bottom drawer
+    43-84, each a band of three 14-bay rows with the front row at the
+    drawer-pull edge. (Dell's own docs disagree about drawer NAMES - the
+    body text calls the top drawer "drawer 0" while both figures label it
+    "drawer 1" - so the profile speaks in bay ranges and positions only.)
     """
 
     return [
-        [row, 14 + row, 28 + row, None, 42 + row, 56 + row, 70 + row]
-        for row in range(14)
+        list(range(28, 42)),
+        list(range(14, 28)),
+        list(range(0, 14)),
+        list(range(70, 84)),
+        list(range(56, 70)),
+        list(range(42, 56)),
     ]
 
 
@@ -106,21 +111,22 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             label="Dell MD1280 84 Bay",
             eyebrow="TrueNAS SCALE / Dell MD1280 (Xyratex 5U84) Drawer View",
             summary=(
-                "Both pull-out drawers side by side as in the Dell owner's manual: "
-                "drawer 0 (bays 1-42, the top drawer) on the left, drawer 1 (43-84) "
-                "on the right, each three columns of fourteen bays numbered down the "
-                "front, middle, and back rows. Bay labels match the 1-based chassis "
-                "silk-screen; slot mapping comes from the Linux enclosure driver "
-                "because this shelf's AES pages cannot identify SATA drives per bay."
+                "Both pull-out drawers stacked as in the chassis: the top drawer "
+                "holds bays 1-42 and the bottom drawer 43-84, each three rows of "
+                "fourteen with the front row at the drawer-pull edge. Bay labels "
+                "match the 1-based chassis silk-screen; slot mapping comes from "
+                "the Linux enclosure driver because this shelf's AES pages cannot "
+                "identify SATA drives per bay."
             ),
-            panel_title="Drawers 0 + 1 (Top View)",
-            edge_label="Drawer pull direction / chassis front",
+            panel_title="Drawers Top View",
+            edge_label="Drawer fronts / pull edge",
             face_style="top-loader",
-            latch_edge="left",
+            latch_edge="bottom",
             bay_size="3.5",
-            rows=14,
-            columns=7,
+            rows=6,
+            columns=14,
             slot_layout=dell_md1280_drawer_slot_layout(),
+            row_groups=[3, 3],
             slot_number_base=1,
         ),
         EnclosureProfileConfig(
