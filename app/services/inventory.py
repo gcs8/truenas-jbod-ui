@@ -3245,6 +3245,9 @@ class InventoryService:
                     source_bundle,
                     selected_enclosure_id,
                 )
+            for warning in ssh_data.warnings:
+                if warning not in warnings:
+                    warnings.append(warning)
             if self.system.truenas.platform == "esxi":
                 storcli_runtime_warning = self._esxi_storcli_runtime_warning(source_bundle.ssh_outputs)
                 if storcli_runtime_warning and storcli_runtime_warning not in warnings:
@@ -3847,7 +3850,10 @@ class InventoryService:
         if self.system.truenas.platform == "linux":
             return self._build_linux_disk_records(ssh_data)
         if self.system.truenas.platform == "esxi":
-            records = self._build_esxi_disk_records(ssh_data)
+            records = self._build_esxi_disk_records(
+                ssh_data,
+                enclosure_id=self.system.default_profile_id,
+            )
             if bmc_inventory is not None:
                 records.extend(self._build_bmc_disk_records(bmc_inventory))
             return records
@@ -4224,7 +4230,10 @@ class InventoryService:
         slot_positions = layout_slot_positions(layout_rows)
         selected_meta = self._enclosure_option_meta(selected_option)
 
-        disk_records = self._build_esxi_disk_records(ssh_data)
+        disk_records = self._build_esxi_disk_records(
+            ssh_data,
+            enclosure_id=selected_option.id,
+        )
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
         disks_by_bmc_slot: dict[int, DiskRecord] = {}
@@ -8138,37 +8147,66 @@ class InventoryService:
         return text.upper()
 
     @staticmethod
-    def _storcli_virtual_drive_names_for_slots(virtual_drives: list[dict[str, Any]]) -> dict[str, list[str]]:
-        names_by_slot: dict[str, list[str]] = {}
+    def _storcli_virtual_drive_metadata_for_slots(
+        virtual_drives: list[dict[str, Any]],
+    ) -> dict[tuple[str | None, str], dict[str, list[str]]]:
+        metadata_by_slot: dict[tuple[str | None, str], dict[str, list[str]]] = {}
         for virtual_drive in virtual_drives:
             name = normalize_text(virtual_drive.get("name")) or (
                 f"VD{virtual_drive.get('vd_id')}" if virtual_drive.get("vd_id") is not None else "Virtual Drive"
             )
+            raid_level = normalize_text(virtual_drive.get("raid"))
+            controller_id = normalize_text(virtual_drive.get("controller_id"))
             for physical_drive in virtual_drive.get("physical_drives") or []:
                 if not isinstance(physical_drive, dict):
                     continue
                 slot_key = normalize_text(physical_drive.get("slot_key"))
                 if not slot_key:
                     continue
-                names_by_slot.setdefault(slot_key, [])
-                if name not in names_by_slot[slot_key]:
-                    names_by_slot[slot_key].append(name)
-        return names_by_slot
+                physical_controller_id = (
+                    normalize_text(physical_drive.get("controller_id")) or controller_id
+                )
+                metadata = metadata_by_slot.setdefault(
+                    (physical_controller_id, slot_key),
+                    {"names": [], "raid_levels": []},
+                )
+                if name not in metadata["names"]:
+                    metadata["names"].append(name)
+                if raid_level and raid_level not in metadata["raid_levels"]:
+                    metadata["raid_levels"].append(raid_level)
+        return metadata_by_slot
 
-    def _build_esxi_disk_records(self, ssh_data: ParsedSSHData) -> list[DiskRecord]:
-        vd_names_by_slot = self._storcli_virtual_drive_names_for_slots(ssh_data.esxi_storcli_virtual_drives)
+    def _build_esxi_disk_records(
+        self,
+        ssh_data: ParsedSSHData,
+        *,
+        enclosure_id: str | None = None,
+    ) -> list[DiskRecord]:
+        vd_metadata_by_slot = self._storcli_virtual_drive_metadata_for_slots(
+            ssh_data.esxi_storcli_virtual_drives
+        )
         storage_devices_by_key = self._build_esxi_storage_device_index(ssh_data)
+        record_enclosure_id = normalize_text(enclosure_id) or normalize_text(
+            self.system.default_profile_id
+        )
         records: list[DiskRecord] = []
         for drive in ssh_data.esxi_storcli_physical_drives:
             slot = drive.get("slot") if isinstance(drive.get("slot"), int) else None
             slot_key = normalize_text(drive.get("slot_key"))
-            enclosure_id = normalize_text(drive.get("enclosure_id"))
+            storcli_enclosure_id = normalize_text(drive.get("enclosure_id"))
             if slot is None or not slot_key:
                 continue
             connector_name = normalize_text(drive.get("connector_name"))
             connected_port = normalize_text(drive.get("connected_port"))
             controller_id = normalize_text(drive.get("controller_id")) or "c0"
-            virtual_drive_names = vd_names_by_slot.get(slot_key, [])
+            controller_slot_key = f"{controller_id}:{slot_key}"
+            virtual_drive_metadata = vd_metadata_by_slot.get(
+                (controller_id, slot_key)
+            ) or vd_metadata_by_slot.get((None, slot_key), {})
+            virtual_drive_names = list(virtual_drive_metadata.get("names", []))
+            virtual_drive_raid_levels = list(
+                virtual_drive_metadata.get("raid_levels", [])
+            )
             storcli_state = normalize_text(drive.get("state"))
             is_jbod_member = (storcli_state or "").upper() == "JBOD" and not virtual_drive_names
             pool_name = " + ".join(virtual_drive_names) if virtual_drive_names else (
@@ -8210,10 +8248,15 @@ class InventoryService:
                 model,
                 connector_name,
                 connected_port,
+                controller_slot_key,
                 esxi_device_id,
                 other_uids,
-                f"{controller_id}/e{enclosure_id}/s{slot}" if enclosure_id is not None else None,
-                f"/{controller_id}/e{enclosure_id}/s{slot}" if enclosure_id is not None else None,
+                f"{controller_id}/e{storcli_enclosure_id}/s{slot}"
+                if storcli_enclosure_id is not None
+                else None,
+                f"/{controller_id}/e{storcli_enclosure_id}/s{slot}"
+                if storcli_enclosure_id is not None
+                else None,
             ):
                 lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
 
@@ -8225,7 +8268,8 @@ class InventoryService:
                         "storcli_physical_drive": drive,
                         "storcli_state": storcli_state,
                         "storcli_slot": slot_key,
-                        "storcli_enclosure_id": enclosure_id,
+                        "storcli_controller_slot": controller_slot_key,
+                        "storcli_enclosure_id": storcli_enclosure_id,
                         "controllerId": controller_id,
                         "controller_id": controller_id,
                         "interface": normalize_text(drive.get("interface")),
@@ -8233,6 +8277,7 @@ class InventoryService:
                         "connected_port": connected_port,
                         "transport_address": connector_name or connected_port or slot_key,
                         "virtual_drive_names": virtual_drive_names,
+                        "virtual_drive_raid_levels": virtual_drive_raid_levels,
                         "media_errors": drive.get("media_errors"),
                         "other_errors": drive.get("other_errors"),
                         "predictive_errors": drive.get("predictive_errors"),
@@ -8273,7 +8318,7 @@ class InventoryService:
                     last_smart_test_lifetime_hours=None,
                     logical_block_size=logical_block_size,
                     physical_block_size=logical_block_size,
-                    enclosure_id=ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
+                    enclosure_id=record_enclosure_id,
                     slot=slot,
                     smart_devices=smart_devices,
                     lookup_keys=lookup_keys,
@@ -8855,17 +8900,42 @@ class InventoryService:
                 vdev_class = "JBOD"
             else:
                 pool_name = normalize_text(disk.pool_name) or "ESXi local RAID"
+                raw_raid_levels = disk.raw.get("virtual_drive_raid_levels")
+                raid_levels = [
+                    level
+                    for level in dict.fromkeys(
+                        normalize_text(str(value) if value is not None else None)
+                        for value in (
+                            raw_raid_levels
+                            if isinstance(raw_raid_levels, list)
+                            else []
+                        )
+                    )
+                    if level and level.upper() not in {"NA", "N/A", "JBOD"}
+                ]
+                fallback_raid_level = normalize_text(disk.raw.get("esxi_raid_level"))
+                if (
+                    not raid_levels
+                    and fallback_raid_level
+                    and fallback_raid_level.upper() not in {"NA", "N/A", "JBOD"}
+                ):
+                    raid_levels.append(fallback_raid_level)
+                raid_label = " + ".join(raid_levels) if raid_levels else "RAID"
                 topology_label = " > ".join(
                     filter(
                         None,
                         [
                             pool_name,
-                            "RAID1 member",
+                            f"{raid_label} member",
                             f"slot {slot_key}" if slot_key else None,
                         ],
                     )
                 )
-                vdev_class = "raid1"
+                vdev_class = (
+                    re.sub(r"[^a-z0-9]+", "", raid_levels[0].lower())
+                    if len(raid_levels) == 1
+                    else "raid"
+                )
             member = ZpoolMember(
                 pool_name=pool_name,
                 vdev_class=vdev_class,
@@ -8882,6 +8952,7 @@ class InventoryService:
                 disk.raw.get("connector_name"),
                 disk.raw.get("connected_port"),
                 disk.raw.get("storcli_slot"),
+                disk.raw.get("storcli_controller_slot"),
             ):
                 for key in normalize_lookup_keys(str(value) if value is not None else None):
                     members[key] = member
@@ -9122,7 +9193,7 @@ class InventoryService:
                 return hinted
 
         if not quantastor_ses_empty:
-            direct = disks_by_slot.get((enclosure_id, slot)) or disks_by_slot.get((None, slot))
+            direct = disks_by_slot.get((enclosure_id, slot))
             if direct:
                 return direct
 
@@ -9132,6 +9203,15 @@ class InventoryService:
                 hinted = disks_by_key.get(normalized.lower())
                 if hinted:
                     return hinted
+
+        # The bare (None, slot) bucket is last-writer-wins across every
+        # enclosure on the system (TrueNAS disk.query carries no enclosure id
+        # the extractor recognises), so it may only break ties after the SES
+        # device name observed in this bay has had its say (issue #164).
+        if not quantastor_ses_empty:
+            direct = disks_by_slot.get((None, slot))
+            if direct:
+                return direct
 
         for candidate in (
             raw_slot_status.get("device_hint"),

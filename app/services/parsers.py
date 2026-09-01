@@ -71,6 +71,7 @@ class ParsedSSHData:
     esxi_storcli_controller: dict[str, Any] = field(default_factory=dict)
     esxi_storcli_virtual_drives: list[dict[str, Any]] = field(default_factory=list)
     esxi_storcli_physical_drives: list[dict[str, Any]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -3336,26 +3337,86 @@ def parse_esxcli_smart_get(output: str, logical_block_size: int | None = None) -
     return summary
 
 
-def _parse_storcli_json(output: str) -> dict[str, Any]:
+def _storcli_controller_id(
+    controller: dict[str, Any],
+    response_data: dict[str, Any],
+    controller_index: int,
+    default_controller_id: str | None = None,
+) -> str:
+    command_status = controller.get("Command Status")
+    if isinstance(command_status, dict):
+        for key in ("Controller", "Controller Number", "Ctl"):
+            value = normalize_text(
+                str(command_status.get(key)) if command_status.get(key) is not None else None
+            )
+            if value:
+                return value.lower() if value.lower().startswith("c") else f"c{value}"
+    for key in response_data:
+        if not isinstance(key, str):
+            continue
+        match = re.search(r"/c(?P<controller>\d+)(?:/|\b)", key, re.IGNORECASE)
+        if match:
+            return f"c{match.group('controller')}"
+    return normalize_text(default_controller_id) or f"c{controller_index}"
+
+
+def _parse_storcli_controllers(
+    output: str,
+    warnings: list[str] | None = None,
+    default_controller_id: str | None = None,
+) -> list[dict[str, Any]]:
     try:
         payload = json.loads(output)
     except json.JSONDecodeError:
-        return {}
+        return []
     if not isinstance(payload, dict):
-        return {}
+        return []
     controllers = payload.get("Controllers")
     if not isinstance(controllers, list) or not controllers:
-        return {}
-    controller = controllers[0]
-    if not isinstance(controller, dict):
-        return {}
-    response_data = controller.get("Response Data")
-    if not isinstance(response_data, dict):
-        response_data = {}
-    return {
-        "command_status": controller.get("Command Status") if isinstance(controller.get("Command Status"), dict) else {},
-        "response_data": response_data,
-    }
+        return []
+    parsed: list[dict[str, Any]] = []
+    for controller_index, controller in enumerate(controllers):
+        if not isinstance(controller, dict):
+            if warnings is not None:
+                warnings.append(
+                    f"StorCLI controller block {controller_index} was invalid and was not used: "
+                    "controller entry was not an object."
+                )
+            continue
+        raw_command_status = controller.get("Command Status")
+        command_status: dict[str, Any] = (
+            raw_command_status if isinstance(raw_command_status, dict) else {}
+        )
+        response_data = controller.get("Response Data")
+        if not isinstance(response_data, dict):
+            if warnings is not None:
+                detail = normalize_text(
+                    str(command_status.get("Description") or command_status.get("Status") or "")
+                ) or "Response Data was not an object"
+                warnings.append(
+                    f"StorCLI controller block {controller_index} was invalid and was not used: "
+                    f"{detail.rstrip('.')}."
+                )
+            continue
+        parsed.append(
+            {
+                "controller_id": _storcli_controller_id(
+                    controller,
+                    response_data,
+                    controller_index,
+                    default_controller_id if len(controllers) == 1 else None,
+                ),
+                "controller_index": controller_index,
+                "command_status": command_status,
+                "response_data": response_data,
+            }
+        )
+    return parsed
+
+
+def _parse_storcli_json(output: str) -> dict[str, Any]:
+    controllers = _parse_storcli_controllers(output)
+    return controllers[0] if controllers else {}
 
 
 def _storcli_response_data(output: str) -> dict[str, Any]:
@@ -3465,8 +3526,12 @@ def _collect_storcli_physical_drive_rows(response_data: dict[str, Any]) -> list[
     return fallback_rows
 
 
-def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
-    response_data = _storcli_response_data(output)
+def _parse_storcli_physical_drive_response(
+    response_data: dict[str, Any],
+    *,
+    controller_id: str,
+    controller_index: int,
+) -> list[dict[str, Any]]:
     rows = _collect_storcli_physical_drive_rows(response_data)
     details_by_slot = _collect_storcli_drive_details(response_data)
     drives: list[dict[str, Any]] = []
@@ -3476,7 +3541,9 @@ def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
         enclosure_id, slot, slot_key = _parse_storcli_eid_slot(row.get("EID:Slt") or row.get("EID:Slt "))
         if slot_key is None:
             continue
-        row_controller_id = normalize_text(str(row.get("Ctl") or row.get("Controller") or ""))
+        row_controller_id = normalize_text(
+            str(row.get("Ctl") or row.get("Controller") or controller_id)
+        )
         detail = (
             details_by_slot.get(f"{row_controller_id.lower()}:{slot_key}", {})
             if row_controller_id
@@ -3526,7 +3593,10 @@ def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
                 "slot_key": slot_key,
                 "enclosure_id": enclosure_id,
                 "slot": slot,
-                "controller_id": normalize_text(str(detail.get("controller_id") or row_controller_id or "c0")),
+                "controller_id": normalize_text(
+                    str(detail.get("controller_id") or row_controller_id or controller_id)
+                ),
+                "controller_index": controller_index,
                 "device_id": normalize_text(str(row.get("DID") if row.get("DID") is not None else "")),
                 "state": normalize_text(str(row.get("State") or "")),
                 "drive_group": normalize_text(str(row.get("DG") if row.get("DG") is not None else "")),
@@ -3552,6 +3622,27 @@ def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
                 "raw": row,
                 "detail": detail,
             }
+        )
+    return drives
+
+
+def parse_storcli_physical_drives(
+    output: str,
+    warnings: list[str] | None = None,
+    default_controller_id: str | None = None,
+) -> list[dict[str, Any]]:
+    drives: list[dict[str, Any]] = []
+    for controller in _parse_storcli_controllers(
+        output,
+        warnings,
+        default_controller_id,
+    ):
+        drives.extend(
+            _parse_storcli_physical_drive_response(
+                controller["response_data"],
+                controller_id=controller["controller_id"],
+                controller_index=controller["controller_index"],
+            )
         )
     return drives
 
@@ -3587,8 +3678,12 @@ def _collect_storcli_virtual_drive_rows(response_data: dict[str, Any]) -> list[d
     return fallback_rows
 
 
-def parse_storcli_virtual_drives(output: str) -> list[dict[str, Any]]:
-    response_data = _storcli_response_data(output)
+def _parse_storcli_virtual_drive_response(
+    response_data: dict[str, Any],
+    *,
+    controller_id: str,
+    controller_index: int,
+) -> list[dict[str, Any]]:
     rows = _collect_storcli_virtual_drive_rows(response_data)
     details_by_vd = _collect_storcli_virtual_drive_details(response_data)
     virtual_drives: list[dict[str, Any]] = []
@@ -3613,6 +3708,7 @@ def parse_storcli_virtual_drives(output: str) -> list[dict[str, Any]]:
             if slot_key:
                 physical_drives.append(
                     {
+                        "controller_id": controller_id,
                         "slot_key": slot_key,
                         "enclosure_id": enclosure_id,
                         "slot": slot,
@@ -3621,6 +3717,8 @@ def parse_storcli_virtual_drives(output: str) -> list[dict[str, Any]]:
                 )
         virtual_drives.append(
             {
+                "controller_id": controller_id,
+                "controller_index": controller_index,
                 "vd_id": vd_id,
                 "name": normalize_text(str(row.get("Name") or _first_detail_value(detail, "Name") or "")),
                 "raid": normalize_text(str(row.get("TYPE") or row.get("Type") or "")),
@@ -3631,6 +3729,27 @@ def parse_storcli_virtual_drives(output: str) -> list[dict[str, Any]]:
                 "raw": row,
                 "detail": detail,
             }
+        )
+    return virtual_drives
+
+
+def parse_storcli_virtual_drives(
+    output: str,
+    warnings: list[str] | None = None,
+    default_controller_id: str | None = None,
+) -> list[dict[str, Any]]:
+    virtual_drives: list[dict[str, Any]] = []
+    for controller in _parse_storcli_controllers(
+        output,
+        warnings,
+        default_controller_id,
+    ):
+        virtual_drives.extend(
+            _parse_storcli_virtual_drive_response(
+                controller["response_data"],
+                controller_id=controller["controller_id"],
+                controller_index=controller["controller_index"],
+            )
         )
     return virtual_drives
 
@@ -3749,12 +3868,22 @@ def parse_ssh_outputs(
             if controller_info and not parsed.esxi_storcli_controller:
                 parsed.esxi_storcli_controller = controller_info
         elif re.match(r"^storcli /(?:c\d+|call)/vall show all J$", command_key):
+            controller_match = re.match(r"^storcli /(?P<controller>c\d+)/", command_key)
             parsed.esxi_storcli_virtual_drives.extend(
-                parse_storcli_virtual_drives(normalized_outputs[command_key])
+                parse_storcli_virtual_drives(
+                    normalized_outputs[command_key],
+                    parsed.warnings,
+                    controller_match.group("controller") if controller_match else None,
+                )
             )
         elif re.match(r"^storcli /(?:c\d+|call)/eall/sall show all J$", command_key):
+            controller_match = re.match(r"^storcli /(?P<controller>c\d+)/", command_key)
             parsed.esxi_storcli_physical_drives.extend(
-                parse_storcli_physical_drives(normalized_outputs[command_key])
+                parse_storcli_physical_drives(
+                    normalized_outputs[command_key],
+                    parsed.warnings,
+                    controller_match.group("controller") if controller_match else None,
+                )
             )
     if normalized_outputs.get("gmultipath list"):
         parsed.multipath_info = parse_gmultipath_list(normalized_outputs["gmultipath list"])

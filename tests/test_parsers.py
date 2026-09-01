@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -349,6 +350,136 @@ Slot00 [0,0]  Element type: Array device slot
         self.assertEqual(parsed.esxi_storcli_physical_drives[0]["connector_name"], "C0 x4")
         self.assertEqual(parsed.esxi_storcli_physical_drives[0]["temperature_c"], 34)
         self.assertEqual(parsed.esxi_storcli_physical_drives[1]["media_errors"], 262)
+
+    def test_parse_storcli_physical_drives_reads_all_controller_blocks(self) -> None:
+        output = json.dumps(
+            {
+                "Controllers": [
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "Drive Information": [
+                                {"Ctl": "c0", "EID:Slt": "252:0", "State": "JBOD"},
+                            ]
+                        },
+                    },
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "Drive Information": [
+                                {"Ctl": "c1", "EID:Slt": "252:1", "State": "Onln"},
+                            ]
+                        },
+                    },
+                ]
+            }
+        )
+
+        parsed = parse_storcli_physical_drives(output)
+
+        self.assertEqual([drive["controller_id"] for drive in parsed], ["c0", "c1"])
+        self.assertEqual([drive["slot_key"] for drive in parsed], ["252:0", "252:1"])
+
+    def test_parse_storcli_uses_controller_id_from_single_controller_command(self) -> None:
+        output = json.dumps(
+            {
+                "Controllers": [
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "Drive Information": [
+                                {"EID:Slt": "252:0", "State": "JBOD"},
+                            ]
+                        },
+                    }
+                ]
+            }
+        )
+
+        parsed = parse_ssh_outputs(
+            {"storcli /c7/eall/sall show all J": output},
+            slot_count=1,
+            enclosure_filter=None,
+        )
+
+        self.assertEqual(parsed.esxi_storcli_physical_drives[0]["controller_id"], "c7")
+
+    def test_parse_storcli_virtual_drives_reads_all_controller_blocks(self) -> None:
+        output = json.dumps(
+            {
+                "Controllers": [
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "VD LIST": [
+                                {"DG/VD": "0/0", "Name": "boot", "TYPE": "RAID1", "State": "Optl"},
+                            ],
+                            "PDs for VD 0": [{"EID:Slt": "252:0"}],
+                        },
+                    },
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "VD LIST": [
+                                {"DG/VD": "1/1", "Name": "data", "TYPE": "RAID5", "State": "Optl"},
+                            ],
+                            "PDs for VD 1": [{"EID:Slt": "252:0"}],
+                        },
+                    },
+                ]
+            }
+        )
+
+        parsed = parse_ssh_outputs(
+            {"storcli /call/vall show all J": output},
+            slot_count=2,
+            enclosure_filter=None,
+        )
+
+        self.assertEqual(
+            [
+                (
+                    drive["controller_id"],
+                    drive["name"],
+                    drive["raid"],
+                    drive["physical_drives"][0]["controller_id"],
+                )
+                for drive in parsed.esxi_storcli_virtual_drives
+            ],
+            [("c0", "boot", "RAID1", "c0"), ("c1", "data", "RAID5", "c1")],
+        )
+
+    def test_parse_storcli_warns_when_a_controller_block_is_invalid(self) -> None:
+        output = json.dumps(
+            {
+                "Controllers": [
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "Drive Information": [
+                                {"Ctl": "c0", "EID:Slt": "252:0", "State": "JBOD"},
+                            ]
+                        },
+                    },
+                    {
+                        "Command Status": {"Status": "Failure", "Description": "synthetic failure"},
+                        "Response Data": "not an object",
+                    },
+                ]
+            }
+        )
+
+        parsed = parse_ssh_outputs(
+            {"storcli /call/eall/sall show all J": output},
+            slot_count=1,
+            enclosure_filter=None,
+        )
+
+        self.assertEqual([drive["controller_id"] for drive in parsed.esxi_storcli_physical_drives], ["c0"])
+        self.assertEqual(
+            parsed.warnings,
+            ["StorCLI controller block 1 was invalid and was not used: synthetic failure."],
+        )
 
     def test_parse_unifi_gpio_debug_uses_last_output_line_per_slot(self) -> None:
         output = """
