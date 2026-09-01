@@ -1129,6 +1129,6 @@
 </div>
 
 <script>
-  window.ADMIN_BOOTSTRAP = {{ admin_bootstrap | tojson }};
+  window.ADMIN_BOOTSTRAP = {{ admin_bootstrap_json | script_json_text }};
 </script>
 {% endblock %}

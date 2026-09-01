@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +26,135 @@ from history_service.segment_sealer import (
     seal_history_segment,
 )
 from history_service.migration_lock import history_write_lock
+from history_service.store import SCHEMA
 
 
 class SegmentedHistoryMigrationError(RuntimeError):
     pass
+
+
+@lru_cache(maxsize=1)
+def _current_history_schema_contract() -> tuple[
+    tuple[tuple[str, tuple[str, ...]], ...],
+    tuple[str, ...],
+]:
+    with sqlite3.connect(":memory:") as connection:
+        connection.executescript(SCHEMA)
+        table_names = tuple(
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+                """
+            )
+        )
+        tables = tuple(
+            (
+                table_name,
+                tuple(
+                    str(row[1])
+                    for row in connection.execute(
+                        f'PRAGMA table_info("{table_name}")'
+                    )
+                ),
+            )
+            for table_name in table_names
+        )
+        triggers = tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name"
+            )
+        )
+    return tables, triggers
+
+
+def _require_current_history_schema(
+    source: Path,
+    source_metadata: os.stat_result,
+) -> None:
+    source_uri = f"{source.resolve().as_uri()}?mode=ro&immutable=1"
+    try:
+        with sqlite3.connect(source_uri, uri=True) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise ValueError("History database integrity check failed before segmented migration.")
+            actual_tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            actual_triggers = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )
+            }
+            required_tables, required_triggers = _current_history_schema_contract()
+            missing_tables = [
+                table_name
+                for table_name, _ in required_tables
+                if table_name not in actual_tables
+            ]
+            missing_columns: list[str] = []
+            for table_name, required_columns in required_tables:
+                if table_name in missing_tables:
+                    continue
+                actual_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        f'PRAGMA table_info("{table_name}")'
+                    )
+                }
+                missing_columns.extend(
+                    f"{table_name}.{column_name}"
+                    for column_name in required_columns
+                    if column_name not in actual_columns
+                )
+            missing_triggers = [
+                trigger_name
+                for trigger_name in required_triggers
+                if trigger_name not in actual_triggers
+            ]
+    except sqlite3.Error as exc:
+        raise ValueError(
+            "History database schema could not be preflighted for segmented migration."
+        ) from exc
+
+    current_metadata = os.stat(source, follow_symlinks=False)
+    expected_identity = (
+        source_metadata.st_dev,
+        source_metadata.st_ino,
+        source_metadata.st_mode,
+        source_metadata.st_size,
+        source_metadata.st_mtime_ns,
+    )
+    current_identity = (
+        current_metadata.st_dev,
+        current_metadata.st_ino,
+        current_metadata.st_mode,
+        current_metadata.st_size,
+        current_metadata.st_mtime_ns,
+    )
+    if current_identity != expected_identity:
+        raise ValueError("Segmented history source changed during migration preflight.")
+    if missing_tables or missing_columns or missing_triggers:
+        missing = ", ".join(
+            [
+                *(f"table:{name}" for name in missing_tables),
+                *(f"column:{name}" for name in missing_columns),
+                *(f"trigger:{name}" for name in missing_triggers),
+            ]
+        )
+        raise ValueError(
+            "History database schema is incompatible with segmented migration; "
+            "initialize it once through the current history service before retrying. "
+            f"Missing schema objects: {missing}."
+        )
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -463,6 +589,8 @@ def _migrate_segmented_history_locked(
     catalog_path = segments_directory / "catalog.json"
     if path_entry_exists(catalog_path):
         raise ValueError("Segmented history catalog already exists.")
+    source_metadata = _require_regular_source(source)
+    _require_current_history_schema(source, source_metadata)
     if not apply:
         return {
             "apply": False,
@@ -470,7 +598,6 @@ def _migrate_segmented_history_locked(
             "detail": "Dry run only. Pass --apply after quiescing the history service.",
         }
 
-    source_metadata = _require_regular_source(source)
     segments_directory = _prepare_output_directory(segments_directory)
     rollback_path = segments_directory / ".v1-rollback.sqlite3"
     pending_path = segments_directory / MIGRATION_PENDING_MARKER
