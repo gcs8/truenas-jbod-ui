@@ -156,6 +156,7 @@ the wiki:
 - [SSH Setup and Sudo](wiki/SSH-Setup-and-Sudo.md)
 - [Live Enclosures and Storage Views](wiki/Live-Enclosures-and-Storage-Views.md)
 - [History and Snapshot Export](wiki/History-and-Snapshot-Export.md)
+- [Segmented History v2](docs/SEGMENTED_HISTORY_V2.md)
 - [Demo and Offline Workflows](wiki/Demo-and-Offline-Workflows.md)
 - [Public Demo Site](wiki/Public-Demo-Site.md)
 - [Docker and GHCR Deployment](wiki/Docker-and-GHCR-Deployment.md)

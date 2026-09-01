@@ -19,7 +19,8 @@ from pydantic import BaseModel, Field, model_validator
 _ARCHIVE_PREFIX = "jbod-scheduled-backup-"
 _ARCHIVE_SUFFIX = ".tar.zst.enc"
 _ARCHIVE_NAME = re.compile(
-    r"^jbod-scheduled-backup-(?P<timestamp>[0-9]{8}T[0-9]{6}Z)-(?P<nonce>[0-9a-f]{8})\.tar\.zst\.enc$"
+    r"^jbod-scheduled-backup-(?P<timestamp>[0-9]{8}T[0-9]{6}Z)-"
+    r"(?P<nonce>[0-9a-f]{8})(?:\.7z|\.tar\.zst\.enc)$"
 )
 _MAX_PASSPHRASE_BYTES = 512
 _MAX_STATUS_BYTES = 64 * 1024
@@ -508,9 +509,10 @@ class ScheduledBackupRunner:
                     passphrase=passphrase,
                     included_paths=list(self.included_groups),
                 )
+                archive_suffix = ".7z" if artifact.filename.endswith(".7z") else _ARCHIVE_SUFFIX
                 filename = (
                     f"{_ARCHIVE_PREFIX}{attempted_at.strftime('%Y%m%dT%H%M%SZ')}-"
-                    f"{uuid.uuid4().hex[:8]}{_ARCHIVE_SUFFIX}"
+                    f"{uuid.uuid4().hex[:8]}{archive_suffix}"
                 )
                 size_bytes, digest, absent_groups = self._publish(
                     artifact.path,

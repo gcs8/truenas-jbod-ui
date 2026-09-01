@@ -181,6 +181,7 @@ If you are running the optional history sidecar, the main retention knobs are:
 - `HISTORY_RETENTION_INTERVAL_SECONDS`
 - `HISTORY_RETENTION_BATCH_SIZE`
 - `HISTORY_RETENTION_MAX_BATCHES_PER_RUN`
+- `HISTORY_SEGMENT_CATALOG_PATH` for an already migrated segmented deployment
 
 The default behavior is:
 
@@ -205,6 +206,13 @@ Temperature and annualized-rate rollups use the sample-count-weighted average;
 cumulative byte and power-on-hour counters use the latest value in each bucket.
 Slot events remain discrete records and are unavailable before the configured
 event-retention cutoff.
+
+When `HISTORY_SEGMENT_CATALOG_PATH` is set, retention modifies only the writable
+hot database. Immutable segments are never edited in place. Segment removal or
+compaction requires a new complete catalog generation with matching tombstones
+and `supersedes` declarations. V1-only history backup/restore and system-wide
+delete, purge, or adopt operations fail closed while segmented history is
+active.
 
 If you want longer-lived copies on a different disk or NAS later, point
 `HISTORY_LONG_TERM_BACKUP_DIR` at that mounted path and leave the short-term

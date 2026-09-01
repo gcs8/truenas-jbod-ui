@@ -31,6 +31,7 @@ configure_service_logging(
 def build_history_store(settings: HistorySettings) -> HistoryStore:
     return HistoryStore(
         settings.sqlite_path,
+        segment_catalog_path=settings.segment_catalog_path,
         permission_repair_enabled=settings.permission_repair_enabled,
         shared_dir_mode=settings.shared_dir_mode,
         shared_file_mode=settings.shared_file_mode,

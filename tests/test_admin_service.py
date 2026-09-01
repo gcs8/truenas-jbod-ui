@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+import stat
 import tempfile
 import threading
 import urllib.error
@@ -14,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
 from fastapi import Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from app import __version__
 from admin_service.config import AdminSettings
@@ -25,6 +26,7 @@ from admin_service.main import decode_optional_secret_header
 from admin_service.main import enrich_quantastor_nodes_from_ssh
 from admin_service.main import get_history_store
 from admin_service.main import read_limited_request_body
+from admin_service.main import stream_limited_request_body_to_file
 from admin_service.main import templates as admin_templates
 from app.config import (
     AdminSurfaceConfig,
@@ -138,6 +140,20 @@ class BackupImportRequestLimitTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 413)
         self.assertEqual(receive_probe.call_count, 2)
 
+    def test_file_backed_body_streams_to_private_temporary_file(self) -> None:
+        request, receive_probe = make_streaming_request([b"abc", b"def"])
+
+        archive_path = asyncio.run(
+            stream_limited_request_body_to_file(request, max_bytes=6)
+        )
+        try:
+            self.assertEqual(archive_path.read_bytes(), b"abcdef")
+            self.assertEqual(stat.S_IMODE(archive_path.stat().st_mode), 0o600)
+            self.assertEqual(receive_probe.call_count, 2)
+        finally:
+            archive_path.unlink(missing_ok=True)
+            archive_path.parent.rmdir()
+
 
 class MainAppBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -171,7 +187,10 @@ class MainAppBoundaryTests(unittest.TestCase):
             with (
                 patch(
                     "admin_service.main.get_history_settings",
-                    return_value=SimpleNamespace(sqlite_path="/tmp/admin-history.sqlite3"),
+                    return_value=SimpleNamespace(
+                        sqlite_path="/tmp/admin-history.sqlite3",
+                        segment_catalog_path="/tmp/admin-history-segments/catalog.json",
+                    ),
                 ),
                 patch("admin_service.main.HistoryStore") as history_store,
             ):
@@ -180,6 +199,7 @@ class MainAppBoundaryTests(unittest.TestCase):
             history_store.assert_called_once_with(
                 "/tmp/admin-history.sqlite3",
                 recover_unreadable_database=False,
+                segment_catalog_path="/tmp/admin-history-segments/catalog.json",
             )
         finally:
             get_history_store.cache_clear()
@@ -253,6 +273,67 @@ class MainAppBoundaryTests(unittest.TestCase):
         with self.assertRaises(asyncio.CancelledError):
             asyncio.run(disconnect_during_body())
         self.assertFalse(workspace.exists())
+
+    def test_admin_backup_import_streams_file_and_cleans_workspace(self) -> None:
+        request, _receive_probe = make_streaming_request([b"archive-", b"bytes"])
+        maintenance = SimpleNamespace(
+            stopped_containers=[],
+            restarted_containers=[],
+            restart_failures={},
+        )
+        service = MagicMock()
+        observed: dict[str, object] = {}
+
+        def import_from_file(path: Path, **kwargs: object) -> tuple[dict[str, object], object]:
+            observed["path"] = path
+            observed["content"] = path.read_bytes()
+            observed["mode"] = stat.S_IMODE(path.stat().st_mode)
+            return (
+                {
+                    "ok": True,
+                    "systems": [],
+                    "restored_paths": [],
+                    "preserved_absent_groups": [],
+                },
+                maintenance,
+            )
+
+        service.import_bundle_from_file.side_effect = import_from_file
+        service.import_bundle.side_effect = AssertionError("byte import must not be used")
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
+        runtime_service = MagicMock()
+        runtime_service.managed_containers = {}
+
+        with (
+            patch("admin_service.main.get_maintenance_service", return_value=service),
+            patch(
+                "admin_service.main.reload_app_settings",
+                return_value=SimpleNamespace(default_system_id=None),
+            ),
+            patch(
+                "admin_service.main.get_runtime_service",
+                return_value=runtime_service,
+            ),
+            patch("admin_service.main.build_runtime_payload", new=AsyncMock(return_value={})),
+            patch("admin_service.main.serialize_systems", return_value=[]),
+        ):
+            response = asyncio.run(
+                route.endpoint(
+                    request,
+                    stop_services=True,
+                    restart_services=False,
+                )
+            )
+
+        self.assertIsInstance(response, JSONResponse)
+        self.assertEqual(observed["content"], b"archive-bytes")
+        self.assertEqual(observed["mode"], 0o600)
+        archive_path = observed["path"]
+        assert isinstance(archive_path, Path)
+        self.assertFalse(archive_path.exists())
+        self.assertFalse(archive_path.parent.exists())
+        service.import_bundle_from_file.assert_called_once()
+        service.import_bundle.assert_not_called()
 
     def test_admin_backup_export_cleans_workspace_when_response_setup_fails(self) -> None:
         workspace = Path(tempfile.mkdtemp(prefix="admin-export-setup-failure-"))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from admin_service.services.runtime_control import DockerRuntimeError
@@ -228,6 +229,26 @@ class AdminMaintenanceService:
     ) -> tuple[dict[str, Any], MaintenanceOutcome]:
         def operation(_stopped: list[str]) -> dict[str, Any]:
             return self.backup_service.import_bundle(content, passphrase=passphrase)
+
+        return self._run_with_quiesced_services(
+            operation,
+            stop_services=stop_services,
+            restart_services=restart_services,
+        )
+
+    def import_bundle_from_file(
+        self,
+        archive_path: Path,
+        *,
+        passphrase: str | None = None,
+        stop_services: bool = False,
+        restart_services: bool = True,
+    ) -> tuple[dict[str, Any], MaintenanceOutcome]:
+        def operation(_stopped: list[str]) -> dict[str, Any]:
+            return self.backup_service.import_bundle_from_file(
+                archive_path,
+                passphrase=passphrase,
+            )
 
         return self._run_with_quiesced_services(
             operation,
