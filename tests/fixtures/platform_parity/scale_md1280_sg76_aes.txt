@@ -1,0 +1,535 @@
+  DELL      EN-8435A-E6EBD    3535
+  Primary enclosure logical identifier (hex): 5000000000000104
+Additional element status diagnostic page:
+  generation code: 0x0
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 0
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000079
+          phy identifier: 0x0
+      Element index: 1  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 1
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000080
+          phy identifier: 0x0
+      Element index: 2  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 2
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000081
+          phy identifier: 0x0
+      Element index: 3  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 3
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000082
+          phy identifier: 0x0
+      Element index: 4  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 4
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000083
+          phy identifier: 0x0
+      Element index: 5  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 5
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000084
+          phy identifier: 0x0
+      Element index: 6  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 6
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000085
+          phy identifier: 0x0
+      Element index: 7  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 7
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000086
+          phy identifier: 0x0
+      Element index: 8  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 8
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000087
+          phy identifier: 0x0
+      Element index: 9  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 9
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000088
+          phy identifier: 0x0
+      Element index: 10  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 10
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000089
+          phy identifier: 0x0
+      Element index: 11  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 11
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000090
+          phy identifier: 0x0
+      Element index: 12  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 12
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000091
+          phy identifier: 0x0
+      Element index: 13  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 13
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000078
+          SAS address: 0x5000000000000092
+          phy identifier: 0x0
+      Element index: 14  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 14
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000093
+          SAS address: 0x5000000000000094
+          phy identifier: 0x0
+      Element index: 15  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 15
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000093
+          SAS address: 0x5000000000000095
+          phy identifier: 0x0
+      Element index: 16  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 16
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000093
+          SAS address: 0x5000000000000096
+          phy identifier: 0x0
+      Element index: 17  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 17
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000093
+          SAS address: 0x5000000000000097
+          phy identifier: 0x0
+      Element index: 18  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 18
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000093
+          SAS address: 0x5000000000000098
+          phy identifier: 0x0
+      Element index: 19  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 19
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SATA_device
+          attached SAS address: 0x5000000000000093
+          SAS address: 0x5000000000000099
+          phy identifier: 0x0
+      Element index: 20  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 21  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 22  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 23  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 24  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 25  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 26  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 27  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 28  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 29  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 30  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 31  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 32  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 33  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 34  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 35  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 36  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 37  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 38  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 39  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 40  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 41  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 42  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 43  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 44  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 45  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 46  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 47  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 48  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 49  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 50  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 51  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 52  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 53  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 54  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 55  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 56  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 57  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 58  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 59  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 60  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 61  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 62  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 63  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 64  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 65  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 66  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 67  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 68  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 69  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 70  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 71  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 72  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 73  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 1, device slot number: 73
+        phy index: 0
+          SAS device type: end device
+          initiator port for:
+          target port for: SSP
+          attached SAS address: 0x5000000000000100
+          SAS address: 0x5000000000000101
+          phy identifier: 0x0
+      Element index: 74  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 75  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 76  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 77  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 78  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 79  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 80  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 81  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 82  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 83  eiioe=0
+        flagged as invalid (no further information)
+    Element type: SAS expander, subenclosure id: 0 [ti=10]
+      Element index: 132  eiioe=0
+        Transport protocol: SAS
+        number of phys: 36
+        SAS address: 0x5000000000000093
+        Attached connector; other_element pairs:
+          [0] connector ei: 154; other ei: 141
+          [1] connector ei: 154; other ei: 141
+          [2] connector ei: 154; other ei: 141
+          [3] connector ei: 154; other ei: 141
+          [4] connector ei: 155; other ei: 141
+          [5] connector ei: 155; other ei: 141
+          [6] connector ei: 155; other ei: 141
+          [7] connector ei: 155; other ei: 141
+          [8] no connector; other ei: 34
+          [9] no connector; other ei: 37
+          [10] no connector; other ei: 40
+          [11] no connector; other ei: 41
+          [12] no connector; other ei: 38
+          [13] no connector; other ei: 39
+          [14] no connector; other ei: 35
+          [15] no connector; other ei: 36
+          [16] no connector; other ei: 32
+          [17] no connector; other ei: 33
+          [18] no connector; other ei: 29
+          [19] no connector; other ei: 30
+          [20] no connector; other ei: 28
+          [21] no connector; other ei: 31
+          [22] no connector; other ei: 20
+          [23] no connector; other ei: 23
+          [24] no connector; other ei: 26
+          [25] no connector; other ei: 27
+          [26] no connector; other ei: 24
+          [27] no connector; other ei: 25
+          [28] no connector; other ei: 21
+          [29] no connector; other ei: 22
+          [30] no connector; other ei: 18
+          [31] no connector; other ei: 19
+          [32] no connector; other ei: 15
+          [33] no connector; other ei: 16
+          [34] no connector; other ei: 14
+          [35] no connector; other ei: 17
+      Element index: 133  eiioe=0
+        Transport protocol: SAS
+        number of phys: 24
+        SAS address: 0x5000000000000078
+        Attached connector; other_element pairs:
+          [0] connector ei: 156; other ei: 141
+          [1] connector ei: 156; other ei: 141
+          [2] connector ei: 156; other ei: 141
+          [3] connector ei: 156; other ei: 141
+          [4] no connector; other ei: 141
+          [5] no connector; other ei: 141
+          [6] no connector; other ei: 141
+          [7] no connector; other ei: 141
+          [8] no connector; other ei: 141
+          [9] no connector; other ei: 141
+          [10] no connector; other ei: 6
+          [11] no connector; other ei: 9
+          [12] no connector; other ei: 12
+          [13] no connector; other ei: 13
+          [14] no connector; other ei: 10
+          [15] no connector; other ei: 11
+          [16] no connector; other ei: 7
+          [17] no connector; other ei: 8
+          [18] no connector; other ei: 4
+          [19] no connector; other ei: 5
+          [20] no connector; other ei: 1
+          [21] no connector; other ei: 2
+          [22] no connector; other ei: 0
+          [23] no connector; other ei: 3
+      Element index: 134  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 135  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 136  eiioe=0
+        Transport protocol: SAS
+        number of phys: 36
+        SAS address: 0x5000000000000100
+        Attached connector; other_element pairs:
+          [0] connector ei: 159; other ei: 141
+          [1] connector ei: 159; other ei: 141
+          [2] connector ei: 159; other ei: 141
+          [3] connector ei: 159; other ei: 141
+          [4] connector ei: 158; other ei: 141
+          [5] connector ei: 158; other ei: 141
+          [6] connector ei: 158; other ei: 141
+          [7] connector ei: 158; other ei: 141
+          [8] no connector; other ei: 76
+          [9] no connector; other ei: 79
+          [10] no connector; other ei: 82
+          [11] no connector; other ei: 83
+          [12] no connector; other ei: 80
+          [13] no connector; other ei: 81
+          [14] no connector; other ei: 77
+          [15] no connector; other ei: 78
+          [16] no connector; other ei: 74
+          [17] no connector; other ei: 75
+          [18] no connector; other ei: 71
+          [19] no connector; other ei: 72
+          [20] no connector; other ei: 70
+          [21] no connector; other ei: 73
+          [22] no connector; other ei: 62
+          [23] no connector; other ei: 65
+          [24] no connector; other ei: 68
+          [25] no connector; other ei: 69
+          [26] no connector; other ei: 66
+          [27] no connector; other ei: 67
+          [28] no connector; other ei: 63
+          [29] no connector; other ei: 64
+          [30] no connector; other ei: 60
+          [31] no connector; other ei: 61
+          [32] no connector; other ei: 57
+          [33] no connector; other ei: 58
+          [34] no connector; other ei: 56
+          [35] no connector; other ei: 59
+      Element index: 137  eiioe=0
+        Transport protocol: SAS
+        number of phys: 24
+        SAS address: 0x5000000000000102
+        Attached connector; other_element pairs:
+          [0] connector ei: 157; other ei: 141
+          [1] connector ei: 157; other ei: 141
+          [2] connector ei: 157; other ei: 141
+          [3] connector ei: 157; other ei: 141
+          [4] no connector; other ei: 141
+          [5] no connector; other ei: 141
+          [6] no connector; other ei: 141
+          [7] no connector; other ei: 141
+          [8] no connector; other ei: 141
+          [9] no connector; other ei: 141
+          [10] no connector; other ei: 48
+          [11] no connector; other ei: 51
+          [12] no connector; other ei: 54
+          [13] no connector; other ei: 55
+          [14] no connector; other ei: 52
+          [15] no connector; other ei: 53
+          [16] no connector; other ei: 49
+          [17] no connector; other ei: 50
+          [18] no connector; other ei: 46
+          [19] no connector; other ei: 47
+          [20] no connector; other ei: 43
+          [21] no connector; other ei: 44
+          [22] no connector; other ei: 42
+          [23] no connector; other ei: 45
+      Element index: 138  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 139  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 140  eiioe=0
+        flagged as invalid (no further information)
+      Element index: 141  eiioe=0
+        Transport protocol: SAS
+        number of phys: 37
+        SAS address: 0x5000000000000103
+        Attached connector; other_element pairs:
+          [0] connector ei: 147
+          [1] connector ei: 147
+          [2] connector ei: 147
+          [3] connector ei: 147
+          [4] connector ei: 146
+          [5] connector ei: 146
+          [6] connector ei: 146
+          [7] connector ei: 146
+          [8] connector ei: 145
+          [9] connector ei: 145
+          [10] connector ei: 145
+          [11] connector ei: 145
+          [12] connector ei: 159; other ei: 136
+          [13] connector ei: 159; other ei: 136
+          [14] connector ei: 159; other ei: 136
+          [15] connector ei: 159; other ei: 136
+          [16] connector ei: 158; other ei: 136
+          [17] connector ei: 158; other ei: 136
+          [18] connector ei: 158; other ei: 136
+          [19] connector ei: 158; other ei: 136
+          [20] connector ei: 157; other ei: 137
+          [21] connector ei: 157; other ei: 137
+          [22] connector ei: 157; other ei: 137
+          [23] connector ei: 157; other ei: 137
+          [24] connector ei: 156; other ei: 133
+          [25] connector ei: 156; other ei: 133
+          [26] connector ei: 156; other ei: 133
+          [27] connector ei: 156; other ei: 133
+          [28] connector ei: 155; other ei: 132
+          [29] connector ei: 155; other ei: 132
+          [30] connector ei: 155; other ei: 132
+          [31] connector ei: 155; other ei: 132
+          [32] connector ei: 154; other ei: 132
+          [33] connector ei: 154; other ei: 132
+          [34] connector ei: 154; other ei: 132
+          [35] connector ei: 154; other ei: 132
+          [36] no connector; other ei: 122

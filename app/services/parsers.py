@@ -120,6 +120,7 @@ class SESMapSlot:
     do_not_remove: bool | None = None
     fault_sensed: bool | None = None
     fault_requested: bool | None = None
+    sas_address_degraded: bool = False
 
 
 @dataclass(slots=True)
@@ -637,6 +638,7 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
     source_strength = {
         None: 0,
         "ses_element_id_fallback": 1,
+        "ses_element_index_invalid_descriptor": 1,
         "ses_description": 2,
         "ses_device_slot_number": 2,
     }
@@ -673,6 +675,7 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
     existing.model = existing.model or slot.model
     existing.size_text = existing.size_text or slot.size_text
     existing.sas_address = existing.sas_address or slot.sas_address
+    existing.sas_address_degraded = existing.sas_address_degraded or slot.sas_address_degraded
     existing.attached_sas_address = existing.attached_sas_address or slot.attached_sas_address
     existing.sas_device_type = existing.sas_device_type or slot.sas_device_type
     existing.transport_protocol = existing.transport_protocol or slot.transport_protocol
@@ -1025,6 +1028,28 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
         if current_slot is None:
             continue
 
+        if stripped.startswith("flagged as invalid"):
+            # SES sets the INVALID bit on additional-element descriptors that
+            # carry no valid device data — issue #119's Dell EN-8435A shelf
+            # does this for every empty bay, so the descriptor has no device
+            # slot number at all. Fall back to the element index with
+            # low-strength provenance (stronger sources still override on
+            # merge) and record the bay as empty instead of dropping it from
+            # the shelf geometry.
+            current_slot.description = f"Element {current_slot.element_id} (invalid AES descriptor)"
+            current_slot.present = False
+            current_slot = _record_ses_slot(
+                enclosure,
+                current_slot,
+                reported_slot_number=current_slot.element_id,
+                source="ses_element_index_invalid_descriptor",
+                warning=(
+                    f"SES AES element {current_slot.element_id} is flagged invalid; "
+                    "using the element index as the bay number."
+                ),
+            )
+            continue
+
         if stripped.startswith("Transport protocol:"):
             current_slot.transport_protocol = normalize_text(stripped.split(":", 1)[1])
             continue
@@ -1166,17 +1191,9 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
             continue
 
         if stripped.startswith("Predicted failure=") and "status:" in stripped:
-            current_slot.status = normalize_text(stripped.split("status:", 1)[1])
-            if current_slot.status:
-                current_slot.present = "not installed" not in current_slot.status.lower()
-            for field_name, attribute in (
-                ("Predicted failure", "predicted_failure"),
-                ("Disabled", "disabled"),
-                ("Hot spare", "hot_spare"),
-            ):
-                match = re.search(rf"{re.escape(field_name)}=(?P<value>[01])", stripped)
-                if match:
-                    setattr(current_slot, attribute, match.group("value") == "1")
+            # Shared with the join parser so the presence semantics of SES
+            # status codes cannot drift between the two pages again.
+            _apply_sg_ses_status_line(current_slot, stripped)
             continue
 
         ident_match = re.search(r"\bIdent=(?P<ident>[01])\b", stripped)
@@ -1316,7 +1333,16 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
 def _apply_sg_ses_status_line(slot: SESMapSlot, line: str) -> None:
     slot.status = normalize_text(line.split("status:", 1)[1])
     if slot.status:
-        slot.present = "not installed" not in slot.status.lower()
+        lowered = slot.status.lower()
+        if "not installed" in lowered or "absent" in lowered:
+            slot.present = False
+        elif lowered.startswith("ok") or "installed" in lowered or "ready" in lowered:
+            slot.present = True
+        # Condition codes such as Critical/Noncritical/Unknown/Unsupported say
+        # nothing about occupancy by themselves — issue #119's shelf latches
+        # Critical onto every EMPTY bay (documented minimum-drive-count rule),
+        # so treating "anything but not installed" as present invented drives.
+        # Those statuses leave presence undecided for stronger evidence.
     for field_name, attribute in (
         ("Predicted failure", "predicted_failure"),
         ("Disabled", "disabled"),
@@ -1503,6 +1529,121 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
                 _merge_ses_slot_evidence(existing_unmapped, slot)
 
     return list(merged.values())
+
+
+def parse_enclosure_sysfs_map(output: str) -> dict[str, dict[int, list[str]]]:
+    """
+    Parse the Linux enclosure-driver slot map probe into per-sg slot hints.
+
+    Each line is pipe-separated:
+
+        <enclosure scsi id>|<sg name>|<slot attr>|<component name>|<block devices>
+
+    The kernel `ses` module binds disks to enclosure components for SAS and
+    SATA alike, so this evidence keeps slot mapping working when AES pages
+    cannot provide per-bay SAS addresses (issue #119: expanders that report
+    one shared SAS address for every SATA bay). The component `slot` attribute
+    carries the SES device slot number; component names are only trusted as a
+    fallback when they are purely numeric, because they can also be free-form
+    element descriptor text.
+    """
+
+    mapping: dict[str, dict[int, list[str]]] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or "|" not in line:
+            continue
+        parts = line.split("|", 4)
+        if len(parts) != 5:
+            continue
+        _enclosure_id, sg_field, slot_field, component_field, devices_field = (
+            part.strip() for part in parts
+        )
+        sg_tokens = sg_field.split()
+        sg_name = sg_tokens[0] if sg_tokens else ""
+        if not re.fullmatch(r"sg\d+", sg_name):
+            continue
+        slot_number: int | None = None
+        if re.fullmatch(r"-?\d+", slot_field):
+            slot_number = int(slot_field)
+        if slot_number is None or slot_number < 0:
+            if re.fullmatch(r"\d+", component_field):
+                slot_number = int(component_field)
+            else:
+                continue
+        devices = []
+        for token in devices_field.split():
+            normalized = normalize_device_name(token)
+            if normalized and normalized not in devices:
+                devices.append(normalized)
+        if not devices:
+            continue
+        slots = mapping.setdefault(sg_name, {})
+        existing = slots.setdefault(slot_number, [])
+        for device in devices:
+            if device not in existing:
+                existing.append(device)
+    return mapping
+
+
+def _apply_enclosure_sysfs_device_names(
+    enclosures: list[SESMapEnclosure],
+    sysfs_slots: dict[str, dict[int, list[str]]],
+) -> None:
+    for enclosure in enclosures:
+        sg_name = (enclosure.ses_device or "").rsplit("/", 1)[-1]
+        slot_hints = sysfs_slots.get(sg_name)
+        if not slot_hints:
+            continue
+        for slot_number, device_names in slot_hints.items():
+            slot = enclosure.slots.get(slot_number)
+            if slot is None:
+                continue
+            for device_name in device_names:
+                if device_name not in slot.device_names:
+                    slot.device_names.append(device_name)
+
+
+def _flag_degraded_ses_sas_addresses(enclosure: SESMapEnclosure) -> None:
+    """
+    Disable per-bay SAS matching when AES repeats one address across bays.
+
+    Some expanders fill every Array-device AES descriptor with their own SAS
+    address instead of a per-bay device address (issue #119: an 84-bay shelf
+    reporting the expander address for all SATA bays). Matching disks against
+    that shared value can only produce wrong slots, so the shared address is
+    demoted to display evidence and slot presence is re-derived from the
+    remaining SES signals instead of the address value.
+    """
+
+    all_slots = [*enclosure.slots.values(), *enclosure.unmapped_slots]
+    counts: dict[str, int] = {}
+    for slot in all_slots:
+        if slot.sas_address and slot.sas_address != "0":
+            counts[slot.sas_address] = counts.get(slot.sas_address, 0) + 1
+    shared_addresses = {address for address, count in counts.items() if count > 1}
+    if not shared_addresses:
+        return
+    for slot in all_slots:
+        if slot.sas_address in shared_addresses:
+            slot.sas_address_degraded = True
+            slot.present = _degraded_slot_presence(slot)
+
+
+def _degraded_slot_presence(slot: SESMapSlot) -> bool | None:
+    type_text = (slot.sas_device_type or "").lower()
+    status_text = (slot.status or "").lower()
+    if "no sas device attached" in type_text:
+        return False
+    if any(token in status_text for token in ("not installed", "absent", "empty")):
+        return False
+    if slot.device_names:
+        return True
+    if "end device" in type_text:
+        return True
+    if status_text.startswith("ok") or "installed" in status_text or "ready" in status_text:
+        return True
+    return None
 
 
 def _enclosure_sort_key(item: SESMapEnclosure) -> tuple[int, int, int, str, str]:
@@ -1706,6 +1847,24 @@ def build_slot_candidates_from_ses_enclosures(
         if not slot_numbers and not enclosure.unmapped_slots:
             continue
         labels.append(enclosure.enclosure_name or enclosure.enclosure_id or "SES enclosure")
+        degraded_slot_count = sum(
+            1
+            for slot in [*enclosure.slots.values(), *enclosure.unmapped_slots]
+            if slot.sas_address_degraded
+        )
+        if degraded_slot_count:
+            degraded_label = (
+                enclosure.enclosure_label
+                or enclosure.enclosure_name
+                or enclosure.enclosure_id
+                or "SES enclosure"
+            )
+            unmapped_warnings.append(
+                f"{degraded_label}: SES AES reports shared SAS addresses across "
+                f"{degraded_slot_count} bays (observed with SATA drives behind some expanders), "
+                "so SAS-address slot matching is disabled for those bays. Slot mapping uses "
+                "Linux enclosure-driver evidence when available."
+            )
         if slot_numbers:
             min_slot = slot_numbers[0]
             max_slot = slot_numbers[-1]
@@ -1736,7 +1895,9 @@ def build_slot_candidates_from_ses_enclosures(
                     "ses_device": enclosure.ses_device,
                     "ses_element_id": slot.element_id,
                     "ses_slot_number": slot.slot_number,
-                    "sas_address_hint": slot.sas_address,
+                    "sas_address_hint": None if slot.sas_address_degraded else slot.sas_address,
+                    "shared_sas_address": slot.sas_address if slot.sas_address_degraded else None,
+                    "sas_address_degraded": slot.sas_address_degraded,
                     "attached_sas_address": slot.attached_sas_address,
                     "sas_device_type": slot.sas_device_type,
                     "transport_protocol": slot.transport_protocol,
@@ -1778,7 +1939,9 @@ def build_slot_candidates_from_ses_enclosures(
                 "ses_device": enclosure.ses_device,
                 "ses_element_id": slot.element_id,
                 "ses_slot_number": None,
-                "sas_address_hint": slot.sas_address,
+                "sas_address_hint": None if slot.sas_address_degraded else slot.sas_address,
+                "shared_sas_address": slot.sas_address if slot.sas_address_degraded else None,
+                "sas_address_degraded": slot.sas_address_degraded,
                 "attached_sas_address": slot.attached_sas_address,
                 "ses_targets": _merge_control_targets(
                     slot.control_targets,
@@ -2911,6 +3074,8 @@ def canonicalize_ssh_command(command: str) -> str:
                 return f"storcli {target} show all J"
     if "/sys/kernel/debug/gpio" in command:
         return "gpio debug"
+    if "/sys/class/enclosure" in command:
+        return "enclosure sysfs map"
 
     return " ".join([executable] + args).strip()
 
@@ -3619,8 +3784,16 @@ def parse_ssh_outputs(
         if enclosure:
             parsed.ses_enclosures.append(enclosure)
 
+    enclosure_sysfs_output = normalized_outputs.get("enclosure sysfs map")
+    if enclosure_sysfs_output and parsed.ses_enclosures:
+        enclosure_sysfs_slots = parse_enclosure_sysfs_map(enclosure_sysfs_output)
+        if enclosure_sysfs_slots:
+            _apply_enclosure_sysfs_device_names(parsed.ses_enclosures, enclosure_sysfs_slots)
+
     if parsed.ses_enclosures:
         parsed.ses_enclosures = _merge_ses_enclosures(parsed.ses_enclosures)
+        for enclosure in parsed.ses_enclosures:
+            _flag_degraded_ses_sas_addresses(enclosure)
     if parsed.ses_enclosures or ses_map_output or ses_show_output:
         ses_candidates, ses_meta = build_slot_candidates_from_ses_enclosures(
             parsed.ses_enclosures,

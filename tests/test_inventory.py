@@ -35,7 +35,19 @@ from app.models.domain import (
     StorageViewRuntimeView,
     SystemLocatorStatusView,
 )
-from app.services.inventory import DiskRecord, InventoryService, InventorySourceBundle, build_lunid_aliases, infer_slot_count_from_layout, parse_size_to_bytes, resolve_persistent_id
+from app.services.inventory import (
+    DiskRecord,
+    InventoryService,
+    InventorySourceBundle,
+    LINUX_ENCLOSURE_SYSFS_MAP_COMMAND,
+    build_lunid_alias_tiers,
+    build_lunid_aliases,
+    index_disks_by_sas,
+    infer_slot_count_from_layout,
+    lunid_alias_tier_sets,
+    parse_size_to_bytes,
+    resolve_persistent_id,
+)
 from app.services.mapping_store import MappingStore
 from app.services.parsers import (
     LinuxScsiDevice,
@@ -160,6 +172,78 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertIn("5002538b103e5ee0", aliases)
         self.assertIn("5002538b103e5ee1", aliases)
         self.assertIn("5002538b103e5ee2", aliases)
+
+    def test_build_lunid_alias_tiers_splits_exact_identity_from_shifted_neighbors(self) -> None:
+        exact, shifted = build_lunid_alias_tiers("5000c5003e8253a7", "scale")
+
+        self.assertEqual(exact, "5000c5003e8253a7")
+        self.assertEqual(
+            shifted,
+            {
+                "5000c5003e8253a5",
+                "5000c5003e8253a6",
+                "5000c5003e8253a8",
+                "5000c5003e8253a9",
+            },
+        )
+
+    def _make_disk_record(self, device_name: str, lunid: str) -> DiskRecord:
+        return DiskRecord(
+            raw={},
+            device_name=device_name,
+            path_device_name=device_name,
+            multipath_name=None,
+            multipath_member=None,
+            serial=None,
+            model=None,
+            size_bytes=None,
+            identifier=None,
+            health=None,
+            pool_name=None,
+            lunid=lunid,
+            bus=None,
+            temperature_c=None,
+            last_smart_test_type=None,
+            last_smart_test_status=None,
+            last_smart_test_lifetime_hours=None,
+            logical_block_size=None,
+            physical_block_size=None,
+            enclosure_id=None,
+            slot=None,
+            smart_devices=[],
+            lookup_keys=set(),
+        )
+
+    def test_index_disks_by_sas_exact_identity_beats_neighbor_shifted_alias(self) -> None:
+        # Same-batch disks often carry near-sequential lunids. With the wider
+        # scale window, each disk's shifted aliases land on the other disk's
+        # exact identity; the exact identity must always win the lookup.
+        disk_a = self._make_disk_record("sdaa", "5000c5003e825300")
+        disk_b = self._make_disk_record("sdab", "5000c5003e825302")
+
+        index = index_disks_by_sas(
+            (disk, *lunid_alias_tier_sets(disk.lunid, "scale"))
+            for disk in (disk_a, disk_b)
+        )
+
+        self.assertIs(index["5000c5003e825300"], disk_a)
+        self.assertIs(index["5000c5003e825302"], disk_b)
+        # The alias between the two identities is claimed by both disks, so it
+        # must be dropped instead of resolving to whichever disk came last.
+        self.assertNotIn("5000c5003e825301", index)
+        # Unshared shifted aliases keep matching their only claimant.
+        self.assertIs(index["5000c5003e8252fe"], disk_a)
+        self.assertIs(index["5000c5003e825304"], disk_b)
+
+    def test_index_disks_by_sas_keeps_all_aliases_for_a_single_disk(self) -> None:
+        disk = self._make_disk_record("sdaa", "5000c5003e8253a7")
+
+        index = index_disks_by_sas(
+            [(disk, *lunid_alias_tier_sets(disk.lunid, "scale"))]
+        )
+
+        for alias in build_lunid_aliases("5000c5003e8253a7", "scale"):
+            self.assertIs(index[alias], disk)
 
     def test_quantastor_backoff_warnings_are_collapsed_across_cli_and_ses(self) -> None:
         warnings = [
@@ -493,10 +577,12 @@ class InventoryHelpersTests(unittest.TestCase):
 
             commands = service._linux_storage_enrichment_probe_commands(command_results)
 
-            self.assertEqual(len(commands), 1)
+            self.assertEqual(len(commands), 2)
             self.assertIn("nvme list-subsys -o json", commands[0])
             self.assertIn("|| true", commands[0])
             self.assertEqual(canonicalize_ssh_command(commands[0]), "nvme list-subsys -o json")
+            self.assertIn("/sys/class/enclosure", commands[1])
+            self.assertEqual(canonicalize_ssh_command(commands[1]), "enclosure sysfs map")
 
     def test_linux_nvme_subsystem_failure_is_classified_as_enrichment(self) -> None:
         command_results = [
@@ -4772,7 +4858,8 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(failures, [])
             self.assertEqual(best_host, "192.0.2.60")
             self.assertEqual(probe.session_count, 1)
-            self.assertEqual(len(probe.commands), 4)
+            self.assertEqual(len(probe.commands), 5)
+            self.assertIn(LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, probe.commands)
 
     async def test_sg_ses_planned_session_serializes_same_host_batches(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -9476,6 +9563,8 @@ Enclosure Status diagnostic page:
                     return SSHCommandResult(command=command, ok=True, stdout=ec_on_output, stderr="", exit_code=0)
                 if "sg_ses --join --filter" in command:
                     return SSHCommandResult(command=command, ok=False, stdout="", stderr="join unsupported", exit_code=1)
+                if "/sys/class/enclosure" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
                 raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
 
             service._run_ssh_command = AsyncMock(side_effect=run_command)
@@ -9554,6 +9643,8 @@ Enclosure Status diagnostic page:
                     return SSHCommandResult(command=command, ok=True, stdout=ec_output, stderr="", exit_code=0)
                 if "sg_ses --join --filter /dev/sg26" in command:
                     return SSHCommandResult(command=command, ok=False, stdout="", stderr="join unsupported", exit_code=1)
+                if "/sys/class/enclosure" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
                 raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
 
             service._run_ssh_command = AsyncMock(side_effect=run_command)
@@ -9627,6 +9718,8 @@ Enclosure Status diagnostic page:
                     return SSHCommandResult(command=command, ok=True, stdout=ec_output, stderr="", exit_code=0)
                 if "sg_ses --join --filter /dev/sg26" in command:
                     return SSHCommandResult(command=command, ok=False, stdout="", stderr="join unsupported", exit_code=1)
+                if "/sys/class/enclosure" in command:
+                    return SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
                 raise AssertionError(f"Unexpected command {command!r} for host {host!r}")
 
             service._run_ssh_command = AsyncMock(side_effect=run_command)

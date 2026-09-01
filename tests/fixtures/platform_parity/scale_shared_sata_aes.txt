@@ -1,0 +1,53 @@
+  EXAMPLE  SATAJBOD84        0100
+  Primary enclosure logical identifier (hex): 5eeeeeee00000084
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 0
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5eeeeeee00000084
+          SAS address: 0x5eeeeeee00000084
+          phy identifier: 0x0
+      Element index: 1  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 1
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5eeeeeee00000084
+          SAS address: 0x5eeeeeee00000084
+          phy identifier: 0x1
+      Element index: 2  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 2
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5eeeeeee00000084
+          SAS address: 0x5eeeeeee00000084
+          phy identifier: 0x2
+      Element index: 3  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 3
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5eeeeeee00000084
+          SAS address: 0x5eeeeeee00000084
+          phy identifier: 0x3
+      Element index: 4  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 4
+        phy index: 0
+          SAS device type: end device
+          attached SAS address: 0x5eeeeeee00000084
+          SAS address: 0x5aaaaaaa00000d05
+          phy identifier: 0x4
+      Element index: 5  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 5
+        phy index: 0
+          SAS device type: no SAS device attached
+          attached SAS address: 0x5eeeeeee00000084
+          SAS address: 0x0
+          phy identifier: 0x5

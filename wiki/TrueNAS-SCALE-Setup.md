@@ -59,6 +59,11 @@ ssh:
 `smartctl` does not need to live in the standing command list. The app runs it
 on demand for the selected slot.
 
+The app also reads the Linux enclosure-driver slot bindings from
+`/sys/class/enclosure` automatically. That probe needs no sudo and no standing
+command entry, and it is what keeps slot mapping working for SATA drives behind
+expanders whose AES pages report one shared SAS address for every bay.
+
 ## 4. Required SCALE Sudo Access
 
 The important pattern is:
