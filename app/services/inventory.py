@@ -49,6 +49,7 @@ from app.metrics import (
 from app.perf import add_perf_metadata, perf_stage
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import (
+    ENCLOSURE_SUB_VIEW_PROFILE_IDS,
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
     ProfileRegistry,
     SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
@@ -4415,7 +4416,7 @@ class InventoryService:
             ssh_data.ses_enclosures,
             slot_count,
             self.system.truenas.enclosure_filter,
-            selected_option.id,
+            self._base_enclosure_id(selected_option.id),
         )
         for warning in ssh_meta.get("warnings") or []:
             warning_text = normalize_text(warning)
@@ -4472,11 +4473,17 @@ class InventoryService:
         )
         slot_count = infer_slot_count_from_layout(layout_rows, slot_count)
         slot_positions = layout_slot_positions(layout_rows)
+        # Render exactly the layout's slots: identical to range(slot_count)
+        # for every whole-shelf profile, and the drawer sub-views list only
+        # their own 42 bays.
+        slots_to_render = sorted(slot_positions) if slot_positions else list(range(slot_count))
+        slot_count = len(slots_to_render)
+        mapping_enclosure_id = self._base_enclosure_id(selected_option.id)
         slot_views: list[SlotView] = []
 
-        for slot in range(slot_count):
+        for slot in slots_to_render:
             candidate = dict(slot_candidates.get(slot, {}))
-            mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            mapping = self.mapping_store.get_mapping(self.system.id, mapping_enclosure_id, slot)
             disk = self._resolve_disk_for_slot(
                 slot,
                 selected_option.id,
@@ -7858,6 +7865,32 @@ class InventoryService:
             option = self._ses_enclosure_to_option(enclosure)
             if option is None:
                 continue
+            # Multi-drawer chassis expose one selectable view per drawer in
+            # addition to the whole-shelf view; the suffixed option id keeps
+            # selector state distinct while _base_enclosure_id maps it back
+            # to the real SES enclosure for candidates and manual mappings.
+            for sub_profile_id in ENCLOSURE_SUB_VIEW_PROFILE_IDS.get(option.profile_id or "", []):
+                sub_profile = self.profile_registry.get(sub_profile_id)
+                if sub_profile is None:
+                    continue
+                sub_slots = [
+                    slot
+                    for row in sub_profile.slot_layout
+                    for slot in row
+                    if slot is not None
+                ]
+                options.append(
+                    EnclosureOption(
+                        id=f"{option.id}::{sub_profile.id}",
+                        label=sub_profile.label,
+                        name=option.name,
+                        profile_id=sub_profile.id,
+                        rows=sub_profile.rows,
+                        columns=sub_profile.columns,
+                        slot_count=len(sub_slots),
+                        slot_layout=copy_layout_rows(sub_profile.slot_layout),
+                    )
+                )
             options.append(option)
 
         return sorted(
@@ -7868,6 +7901,12 @@ class InventoryService:
                 item.label,
             ),
         )
+
+    @staticmethod
+    def _base_enclosure_id(option_id: str | None) -> str | None:
+        if not option_id:
+            return option_id
+        return option_id.split("::", 1)[0]
 
     @staticmethod
     def _enclosure_option_meta(option: EnclosureOption) -> dict[str, str | None]:

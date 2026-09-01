@@ -227,5 +227,89 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_controller["c1"]["firmware"], "SN03")
 
 
+
+    async def test_md1280_enclosure_offers_per_drawer_sub_views(self) -> None:
+        """
+        The MD1280 selector must offer both drawers as their own views in
+        addition to the whole shelf, and a drawer view must render exactly its
+        own 42 bays with chassis-true 1-based labels.
+        """
+
+        aes_output = "\n".join(
+            [
+                "  DELL      EN-8435A-E6EBD    3535",
+                "  Primary enclosure logical identifier (hex): 5eeeeeee00000084",
+                "Additional element status diagnostic page:",
+                "  additional element status descriptor list",
+                "    Element type: Array device slot, subenclosure id: 0 [ti=0]",
+            ]
+            + [
+                line
+                for slot in (0, 1, 43, 44)
+                for line in (
+                    f"      Element index: {slot}  eiioe=0",
+                    "        Transport protocol: SAS",
+                    f"        number of phys: 1, not all phys: 1, device slot number: {slot}",
+                    "        phy index: 0",
+                    "          SAS device type: no SAS device attached",
+                    "          target port for: SATA_device",
+                    "          attached SAS address: 0x5eeeeeee00000001",
+                    f"          SAS address: 0x5eeeeeee000000{50 + slot:02x}",
+                )
+            ]
+        )
+
+        class DummyScaleClient:
+            async def fetch_all(self) -> TrueNASRawData:
+                return TrueNASRawData(
+                    enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[]
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="md1280-drawers",
+                truenas=TrueNASConfig(platform="scale"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.51", user="jbodmap", commands=[]),
+            )
+            service = build_inventory_service(settings, system, DummyScaleClient(), AsyncMock(), temp_dir)
+            overlay = parse_ssh_outputs(
+                {"sudo -n /usr/bin/sg_ses -p aes /dev/sg9": aes_output}, 84, None, None
+            )
+            service._tag_ses_overlay(overlay, "192.0.2.51")
+            service._fetch_scale_ses_overlay = AsyncMock(return_value=(overlay, []))
+
+            snapshot = await service.get_snapshot()
+            labels = [option.label for option in snapshot.enclosures]
+            self.assertEqual(
+                labels,
+                [
+                    "Dell MD1280 Drawer 1-42 (Top)",
+                    "Dell MD1280 Drawer 43-84 (Bottom)",
+                    "Dell MD1280 84 Bay",
+                ],
+            )
+            top, bottom, full = snapshot.enclosures
+            self.assertEqual(top.id, "5eeeeeee00000084::dell-md1280-drawer-top-42")
+            self.assertEqual(bottom.id, "5eeeeeee00000084::dell-md1280-drawer-bottom-42")
+            self.assertEqual(full.id, "5eeeeeee00000084")
+            self.assertEqual((top.slot_count, bottom.slot_count), (42, 42))
+
+            bottom_snap = await service.get_snapshot(selected_enclosure_id=bottom.id)
+            slots = sorted(slot.slot for slot in bottom_snap.slots)
+            self.assertEqual(slots, list(range(42, 84)))
+            self.assertEqual(bottom_snap.layout_slot_count, 42)
+            labels = sorted(slot.slot_label for slot in bottom_snap.slots)
+            self.assertEqual((labels[0], labels[-1]), ("43", "84"))
+            self.assertEqual(bottom_snap.selected_profile.id, "dell-md1280-drawer-bottom-42")
+
+            top_snap = await service.get_snapshot(selected_enclosure_id=top.id)
+            self.assertEqual(
+                sorted(slot.slot for slot in top_snap.slots), list(range(0, 42))
+            )
+            top_labels = sorted(int(slot.slot_label) for slot in top_snap.slots)
+            self.assertEqual((top_labels[0], top_labels[-1]), (1, 42))
+
+
 if __name__ == "__main__":
     unittest.main()
