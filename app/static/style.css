@@ -4000,8 +4000,11 @@ button.fabric-trace-crumb:hover {
   content: "";
   position: absolute;
   inset: 2px;
+  width: auto;
+  height: auto;
   border-radius: 6px 6px 10px 10px;
   border: 1px solid rgba(85, 214, 235, 0.56);
+  background: none;
   pointer-events: none;
 }
 
