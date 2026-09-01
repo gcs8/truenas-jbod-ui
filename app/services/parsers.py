@@ -1440,9 +1440,13 @@ def _infer_scale_enclosure_profile(
     if "en-8435" in name:
         # Dell EN-8435A enclosure module = MD1280, the Xyratex 5U84 platform
         # (issue #119). Two pull-out drawers of 3x14; SES element index is the
-        # 0-based bay number and chassis labels are 1-based. Row order per
-        # drawer follows the top-loader convention: back row rendered first,
-        # front row at the drawer-pull edge.
+        # 0-based bay number and chassis labels are 1-based. Verified against
+        # the Dell owner's manual: slots 1-42 live in drawer 0, which the
+        # minimum-population rule ("one full, front row in the top drive
+        # drawer" = fill group 1, slots 1-14) places as the physical TOP
+        # drawer, numbered left to right across the front row and then front
+        # to rear. Rendered per the top-loader convention: back row first,
+        # front row at the drawer-pull edge, drawer 0 above drawer 1.
         return (
             DELL_MD1280_PROFILE_ID,
             "Dell MD1280 84 Bay",
