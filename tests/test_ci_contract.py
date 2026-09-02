@@ -65,7 +65,13 @@ class CIWorkflowContractTests(unittest.TestCase):
 
         self.assertIn("container-smoke:", workflow_text)
         self.assertIn("docker compose -f tests/fixtures/ci-smoke.compose.yml up -d --build --wait --wait-timeout 90", workflow_text)
-        self.assertIn("trap 'docker compose -f tests/fixtures/ci-smoke.compose.yml down --volumes --remove-orphans' EXIT", workflow_text)
+        self.assertIn("cleanup() {", workflow_text)
+        self.assertIn(
+            "docker compose -f tests/fixtures/ci-smoke.compose.yml down --volumes --remove-orphans",
+            workflow_text,
+        )
+        self.assertIn('if [ -f "$compose_contract_root/compose.yaml" ]; then', workflow_text)
+        self.assertIn("trap cleanup EXIT", workflow_text)
         self.assertIn("http://127.0.0.1:18080/livez", workflow_text)
         self.assertIn("http://127.0.0.1:18080/healthz", workflow_text)
         self.assertIn('"dependency_status": "unknown"', workflow_text)

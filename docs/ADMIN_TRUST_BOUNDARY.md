@@ -37,6 +37,13 @@ authority over the Docker host. The Compose files therefore mount the socket
 only into the explicitly started, explicitly root `enclosure-admin` service;
 UI, history, and one-shot backup services receive no socket.
 
+The admin container's image filesystem is read-only. Compose drops every Linux
+capability, adds back only `CHOWN` and `FOWNER` for ownership-preserving restore,
+uses the app-data GID as its primary group, and enables `no-new-privileges`.
+Its writable host mounts are limited to config, data, and history state plus the
+Docker socket. These controls reduce accidental filesystem reach, but they do
+not weaken the socket's root-equivalent authority.
+
 A generic Docker socket proxy was evaluated but is not enabled by default.
 Method/category switches broad enough to permit container start, stop, and
 restart also expose operations beyond this client's four routes. Such a proxy

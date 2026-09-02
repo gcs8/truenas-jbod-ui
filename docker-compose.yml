@@ -2,7 +2,14 @@ services:
   enclosure-ui:
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-ui
-    user: "0:0"
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
     env_file:
       - .env
     environment:
@@ -20,7 +27,7 @@ services:
     ports:
       - "${APP_PORT:-8080}:8000"
     volumes:
-      - ./config:/app/config
+      - ./config:/app/config:ro
       - ./data:/app/data
       - ./logs:/app/logs
       - ./config/ssh:/run/ssh:ro
@@ -33,9 +40,17 @@ services:
       - history
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-history
-    user: "0:0"
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
     command: ["uvicorn", "history_service.main:app", "--host", "0.0.0.0", "--port", "8001"]
     environment:
+      TMPDIR: /app/history
       HISTORY_SOURCE_BASE_URL: http://enclosure-ui:8000
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-text}
@@ -92,11 +107,22 @@ services:
       - admin
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     container_name: truenas-jbod-admin
-    user: "0:0"
+    user: "0:${APP_GID:-10001}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+    security_opt:
+      - "no-new-privileges:true"
     command: ["uvicorn", "admin_service.main:app", "--host", "0.0.0.0", "--port", "8002"]
     env_file:
       - .env
     environment:
+      TMPDIR: /app/history
       HISTORY_SQLITE_PATH: /app/history/history.db
       HISTORY_SEGMENT_CATALOG_PATH: ${HISTORY_SEGMENT_CATALOG_PATH:-}
       HISTORY_BACKUP_DIR: ${HISTORY_BACKUP_DIR:-/app/history/backups}
@@ -118,7 +144,6 @@ services:
       - ./config:/app/config
       - ./data:/app/data
       - ./history:/app/history
-      - ./logs:/app/logs
       - ./config/ssh:/run/ssh:ro
       - /var/run/docker.sock:/var/run/docker.sock
     restart: "no"
@@ -136,8 +161,18 @@ services:
     image: ${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}
     command: ["python", "-m", "history_service.scheduled_backup_main"]
     user: "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    group_add:
+      - "${APP_GID:-10001}"
     network_mode: none
     environment:
+      TMPDIR: /app/backups
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
       APP_GID: ${APP_GID:-10001}
       LOG_FORMAT: ${LOG_FORMAT:-text}

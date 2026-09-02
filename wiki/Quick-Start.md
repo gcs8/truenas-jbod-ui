@@ -32,12 +32,16 @@ cd /docker-local/truenas-jbod-ui
 mkdir -p config/ssh data history/backups/long-term logs
 ```
 
-## 2. Download The Compose File
+## 2. Download the Compose file and ownership helper
 
 ```bash
+mkdir -p scripts
 curl -fsSL \
   -o compose.yaml \
   https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/docker-compose.yml
+curl -fsSL \
+  -o scripts/prepare_nonroot_bind_mounts.py \
+  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/scripts/prepare_nonroot_bind_mounts.py
 ```
 
 That Compose file runs the public image from:
@@ -77,12 +81,18 @@ Edit the values before starting:
 Start with CORE or SCALE here. Less common adapters are covered on their
 platform-specific setup pages so this first-run path stays focused.
 
-## 4. Pull And Start
+## 4. Prepare, pull, and start
 
 ```bash
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 docker compose pull
 docker compose up -d
 ```
+
+The dry run must pass before `--apply`. The base Compose file runs UI and
+history as `10001:10001`, so these ownership steps are required for a fresh
+install and before the first v0.22.3 start of an older root-owned deployment.
 
 Open:
 
@@ -111,6 +121,9 @@ cd /docker-local/truenas-jbod-ui
 docker compose pull
 docker compose up -d
 ```
+
+When crossing from v0.22.2 or older to v0.22.3, stop the stack and run the
+ownership helper's dry run and `--apply` commands above before recreating it.
 
 If you pin a version, edit `JBOD_UI_IMAGE` in `.env` first:
 
@@ -203,6 +216,8 @@ git clone https://github.com/gcs8/truenas-jbod-ui.git
 cd truenas-jbod-ui
 cp .env.example .env
 cp config/config.example.yaml config/config.yaml
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 ```
 
 Edit `.env` before the first start; values in `.env` override matching YAML settings.
