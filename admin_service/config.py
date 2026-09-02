@@ -18,7 +18,7 @@ class AdminSettings(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8002
     docker_socket_path: str = "/var/run/docker.sock"
-    auto_stop_seconds: int = 3600
+    auto_stop_seconds: int = Field(default=0, ge=0)
     container_ui_name: str = "truenas-jbod-ui"
     container_history_name: str = "truenas-jbod-history"
     container_admin_name: str = "truenas-jbod-admin"

@@ -284,3 +284,15 @@ test("countdown ticks reuse the existing release-note link", () => {
   assert.ok(firstLink);
   assert.equal(releaseNote.firstElementChild, firstLink);
 });
+
+test("missing admin expiry renders No auto-stop", () => {
+  const formatSource = sourceBetween(
+    "  function formatCountdown()",
+    "\n  function startCountdownTimer"
+  );
+  const { formatCountdown } = loadFunctions([formatSource], ["formatCountdown"], {
+    state: { admin: { expires_at: null } },
+  });
+
+  assert.equal(formatCountdown(), "No auto-stop");
+});
