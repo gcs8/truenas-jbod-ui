@@ -2302,6 +2302,9 @@ class SystemBackupService:
         hot_path = target_dir / "history.sqlite3"
         segment_root = target_dir / "segments"
         segment_root.mkdir(mode=0o700)
+        staged_segments: list[Path] = []
+        catalog: dict[str, Any]
+        source_segments: tuple[Path, ...]
         with history_write_lock(self.store.file_path, blocking=False):
             with self.store._lock:
                 reader = SegmentedHistoryReader.from_catalog(
@@ -2317,21 +2320,37 @@ class SystemBackupService:
                 os.chmod(hot_path, 0o600)
                 with hot_path.open("rb", buffering=0) as stream:
                     os.fsync(stream.fileno())
-                staged_segments: list[Path] = []
-                for source_segment in reader.verify_catalog_segments():
-                    target_segment = segment_root / source_segment.name
-                    shutil.copyfile(source_segment, target_segment)
-                    os.chmod(target_segment, 0o600)
-                    with target_segment.open("rb", buffering=0) as stream:
-                        os.fsync(stream.fileno())
-                    staged_segments.append(target_segment)
-                _ImportActivationTransaction._fsync_directory(segment_root)
-                _ImportActivationTransaction._fsync_directory(target_dir)
-                return _SegmentedExportSnapshot(
-                    hot_path=hot_path,
-                    catalog=dict(reader.catalog_payload()),
-                    segment_paths=tuple(staged_segments),
-                )
+                source_segments = reader.verify_catalog_segments()
+                catalog = dict(reader.catalog_payload())
+        catalog_segments = catalog.get("segments")
+        if not isinstance(catalog_segments, list):
+            raise ValueError("Segmented history catalog is invalid.")
+        expected_segments = {
+            str(entry.get("file_name")): entry
+            for entry in catalog_segments
+            if isinstance(entry, dict)
+        }
+        for source_segment in source_segments:
+            target_segment = segment_root / source_segment.name
+            shutil.copyfile(source_segment, target_segment)
+            os.chmod(target_segment, 0o600)
+            with target_segment.open("rb", buffering=0) as stream:
+                os.fsync(stream.fileno())
+            expected = expected_segments.get(source_segment.name)
+            if (
+                expected is None
+                or target_segment.stat().st_size != expected.get("size_bytes")
+                or self._extracted_member_sha256(target_segment) != expected.get("sha256")
+            ):
+                raise ValueError("Segmented history export segment integrity check failed.")
+            staged_segments.append(target_segment)
+        _ImportActivationTransaction._fsync_directory(segment_root)
+        _ImportActivationTransaction._fsync_directory(target_dir)
+        return _SegmentedExportSnapshot(
+            hot_path=hot_path,
+            catalog=catalog,
+            segment_paths=tuple(staged_segments),
+        )
 
     def _resolve_selected_groups(
         self,

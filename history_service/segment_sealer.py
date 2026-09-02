@@ -6,7 +6,7 @@ import os
 import sqlite3
 import stat
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,9 +33,13 @@ def _parse_timestamp(value: Any, *, label: str) -> datetime:
     return parsed
 
 
-def _require_timestamp(value: str, *, label: str) -> str:
-    _parse_timestamp(value, label=label)
-    return value
+def normalize_history_cutoff(value: str) -> str:
+    return (
+        _parse_timestamp(value, label="History segment cutoff")
+        .astimezone(timezone.utc)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .isoformat()
+    )
 
 
 def _history_coverage(connection: sqlite3.Connection) -> tuple[str, str] | None:
@@ -203,7 +207,7 @@ def seal_history_segment(
         raise ValueError("History segment key ID is invalid.")
     if type(sequence) is not int or sequence < 1:
         raise ValueError("History segment sequence is invalid.")
-    cutoff = _require_timestamp(cutoff, label="History segment cutoff")
+    cutoff = normalize_history_cutoff(cutoff)
     source = source.absolute()
     source_metadata = _require_regular_source(source)
     _require_source_owner(source_metadata)

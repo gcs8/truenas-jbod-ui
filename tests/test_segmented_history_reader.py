@@ -786,6 +786,76 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
             self.assertEqual(samples[1]["value_min"], 31.0)
             self.assertEqual(samples[1]["value_max"], 33.0)
 
+    def test_reader_merges_partial_rollups_with_the_same_bucket_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [])
+            insert_sql = """
+                INSERT INTO metric_rollups (
+                    bucket_start, bucket_seconds, system_id, enclosure_key, slot, slot_label,
+                    metric_name, sample_count, value_sum, value_min, value_max, last_value,
+                    last_observed_at
+                ) VALUES (?, 3600, 'system-1', 'enclosure-1', 1, 'slot-1',
+                          'temperature', ?, ?, ?, ?, ?, ?)
+            """
+            with sqlite3.connect(segment_path) as connection:
+                connection.execute(
+                    insert_sql,
+                    (
+                        "2025-01-01T10:00:00+00:00",
+                        2,
+                        62.0,
+                        30.0,
+                        32.0,
+                        32.0,
+                        "2025-01-01T10:30:00+00:00",
+                    ),
+                )
+            with sqlite3.connect(hot_path) as connection:
+                connection.execute(
+                    insert_sql,
+                    (
+                        "2025-01-01T10:00:00+00:00",
+                        2,
+                        70.0,
+                        34.0,
+                        36.0,
+                        36.0,
+                        "2025-01-01T10:50:00+00:00",
+                    ),
+                )
+
+            reader = SegmentedHistoryReader(
+                hot_path=hot_path,
+                segment_paths=[segment_path],
+            )
+            samples = reader.list_metric_samples(
+                "system-1",
+                "enclosure-1",
+                1,
+                metric_name="temperature",
+                limit=10,
+            )
+            batched_samples = reader.list_scope_history(
+                "system-1",
+                "enclosure-1",
+                slots=[1],
+                event_limit=0,
+                metric_limits={"temperature": 10},
+            )[1]["metrics"]["temperature"]
+
+            self.assertEqual(len(batched_samples), 1)
+            self.assertEqual(batched_samples[0]["value"], 33.0)
+            self.assertEqual(batched_samples[0]["sample_count"], 4)
+            self.assertEqual(len(samples), 1)
+            self.assertEqual(samples[0]["value"], 33.0)
+            self.assertEqual(samples[0]["sample_count"], 4)
+            self.assertEqual(samples[0]["value_min"], 30.0)
+            self.assertEqual(samples[0]["value_max"], 36.0)
+
     def test_catalog_loader_refuses_a_dangling_pending_migration_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

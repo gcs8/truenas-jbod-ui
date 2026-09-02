@@ -30,6 +30,7 @@ from history_service.segment_sealer import (
     _prepare_output_directory,
     _require_regular_source,
     _require_source_owner,
+    normalize_history_cutoff,
     seal_history_segment,
 )
 
@@ -610,6 +611,7 @@ def _rotate_segmented_history_locked(
     scheduled_backup_status_path: Path,
     apply: bool,
 ) -> dict[str, Any]:
+    cutoff = normalize_history_cutoff(cutoff)
     source = source.absolute()
     segments_directory = _require_output_directory(segments_directory.absolute())
     source_metadata = _require_regular_source(source)

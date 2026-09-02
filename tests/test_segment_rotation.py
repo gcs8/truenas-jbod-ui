@@ -1453,6 +1453,34 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
             self.assertTrue(saved_rollback_path.is_file())
             self.assertTrue(activation_pending_path(source).is_file())
 
+    def test_later_rotation_snaps_cutoff_for_segment_and_hot_partitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_generation_0001(source, segments_directory)
+            self._append_event(source, "generation-2-sealed", "2025-01-02T12:00:00+00:00")
+            self._append_event(source, "generation-2-hot", "2025-01-03T06:00:00+00:00")
+            backup_directory, backup_status_path = self._create_full_backup_evidence(root)
+
+            self._rotation_module().rotate_segmented_history(
+                source=source,
+                segments_directory=segments_directory,
+                cutoff="2025-01-03T12:34:56+00:00",
+                key_id="generation-key-2",
+                scheduled_backup_directory=backup_directory,
+                scheduled_backup_status_path=backup_status_path,
+                apply=True,
+            )
+
+            catalog = json.loads((segments_directory / "catalog.json").read_text(encoding="utf-8"))
+            self.assertEqual(catalog["segments"][1]["sealed_at"], "2025-01-03T00:00:00+00:00")
+            self.assertEqual(
+                self._event_types(segments_directory / "segment-0002.sqlite3"),
+                ["generation-1-hot", "generation-2-sealed"],
+            )
+            self.assertEqual(self._event_types(source), ["generation-2-hot"])
+
     def test_rotated_generation_exports_imports_and_queries_as_schema_v2(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
