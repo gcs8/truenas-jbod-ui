@@ -48,6 +48,7 @@ from history_service.system_backup import (
     CONFIG_FILE_KEY,
     DEBUG_BUNDLE_FORMAT,
     DEBUG_README_KEY,
+    DebugScrubber,
     ENCRYPTED_BACKUP_MAGIC,
     ENCRYPTED_BACKUP_NONCE_BYTES,
     ENCRYPTED_BACKUP_SALT_BYTES,
@@ -480,6 +481,40 @@ class SystemBackupServiceTests(unittest.TestCase):
             )
         finally:
             artifact.cleanup()
+
+    def test_scrubbed_history_snapshot_removes_deleted_identifier_residue(self) -> None:
+        service, _catalog_path, _segment_path = self._build_segmented_debug_service()
+        source_path = Path(service.history_settings.sqlite_path)
+        private_nonce = b"ZXQ9PRIVATE7MKR-FREELIST-6c24f8"
+        with sqlite3.connect(source_path) as connection:
+            connection.execute("PRAGMA secure_delete=OFF")
+            connection.execute("CREATE TABLE deleted_private_residue(value BLOB)")
+            connection.executemany(
+                "INSERT INTO deleted_private_residue(value) VALUES (?)",
+                [(private_nonce + (b"X" * 3000),)] * 32,
+            )
+            connection.commit()
+            connection.execute("DROP TABLE deleted_private_residue")
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.assertGreater(connection.execute("PRAGMA freelist_count").fetchone()[0], 0)
+
+        self.assertTrue(
+            private_nonce in source_path.read_bytes(),
+            "synthetic source must retain deleted identifier bytes before scrubbing",
+        )
+        scrubbed_path = self.temp_dir / "scrubbed-deleted-residue.sqlite3"
+
+        service._build_scrubbed_history_snapshot_file(
+            source_path,
+            DebugScrubber(scrub_secrets=True, scrub_disk_identifiers=True),
+            scrubbed_path,
+        )
+
+        self.assertFalse(
+            private_nonce in scrubbed_path.read_bytes(),
+            "scrubbed debug database must not retain deleted identifier bytes",
+        )
 
     def test_segmented_snapshot_rejects_unreferenced_segment_file(self) -> None:
         service, catalog_path, segment_path = self._build_segmented_debug_service()

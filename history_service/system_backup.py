@@ -5185,6 +5185,7 @@ class SystemBackupService:
         connection = sqlite3.connect(target_path)
         try:
             connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA secure_delete=ON")
             (
                 slot_state_rules,
                 slot_event_rules,
@@ -5200,6 +5201,7 @@ class SystemBackupService:
             if metric_rollup_rules:
                 self._scrub_history_table(connection, "metric_rollups", metric_rollup_rules)
             connection.commit()
+            connection.execute("VACUUM")
         finally:
             connection.close()
         return target_path
