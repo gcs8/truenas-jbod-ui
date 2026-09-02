@@ -255,6 +255,8 @@ the journal and all evidence in place for repair.
   limit.
 - Validate offset-aware timestamps before publication and partition every
   historical row into exactly one of the new segment or complementary hot file.
+  Operational cutoffs are snapped down to the containing UTC-day boundary so a
+  rollup bucket cannot be split across generations.
 - Assert exact row accounting per history table across prior segments, the new
   segment, and hot storage before catalog publication.
 
@@ -318,7 +320,10 @@ configured:
 
 Multi-slot scope reads open each selected database once. Segment files are
 opened with no-follow semantics, hashed through a pinned descriptor, and opened
-by SQLite through that same descriptor.
+by SQLite through that same descriptor. If a legacy split left partial rollups
+for one logical bucket in both hot and sealed history, readers merge the rows by
+bucket identity, sum counts and values, preserve extrema, and select the latest
+counter value instead of returning duplicate points.
 
 ## Backup schema 2
 
@@ -329,6 +334,11 @@ A segmented full backup contains:
 - generation metadata;
 - a complete history catalog with segment sizes, SHA-256 digests, coverage,
   row counts, tombstones, and `supersedes` declarations.
+
+Export pins and verifies the catalog and captures the hot snapshot while holding
+the history write lock, then releases that lock before copying immutable segment
+bytes. Every copied segment is checked against the pinned catalog digest and size
+before packaging.
 
 Import validates the manifest before payload extraction, checks every member
 size and digest, validates every SQLite member, constructs a local catalog, and

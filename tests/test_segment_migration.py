@@ -1006,6 +1006,37 @@ class SegmentedHistoryMigrationCliTests(unittest.TestCase):
             self.assertFalse((segments_directory / "segment-0001.sqlite3").exists())
             self.assertTrue((segments_directory / ".v1-rollback.sqlite3").is_file())
 
+    def test_apply_snaps_cutoff_for_both_segment_and_hot_partitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_source_database(source)
+
+            segment_migration.migrate_segmented_history(
+                source=source,
+                segments_directory=segments_directory,
+                cutoff="2025-01-02T12:34:56+00:00",
+                key_id="test-key-1",
+                apply=True,
+            )
+
+            segment_path = segments_directory / "segment-0001.sqlite3"
+            catalog = json.loads((segments_directory / "catalog.json").read_text(encoding="utf-8"))
+            self.assertEqual(catalog["segments"][0]["sealed_at"], "2025-01-02T00:00:00+00:00")
+            with sqlite3.connect(source) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM slot_events").fetchone()[0], 1)
+                self.assertEqual(
+                    connection.execute("SELECT observed_at FROM slot_events").fetchone()[0],
+                    "2025-01-02T00:00:00+00:00",
+                )
+            with sqlite3.connect(segment_path) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM slot_events").fetchone()[0], 1)
+                self.assertEqual(
+                    connection.execute("SELECT observed_at FROM slot_events").fetchone()[0],
+                    "2025-01-01T00:00:00+00:00",
+                )
+
     def test_apply_migrates_pre_cutoff_history_into_cataloged_segment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

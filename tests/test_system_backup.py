@@ -38,6 +38,7 @@ from history_service.scheduled_backup import ScheduledBackupRunner
 from history_service.config import HistorySettings
 from history_service import segment_migration, system_backup as system_backup_module
 from history_service.domain import MetricSample, SlotStateRecord
+from history_service.migration_lock import history_write_lock
 from history_service.store import SCHEMA, HistoryStore
 from history_service.system_backup import (
     BACKUP_GROUP_METADATA,
@@ -540,6 +541,73 @@ class SystemBackupServiceTests(unittest.TestCase):
                     encrypted_artifact.cleanup()
         finally:
             artifact.cleanup()
+
+    def test_segmented_history_export_releases_write_lock_before_segment_copy(self) -> None:
+        segmented_root = self.temp_dir / "segmented-export-lock"
+        segmented_root.mkdir()
+        source = segmented_root / "history.db"
+        segments_directory = segmented_root / "segments"
+        with sqlite3.connect(source) as connection:
+            connection.executescript(SCHEMA)
+            for event_id, observed_at in (
+                (1, "2025-01-01T00:00:00+00:00"),
+                (2, "2025-01-02T00:00:00+00:00"),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO slot_events (
+                        id, observed_at, system_id, enclosure_key,
+                        slot, slot_label, event_type, details_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (event_id, observed_at, "system-1", "enc-1", 1, "slot-1", "state_change", "{}"),
+                )
+        segment_migration.migrate_segmented_history(
+            source=source,
+            segments_directory=segments_directory,
+            cutoff="2025-01-02T00:00:00+00:00",
+            key_id="test-key-1",
+            apply=True,
+        )
+        catalog_path = segments_directory / "catalog.json"
+        store = HistoryStore(
+            str(source),
+            recover_unreadable_database=False,
+            segment_catalog_path=catalog_path,
+        )
+        service = SystemBackupService(
+            HistorySettings(
+                sqlite_path=str(source),
+                segment_catalog_path=str(catalog_path),
+                backup_dir=str(segmented_root / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        segment_path = segments_directory / "segment-0001.sqlite3"
+        expected_segment_bytes = segment_path.read_bytes()
+        real_copyfile = shutil.copyfile
+        copied_without_write_lock = False
+
+        def copy_after_lock_release(
+            source_path: str | Path,
+            destination_path: str | Path,
+            *args: Any,
+            **kwargs: Any,
+        ) -> str:
+            nonlocal copied_without_write_lock
+            if Path(source_path) == segment_path:
+                with history_write_lock(source, blocking=False):
+                    copied_without_write_lock = True
+            return str(real_copyfile(source_path, destination_path, *args, **kwargs))
+
+        with patch.object(system_backup_module.shutil, "copyfile", side_effect=copy_after_lock_release):
+            snapshot = service._build_segmented_history_snapshot_to_directory(
+                segmented_root / "snapshot"
+            )
+
+        self.assertTrue(copied_without_write_lock)
+        self.assertEqual(snapshot.segment_paths[0].read_bytes(), expected_segment_bytes)
 
     @staticmethod
     def _fake_7z_passphrase_token(passphrase: str | None) -> str | None:

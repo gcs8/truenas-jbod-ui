@@ -358,6 +358,67 @@ class SegmentedHistoryReader:
         return limit
 
     @staticmethod
+    def _rollup_key(row: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            int(row["rollup_seconds"]),
+            str(row["_bucket_start"]),
+            str(row["system_id"]),
+            str(row["enclosure_key"]),
+            int(row["slot"]),
+            str(row["metric_name"]),
+            str(row.get("disk_identity_key") or ""),
+        )
+
+    @classmethod
+    def _merge_rollup_rows(cls, rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for row in rows:
+            key = cls._rollup_key(row)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = row
+                continue
+            existing["sample_count"] = int(existing["sample_count"]) + int(row["sample_count"])
+            existing["_value_sum"] = float(existing["_value_sum"]) + float(row["_value_sum"])
+            existing["value_min"] = min(float(existing["value_min"]), float(row["value_min"]))
+            existing["value_max"] = max(float(existing["value_max"]), float(row["value_max"]))
+            if _parse_catalog_timestamp(row["_last_observed_at"]) > _parse_catalog_timestamp(
+                existing["_last_observed_at"]
+            ):
+                for field in (
+                    "observed_at",
+                    "system_label",
+                    "enclosure_id",
+                    "enclosure_label",
+                    "slot_label",
+                    "device_name",
+                    "serial",
+                    "model",
+                    "state",
+                    "gptid",
+                    "persistent_id_label",
+                    "disk_identity_key",
+                    "logical_unit_id",
+                    "sas_address",
+                    "_last_value",
+                    "_last_observed_at",
+                ):
+                    existing[field] = row[field]
+        for row in merged.values():
+            if row["metric_name"] in {"bytes_read", "bytes_written", "power_on_hours"}:
+                value = float(row["_last_value"])
+                row["observed_at"] = row["_last_observed_at"]
+            else:
+                value = float(row["_value_sum"]) / int(row["sample_count"])
+                row["observed_at"] = row["_bucket_start"]
+            row["value_real"] = value
+            row["value"] = value
+            row.pop("_value_sum", None)
+            row.pop("_last_value", None)
+            row.pop("_last_observed_at", None)
+        return list(merged.values())
+
+    @staticmethod
     def _require_no_sqlite_sidecars(path: Path) -> None:
         for suffix in ("-wal", "-shm", "-journal"):
             if path_entry_exists(Path(f"{path}{suffix}")):
@@ -1124,6 +1185,9 @@ class SegmentedHistoryReader:
                                     logical_unit_id, sas_address,
                                     bucket_seconds AS rollup_seconds,
                                     sample_count, value_min, value_max,
+                                    value_sum AS _value_sum,
+                                    last_value AS _last_value,
+                                    last_observed_at AS _last_observed_at,
                                     ROW_NUMBER() OVER (
                                         PARTITION BY slot, metric_name
                                         ORDER BY julianday(bucket_start) DESC
@@ -1176,7 +1240,9 @@ class SegmentedHistoryReader:
                             else before
                         )
                     candidates = sorted(
-                        rollups_by_metric_interval_slot[metric_name][bucket_seconds].get(slot, []),
+                        self._merge_rollup_rows(
+                            rollups_by_metric_interval_slot[metric_name][bucket_seconds].get(slot, [])
+                        ),
                         key=lambda item: _parse_catalog_timestamp(item["_bucket_start"]),
                         reverse=True,
                     )
@@ -1276,7 +1342,10 @@ class SegmentedHistoryReader:
                     bucket_seconds AS rollup_seconds,
                     sample_count,
                     value_min,
-                    value_max
+                    value_max,
+                    value_sum AS _value_sum,
+                    last_value AS _last_value,
+                    last_observed_at AS _last_observed_at
                 FROM metric_rollups
                 WHERE {' AND '.join(rollup_where)}
                 ORDER BY julianday(bucket_start) DESC
@@ -1286,6 +1355,7 @@ class SegmentedHistoryReader:
             for path in (self.hot_path, *self._selected_segment_paths(since=since)):
                 with self._query_connection(path) as connection:
                     rollups.extend(dict(row) for row in connection.execute(query, rollup_parameters).fetchall())
+            rollups = self._merge_rollup_rows(rollups)
             rollups.sort(
                 key=lambda row: _parse_catalog_timestamp(row["_bucket_start"]),
                 reverse=True,

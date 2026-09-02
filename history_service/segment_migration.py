@@ -25,6 +25,7 @@ from history_service.segment_sealer import (
     _require_output_directory,
     _require_regular_source,
     _require_source_owner,
+    normalize_history_cutoff,
     seal_history_segment,
 )
 from history_service.migration_lock import history_write_lock
@@ -640,6 +641,7 @@ def _migrate_segmented_history_locked(
     key_id: str,
     apply: bool = False,
 ) -> dict[str, Any]:
+    cutoff = normalize_history_cutoff(cutoff)
     source = source.absolute()
     segments_directory = segments_directory.absolute()
     catalog_path = segments_directory / "catalog.json"

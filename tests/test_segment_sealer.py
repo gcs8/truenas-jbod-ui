@@ -17,6 +17,28 @@ from history_service.store import SCHEMA
 
 
 class SegmentSealerCliTests(unittest.TestCase):
+    def test_sealer_snaps_cutoff_to_the_utc_day_bucket_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            output_directory = root / "segments"
+            self._create_source_database(source)
+
+            receipt = seal_history_segment(
+                source=source,
+                output_directory=output_directory,
+                segment_id="segment-0001",
+                cutoff="2025-01-02T12:34:56+00:00",
+                key_id="test-key-1",
+            )
+
+            self.assertEqual(receipt["sealed_at"], "2025-01-02T00:00:00+00:00")
+            with sqlite3.connect(receipt["path"]) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT observed_at FROM slot_events ORDER BY observed_at").fetchall(),
+                    [("2025-01-01T00:00:00+00:00",)],
+                )
+
     def test_sealer_partitions_mixed_offset_timestamps_by_absolute_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
