@@ -221,6 +221,7 @@ jobs:
           export CI_SMOKE_LOG_DIR="${smoke_root}/logs"
           shared_probe_dir="${smoke_root}/shared"
           backup_secret_dir="${smoke_root}/backup-secrets"
+          compose_contract_root="${smoke_root}/compose-contract"
           sudo install -d -m 0770 -o 10001 -g 10001 "$CI_SMOKE_DATA_DIR" "$CI_SMOKE_LOG_DIR"
           sudo install -d -m 0770 -o 10001 -g 10001 "$shared_probe_dir"
           sudo install -d -m 0700 -o 1000 -g 1000 "$backup_secret_dir"
@@ -228,7 +229,18 @@ jobs:
           sudo install -m 0600 -o 1000 -g 1000 /dev/null "$backup_secret_dir/passphrase"
           printf 'shared' | sudo tee "$shared_probe_dir/app-data" >/dev/null
           printf 'synthetic-test-value' | sudo tee "$backup_secret_dir/passphrase" >/dev/null
-          trap 'docker compose -f tests/fixtures/ci-smoke.compose.yml down --volumes --remove-orphans' EXIT
+          cleanup() {
+            docker compose -f tests/fixtures/ci-smoke.compose.yml down --volumes --remove-orphans
+            if [ -f "$compose_contract_root/compose.yaml" ]; then
+              docker compose \
+                --project-directory "$compose_contract_root" \
+                -f "$compose_contract_root/compose.yaml" \
+                --profile history --profile admin --profile backup \
+                down --volumes --remove-orphans
+            fi
+            sudo rm -rf "$smoke_root"
+          }
+          trap cleanup EXIT
           docker compose -f tests/fixtures/ci-smoke.compose.yml up -d --build --wait --wait-timeout 90
           python - <<'PY'
           import json
@@ -253,11 +265,32 @@ jobs:
           PY
           container_id="$(docker compose -f tests/fixtures/ci-smoke.compose.yml ps -q enclosure-ui)"
           docker exec -i "$container_id" python - <<'PY'
+          import errno
           import os
           from pathlib import Path
 
           assert os.getuid() == 10001
           assert os.getgid() == 10001
+          status = dict(
+              line.split(":", 1)
+              for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines()
+              if ":" in line
+          )
+          status = {key: value.strip() for key, value in status.items()}
+          assert status["CapEff"] == "0000000000000000"
+          assert status["NoNewPrivs"] == "1"
+          rootfs_probe = Path("/app/nonroot-rootfs-smoke")
+          try:
+              rootfs_probe.write_text("blocked", encoding="utf-8")
+          except OSError as exc:
+              assert exc.errno == errno.EROFS
+          else:
+              rootfs_probe.unlink(missing_ok=True)
+              raise AssertionError("container image filesystem is writable")
+          temporary_probe = Path("/tmp/nonroot-smoke")
+          temporary_probe.write_text("ok", encoding="utf-8")
+          assert temporary_probe.read_text(encoding="utf-8") == "ok"
+          temporary_probe.unlink()
           data_probe = Path("/app/data/nonroot-smoke")
           log_probe = Path("/app/logs/nonroot-smoke")
           data_probe.write_text("ok", encoding="utf-8")
@@ -268,6 +301,94 @@ jobs:
           log_probe.unlink()
           PY
           image_id="$(docker inspect --format '{{.Image}}' "$container_id")"
+          mkdir -p "$compose_contract_root"
+          sudo install -d -m 0770 -o 10001 -g 10001 \
+            "$compose_contract_root/config" \
+            "$compose_contract_root/config/ssh" \
+            "$compose_contract_root/data" \
+            "$compose_contract_root/history" \
+            "$compose_contract_root/logs"
+          sudo install -d -m 0700 -o 1000 -g 1000 \
+            "$compose_contract_root/backups" \
+            "$compose_contract_root/config/backup-secrets"
+          sudo install -d -m 2750 -o 1000 -g 10001 \
+            "$compose_contract_root/backup-status"
+          cp docker-compose.yml "$compose_contract_root/compose.yaml"
+          printf '%s\n' \
+            "JBOD_UI_IMAGE=$image_id" \
+            'APP_UID=10001' \
+            'APP_GID=10001' \
+            'BACKUP_UID=1000' \
+            'BACKUP_GID=1000' \
+            > "$compose_contract_root/.env"
+          chmod 0600 "$compose_contract_root/.env"
+
+          probe_compose_service() {
+            local service="$1"
+            local expected_uid="$2"
+            local expected_gid="$3"
+            local expected_cap_eff="$4"
+            local expected_tmpdir="$5"
+            local expected_writable="$6"
+            docker compose \
+              --project-directory "$compose_contract_root" \
+              -f "$compose_contract_root/compose.yaml" \
+              --profile history --profile admin --profile backup \
+              run --rm --no-deps \
+              -e "EXPECTED_UID=$expected_uid" \
+              -e "EXPECTED_GID=$expected_gid" \
+              -e "EXPECTED_CAP_EFF=$expected_cap_eff" \
+              -e "EXPECTED_TMPDIR=$expected_tmpdir" \
+              -e "EXPECTED_WRITABLE=$expected_writable" \
+              --entrypoint python "$service" - <<'PY'
+          import errno
+          import os
+          import shutil
+          import tempfile
+          from pathlib import Path
+
+          assert os.getuid() == int(os.environ["EXPECTED_UID"])
+          assert os.getgid() == int(os.environ["EXPECTED_GID"])
+          status = dict(
+              line.split(":", 1)
+              for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines()
+              if ":" in line
+          )
+          status = {key: value.strip() for key, value in status.items()}
+          assert status["CapEff"] == os.environ["EXPECTED_CAP_EFF"]
+          assert status["NoNewPrivs"] == "1"
+
+          rootfs_probe = Path("/app/compose-contract-rootfs")
+          try:
+              rootfs_probe.write_text("blocked", encoding="utf-8")
+          except OSError as exc:
+              assert exc.errno == errno.EROFS
+          else:
+              rootfs_probe.unlink(missing_ok=True)
+              raise AssertionError("container image filesystem is writable")
+
+          tmp_probe = Path("/tmp/compose-contract-tmp")
+          tmp_probe.write_text("ok", encoding="utf-8")
+          tmp_probe.unlink()
+
+          temporary_root = Path(tempfile.mkdtemp(prefix="compose-contract-"))
+          try:
+              assert temporary_root.parent == Path(os.environ["EXPECTED_TMPDIR"])
+          finally:
+              shutil.rmtree(temporary_root)
+
+          writable_probe = Path(os.environ["EXPECTED_WRITABLE"]) / ".compose-contract-write"
+          writable_probe.write_text("ok", encoding="utf-8")
+          writable_probe.unlink()
+          PY
+          }
+
+          probe_compose_service enclosure-ui 10001 10001 0000000000000000 /tmp /app/data
+          probe_compose_service enclosure-history 10001 10001 0000000000000000 /app/history /app/history
+          probe_compose_service enclosure-admin 0 10001 0000000000000009 /app/history /app/data
+          probe_compose_service enclosure-backup 1000 1000 0000000000000000 /app/backups /app/backups
+          printf '%s\n' 'base_compose_service_contracts=ok'
+
           docker run --rm -i --user 1000:1000 --group-add 10001 \
             -v "$shared_probe_dir:/probe/shared:ro" \
             -v "$backup_secret_dir:/probe/backup-secrets:ro" \

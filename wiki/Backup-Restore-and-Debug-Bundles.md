@@ -95,7 +95,7 @@ HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS=129600
 ```
 
 Replace `1000` with the numeric values printed by `id -u` and `id -g` above.
-Set `APP_GID` to the numeric app group used by `docker-compose.nonroot.yml`.
+Set `APP_GID` to the numeric app group used by the base Compose file.
 The backup container keeps its host identity and receives `APP_GID` as both an
 explicit validation value and a supplemental group. The setgid `2750` status
 directory makes atomic status replacements inherit that exact group.
@@ -170,6 +170,12 @@ The one-shot container mounts the whole history directory writable. Do not
 file-bind only `history.db`; segmented locking rejects database-file mount
 points. Size the backup destination and temporary workspace for the hot database
 plus every active segment.
+
+The base Compose file keeps large temporary workspaces on disk-backed scratch
+inside an existing state mount. `TMPDIR` points history and admin work at
+`/app/history`, and points the one-shot backup worker at `/app/backups`. The
+private `/tmp` tmpfs remains available for small library/runtime files, but FULL
+backup and restore archives do not consume that memory-backed filesystem.
 
 Hot-only deployments export backup schema 1. A deployment configured with
 `HISTORY_SEGMENT_CATALOG_PATH` exports schema 2. Schema 2 includes the hot

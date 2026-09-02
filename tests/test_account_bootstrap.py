@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,6 +56,16 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
             encryption_algorithm=serialization.NoEncryption(),
         )
         path.write_bytes(private_bytes)
+
+    def test_generated_private_key_is_readable_by_the_app_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "config" / "config.yaml"
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+
+            generated_key = SSHKeyManager(str(config_file)).generate_keypair("id_truenas")
+
+            private_path = Path(generated_key["private_path"])
+            self.assertEqual(stat.S_IMODE(private_path.stat().st_mode), 0o640)
 
     def test_bootstrap_uses_managed_key_without_sudo_for_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

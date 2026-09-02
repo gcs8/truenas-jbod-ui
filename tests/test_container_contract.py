@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -28,6 +29,18 @@ EXPECTED_HISTORY_PERMISSION_ENV = {
     "HISTORY_SHARED_DIR_MODE": "${HISTORY_SHARED_DIR_MODE:-0770}",
     "HISTORY_SHARED_FILE_MODE": "${HISTORY_SHARED_FILE_MODE:-0660}",
 }
+
+
+def writable_volume_targets(service: dict[str, Any]) -> set[str]:
+    targets: set[str] = set()
+    for volume in service.get("volumes", []):
+        if not isinstance(volume, str):
+            continue
+        fields = volume.split(":")
+        if len(fields) < 2 or (len(fields) > 2 and fields[-1] == "ro"):
+            continue
+        targets.add(fields[1])
+    return targets
 
 
 class ContainerResourceContractTests(unittest.TestCase):
@@ -73,13 +86,22 @@ class ContainerResourceContractTests(unittest.TestCase):
         ]
         self.assertEqual(active_assignments, [])
 
-    def test_nonroot_runtime_is_an_explicit_overlay_with_root_compatible_base(self) -> None:
+    def test_ui_and_history_are_nonroot_by_default_with_compatible_overlay(self) -> None:
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
             with self.subTest(compose=compose_name):
-                self.assertEqual(services["enclosure-ui"]["user"], "0:0")
-                self.assertEqual(services["enclosure-history"]["user"], "0:0")
-                self.assertEqual(services["enclosure-admin"]["user"], "0:0")
+                self.assertEqual(
+                    services["enclosure-ui"]["user"],
+                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                )
+                self.assertEqual(
+                    services["enclosure-history"]["user"],
+                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                )
+                self.assertEqual(
+                    services["enclosure-admin"]["user"],
+                    "0:${APP_GID:-10001}",
+                )
                 self.assertEqual(
                     services["enclosure-backup"]["user"],
                     "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}",
@@ -88,6 +110,11 @@ class ContainerResourceContractTests(unittest.TestCase):
                     services["enclosure-backup"]["environment"]["APP_GID"],
                     "${APP_GID:-10001}",
                 )
+                self.assertEqual(
+                    services["enclosure-backup"]["group_add"],
+                    ["${APP_GID:-10001}"],
+                )
+                self.assertIn("./config:/app/config:ro", services["enclosure-ui"]["volumes"])
 
         overlay = yaml.safe_load((REPO_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8"))
         self.assertEqual(
@@ -104,6 +131,81 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("ARG APP_UID=10001", dockerfile)
         self.assertIn("ARG APP_GID=10001", dockerfile)
         self.assertIn("USER app", dockerfile)
+
+    def test_compose_services_use_read_only_root_filesystems_and_drop_privileges(self) -> None:
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
+            for service_name, service in services.items():
+                with self.subTest(compose=compose_name, service=service_name):
+                    self.assertIs(service.get("read_only"), True)
+                    self.assertEqual(service.get("tmpfs"), ["/tmp"])
+                    self.assertEqual(service.get("cap_drop"), ["ALL"])
+                    self.assertEqual(service.get("security_opt"), ["no-new-privileges:true"])
+
+                    if service_name == "enclosure-admin":
+                        self.assertEqual(service.get("cap_add"), ["CHOWN", "FOWNER"])
+                        self.assertNotIn("group_add", service)
+                    else:
+                        self.assertNotIn("cap_add", service)
+
+    def test_compose_writable_mounts_are_limited_to_service_state(self) -> None:
+        expected_targets = {
+            "enclosure-ui": {"/app/data", "/app/logs"},
+            "enclosure-history": {"/app/history"},
+            "enclosure-admin": {
+                "/app/config",
+                "/app/data",
+                "/app/history",
+                "/var/run/docker.sock",
+            },
+            "enclosure-backup": {
+                "/app/history",
+                "/app/backups",
+                "/app/backup-status",
+            },
+        }
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
+            for service_name, expected in expected_targets.items():
+                with self.subTest(compose=compose_name, service=service_name):
+                    self.assertEqual(writable_volume_targets(services[service_name]), expected)
+            self.assertNotIn("./logs:/app/logs", services["enclosure-admin"]["volumes"])
+
+    def test_large_temporary_workspaces_use_disk_backed_state_mounts(self) -> None:
+        expected_temp_roots = {
+            "enclosure-history": "/app/history",
+            "enclosure-admin": "/app/history",
+            "enclosure-backup": "/app/backups",
+        }
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]
+            for service_name, expected_temp_root in expected_temp_roots.items():
+                with self.subTest(compose=compose_name, service=service_name):
+                    service = services[service_name]
+                    self.assertEqual(service["environment"].get("TMPDIR"), expected_temp_root)
+                    self.assertIn(expected_temp_root, writable_volume_targets(service))
+
+        backup_guide = (
+            REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("disk-backed scratch", backup_guide)
+        self.assertIn("TMPDIR", backup_guide)
+
+    def test_default_nonroot_migration_is_documented_before_start(self) -> None:
+        env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        deployment_guide = (
+            REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md"
+        ).read_text(encoding="utf-8")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        quick_start = (REPO_ROOT / "wiki/Quick-Start.md").read_text(encoding="utf-8")
+
+        self.assertIn("default non-root UI and history services", env_example)
+        self.assertIn("Default non-root runtime", deployment_guide)
+        self.assertRegex(deployment_guide, r"before\s+the first v0\.22\.3 start")
+        self.assertIn("prepare_nonroot_bind_mounts.py", readme)
+        self.assertIn("prepare_nonroot_bind_mounts.py", quick_start)
+        self.assertIn("--apply", quick_start)
+        self.assertNotIn("The base Compose file keeps the existing root-compatible", deployment_guide)
 
     def test_nonroot_overlay_preserves_backup_identity_with_app_data_group(self) -> None:
         overlay = yaml.safe_load(
@@ -138,6 +240,10 @@ class ContainerResourceContractTests(unittest.TestCase):
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("${CI_SMOKE_DATA_DIR:?CI_SMOKE_DATA_DIR is required}:/app/data", fixture)
         self.assertIn("${CI_SMOKE_LOG_DIR:?CI_SMOKE_LOG_DIR is required}:/app/logs", fixture)
+        self.assertIn("read_only: true", fixture)
+        self.assertIn("- /tmp", fixture)
+        self.assertIn("- ALL", fixture)
+        self.assertIn('no-new-privileges:true', fixture)
         self.assertIn('"18080:8000"', fixture)
         self.assertNotIn("- /app/data", fixture)
         self.assertIn("install -d -m 0770 -o 10001 -g 10001", workflow)
@@ -145,6 +251,17 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("assert os.getgid() == 10001", workflow)
         self.assertIn("data_probe.write_text", workflow)
         self.assertIn("log_probe.write_text", workflow)
+        self.assertIn("temporary_probe.write_text", workflow)
+        self.assertIn("rootfs_probe.write_text", workflow)
+        self.assertIn('status["CapEff"] == "0000000000000000"', workflow)
+        self.assertIn('status["NoNewPrivs"] == "1"', workflow)
+        self.assertIn("compose_contract_root", workflow)
+        self.assertIn("probe_compose_service enclosure-ui 10001 10001", workflow)
+        self.assertIn("probe_compose_service enclosure-history 10001 10001", workflow)
+        self.assertIn("probe_compose_service enclosure-admin 0 10001", workflow)
+        self.assertIn("probe_compose_service enclosure-backup 1000 1000", workflow)
+        self.assertIn("EXPECTED_CAP_EFF", workflow)
+        self.assertIn("tempfile.mkdtemp", workflow)
         self.assertIn("docker run --rm -i --user 1000:1000 --group-add 10001", workflow)
         self.assertGreaterEqual(workflow.count("docker run --rm -i"), 2)
         self.assertIn("backup_identity_and_group_access=ok", workflow)

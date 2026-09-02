@@ -55,7 +55,7 @@ class SSHKeyManager:
 
         self._write_bytes_atomic(private_path, private_bytes)
         self._write_bytes_atomic(public_path, f"{public_text} truenas-jbod-ui:{normalized_name}\n".encode("utf-8"))
-        self._set_permissions(private_path, 0o600)
+        self._set_permissions(private_path, 0o640)
         self._set_permissions(public_path, 0o644)
         return self._describe_private_key(private_path)
 

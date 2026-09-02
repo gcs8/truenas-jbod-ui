@@ -5,6 +5,11 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
     environment:
       APP_CONFIG_PATH: /app/config/config.yaml
       HISTORY_BACKEND_URL: ""
@@ -16,5 +21,6 @@ services:
       - ${CI_SMOKE_DATA_DIR:?CI_SMOKE_DATA_DIR is required}:/app/data
       - ${CI_SMOKE_LOG_DIR:?CI_SMOKE_LOG_DIR is required}:/app/logs
     tmpfs:
+      - /tmp
       - /run/ssh:uid=10001,gid=10001,mode=0750
     restart: "no"

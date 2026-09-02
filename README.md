@@ -74,6 +74,10 @@ Public demo:
 mkdir -p /docker-local/truenas-jbod-ui/{config/ssh,data,history/backups/long-term,logs}
 cd /docker-local/truenas-jbod-ui
 curl -fsSL -o compose.yaml https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/docker-compose.yml
+mkdir -p scripts
+curl -fsSL -o scripts/prepare_nonroot_bind_mounts.py https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/scripts/prepare_nonroot_bind_mounts.py
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 # create .env with your TRUENAS_HOST / TRUENAS_API_KEY first
 docker compose pull
 docker compose up -d
@@ -115,6 +119,8 @@ git clone https://github.com/gcs8/truenas-jbod-ui.git
 cd truenas-jbod-ui
 cp .env.example .env
 cp config/config.example.yaml config/config.yaml
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 ```
 
 Edit `.env` before the first start; values in `.env` override matching YAML settings.

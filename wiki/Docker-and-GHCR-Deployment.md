@@ -26,12 +26,17 @@ cd /docker-local/truenas-jbod-ui
 mkdir -p config/ssh data history/backups/long-term logs
 ```
 
-Download the release Compose file:
+Download the release Compose file and ownership helper from the same source
+revision:
 
 ```bash
+mkdir -p scripts
 curl -fsSL \
   -o compose.yaml \
   https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/docker-compose.yml
+curl -fsSL \
+  -o scripts/prepare_nonroot_bind_mounts.py \
+  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/scripts/prepare_nonroot_bind_mounts.py
 ```
 
 Create a minimal `.env` for one TrueNAS system:
@@ -52,9 +57,11 @@ EOF
 chmod 600 .env
 ```
 
-Then pull and start:
+Prepare the bind mounts, then pull and start:
 
 ```bash
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 docker compose pull
 docker compose up -d
 ```
@@ -80,18 +87,29 @@ Basic mode protects persistent and hardware-changing main-UI writes while reads
 remain anonymous. Use HTTPS through a reverse proxy or an encrypted private
 network; Basic credentials are not encrypted by HTTP itself.
 
-## Optional Non-Root Runtime
+## Default non-root runtime
 
-The base Compose file keeps the existing root-compatible deployment contract.
-To opt the UI and history services into numeric UID/GID `10001:10001`, download
-`docker-compose.nonroot.yml` and `scripts/prepare_nonroot_bind_mounts.py` from
-the same release ref as the base file. The admin sidecar remains root because
-it writes configuration and controls the raw Docker socket. The one-shot backup
-service keeps its separate `1000:1000` primary identity and receives only the
-supplemental app-data group `10001` while this overlay is active.
+The base Compose file uses numeric UID/GID `10001:10001` for the UI and history
+services by default, and mounts the UI's configuration read-only. Every service
+uses a read-only image filesystem with a private `/tmp`, drops all capabilities,
+and enables `no-new-privileges`.
 
-Stop the stack before changing ownership. Run the helper once without
-`--apply`. It inspects only the `config` directory inode,
+History, admin, and one-shot backup route `tempfile` workspaces to their existing
+disk-backed history or backup state mounts. This preserves multi-gigabyte FULL
+backup and restore headroom instead of charging those files to the `/tmp` tmpfs.
+
+The admin sidecar remains explicitly root because it controls the raw Docker
+socket and must preserve file ownership during transactional restores. It adds
+back only `CHOWN` and `FOWNER`, uses the app-data GID as its primary group, and
+can write only the mounted config, data, and history state plus the Docker
+socket. Admin-generated private SSH keys use owner/group-readable mode `0640`
+so the non-root UI can use them. The admin container no longer mounts the app
+log directory. The one-shot backup service keeps its separate `1000:1000`
+primary identity and receives only the supplemental app-data group `10001`.
+
+For an existing deployment, stop the stack and run the ownership helper before
+the first v0.22.3 start. Run it once without `--apply` first. It inspects only
+the `config` directory inode,
 `config/config.yaml`, `config/ssh/**`, `config/tls/**`, `data/**`,
 `history/**`, and `logs/**`. It deliberately leaves
 `config/backup-secrets/**`, `backups/**`, and `backup-status/**` owned by the
@@ -113,25 +131,29 @@ its runtime state and lets the backup service read selected app data through
 its supplemental group. Backup passphrases remain under the separate backup
 identity with their existing private modes.
 
-Then start with the explicit overlay:
+Then start the base Compose file:
 
 ```bash
-docker compose -f compose.yaml -f docker-compose.nonroot.yml pull
-docker compose -f compose.yaml -f docker-compose.nonroot.yml up -d
-docker compose -f compose.yaml -f docker-compose.nonroot.yml exec enclosure-ui id
+docker compose pull
+docker compose up -d
+docker compose exec enclosure-ui id
 ```
 
-The UI mounts `config` read-only in this mode. After any admin-sidecar restore,
-leave UI/history stopped, rerun the helper preflight and apply step, then restart
-with the overlay. This is the ownership interlock for root-created restored
-files. If the helper reports that rollback was incomplete, do not start any
-profile; preserve the full backup and inspect the named host paths first.
+`docker-compose.nonroot.yml` remains available so existing immutable-deployment
+chains do not need an immediate file-list change. It now repeats the base
+non-root identity, read-only UI config mount, and backup group, so it is optional
+and has no additional effect.
 
-To roll back the runtime identity, stop the stack and recreate it with only
-`compose.yaml`. Do not recursively change ownership back unless an older image
-actually requires it; first verify the root-compatible stack is healthy. Keep
-the pre-migration ownership listing and a full encrypted backup until the
-non-root deployment has passed operator acceptance.
+After any admin-sidecar restore, leave UI/history stopped, rerun the helper
+preflight and apply step, then restart. This is the ownership interlock for
+root-created restored files. If the helper reports that rollback was incomplete,
+do not start any profile; preserve the full backup and inspect the named host
+paths first.
+
+To roll back, use the deployment transaction's retained predecessor Compose and
+image identities. Do not recursively change ownership back unless that reviewed
+predecessor requires it. Keep the pre-migration ownership listing and a full
+encrypted backup until the non-root deployment has passed operator acceptance.
 
 ## Optional File-Backed Secrets
 
