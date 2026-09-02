@@ -7,7 +7,6 @@ import hmac
 import json
 import logging
 import os
-import shlex
 import signal
 import tempfile
 from contextlib import asynccontextmanager
@@ -62,6 +61,7 @@ from app.services.demo_system_factory import DemoSystemFactory
 from app.services.inventory import InventoryService
 from app.services.profile_registry import ProfileRegistry
 from app.services.inventory_registry import InventoryRegistry
+from app.services.quantastor_cli import build_quantastor_cli_invocation
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.release_status import ReleaseStatusService, describe_release_status
 from app.services.ssh_key_manager import SSHKeyManager
@@ -1800,7 +1800,7 @@ async def enrich_quantastor_nodes_from_ssh(
             ),
         }
 
-    command = build_quantastor_network_port_list_command(payload)
+    command, stdin_data = build_quantastor_network_port_list_invocation(payload)
     failures: list[str] = []
     for seed_host in seed_hosts:
         ssh_config = SSHConfig(
@@ -1816,7 +1816,11 @@ async def enrich_quantastor_nodes_from_ssh(
             commands=[],
         )
         try:
-            results = await SSHProbe(ssh_config).run_commands([command])
+            probe = SSHProbe(ssh_config)
+            if stdin_data is None:
+                results = await probe.run_commands([command])
+            else:
+                results = await probe.run_commands([command], stdin_data=stdin_data)
         except Exception as exc:  # noqa: BLE001 - keep discovery helper best-effort.
             logger.warning("Quantastor HA node host discovery failed on %s: %s", seed_host, exc)
             failures.append(f"{seed_host}: SSH interface discovery failed; see admin logs")
@@ -1884,10 +1888,16 @@ def quantastor_request_node_host_map(payload: QuantastorNodeDiscoveryRequest) ->
 
 
 def build_quantastor_network_port_list_command(payload: QuantastorNodeDiscoveryRequest) -> str:
-    args = ["/usr/bin/qs", "network-port-list", "--json"]
+    return build_quantastor_network_port_list_invocation(payload)[0]
+
+
+def build_quantastor_network_port_list_invocation(
+    payload: QuantastorNodeDiscoveryRequest,
+) -> tuple[str, str | None]:
+    server_spec = None
     if payload.api_user and payload.api_password:
-        args.append(f"--server=localhost,{payload.api_user},{payload.api_password}")
-    return shlex.join(args)
+        server_spec = f"localhost,{payload.api_user},{payload.api_password}"
+    return build_quantastor_cli_invocation("network-port-list", server_spec=server_spec)
 
 
 def ensure_quantastor_rows(payload: Any) -> list[dict[str, Any]]:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import ipaddress
 import json
 import logging
@@ -78,6 +77,7 @@ from app.services.sas_fabric import (
     storage_node_legacy_alias_ids,
 )
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
+from app.services.quantastor_cli import build_quantastor_cli_invocation
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.parsers import (
     ParsedSSHData,
@@ -6706,8 +6706,13 @@ class InventoryService:
                 "cli_network_ports": [],
             }
             host_failures: list[str] = []
-            commands = [self._build_quantastor_cli_command(subcommand) for subcommand, _label, _target in target_specs]
-            stdin_data = self._build_quantastor_cli_stdin_data()
+            server_spec = self._build_quantastor_cli_server_spec()
+            invocations = [
+                build_quantastor_cli_invocation(subcommand, server_spec=server_spec)
+                for subcommand, _label, _target in target_specs
+            ]
+            commands = [command for command, _stdin_data in invocations]
+            stdin_data = invocations[0][1] if invocations else None
             if stdin_data is None:
                 command_results = await self._run_ssh_commands(commands, host)
             else:
@@ -7545,22 +7550,6 @@ class InventoryService:
             unifi_led_states=dict(base.unifi_led_states),
         )
         return merged
-
-    def _build_quantastor_cli_command(self, subcommand: str) -> str:
-        args = ["/usr/bin/qs", subcommand, "--json"]
-        if not self._build_quantastor_cli_server_spec():
-            return shlex.join(args)
-        return (
-            "IFS= read -r qs_server_b64 || exit 64; "
-            "QS_SERVER=$(printf '%s' \"$qs_server_b64\" | /usr/bin/base64 --decode) || exit 64; "
-            f"export QS_SERVER; exec {shlex.join(args)}"
-        )
-
-    def _build_quantastor_cli_stdin_data(self) -> str | None:
-        server_spec = self._build_quantastor_cli_server_spec()
-        if not server_spec:
-            return None
-        return f"{base64.b64encode(server_spec.encode('utf-8')).decode('ascii')}\n"
 
     @staticmethod
     def _parse_quantastor_cli_json(stdout: str) -> Any | None:
