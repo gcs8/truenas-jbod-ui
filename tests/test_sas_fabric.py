@@ -21,6 +21,8 @@ from app.services.sas_diagnostics.decoder import (
     MAX_DIAGNOSTIC_TEXT_LENGTH,
     bound_diagnostic_value,
 )
+from app.services.sas_diagnostics.common import fault_family_likely_layer
+from app.services.sas_diagnostics.scsi import _sense_likely_layer
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.sas_fabric import (
     CORE_DMIDECODE_SLOT_COMMAND,
@@ -56,6 +58,22 @@ from app.services.ssh_probe import SSHCommandResult
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "sas_fabric"
+
+
+class SasDiagnosticLayerTests(unittest.TestCase):
+    def test_sense_likely_layer_matches_the_common_fault_family_mapping(self) -> None:
+        families = (
+            "sas_protocol",
+            "bus_reset",
+            "aborted_command",
+            "device_path_exception",
+            "controller_terminated_io",
+            "ses_enclosure",
+        )
+
+        for family in families:
+            with self.subTest(family=family):
+                self.assertEqual(_sense_likely_layer(family), fault_family_likely_layer(family))
 
 
 MPR_ADAPTERS = """
@@ -401,7 +419,7 @@ Adapter     Chip           Board Name        Firmware
         self.assertEqual(sense_record["decode_confidence"], "standard")
         self.assertEqual(sense_record["decode_source"], "t10_scsi_asc_ascq")
         self.assertEqual(sense_record["source_attribution"]["url"], "https://www.t10.org/lists/asc-num.htm")
-        self.assertEqual(sense_record["likely_layer"], "SAS path, cable, expander, or target port")
+        self.assertEqual(sense_record["likely_layer"], "SAS link/path")
         self.assertEqual(target["event_table"]["total_count"], 5)
         self.assertEqual(target["event_table"]["page_size"], 25)
         self.assertEqual(target["event_table"]["rows"][0]["event_id"], "mpr-dmesg-0001")
