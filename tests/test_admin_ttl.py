@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from admin_service.config import AdminSettings
+from admin_service.config import AdminSettings, get_admin_settings
 from admin_service.main import compute_expires_at, create_app
 
 
@@ -25,6 +25,23 @@ class AdminAutoStopContractTests(unittest.TestCase):
     def test_negative_auto_stop_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             AdminSettings(auto_stop_seconds=-1)
+
+    def test_environment_auto_stop_accepts_only_integer_strings(self) -> None:
+        for raw_value, expected in (("0", 0), ("17", 17)):
+            with self.subTest(raw_value=raw_value):
+                get_admin_settings.cache_clear()
+                with patch.dict("os.environ", {"ADMIN_AUTO_STOP_SECONDS": raw_value}, clear=True):
+                    self.assertEqual(get_admin_settings().auto_stop_seconds, expected)
+
+        for raw_value in ("true", "false", "1.0", "1e3", "", "seventeen"):
+            with self.subTest(raw_value=raw_value):
+                get_admin_settings.cache_clear()
+                with (
+                    patch.dict("os.environ", {"ADMIN_AUTO_STOP_SECONDS": raw_value}, clear=True),
+                    self.assertRaises(ValidationError),
+                ):
+                    get_admin_settings()
+        get_admin_settings.cache_clear()
 
     def test_positive_auto_stop_keeps_expiry_and_shutdown_task(self) -> None:
         settings = AdminSettings(auto_stop_seconds=17)

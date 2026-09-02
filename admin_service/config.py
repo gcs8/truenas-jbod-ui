@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, model_validator
 
 from app.secret_files import load_secret_environment_value
 
@@ -18,7 +18,7 @@ class AdminSettings(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8002
     docker_socket_path: str = "/var/run/docker.sock"
-    auto_stop_seconds: int = Field(default=0, ge=0)
+    auto_stop_seconds: StrictInt = Field(default=0, ge=0)
     container_ui_name: str = "truenas-jbod-ui"
     container_history_name: str = "truenas-jbod-history"
     container_admin_name: str = "truenas-jbod-admin"
