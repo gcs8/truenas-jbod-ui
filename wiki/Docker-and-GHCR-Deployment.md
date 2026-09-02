@@ -65,6 +65,21 @@ Open:
 http://your-docker-host:8080
 ```
 
+The default `ADMIN_AUTH_MODE=network` keeps this dashboard readable but disables
+mapping, alias, import, locator, and LED mutations. To enable operator controls,
+set shared Basic credentials and the exact main-UI origin:
+
+```dotenv
+ADMIN_AUTH_MODE=basic
+ADMIN_AUTH_USERNAME=operator
+ADMIN_AUTH_PASSWORD=replace-with-a-long-random-secret
+APP_PUBLIC_ORIGIN=https://storage-ui.example.local
+```
+
+Basic mode protects persistent and hardware-changing main-UI writes while reads
+remain anonymous. Use HTTPS through a reverse proxy or an encrypted private
+network; Basic credentials are not encrypted by HTTP itself.
+
 ## Optional Non-Root Runtime
 
 The base Compose file keeps the existing root-compatible deployment contract.
@@ -137,8 +152,8 @@ chmod 600 secrets/*
 
 Create all five files before applying the overlay. An unused optional secret
 may be an empty private file. Do not set a blank `_FILE` path: that is treated
-as a startup error. The overlay mounts only the four appliance/SSH files into
-the UI and all five into admin; history and scheduled backup receive none.
+as a startup error. The overlay mounts all five files into both UI and admin;
+history and scheduled backup receive none.
 
 Supported variables are `TRUENAS_API_KEY_FILE`,
 `TRUENAS_API_PASSWORD_FILE`, `SSH_PASSWORD_FILE`,

@@ -85,6 +85,12 @@ Before starting the admin profile, read the
 [Admin Trust Boundary](docs/ADMIN_TRUST_BOUNDARY.md). Its default network mode
 assumes every client that can reach port `8082` is a trusted operator.
 
+The same operator-auth settings now control main-UI writes. The compatibility
+default, `ADMIN_AUTH_MODE=network`, keeps inventory and history views available
+without a login but rejects mapping, alias, import, locator, and LED mutations.
+To enable those controls, set `ADMIN_AUTH_MODE=basic`, configure the shared
+username/password, and set `APP_PUBLIC_ORIGIN` to the exact main-UI origin.
+
 ```bash
 docker compose --profile history up -d
 docker compose --profile admin up -d enclosure-admin

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
-import hmac
 import json
 import logging
 import os
@@ -38,6 +36,7 @@ from app.config import (
     save_runtime_behavior_overrides,
 )
 from app.logging_config import configure_service_logging
+from app.http_auth import basic_auth_matches, request_origin_allowed
 from app.metrics import install_metrics, metrics_path
 from app.script_json import register_script_json_filters
 from app.models.domain import (
@@ -139,60 +138,15 @@ logger = logging.getLogger(__name__)
 
 
 def _basic_auth_matches(authorization: str | None, settings: AdminSettings) -> bool:
-    if not authorization:
-        return False
-    scheme, separator, encoded = authorization.partition(" ")
-    if separator != " " or scheme.lower() != "basic" or not encoded:
-        return False
-    try:
-        decoded = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError):
-        return False
-    username, separator, password = decoded.partition(b":")
-    if separator != b":" or settings.auth_password is None:
-        return False
-    expected_username = str(settings.auth_username or "").encode("utf-8")
-    expected_password = settings.auth_password.get_secret_value().encode("utf-8")
-    username_matches = hmac.compare_digest(username, expected_username)
-    password_matches = hmac.compare_digest(
-        password,
-        expected_password,
+    return basic_auth_matches(
+        authorization,
+        settings.auth_username,
+        settings.auth_password,
     )
-    return bool(username_matches & password_matches)
-
-
-def _origin_identity(value: str | None) -> tuple[str, str, int] | None:
-    candidate = str(value or "").strip()
-    if not candidate:
-        return None
-    try:
-        parsed = urlsplit(candidate)
-        port = parsed.port
-    except ValueError:
-        return None
-    scheme = parsed.scheme.lower()
-    if (
-        scheme not in {"http", "https"}
-        or parsed.hostname is None
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        return None
-    if port is None:
-        port = 443 if scheme == "https" else 80
-    return scheme, parsed.hostname.lower(), port
 
 
 def _request_origin_allowed(request: Request, settings: AdminSettings) -> bool:
-    supplied_origin = request.headers.get("origin") or request.headers.get("referer")
-    if supplied_origin is None:
-        # Non-browser automation does not normally send Origin or Referer.
-        return True
-    candidate = _origin_identity(supplied_origin)
-    if candidate is None:
-        return False
-    configured_origin = _origin_identity(settings.public_origin)
-    return configured_origin is not None and candidate == configured_origin
+    return request_origin_allowed(request, settings.public_origin)
 
 
 def validate_admin_export_policy(
