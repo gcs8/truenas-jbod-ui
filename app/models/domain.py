@@ -937,6 +937,8 @@ class SystemSetupRequest(BaseModel):
     ssh_strict_host_key_checking: bool = True
     ssh_timeout_seconds: int = 15
     ssh_commands: list[str] = Field(default_factory=list)
+    ssh_commands_action: Literal["default", "preserve", "replace"] = "default"
+    ssh_commands_source_system_id: str | None = None
     bmc_enabled: bool = False
     bmc_host: str | None = None
     bmc_username: str | None = None
@@ -960,6 +962,7 @@ class SystemSetupRequest(BaseModel):
         "ssh_host",
         "ssh_user",
         "ssh_key_path",
+        "ssh_commands_source_system_id",
         "bmc_host",
         "bmc_username",
         "default_profile_id",

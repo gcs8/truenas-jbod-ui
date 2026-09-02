@@ -229,7 +229,11 @@ test("setup collection preserves saved SSH secrets and configured timeout", () =
   const state = { loadedSystemId: "saved-esxi", storageViews: [] };
   const bindings = {
     PRESERVE_SECRET_SENTINEL,
-    collectSetupCommands: () => [],
+    collectSshCommandUpdate: () => ({
+      ssh_commands: [],
+      ssh_commands_action: "preserve",
+      ssh_commands_source_system_id: "saved-esxi",
+    }),
     collectTlsServerName: () => null,
     currentQuantastorHaNodes: () => [],
     currentSetupPlatform: () => "esxi",
@@ -256,6 +260,8 @@ test("setup collection preserves saved SSH secrets and configured timeout", () =
 
   assert.equal(payload.ssh_password, PRESERVE_SECRET_SENTINEL);
   assert.equal(payload.ssh_timeout_seconds, 240);
+  assert.equal(payload.ssh_commands_action, "preserve");
+  assert.equal(payload.ssh_commands_source_system_id, "saved-esxi");
 });
 
 test("Quantastor discovery uses canonical preserved secrets and SSH timeout", async () => {

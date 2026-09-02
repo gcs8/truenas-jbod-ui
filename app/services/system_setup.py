@@ -297,11 +297,32 @@ class SystemSetupService:
 
             ssh_enabled = bool(payload.ssh_enabled)
             existing_ssh_commands = list(existing_system.ssh.commands) if existing_system else []
-            ssh_commands = (
-                payload.ssh_commands
-                or existing_ssh_commands
-                or default_ssh_commands_for_platform(payload.platform)
-            )
+            if payload.ssh_commands_action == "preserve":
+                if payload.ssh_commands:
+                    raise ValueError("A preserved SSH command list cannot include replacement commands.")
+                source_system_id = normalize_text(payload.ssh_commands_source_system_id)
+                source_index = next(
+                    (
+                        index
+                        for index, item in enumerate(raw_systems)
+                        if isinstance(item, dict)
+                        and source_system_id
+                        and _normalize_system_id(item.get("id"), index + 1) == source_system_id
+                    ),
+                    None,
+                )
+                if source_index is None:
+                    raise ValueError("The saved SSH command list is unavailable.")
+                source_system = SystemConfig.model_validate(raw_systems[source_index])
+                ssh_commands = list(source_system.ssh.commands)
+            elif payload.ssh_commands_action == "replace":
+                ssh_commands = list(payload.ssh_commands)
+            else:
+                ssh_commands = (
+                    payload.ssh_commands
+                    or existing_ssh_commands
+                    or default_ssh_commands_for_platform(payload.platform)
+                )
             ssh_host = payload.ssh_host or payload.truenas_host
             if payload.storage_views is None and existing_system is not None:
                 storage_views = list(existing_system.storage_views)

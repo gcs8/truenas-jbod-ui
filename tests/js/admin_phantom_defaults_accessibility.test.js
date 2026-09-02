@@ -62,7 +62,11 @@ function collectSetupPayload({ sshUser = "", bmcEnabled = false, bmcHost = "" } 
     ["collectSetupPayload"],
     {
       collectSecretField: () => null,
-      collectSetupCommands: () => [],
+      collectSshCommandUpdate: () => ({
+        ssh_commands: [],
+        ssh_commands_action: "default",
+        ssh_commands_source_system_id: null,
+      }),
       collectTlsServerName: () => null,
       currentQuantastorHaNodes: () => [],
       currentSetupPlatform: () => "core",

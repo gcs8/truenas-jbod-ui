@@ -1602,7 +1602,12 @@ def serialize_systems(settings: Settings) -> list[dict[str, Any]]:
             "ssh_sudo_password_configured": bool(system.ssh.sudo_password),
             "ssh_strict_host_key_checking": bool(system.ssh.strict_host_key_checking),
             "ssh_timeout_seconds": system.ssh.timeout_seconds,
-            "ssh_commands": list(system.ssh.commands),
+            "ssh_commands": [
+                f"Saved command {index} (hidden)"
+                for index, _command in enumerate(system.ssh.commands, start=1)
+            ],
+            "ssh_commands_redacted": bool(system.ssh.commands),
+            "ssh_commands_count": len(system.ssh.commands),
             "bmc_enabled": bool(system.bmc.enabled),
             "bmc_host": system.bmc.host,
             "bmc_username": system.bmc.username,
