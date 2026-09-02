@@ -47,6 +47,7 @@ from history_service.system_backup import (
     BundleMember,
     CONFIG_FILE_KEY,
     DEBUG_BUNDLE_FORMAT,
+    DEBUG_README_KEY,
     ENCRYPTED_BACKUP_MAGIC,
     ENCRYPTED_BACKUP_NONCE_BYTES,
     ENCRYPTED_BACKUP_SALT_BYTES,
@@ -320,6 +321,200 @@ class SystemBackupServiceTests(unittest.TestCase):
             self.assertEqual(scheduled_artifact.manifest["schema_version"], 1)
         finally:
             scheduled_artifact.cleanup()
+
+    def _build_segmented_debug_service(
+        self,
+    ) -> tuple[SystemBackupService, Path, Path]:
+        segmented_root = Path(
+            tempfile.mkdtemp(prefix="segmented-debug-", dir=self.temp_dir)
+        )
+        source = segmented_root / "history.db"
+        segments_directory = segmented_root / "segments"
+        with sqlite3.connect(source) as connection:
+            connection.executescript(SCHEMA)
+            for event_id, observed_at, marker in (
+                (1, "2025-01-01T00:00:00+00:00", "SEGMENT-PRIVATE-SERIAL"),
+                (2, "2025-01-02T00:00:00+00:00", "HOT-PRIVATE-SERIAL"),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO slot_events (
+                        id, observed_at, system_id, enclosure_key,
+                        slot, slot_label, event_type, details_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        observed_at,
+                        "synthetic-system",
+                        "synthetic-enclosure",
+                        1,
+                        "slot-1",
+                        "state_change",
+                        json.dumps({"serial": marker}),
+                    ),
+                )
+        segment_migration.migrate_segmented_history(
+            source=source,
+            segments_directory=segments_directory,
+            cutoff="2025-01-02T00:00:00+00:00",
+            key_id="synthetic-key-1",
+            apply=True,
+        )
+        catalog_path = segments_directory / "catalog.json"
+        settings = HistorySettings(
+            sqlite_path=str(source),
+            segment_catalog_path=str(catalog_path),
+            backup_dir=str(segmented_root / "backups"),
+            startup_grace_seconds=0,
+        )
+        service = SystemBackupService(
+            settings,
+            HistoryStore(
+                str(source),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog_path,
+            ),
+        )
+        return service, catalog_path, segments_directory / "segment-0001.sqlite3"
+
+    def test_segmented_debug_export_scrubs_hot_and_segment_history(self) -> None:
+        service, _catalog_path, _segment_path = self._build_segmented_debug_service()
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            artifact = service.export_debug_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY, DEBUG_README_KEY],
+                scrub_secrets=False,
+                scrub_disk_identifiers=True,
+            )
+        try:
+            self.assertEqual(artifact.manifest["format"], DEBUG_BUNDLE_FORMAT)
+            self.assertEqual(artifact.manifest["schema_version"], 1)
+            self.assertNotIn("generation", artifact.manifest)
+            self.assertNotIn("history_catalog", artifact.manifest)
+            file_keys = {entry["key"] for entry in artifact.manifest["files"]}
+            self.assertEqual(
+                file_keys,
+                {
+                    HISTORY_DB_KEY,
+                    DEBUG_README_KEY,
+                    "history-segment-catalog",
+                    "history-segment:segment-0001",
+                },
+            )
+            with zipfile.ZipFile(artifact.path) as archive:
+                self.assertEqual(
+                    set(archive.namelist()),
+                    {
+                        "manifest.json",
+                        "debug/README.txt",
+                        "history/history.sqlite3",
+                        "history/segments/catalog.json",
+                        "history/segments/segment-0001.sqlite3",
+                    },
+                )
+                self.assertIn(
+                    "not a restore bundle",
+                    archive.read("debug/README.txt").decode("utf-8"),
+                )
+                debug_catalog = json.loads(
+                    archive.read("history/segments/catalog.json")
+                )
+                segment_content = archive.read(
+                    "history/segments/segment-0001.sqlite3"
+                )
+                self.assertEqual(
+                    debug_catalog["segments"][0]["size_bytes"],
+                    len(segment_content),
+                )
+                self.assertEqual(
+                    debug_catalog["segments"][0]["sha256"],
+                    hashlib.sha256(segment_content).hexdigest(),
+                )
+                exported_databases = {
+                    "hot": archive.read("history/history.sqlite3"),
+                    "segment": segment_content,
+                }
+            for label, content in exported_databases.items():
+                database_path = self.temp_dir / f"debug-{label}.sqlite3"
+                database_path.write_bytes(content)
+                with sqlite3.connect(database_path) as connection:
+                    details = [row[0] for row in connection.execute("SELECT details_json FROM slot_events")]
+                self.assertTrue(details, label)
+                self.assertNotIn("SEGMENT-PRIVATE-SERIAL", "".join(details))
+                self.assertNotIn("HOT-PRIVATE-SERIAL", "".join(details))
+        finally:
+            artifact.cleanup()
+
+    def test_segmented_debug_export_supports_encrypted_packaging(self) -> None:
+        service, _catalog_path, _segment_path = self._build_segmented_debug_service()
+        passphrase = "synthetic segmented debug passphrase"
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(service, "_run_7z_command", side_effect=self._fake_7z_command),
+        ):
+            get_settings.cache_clear()
+            artifact = service.export_debug_bundle_to_file(
+                encrypt=True,
+                passphrase=passphrase,
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+                scrub_secrets=False,
+                scrub_disk_identifiers=False,
+            )
+        try:
+            payload = json.loads(
+                artifact.path.read_bytes()[len(SEVEN_ZIP_SIGNATURE) :].decode("utf-8")
+            )
+            self.assertTrue(payload["encrypted"])
+            self.assertEqual(payload["passphrase_kdf"], self._fake_7z_passphrase_token(passphrase))
+            self.assertEqual(
+                set(payload["files"]),
+                {
+                    "manifest.json",
+                    "history/history.sqlite3",
+                    "history/segments/catalog.json",
+                    "history/segments/segment-0001.sqlite3",
+                },
+            )
+        finally:
+            artifact.cleanup()
+
+    def test_segmented_snapshot_rejects_unreferenced_segment_file(self) -> None:
+        service, catalog_path, segment_path = self._build_segmented_debug_service()
+        orphan_path = catalog_path.parent / "segment-orphan.sqlite3"
+        shutil.copyfile(segment_path, orphan_path)
+
+        with self.assertRaisesRegex(ValueError, "unreferenced"):
+            service._build_segmented_history_snapshot_to_directory(
+                self.temp_dir / "unreferenced-segment-snapshot"
+            )
+
+    def test_segmented_snapshot_rejects_catalog_change_during_copy(self) -> None:
+        service, catalog_path, segment_path = self._build_segmented_debug_service()
+        real_copyfile = shutil.copyfile
+
+        def copy_then_change_catalog(
+            source_path: str | Path,
+            destination_path: str | Path,
+            *args: Any,
+            **kwargs: Any,
+        ) -> str:
+            copied = str(real_copyfile(source_path, destination_path, *args, **kwargs))
+            if Path(source_path) == segment_path:
+                catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+                catalog["generation_id"] = "generation-changed"
+                catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+            return copied
+
+        with (
+            patch.object(system_backup_module.shutil, "copyfile", side_effect=copy_then_change_catalog),
+            self.assertRaisesRegex(ValueError, "catalog changed"),
+        ):
+            service._build_segmented_history_snapshot_to_directory(
+                self.temp_dir / "changed-catalog-snapshot"
+            )
 
     def test_segmented_history_export_emits_schema_v2_hot_and_segment_members(self) -> None:
         segmented_root = self.temp_dir / "segmented-export"
