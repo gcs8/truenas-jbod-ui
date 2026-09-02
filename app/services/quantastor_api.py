@@ -19,6 +19,12 @@ from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
 
 logger = logging.getLogger(__name__)
 
+# Required endpoints must answer without an error payload, but an empty list is a
+# valid answer for these: an appliance with no storage pools yet is not an
+# unreachable API, and the inventory can render its disks and enclosures without pools.
+REQUIRED_ENDPOINTS_ALLOWING_EMPTY_ROWS = frozenset({"storagePoolEnum"})
+SUPPORTED_COLLECTION_KEYS = ("result", "list", "items", "objects", "data")
+
 
 def build_quantastor_api_base(host: str) -> str:
     if "://" not in host:
@@ -69,10 +75,38 @@ class QuantastorRESTClient:
         payload = self._request_json(endpoint, {"flags": 0})
         if self._is_error_payload(payload):
             raise TrueNASAPIError(f"Quantastor endpoint {endpoint} returned an API error payload: {payload}")
+        if not self._is_valid_collection_payload(payload):
+            raise TrueNASAPIError(f"Quantastor endpoint {endpoint} returned no usable rows.")
         rows = self._ensure_list(payload)
         if not rows:
-            raise TrueNASAPIError(f"Quantastor endpoint {endpoint} returned no usable rows.")
+            allows_empty = endpoint in REQUIRED_ENDPOINTS_ALLOWING_EMPTY_ROWS
+            if not allows_empty or not self._is_explicit_empty_collection(payload):
+                raise TrueNASAPIError(f"Quantastor endpoint {endpoint} returned no usable rows.")
         return rows
+
+    @staticmethod
+    def _is_valid_collection_payload(payload: Any) -> bool:
+        if isinstance(payload, list):
+            return all(isinstance(item, dict) for item in payload)
+        if not isinstance(payload, dict):
+            return False
+
+        wrapper_keys = [key for key in SUPPORTED_COLLECTION_KEYS if key in payload]
+        if len(wrapper_keys) != 1:
+            return False
+        rows = payload[wrapper_keys[0]]
+        return isinstance(rows, list) and all(isinstance(item, dict) for item in rows)
+
+    @staticmethod
+    def _is_explicit_empty_collection(payload: Any) -> bool:
+        if isinstance(payload, list):
+            return not payload
+        if isinstance(payload, dict):
+            for key in SUPPORTED_COLLECTION_KEYS:
+                if key in payload:
+                    value = payload[key]
+                    return isinstance(value, list) and not value
+        return False
 
     def _fetch_optional_list(self, endpoint: str) -> list[dict[str, Any]]:
         try:
