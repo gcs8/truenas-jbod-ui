@@ -1447,5 +1447,79 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
 
 
+
+class SnapshotRedactorIdentifierKeyTests(unittest.TestCase):
+    def test_partial_redaction_does_not_replace_identifier_substrings(self) -> None:
+        snapshot = build_snapshot()
+        matching_timestamp = datetime(2026, 9, 2, 0, 1, tzinfo=timezone.utc)
+        snapshot.last_updated = matching_timestamp
+        snapshot.generated_at = matching_timestamp
+        snapshot.slots[0].raw_status = {
+            "sas_address_hint": "00:01",
+            "message": "observed 2026-09-02T00:01:00Z",
+        }
+
+        redacted = SnapshotRedactor(snapshot, {}, {}).redact_snapshot(snapshot)
+
+        self.assertNotEqual(redacted.slots[0].raw_status["sas_address_hint"], "00:01")
+        self.assertEqual(
+            redacted.slots[0].raw_status["message"],
+            "observed 2026-09-02T00:01:00Z",
+        )
+
+    def test_partial_redaction_does_not_collect_low_entropy_sentinel_tokens(self) -> None:
+        snapshot = build_snapshot()
+        snapshot.slots[0].raw_status = {
+            "sas_address_hint": "0",
+            "message": "slot 10 observed at 2026-09-02T00:00:00Z",
+        }
+
+        redacted = SnapshotRedactor(snapshot, {}, {}).redact_snapshot(snapshot)
+
+        self.assertEqual(redacted.slots[0].raw_status["sas_address_hint"], "0")
+        self.assertEqual(
+            redacted.slots[0].raw_status["message"],
+            "slot 10 observed at 2026-09-02T00:00:00Z",
+        )
+
+    def test_partial_redaction_masks_hint_and_linux_blockdevice_identifier_keys(self) -> None:
+        snapshot = build_snapshot()
+        slot = snapshot.slots[0]
+        slot.serial = "MAINSERIAL0001"
+        slot.sas_address = "0x5000c500a1b2c3d4"
+        slot.raw_status = {
+            # BMC / Quantastor correlation hints carry their own identifiers.
+            "serial_hint": "BMCSERIAL9999",
+            "sas_address_hint": "5000c500a1b2c3e0",
+            # Linux SCALE/generic slots embed the lsblk summary and sysfs transport address.
+            "transport_address": "0x5000c500a1b2c3f1",
+            "linux_blockdevice": {
+                "wwn": "0x5000c500a1b2c3d5",
+                "partuuid": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+                "serial": "MAINSERIAL0001",
+            },
+        }
+
+        redacted = SnapshotRedactor(snapshot, {}, {}).redact_snapshot(snapshot)
+        raw_status = redacted.slots[0].raw_status
+
+        self.assertEqual(raw_status["serial_hint"], "...9999")
+        self.assertEqual(raw_status["sas_address_hint"], "5000...c3e0")
+        self.assertEqual(raw_status["transport_address"], "0x50...c3f1")
+        self.assertEqual(raw_status["linux_blockdevice"]["wwn"], "0x50...c3d5")
+        self.assertEqual(raw_status["linux_blockdevice"]["partuuid"], "3f25...3301")
+        # The same serial appears under two keys, so the suffix-collision form is expected.
+        self.assertEqual(raw_status["linux_blockdevice"]["serial"], "MA...0001")
+        self.assertEqual(redacted.slots[0].serial, "MA...0001")
+        for original in (
+            "BMCSERIAL9999",
+            "5000c500a1b2c3e0",
+            "0x5000c500a1b2c3f1",
+            "0x5000c500a1b2c3d5",
+            "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+        ):
+            self.assertNotIn(original, redacted.model_dump_json())
+
+
 if __name__ == "__main__":
     unittest.main()
