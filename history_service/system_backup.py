@@ -45,11 +45,12 @@ from history_service.segment_catalog import (
     HISTORY_SEGMENT_GROUP_KEY,
     SEGMENTED_BACKUP_SCHEMA_VERSION,
     activation_pending_path,
+    path_entry_exists,
     validate_segmented_manifest,
 )
 from history_service.migration_lock import history_write_lock
 from history_service.segment_reader import SegmentedHistoryReader
-from history_service.store import HistoryStore
+from history_service.store import SQLITE_CONNECT_TIMEOUT_SECONDS, HistoryStore
 
 
 BUNDLE_SCHEMA_VERSION = 1
@@ -437,12 +438,41 @@ class _ImportActivationTransaction:
             raise ValueError("Segmented history catalog target is not configured.")
         store._segment_reader_cache = None
         store._segment_reader_identity = None
+        # The v1 path restores through HistoryStore.restore_backup, which owns
+        # the live WAL/SHM. This path is a plain file replace: committed frames
+        # still sitting in the live WAL would be replayed over the restored
+        # image by the next connection, and unlinking the WAL blindly would
+        # strip the parked original of frames a rollback needs. Fold the WAL
+        # into the hot file first and refuse if a reader keeps frames pending;
+        # import_bundle holds the history write lock, so nothing can append
+        # frames between the checkpoint and the replace.
+        self._checkpoint_hot_database(store.file_path)
         self._activate_file(
             store.file_path,
             hot_member_key,
             allow_history=True,
         )
+        for suffix in ("-shm", "-wal"):
+            Path(f"{store.file_path}{suffix}").unlink(missing_ok=True)
         self.activate_directory(catalog_path.parent, segment_members)
+
+    @staticmethod
+    def _checkpoint_hot_database(hot_path: Path) -> None:
+        if path_entry_exists(Path(f"{hot_path}-journal")):
+            raise ValueError(
+                "History database has a rollback journal; recover it before a segmented restore."
+            )
+        if not path_entry_exists(hot_path):
+            return
+        with closing(sqlite3.connect(hot_path, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS)) as connection:
+            row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        busy, pending_frames, _checkpointed = (int(value) for value in row)
+        if busy or pending_frames > 0:
+            raise ValueError(
+                "History database WAL cannot be checkpointed while readers hold it open "
+                f"({max(pending_frames, 0)} frames pending); stop the history service and retry "
+                "the segmented restore."
+            )
 
     def activate_directory(
         self,
