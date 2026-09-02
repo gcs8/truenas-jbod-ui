@@ -23,7 +23,7 @@ from contextlib import closing, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import yaml
@@ -50,6 +50,17 @@ from history_service.segment_catalog import (
 )
 from history_service.migration_lock import history_write_lock
 from history_service.segment_reader import SegmentedHistoryReader
+from history_service.segmented_restore import (
+    file_matches as restore_file_matches,
+    record_file as record_restore_file,
+    record_optional_file as record_optional_restore_file,
+    record_optional_tree as record_optional_restore_tree,
+    record_tree as record_restore_tree,
+    remove_recorded_file as remove_recorded_restore_file,
+    remove_recorded_tree as remove_recorded_restore_tree,
+    tree_matches as restore_tree_matches,
+    write_restore_journal,
+)
 from history_service.store import SQLITE_CONNECT_TIMEOUT_SECONDS, HistoryStore
 
 
@@ -298,6 +309,20 @@ class _ImportRollbackEntry:
     mutated: bool = False
 
 
+@dataclass(slots=True)
+class _PreparedSegmentedRestore:
+    store: HistoryStore
+    hot_member_key: str
+    segment_members: tuple[tuple[str, Path], ...]
+    hot_entry: _ImportRollbackEntry
+    segments_entry: _ImportRollbackEntry
+    staged_hot_path: Path
+    staged_segments_path: Path
+    previous_hot_path: Path
+    previous_segments_path: Path
+    journal_payload: dict[str, Any]
+
+
 class _ImportActivationTransaction:
     _MISSING_FILE_MODE = 0o600
     _MISSING_DIRECTORY_MODE = 0o700
@@ -325,6 +350,8 @@ class _ImportActivationTransaction:
         )
         self._committed = False
         self._rollback_completed = False
+        self._prepared_segmented_restore: _PreparedSegmentedRestore | None = None
+        self._preserve_segmented_evidence = False
         try:
             for member_key, content in sorted(extracted_members.items()):
                 staged_path = self.staging_root / hashlib.sha256(
@@ -346,6 +373,11 @@ class _ImportActivationTransaction:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> Literal[False]:
+        if exc is not None and self._preserve_segmented_evidence:
+            raise RuntimeError(
+                "Segmented history restore integrity failed; recovery material was "
+                f"preserved at {self.root}."
+            ) from exc
         if exc is not None and not self._committed:
             try:
                 self.rollback()
@@ -426,6 +458,244 @@ class _ImportActivationTransaction:
         finally:
             self._cleanup_sibling_artifact(temp_path)
 
+    def prepare_segmented_history(
+        self,
+        store: HistoryStore,
+        *,
+        hot_member_key: str,
+        segment_members: list[tuple[str, Path]],
+        generation_id: str | None,
+    ) -> dict[str, Any]:
+        if self._prepared_segmented_restore is not None:
+            raise ValueError("Segmented history restore is already prepared.")
+        catalog_path = store.segment_catalog_path
+        if catalog_path is None:
+            raise ValueError("Segmented history catalog target is not configured.")
+        store._segment_reader_cache = None
+        store._segment_reader_identity = None
+        self._checkpoint_hot_database(store.file_path)
+        hot_entry = self._record_target(store.file_path, allow_history=True)
+        segments_entry = self._record_target(catalog_path.parent)
+        if hot_entry.kind not in {"file", "missing"}:
+            raise ValueError("Live segmented history hot target is invalid.")
+        if segments_entry.kind not in {"directory", "missing"}:
+            raise ValueError("Live segmented history directory target is invalid.")
+        self._ensure_parent_hierarchy(store.file_path.parent)
+        self._ensure_parent_hierarchy(catalog_path.parent.parent)
+
+        transaction_id = uuid.uuid4().hex
+        staged_hot_path = store.file_path.with_name(
+            f".{store.file_path.name}.restore-{transaction_id}"
+        )
+        previous_hot_path = store.file_path.with_name(
+            f".{store.file_path.name}.previous-{transaction_id}"
+        )
+        staged_segments_path = catalog_path.parent.with_name(
+            f".{catalog_path.parent.name}.restore-{transaction_id}"
+        )
+        previous_segments_path = catalog_path.parent.with_name(
+            f".{catalog_path.parent.name}.previous-{transaction_id}"
+        )
+        for path in (
+            staged_hot_path,
+            previous_hot_path,
+            staged_segments_path,
+            previous_segments_path,
+        ):
+            if self._path_exists(path):
+                raise ValueError("Segmented history restore artifact already exists.")
+
+        self._stage_segmented_hot(
+            staged_hot_path,
+            source_path=self._staged_member(hot_member_key),
+            target_path=store.file_path,
+            entry=hot_entry,
+        )
+        self._stage_segmented_directory(
+            staged_segments_path,
+            target_dir=catalog_path.parent,
+            entry=segments_entry,
+            members=segment_members,
+        )
+        journal_payload: dict[str, Any] = {
+            "journal_version": 1,
+            "operation": "segmented-restore",
+            "transaction_id": transaction_id,
+            "phase": "prepared",
+            "generation_id": generation_id,
+            "hot": {
+                "target_name": store.file_path.name,
+                "staged_name": staged_hot_path.name,
+                "previous_name": previous_hot_path.name,
+                "prior": record_optional_restore_file(store.file_path),
+                "candidate": record_restore_file(staged_hot_path),
+            },
+            "segments": {
+                "target_name": catalog_path.parent.name,
+                "staged_name": staged_segments_path.name,
+                "previous_name": previous_segments_path.name,
+                "prior": record_optional_restore_tree(catalog_path.parent),
+                "candidate": record_restore_tree(staged_segments_path),
+            },
+        }
+        self._prepared_segmented_restore = _PreparedSegmentedRestore(
+            store=store,
+            hot_member_key=hot_member_key,
+            segment_members=tuple(segment_members),
+            hot_entry=hot_entry,
+            segments_entry=segments_entry,
+            staged_hot_path=staged_hot_path,
+            staged_segments_path=staged_segments_path,
+            previous_hot_path=previous_hot_path,
+            previous_segments_path=previous_segments_path,
+            journal_payload=journal_payload,
+        )
+        return journal_payload
+
+    def _stage_segmented_hot(
+        self,
+        staged_path: Path,
+        *,
+        source_path: Path,
+        target_path: Path,
+        entry: _ImportRollbackEntry,
+    ) -> None:
+        descriptor = os.open(
+            staged_path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            self._MISSING_FILE_MODE,
+        )
+        os.close(descriptor)
+        self._sibling_artifacts.add(staged_path)
+        shutil.copyfile(source_path, staged_path)
+        owner = self._existing_owner(
+            target_path if entry.kind == "file" else target_path.parent,
+            directory=entry.kind != "file",
+        )
+        mode = (
+            target_path.stat(follow_symlinks=False).st_mode & 0o7777
+            if entry.kind == "file"
+            else self._MISSING_FILE_MODE
+        )
+        self._apply_owner(staged_path, owner)
+        staged_path.chmod(mode)
+        self._fsync_file(staged_path)
+        self._fsync_directory(staged_path.parent)
+
+    def _stage_segmented_directory(
+        self,
+        staged_dir: Path,
+        *,
+        target_dir: Path,
+        entry: _ImportRollbackEntry,
+        members: list[tuple[str, Path]],
+    ) -> None:
+        staged_dir.mkdir(mode=self._MISSING_DIRECTORY_MODE)
+        self._sibling_artifacts.add(staged_dir)
+        existing_directory = target_dir if entry.kind == "directory" else None
+        root_owner = self._existing_owner(
+            existing_directory or target_dir.parent,
+            directory=True,
+        )
+        self._apply_owner(staged_dir, root_owner)
+        staged_dir.chmod(
+            self._existing_mode(existing_directory, directory=True)
+            or self._MISSING_DIRECTORY_MODE
+        )
+        seen: set[Path] = set()
+        for member_key, relative_path in members:
+            if (
+                relative_path.is_absolute()
+                or not relative_path.parts
+                or any(part in {"", ".", ".."} for part in relative_path.parts)
+                or relative_path in seen
+            ):
+                raise ValueError("Segmented history restore member path is invalid.")
+            seen.add(relative_path)
+            staged_target = staged_dir / relative_path
+            current_relative = Path()
+            for part in relative_path.parts[:-1]:
+                current_relative /= part
+                staged_parent = staged_dir / current_relative
+                if not staged_parent.exists():
+                    staged_parent.mkdir()
+                existing_parent = (
+                    existing_directory / current_relative
+                    if existing_directory is not None
+                    else None
+                )
+                parent_owner = self._existing_owner(existing_parent, directory=True)
+                if parent_owner is None:
+                    parent_owner = self._existing_owner(
+                        staged_parent.parent,
+                        directory=True,
+                    )
+                self._apply_owner(staged_parent, parent_owner)
+                staged_parent.chmod(
+                    self._existing_mode(existing_parent, directory=True)
+                    or self._MISSING_DIRECTORY_MODE
+                )
+            shutil.copyfile(self._staged_member(member_key), staged_target)
+            existing_target = (
+                existing_directory / relative_path
+                if existing_directory is not None
+                else None
+            )
+            target_owner = self._existing_owner(existing_target, directory=False)
+            if target_owner is None:
+                target_owner = self._existing_owner(
+                    staged_target.parent,
+                    directory=True,
+                )
+            self._apply_owner(staged_target, target_owner)
+            staged_target.chmod(
+                self._existing_mode(existing_target, directory=False)
+                or self._MISSING_FILE_MODE
+            )
+        self._fsync_tree(staged_dir)
+        self._fsync_directory(staged_dir.parent)
+
+    def _activate_prepared_target(
+        self,
+        entry: _ImportRollbackEntry,
+        *,
+        staged_path: Path,
+        previous_path: Path,
+        prior_record: dict[str, Any],
+        candidate_record: dict[str, Any],
+        matcher: Callable[[Path, Any], bool],
+    ) -> None:
+        prior_matches = (
+            not self._path_exists(entry.target_path)
+            if prior_record.get("kind") == "missing"
+            else matcher(entry.target_path, prior_record)
+        )
+        if not prior_matches or not matcher(staged_path, candidate_record):
+            self._preserve_segmented_evidence = True
+            raise ValueError("Segmented history restore prepared artifact integrity failed.")
+        if entry.kind != "missing":
+            if self._path_exists(previous_path):
+                raise ValueError("Segmented history prior restore artifact already exists.")
+            os.replace(entry.target_path, previous_path)
+            entry.backup_path = previous_path
+            entry.mutated = True
+            self._sibling_artifacts.add(previous_path)
+            self._fsync_directory(entry.target_path.parent)
+            if not matcher(previous_path, prior_record):
+                self._preserve_segmented_evidence = True
+                raise ValueError("Segmented history restore parked prior integrity failed.")
+        os.replace(staged_path, entry.target_path)
+        self._sibling_artifacts.discard(staged_path)
+        entry.mutated = True
+        self._fsync_directory(entry.target_path.parent)
+        if not matcher(entry.target_path, candidate_record):
+            self._preserve_segmented_evidence = True
+            raise ValueError("Segmented history restore activated candidate integrity failed.")
+
     def activate_segmented_history(
         self,
         store: HistoryStore,
@@ -433,28 +703,36 @@ class _ImportActivationTransaction:
         hot_member_key: str,
         segment_members: list[tuple[str, Path]],
     ) -> None:
-        catalog_path = store.segment_catalog_path
-        if catalog_path is None:
-            raise ValueError("Segmented history catalog target is not configured.")
-        store._segment_reader_cache = None
-        store._segment_reader_identity = None
-        # The v1 path restores through HistoryStore.restore_backup, which owns
-        # the live WAL/SHM. This path is a plain file replace: committed frames
-        # still sitting in the live WAL would be replayed over the restored
-        # image by the next connection, and unlinking the WAL blindly would
-        # strip the parked original of frames a rollback needs. Fold the WAL
-        # into the hot file first and refuse if a reader keeps frames pending;
-        # import_bundle holds the history write lock, so nothing can append
-        # frames between the checkpoint and the replace.
-        self._checkpoint_hot_database(store.file_path)
-        self._activate_file(
-            store.file_path,
-            hot_member_key,
-            allow_history=True,
+        prepared = self._prepared_segmented_restore
+        if (
+            prepared is None
+            or prepared.store is not store
+            or prepared.hot_member_key != hot_member_key
+            or prepared.segment_members != tuple(segment_members)
+        ):
+            raise ValueError("Segmented history restore was not prepared.")
+        for suffix in ("-wal", "-shm", "-journal"):
+            if path_entry_exists(Path(f"{store.file_path}{suffix}")):
+                self._preserve_segmented_evidence = True
+                raise ValueError(
+                    "Segmented history restore refuses post-marker SQLite sidecars."
+                )
+        self._activate_prepared_target(
+            prepared.hot_entry,
+            staged_path=prepared.staged_hot_path,
+            previous_path=prepared.previous_hot_path,
+            prior_record=prepared.journal_payload["hot"]["prior"],
+            candidate_record=prepared.journal_payload["hot"]["candidate"],
+            matcher=restore_file_matches,
         )
-        for suffix in ("-shm", "-wal"):
-            Path(f"{store.file_path}{suffix}").unlink(missing_ok=True)
-        self.activate_directory(catalog_path.parent, segment_members)
+        self._activate_prepared_target(
+            prepared.segments_entry,
+            staged_path=prepared.staged_segments_path,
+            previous_path=prepared.previous_segments_path,
+            prior_record=prepared.journal_payload["segments"]["prior"],
+            candidate_record=prepared.journal_payload["segments"]["candidate"],
+            matcher=restore_tree_matches,
+        )
 
     @staticmethod
     def _checkpoint_hot_database(hot_path: Path) -> None:
@@ -463,6 +741,18 @@ class _ImportActivationTransaction:
                 "History database has a rollback journal; recover it before a segmented restore."
             )
         if not path_entry_exists(hot_path):
+            if any(
+                path_entry_exists(Path(f"{hot_path}{suffix}"))
+                for suffix in ("-wal", "-shm")
+            ):
+                raise ValueError(
+                    "History database sidecars exist without the main database; recover them "
+                    "before a segmented restore."
+                )
+            return
+        wal_path = Path(f"{hot_path}-wal")
+        shm_path = Path(f"{hot_path}-shm")
+        if not path_entry_exists(wal_path) and not path_entry_exists(shm_path):
             return
         with closing(sqlite3.connect(hot_path, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS)) as connection:
             row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
@@ -472,6 +762,11 @@ class _ImportActivationTransaction:
                 "History database WAL cannot be checkpointed while readers hold it open "
                 f"({max(pending_frames, 0)} frames pending); stop the history service and retry "
                 "the segmented restore."
+            )
+        if path_entry_exists(wal_path) or path_entry_exists(shm_path):
+            raise ValueError(
+                "History database sidecars remain after checkpoint; stop the history service, "
+                "remove only checkpointed residual sidecars, and retry the segmented restore."
             )
 
     def activate_directory(
@@ -775,6 +1070,42 @@ class _ImportActivationTransaction:
         return failures
 
     def _finalize_commit(self) -> None:
+        prepared = self._prepared_segmented_restore
+        if prepared is not None:
+            hot = prepared.journal_payload["hot"]
+            segments = prepared.journal_payload["segments"]
+            if not restore_file_matches(prepared.hot_entry.target_path, hot["candidate"]):
+                raise ValueError("Segmented history restore live hot integrity failed.")
+            if not restore_tree_matches(prepared.segments_entry.target_path, segments["candidate"]):
+                raise ValueError("Segmented history restore live segment tree integrity failed.")
+            if hot["prior"].get("kind") == "missing":
+                if self._path_exists(prepared.previous_hot_path):
+                    raise ValueError("Segmented history restore prior hot artifact is unexpected.")
+            elif not restore_file_matches(prepared.previous_hot_path, hot["prior"]):
+                raise ValueError("Segmented history restore prior hot integrity failed.")
+            if segments["prior"].get("kind") == "missing":
+                if self._path_exists(prepared.previous_segments_path):
+                    raise ValueError("Segmented history restore prior segment artifact is unexpected.")
+            elif not restore_tree_matches(
+                prepared.previous_segments_path,
+                segments["prior"],
+            ):
+                raise ValueError("Segmented history restore prior segment tree integrity failed.")
+            if hot["prior"].get("kind") != "missing":
+                remove_recorded_restore_file(
+                    prepared.previous_hot_path,
+                    hot["prior"],
+                    label="prior hot database",
+                )
+            self._sibling_artifacts.discard(prepared.previous_hot_path)
+            if segments["prior"].get("kind") != "missing":
+                remove_recorded_restore_tree(
+                    prepared.previous_segments_path,
+                    segments["prior"],
+                    label="prior segment tree",
+                )
+            self._sibling_artifacts.discard(prepared.previous_segments_path)
+            self._prepared_segmented_restore = None
         failures = self._cleanup_sibling_artifacts()
         if failures:
             raise RuntimeError(self._failure_summary(failures))
@@ -1609,89 +1940,21 @@ class SystemBackupService:
     @staticmethod
     def _create_segmented_activation_marker(
         store: HistoryStore,
-        manifest: dict[str, Any],
-    ) -> tuple[Path, int, tuple[int, int]]:
+        payload: dict[str, Any],
+    ) -> tuple[Path, dict[str, Any]]:
         marker_path = activation_pending_path(store.file_path)
-        generation = manifest.get("generation")
-        generation_id = generation.get("generation_id") if isinstance(generation, dict) else None
-        payload = json.dumps(
-            {
-                "operation": "segmented-restore",
-                "generation_id": generation_id,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        descriptor = os.open(marker_path, flags, 0o600)
-        try:
-            view = memoryview(payload)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("Segmented history activation marker write failed.")
-                view = view[written:]
-            os.fsync(descriptor)
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise ValueError("Segmented history activation marker is invalid.")
-            path_metadata = os.stat(marker_path, follow_symlinks=False)
-            identity = (int(metadata.st_dev), int(metadata.st_ino))
-            if (path_metadata.st_dev, path_metadata.st_ino) != identity:
-                raise ValueError("Segmented history activation marker is invalid.")
-            _ImportActivationTransaction._fsync_directory(marker_path.parent)
-            return marker_path, descriptor, identity
-        except Exception:
-            removed = False
-            try:
-                metadata = os.fstat(descriptor)
-                path_metadata = os.stat(marker_path, follow_symlinks=False)
-                if (
-                    stat.S_ISREG(path_metadata.st_mode)
-                    and (path_metadata.st_dev, path_metadata.st_ino)
-                    == (metadata.st_dev, metadata.st_ino)
-                ):
-                    marker_path.unlink()
-                    removed = True
-            except FileNotFoundError:
-                pass
-            finally:
-                os.close(descriptor)
-            if removed:
-                _ImportActivationTransaction._fsync_directory(marker_path.parent)
-            raise
+        return marker_path, write_restore_journal(marker_path, payload)
 
     @staticmethod
     def _remove_segmented_activation_marker(
-        marker: tuple[Path, int, tuple[int, int]],
+        marker: tuple[Path, dict[str, Any]],
     ) -> None:
-        marker_path, descriptor, identity = marker
-        try:
-            metadata = os.fstat(descriptor)
-            path_metadata = os.stat(marker_path, follow_symlinks=False)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_nlink != 1
-                or (metadata.st_dev, metadata.st_ino) != identity
-                or (path_metadata.st_dev, path_metadata.st_ino) != identity
-            ):
-                raise RuntimeError("Segmented history activation marker identity changed.")
-            marker_path.unlink()
-            _ImportActivationTransaction._fsync_directory(marker_path.parent)
-        finally:
-            os.close(descriptor)
-
-    @staticmethod
-    def _close_segmented_activation_marker(
-        marker: tuple[Path, int, tuple[int, int]],
-    ) -> None:
-        os.close(marker[1])
+        marker_path, marker_record = marker
+        remove_recorded_restore_file(
+            marker_path,
+            marker_record,
+            label="activation journal",
+        )
 
     def import_bundle(self, content: bytes, *, passphrase: str | None = None) -> dict[str, Any]:
         if len(content) > MAX_BACKUP_ARCHIVE_BYTES:
@@ -1730,6 +1993,15 @@ class SystemBackupService:
             self._preflight_import_members(manifest, group_entries, extracted)
             self._prepare_segmented_history_import(manifest, extracted)
             segmented_restore = manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
+            segmented_activation = (
+                self._segmented_history_activation_members(
+                    manifest,
+                    extracted,
+                    group_entries,
+                )
+                if segmented_restore
+                else None
+            )
             lock_context = (
                 history_write_lock(self.store.file_path, blocking=False)
                 if segmented_restore
@@ -1739,15 +2011,31 @@ class SystemBackupService:
                 extracted,
                 history_store=self.store,
             )
-            marker: tuple[Path, int, tuple[int, int]] | None = None
+            marker: tuple[Path, dict[str, Any]] | None = None
             try:
                 with lock_context:
                     try:
                         with transaction:
-                            if segmented_restore:
+                            if segmented_activation is not None:
+                                generation = manifest.get("generation")
+                                generation_id = (
+                                    generation.get("generation_id")
+                                    if isinstance(generation, dict)
+                                    else None
+                                )
+                                marker_payload = transaction.prepare_segmented_history(
+                                    self.store,
+                                    hot_member_key=segmented_activation[0],
+                                    segment_members=segmented_activation[1],
+                                    generation_id=(
+                                        str(generation_id)
+                                        if generation_id is not None
+                                        else None
+                                    ),
+                                )
                                 marker = self._create_segmented_activation_marker(
                                     self.store,
-                                    manifest,
+                                    marker_payload,
                                 )
                             extraction_root = cleanup_root
                             cleanup_root = None
@@ -1765,8 +2053,6 @@ class SystemBackupService:
                         if marker is not None:
                             if transaction.rollback_completed:
                                 self._remove_segmented_activation_marker(marker)
-                            else:
-                                self._close_segmented_activation_marker(marker)
                             marker = None
                         raise
                     if marker is not None:
@@ -1828,6 +2114,44 @@ class SystemBackupService:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+
+    def _segmented_history_activation_members(
+        self,
+        manifest: dict[str, Any],
+        extracted: dict[str, ExtractedMember],
+        group_entries: dict[str, dict[str, Any]],
+    ) -> tuple[str, list[tuple[str, Path]]] | None:
+        history_group = group_entries.get(HISTORY_DB_KEY)
+        if not self._manifest_group_selected(history_group):
+            return None
+        history_member = self._first_group_member(manifest, HISTORY_DB_KEY)
+        if history_member is None or history_member["key"] not in extracted:
+            if self._manifest_group_present(history_group):
+                raise ValueError("Backup bundle is missing the selected history database member.")
+            return None
+        history_catalog = manifest.get("history_catalog")
+        if not isinstance(history_catalog, dict):
+            raise ValueError("Segmented history manifest is invalid.")
+        manifest_segments = history_catalog.get("segments")
+        if not isinstance(manifest_segments, list):
+            raise ValueError("Segmented history manifest is invalid.")
+        segment_members: list[tuple[str, Path]] = []
+        for entry in manifest_segments:
+            if not isinstance(entry, dict):
+                raise ValueError("Segmented history manifest is invalid.")
+            segment_id = entry.get("segment_id")
+            member_key = entry.get("member_key")
+            if (
+                not isinstance(segment_id, str)
+                or not isinstance(member_key, str)
+                or member_key not in extracted
+            ):
+                raise ValueError("Segmented history manifest is invalid.")
+            segment_members.append((member_key, Path(f"{segment_id}.sqlite3")))
+        if SEGMENTED_CATALOG_STAGING_KEY not in extracted:
+            raise ValueError("Segmented history catalog staging member is missing.")
+        segment_members.append((SEGMENTED_CATALOG_STAGING_KEY, Path("catalog.json")))
+        return str(history_member["key"]), segment_members
 
     def _activate_import_bundle(
         self,
@@ -1943,28 +2267,17 @@ class SystemBackupService:
             history_member = self._first_group_member(manifest, HISTORY_DB_KEY)
             if history_member and history_member["key"] in extracted:
                 if manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION:
-                    history_catalog = manifest.get("history_catalog")
-                    if not isinstance(history_catalog, dict):
-                        raise ValueError("Segmented history manifest is invalid.")
-                    manifest_segments = history_catalog.get("segments")
-                    if not isinstance(manifest_segments, list):
-                        raise ValueError("Segmented history manifest is invalid.")
-                    segment_members: list[tuple[str, Path]] = []
-                    for entry in manifest_segments:
-                        if not isinstance(entry, dict):
-                            raise ValueError("Segmented history manifest is invalid.")
-                        segment_id = entry.get("segment_id")
-                        member_key = entry.get("member_key")
-                        if not isinstance(segment_id, str) or not isinstance(member_key, str):
-                            raise ValueError("Segmented history manifest is invalid.")
-                        segment_members.append((member_key, Path(f"{segment_id}.sqlite3")))
-                    segment_members.append(
-                        (SEGMENTED_CATALOG_STAGING_KEY, Path("catalog.json"))
+                    segmented_activation = self._segmented_history_activation_members(
+                        manifest,
+                        extracted,
+                        group_entries,
                     )
+                    if segmented_activation is None:
+                        raise ValueError("Segmented history activation members are missing.")
                     transaction.activate_segmented_history(
                         self.store,
-                        hot_member_key=history_member["key"],
-                        segment_members=segment_members,
+                        hot_member_key=segmented_activation[0],
+                        segment_members=segmented_activation[1],
                     )
                 else:
                     transaction.activate_history(self.store, history_member["key"])

@@ -879,6 +879,41 @@ class HistoryStoreTests(unittest.TestCase):
             restarted.release_segmented_retention_backup(newer_backup_at)
             self.assertTrue(restarted.claim_segmented_retention_backup(newer_backup_at))
 
+    def test_segmented_retention_claim_respects_the_shared_history_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = HistoryStore(str(Path(temp_dir) / "history.db"))
+            backup_at = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+            with history_write_lock(store.file_path, blocking=False):
+                with self.assertRaises(sqlite3.OperationalError):
+                    store.claim_segmented_retention_backup(backup_at)
+
+            self.assertTrue(store.claim_segmented_retention_backup(backup_at))
+
+    def test_segmented_retention_finish_respects_the_shared_history_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = HistoryStore(str(Path(temp_dir) / "history.db"))
+            backup_at = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+            self.assertTrue(store.claim_segmented_retention_backup(backup_at))
+
+            with history_write_lock(store.file_path, blocking=False):
+                with self.assertRaises(sqlite3.OperationalError):
+                    store.finish_segmented_retention_backup(backup_at, has_more=False)
+
+            store.finish_segmented_retention_backup(backup_at, has_more=False)
+
+    def test_segmented_retention_release_respects_the_shared_history_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = HistoryStore(str(Path(temp_dir) / "history.db"))
+            backup_at = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+            self.assertTrue(store.claim_segmented_retention_backup(backup_at))
+
+            with history_write_lock(store.file_path, blocking=False):
+                with self.assertRaises(sqlite3.OperationalError):
+                    store.release_segmented_retention_backup(backup_at)
+
+            store.release_segmented_retention_backup(backup_at)
+
     def test_shared_lock_rejects_database_file_mount_points(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2095,12 +2130,12 @@ class HistoryStoreTests(unittest.TestCase):
         original_execute_write = store._execute_write
         calls = 0
 
-        def fail_second_batch(operation):
+        def fail_second_batch(operation, **kwargs):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise RuntimeError("private failure detail")
-            return original_execute_write(operation)
+            return original_execute_write(operation, **kwargs)
 
         with patch.object(store, "_execute_write", side_effect=fail_second_batch):
             with self.assertRaises(RuntimeError) as raised:
@@ -4424,6 +4459,36 @@ class HistoryCollectorTests(unittest.TestCase):
             "has_more": has_more,
             "interrupted": False,
         }
+
+    def test_segmented_retention_holds_shared_lock_from_claim_through_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
+            success_at = now - timedelta(hours=1)
+            db_path = Path(temp_dir) / "history.db"
+            settings = HistorySettings(
+                sqlite_path=str(db_path),
+                segment_catalog_path=str(Path(temp_dir) / "segments" / "catalog.json"),
+            )
+            store = HistoryStore(str(db_path), segment_catalog_path=settings.segment_catalog_path)
+            competing_mutation_entered = False
+
+            def retention_pass(**_kwargs: object) -> dict[str, object]:
+                nonlocal competing_mutation_entered
+                try:
+                    with history_write_lock(db_path, blocking=False):
+                        competing_mutation_entered = True
+                except sqlite3.OperationalError:
+                    pass
+                return self._retention_result(has_more=False)
+
+            store.maintain_retention = retention_pass  # type: ignore[method-assign]
+            HistoryCollector(settings, store)._run_retention_if_due(
+                now,
+                backup_succeeded=True,
+                backup_at=success_at,
+            )
+
+            self.assertFalse(competing_mutation_entered)
 
     def test_segmented_retention_consumption_survives_collector_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

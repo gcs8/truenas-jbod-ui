@@ -257,6 +257,92 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
             self.assertFalse(activation_pending_path(source).exists())
             self.assertFalse((segments_directory / "segment-0002.sqlite3").exists())
 
+    def test_rotation_rechecks_quiescence_after_preflight_before_journal_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_generation_0001(source, segments_directory)
+            self._append_event(source, "generation-2-sealed", "2025-01-02T12:00:00+00:00")
+            backup_directory, backup_status_path = self._create_full_backup_evidence(root)
+            rotation = self._rotation_module()
+            original_headroom = rotation._require_headroom
+
+            def create_sidecar_after_preflight(*args, **kwargs) -> None:
+                original_headroom(*args, **kwargs)
+                Path(f"{source}-wal").write_bytes(b"late-writer-sidecar")
+
+            with patch.object(rotation, "_require_headroom", side_effect=create_sidecar_after_preflight):
+                with self.assertRaisesRegex(ValueError, "sidecar|quiesc"):
+                    rotation.rotate_segmented_history(
+                        source=source,
+                        segments_directory=segments_directory,
+                        cutoff="2025-01-03T00:00:00+00:00",
+                        key_id="generation-key-2",
+                        scheduled_backup_directory=backup_directory,
+                        scheduled_backup_status_path=backup_status_path,
+                        apply=True,
+                    )
+
+            self.assertFalse(activation_pending_path(source).exists())
+            self.assertFalse((root / ".history.db.generation-0002.rollback.sqlite3").exists())
+            self.assertFalse((segments_directory / ".generation-0001.catalog.rollback.json").exists())
+            self.assertFalse((segments_directory / "segment-0002.sqlite3").exists())
+
+    def test_rotation_recovery_removes_both_links_after_segment_publish_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_generation_0001(source, segments_directory)
+            self._append_event(source, "generation-2-sealed", "2025-01-02T12:00:00+00:00")
+            self._append_event(source, "generation-2-hot", "2025-01-03T12:00:00+00:00")
+            backup_directory, backup_status_path = self._create_full_backup_evidence(root)
+            prior_hot_sha256 = self._sha256_file(source)
+            prior_catalog_sha256 = self._sha256_file(segments_directory / "catalog.json")
+            rotation = self._rotation_module()
+            original_unlink = Path.unlink
+
+            def crash_before_temporary_link_unlink(path: Path, *args, **kwargs) -> None:
+                if (
+                    path.parent == segments_directory
+                    and path.name.startswith(".segment-")
+                    and (segments_directory / "segment-0002.sqlite3").exists()
+                ):
+                    raise SimulatedRotationCrash("segment-link-visible")
+                original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", crash_before_temporary_link_unlink):
+                with self.assertRaises(SimulatedRotationCrash):
+                    rotation.rotate_segmented_history(
+                        source=source,
+                        segments_directory=segments_directory,
+                        cutoff="2025-01-03T00:00:00+00:00",
+                        key_id="generation-key-2",
+                        scheduled_backup_directory=backup_directory,
+                        scheduled_backup_status_path=backup_status_path,
+                        apply=True,
+                    )
+
+            segment_path = segments_directory / "segment-0002.sqlite3"
+            temporary_links = list(segments_directory.glob(".segment-*.sqlite3"))
+            self.assertEqual(len(temporary_links), 1)
+            self.assertEqual(segment_path.stat().st_nlink, 2)
+            self.assertEqual(temporary_links[0].stat().st_ino, segment_path.stat().st_ino)
+
+            result = rotation.recover_pending_rotation(
+                source=source,
+                segments_directory=segments_directory,
+                apply=True,
+            )
+
+            self.assertEqual(result["recovery_state"], "prior-generation-restored")
+            self.assertEqual(self._sha256_file(source), prior_hot_sha256)
+            self.assertEqual(self._sha256_file(segments_directory / "catalog.json"), prior_catalog_sha256)
+            self.assertFalse(segment_path.exists())
+            self.assertFalse(temporary_links[0].exists())
+            self.assertFalse(activation_pending_path(source).exists())
+
     def test_rotation_refuses_a_thirty_third_active_segment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1600,10 +1686,17 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
             finally:
                 reader.close()
 
-            _ImportActivationTransaction._checkpoint_hot_database(hot_path)
+            with self.assertRaisesRegex(ValueError, "sidecars remain"):
+                _ImportActivationTransaction._checkpoint_hot_database(hot_path)
             self.assertEqual(wal_path.stat().st_size, 0)
             self.assertEqual(writer.execute("SELECT count(*) FROM t").fetchone()[0], 1)
             writer.close()
+            _ImportActivationTransaction._checkpoint_hot_database(hot_path)
+            with sqlite3.connect(hot_path) as verification_connection:
+                self.assertEqual(
+                    verification_connection.execute("SELECT count(*) FROM t").fetchone()[0],
+                    1,
+                )
 
             Path(f"{hot_path}-journal").write_bytes(b"")
             with self.assertRaisesRegex(ValueError, "rollback journal"):
@@ -1716,6 +1809,13 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                 finally:
                     reader.close()
 
+                with sqlite3.connect(target_source) as checkpoint_connection:
+                    checkpoint = checkpoint_connection.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    ).fetchone()
+                self.assertEqual(tuple(int(value) for value in checkpoint), (0, 0, 0))
+                for suffix in ("-wal", "-shm", "-journal"):
+                    Path(f"{target_source}{suffix}").unlink(missing_ok=True)
                 result = target_service.import_bundle(artifact.path.read_bytes())
 
                 self.assertEqual(result["schema_version"], 2)

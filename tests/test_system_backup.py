@@ -418,11 +418,23 @@ class SystemBackupServiceTests(unittest.TestCase):
             )
             target_service = SystemBackupService(target_settings, target_store)
             original_target_bytes = target_source.read_bytes()
+            original_activate_prepared_target = (
+                _ImportActivationTransaction._activate_prepared_target
+            )
+            activation_count = 0
+
+            def fail_before_segment_activation(transaction, *args, **kwargs) -> None:
+                nonlocal activation_count
+                activation_count += 1
+                if activation_count == 2:
+                    raise RuntimeError("injected segment activation failure")
+                original_activate_prepared_target(transaction, *args, **kwargs)
 
             with patch.object(
                 _ImportActivationTransaction,
-                "activate_directory",
-                side_effect=RuntimeError("injected segment activation failure"),
+                "_activate_prepared_target",
+                autospec=True,
+                side_effect=fail_before_segment_activation,
             ):
                 with self.assertRaisesRegex(RuntimeError, "injected segment activation failure"):
                     target_service.import_bundle(artifact.path.read_bytes())
@@ -466,8 +478,14 @@ class SystemBackupServiceTests(unittest.TestCase):
             )
             visible_during_activation: list[list[int]] = []
             read_errors: list[str] = []
+            split_activation_count = 0
 
-            def reject_segment_directory(*_args: Any, **_kwargs: Any) -> None:
+            def reject_segment_directory(transaction, *args: Any, **kwargs: Any) -> None:
+                nonlocal split_activation_count
+                split_activation_count += 1
+                if split_activation_count == 1:
+                    original_activate_prepared_target(transaction, *args, **kwargs)
+                    return
                 try:
                     visible_during_activation.append(
                         [
@@ -486,7 +504,8 @@ class SystemBackupServiceTests(unittest.TestCase):
             try:
                 with patch.object(
                     _ImportActivationTransaction,
-                    "activate_directory",
+                    "_activate_prepared_target",
+                    autospec=True,
                     side_effect=reject_segment_directory,
                 ):
                     with self.assertRaisesRegex(
