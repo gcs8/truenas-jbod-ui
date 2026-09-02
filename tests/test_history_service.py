@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -809,6 +809,27 @@ class HistoryStoreTests(unittest.TestCase):
                 recovered._execute_write(lambda connection: connection.execute("SELECT 1").fetchone())[0],
                 1,
             )
+
+    def test_store_rechecks_lifecycle_markers_after_acquiring_the_history_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "history.db"
+            marker_path = activation_pending_path(database_path)
+
+            @contextmanager
+            def lifecycle_lock_that_creates_a_pending_marker(*args: Any, **kwargs: Any):
+                with history_write_lock(*args, **kwargs):
+                    marker_path.write_text("{}", encoding="utf-8")
+                    yield
+
+            try:
+                with patch(
+                    "history_service.store.history_write_lock",
+                    lifecycle_lock_that_creates_a_pending_marker,
+                ):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "activation is pending"):
+                        HistoryStore(str(database_path), recover_unreadable_database=False)
+            finally:
+                marker_path.unlink(missing_ok=True)
 
     def test_store_initialization_rejects_while_migration_owns_shared_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

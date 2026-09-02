@@ -332,8 +332,8 @@ class HistoryStore:
         self._segment_reader_lock = threading.Lock()
         self._segment_reader_identity: tuple[int, int, int, int] | None = None
         self._segment_reader_cache: SegmentedHistoryReader | None = None
-        self._require_no_pending_lifecycle_markers()
         with history_write_lock(self.file_path, blocking=False):
+            self._require_no_pending_lifecycle_markers()
             self._initialize(migration_lock_held=True)
 
     def _require_no_pending_lifecycle_markers(self) -> None:
