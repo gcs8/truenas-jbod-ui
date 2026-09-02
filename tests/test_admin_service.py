@@ -2710,6 +2710,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
     def test_esxi_host_prep_install_route_returns_install_status_payload(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/install")
+        settings = Settings(ssh=SSHConfig(known_hosts_path="/runtime/data/known_hosts"))
         host_prep_service = MagicMock()
         host_prep_service.install_package.return_value = {
             "ok": False,
@@ -2724,17 +2725,20 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             {"token": "storcli-1", "filename": "BCM-vmware-storcli64.zip"}
         ]
 
-        with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
-            response = asyncio.run(
-                route.endpoint(
-                    payload=ESXiHostPrepInstallRequest(
-                        host="192.0.2.121",
-                        user="root",
-                        password="secret",
-                        upload_token="storcli-1",
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+                response = asyncio.run(
+                    route.endpoint(
+                        payload=ESXiHostPrepInstallRequest(
+                            host="192.0.2.121",
+                            user="root",
+                            password="secret",
+                            known_hosts_path="/request-selected-known-hosts",
+                            strict_host_key_checking=False,
+                            upload_token="storcli-1",
+                        )
                     )
                 )
-            )
 
         payload = json.loads(response.body.decode("utf-8"))
 
@@ -2743,6 +2747,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertFalse(payload["install_ok"])
         self.assertIn("no compatible MegaRAID controller", payload["detail"])
         self.assertEqual(payload["packages"][0]["token"], "storcli-1")
+        self.assertEqual(
+            host_prep_service.install_package.call_args.kwargs["known_hosts_path"],
+            "/runtime/data/known_hosts",
+        )
 
     def test_system_setup_request_preserves_distinct_quantastor_label_only_nodes(self) -> None:
         payload = SystemSetupRequest(

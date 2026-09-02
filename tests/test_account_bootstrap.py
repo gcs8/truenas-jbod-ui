@@ -85,6 +85,33 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
             self.assertIn("not written to config.yaml", str(result["detail"]))
             self.assertEqual(result["permission_target"], "/etc/sudoers.d/truenas-jbod-ui-jbodmap")
 
+    def test_bootstrap_derives_known_hosts_path_instead_of_using_request_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "config" / "config.yaml"
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            key_manager = SSHKeyManager(str(config_file))
+            generated_key = key_manager.generate_keypair("id_truenas")
+            service = self.make_service(config_file)
+
+            result = service.bootstrap_service_account(
+                SystemSetupBootstrapRequest(
+                    platform="core",
+                    host="nas.example.local",
+                    bootstrap_user="root",
+                    bootstrap_password="bootstrap-secret",
+                    bootstrap_known_hosts_path=str(Path(temp_dir) / "request-selected-known-hosts"),
+                    bootstrap_strict_host_key_checking=False,
+                    service_user="jbodmap",
+                    service_key_name=generated_key["name"],
+                )
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                FakeProbe.last_config.known_hosts_path,
+                str(Path(temp_dir) / "data" / "known_hosts"),
+            )
+
     def test_bootstrap_uses_sudo_and_private_key_path_for_non_root_user(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_file = Path(temp_dir) / "config" / "config.yaml"

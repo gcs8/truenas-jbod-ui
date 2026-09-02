@@ -762,10 +762,6 @@ def create_app() -> FastAPI:
                             and same_saved_text(payload.user, system.ssh.user)
                             and payload.strict_host_key_checking
                             == system.ssh.strict_host_key_checking
-                            and same_saved_text(
-                                payload.known_hosts_path,
-                                system.ssh.known_hosts_path,
-                            )
                         ),
                     )
                 }
@@ -774,7 +770,11 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         service = get_esxi_host_prep_service()
         try:
-            result = await asyncio.to_thread(service.install_package, payload)
+            result = await asyncio.to_thread(
+                service.install_package,
+                payload,
+                known_hosts_path=settings.ssh.known_hosts_path,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(
