@@ -869,6 +869,17 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
             "collector failed on host-01 for host-01",
         )
 
+    def test_redactor_scrubs_enclosure_raw_label_and_operator_alias(self) -> None:
+        snapshot = build_snapshot()
+        snapshot.enclosures[0].raw_label = "Private Rack Three East"
+        snapshot.enclosures[0].alias = "Private Archive Cold"
+        redactor = SnapshotRedactor(snapshot, {}, {})
+
+        redacted = redactor.redact_snapshot(snapshot)
+
+        self.assertEqual(redacted.enclosures[0].raw_label, "enc-01")
+        self.assertEqual(redacted.enclosures[0].alias, "enc-01")
+
     async def test_none_export_preserves_configured_hostname_fidelity(self) -> None:
         api_hostname = "api206.none.invalid"
         source_system = SystemConfig(

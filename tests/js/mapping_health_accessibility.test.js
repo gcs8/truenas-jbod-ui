@@ -156,7 +156,9 @@ test("saved-view card selection refreshes mapping health with the grid scope", (
     {
       state,
       confirmMappingDraftDiscard() { return true; },
+      closeEnclosureAliasEditor() { events.push("close-alias-editor"); },
       resetHeatmapHistoryCache() { events.push("reset-heatmap"); },
+      renderViewChrome() { events.push("render-chrome"); },
       renderStorageViewsRuntime() { events.push("render-views"); },
       renderGrid() { events.push("render-grid"); },
       renderSummary() { events.push("render-summary"); },
@@ -167,7 +169,9 @@ test("saved-view card selection refreshes mapping health with the grid scope", (
   assert.equal(selectStorageViewRuntimeFromCard("boot-doms"), true);
   assert.equal(state.selectedStorageViewRuntimeId, "boot-doms");
   assert.deepEqual(events, [
+    "close-alias-editor",
     "reset-heatmap",
+    "render-chrome",
     "render-views",
     "render-grid",
     "render-summary",

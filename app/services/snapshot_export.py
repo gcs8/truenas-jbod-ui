@@ -233,11 +233,11 @@ class SnapshotRedactor:
             return "enclosure"
         if parent == "systems" and leaf in {"id", "label"}:
             return "system"
-        if parent == "enclosures" and leaf in {"id", "label", "name"}:
+        if parent == "enclosures" and leaf in {"id", "label", "raw_label", "alias", "name"}:
             return "enclosure"
         if grandparent == "systems" and leaf in {"id", "label"}:
             return "system"
-        if grandparent == "enclosures" and leaf in {"id", "label", "name"}:
+        if grandparent == "enclosures" and leaf in {"id", "label", "raw_label", "alias", "name"}:
             return "enclosure"
         return None
 
@@ -265,7 +265,15 @@ class SnapshotRedactor:
         groups: list[list[str]] = []
         for snapshot in snapshots:
             for enclosure in snapshot.enclosures:
-                groups.append([enclosure.id, enclosure.label, enclosure.name or ""])
+                groups.append(
+                    [
+                        enclosure.id,
+                        enclosure.label,
+                        enclosure.raw_label or "",
+                        enclosure.alias or "",
+                        enclosure.name or "",
+                    ]
+                )
             if snapshot.selected_enclosure_id or snapshot.selected_enclosure_label or snapshot.selected_enclosure_name:
                 groups.append(
                     [

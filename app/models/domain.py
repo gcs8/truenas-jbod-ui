@@ -286,6 +286,8 @@ class SystemOption(BaseModel):
 class EnclosureOption(BaseModel):
     id: str
     label: str
+    raw_label: str | None = None
+    alias: str | None = None
     name: str | None = None
     profile_id: str | None = None
     rows: int | None = None
