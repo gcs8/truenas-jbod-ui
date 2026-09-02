@@ -199,6 +199,11 @@ STABLE_SMART_DETAIL_FIELDS = (
     "attached_sas_address",
     "negotiated_link_rate",
 )
+SMART_SUMMARY_VALUE_FIELDS = tuple(
+    field_name
+    for field_name in SmartSummaryView.model_fields
+    if field_name not in {"available", "message"}
+)
 OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
 SSH_CONNECTION_FAILURE_MARKERS = (
@@ -10275,51 +10280,7 @@ class InventoryService:
         ):
             summary.last_test_age_hours = summary.power_on_hours - summary.last_test_lifetime_hours
         summary.available = summary.available or any(
-            value is not None
-            for value in (
-                summary.temperature_c,
-                summary.warning_temperature_c,
-                summary.critical_temperature_c,
-                summary.smart_health_status,
-                summary.last_test_type,
-                summary.last_test_status,
-                summary.last_test_lifetime_hours,
-                summary.power_on_hours,
-                summary.logical_block_size,
-                summary.physical_block_size,
-                summary.available_spare_percent,
-                summary.available_spare_threshold_percent,
-                summary.endurance_used_percent,
-                summary.endurance_remaining_percent,
-                summary.bytes_read,
-                summary.bytes_written,
-                summary.annualized_bytes_read,
-                summary.annualized_bytes_written,
-                summary.estimated_lifetime_bytes_written,
-                summary.estimated_remaining_bytes_written,
-                summary.read_error_count,
-                summary.write_error_count,
-                summary.media_errors,
-                summary.predictive_errors,
-                summary.non_medium_errors,
-                summary.uncorrected_read_errors,
-                summary.uncorrected_write_errors,
-                summary.unsafe_shutdowns,
-                summary.rotation_rate_rpm,
-                summary.form_factor,
-                summary.firmware_version,
-                summary.protocol_version,
-                summary.namespace_eui64,
-                summary.namespace_nguid,
-                summary.read_cache_enabled,
-                summary.writeback_cache_enabled,
-                summary.trim_supported,
-                summary.transport_protocol,
-                summary.logical_unit_id,
-                summary.sas_address,
-                summary.attached_sas_address,
-                summary.negotiated_link_rate,
-            )
+            getattr(summary, field_name) is not None for field_name in SMART_SUMMARY_VALUE_FIELDS
         )
         return summary
 
@@ -10353,58 +10314,7 @@ class InventoryService:
         primary: SmartSummaryView,
         supplement: SmartSummaryView,
     ) -> SmartSummaryView:
-        for field_name in (
-            "temperature_c",
-            "warning_temperature_c",
-            "critical_temperature_c",
-            "smart_health_status",
-            "last_test_type",
-            "last_test_status",
-            "last_test_lifetime_hours",
-            "last_test_age_hours",
-            "power_cycle_count",
-            "power_on_resets",
-            "power_on_hours",
-            "power_on_days",
-            "logical_block_size",
-            "physical_block_size",
-            "available_spare_percent",
-            "available_spare_threshold_percent",
-            "endurance_used_percent",
-            "endurance_remaining_percent",
-            "bytes_read",
-            "bytes_written",
-            "annualized_bytes_read",
-            "annualized_bytes_written",
-            "estimated_lifetime_bytes_written",
-            "estimated_remaining_bytes_written",
-            "read_commands",
-            "write_commands",
-            "read_error_count",
-            "write_error_count",
-            "media_errors",
-            "predictive_errors",
-            "non_medium_errors",
-            "uncorrected_read_errors",
-            "uncorrected_write_errors",
-            "unsafe_shutdowns",
-            "hardware_resets",
-            "interface_crc_errors",
-            "rotation_rate_rpm",
-            "form_factor",
-            "firmware_version",
-            "protocol_version",
-            "namespace_eui64",
-            "namespace_nguid",
-            "read_cache_enabled",
-            "writeback_cache_enabled",
-            "trim_supported",
-            "transport_protocol",
-            "logical_unit_id",
-            "sas_address",
-            "attached_sas_address",
-            "negotiated_link_rate",
-        ):
+        for field_name in SMART_SUMMARY_VALUE_FIELDS:
             if getattr(primary, field_name) is None and getattr(supplement, field_name) is not None:
                 setattr(primary, field_name, getattr(supplement, field_name))
 
