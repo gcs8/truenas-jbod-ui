@@ -25,6 +25,7 @@ from fastapi.templating import Jinja2Templates
 from admin_service.config import AdminSettings, get_admin_settings
 from admin_service.services.account_bootstrap import ServiceAccountBootstrapService
 from admin_service.services.esxi_host_prep import ESXiHostPrepService
+from admin_service.services.esxi_host_prep import MAX_UPLOAD_BYTES as MAX_ESXI_HOST_PREP_UPLOAD_BYTES
 from admin_service.services.maintenance import AdminMaintenanceService
 from admin_service.services.runtime_control import DockerRuntimeError, DockerRuntimeService
 from admin_service.services.tls_trust import TLSTrustStoreService
@@ -219,7 +220,9 @@ async def stream_limited_request_body_to_file(
     request: Request,
     *,
     max_bytes: int = MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES,
+    body_description: str = "Backup import",
 ) -> Path:
+    too_large_detail = f"{body_description} request body is too large."
     raw_content_length = request.headers.get("content-length")
     if raw_content_length is not None:
         try:
@@ -229,7 +232,7 @@ async def stream_limited_request_body_to_file(
         if content_length < 0:
             raise HTTPException(status_code=400, detail="Content-Length must not be negative.")
         if content_length > max_bytes:
-            raise HTTPException(status_code=413, detail="Backup import request body is too large.")
+            raise HTTPException(status_code=413, detail=too_large_detail)
 
     workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-admin-import-"))
     archive_path = workspace / "bundle.archive"
@@ -250,12 +253,12 @@ async def stream_limited_request_body_to_file(
             async for chunk in request.stream():
                 total += len(chunk)
                 if total > max_bytes:
-                    raise HTTPException(status_code=413, detail="Backup import request body is too large.")
+                    raise HTTPException(status_code=413, detail=too_large_detail)
                 output.write(chunk)
             output.flush()
             os.fsync(output.fileno())
         return archive_path
-    except Exception:
+    except BaseException:
         if descriptor is not None:
             os.close(descriptor)
         archive_path.unlink(missing_ok=True)
@@ -723,21 +726,30 @@ def create_app() -> FastAPI:
         request: Request,
         filename: str = Query(..., min_length=1),
     ) -> JSONResponse:
-        content = await request.body()
-        if not content:
-            raise HTTPException(status_code=400, detail="ESXi host-prep upload request body was empty.")
-        service = get_esxi_host_prep_service()
-        try:
-            package = await asyncio.to_thread(service.stage_package, filename, content)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return JSONResponse(
-            {
-                "ok": True,
-                "package": package,
-                "packages": await asyncio.to_thread(service.list_staged_packages),
-            }
+        upload_path = await stream_limited_request_body_to_file(
+            request,
+            max_bytes=MAX_ESXI_HOST_PREP_UPLOAD_BYTES,
+            body_description="ESXi host-prep upload",
         )
+        try:
+            if upload_path.stat().st_size == 0:
+                raise HTTPException(status_code=400, detail="ESXi host-prep upload request body was empty.")
+            content = await asyncio.to_thread(upload_path.read_bytes)
+            service = get_esxi_host_prep_service()
+            try:
+                package = await asyncio.to_thread(service.stage_package, filename, content)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "package": package,
+                    "packages": await asyncio.to_thread(service.list_staged_packages),
+                }
+            )
+        finally:
+            upload_path.unlink(missing_ok=True)
+            upload_path.parent.rmdir()
 
     @app.post("/api/admin/esxi-host-prep/install")
     async def install_esxi_host_prep_package(payload: ESXiHostPrepInstallRequest) -> JSONResponse:

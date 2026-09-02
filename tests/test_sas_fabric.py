@@ -35,6 +35,9 @@ from app.services.sas_fabric import (
     _build_sas_fabric_context,
     _build_storage_fabric_route_context,
     _device_name_candidates,
+    _identifier_lookup_key,
+    _lookup_mpr_device_context,
+    _slot_location_number_candidates,
     _select_sas_fabric_builder,
     _select_sas_fabric_builder_key,
     _select_storage_fabric_route_provider,
@@ -538,6 +541,53 @@ Adapter     Chip           Board Name        Firmware
         self.assertEqual(diagnostics["event_table"]["total_count"], 40)
         self.assertEqual(len(diagnostics["event_table"]["rows"]), 25)
         self.assertEqual(serialized_text.count('"event_id": "mpr-dmesg-0040"'), 1)
+
+    def test_slot_location_candidates_try_exact_bay_before_shifted_alias(self) -> None:
+        slot = SlotView(
+            slot=5,
+            slot_label="05",
+            row_index=0,
+            column_index=5,
+            present=True,
+            state=SlotState.healthy,
+            device_name="da5",
+            raw_status={"enclosure_id": "50030480090c4f7f", "ses_slot_number": 5},
+        )
+
+        self.assertEqual(_slot_location_number_candidates(slot), [5, 4])
+
+    def test_mpr_location_lookup_returns_the_exact_bay_not_its_neighbour(self) -> None:
+        enclosure_key = _identifier_lookup_key("50030480090c4f7f")
+        assert enclosure_key is not None
+        trace_index = {
+            "devices": {},
+            "devices_by_location": {
+                ("mpr0", enclosure_key, 4): {"dev_handle": "0x0010", "slot": "4"},
+                ("mpr0", enclosure_key, 5): {"dev_handle": "0x0011", "slot": "5"},
+            },
+        }
+        slot = SlotView(
+            slot=5,
+            slot_label="05",
+            row_index=0,
+            column_index=5,
+            present=True,
+            state=SlotState.healthy,
+            device_name="da5",
+            raw_status={"enclosure_id": "50030480090c4f7f", "ses_slot_number": 5},
+        )
+
+        context = _lookup_mpr_device_context(
+            trace_index,
+            "mpr0",
+            "da5",
+            slot_enclosure_ids=["50030480090c4f7f"],
+            slot_location_numbers=_slot_location_number_candidates(slot),
+        )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context["dev_handle"], "0x0011")
 
     def test_core_snapshot_bounds_controller_and_mapped_member_diagnostics(self) -> None:
         oversized_suffix = "X" * 8_000
