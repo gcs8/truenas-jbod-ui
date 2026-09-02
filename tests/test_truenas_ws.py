@@ -1,15 +1,40 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config import TrueNASConfig
-from app.services.truenas_ws import TrueNASWebsocketClient
+from app.services.truenas_ws import _MiddlewareCallDispatcher, TrueNASAPIError, TrueNASWebsocketClient
 
 
 class TrueNASWebsocketClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dispatcher_cancellation_during_send_retires_pending_future(self) -> None:
+        class BlockingSendWS:
+            def __init__(self) -> None:
+                self.send_started = asyncio.Event()
+
+            async def send(self, _raw_message: str) -> None:
+                self.send_started.set()
+                await asyncio.Future()
+
+            async def recv(self) -> str:
+                await asyncio.Future()
+
+        websocket = BlockingSendWS()
+        dispatcher = _MiddlewareCallDispatcher(websocket)
+        call_task = asyncio.create_task(dispatcher.call("disk.query", []))
+        await websocket.send_started.wait()
+
+        call_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await call_task
+
+        self.assertEqual(dispatcher._pending, {})
+        await dispatcher.close()
+
     async def test_fetch_all_collects_payloads_in_parallel(self) -> None:
         class TrackingClient(TrueNASWebsocketClient):
             def __init__(self) -> None:
@@ -62,6 +87,49 @@ class TrueNASWebsocketClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload.pools[0]["name"], "tank")
         self.assertEqual(payload.disk_temperatures["da0"], 30)
         self.assertEqual(payload.smart_test_results[0]["status"], "SUCCESS")
+
+    async def test_fetch_all_failure_cancels_sibling_calls_instead_of_leaving_them_pending(self) -> None:
+        class OneErrorWS:
+            """Answers pool.query with a middleware error; every other call never answers."""
+
+            def __init__(self) -> None:
+                self.queue: asyncio.Queue[str] = asyncio.Queue()
+                self.methods: list[str] = []
+
+            async def send(self, raw_message: str) -> None:
+                message = json.loads(raw_message)
+                self.methods.append(message["method"])
+                if message["method"] == "pool.query":
+                    await self.queue.put(
+                        json.dumps({"msg": "result", "id": message["id"], "error": {"reason": "EPERM"}})
+                    )
+
+            async def recv(self) -> str:
+                return await self.queue.get()
+
+        fake_ws = OneErrorWS()
+
+        class OneErrorClient(TrueNASWebsocketClient):
+            @asynccontextmanager
+            async def _session(self):
+                yield fake_ws
+
+        client = OneErrorClient(TrueNASConfig(api_key="token"))
+        baseline = set(asyncio.all_tasks())
+
+        with self.assertRaisesRegex(TrueNASAPIError, "pool.query failed"):
+            await client.fetch_all()
+        await asyncio.sleep(0)
+
+        leftover = [
+            task.get_coro().__qualname__
+            for task in asyncio.all_tasks() - baseline
+            if not task.done()
+        ]
+        self.assertEqual(leftover, [])
+        self.assertEqual(sorted(fake_ws.methods), sorted([
+            "disk.query", "disk.temperatures", "enclosure.query", "pool.query", "smart.test.results",
+        ]))
 
     @patch("app.services.truenas_ws.connect")
     async def test_session_passes_tls_server_name_override_to_connect(self, connect_mock: MagicMock) -> None:
