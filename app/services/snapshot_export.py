@@ -11,9 +11,11 @@ import zipfile
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from ipaddress import ip_address
 from math import ceil
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import Request
 from starlette.templating import Jinja2Templates
@@ -143,12 +145,16 @@ class SnapshotRedactor:
         smart_summary_cache: dict[str, dict[str, Any]],
         extra_payloads: list[Any] | None = None,
         extra_snapshots: list[InventorySnapshot] | None = None,
+        configured_hostnames: list[str] | None = None,
     ) -> None:
         self.serial_values: list[str] = []
         self.partial_identifier_values: list[str] = []
         alias_snapshots = [snapshot, *(extra_snapshots or [])]
         self.system_aliases = self._build_system_aliases(alias_snapshots)
         self.enclosure_aliases = self._build_enclosure_aliases(alias_snapshots)
+        self.configured_hostname_values = list(dict.fromkeys(configured_hostnames or []))
+        self.configured_hostname_keys = {hostname.casefold() for hostname in self.configured_hostname_values}
+        self._add_configured_hostname_aliases(snapshot)
         self._collect_known_values(snapshot.model_dump(mode="json"))
         for extra_snapshot in extra_snapshots or []:
             self._collect_known_values(extra_snapshot.model_dump(mode="json"))
@@ -272,6 +278,66 @@ class SnapshotRedactor:
                 groups.append([slot.enclosure_id or "", slot.enclosure_label or "", slot.enclosure_name or ""])
         return cls._build_group_aliases(groups, "enc")
 
+    @classmethod
+    def _collect_configured_hostnames(cls, source_config: dict[str, Any] | None) -> list[str]:
+        if not source_config:
+            return []
+        truenas = source_config.get("truenas") or {}
+        ssh = source_config.get("ssh") or {}
+        bmc = source_config.get("bmc") or {}
+        raw_values = [
+            truenas.get("host"),
+            truenas.get("tls_server_name"),
+            ssh.get("host"),
+            *(ssh.get("extra_hosts") or []),
+            *((node or {}).get("host") for node in (ssh.get("ha_nodes") or [])),
+            bmc.get("host"),
+        ]
+        hostnames: list[str] = []
+        seen: set[str] = set()
+        for raw_value in raw_values:
+            hostname = cls._hostname_from_config_value(raw_value)
+            if not hostname or cls._is_zero_identifier_sentinel(hostname):
+                continue
+            try:
+                ip_address(hostname)
+            except ValueError:
+                pass
+            else:
+                continue
+            folded = hostname.casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+            hostnames.append(hostname)
+        return hostnames
+
+    @staticmethod
+    def _hostname_from_config_value(value: Any) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        candidate = value.strip()
+        try:
+            parsed = urlsplit(candidate if "://" in candidate else f"//{candidate}")
+            hostname = parsed.hostname
+            return hostname.rstrip(".") if hostname else None
+        except ValueError:
+            return None
+
+    def _add_configured_hostname_aliases(self, snapshot: InventorySnapshot) -> None:
+        selected_alias = next(
+            (
+                self.system_aliases[token]
+                for token in (snapshot.selected_system_id, snapshot.selected_system_label)
+                if token and token in self.system_aliases
+            ),
+            None,
+        )
+        if selected_alias is None:
+            selected_alias = next(iter(self.system_aliases.values()), "host-01")
+        for hostname in self.configured_hostname_values:
+            self.system_aliases[hostname] = selected_alias
+
     @staticmethod
     def _build_group_aliases(groups: list[list[str]], prefix: str) -> dict[str, str]:
         aliases: dict[str, str] = {}
@@ -321,7 +387,13 @@ class SnapshotRedactor:
 
         redacted = value
         for original, replacement in self.token_replacements:
-            if original and original in redacted:
+            if original.casefold() in self.configured_hostname_keys:
+                pattern = re.compile(
+                    rf"(?<![A-Za-z0-9_.-]){re.escape(original)}(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+                    re.IGNORECASE,
+                )
+                redacted = pattern.sub(lambda _match: replacement, redacted)
+            elif original and original in redacted:
                 pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(original)}(?![A-Za-z0-9])")
                 redacted = pattern.sub(lambda _match: replacement, redacted)
         redacted = IPV4_PATTERN.sub(lambda match: self._mask_ipv4(match.group("ip")), redacted)
@@ -374,6 +446,10 @@ class SnapshotRedactor:
         return f"x:x:{':'.join(tail)}" if tail else "x:x"
 
 
+def collect_configured_hostnames(source_config: dict[str, Any] | None) -> list[str]:
+    return SnapshotRedactor._collect_configured_hostnames(source_config)
+
+
 class SnapshotExportService:
     def __init__(
         self,
@@ -409,6 +485,7 @@ class SnapshotExportService:
         history_panel_open: bool = False,
         io_chart_mode: str,
         redact_sensitive: bool = False,
+        configured_hostnames: list[str] | None = None,
         packaging: str = "auto",
         allow_oversize: bool = False,
     ) -> PackagedSnapshotExport:
@@ -426,6 +503,7 @@ class SnapshotExportService:
                 history_panel_open=history_panel_open,
                 io_chart_mode=io_chart_mode,
                 redact_sensitive=redact_sensitive,
+                configured_hostnames=configured_hostnames,
                 requested_packaging=packaging,
             )
         html_bytes = rendered.html.encode("utf-8")
@@ -518,6 +596,7 @@ class SnapshotExportService:
         history_panel_open: bool = False,
         io_chart_mode: str,
         redact_sensitive: bool = False,
+        configured_hostnames: list[str] | None = None,
         packaging: str = "auto",
         allow_oversize: bool = False,
     ) -> dict[str, Any]:
@@ -535,6 +614,7 @@ class SnapshotExportService:
                 history_panel_open=history_panel_open,
                 io_chart_mode=io_chart_mode,
                 redact_sensitive=redact_sensitive,
+                configured_hostnames=configured_hostnames,
                 requested_packaging=packaging,
             )
         html_bytes = rendered.html.encode("utf-8")
@@ -598,6 +678,7 @@ class SnapshotExportService:
         history_panel_open: bool = False,
         io_chart_mode: str,
         redact_sensitive: bool = False,
+        configured_hostnames: list[str] | None = None,
         requested_packaging: str = "auto",
         generated_at: datetime | None = None,
         identifier_policy_label: str | None = None,
@@ -628,6 +709,7 @@ class SnapshotExportService:
             history_panel_open=history_panel_open,
             io_chart_mode=normalized_chart_mode,
             redact_sensitive=redact_sensitive,
+            configured_hostnames=configured_hostnames,
             generated_at=generated_at,
             identifier_policy_label=identifier_policy_label,
             identifier_policy_note=identifier_policy_note,
@@ -692,6 +774,7 @@ class SnapshotExportService:
                 raw_history_cache,
                 base_smart_summary_cache,
                 extra_snapshots=list(live_enclosure_snapshots_for_render.values()),
+                configured_hostnames=configured_hostnames,
                 extra_payloads=[
                     {
                         enclosure_id: live_snapshot.model_dump(mode="json")
@@ -1729,6 +1812,24 @@ class SnapshotExportService:
         rendered = json.dumps(normalized_cache, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(rendered.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _configured_hostname_fingerprint(configured_hostnames: list[str] | None) -> str:
+        hostnames = sorted(hostname.casefold() for hostname in (configured_hostnames or []))
+        rendered = json.dumps(hostnames, separators=(",", ":"))
+        return hashlib.sha1(rendered.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _build_render_source_signature(
+        cls,
+        snapshot: InventorySnapshot,
+        configured_hostnames: list[str] | None,
+    ) -> str:
+        payload = (
+            f"{cls._build_snapshot_signature(snapshot)}|"
+            f"{cls._configured_hostname_fingerprint(configured_hostnames)}"
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
     def _build_render_cache_key(
         self,
         *,
@@ -1743,6 +1844,7 @@ class SnapshotExportService:
         history_panel_open: bool,
         io_chart_mode: str,
         redact_sensitive: bool,
+        configured_hostnames: list[str] | None,
         generated_at: datetime | None,
         identifier_policy_label: str | None,
         identifier_policy_note: str | None,
@@ -1750,7 +1852,7 @@ class SnapshotExportService:
         return "|".join(
             [
                 "render",
-                self._build_snapshot_signature(snapshot),
+                self._build_render_source_signature(snapshot, configured_hostnames),
                 f"smart={self._smart_summary_cache_fingerprint(smart_summary_cache)}",
                 f"live={self._live_enclosure_snapshots_fingerprint(live_enclosure_snapshots)}",
                 f"livesmart={self._storage_view_smart_summary_cache_fingerprint(live_enclosure_smart_summary_cache)}",

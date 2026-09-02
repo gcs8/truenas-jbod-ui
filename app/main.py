@@ -45,7 +45,11 @@ from app.services.history_backend import HistoryBackendClient
 from app.services.inventory_registry import InventoryRegistry
 from app.services.mapping_store import MappingImportDigestMismatch, MappingRevisionConflict
 from app.services.release_status import ReleaseStatusService
-from app.services.snapshot_export import SnapshotExportService, SnapshotExportTooLargeError
+from app.services.snapshot_export import (
+    SnapshotExportService,
+    SnapshotExportTooLargeError,
+    collect_configured_hostnames,
+)
 from app.services.truenas_ws import TrueNASAPIError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1069,6 +1073,7 @@ def create_app() -> FastAPI:
                     history_panel_open=payload.history_panel_open,
                     io_chart_mode=payload.io_chart_mode,
                     redact_sensitive=payload.redact_sensitive,
+                    configured_hostnames=collect_configured_hostnames(service.system.model_dump(mode="json")),
                     packaging=payload.packaging,
                     allow_oversize=payload.allow_oversize,
                 )
@@ -1135,6 +1140,7 @@ def create_app() -> FastAPI:
                 history_panel_open=payload.history_panel_open,
                 io_chart_mode=payload.io_chart_mode,
                 redact_sensitive=payload.redact_sensitive,
+                configured_hostnames=collect_configured_hostnames(service.system.model_dump(mode="json")),
                 packaging=payload.packaging,
                 allow_oversize=payload.allow_oversize,
             )

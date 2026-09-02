@@ -930,6 +930,13 @@ class MainAppBoundaryTests(unittest.TestCase):
         fake_service = MagicMock()
         fake_service.system.id = "archive-core"
         fake_service.system.truenas.platform = "core"
+        source_config = {
+            "id": "archive-core",
+            "truenas": {"host": "https://api206.route.invalid"},
+            "ssh": {"host": "ssh206.route.invalid", "extra_hosts": [], "ha_nodes": []},
+            "bmc": {"host": "bmc206.route.invalid"},
+        }
+        fake_service.system.model_dump.return_value = source_config
         fake_service.get_snapshot = AsyncMock(return_value=snapshot)
         fake_service.get_slot_smart_summaries = AsyncMock(
             return_value=[SimpleNamespace(slot=0, summary=fake_summary)]
@@ -987,6 +994,18 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertEqual(estimate_response.status_code, 200)
         self.assertEqual(export_response.status_code, 200)
         self.assertEqual(export_response.headers["X-Export-Packaging"], "zip")
+        self.assertEqual(
+            fake_exporter.estimate_enclosure_snapshot_export.await_args.kwargs.get("configured_hostnames"),
+            ["api206.route.invalid", "ssh206.route.invalid", "bmc206.route.invalid"],
+        )
+        self.assertEqual(
+            fake_exporter.build_enclosure_snapshot_export.await_args.kwargs.get("configured_hostnames"),
+            ["api206.route.invalid", "ssh206.route.invalid", "bmc206.route.invalid"],
+        )
+        self.assertNotIn("source_config", fake_exporter.estimate_enclosure_snapshot_export.await_args.kwargs)
+        self.assertNotIn("source_config", fake_exporter.build_enclosure_snapshot_export.await_args.kwargs)
+        self.assertEqual(fake_service.system.model_dump.call_count, 2)
+        fake_service.system.model_dump.assert_called_with(mode="json")
         fake_service.get_snapshot.assert_awaited_once_with(selected_enclosure_id="front")
         fake_service.get_slot_smart_summaries.assert_awaited_once_with(
             [0, 1],
