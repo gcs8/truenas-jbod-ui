@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,34 @@ class SegmentedHistoryMigrationCliTests(unittest.TestCase):
                 hot_events = connection.execute("SELECT event_type FROM slot_events").fetchall()
             self.assertEqual(segment_events, [("chronologically-old",)])
             self.assertEqual(hot_events, [("chronologically-new",)])
+
+    def test_apply_publishes_group_readable_segment_catalog_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_source_database(source)
+            source.chmod(0o660)
+            source_owner = (source.stat().st_uid, source.stat().st_gid)
+
+            segment_migration.migrate_segmented_history(
+                source=source,
+                segments_directory=segments_directory,
+                cutoff="2025-01-02T00:00:00+00:00",
+                key_id="test-key-1",
+                apply=True,
+            )
+
+            self.assertEqual(stat.S_IMODE(segments_directory.stat().st_mode), 0o750)
+            self.assertEqual(
+                (segments_directory.stat().st_uid, segments_directory.stat().st_gid),
+                source_owner,
+            )
+            for name in ("segment-0001.sqlite3", "catalog.json"):
+                with self.subTest(name=name):
+                    metadata = (segments_directory / name).stat()
+                    self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o640)
+                    self.assertEqual((metadata.st_uid, metadata.st_gid), source_owner)
 
     def test_apply_authenticates_segment_in_marker_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -894,8 +923,14 @@ class SegmentedHistoryMigrationCliTests(unittest.TestCase):
             self._create_source_database(source)
             source_bytes = source.read_bytes()
 
-            def fail_catalog_write(path: Path, payload: dict[str, object]) -> None:
+            def fail_catalog_write(
+                path: Path,
+                payload: dict[str, object],
+                *,
+                owner: tuple[int, int],
+            ) -> None:
                 self.assertEqual(path, segments_directory / "catalog.json")
+                self.assertEqual(owner, (source.stat().st_uid, source.stat().st_gid))
                 self.assertTrue(pending_path.is_file())
                 raise OSError("injected catalog failure")
 

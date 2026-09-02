@@ -26,7 +26,10 @@ from history_service.segment_migration import (
 from history_service.segment_reader import MAX_SEGMENTS_PER_QUERY, SegmentedHistoryReader
 from history_service.segment_sealer import (
     HISTORY_TABLE_TIMESTAMPS,
+    SEGMENT_FILE_MODE,
+    _prepare_output_directory,
     _require_regular_source,
+    _require_source_owner,
     seal_history_segment,
 )
 
@@ -257,16 +260,29 @@ def _copy_file_no_replace(source: Path, destination: Path) -> dict[str, Any]:
     return destination_record
 
 
-def _stage_catalog(segments_directory: Path, payload: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+def _stage_catalog(
+    segments_directory: Path,
+    payload: dict[str, Any],
+    *,
+    owner: tuple[int, int],
+) -> tuple[Path, dict[str, Any]]:
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".rotation-catalog-",
         suffix=".json",
         dir=segments_directory,
     )
     path = Path(temporary_name)
-    os.fchmod(descriptor, 0o600)
     created_metadata = os.fstat(descriptor)
     try:
+        os.fchown(descriptor, *owner)
+        os.fchmod(descriptor, SEGMENT_FILE_MODE)
+        published_metadata = os.fstat(descriptor)
+        if (
+            published_metadata.st_uid,
+            published_metadata.st_gid,
+            stat.S_IMODE(published_metadata.st_mode),
+        ) != (*owner, SEGMENT_FILE_MODE):
+            raise ValueError("Segment rotation catalog permission policy could not be applied.")
         content = _canonical_json_bytes(payload)
         with os.fdopen(descriptor, "wb", closefd=True) as stream:
             descriptor = -1
@@ -597,6 +613,7 @@ def _rotate_segmented_history_locked(
     source = source.absolute()
     segments_directory = _require_output_directory(segments_directory.absolute())
     source_metadata = _require_regular_source(source)
+    _require_source_owner(source_metadata)
     if source.parent.stat().st_dev != segments_directory.stat().st_dev:
         raise ValueError("Segment rotation artifacts must share one directory mount.")
     journal_path = activation_pending_path(source)
@@ -641,7 +658,7 @@ def _rotate_segmented_history_locked(
             "detail": "Dry run only. Pass --apply after quiescing the history service.",
         }
 
-    os.chmod(segments_directory, 0o700)
+    segments_directory = _prepare_output_directory(segments_directory, source_metadata)
 
     rollback_hot_path = source.parent / f".{source.name}.{candidate_generation_id}.rollback.sqlite3"
     rollback_catalog_path = segments_directory / f".{prior_generation_id}.catalog.rollback.json"
@@ -752,6 +769,7 @@ def _rotate_segmented_history_locked(
         staged_catalog_path, staged_catalog_record = _stage_catalog(
             segments_directory,
             candidate_catalog,
+            owner=(source_metadata.st_uid, source_metadata.st_gid),
         )
         journal["candidate_catalog"] = staged_catalog_record
         journal["phase"] = "hot-staged"
@@ -824,9 +842,10 @@ def _recover_pending_rotation_locked(
 ) -> dict[str, Any]:
     source = source.absolute()
     segments_directory = _require_output_directory(segments_directory.absolute())
-    _require_regular_source(source)
+    source_metadata = _require_regular_source(source)
+    _require_source_owner(source_metadata)
     if apply:
-        os.chmod(segments_directory, 0o700)
+        segments_directory = _prepare_output_directory(segments_directory, source_metadata)
     journal_path = activation_pending_path(source)
     if not path_entry_exists(journal_path):
         catalog_path, catalog, catalog_record = _validated_catalog(source, segments_directory)

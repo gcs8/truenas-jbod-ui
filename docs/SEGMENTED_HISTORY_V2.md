@@ -8,7 +8,7 @@ query limits, backup format, and recovery behavior.
 Segmented history uses:
 
 - one writable hot SQLite database;
-- immutable SQLite segments under one private segment directory;
+- immutable SQLite segments under one private, group-traversable segment directory;
 - `catalog.json` as the active-generation commit point;
 - `.v1-rollback.sqlite3` as the retained pre-migration rollback snapshot;
 - `.migration-pending.json` as the durable operation journal.
@@ -16,6 +16,15 @@ Segmented history uses:
 The history database and segment directory must share a directory mount. Do not
 bind-mount the database file by itself. File mount points are rejected because
 they can create independent lock domains across containers or namespaces.
+
+The publisher effective UID must own the hot database. It makes or repairs the
+owned segment directory to owner/group inherited from that database with exact
+mode `0750`, and atomically publishes immutable segments and `catalog.json` with
+the same owner/group and exact mode `0640`. This gives the documented backup UID
+read/traverse access through its `APP_GID` supplemental group without granting
+write access or world access. Rollback snapshots and pending journals remain
+private. A directory owned by another UID or a publisher that does not own the
+hot database fails closed; publication does not seize unrelated paths.
 
 The initial implementation uses one segment named `segment-0001.sqlite3` and a
 complete catalog named `generation-0001`. The schema validates `tombstones` and
