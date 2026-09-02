@@ -8189,7 +8189,7 @@
           detailParts.push(member.controller_label);
         }
         return `
-          <div class="topology-pill path-state-${stateName.toLowerCase()}">
+          <div class="topology-pill path-state-${sasFabricClassToken(stateName)}">
             <span>${escapeHtml(member.device_name)}</span>
             <small>${escapeHtml(detailParts.join(" / "))}</small>
           </div>
