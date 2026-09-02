@@ -1877,17 +1877,37 @@ class SystemBackupService:
         )
         workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-debug-export-"))
         try:
-            history_snapshot_path = (
-                self._build_history_snapshot_to_directory(workspace / "history-snapshot")
-                if HISTORY_DB_KEY in selected_groups
-                else None
-            )
+            segmented_snapshot: _SegmentedExportSnapshot | None = None
+            history_snapshot_path: Path | None = None
+            history_segment_paths: tuple[Path, ...] = ()
+            if HISTORY_DB_KEY in selected_groups:
+                if self.store.segment_catalog_path is not None:
+                    segmented_snapshot = self._build_segmented_history_snapshot_to_directory(
+                        workspace / "history-snapshot"
+                    )
+                    history_snapshot_path = segmented_snapshot.hot_path
+                    history_segment_paths = segmented_snapshot.segment_paths
+                else:
+                    history_snapshot_path = self._build_history_snapshot_to_directory(
+                        workspace / "history-snapshot"
+                    )
             if history_snapshot_path is not None and scrubber is not None:
                 history_snapshot_path = self._build_scrubbed_history_snapshot_file(
                     history_snapshot_path,
                     scrubber,
                     workspace / "history-scrub.sqlite3",
                 )
+                if history_segment_paths:
+                    scrubbed_segment_root = workspace / "history-segment-scrub"
+                    scrubbed_segment_root.mkdir(mode=0o700)
+                    history_segment_paths = tuple(
+                        self._build_scrubbed_history_snapshot_file(
+                            segment_path,
+                            scrubber,
+                            scrubbed_segment_root / segment_path.name,
+                        )
+                        for segment_path in history_segment_paths
+                    )
             bundle_groups, bundle_members = self._collect_debug_bundle(
                 app_settings,
                 history_snapshot_path,
@@ -1897,6 +1917,33 @@ class SystemBackupService:
                 maintenance_payload=maintenance_payload,
                 exported_at=exported_at,
             )
+            if segmented_snapshot is not None:
+                bundle_members.append(
+                    BundleMember(
+                        key="history-segment-catalog",
+                        group_key=HISTORY_DB_KEY,
+                        archive_path="history/segments/catalog.json",
+                        source_path=None,
+                        present=True,
+                        content=self._build_debug_segment_catalog_bytes(
+                            segmented_snapshot.catalog,
+                            history_segment_paths,
+                        ),
+                    )
+                )
+                for segment_path in history_segment_paths:
+                    segment_id = segment_path.stem
+                    bundle_members.append(
+                        BundleMember(
+                            key=f"history-segment:{segment_id}",
+                            group_key=HISTORY_DB_KEY,
+                            archive_path=f"history/segments/{segment_id}.sqlite3",
+                            source_path=None,
+                            present=True,
+                            content=None,
+                            file_path=segment_path,
+                        )
+                    )
             manifest = self._build_manifest(
                 format_name=DEBUG_BUNDLE_FORMAT,
                 app_settings=app_settings,
@@ -2618,8 +2665,10 @@ class SystemBackupService:
         staged_segments: list[Path] = []
         catalog: dict[str, Any]
         source_segments: tuple[Path, ...]
+        catalog_record: dict[str, Any]
         with history_write_lock(self.store.file_path, blocking=False):
             with self.store._lock:
+                catalog_record = record_restore_file(catalog_path)
                 reader = SegmentedHistoryReader.from_catalog(
                     hot_path=self.store.file_path,
                     catalog_path=catalog_path,
@@ -2635,6 +2684,20 @@ class SystemBackupService:
                     os.fsync(stream.fileno())
                 source_segments = reader.verify_catalog_segments()
                 catalog = dict(reader.catalog_payload())
+                if not restore_file_matches(catalog_path, catalog_record):
+                    raise ValueError("Segmented history export catalog changed during verification.")
+                referenced_segments = {path.absolute() for path in source_segments}
+                live_hot_path = self.store.file_path.absolute()
+                unreferenced_segments = [
+                    path
+                    for path in catalog_path.parent.iterdir()
+                    if path.name.endswith(".sqlite3")
+                    and not path.name.startswith(".")
+                    and path.absolute() != live_hot_path
+                    and path.absolute() not in referenced_segments
+                ]
+                if unreferenced_segments:
+                    raise ValueError("Segmented history export contains an unreferenced segment file.")
         catalog_segments = catalog.get("segments")
         if not isinstance(catalog_segments, list):
             raise ValueError("Segmented history catalog is invalid.")
@@ -2657,6 +2720,8 @@ class SystemBackupService:
             ):
                 raise ValueError("Segmented history export segment integrity check failed.")
             staged_segments.append(target_segment)
+        if not restore_file_matches(catalog_path, catalog_record):
+            raise ValueError("Segmented history export catalog changed during segment copy.")
         _ImportActivationTransaction._fsync_directory(segment_root)
         _ImportActivationTransaction._fsync_directory(target_dir)
         return _SegmentedExportSnapshot(
@@ -2664,6 +2729,25 @@ class SystemBackupService:
             catalog=catalog,
             segment_paths=tuple(staged_segments),
         )
+
+    def _build_debug_segment_catalog_bytes(
+        self,
+        catalog: dict[str, Any],
+        segment_paths: tuple[Path, ...],
+    ) -> bytes:
+        paths_by_name = {path.name: path for path in segment_paths}
+        debug_segments: list[dict[str, Any]] = []
+        for entry in catalog.get("segments") or []:
+            segment_path = paths_by_name[str(entry["file_name"])]
+            debug_segments.append(
+                {
+                    **entry,
+                    "size_bytes": segment_path.stat().st_size,
+                    "sha256": self._extracted_member_sha256(segment_path),
+                }
+            )
+        debug_catalog = {**catalog, "segments": debug_segments}
+        return json.dumps(debug_catalog, indent=2, sort_keys=True).encode("utf-8")
 
     def _resolve_selected_groups(
         self,
@@ -5101,6 +5185,7 @@ class SystemBackupService:
         connection = sqlite3.connect(target_path)
         try:
             connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA secure_delete=ON")
             (
                 slot_state_rules,
                 slot_event_rules,
@@ -5116,6 +5201,7 @@ class SystemBackupService:
             if metric_rollup_rules:
                 self._scrub_history_table(connection, "metric_rollups", metric_rollup_rules)
             connection.commit()
+            connection.execute("VACUUM")
         finally:
             connection.close()
         return target_path
