@@ -967,12 +967,6 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
                     slot_number=-1,
                     element_id=int(element_match.group("element")),
                     ses_device=current_enclosure.ses_device,
-                    control_targets=[
-                        {
-                            "ses_device": current_enclosure.ses_device,
-                            "ses_element_id": int(element_match.group("element")),
-                        }
-                    ],
                 )
                 continue
 
@@ -1089,12 +1083,6 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
         current_enclosure.slots[slot_number] = SESMapSlot(
             slot_number=slot_number,
             ses_device=current_enclosure.ses_device,
-            control_targets=[
-                {
-                    "ses_device": current_enclosure.ses_device,
-                    "ses_element_id": slot_number,
-                }
-            ],
             status=status_text,
             description=normalize_text(columns[0]),
             device_names=[device_name] if device_name else [],
@@ -2029,7 +2017,8 @@ def merge_slot_candidate_maps(
                         if pair[0]:
                             payload["ssh_host"] = pair[0]
                         combined.append(payload)
-                    target[key] = combined
+                    if combined:
+                        target[key] = combined
                 continue
             if key == "identify_active":
                 existing = target.get(key)

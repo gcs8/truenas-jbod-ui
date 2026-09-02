@@ -1292,6 +1292,77 @@ Slot 06  -  -  -  Not installed
         self.assertTrue(parsed[0].slots[0].present)
         self.assertFalse(parsed[0].slots[6].present)
 
+    def test_parse_sesutil_show_does_not_fabricate_element_control_targets(self) -> None:
+        output = """
+ses2:  <ExampleCo OneBasedShelf 0001>; ID: 5000000000000101
+Desc  Device  Model  Serial  Status
+Slot 01  da0  Example Disk  SYNTH0001  OK
+""".strip()
+
+        slot = parse_sesutil_show_enclosures(output)[0].slots[1]
+
+        self.assertIsNone(slot.element_id)
+        self.assertEqual(slot.control_targets, [])
+
+    def test_core_map_show_mismatch_keeps_only_authentic_map_element_target(self) -> None:
+        ses_map = """
+ses2:
+  Enclosure Name: ExampleCo OneBasedShelf
+  Enclosure ID: 5000000000000101
+  Element 2, Type: Array Device Slot
+    Status: OK
+    Description: Slot01
+    Device Names: da0, pass0
+""".strip()
+        ses_show = """
+ses2:  <ExampleCo OneBasedShelf 0001>; ID: 5000000000000101
+Desc  Device  Model  Serial  Status
+Slot 01  da0  Example Disk  SYNTH0001  OK
+""".strip()
+
+        parsed = parse_ssh_outputs(
+            {"sesutil map": ses_map, "sesutil show": ses_show},
+            slot_count=1,
+            enclosure_filter=None,
+        )
+
+        self.assertEqual(
+            parsed.ses_slot_candidates[0]["ses_targets"],
+            [
+                {
+                    "ses_device": "/dev/ses2",
+                    "ses_element_id": 2,
+                    "ses_slot_number": 1,
+                }
+            ],
+        )
+
+    def test_core_map_show_matching_indexes_keeps_one_authentic_target(self) -> None:
+        ses_map = """
+ses2:
+  Enclosure Name: ExampleCo MatchingShelf
+  Enclosure ID: 5000000000000202
+  Element 1, Type: Array Device Slot
+    Status: OK
+    Description: Slot01
+    Device Names: da0, pass0
+""".strip()
+        ses_show = """
+ses2:  <ExampleCo MatchingShelf 0001>; ID: 5000000000000202
+Desc  Device  Model  Serial  Status
+Slot 01  da0  Example Disk  SYNTH0002  OK
+""".strip()
+
+        parsed = parse_ssh_outputs(
+            {"sesutil map": ses_map, "sesutil show": ses_show},
+            slot_count=1,
+            enclosure_filter=None,
+        )
+
+        self.assertEqual(len(parsed.ses_slot_candidates[0]["ses_targets"]), 1)
+        self.assertEqual(parsed.ses_slot_candidates[0]["ses_targets"][0]["ses_element_id"], 1)
+        self.assertEqual(parsed.ses_slot_candidates[0]["ses_targets"][0]["ses_slot_number"], 1)
+
     def test_parse_ssh_outputs_builds_ses_candidates_once_after_collecting_all_evidence(self) -> None:
         ses_map = """
 ses2:
@@ -1374,6 +1445,7 @@ Slot 00  da0  Samsung SSD  SER000  OK
         self.assertNotIn("sas_address_hint", candidate)
         self.assertNotIn("ses_element_id", candidate)
         self.assertNotIn("slot_number_source", candidate)
+        self.assertNotIn("ses_targets", candidate)
 
     def test_parse_ssh_outputs_preserves_scale_profile_id_after_ses_merge(self) -> None:
         aes_output = """

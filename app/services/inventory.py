@@ -221,6 +221,17 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _is_authentic_core_ses_target(target: Any) -> bool:
+    return bool(
+        isinstance(target, dict)
+        and re.fullmatch(
+            r"/dev/ses\d+",
+            normalize_text(target.get("ses_device")) or "",
+        )
+        and isinstance(target.get("ses_element_id"), int)
+    )
+
+
 def build_layout_rows(rows: int, columns: int, slot_count: int) -> list[list[int | None]]:
     layout_rows: list[list[int | None]] = []
     for row_index in reversed(range(rows)):
@@ -9580,7 +9591,19 @@ class InventoryService:
                 if isinstance(target, dict) and normalize_text(target.get("ses_device", ""))
             )
         )
-        ssh_led_supported = bool(self.system.ssh.enabled and ses_targets and not scale_linux_ses_targets)
+        core_ses_target_invalid = bool(
+            self.system.truenas.platform == "core"
+            and (
+                len(ses_targets) != 1
+                or not _is_authentic_core_ses_target(ses_targets[0])
+            )
+        )
+        ssh_led_supported = bool(
+            self.system.ssh.enabled
+            and ses_targets
+            and not scale_linux_ses_targets
+            and not core_ses_target_invalid
+        )
         unifi_vendor_slot_number = raw_slot_status.get("vendor_slot_number")
         unifi_fault_led_supported = bool(
             self.system.truenas.platform == "linux"
@@ -9620,6 +9643,12 @@ class InventoryService:
             led_supported = True
             led_backend = "api"
             led_reason = None
+        elif core_ses_target_invalid:
+            led_supported = False
+            led_backend = None
+            led_reason = (
+                f"Slot {slot:02d} must resolve to exactly one authentic SES element before CORE identify control can run."
+            )
         elif scale_linux_ses_targets and self.system.ssh.enabled:
             led_supported = True
             led_backend = "scale_sg_ses"
@@ -9804,6 +9833,19 @@ class InventoryService:
                 slot_view.led_reason
                 or f"Slot {slot_view.slot_label} is missing SES controller metadata required for SSH LED control."
             )
+
+        if self.system.truenas.platform == "core":
+            authentic_targets = [
+                target
+                for target in ses_targets
+                if _is_authentic_core_ses_target(target)
+            ]
+            if len(ses_targets) != 1 or len(authentic_targets) != 1:
+                raise TrueNASAPIError(
+                    f"Slot {slot_view.slot_label} must resolve to exactly one authentic SES element "
+                    "before CORE identify control can run."
+                )
+            ses_targets = authentic_targets
 
         if action == LedAction.identify:
             locate_state = "on"

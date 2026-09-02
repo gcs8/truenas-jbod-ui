@@ -10162,6 +10162,159 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
 
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_core_duplicate_slot_descriptions_disable_ssh_identify_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="core-ambiguous-capability",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(), system, AsyncMock(), AsyncMock(), temp_dir
+            )
+
+            slot = service._build_slot_view(
+                slot=0,
+                row_index=0,
+                column_index=0,
+                enclosure_meta={"id": "5000000000000303"},
+                raw_slot_status={
+                    "ses_device": "/dev/ses2",
+                    "ses_element_id": 1,
+                    "ses_targets": [
+                        {
+                            "ses_device": "/dev/ses2",
+                            "ses_element_id": 1,
+                            "ses_slot_number": 1,
+                        },
+                        {
+                            "ses_device": "/dev/ses2",
+                            "ses_element_id": 2,
+                            "ses_slot_number": 1,
+                        },
+                    ],
+                },
+                disk=None,
+                mapping=None,
+                ssh_data=ParsedSSHData(),
+                api_topology_members={},
+                api_enclosure_ids=set(),
+            )
+
+            self.assertFalse(slot.led_supported)
+            self.assertIsNone(slot.led_backend)
+            self.assertIn("exactly one authentic SES element", slot.led_reason or "")
+
+    async def test_core_non_ses_device_disables_ssh_identify_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="core-inauthentic-target",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(), system, AsyncMock(), AsyncMock(), temp_dir
+            )
+
+            slot = service._build_slot_view(
+                slot=0,
+                row_index=0,
+                column_index=0,
+                enclosure_meta={"id": "5000000000000404"},
+                raw_slot_status={
+                    "ses_device": "/dev/not-ses2",
+                    "ses_element_id": 2,
+                    "ses_targets": [
+                        {
+                            "ses_device": "/dev/not-ses2",
+                            "ses_element_id": 2,
+                            "ses_slot_number": 1,
+                        }
+                    ],
+                },
+                disk=None,
+                mapping=None,
+                ssh_data=ParsedSSHData(),
+                api_topology_members={},
+                api_enclosure_ids=set(),
+            )
+
+            self.assertFalse(slot.led_supported)
+            self.assertIsNone(slot.led_backend)
+            self.assertIn("exactly one authentic SES element", slot.led_reason or "")
+
+    async def test_core_led_control_uses_authentic_element_index_not_slot_number(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="core-element-index",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(), system, AsyncMock(), AsyncMock(), temp_dir
+            )
+            service._run_ssh_command = AsyncMock(
+                return_value=SSHCommandResult(command="", ok=True, stdout="", exit_code=0)
+            )
+            slot = SlotView(
+                slot=0,
+                slot_label="01",
+                row_index=0,
+                column_index=0,
+                led_supported=True,
+                led_backend="ssh",
+                ssh_ses_targets=[
+                    {
+                        "ses_device": "/dev/ses2",
+                        "ses_element_id": 2,
+                        "ses_slot_number": 1,
+                    }
+                ],
+            )
+
+            await service._set_slot_led_over_ssh(slot, LedAction.identify)
+
+            service._run_ssh_command.assert_awaited_once_with(
+                "sudo -n /usr/sbin/sesutil locate -u /dev/ses2 2 on", None
+            )
+
+    async def test_core_led_control_fails_closed_for_duplicate_slot_descriptions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="core-ambiguous-elements",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(), system, AsyncMock(), AsyncMock(), temp_dir
+            )
+            service._run_ssh_command = AsyncMock()
+            slot = SlotView(
+                slot=0,
+                slot_label="01",
+                row_index=0,
+                column_index=0,
+                led_supported=True,
+                led_backend="ssh",
+                ssh_ses_targets=[
+                    {
+                        "ses_device": "/dev/ses2",
+                        "ses_element_id": 1,
+                        "ses_slot_number": 1,
+                    },
+                    {
+                        "ses_device": "/dev/ses2",
+                        "ses_element_id": 2,
+                        "ses_slot_number": 1,
+                    },
+                ],
+            )
+
+            with self.assertRaisesRegex(TrueNASAPIError, "exactly one authentic SES element"):
+                await service._set_slot_led_over_ssh(slot, LedAction.identify)
+
+            service._run_ssh_command.assert_not_awaited()
+
     async def test_quantastor_ses_overlay_keeps_authoritative_host_truth_and_merges_redundant_targets(self) -> None:
         class DummyTrueNASClient:
             pass
