@@ -19,6 +19,16 @@ DEVICE_REGEX = re.compile(
     r"(?P<device>(?:/dev/)?(?:(?:da|ada|sd|nvd)\d+|nvme\d+(?:n\d+)?|multipath/disk[0-9A-Za-z-]+)(?:p\d+)?)",
     re.IGNORECASE,
 )
+# Same token set as DEVICE_REGEX, but the device may not start inside a longer
+# name. Used only for identity normalization: without the guard the FreeBSD
+# `da<N>` alternative matches the tail of the Linux partition name `sda1` and
+# turns it into the bogus disk key `da1` (issue #173). Free-text scanners keep
+# the unanchored DEVICE_REGEX.
+DEVICE_NAME_REGEX = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?P<device>(?:/dev/)?(?:(?:da|ada|sd|nvd)\d+|nvme\d+(?:n\d+)?|multipath/disk[0-9A-Za-z-]+)(?:p\d+)?)",
+    re.IGNORECASE,
+)
 GPTID_REGEX = re.compile(r"(?P<gptid>(?:/dev/)?gptid/[A-Za-z0-9\-_.]+)", re.IGNORECASE)
 GUID_REGEX = re.compile(r"^[0-9]{16,}$")
 SLOT_REGEX = re.compile(r"(?:slot|bay|element)\D{0,4}(?P<slot>\d{1,3})", re.IGNORECASE)
@@ -190,7 +200,7 @@ def normalize_text(value: str | None) -> str | None:
 def normalize_device_name(value: str | None) -> str | None:
     if not value:
         return None
-    match = DEVICE_REGEX.search(value)
+    match = DEVICE_NAME_REGEX.search(value)
     if not match:
         return value.strip().removeprefix("/dev/")
     normalized = match.group("device").removeprefix("/dev/")

@@ -10,6 +10,7 @@ from app.services.parsers import (
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
     merge_slot_candidate_maps,
+    normalize_device_name,
     parse_camcontrol_devlist,
     parse_enclosure_sysfs_map,
     parse_esxcli_smart_get,
@@ -39,6 +40,21 @@ from app.services.parsers import (
 
 
 class ParserTests(unittest.TestCase):
+    def test_normalize_device_name_does_not_read_a_freebsd_disk_out_of_a_linux_partition(self) -> None:
+        # `sda1` used to normalize to `da1` because the FreeBSD `da<N>` token
+        # matched inside the Linux partition name (issue #173).
+        self.assertEqual(normalize_device_name("sda1"), "sda1")
+        self.assertEqual(normalize_device_name("/dev/sda1"), "sda1")
+        self.assertEqual(normalize_device_name("sdab"), "sdab")
+        # FreeBSD, NVMe, multipath and embedded-token forms are unchanged.
+        self.assertEqual(normalize_device_name("da1"), "da1")
+        self.assertEqual(normalize_device_name("/dev/da0p2"), "da0")
+        self.assertEqual(normalize_device_name("ada3p1"), "ada3")
+        self.assertEqual(normalize_device_name("nvme0n1p1"), "nvme0n1")
+        self.assertEqual(normalize_device_name("/dev/multipath/disk0"), "multipath/disk0")
+        self.assertEqual(normalize_device_name("(pass0,da0)"), "da0")
+        self.assertEqual(normalize_device_name("gptid/abc"), "gptid/abc")
+
     def test_parse_camcontrol_devlist_tracks_models_and_controllers(self) -> None:
         output = """
 scbus12 on mpr0 bus 0:
