@@ -4,6 +4,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import quote, unquote
 
 from app.config import SystemConfig
 from app.models.domain import (
@@ -27,6 +28,7 @@ from app.services.parsers import canonicalize_ssh_command, normalize_text
 
 
 CORE_MPRUTIL_UNIT_SUBCOMMANDS = ("adapter", "devices", "enclosures", "expanders", "iocfacts")
+SAS_FABRIC_CANONICAL_ALIAS_SOURCE = "operator-canonical-v1"
 CORE_MESSAGES_TAIL_COMMAND = "tail -n 4000 /var/log/messages"
 CORE_MESSAGES_TAIL_SUDO_COMMAND = "sudo -n /usr/bin/tail -n 4000 /var/log/messages"
 CORE_MPR_DMESG_EVENTS_COMMAND = (
@@ -998,15 +1000,15 @@ def _build_core_mpr_fabric_snapshot(
             bay_related_nodes.append(ses_id)
             bay_related_links.append(link.id)
         if slot.pool_name:
-            pool_id = f"pool:{slot.pool_name}"
+            pool_id = _pool_node_id(slot.pool_name)
             add_node(nodes, SasFabricNode(id=pool_id, kind="pool", label=slot.pool_name, related_slots=[slot.slot]))
             link = add_link(links, bay_id, pool_id, "bay-pool", slot=slot.slot, related_slots=[slot.slot])
             bay_related_nodes.append(pool_id)
             bay_related_links.append(link.id)
         if slot.vdev_name:
-            vdev_id = f"vdev:{slot.vdev_name}"
+            vdev_id = _vdev_node_id(slot.vdev_name, slot.pool_name)
             add_node(nodes, SasFabricNode(id=vdev_id, kind="vdev", label=slot.vdev_name, related_slots=[slot.slot]))
-            target_id = f"pool:{slot.pool_name}" if slot.pool_name else bay_id
+            target_id = _pool_node_id(slot.pool_name) if slot.pool_name else bay_id
             link = add_link(links, target_id, vdev_id, "pool-vdev", slot=slot.slot, related_slots=[slot.slot])
             bay_related_nodes.append(vdev_id)
             bay_related_links.append(link.id)
@@ -1045,6 +1047,7 @@ def _build_core_mpr_fabric_snapshot(
         if controller_node:
             controller["related_slots"] = list(controller_node.related_slots)
 
+    aliases_by_id = _resolve_sas_fabric_alias_map(aliases_by_id, nodes)
     _apply_sas_fabric_aliases(
         nodes=nodes,
         traces=traces,
@@ -1453,15 +1456,15 @@ def _build_linux_ses_fabric_snapshot(
             )
             bay_related_links.append(ses_link.id)
         if slot.pool_name:
-            pool_id = f"pool:{slot.pool_name}"
+            pool_id = _pool_node_id(slot.pool_name)
             add_node(nodes, SasFabricNode(id=pool_id, kind="pool", label=slot.pool_name, related_slots=[slot.slot]))
             link = add_link(links, bay_id, pool_id, "bay-pool", slot=slot.slot, related_slots=[slot.slot])
             bay_related_nodes.append(pool_id)
             bay_related_links.append(link.id)
         if slot.vdev_name:
-            vdev_id = f"vdev:{slot.vdev_name}"
+            vdev_id = _vdev_node_id(slot.vdev_name, slot.pool_name)
             add_node(nodes, SasFabricNode(id=vdev_id, kind="vdev", label=slot.vdev_name, related_slots=[slot.slot]))
-            target_id = f"pool:{slot.pool_name}" if slot.pool_name else bay_id
+            target_id = _pool_node_id(slot.pool_name) if slot.pool_name else bay_id
             link = add_link(links, target_id, vdev_id, "pool-vdev", slot=slot.slot, related_slots=[slot.slot])
             bay_related_nodes.append(vdev_id)
             bay_related_links.append(link.id)
@@ -1515,6 +1518,7 @@ def _build_linux_ses_fabric_snapshot(
             "fabric_kind": "linux_ses",
         }
     ]
+    aliases_by_id = _resolve_sas_fabric_alias_map(aliases_by_id, nodes)
     _apply_sas_fabric_aliases(
         nodes=nodes,
         traces=traces,
@@ -1847,15 +1851,15 @@ def _build_platform_storage_fabric_snapshot(
         bay_related_links.append(enclosure_link.id)
 
         if slot.pool_name:
-            pool_id = f"pool:{_object_id_token(slot.pool_name)}"
+            pool_id = _pool_node_id(slot.pool_name)
             add_node(nodes, SasFabricNode(id=pool_id, kind="pool", label=slot.pool_name, related_slots=slot_numbers))
             link = add_link(links, bay_id, pool_id, "bay-pool", slot=slot.slot, related_slots=slot_numbers)
             bay_related_nodes.append(pool_id)
             bay_related_links.append(link.id)
         if slot.vdev_name:
-            vdev_id = f"vdev:{_object_id_token(slot.vdev_name)}"
+            vdev_id = _vdev_node_id(slot.vdev_name, slot.pool_name)
             add_node(nodes, SasFabricNode(id=vdev_id, kind="vdev", label=slot.vdev_name, related_slots=slot_numbers))
-            target_id = f"pool:{_object_id_token(slot.pool_name)}" if slot.pool_name else bay_id
+            target_id = _pool_node_id(slot.pool_name) if slot.pool_name else bay_id
             link = add_link(links, target_id, vdev_id, "pool-vdev", slot=slot.slot, related_slots=slot_numbers)
             bay_related_nodes.append(vdev_id)
             bay_related_links.append(link.id)
@@ -1912,6 +1916,7 @@ def _build_platform_storage_fabric_snapshot(
         controller["path_counts"] = dict(controller["path_counts"])
         controllers.append(controller)
     paths = sorted(paths_by_id.values(), key=lambda item: (str(item.get("controller") or ""), str(item.get("label") or "")))
+    aliases_by_id = _resolve_sas_fabric_alias_map(aliases_by_id, nodes)
     _apply_sas_fabric_aliases(
         nodes=nodes,
         traces=traces,
@@ -3301,6 +3306,39 @@ def _object_id_token(value: Any) -> str:
     return token or "unknown"
 
 
+def _storage_node_id_component(value: Any) -> str:
+    text = normalize_text(str(value or "")) or "unknown"
+    return quote(text, safe="-._~")
+
+
+def _pool_node_id(pool_name: Any) -> str:
+    return f"pool:{_storage_node_id_component(pool_name)}"
+
+
+def _vdev_node_id(vdev_name: Any, pool_name: Any = None) -> str:
+    vdev_component = _storage_node_id_component(vdev_name)
+    if pool_name:
+        return f"vdev:{_storage_node_id_component(pool_name)}/{vdev_component}"
+    return f"vdev:{vdev_component}"
+
+
+def storage_node_legacy_alias_ids(object_id: str, object_kind: str | None) -> list[str]:
+    kind = normalize_text(object_kind)
+    prefix = f"{kind}:" if kind in {"pool", "vdev"} else None
+    if not prefix or not object_id.startswith(prefix):
+        return []
+    component = object_id.removeprefix(prefix)
+    if kind == "vdev" and "/" in component:
+        component = component.rsplit("/", 1)[1]
+    raw_label = unquote(component)
+    return _dedupe_strings(
+        [
+            f"{kind}:{raw_label}",
+            f"{kind}:{_object_id_token(raw_label)}",
+        ]
+    )
+
+
 def _linux_ses_sort_key(value: str) -> tuple[int, str]:
     match = re.search(r"(\d+)$", normalize_text(value))
     return (int(match.group(1)) if match else 1_000_000, normalize_text(value))
@@ -3342,6 +3380,47 @@ def _backplane_zones_for_slots(slots: list[SlotView]) -> dict[int, dict[str, Any
 
 def _sas_fabric_alias_map(aliases: list[SasFabricAlias]) -> dict[str, SasFabricAlias]:
     return {alias.object_id: alias for alias in aliases if alias.object_id and alias.label}
+
+
+def _resolve_sas_fabric_alias_map(
+    aliases: dict[str, SasFabricAlias],
+    nodes: dict[str, SasFabricNode],
+) -> dict[str, SasFabricAlias]:
+    legacy_targets: dict[str, set[str]] = defaultdict(set)
+    for node in nodes.values():
+        if node.kind not in {"pool", "vdev"}:
+            continue
+        raw_label = normalize_text(node.label)
+        if not raw_label:
+            continue
+        legacy_targets[f"{node.kind}:{raw_label}"].add(node.id)
+        legacy_targets[f"{node.kind}:{_object_id_token(raw_label)}"].add(node.id)
+
+    resolved: dict[str, SasFabricAlias] = {
+        object_id: alias
+        for object_id, alias in aliases.items()
+        if object_id in nodes
+        and (
+            nodes[object_id].kind not in {"pool", "vdev"}
+            or alias.source == SAS_FABRIC_CANONICAL_ALIAS_SOURCE
+            or len(legacy_targets.get(object_id, set())) <= 1
+        )
+    }
+    for object_id, alias in aliases.items():
+        if object_id in resolved:
+            continue
+        targets = legacy_targets.get(object_id, set())
+        if len(targets) == 1:
+            canonical_id = next(iter(targets))
+            existing = resolved.get(canonical_id)
+            if existing is None or (
+                existing.source != SAS_FABRIC_CANONICAL_ALIAS_SOURCE
+                and alias.updated_at > existing.updated_at
+            ):
+                resolved[canonical_id] = alias.model_copy(update={"object_id": canonical_id})
+        elif object_id not in nodes:
+            resolved[object_id] = alias
+    return resolved
 
 
 def _apply_sas_fabric_aliases(

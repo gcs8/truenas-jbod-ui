@@ -70,8 +70,10 @@ from app.services.sas_fabric import (
     CORE_MPR_DMESG_EVENTS_COMMAND,
     CORE_MPR_SYSCTL_LOCATION_COMMAND,
     CORE_PCICONF_LV_OPTIONAL_COMMAND,
+    SAS_FABRIC_CANONICAL_ALIAS_SOURCE,
     build_core_mprutil_unit_commands,
     build_sas_fabric_snapshot,
+    storage_node_legacy_alias_ids,
 )
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.quantastor_api import QuantastorRESTClient
@@ -725,8 +727,14 @@ class InventoryService:
             else None
         )
 
+        compatible_object_ids = storage_node_legacy_alias_ids(object_text, kind_name)
         if not label_text:
-            cleared = self.sas_fabric_alias_store.clear_alias(self.system.id, enclosure_id, object_text)
+            cleared = self.sas_fabric_alias_store.clear_alias(
+                self.system.id,
+                enclosure_id,
+                object_text,
+                compatible_object_ids,
+            )
             return {"ok": cleared, "cleared": cleared, "alias": None}
 
         alias = self.sas_fabric_alias_store.save_alias(
@@ -736,7 +744,13 @@ class InventoryService:
                 object_id=object_text,
                 object_kind=kind_name,
                 label=label_text,
-            )
+                source=(
+                    SAS_FABRIC_CANONICAL_ALIAS_SOURCE
+                    if kind_name in {"pool", "vdev"}
+                    else "operator"
+                ),
+            ),
+            compatible_object_ids,
         )
         return {"ok": True, "cleared": False, "alias": alias.model_dump(mode="json")}
 

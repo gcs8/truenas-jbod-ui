@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1095,6 +1096,51 @@ class SasFabricAliasStoreTests(unittest.TestCase):
             selected_after_clear = {alias.object_id: alias for alias in store.list_aliases("archive-core", "enc-60")}
             self.assertEqual(selected_after_clear["backplane:0"].label, "System backplane")
 
+    def test_canonical_pool_and_vdev_alias_updates_remove_legacy_rows(self) -> None:
+        cases = (
+            ("pool:Tank Main", "pool:Tank%20Main", "pool"),
+            ("pool:tank-main", "pool:Tank%20Main", "pool"),
+            ("vdev:Data/Mirror", "vdev:Tank%20Main/Data%2FMirror", "vdev"),
+            ("vdev:data-mirror", "vdev:Tank%20Main/Data%2FMirror", "vdev"),
+        )
+        for legacy_id, canonical_id, object_kind in cases:
+            with self.subTest(legacy_id=legacy_id), tempfile.TemporaryDirectory() as temp_dir:
+                store = SasFabricAliasStore(Path(temp_dir) / "sas_fabric_aliases.json")
+                store.save_alias(
+                    SasFabricAlias(
+                        system_id="synthetic-system",
+                        object_id=legacy_id,
+                        object_kind=object_kind,
+                        label="Legacy label",
+                    )
+                )
+                service = object.__new__(InventoryService)
+                service.system = SystemConfig(
+                    id="synthetic-system",
+                    truenas=TrueNASConfig(platform="scale"),
+                )
+                service.sas_fabric_alias_store = store
+
+                saved = service.save_sas_fabric_alias(
+                    object_id=canonical_id,
+                    object_kind=object_kind,
+                    label="Updated label",
+                )
+                selected = store.list_aliases("synthetic-system")
+
+                self.assertTrue(saved["ok"])
+                self.assertEqual(
+                    [(alias.object_id, alias.label) for alias in selected],
+                    [(canonical_id, "Updated label")],
+                )
+                cleared = service.save_sas_fabric_alias(
+                    object_id=canonical_id,
+                    object_kind=object_kind,
+                    label=None,
+                )
+                self.assertTrue(cleared["cleared"])
+                self.assertEqual(store.list_aliases("synthetic-system"), [])
+
 
 class SasFabricSnapshotTests(unittest.TestCase):
     def test_select_sas_fabric_builder_key_keeps_platform_selection_explicit(self) -> None:
@@ -1234,6 +1280,271 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 self.assertIn("controller_id", route)
                 self.assertIn("path_id", route)
                 self.assertIn("enclosure_id", route)
+
+    @staticmethod
+    def _storage_id_slot(
+        *,
+        slot: int = 0,
+        pool_name: str = "Tank Main",
+        vdev_name: str = "Data/Mirror",
+        with_ses: bool = False,
+    ) -> SlotView:
+        return SlotView(
+            slot=slot,
+            slot_label=f"{slot:02d}",
+            row_index=0,
+            column_index=slot,
+            present=True,
+            state=SlotState.healthy,
+            device_name=f"sd{chr(ord('a') + slot)}",
+            pool_name=pool_name,
+            vdev_name=vdev_name,
+            ssh_ses_device="/dev/sg26" if with_ses else None,
+            ssh_ses_element_id=slot if with_ses else None,
+            raw_status={"device_names": [f"sd{chr(ord('a') + slot)}"]},
+        )
+
+    @staticmethod
+    def _build_storage_id_fabric(
+        *,
+        system_id: str,
+        platform: str,
+        slots: list[SlotView],
+        aliases: list[SasFabricAlias] | None = None,
+    ):
+        return build_sas_fabric_snapshot(
+            system=SystemConfig(
+                id=system_id,
+                label=system_id,
+                truenas=TrueNASConfig(platform=platform),
+            ),
+            snapshot=InventorySnapshot(
+                slots=slots,
+                refresh_interval_seconds=30,
+                selected_system_id=system_id,
+                selected_system_platform=platform,
+                selected_enclosure_id="synthetic-enclosure",
+            ),
+            ssh_outputs={},
+            aliases=aliases,
+        )
+
+    def test_pool_and_vdev_ids_are_identical_across_all_fabric_builders(self) -> None:
+        fabrics = {
+            "core_mpr": self._build_storage_id_fabric(
+                system_id="synthetic-core",
+                platform="core",
+                slots=[self._storage_id_slot()],
+            ),
+            "linux_ses": self._build_storage_id_fabric(
+                system_id="synthetic-scale",
+                platform="scale",
+                slots=[self._storage_id_slot(with_ses=True)],
+            ),
+            "platform_storage": self._build_storage_id_fabric(
+                system_id="synthetic-scale",
+                platform="scale",
+                slots=[self._storage_id_slot()],
+            ),
+        }
+
+        storage_ids = {
+            builder: {node.id for node in fabric.nodes if node.kind in {"pool", "vdev"}}
+            for builder, fabric in fabrics.items()
+        }
+
+        self.assertEqual(
+            storage_ids,
+            {
+                builder: {"pool:Tank%20Main", "vdev:Tank%20Main/Data%2FMirror"}
+                for builder in fabrics
+            },
+        )
+
+    def test_pool_and_vdev_ids_keep_duplicate_labels_collision_safe(self) -> None:
+        fabric = self._build_storage_id_fabric(
+            system_id="synthetic-linux",
+            platform="linux",
+            slots=[
+                self._storage_id_slot(slot=0, pool_name="Pool A", vdev_name="mirror-0"),
+                self._storage_id_slot(slot=1, pool_name="Pool B", vdev_name="mirror-0"),
+                self._storage_id_slot(slot=2, pool_name="Pool A", vdev_name="mirror-0"),
+                self._storage_id_slot(slot=3, pool_name="pool-a", vdev_name="mirror-0"),
+            ],
+        )
+        nodes = {node.id: node for node in fabric.nodes if node.kind in {"pool", "vdev"}}
+
+        self.assertEqual(
+            set(nodes),
+            {
+                "pool:Pool%20A",
+                "pool:Pool%20B",
+                "pool:pool-a",
+                "vdev:Pool%20A/mirror-0",
+                "vdev:Pool%20B/mirror-0",
+                "vdev:pool-a/mirror-0",
+            },
+        )
+        self.assertEqual(nodes["vdev:Pool%20A/mirror-0"].related_slots, [0, 2])
+
+    def test_saved_pool_aliases_remain_scoped_to_their_system(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SasFabricAliasStore(Path(temp_dir) / "sas_fabric_aliases.json")
+            for system_id, label in (("system-a", "Primary tank"), ("system-b", "Replica tank")):
+                store.save_alias(
+                    SasFabricAlias(
+                        system_id=system_id,
+                        object_id="pool:Tank%20Main",
+                        object_kind="pool",
+                        label=label,
+                    )
+                )
+
+            fabrics = {
+                system_id: self._build_storage_id_fabric(
+                    system_id=system_id,
+                    platform="scale",
+                    slots=[self._storage_id_slot()],
+                    aliases=store.list_aliases(system_id, "synthetic-enclosure"),
+                )
+                for system_id in ("system-a", "system-b")
+            }
+
+        self.assertEqual(
+            {
+                system_id: next(node.display_label for node in fabric.nodes if node.id == "pool:Tank%20Main")
+                for system_id, fabric in fabrics.items()
+            },
+            {"system-a": "Primary tank", "system-b": "Replica tank"},
+        )
+
+    def test_saved_legacy_pool_and_vdev_aliases_follow_builder_changes(self) -> None:
+        legacy_alias_sets = {
+            "raw_core_ids": (("pool:Tank Main", "Legacy pool"), ("vdev:Data/Mirror", "Legacy vdev")),
+            "tokenized_platform_ids": (("pool:tank-main", "Legacy pool"), ("vdev:data-mirror", "Legacy vdev")),
+        }
+        builder_cases = {
+            "core_mpr": ("core", False),
+            "linux_ses": ("scale", True),
+            "platform_storage": ("scale", False),
+        }
+
+        for alias_shape, saved_rows in legacy_alias_sets.items():
+            with self.subTest(alias_shape=alias_shape), tempfile.TemporaryDirectory() as temp_dir:
+                store = SasFabricAliasStore(Path(temp_dir) / "sas_fabric_aliases.json")
+                for object_id, label in saved_rows:
+                    store.save_alias(
+                        SasFabricAlias(
+                            system_id="synthetic-system",
+                            object_id=object_id,
+                            object_kind=object_id.split(":", 1)[0],
+                            label=label,
+                        )
+                    )
+                aliases = store.list_aliases("synthetic-system", "synthetic-enclosure")
+
+                for builder, (platform, with_ses) in builder_cases.items():
+                    with self.subTest(alias_shape=alias_shape, builder=builder):
+                        fabric = self._build_storage_id_fabric(
+                            system_id="synthetic-system",
+                            platform=platform,
+                            slots=[self._storage_id_slot(with_ses=with_ses)],
+                            aliases=aliases,
+                        )
+                        nodes = {node.id: node for node in fabric.nodes}
+                        aliases_by_id = {alias.object_id: alias for alias in fabric.aliases}
+
+                        self.assertEqual(nodes["pool:Tank%20Main"].display_label, "Legacy pool")
+                        self.assertEqual(nodes["vdev:Tank%20Main/Data%2FMirror"].display_label, "Legacy vdev")
+                        self.assertEqual(aliases_by_id["pool:Tank%20Main"].label, "Legacy pool")
+                        self.assertEqual(
+                            aliases_by_id["vdev:Tank%20Main/Data%2FMirror"].label,
+                            "Legacy vdev",
+                        )
+
+    def test_newest_legacy_alias_wins_when_builder_drift_left_duplicate_rows(self) -> None:
+        fabric = self._build_storage_id_fabric(
+            system_id="synthetic-scale",
+            platform="scale",
+            slots=[self._storage_id_slot()],
+            aliases=[
+                SasFabricAlias(
+                    system_id="synthetic-scale",
+                    object_id="pool:Tank Main",
+                    object_kind="pool",
+                    label="Older raw-builder label",
+                    updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                ),
+                SasFabricAlias(
+                    system_id="synthetic-scale",
+                    object_id="pool:tank-main",
+                    object_kind="pool",
+                    label="Newer tokenized-builder label",
+                    updated_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+                ),
+            ],
+        )
+
+        pool = next(node for node in fabric.nodes if node.id == "pool:Tank%20Main")
+        self.assertEqual(pool.alias, "Newer tokenized-builder label")
+
+    def test_saved_canonical_alias_disambiguates_a_legacy_token_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SasFabricAliasStore(Path(temp_dir) / "sas_fabric_aliases.json")
+            service = object.__new__(InventoryService)
+            service.system = SystemConfig(
+                id="synthetic-linux",
+                truenas=TrueNASConfig(platform="linux"),
+            )
+            service.sas_fabric_alias_store = store
+            service.save_sas_fabric_alias(
+                object_id="pool:pool-a",
+                object_kind="pool",
+                label="Lowercase pool",
+            )
+
+            fabric = self._build_storage_id_fabric(
+                system_id="synthetic-linux",
+                platform="linux",
+                slots=[
+                    self._storage_id_slot(slot=0, pool_name="Pool A", vdev_name="mirror-0"),
+                    self._storage_id_slot(slot=1, pool_name="pool-a", vdev_name="mirror-0"),
+                ],
+                aliases=store.list_aliases("synthetic-linux"),
+            )
+
+        pools = {node.id: node for node in fabric.nodes if node.kind == "pool"}
+        self.assertIsNone(pools["pool:Pool%20A"].alias)
+        self.assertEqual(pools["pool:pool-a"].alias, "Lowercase pool")
+
+    def test_ambiguous_legacy_storage_aliases_are_not_applied_to_colliding_labels(self) -> None:
+        fabric = self._build_storage_id_fabric(
+            system_id="synthetic-linux",
+            platform="linux",
+            slots=[
+                self._storage_id_slot(slot=0, pool_name="Pool A", vdev_name="mirror-0"),
+                self._storage_id_slot(slot=1, pool_name="pool-a", vdev_name="mirror-0"),
+            ],
+            aliases=[
+                SasFabricAlias(
+                    system_id="synthetic-linux",
+                    object_id="pool:pool-a",
+                    object_kind="pool",
+                    label="Ambiguous old pool alias",
+                ),
+                SasFabricAlias(
+                    system_id="synthetic-linux",
+                    object_id="vdev:mirror-0",
+                    object_kind="vdev",
+                    label="Ambiguous old vdev alias",
+                ),
+            ],
+        )
+        storage_nodes = [node for node in fabric.nodes if node.kind in {"pool", "vdev"}]
+
+        self.assertEqual(len(storage_nodes), 4)
+        self.assertTrue(all(node.alias is None for node in storage_nodes))
+        self.assertTrue(all(node.display_label is None for node in storage_nodes))
 
     def test_core_snapshot_applies_aliases_without_rewriting_raw_labels(self) -> None:
         slot = SlotView(
