@@ -1378,6 +1378,14 @@
     }
   }
 
+  function handleEnclosureAliasEditorKeydown(event) {
+    if (event.key !== "Escape") {
+      return;
+    }
+    event.preventDefault();
+    closeEnclosureAliasEditor(true);
+  }
+
   async function submitEnclosureAlias(event) {
     event?.preventDefault();
     const enclosure = getSelectedEnclosureOption();
@@ -9586,14 +9594,7 @@
     enclosureAliasForm.addEventListener("submit", (event) => {
       void submitEnclosureAlias(event);
     });
-  }
-  if (enclosureAliasInput) {
-    enclosureAliasInput.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        closeEnclosureAliasEditor(true);
-      }
-    });
+    enclosureAliasForm.addEventListener("keydown", handleEnclosureAliasEditorKeydown);
   }
   if (enclosureFace) {
     enclosureFace.addEventListener("click", (event) => {
