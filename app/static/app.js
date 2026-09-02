@@ -83,6 +83,8 @@
     hoveredSlot: null,
     selectedSystemId: bootstrap.snapshot?.selected_system_id || null,
     selectedEnclosureId: bootstrap.snapshot?.selected_enclosure_id || null,
+    enclosureAliasEditorOpen: false,
+    enclosureAliasEditorScopeKey: null,
     mappingFormScopeKey: null,
     mappingFormDirty: false,
     snapshotReuseCache: {},
@@ -197,6 +199,12 @@
   const headerEyebrow = document.getElementById("header-eyebrow");
   const headerSummary = document.getElementById("header-summary");
   const enclosurePanelTitle = document.getElementById("enclosure-panel-title");
+  const enclosureAliasEditButton = document.getElementById("enclosure-alias-edit-button");
+  const enclosureAliasForm = document.getElementById("enclosure-alias-form");
+  const enclosureAliasInput = document.getElementById("enclosure-alias-input");
+  const enclosureAliasClear = document.getElementById("enclosure-alias-clear");
+  const enclosureAliasCancel = document.getElementById("enclosure-alias-cancel");
+  const enclosureAliasRawHint = document.getElementById("enclosure-alias-raw-hint");
   const enclosureEdgeLabel = document.getElementById("enclosure-edge-label");
   const platformDetailsToggleButton = document.getElementById("platform-details-toggle-button");
   const platformDetailsPanel = document.getElementById("platform-details-panel");
@@ -1301,7 +1309,7 @@
       profileLabel: profile?.label || null,
       eyebrow: profile?.eyebrow || systemLabel,
       summary: profile?.summary || "Drive-bay map with API-or-SSH enrichment for the selected enclosure.",
-      enclosureTitle: profile?.panel_title || enclosureLabel,
+      enclosureTitle: (state.snapshot.enclosures || []).length > 1 ? enclosureLabel : (profile?.panel_title || enclosureLabel),
       edgeLabel: profile?.edge_label || "System front",
       faceStyle: profile?.face_style || "generic",
       latchEdge: profile?.latch_edge || "bottom",
@@ -1310,6 +1318,109 @@
       slotLayout: Array.isArray(profile?.slot_layout) ? profile.slot_layout : [],
       slotCount: Number(state.snapshot.layout_slot_count) || countLayoutSlots(activeLayoutRows()),
     };
+  }
+
+  function currentEnclosureAliasScopeKey() {
+    const enclosure = getSelectedEnclosureOption();
+    const systemId = state.selectedSystemId || state.snapshot?.selected_system_id || "";
+    const baseEnclosureId = String(enclosure?.id || "").split("::", 1)[0];
+    return systemId && baseEnclosureId ? JSON.stringify([String(systemId), baseEnclosureId]) : null;
+  }
+
+  function enclosureAliasEditorAvailable() {
+    return !state.snapshotMode && !state.selectedStorageViewRuntimeId && Boolean(getSelectedEnclosureOption());
+  }
+
+  function renderEnclosureAliasEditor() {
+    if (!enclosureAliasEditButton || !enclosureAliasForm) {
+      return;
+    }
+    const available = enclosureAliasEditorAvailable();
+    const scopeKey = currentEnclosureAliasScopeKey();
+    if (!available || (state.enclosureAliasEditorOpen && state.enclosureAliasEditorScopeKey !== scopeKey)) {
+      state.enclosureAliasEditorOpen = false;
+      state.enclosureAliasEditorScopeKey = null;
+    }
+    enclosureAliasEditButton.classList.toggle("hidden", !available || state.enclosureAliasEditorOpen);
+    enclosureAliasForm.classList.toggle("hidden", !available || !state.enclosureAliasEditorOpen);
+    const enclosure = getSelectedEnclosureOption();
+    if (enclosureAliasRawHint) {
+      enclosureAliasRawHint.textContent = enclosure?.raw_label ? `Raw: ${enclosure.raw_label}` : "";
+    }
+  }
+
+  function openEnclosureAliasEditor() {
+    if (!enclosureAliasEditorAvailable() || !enclosureAliasForm || !enclosureAliasInput) {
+      return;
+    }
+    const enclosure = getSelectedEnclosureOption();
+    state.enclosureAliasEditorOpen = true;
+    state.enclosureAliasEditorScopeKey = currentEnclosureAliasScopeKey();
+    enclosureAliasInput.value = enclosure?.alias || "";
+    if (enclosureAliasRawHint) {
+      enclosureAliasRawHint.textContent = enclosure?.raw_label ? `Raw: ${enclosure.raw_label}` : "";
+    }
+    enclosureAliasEditButton?.classList.add("hidden");
+    enclosureAliasForm.classList.remove("hidden");
+    enclosureAliasInput.focus();
+    enclosureAliasInput.select();
+  }
+
+  function closeEnclosureAliasEditor(restoreFocus = false) {
+    state.enclosureAliasEditorOpen = false;
+    state.enclosureAliasEditorScopeKey = null;
+    enclosureAliasForm?.classList.add("hidden");
+    if (enclosureAliasEditorAvailable()) {
+      enclosureAliasEditButton?.classList.remove("hidden");
+    }
+    if (restoreFocus) {
+      enclosureAliasEditButton?.focus();
+    }
+  }
+
+  async function submitEnclosureAlias(event) {
+    event?.preventDefault();
+    const enclosure = getSelectedEnclosureOption();
+    if (!enclosure || !enclosureAliasInput) {
+      return;
+    }
+    const baseEnclosureId = String(enclosure.id || "").split("::", 1)[0];
+    if (!baseEnclosureId) {
+      setStatus("The selected enclosure has no persistent identity.", "error");
+      return;
+    }
+    const params = new URLSearchParams();
+    const systemId = state.selectedSystemId || state.snapshot?.selected_system_id;
+    const liveEnclosureId = currentLiveEnclosureId();
+    if (systemId) params.set("system_id", systemId);
+    if (liveEnclosureId) params.set("enclosure_id", liveEnclosureId);
+    const label = enclosureAliasInput.value.trim() || null;
+    try {
+      await fetchJson(`/api/sas-fabric/aliases?${params.toString()}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          object_id: baseEnclosureId,
+          object_kind: "enclosure",
+          label,
+          scope: "system",
+        }),
+      });
+      closeEnclosureAliasEditor(true);
+      setStatus(label ? "Enclosure name saved." : "Enclosure name cleared.");
+      await refreshSnapshot(true, "enclosure-alias");
+    } catch (error) {
+      setStatus(error?.message || "Enclosure name could not be saved.", "error");
+      enclosureAliasInput.focus();
+    }
+  }
+
+  async function clearEnclosureAlias() {
+    if (!enclosureAliasInput) {
+      return;
+    }
+    enclosureAliasInput.value = "";
+    await submitEnclosureAlias();
   }
 
   function normalizeDriveScaleCandidate(value) {
@@ -8271,6 +8382,7 @@
     if (enclosurePanelTitle) {
       enclosurePanelTitle.textContent = profile.enclosureTitle;
     }
+    renderEnclosureAliasEditor();
     if (enclosureEdgeLabel) {
       enclosureEdgeLabel.textContent = profile.edgeLabel;
     }
@@ -9398,6 +9510,7 @@
         renderSelectors();
         return;
       }
+      closeEnclosureAliasEditor(false);
       state.selectedSystemId = nextSystemId;
       state.selectedEnclosureId = null;
       state.storageViewsRuntime = {
@@ -9425,6 +9538,7 @@
         renderSelectors();
         return;
       }
+      closeEnclosureAliasEditor(false);
       clearSelectedSlot();
       resetHeatmapHistoryCache();
       if (rawValue.startsWith("view:")) {
@@ -9457,6 +9571,30 @@
       queueIdentifyVerify("enclosure-switch");
     });
   }
+  if (enclosureAliasEditButton) {
+    enclosureAliasEditButton.addEventListener("click", openEnclosureAliasEditor);
+  }
+  if (enclosureAliasCancel) {
+    enclosureAliasCancel.addEventListener("click", () => closeEnclosureAliasEditor(true));
+  }
+  if (enclosureAliasClear) {
+    enclosureAliasClear.addEventListener("click", () => {
+      void clearEnclosureAlias();
+    });
+  }
+  if (enclosureAliasForm) {
+    enclosureAliasForm.addEventListener("submit", (event) => {
+      void submitEnclosureAlias(event);
+    });
+  }
+  if (enclosureAliasInput) {
+    enclosureAliasInput.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeEnclosureAliasEditor(true);
+      }
+    });
+  }
   if (enclosureFace) {
     enclosureFace.addEventListener("click", (event) => {
       if (event.target.closest(".slot-tile")) {
@@ -9469,8 +9607,10 @@
     if (nextViewId !== state.selectedStorageViewRuntimeId && !confirmMappingDraftDiscard()) {
       return false;
     }
+    closeEnclosureAliasEditor(false);
     state.selectedStorageViewRuntimeId = nextViewId;
     resetHeatmapHistoryCache();
+    renderViewChrome();
     renderStorageViewsRuntime();
     renderGrid();
     renderSummary();

@@ -26,6 +26,7 @@ from app.models.domain import (
     MultipathMember,
     MultipathView,
     PlatformCapability,
+    SasFabricAlias,
     SasFabricSnapshot,
     SmartBatchItem,
     SmartSummaryView,
@@ -283,11 +284,46 @@ def disambiguate_enclosure_option_labels(options: list[EnclosureOption]) -> list
         tail_length += 1
     resolved: list[EnclosureOption] = []
     for option, base_id in zip(options, base_ids):
-        if label_counts[option.label] > 1:
+        if label_counts[option.label] > 1 and not option.alias:
             resolved.append(option.model_copy(update={"label": f"{option.label} [{base_id[-tail_length:]}]"}))
         else:
             resolved.append(option)
     return resolved
+
+
+def finalize_enclosure_option_labels(
+    options: list[EnclosureOption],
+    aliases: Iterable[SasFabricAlias] = (),
+) -> list[EnclosureOption]:
+    """Apply system-scoped enclosure aliases before adding collision tails."""
+    enclosure_aliases = {
+        alias.object_id: alias.label
+        for alias in aliases
+        if alias.object_kind == "enclosure" and alias.enclosure_id is None
+    }
+    resolved: list[EnclosureOption] = []
+    for option in options:
+        raw_label = option.raw_label or option.label
+        base_id, separator, _ = option.id.partition("::")
+        alias = enclosure_aliases.get(base_id)
+        label = raw_label
+        if alias:
+            if separator:
+                drawer_marker = raw_label.find("Drawer ")
+                descriptor = raw_label[drawer_marker:] if drawer_marker >= 0 else raw_label
+                label = f"{alias} · {descriptor}"
+            else:
+                label = alias
+        resolved.append(
+            option.model_copy(
+                update={
+                    "label": label,
+                    "raw_label": raw_label,
+                    "alias": alias,
+                }
+            )
+        )
+    return disambiguate_enclosure_option_labels(resolved)
 
 
 def infer_slot_count_from_layout(layout_rows: list[list[int | None]], fallback: int | None = None) -> int:
@@ -721,11 +757,15 @@ class InventoryService:
         kind_name = normalize_text(object_kind)
         scope_name = str(scope or "auto").strip().lower()
         enclosure_scoped_kinds = {"bay", "backplane", "ses-enclosure", "mpr-enclosure", "expander"}
-        enclosure_id = (
-            selected_enclosure_id
-            if scope_name == "enclosure" or (scope_name == "auto" and kind_name in enclosure_scoped_kinds)
-            else None
-        )
+        if kind_name == "enclosure":
+            object_text = self._base_enclosure_id(object_text) or object_text
+            enclosure_id = None
+        else:
+            enclosure_id = (
+                selected_enclosure_id
+                if scope_name == "enclosure" or (scope_name == "auto" and kind_name in enclosure_scoped_kinds)
+                else None
+            )
 
         compatible_object_ids = storage_node_legacy_alias_ids(object_text, kind_name)
         if not label_text:
@@ -735,6 +775,11 @@ class InventoryService:
                 object_text,
                 compatible_object_ids,
             )
+            if cleared and kind_name == "enclosure":
+                self.invalidate_physical_enclosure_snapshot_cache(
+                    reason="save_enclosure_alias",
+                    enclosure_id=object_text,
+                )
             return {"ok": cleared, "cleared": cleared, "alias": None}
 
         alias = self.sas_fabric_alias_store.save_alias(
@@ -752,6 +797,11 @@ class InventoryService:
             ),
             compatible_object_ids,
         )
+        if kind_name == "enclosure":
+            self.invalidate_physical_enclosure_snapshot_cache(
+                reason="save_enclosure_alias",
+                enclosure_id=object_text,
+            )
         return {"ok": True, "cleared": False, "alias": alias.model_dump(mode="json")}
 
     async def get_storage_view_candidates(
@@ -4913,7 +4963,7 @@ class InventoryService:
                     slot_layout=slot_layout,
                 )
             )
-        return disambiguate_enclosure_option_labels(options)
+        return self._finalize_enclosure_options(options)
 
     def _select_quantastor_ses_candidates(
         self,
@@ -8090,7 +8140,7 @@ class InventoryService:
                 )
             )
 
-        return disambiguate_enclosure_option_labels(options)
+        return self._finalize_enclosure_options(options)
 
     @staticmethod
     def _ses_enclosure_to_option(enclosure) -> EnclosureOption | None:
@@ -8130,7 +8180,7 @@ class InventoryService:
             if filter_value and filter_value not in haystack:
                 continue
             options.append(option)
-        return disambiguate_enclosure_option_labels(
+        return self._finalize_enclosure_options(
             sorted(
                 options,
                 key=lambda item: (
@@ -8175,7 +8225,7 @@ class InventoryService:
                 )
             options.append(option)
 
-        return disambiguate_enclosure_option_labels(
+        return self._finalize_enclosure_options(
             sorted(
                 options,
                 key=lambda item: (
@@ -8185,6 +8235,14 @@ class InventoryService:
                 ),
             )
         )
+
+    def _finalize_enclosure_options(self, options: list[EnclosureOption]) -> list[EnclosureOption]:
+        aliases = (
+            self.sas_fabric_alias_store.list_aliases(self.system.id)
+            if self.sas_fabric_alias_store is not None
+            else []
+        )
+        return finalize_enclosure_option_labels(options, aliases)
 
     @staticmethod
     def _base_enclosure_id(option_id: str | None) -> str | None:

@@ -27,7 +27,7 @@
           {% endfor %}
         </select>
       </div>
-      <div class="meta-card meta-select-card">
+      <div class="meta-card meta-select-card enclosure-select-card">
         <label class="meta-label" for="enclosure-select">Enclosure / View</label>
         <select class="meta-select" id="enclosure-select">
           {% if snapshot.enclosures %}
@@ -262,10 +262,33 @@
     <div class="primary-column">
       <section class="panel enclosure-panel">
         <div class="panel-header">
-          <div>
-            <h2 id="enclosure-panel-title">
-              {{ profile.panel_title if profile and profile.panel_title else (snapshot.selected_enclosure_label or "Enclosure") }}
-            </h2>
+          <div class="enclosure-title-stack">
+            <div class="enclosure-title-row">
+              <h2 id="enclosure-panel-title">
+                {% if snapshot.enclosures | length > 1 %}{{ snapshot.selected_enclosure_label or "Enclosure" }}{% else %}{{ profile.panel_title if profile and profile.panel_title else (snapshot.selected_enclosure_label or "Enclosure") }}{% endif %}
+              </h2>
+              {% if not snapshot_mode %}
+              <button
+                class="enclosure-alias-edit-button"
+                id="enclosure-alias-edit-button"
+                type="button"
+                aria-label="Edit enclosure name"
+                title="Edit enclosure name"
+              >✎</button>
+              {% endif %}
+            </div>
+            {% if not snapshot_mode %}
+            <form class="enclosure-alias-editor hidden" id="enclosure-alias-form">
+              <label for="enclosure-alias-input">Enclosure name</label>
+              <div class="enclosure-alias-editor-row">
+                <input id="enclosure-alias-input" type="text" maxlength="256" autocomplete="off" aria-describedby="enclosure-alias-raw-hint">
+                <button class="button small" type="submit">Save</button>
+                <button class="button secondary small" id="enclosure-alias-clear" type="button">Clear</button>
+                <button class="button secondary small" id="enclosure-alias-cancel" type="button">Cancel</button>
+              </div>
+              <span class="subtle" id="enclosure-alias-raw-hint">{% for enclosure in snapshot.enclosures %}{% if enclosure.id == snapshot.selected_enclosure_id and enclosure.raw_label %}Raw: {{ enclosure.raw_label }}{% endif %}{% endfor %}</span>
+            </form>
+            {% endif %}
           </div>
           <div class="panel-header-actions">
             <button class="button secondary small hidden" id="platform-details-toggle-button" type="button" aria-expanded="false">
