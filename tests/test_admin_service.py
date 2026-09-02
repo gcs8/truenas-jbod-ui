@@ -1136,7 +1136,7 @@ class AdminStatePayloadTests(unittest.TestCase):
                         host="archive-core.local",
                         user="jbodmap",
                         key_path="/run/ssh/id_truenas",
-                        commands=["/usr/sbin/zpool status -gP"],
+                        commands=[f"/usr/sbin/zpool status -gP --label {MARKER_ALPHA}"],
                     ),
                 )
             ],
@@ -1225,6 +1225,10 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertTrue(payload["systems"][0]["ssh_enabled"])
         self.assertFalse(payload["systems"][0]["bmc_enabled"])
         self.assertEqual(payload["systems"][0]["ssh_key_path"], "/run/ssh/id_truenas")
+        self.assertEqual(payload["systems"][0]["ssh_commands"], ["Saved command 1 (hidden)"])
+        self.assertTrue(payload["systems"][0]["ssh_commands_redacted"])
+        self.assertEqual(payload["systems"][0]["ssh_commands_count"], 1)
+        self.assertNotIn(MARKER_ALPHA, json.dumps(payload["systems"][0]))
         self.assertEqual(payload["systems"][0]["storage_views"][0]["id"], "front-bays")
         self.assertEqual(payload["systems"][0]["storage_views"][0]["template_id"], "ses-auto")
         self.assertEqual(payload["systems"][0]["storage_views"][0]["profile_id"], "lab-4x4")

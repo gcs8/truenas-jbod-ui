@@ -3596,6 +3596,48 @@
       .join("\n");
   }
 
+  function loadSshCommandState(field, system) {
+    if (!field) {
+      return;
+    }
+    const redacted = system?.ssh_commands_redacted === true;
+    const previews = redacted && Array.isArray(system?.ssh_commands)
+      ? system.ssh_commands.map((value) => String(value || "")).filter(Boolean)
+      : [];
+    field.value = previews.join("\n");
+    field.dataset.sshCommandsLoaded = system ? "true" : "false";
+    field.dataset.sshCommandsRedacted = redacted ? "true" : "false";
+    field.dataset.sshCommandsPreview = normalizeCommandText(field.value);
+    field.dataset.sshCommandsSourceSystemId = redacted ? String(system?.id || "") : "";
+  }
+
+  function unchangedRedactedSshCommands(field) {
+    return Boolean(
+      field?.dataset?.sshCommandsRedacted === "true"
+      && field?.dataset?.sshCommandsSourceSystemId
+      && normalizeCommandText(field?.value) === String(field?.dataset?.sshCommandsPreview || "")
+    );
+  }
+
+  function collectSshCommandUpdate(field, preserveRedactedSecrets = false) {
+    const normalized = normalizeCommandText(field?.value);
+    const commands = normalized ? normalized.split("\n") : [];
+    const sourceSystemId = String(field?.dataset?.sshCommandsSourceSystemId || "");
+    const preserve = Boolean(
+      preserveRedactedSecrets
+      && unchangedRedactedSshCommands(field)
+    );
+    return {
+      ssh_commands: preserve ? [] : commands,
+      ssh_commands_action: preserve
+        ? "preserve"
+        : field?.dataset?.sshCommandsLoaded === "true"
+          ? "replace"
+          : "default",
+      ssh_commands_source_system_id: preserve ? sourceSystemId : null,
+    };
+  }
+
   function commandsTextForPlatform(platform) {
     return defaultCommands(platform).join("\n");
   }
@@ -3650,7 +3692,9 @@
           : "VMware ESXi stays on the saved SSH credentials or key directly. The Linux-style one-time service-account bootstrap and sudoers flow are intentionally disabled here.";
     }
     if (elements.setupSshCommandsNote) {
-      elements.setupSshCommandsNote.innerHTML = bootstrapSupported
+      elements.setupSshCommandsNote.innerHTML = unchangedRedactedSshCommands(elements.setupSshCommands)
+        ? "Saved SSH commands are hidden. Leave these placeholders unchanged to keep the saved list, replace them with a new list, or clear all lines to remove the saved commands."
+        : bootstrapSupported
         ? platform === "core"
           ? "These are the exact SSH commands the app runs. When you use the one-time bootstrap, any <code>sudo -n ...</code> lines here are also converted into the CORE <code>midclt user.update</code> permission payload, with on-demand SMART, LED-control, and topology diagnostic extras kept in place."
           : "These are the exact SSH commands the app runs. When you use the one-time bootstrap, any <code>sudo -n ...</code> lines here are also converted into <code>NOPASSWD</code> sudo rules for the final service account, with the platform's on-demand SMART, LED-control, and topology diagnostic extras kept in place."
@@ -4418,6 +4462,7 @@
       elements.setupSshStrictHostKey.checked = true;
     }
     if (elements.setupSshCommands) {
+      loadSshCommandState(elements.setupSshCommands, null);
       setRecommendedCommands("core");
     }
     if (elements.setupBootstrapHost) {
@@ -4589,12 +4634,8 @@
       elements.setupSshStrictHostKey.checked = system.ssh_strict_host_key_checking !== false;
     }
     if (elements.setupSshCommands) {
-      elements.setupSshCommands.value = Array.isArray(system.ssh_commands) ? system.ssh_commands.join("\n") : "";
-      const systemPlatform = system.platform || "core";
-      state.sshCommandsAutoPlatform =
-        normalizeCommandText(elements.setupSshCommands.value) === normalizeCommandText(commandsTextForPlatform(systemPlatform))
-          ? String(systemPlatform).toLowerCase()
-          : null;
+      loadSshCommandState(elements.setupSshCommands, system);
+      state.sshCommandsAutoPlatform = null;
     }
     if (elements.setupBootstrapHost) {
       elements.setupBootstrapHost.value = "";
@@ -4726,7 +4767,7 @@
         : null,
       ssh_strict_host_key_checking: Boolean(elements.setupSshStrictHostKey?.checked),
       ssh_timeout_seconds: Number(loadedSystem?.ssh_timeout_seconds) || 15,
-      ssh_commands: collectSetupCommands(),
+      ...collectSshCommandUpdate(elements.setupSshCommands, preserveRedactedSecrets),
       bmc_enabled: bmcEnabled,
       bmc_host: bmcEnabled ? bmcHost : null,
       bmc_username: elements.setupBmcUsername?.value?.trim() || null,
@@ -6781,6 +6822,7 @@
     });
     elements.setupSshCommands?.addEventListener("input", () => {
       state.sshCommandsAutoPlatform = null;
+      syncPlatformSpecificSetupFields();
       scheduleSudoersPreviewRefresh();
     });
     elements.setupSshKeyMode?.addEventListener("change", syncKeyMode);
