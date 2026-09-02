@@ -372,6 +372,82 @@ class ScheduledBackupRunnerTests(unittest.TestCase):
         self.assertNotIn("secret value", json.dumps(status))
         self.assertEqual(len(self._published_archives()), 1)
 
+    def test_reordered_included_groups_keep_the_same_status_identity(self) -> None:
+        first = self._runner().run_once()
+        self.now += timedelta(hours=1)
+        self.workspace.mkdir()
+        self.artifact_path.write_bytes(b"reordered-scope")
+        reordered_groups = ["profile_file", "config_file", "mapping_file"]
+
+        result = self._runner(included_groups=reordered_groups).run_once()
+
+        self.assertEqual(result["included_groups"], reordered_groups)
+        self.assertEqual(result["success_count"], first["success_count"] + 1)
+        self.assertEqual(result["last_size_bytes"], len(b"reordered-scope"))
+        self.assertEqual(len(self._published_archives()), 2)
+        self.assertEqual(
+            self.backup_service.export_scheduled_bundle_to_file.call_args.kwargs[
+                "included_paths"
+            ],
+            reordered_groups,
+        )
+
+    def test_changed_included_groups_run_with_a_new_compatible_success(self) -> None:
+        first = self._runner().run_once()
+        self.now += timedelta(hours=1)
+        self.workspace.mkdir()
+        self.artifact_path.write_bytes(b"expanded-scope")
+        expanded_groups = [
+            "config_file",
+            "mapping_file",
+            "profile_file",
+            "history_db",
+        ]
+
+        result = self._runner(included_groups=expanded_groups).run_once()
+
+        self.assertEqual(result["included_groups"], expanded_groups)
+        self.assertEqual(result["success_count"], first["success_count"] + 1)
+        self.assertEqual(result["last_size_bytes"], len(b"expanded-scope"))
+        self.assertEqual(len(self._published_archives()), 2)
+        self.assertEqual(
+            self.backup_service.export_scheduled_bundle_to_file.call_args.kwargs[
+                "included_paths"
+            ],
+            expanded_groups,
+        )
+
+    def test_changed_included_groups_clear_incompatible_success_before_failure(self) -> None:
+        first = self._runner().run_once()
+        self.now += timedelta(hours=1)
+        expanded_groups = [
+            "config_file",
+            "mapping_file",
+            "profile_file",
+            "history_db",
+        ]
+        self.backup_service.export_scheduled_bundle_to_file.reset_mock()
+        self.backup_service.export_scheduled_bundle_to_file.side_effect = RuntimeError(
+            "synthetic export failure"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic export failure"):
+            self._runner(included_groups=expanded_groups).run_once()
+
+        self.backup_service.export_scheduled_bundle_to_file.assert_called_once()
+        status = json.loads(self.status_file.read_text(encoding="utf-8"))
+        self.assertEqual(status["included_groups"], expanded_groups)
+        self.assertEqual(status["success_count"], first["success_count"])
+        self.assertEqual(status["failure_count"], 1)
+        self.assertIsNone(status["last_success_at"])
+        self.assertIsNone(status["last_size_bytes"])
+        self.assertIsNone(status["last_sha256"])
+        self.assertIsNone(status["last_artifact_name"])
+        self.assertEqual(status["last_absent_groups"], [])
+        self.assertEqual(status["last_error_code"], "RuntimeError")
+        self.assertEqual(read_scheduled_backup_status(self.status_file), status)
+        self.assertEqual(len(self._published_archives()), 1)
+
     def test_malformed_durable_status_fails_before_export_and_is_not_overwritten(self) -> None:
         malformed = b'{"schema_version":1,"success_count":"not-an-integer"}\n'
         self.status_file.write_bytes(malformed)

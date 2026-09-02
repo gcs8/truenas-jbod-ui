@@ -408,6 +408,52 @@ class ScheduledBackupMetricsTests(unittest.TestCase):
         self.assertNotIn("private-group", metrics_text)
         self.assertNotIn(str(status_file), metrics_text)
 
+    def test_scheduled_backup_metrics_do_not_report_cleared_incompatible_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_file = Path(temp_dir) / "scheduled-backup.json"
+            status_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "enabled": True,
+                        "success_count": 4,
+                        "failure_count": 3,
+                        "last_attempt_at": "2030-01-02T03:04:05+00:00",
+                        "last_success_at": None,
+                        "last_failure_at": "2030-01-02T03:04:05+00:00",
+                        "last_size_bytes": None,
+                        "last_sha256": None,
+                        "last_error_code": "RuntimeError",
+                        "last_artifact_name": None,
+                        "included_groups": ["config_file", "history_db"],
+                        "last_absent_groups": [],
+                        "last_retention_removed": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_file.chmod(0o600)
+            with patch.dict(
+                "os.environ",
+                {"SCHEDULED_BACKUP_STATUS_FILE": str(status_file)},
+                clear=False,
+            ):
+                metrics = list(ScheduledBackupStatusCollector().collect())
+
+        metric_names = {metric.name for metric in metrics}
+        self.assertIn("truenas_jbod_ui_scheduled_backup_runs", metric_names)
+        self.assertIn("truenas_jbod_ui_scheduled_backup_last_failure_timestamp_seconds", metric_names)
+        self.assertIn("truenas_jbod_ui_scheduled_backup_last_error", metric_names)
+        self.assertNotIn(
+            "truenas_jbod_ui_scheduled_backup_last_success_timestamp_seconds",
+            metric_names,
+        )
+        self.assertNotIn(
+            "truenas_jbod_ui_scheduled_backup_last_success_age_seconds",
+            metric_names,
+        )
+        self.assertNotIn("truenas_jbod_ui_scheduled_backup_last_size_bytes", metric_names)
+
 
 class InventoryMetricsTests(unittest.IsolatedAsyncioTestCase):
     async def test_inventory_metrics_publish_snapshot_cache_states(self) -> None:
