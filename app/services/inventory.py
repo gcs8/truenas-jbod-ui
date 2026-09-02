@@ -255,6 +255,39 @@ def layout_slot_positions(layout_rows: list[list[int | None]]) -> dict[int, tupl
     }
 
 
+ENCLOSURE_OPTION_ID_TAIL_MIN_LENGTH = 4
+
+
+def disambiguate_enclosure_option_labels(options: list[EnclosureOption]) -> list[EnclosureOption]:
+    """Suffix labels shared by several enclosures with the tail of their id.
+
+    Two identical shelves (issue #213: a pair of Dell MD1280s) infer the same
+    label, and each drawer sub-view repeats it again, so the selector showed
+    six entries with three distinct names. The enclosure id already tells the
+    shelves apart; drawer sub-views (``<enclosure id>::<profile id>``) carry
+    the tail of their parent id, so a top and bottom drawer visibly belong to
+    the same shelf. Labels that are already unique are left untouched, which
+    also makes the pass idempotent.
+    """
+    if len(options) < 2:
+        return options
+    base_ids = [str(option.id).split("::", 1)[0] for option in options]
+    label_counts = Counter(option.label for option in options)
+    if all(count == 1 for count in label_counts.values()):
+        return options
+    tail_length = ENCLOSURE_OPTION_ID_TAIL_MIN_LENGTH
+    longest = max(len(base_id) for base_id in base_ids)
+    while tail_length < longest and len({base_id[-tail_length:] for base_id in set(base_ids)}) < len(set(base_ids)):
+        tail_length += 1
+    resolved: list[EnclosureOption] = []
+    for option, base_id in zip(options, base_ids):
+        if label_counts[option.label] > 1:
+            resolved.append(option.model_copy(update={"label": f"{option.label} [{base_id[-tail_length:]}]"}))
+        else:
+            resolved.append(option)
+    return resolved
+
+
 def infer_slot_count_from_layout(layout_rows: list[list[int | None]], fallback: int | None = None) -> int:
     slots = [slot for row in layout_rows for slot in row if slot is not None]
     if slots:
@@ -4865,7 +4898,7 @@ class InventoryService:
                     slot_layout=slot_layout,
                 )
             )
-        return options
+        return disambiguate_enclosure_option_labels(options)
 
     def _select_quantastor_ses_candidates(
         self,
@@ -8042,7 +8075,7 @@ class InventoryService:
                 )
             )
 
-        return options
+        return disambiguate_enclosure_option_labels(options)
 
     @staticmethod
     def _ses_enclosure_to_option(enclosure) -> EnclosureOption | None:
@@ -8082,13 +8115,15 @@ class InventoryService:
             if filter_value and filter_value not in haystack:
                 continue
             options.append(option)
-        return sorted(
-            options,
-            key=lambda item: (
-                0 if "front" in item.label.lower() else 1 if "rear" in item.label.lower() else 2,
-                item.slot_count or 0,
-                item.label,
-            ),
+        return disambiguate_enclosure_option_labels(
+            sorted(
+                options,
+                key=lambda item: (
+                    0 if "front" in item.label.lower() else 1 if "rear" in item.label.lower() else 2,
+                    item.slot_count or 0,
+                    item.label,
+                ),
+            )
         )
 
     def _build_scale_linux_enclosure_options(self, ssh_data: ParsedSSHData) -> list[EnclosureOption]:
@@ -8125,13 +8160,15 @@ class InventoryService:
                 )
             options.append(option)
 
-        return sorted(
-            options,
-            key=lambda item: (
-                0 if "front" in item.label.lower() else 1 if "rear" in item.label.lower() else 2,
-                item.slot_count or 0,
-                item.label,
-            ),
+        return disambiguate_enclosure_option_labels(
+            sorted(
+                options,
+                key=lambda item: (
+                    0 if "front" in item.label.lower() else 1 if "rear" in item.label.lower() else 2,
+                    item.slot_count or 0,
+                    item.label,
+                ),
+            )
         )
 
     @staticmethod
