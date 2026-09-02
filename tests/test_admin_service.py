@@ -1202,7 +1202,11 @@ class AdminStatePayloadTests(unittest.TestCase):
                     with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
                         with patch(
                             "admin_service.main.get_admin_settings",
-                            return_value=AdminSettings(auto_stop_seconds=3600, host_prep_temp_dir="/tmp/truenas-jbod-ui-host-prep"),
+                            return_value=AdminSettings(
+                                auto_stop_seconds=3600,
+                                host_prep_temp_dir="/tmp/truenas-jbod-ui-host-prep",
+                                allow_plaintext_backup_export=True,
+                            ),
                         ):
                             with patch(
                                 "admin_service.main.get_history_settings",
@@ -1275,6 +1279,7 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertIn("runtime_overrides_file", payload["backup_defaults"]["included_paths"])
         self.assertTrue(payload["backup_defaults"]["debug_scrub_secrets"])
         self.assertTrue(payload["backup_defaults"]["debug_scrub_disk_identifiers"])
+        self.assertTrue(payload["backup_defaults"]["allow_plaintext_backup_export"])
         self.assertTrue(any(group["key"] == "ssh_keys" for group in payload["backup_defaults"]["path_groups"]))
 
     def test_build_admin_state_payload_includes_release_status(self) -> None:

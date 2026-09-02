@@ -1428,6 +1428,7 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
             "debug_scrub_secrets": True,
             "debug_scrub_disk_identifiers": True,
             "debug_scrub_sensitive": True,
+            "allow_plaintext_backup_export": admin_settings.allow_plaintext_backup_export,
             "path_groups": describe_bundle_groups(settings, history_settings),
             "clean_backup_targets": list(admin_settings.clean_backup_targets),
         },

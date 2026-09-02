@@ -4223,7 +4223,33 @@
     }
     if (config.passphraseField) {
       config.passphraseField.disabled = !encryptEnabled;
+      if (!encryptEnabled) {
+        config.passphraseField.value = "";
+      }
     }
+  }
+
+  function getDebugExportPolicy() {
+    const encrypt = Boolean(elements.debugEncryptToggle?.checked);
+    const scrubSecrets = Boolean(elements.debugScrubSecretsToggle?.checked);
+    const passphrase = readOptionalSecretValue(elements.debugExportPassphrase);
+    if (encrypt && !passphrase) {
+      return {
+        allowed: false,
+        guidance: "Enter a passphrase before exporting an encrypted debug bundle.",
+      };
+    }
+    if (
+      !encrypt
+      && !scrubSecrets
+      && !Boolean(state.backupDefaults?.allow_plaintext_backup_export)
+    ) {
+      return {
+        allowed: false,
+        guidance: "Enable secret scrubbing or encryption before exporting this debug bundle.",
+      };
+    }
+    return { allowed: true, guidance: null };
   }
 
   function syncBackupControls() {
@@ -4256,6 +4282,7 @@
       forced7zKey: "debugForced7z",
       manualEncryptKey: "debugManualEncrypt",
     });
+    const debugPolicy = getDebugExportPolicy();
     if (elements.backupExportButton) {
       elements.backupExportButton.disabled = !state.selectedBackupPaths.length;
     }
@@ -4274,7 +4301,16 @@
       }
     }
     if (elements.debugExportButton) {
-      elements.debugExportButton.disabled = !state.selectedDebugPaths.length;
+      elements.debugExportButton.disabled = !state.selectedDebugPaths.length || !debugPolicy.allowed;
+    }
+    if (elements.debugExportResult) {
+      if (!debugPolicy.allowed) {
+        elements.debugExportResult.textContent = debugPolicy.guidance;
+        state.debugExportPolicyGuidanceActive = true;
+      } else if (state.debugExportPolicyGuidanceActive) {
+        elements.debugExportResult.textContent = "Use this when you want a frozen local support snapshot without pretending it is the same thing as a restore-grade full backup.";
+        state.debugExportPolicyGuidanceActive = false;
+      }
     }
     if (elements.debugExportRestartToggle) {
       const stopEnabled = Boolean(elements.debugExportStopToggle?.checked);
@@ -5643,8 +5679,10 @@
     const packaging = elements.debugPackaging?.value || "tar.zst";
     const scrubSecrets = Boolean(elements.debugScrubSecretsToggle?.checked);
     const scrubDiskIdentifiers = Boolean(elements.debugScrubIdentifiersToggle?.checked);
-    if (encrypt && !passphrase) {
-      setBanner("Enter a passphrase before exporting an encrypted debug bundle.", "error");
+    const policy = getDebugExportPolicy();
+    if (!policy.allowed) {
+      setBanner(policy.guidance, "error");
+      syncBackupControls();
       return;
     }
     if (elements.debugExportButton) {
@@ -5714,9 +5752,7 @@
       }
       setBanner(`Debug bundle export failed: ${error.message || error}`, "error");
     } finally {
-      if (elements.debugExportButton) {
-        elements.debugExportButton.disabled = false;
-      }
+      syncBackupControls();
     }
   }
 
@@ -6449,6 +6485,7 @@
       state.debugManualEncrypt = Boolean(elements.debugEncryptToggle?.checked);
       syncBackupControls();
     });
+    elements.debugExportPassphrase?.addEventListener("input", syncBackupControls);
     elements.debugPackaging?.addEventListener("change", () => {
       if (!bundleHasLockedSelection("debug") && elements.debugPackaging?.value && elements.debugPackaging.value !== "7z") {
         state.debugLastPlainPackaging = elements.debugPackaging.value;
