@@ -122,9 +122,9 @@ Validated live CLI notes:
 - after enabling a real shell and home directory for `jbodmap`, the `qs` CLI is
   usable over SSH with explicit `--server=<node-or-vip>,jbodmap,...`
 - the local `~/.qs.cnf` token path still attempts to create transient auth
-  files under `/run`, so the app currently uses explicit
-  `--server=localhost,jbodmap,...` arguments instead of relying on token-file
-  auth for `jbodmap`
+  files under `/run`, so the app sends the server specification through SSH
+  stdin and exports the documented `QS_SERVER` variable before executing `qs`.
+  The remote command arguments do not contain the API password.
 - local-node CLI inventory works:
   - `qs hw-enclosure-list --json --server=10.13.37.30,jbodmap,...`
   - `qs hw-disk-list --json --controller=<controller-id> --server=10.13.37.30,jbodmap,...`

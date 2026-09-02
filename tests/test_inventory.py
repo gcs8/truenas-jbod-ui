@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import tempfile
 import unittest
@@ -5256,6 +5257,82 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(overlay["cli_disks"])
             self.assertTrue(any("network port inventory failed" in failure for failure in failures))
 
+    async def test_quantastor_cli_credentials_travel_via_stdin_not_remote_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secret = "synthetic-argv-marker"
+            settings = Settings()
+            system = SystemConfig(
+                id="quantastor-stdin",
+                truenas=TrueNASConfig(
+                    platform="quantastor",
+                    api_user="readonly-user",
+                    api_password=secret,
+                ),
+                ssh=SSHConfig(enabled=True, host="192.0.2.41", user="operator"),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service._build_quantastor_ssh_hosts = MagicMock(return_value=["192.0.2.41"])
+            captured: dict[str, object] = {}
+
+            async def run_commands(commands, _host, *, stdin_data=None):
+                captured["commands"] = list(commands)
+                captured["stdin_data"] = stdin_data
+                return [
+                    SSHCommandResult(command=command, ok=True, stdout='[{"id":"row"}]', exit_code=0)
+                    for command in commands
+                ]
+
+            service._run_ssh_commands = AsyncMock(side_effect=run_commands)
+
+            overlay, failures = await service._fetch_quantastor_cli_overlay()
+
+            self.assertEqual(failures, [])
+            self.assertTrue(all(overlay.values()))
+            commands = captured["commands"]
+            self.assertIsInstance(commands, list)
+            assert isinstance(commands, list)
+            stdin_data = captured["stdin_data"]
+            self.assertIsInstance(stdin_data, str)
+            assert isinstance(stdin_data, str)
+            encoded_spec = stdin_data.strip()
+            self.assertEqual(
+                base64.b64decode(encoded_spec, validate=True).decode("utf-8"),
+                f"localhost,readonly-user,{secret}",
+            )
+            for command in commands:
+                self.assertNotIn(secret, command)
+                self.assertNotIn(encoded_spec, command)
+                self.assertNotIn("--server", command)
+                self.assertIn("QS_SERVER", command)
+                self.assertIn("exec /usr/bin/qs", command)
+
+    async def test_ssh_input_batch_does_not_use_transport_without_stdin_support(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(
+                    id="quantastor-fail-closed",
+                    truenas=TrueNASConfig(platform="quantastor"),
+                    ssh=SSHConfig(enabled=True, host="192.0.2.42", user="operator"),
+                ),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service._run_ssh_command = AsyncMock()
+
+            results = await service._run_ssh_commands(
+                ["safe remote command"],
+                "192.0.2.42",
+                stdin_data="synthetic-input\n",
+            )
+
+            self.assertEqual(len(results), 1)
+            self.assertFalse(results[0].ok)
+            self.assertEqual(results[0].exit_code, 255)
+            self.assertIn("input transport is unavailable", results[0].stderr)
+            service._run_ssh_command.assert_not_awaited()
+
     async def test_ses_partial_winner_preserves_failure_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -6482,7 +6559,6 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             )
             ssh_probe = AsyncMock()
             ssh_probe.run_commands.return_value = []
-            ssh_probe.run_command.side_effect = run_command
             service = build_inventory_service(
                 settings,
                 system,
@@ -6490,6 +6566,12 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                 ssh_probe,
                 temp_dir,
             )
+
+            async def run_commands(commands, host: str | None = None, *, stdin_data=None):
+                self.assertIsInstance(stdin_data, str)
+                return [await run_command(command) for command in commands]
+
+            service._run_ssh_commands = AsyncMock(side_effect=run_commands)
             service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ParsedSSHData(), []))
 
             snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
@@ -6775,11 +6857,18 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             )
             service._quantastor_preferred_ses_host = "10.0.0.20"
 
-            async def run_command(command: str, host: str | None = None) -> SSHCommandResult:
-                payload = [{"id": f"{host}-row"}]
-                return SSHCommandResult(command=command, ok=True, stdout=json.dumps(payload), stderr="", exit_code=0)
+            awaited_hosts: list[str | None] = []
 
-            service._run_ssh_command = AsyncMock(side_effect=run_command)
+            async def run_commands(commands, host: str | None = None, *, stdin_data=None):
+                self.assertIsInstance(stdin_data, str)
+                awaited_hosts.append(host)
+                payload = [{"id": f"{host}-row"}]
+                return [
+                    SSHCommandResult(command=command, ok=True, stdout=json.dumps(payload), stderr="", exit_code=0)
+                    for command in commands
+                ]
+
+            service._run_ssh_commands = AsyncMock(side_effect=run_commands)
 
             overlay, failures = await service._fetch_quantastor_cli_overlay()
 
@@ -6789,8 +6878,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(overlay["cli_hw_disks"][0]["id"], "10.0.0.20-row")
             self.assertEqual(overlay["cli_hw_enclosures"][0]["id"], "10.0.0.20-row")
             self.assertEqual(overlay["cli_network_ports"][0]["id"], "10.0.0.20-row")
-            awaited_hosts = [call.args[1] for call in service._run_ssh_command.await_args_list]
-            self.assertEqual(awaited_hosts, ["10.0.0.20", "10.0.0.20", "10.0.0.20", "10.0.0.20"])
+            self.assertEqual(awaited_hosts, ["10.0.0.20"])
 
     def test_quantastor_cli_json_parser_accepts_network_port_trailing_commas(self) -> None:
         payload = '[{"id": "port-a", "ipAddress": "192.0.2.30",},]'
@@ -6836,7 +6924,9 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                 super().__init__(SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]))
                 self.batches: list[list[str]] = []
 
-            async def run_commands(self, commands=None):  # type: ignore[override]
+            async def run_commands(self, commands=None, *, stdin_data=None):  # type: ignore[override]
+                if not isinstance(stdin_data, str):
+                    raise AssertionError("Credential-bearing CLI batches require stdin data.")
                 command_list = list(commands or [])
                 self.batches.append(command_list)
                 results: list[SSHCommandResult] = []
@@ -6885,7 +6975,9 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                 super().__init__(SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]))
                 self.batches: list[list[str]] = []
 
-            async def run_commands(self, commands=None):  # type: ignore[override]
+            async def run_commands(self, commands=None, *, stdin_data=None):  # type: ignore[override]
+                if not isinstance(stdin_data, str):
+                    raise AssertionError("Credential-bearing CLI batches require stdin data.")
                 command_list = list(commands or [])
                 self.batches.append(command_list)
                 return [
@@ -6943,13 +7035,23 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                 temp_dir,
             )
 
-            async def run_command(command: str, host: str | None = None) -> SSHCommandResult:
-                if host == "10.0.0.10":
-                    return SSHCommandResult(command=command, ok=False, stdout="", stderr="wrong host", exit_code=1)
-                payload = [{"id": f"{host}-row"}]
-                return SSHCommandResult(command=command, ok=True, stdout=json.dumps(payload), stderr="", exit_code=0)
+            awaited_hosts: list[str | None] = []
 
-            service._run_ssh_command = AsyncMock(side_effect=run_command)
+            async def run_commands(commands, host: str | None = None, *, stdin_data=None):
+                self.assertIsInstance(stdin_data, str)
+                awaited_hosts.append(host)
+                if host == "10.0.0.10":
+                    return [
+                        SSHCommandResult(command=command, ok=False, stdout="", stderr="wrong host", exit_code=1)
+                        for command in commands
+                    ]
+                payload = [{"id": f"{host}-row"}]
+                return [
+                    SSHCommandResult(command=command, ok=True, stdout=json.dumps(payload), stderr="", exit_code=0)
+                    for command in commands
+                ]
+
+            service._run_ssh_commands = AsyncMock(side_effect=run_commands)
 
             overlay, failures = await service._fetch_quantastor_cli_overlay()
 
@@ -6959,19 +7061,9 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(overlay["cli_hw_disks"][0]["id"], "10.0.0.20-row")
             self.assertEqual(overlay["cli_hw_enclosures"][0]["id"], "10.0.0.20-row")
             self.assertEqual(overlay["cli_network_ports"][0]["id"], "10.0.0.20-row")
-            awaited_hosts = [call.args[1] for call in service._run_ssh_command.await_args_list]
             self.assertEqual(
                 awaited_hosts,
-                [
-                    "10.0.0.10",
-                    "10.0.0.10",
-                    "10.0.0.10",
-                    "10.0.0.10",
-                    "10.0.0.20",
-                    "10.0.0.20",
-                    "10.0.0.20",
-                    "10.0.0.20",
-                ],
+                ["10.0.0.10", "10.0.0.20"],
             )
 
     async def test_get_slot_smart_summaries_deduplicates_and_filters_to_snapshot(self) -> None:
@@ -7479,7 +7571,6 @@ Enclosure Status diagnostic page:
             )
             ssh_probe = AsyncMock()
             ssh_probe.run_commands.return_value = []
-            ssh_probe.run_command.side_effect = run_command
             service = build_inventory_service(
                 settings,
                 system,
@@ -7487,6 +7578,15 @@ Enclosure Status diagnostic page:
                 ssh_probe,
                 temp_dir,
             )
+
+            async def run_commands(commands, host: str | None = None, *, stdin_data=None):
+                if any("/usr/bin/qs" in command for command in commands):
+                    self.assertIsInstance(stdin_data, str)
+                else:
+                    self.assertIsNone(stdin_data)
+                return [await run_command(command) for command in commands]
+
+            service._run_ssh_commands = AsyncMock(side_effect=run_commands)
             service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ParsedSSHData(), []))
 
             summary = await service.get_slot_smart_summary(0, selected_enclosure_id="node-a")

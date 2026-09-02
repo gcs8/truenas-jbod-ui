@@ -157,7 +157,12 @@ class SSHProbe:
             raise ValueError("SSH fallback is disabled.")
         return self._client()
 
-    async def run_commands(self, commands: Iterable[str] | None = None) -> list[SSHCommandResult]:
+    async def run_commands(
+        self,
+        commands: Iterable[str] | None = None,
+        *,
+        stdin_data: str | None = None,
+    ) -> list[SSHCommandResult]:
         if not self.config.enabled:
             if commands is None:
                 return []
@@ -165,7 +170,7 @@ class SSHProbe:
         command_list = self._command_list(commands)
         if not command_list:
             return []
-        return await asyncio.to_thread(self._run_commands_sync, command_list)
+        return await asyncio.to_thread(self._run_commands_sync, command_list, stdin_data)
 
     async def run_planned_commands(
         self,
@@ -197,7 +202,11 @@ class SSHProbe:
             )
         return self._run_command_sync(command)
 
-    def _run_commands_sync(self, commands: Iterable[str] | None = None) -> list[SSHCommandResult]:
+    def _run_commands_sync(
+        self,
+        commands: Iterable[str] | None = None,
+        stdin_data: str | None = None,
+    ) -> list[SSHCommandResult]:
         command_list = self._command_list(commands)
         if not command_list:
             return []
@@ -207,7 +216,7 @@ class SSHProbe:
         try:
             with self._client() as client:
                 for command in command_list:
-                    results.append(self._run_single_command(client, command))
+                    results.append(self._run_single_command(client, command, stdin_data=stdin_data))
         except Exception as exc:
             logger.warning(
                 "SSH command batch failed for %s@%s: %s",
@@ -409,14 +418,26 @@ class SSHProbe:
         transport.auth_interactive(self.config.user, handler)
         return transport.is_authenticated()
 
-    def _run_single_command(self, client: paramiko.SSHClient, command: str) -> SSHCommandResult:
+    def _run_single_command(
+        self,
+        client: paramiko.SSHClient,
+        command: str,
+        *,
+        stdin_data: str | None = None,
+    ) -> SSHCommandResult:
         safe_command = redact_ssh_command(command)
         logger.debug("Running SSH command: %s", safe_command)
         effective_command, sudo_password = self._prepare_command(command)
+        if stdin_data is not None and sudo_password:
+            return self._failure_result(
+                command,
+                "SSH command input cannot be combined with sudo password input.",
+            )
         try:
             stdin, stdout, stderr = client.exec_command(effective_command, timeout=self.config.timeout_seconds)
-            if sudo_password:
-                stdin.write(f"{sudo_password}\n")
+            command_input = f"{sudo_password}\n" if sudo_password else stdin_data
+            if command_input is not None:
+                stdin.write(command_input)
                 stdin.flush()
                 stdin.channel.shutdown_write()
             else:

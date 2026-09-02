@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import ipaddress
 import json
 import logging
@@ -6706,7 +6707,11 @@ class InventoryService:
             }
             host_failures: list[str] = []
             commands = [self._build_quantastor_cli_command(subcommand) for subcommand, _label, _target in target_specs]
-            command_results = await self._run_ssh_commands(commands, host)
+            stdin_data = self._build_quantastor_cli_stdin_data()
+            if stdin_data is None:
+                command_results = await self._run_ssh_commands(commands, host)
+            else:
+                command_results = await self._run_ssh_commands(commands, host, stdin_data=stdin_data)
 
             transport_detail = self._optional_ssh_transport_failure_detail(command_results)
             if transport_detail is not None:
@@ -7543,10 +7548,19 @@ class InventoryService:
 
     def _build_quantastor_cli_command(self, subcommand: str) -> str:
         args = ["/usr/bin/qs", subcommand, "--json"]
+        if not self._build_quantastor_cli_server_spec():
+            return shlex.join(args)
+        return (
+            "IFS= read -r qs_server_b64 || exit 64; "
+            "QS_SERVER=$(printf '%s' \"$qs_server_b64\" | /usr/bin/base64 --decode) || exit 64; "
+            f"export QS_SERVER; exec {shlex.join(args)}"
+        )
+
+    def _build_quantastor_cli_stdin_data(self) -> str | None:
         server_spec = self._build_quantastor_cli_server_spec()
-        if server_spec:
-            args.append(f"--server={server_spec}")
-        return shlex.join(args)
+        if not server_spec:
+            return None
+        return f"{base64.b64encode(server_spec.encode('utf-8')).decode('ascii')}\n"
 
     @staticmethod
     def _parse_quantastor_cli_json(stdout: str) -> Any | None:
@@ -10201,7 +10215,13 @@ class InventoryService:
             pending = unseen(planner(list(results)))
         return results
 
-    async def _run_ssh_commands(self, commands: Iterable[str], host: str | None = None) -> list[SSHCommandResult]:
+    async def _run_ssh_commands(
+        self,
+        commands: Iterable[str],
+        host: str | None = None,
+        *,
+        stdin_data: str | None = None,
+    ) -> list[SSHCommandResult]:
         command_list = list(commands)
         if not command_list:
             return []
@@ -10214,14 +10234,30 @@ class InventoryService:
             async with self._ssh_session_lock_for_host(host):
                 target_host = normalize_text(host)
                 if not target_host or target_host == normalize_text(self.system.ssh.host):
-                    results = await self.ssh_probe.run_commands(command_list)
+                    if stdin_data is None:
+                        results = await self.ssh_probe.run_commands(command_list)
+                    else:
+                        results = await self.ssh_probe.run_commands(command_list, stdin_data=stdin_data)
                 else:
                     probe = SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
-                    results = await probe.run_commands(command_list)
+                    if stdin_data is None:
+                        results = await probe.run_commands(command_list)
+                    else:
+                        results = await probe.run_commands(command_list, stdin_data=stdin_data)
             self._record_optional_ssh_batch_failure(results, host)
             if results:
                 return results
 
+        if stdin_data is not None:
+            return [
+                SSHCommandResult(
+                    command=command,
+                    ok=False,
+                    stderr="SSH command input transport is unavailable.",
+                    exit_code=255,
+                )
+                for command in command_list
+            ]
         return [await self._run_ssh_command(command, host) for command in command_list]
 
     @staticmethod

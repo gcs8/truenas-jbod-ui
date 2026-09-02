@@ -375,6 +375,79 @@ class SSHProbeTests(unittest.TestCase):
         self.assertEqual(ssh_client.exec_command.call_count, 2)
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
+    def test_run_commands_writes_shared_stdin_data_for_each_command(
+        self,
+        ssh_client_cls: MagicMock,
+    ) -> None:
+        ssh_client = MagicMock()
+        ssh_client.__enter__.return_value = ssh_client
+        ssh_client_cls.return_value = ssh_client
+        ssh_client.connect.return_value = None
+        streams: list[MagicMock] = []
+
+        def exec_command(command: str, timeout: int):
+            stdin = MagicMock()
+            stdout = MagicMock()
+            stderr = MagicMock()
+            stdout.read.return_value = b"ok"
+            stderr.read.return_value = b""
+            stdout.channel.recv_exit_status.return_value = 0
+            streams.append(stdin)
+            return stdin, stdout, stderr
+
+        ssh_client.exec_command.side_effect = exec_command
+        probe = SSHProbe(
+            SSHConfig(
+                enabled=True,
+                host="synthetic.example.test",
+                user="operator",
+                strict_host_key_checking=False,
+            )
+        )
+        stdin_data = "c3ludGhldGljLXNlcnZlci1zcGVj\n"
+
+        results = probe._run_commands_sync(["first command", "second command"], stdin_data=stdin_data)
+
+        self.assertTrue(all(result.ok for result in results))
+        self.assertEqual(len(streams), 2)
+        for stream in streams:
+            stream.write.assert_called_once_with(stdin_data)
+            stream.flush.assert_called_once_with()
+            stream.channel.shutdown_write.assert_called_once_with()
+            stream.close.assert_not_called()
+        for call in ssh_client.exec_command.call_args_list:
+            self.assertNotIn(stdin_data.strip(), call.args[0])
+
+    @patch("app.services.ssh_probe.paramiko.SSHClient")
+    def test_run_commands_rejects_stdin_data_with_sudo_password(
+        self,
+        ssh_client_cls: MagicMock,
+    ) -> None:
+        ssh_client = MagicMock()
+        ssh_client.__enter__.return_value = ssh_client
+        ssh_client_cls.return_value = ssh_client
+        ssh_client.connect.return_value = None
+        probe = SSHProbe(
+            SSHConfig(
+                enabled=True,
+                host="synthetic.example.test",
+                user="operator",
+                sudo_password="synthetic-sudo-password",
+                strict_host_key_checking=False,
+            )
+        )
+
+        results = probe._run_commands_sync(["sudo -n /usr/bin/id"], stdin_data="synthetic-input\n")
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].ok)
+        self.assertEqual(results[0].exit_code, 255)
+        self.assertIn("cannot be combined", results[0].stderr)
+        self.assertNotIn("synthetic-input", results[0].stderr)
+        self.assertNotIn("synthetic-sudo-password", results[0].stderr)
+        ssh_client.exec_command.assert_not_called()
+
+    @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_run_commands_sync_preserves_completed_results_when_batch_aborts(
         self,
         ssh_client_cls: MagicMock,
