@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from app import main as app_main
 from app.config import Settings
+from app.models.domain import InventorySnapshot
 
 
 class SlotHistoryRouteTests(unittest.TestCase):
@@ -18,6 +19,14 @@ class SlotHistoryRouteTests(unittest.TestCase):
         route = self._route("/api/slots/{slot}/history")
         service = Mock()
         service.system = SimpleNamespace(id="system-a", truenas=SimpleNamespace(platform="core"))
+        service.get_snapshot = AsyncMock(
+            return_value=InventorySnapshot(
+                slots=[],
+                layout_slot_count=60,
+                selected_enclosure_id="enc-a",
+                refresh_interval_seconds=30,
+            )
+        )
         registry = Mock()
         registry.get_service.return_value = service
         backend_payload = {"configured": True, "available": True, "slot": 5, "metrics": {}}
@@ -47,6 +56,14 @@ class SlotHistoryRouteTests(unittest.TestCase):
         route = self._route("/api/slots/{slot}/history")
         service = Mock()
         service.system = SimpleNamespace(id="default-system", truenas=SimpleNamespace(platform="core"))
+        service.get_snapshot = AsyncMock(
+            return_value=InventorySnapshot(
+                slots=[],
+                layout_slot_count=60,
+                selected_enclosure_id="enc-a",
+                refresh_interval_seconds=30,
+            )
+        )
         registry = Mock()
         registry.get_service.return_value = service
         history_backend = Mock()

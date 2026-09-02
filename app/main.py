@@ -546,9 +546,9 @@ def create_app() -> FastAPI:
         system_id: str | None = None,
         enclosure_id: str | None = None,
     ) -> JSONResponse:
-        ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
+        await ensure_slot_bounds(slot, service, enclosure_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         try:
             await service.set_slot_led(
@@ -600,9 +600,9 @@ def create_app() -> FastAPI:
         system_id: str | None = None,
         enclosure_id: str | None = None,
     ) -> JSONResponse:
-        ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
+        await ensure_slot_bounds(slot, service, enclosure_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         mapping_payload = {
             "serial": payload.serial,
@@ -666,9 +666,9 @@ def create_app() -> FastAPI:
         enclosure_id: str | None = None,
         expected_revision: str = Query(..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"),
     ) -> JSONResponse:
-        ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
+        await ensure_slot_bounds(slot, service, enclosure_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         try:
             cleared = await service.clear_mapping(
@@ -777,9 +777,9 @@ def create_app() -> FastAPI:
         enclosure_id: str | None = None,
         fresh: bool = False,
     ) -> SmartSummaryView:
-        ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
+        await ensure_slot_bounds(slot, service, enclosure_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         try:
             return await service.get_slot_smart_summary(
@@ -856,10 +856,11 @@ def create_app() -> FastAPI:
         enclosure_id: str | None = None,
         fresh: bool = False,
     ) -> SmartBatchResponse:
-        for slot in payload.slots:
-            ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
+        layout_slot_count = await resolve_layout_slot_count(service, enclosure_id)
+        for slot in payload.slots:
+            check_slot_bounds(slot, layout_slot_count)
         add_perf_metadata(
             system_id=service.system.id,
             platform=service.system.truenas.platform,
@@ -890,9 +891,9 @@ def create_app() -> FastAPI:
         enclosure_id: str | None = None,
         window_hours: int | None = None,
     ) -> JSONResponse:
-        ensure_slot_bounds(get_settings(), slot)
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
+        await ensure_slot_bounds(slot, service, enclosure_id)
         resolved_system_id = service.system.id if system_id is None else system_id
         add_perf_metadata(
             system_id=resolved_system_id,
@@ -922,8 +923,10 @@ def create_app() -> FastAPI:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         normalized_slots = sorted({int(slot) for slot in (slots or [])})
-        for slot in normalized_slots:
-            ensure_slot_bounds(get_settings(), slot)
+        if normalized_slots:
+            layout_slot_count = await resolve_layout_slot_count(service, enclosure_id)
+            for slot in normalized_slots:
+                check_slot_bounds(slot, layout_slot_count)
         add_perf_metadata(
             system_id=service.system.id,
             platform=service.system.truenas.platform,
@@ -1249,9 +1252,54 @@ def build_index_context(
     }
 
 
-def ensure_slot_bounds(settings: Settings, slot: int) -> None:
-    if slot < 0 or slot >= settings.layout.slot_count:
+def check_slot_bounds(slot: int, slot_count: int) -> None:
+    if slot < 0 or slot >= slot_count:
         raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
+
+
+async def resolve_layout_slot_count(
+    service: Any | None = None,
+    selected_enclosure_id: str | None = None,
+) -> int:
+    """Return the selected enclosure's authoritative physical bay count.
+
+    A global ``LAYOUT_SLOT_COUNT`` cannot represent mixed shelves or systems
+    with large disk inventories (#168, #213). Missing, empty, or mismatched
+    snapshot evidence therefore fails closed instead of permitting a mutation
+    against an unrelated global bound.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Unable to resolve selected enclosure layout.")
+    try:
+        snapshot = await service.get_snapshot(
+            selected_enclosure_id=selected_enclosure_id,
+            allow_stale_cache=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - expose a stable route error, not source details
+        logger.debug("Slot bounds: selected enclosure snapshot unavailable (%s)", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to resolve selected enclosure layout.",
+        ) from exc
+    if selected_enclosure_id and snapshot.selected_enclosure_id != selected_enclosure_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Enclosure {selected_enclosure_id!r} is not available for this system.",
+        )
+    layout_slot_count = int(getattr(snapshot, "layout_slot_count", 0) or 0)
+    if layout_slot_count <= 0:
+        raise HTTPException(status_code=503, detail="Unable to resolve selected enclosure layout.")
+    return layout_slot_count
+
+
+async def ensure_slot_bounds(
+    slot: int,
+    service: Any | None = None,
+    selected_enclosure_id: str | None = None,
+) -> None:
+    if slot < 0:
+        raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
+    check_slot_bounds(slot, await resolve_layout_slot_count(service, selected_enclosure_id))
 
 
 def resolve_admin_launch_url(request: Request, settings: Settings) -> str | None:
