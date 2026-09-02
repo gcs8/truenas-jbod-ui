@@ -15,7 +15,12 @@ from app.services.inventory import (
 )
 from app.services.mapping_store import MappingStore
 from app.services.parsers import parse_ssh_outputs
-from app.services.profile_registry import ProfileRegistry
+from app.services.profile_registry import (
+    ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
+    ProfileRegistry,
+    SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+    UNIFI_UNVR_FRONT_4_PROFILE_ID,
+)
 from app.services.slot_detail_store import SlotDetailStore
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.truenas_ws import TrueNASRawData
@@ -232,6 +237,43 @@ class EnclosureAliasOptionLabelTests(unittest.TestCase):
             )
             self.assertEqual(set(service._cache), {"enc-other"})
             self.assertEqual(set(service._cache_until), {"enc-other"})
+
+    def test_linux_esxi_and_bmc_builders_restore_persisted_aliases(self) -> None:
+        cases = [
+            ("linux", UNIFI_UNVR_FRONT_4_PROFILE_ID, "_build_linux_enclosure_options", ()),
+            ("esxi", ESXI_AOC_SLG4_2H8M2_PROFILE_ID, "_build_esxi_enclosure_options", ()),
+            ("ipmi", SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID, "_build_bmc_enclosure_options", (None,)),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SasFabricAliasStore(Path(temp_dir) / "sas_fabric_aliases.json")
+            for platform, profile_id, builder_name, args in cases:
+                with self.subTest(platform=platform):
+                    settings = Settings()
+                    system = SystemConfig(
+                        id=f"synthetic-{platform}",
+                        truenas=TrueNASConfig(platform=platform),
+                        default_profile_id=profile_id,
+                    )
+                    store.save_alias(
+                        SasFabricAlias(
+                            system_id=system.id,
+                            object_id=profile_id,
+                            object_kind="enclosure",
+                            label=f"{platform.upper()} Archive",
+                        )
+                    )
+                    service = object.__new__(InventoryService)
+                    service.settings = settings
+                    service.system = system
+                    service.profile_registry = ProfileRegistry(settings)
+                    service.sas_fabric_alias_store = store
+
+                    options = getattr(service, builder_name)(*args)
+
+                    self.assertEqual(options[0].id, profile_id)
+                    self.assertEqual(options[0].label, f"{platform.upper()} Archive")
+                    self.assertEqual(options[0].alias, f"{platform.upper()} Archive")
+                    self.assertIsNotNone(options[0].raw_label)
 
 
 def _md1280_aes_output(logical_id: str) -> str:

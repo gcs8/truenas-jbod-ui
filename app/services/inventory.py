@@ -7716,7 +7716,7 @@ class InventoryService:
 
         slot_count = infer_slot_count_from_layout(profile.slot_layout, profile.rows * profile.columns)
         enclosure_id = profile.id
-        return [
+        return self._finalize_enclosure_options([
             EnclosureOption(
                 id=enclosure_id,
                 label=profile.panel_title or profile.label,
@@ -7727,7 +7727,7 @@ class InventoryService:
                 slot_count=slot_count,
                 slot_layout=profile.slot_layout,
             )
-        ]
+        ])
 
     def _build_esxi_enclosure_options(self) -> list[EnclosureOption]:
         profile = self.profile_registry.resolve_for_enclosure(
@@ -7743,7 +7743,7 @@ class InventoryService:
 
         slot_count = infer_slot_count_from_layout(profile.slot_layout, profile.rows * profile.columns)
         enclosure_id = profile.id or ESXI_AOC_SLG4_2H8M2_PROFILE_ID
-        return [
+        return self._finalize_enclosure_options([
             EnclosureOption(
                 id=enclosure_id,
                 label=profile.panel_title or profile.label,
@@ -7754,7 +7754,7 @@ class InventoryService:
                 slot_count=slot_count,
                 slot_layout=profile.slot_layout,
             )
-        ]
+        ])
 
     def _build_bmc_enclosure_options(self, bmc_inventory: BMCInventory | None) -> list[EnclosureOption]:
         profile_id = self.system.default_profile_id or self._infer_bmc_profile_id(bmc_inventory)
@@ -7766,7 +7766,7 @@ class InventoryService:
         slot_count = infer_slot_count_from_layout(profile.slot_layout, profile.rows * profile.columns)
         label = profile.panel_title or profile.label
         name = normalize_text(bmc_inventory.system_model if bmc_inventory is not None else None) or profile.label
-        return [
+        return self._finalize_enclosure_options([
             EnclosureOption(
                 id=profile.id,
                 label=label,
@@ -7777,7 +7777,7 @@ class InventoryService:
                 slot_count=slot_count,
                 slot_layout=profile.slot_layout,
             )
-        ]
+        ])
 
     def _infer_bmc_profile_id(self, bmc_inventory: BMCInventory | None) -> str | None:
         if bmc_inventory is None:
