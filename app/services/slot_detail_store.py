@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from app.models.domain import utcnow
 
@@ -67,6 +67,22 @@ class SlotDetailStore:
             for entry in entries:
                 current[self._slot_key(entry.system_id, entry.enclosure_id, entry.slot)] = entry
             self._write(current)
+
+    def prune_unknown_systems(self, valid_system_ids: set[str]) -> int:
+        with self._lock:
+            try:
+                current = self.load_all()
+            except (AttributeError, TypeError, ValidationError):
+                return 0
+            retained = {
+                key: entry
+                for key, entry in current.items()
+                if entry.system_id in valid_system_ids
+            }
+            removed = len(current) - len(retained)
+            if removed:
+                self._write(retained)
+            return removed
 
     def _write(self, entries: dict[str, SlotDetailCacheEntry]) -> None:
         payload = {

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from app.config import Settings, SystemConfig
 from app.services.inventory import InventoryService
 from app.services.mapping_store import MappingStore
@@ -12,6 +14,9 @@ from app.services.supermicro_bmc import SupermicroBMCService
 from app.services.truenas_ws import TrueNASWebsocketClient
 
 
+logger = logging.getLogger(__name__)
+
+
 class InventoryRegistry:
     """Create and reuse one inventory service per configured system."""
 
@@ -21,6 +26,9 @@ class InventoryRegistry:
         self.sas_fabric_alias_store = SasFabricAliasStore(settings.paths.sas_fabric_alias_file)
         self.profile_registry = ProfileRegistry(settings)
         self.slot_detail_store = SlotDetailStore(settings.paths.slot_detail_cache_file)
+        removed = self.slot_detail_store.prune_unknown_systems({system.id for system in settings.systems})
+        if removed:
+            logger.info("Pruned %d stale slot-detail cache rows for unknown systems.", removed)
         self._services: dict[str, InventoryService] = {}
 
     def get_system(self, system_id: str | None) -> SystemConfig:
