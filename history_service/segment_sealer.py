@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import sqlite3
@@ -16,6 +17,8 @@ HISTORY_TABLE_TIMESTAMPS = {
     "metric_samples": "observed_at",
     "metric_rollups": "bucket_start",
 }
+SEGMENT_DIRECTORY_MODE = 0o750
+SEGMENT_FILE_MODE = 0o640
 
 
 def _parse_timestamp(value: Any, *, label: str) -> datetime:
@@ -86,17 +89,67 @@ def _require_regular_source(source: Path) -> os.stat_result:
     return metadata
 
 
-def _require_output_directory(output_directory: Path) -> Path:
-    metadata = os.stat(output_directory, follow_symlinks=False)
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise ValueError("History segment output directory must be a directory.")
-    os.chmod(output_directory, 0o700)
+def _require_source_owner(source_metadata: os.stat_result) -> None:
+    if os.geteuid() != source_metadata.st_uid:
+        raise ValueError("History segment publisher must own the hot history database.")
+
+
+def _require_output_directory(
+    output_directory: Path,
+    *,
+    source_metadata: os.stat_result | None = None,
+    repair: bool = False,
+) -> Path:
+    try:
+        descriptor = os.open(
+            output_directory,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ValueError("History segment output directory must be a directory.") from exc
+        raise
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("History segment output directory must be a directory.")
+        if source_metadata is not None:
+            if metadata.st_uid != source_metadata.st_uid:
+                raise ValueError(
+                    "History segment output directory must be owned by the hot history database owner."
+                )
+            if repair:
+                os.fchown(descriptor, source_metadata.st_uid, source_metadata.st_gid)
+                os.fchmod(descriptor, SEGMENT_DIRECTORY_MODE)
+                metadata = os.fstat(descriptor)
+            if (
+                metadata.st_uid,
+                metadata.st_gid,
+                stat.S_IMODE(metadata.st_mode),
+            ) != (
+                source_metadata.st_uid,
+                source_metadata.st_gid,
+                SEGMENT_DIRECTORY_MODE,
+            ):
+                raise ValueError("History segment output directory permission policy is invalid.")
+    finally:
+        os.close(descriptor)
     return output_directory
 
 
-def _prepare_output_directory(output_directory: Path) -> Path:
-    output_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return _require_output_directory(output_directory)
+def _prepare_output_directory(
+    output_directory: Path,
+    source_metadata: os.stat_result,
+) -> Path:
+    output_directory.mkdir(mode=SEGMENT_DIRECTORY_MODE, parents=True, exist_ok=True)
+    return _require_output_directory(
+        output_directory,
+        source_metadata=source_metadata,
+        repair=True,
+    )
 
 
 def _copy_and_prune(source: Path, destination: Path, cutoff: str) -> dict[str, int]:
@@ -153,7 +206,8 @@ def seal_history_segment(
     cutoff = _require_timestamp(cutoff, label="History segment cutoff")
     source = source.absolute()
     source_metadata = _require_regular_source(source)
-    output_directory = _prepare_output_directory(output_directory.absolute())
+    _require_source_owner(source_metadata)
+    output_directory = _prepare_output_directory(output_directory.absolute(), source_metadata)
     destination = output_directory / f"{segment_id}.sqlite3"
     try:
         destination_metadata = os.stat(destination, follow_symlinks=False)
@@ -164,9 +218,22 @@ def seal_history_segment(
 
     descriptor, temporary_name = tempfile.mkstemp(prefix=".segment-", suffix=".sqlite3", dir=output_directory)
     temporary_path = Path(temporary_name)
-    os.fchmod(descriptor, 0o600)
-    os.close(descriptor)
     try:
+        os.fchown(descriptor, source_metadata.st_uid, source_metadata.st_gid)
+        os.fchmod(descriptor, SEGMENT_FILE_MODE)
+        temporary_metadata = os.fstat(descriptor)
+        if (
+            temporary_metadata.st_uid,
+            temporary_metadata.st_gid,
+            stat.S_IMODE(temporary_metadata.st_mode),
+        ) != (
+            source_metadata.st_uid,
+            source_metadata.st_gid,
+            SEGMENT_FILE_MODE,
+        ):
+            raise ValueError("History segment publication permission policy could not be applied.")
+        os.close(descriptor)
+        descriptor = -1
         row_counts = _copy_and_prune(source, temporary_path, cutoff)
         if os.stat(source, follow_symlinks=False) != source_metadata:
             raise ValueError("History segment source changed while it was being sealed.")
@@ -191,6 +258,9 @@ def seal_history_segment(
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
     return {
         "segment_id": segment_id,

@@ -20,9 +20,11 @@ from history_service.segment_catalog import (
 from history_service.segment_reader import SegmentedHistoryReader
 from history_service.segment_sealer import (
     HISTORY_TABLE_TIMESTAMPS,
+    SEGMENT_FILE_MODE,
     _prepare_output_directory,
     _require_output_directory,
     _require_regular_source,
+    _require_source_owner,
     seal_history_segment,
 )
 from history_service.migration_lock import history_write_lock
@@ -259,10 +261,24 @@ def _stage_hot_replacement(source: Path, cutoff: str) -> Path:
         dir=source.parent,
     )
     temporary_path = Path(temporary_name)
-    source_mode = stat.S_IMODE(os.stat(source, follow_symlinks=False).st_mode)
-    os.fchmod(descriptor, source_mode)
-    os.close(descriptor)
+    source_metadata = os.stat(source, follow_symlinks=False)
+    source_mode = stat.S_IMODE(source_metadata.st_mode)
     try:
+        os.fchown(descriptor, source_metadata.st_uid, source_metadata.st_gid)
+        os.fchmod(descriptor, source_mode)
+        staged_metadata = os.fstat(descriptor)
+        if (
+            staged_metadata.st_uid,
+            staged_metadata.st_gid,
+            stat.S_IMODE(staged_metadata.st_mode),
+        ) != (
+            source_metadata.st_uid,
+            source_metadata.st_gid,
+            source_mode,
+        ):
+            raise ValueError("Staged hot history permission policy could not be applied.")
+        os.close(descriptor)
+        descriptor = -1
         with sqlite3.connect(f"{source.resolve().as_uri()}?mode=ro", uri=True) as source_connection:
             source_connection.execute("PRAGMA query_only = ON")
             with sqlite3.connect(temporary_path) as replacement_connection:
@@ -283,6 +299,9 @@ def _stage_hot_replacement(source: Path, cutoff: str) -> Path:
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _write_private_json_no_replace(
@@ -290,11 +309,21 @@ def _write_private_json_no_replace(
     payload: dict[str, Any],
     *,
     temporary_prefix: str,
+    mode: int = 0o600,
+    owner: tuple[int, int] | None = None,
 ) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=temporary_prefix, suffix=".json", dir=path.parent)
     temporary_path = Path(temporary_name)
-    os.fchmod(descriptor, 0o600)
     try:
+        if owner is not None:
+            os.fchown(descriptor, *owner)
+        os.fchmod(descriptor, mode)
+        published_metadata = os.fstat(descriptor)
+        if stat.S_IMODE(published_metadata.st_mode) != mode or (
+            owner is not None
+            and (published_metadata.st_uid, published_metadata.st_gid) != owner
+        ):
+            raise ValueError("History JSON publication permission policy could not be applied.")
         content = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         stream = os.fdopen(descriptor, "wb", closefd=True)
         descriptor = -1
@@ -302,6 +331,9 @@ def _write_private_json_no_replace(
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -339,8 +371,19 @@ def _write_private_json_replace(
         temporary_path.unlink(missing_ok=True)
 
 
-def _write_catalog(path: Path, payload: dict[str, Any]) -> None:
-    _write_private_json_no_replace(path, payload, temporary_prefix=".catalog-")
+def _write_catalog(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    owner: tuple[int, int],
+) -> None:
+    _write_private_json_no_replace(
+        path,
+        payload,
+        temporary_prefix=".catalog-",
+        mode=SEGMENT_FILE_MODE,
+        owner=owner,
+    )
 
 
 def _write_pending_marker(
@@ -427,8 +470,21 @@ def _restore_v1_source(source: Path, rollback_path: Path, source_mode: int, expe
         dir=source.parent,
     )
     restore_path = Path(restore_name)
-    os.fchmod(descriptor, source_mode)
+    source_metadata = os.stat(source, follow_symlinks=False)
     try:
+        os.fchown(descriptor, source_metadata.st_uid, source_metadata.st_gid)
+        os.fchmod(descriptor, source_mode)
+        restored_metadata = os.fstat(descriptor)
+        if (
+            restored_metadata.st_uid,
+            restored_metadata.st_gid,
+            stat.S_IMODE(restored_metadata.st_mode),
+        ) != (
+            source_metadata.st_uid,
+            source_metadata.st_gid,
+            source_mode,
+        ):
+            raise ValueError("Restored hot history permission policy could not be applied.")
         destination = os.fdopen(descriptor, "wb", closefd=True)
         descriptor = -1
         snapshot_descriptor = os.open(
@@ -590,6 +646,7 @@ def _migrate_segmented_history_locked(
     if path_entry_exists(catalog_path):
         raise ValueError("Segmented history catalog already exists.")
     source_metadata = _require_regular_source(source)
+    _require_source_owner(source_metadata)
     _require_current_history_schema(source, source_metadata)
     if not apply:
         return {
@@ -598,7 +655,7 @@ def _migrate_segmented_history_locked(
             "detail": "Dry run only. Pass --apply after quiescing the history service.",
         }
 
-    segments_directory = _prepare_output_directory(segments_directory)
+    segments_directory = _prepare_output_directory(segments_directory, source_metadata)
     rollback_path = segments_directory / ".v1-rollback.sqlite3"
     pending_path = segments_directory / MIGRATION_PENDING_MARKER
     if path_entry_exists(rollback_path):
@@ -673,7 +730,11 @@ def _migrate_segmented_history_locked(
             ],
             "rollback_sha256": rollback_sha256,
         }
-        _write_catalog(catalog_path, catalog)
+        _write_catalog(
+            catalog_path,
+            catalog,
+            owner=(source_metadata.st_uid, source_metadata.st_gid),
+        )
         _clear_pending_marker(pending_path)
         pending_marker_active = False
     except BaseException:
@@ -725,7 +786,8 @@ def _rollback_segmented_history_locked(
     catalog_path = segments_directory / "catalog.json"
     rollback_path = segments_directory / ".v1-rollback.sqlite3"
     pending_path = segments_directory / MIGRATION_PENDING_MARKER
-    _require_regular_source(source)
+    source_metadata = _require_regular_source(source)
+    _require_source_owner(source_metadata)
     if path_entry_exists(pending_path):
         raise ValueError("Segmented history migration recovery is already pending.")
     catalog, segment_paths = _load_rollback_catalog(catalog_path, source)
@@ -786,7 +848,8 @@ def _recover_pending_migration_locked(
     catalog_path = segments_directory / "catalog.json"
     rollback_path = segments_directory / ".v1-rollback.sqlite3"
     pending_path = segments_directory / MIGRATION_PENDING_MARKER
-    _require_regular_source(source)
+    source_metadata = _require_regular_source(source)
+    _require_source_owner(source_metadata)
     if not path_entry_exists(pending_path):
         if path_entry_exists(catalog_path) or not path_entry_exists(rollback_path):
             raise ValueError("Segmented history migration recovery is not pending.")

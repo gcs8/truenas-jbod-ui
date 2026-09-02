@@ -101,7 +101,26 @@ explicit validation value and a supplemental group. The setgid `2750` status
 directory makes atomic status replacements inherit that exact group.
 Status files use `0640`, so the non-root UI and history services can read backup
 evidence but cannot alter it. Archives and the passphrase remain private `0600`
-files.
+files. Segmented-history publication follows the same least-privilege group
+contract: the segment directory uses exact mode `0750`; segments and `catalog.json` use exact mode `0640`.
+Their owner and group match the hot history database. The non-root app UID owns
+publication; the backup UID reads through its `APP_GID` supplemental group and
+cannot modify those artifacts.
+
+Do not run migration, sealing, rotation, or recovery as host root when the hot
+database belongs to the non-root app UID. The publisher refuses an effective UID
+that does not own the hot database, preventing a root-owned replacement from
+making the history service read-only.
+
+Deployments that already published a `0600` catalog or segments need one bounded,
+quiesced permission repair before the separate backup UID can read them. Stop the
+history and backup containers, verify that `history.db`, `segments/catalog.json`,
+and the cataloged `segment-*.sqlite3` files are the intended regular files, then
+set the segment directory owner to `APP_UID:APP_GID` with mode `0750` and only the
+active catalog and cataloged segment files to that owner/group with mode `0640`.
+Do not recursively relax rollback snapshots, pending journals, or unrelated
+history files. Restart the history service, run a manual FULL backup, and verify
+its status before allowing retention or rotation.
 
 Run one backup manually before enabling a timer:
 

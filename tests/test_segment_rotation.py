@@ -142,6 +142,15 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                 ["generation-1-hot", "generation-2-sealed"],
             )
             self.assertEqual(self._event_types(source), ["generation-2-hot"])
+            self.assertEqual(stat.S_IMODE(segments_directory.stat().st_mode), 0o750)
+            for name in ("segment-0002.sqlite3", "catalog.json"):
+                with self.subTest(name=name):
+                    metadata = (segments_directory / name).stat()
+                    self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o640)
+                    self.assertEqual(
+                        (metadata.st_uid, metadata.st_gid),
+                        (source.stat().st_uid, source.stat().st_gid),
+                    )
 
     def test_rotation_authenticates_the_new_segment_before_publication_and_blocks_readers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

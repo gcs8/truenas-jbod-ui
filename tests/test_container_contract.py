@@ -119,6 +119,8 @@ class ContainerResourceContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('-g "$APP_GID" -m 2750 backup-status', backup_guide)
         self.assertIn("Status files use `0640`", backup_guide)
+        self.assertIn("segment directory uses exact mode `0750`", backup_guide)
+        self.assertIn("segments and `catalog.json` use exact mode `0640`", backup_guide)
 
     def test_nonroot_migration_helper_is_bounded_no_follow_and_dry_run_by_default(self) -> None:
         helper = (REPO_ROOT / "scripts/prepare_nonroot_bind_mounts.py").read_text(encoding="utf-8")
