@@ -24,6 +24,15 @@ GUID_REGEX = re.compile(r"^[0-9]{16,}$")
 SLOT_REGEX = re.compile(r"(?:slot|bay|element)\D{0,4}(?P<slot>\d{1,3})", re.IGNORECASE)
 HEX_VALUE_REGEX = re.compile(r"^(?:0x)?(?P<value>[0-9a-fA-F]+)$")
 HEX_IDENTIFIER_ERROR_SPLIT_REGEX = re.compile(r"(?i)error:")
+SES_EVIDENCE_SOURCE_STRENGTH = {
+    None: 0,
+    "sesutil_show": 10,
+    "sg_ses_ec": 20,
+    "sesutil_map": 30,
+    "sg_ses_aes": 40,
+    "sg_ses_join": 40,
+    "enclosure_sysfs": 50,
+}
 
 
 @dataclass(slots=True)
@@ -71,6 +80,7 @@ class ParsedSSHData:
     esxi_storcli_controller: dict[str, Any] = field(default_factory=dict)
     esxi_storcli_virtual_drives: list[dict[str, Any]] = field(default_factory=list)
     esxi_storcli_physical_drives: list[dict[str, Any]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -110,7 +120,12 @@ class SESMapSlot:
     model: str | None = None
     size_text: str | None = None
     present: bool | None = None
+    presence_source: str | None = None
+    presence_conflict: bool = False
+    device_names_source: str | None = None
     sas_address: str | None = None
+    sas_address_source: str | None = None
+    sas_address_conflict: bool = False
     attached_sas_address: str | None = None
     sas_device_type: str | None = None
     transport_protocol: str | None = None
@@ -636,6 +651,101 @@ def parse_gmultipath_list(output: str) -> dict[str, MultipathInfo]:
     return {key: value for key, value in multipaths.items() if key.startswith("multipath/")}
 
 
+def _ses_evidence_strength(source: str | None) -> int:
+    return SES_EVIDENCE_SOURCE_STRENGTH.get(source, 0)
+
+
+def _device_name_sort_key(name: str) -> tuple[str, str]:
+    natural_name = re.sub(r"\d+", lambda match: match.group(0).zfill(20), name.casefold())
+    return natural_name, name
+
+
+def _apply_ses_presence_evidence(
+    slot: SESMapSlot,
+    present: bool | None,
+    source: str | None,
+    *,
+    conflict: bool = False,
+) -> None:
+    if present is None:
+        return
+    existing_strength = _ses_evidence_strength(slot.presence_source)
+    incoming_strength = _ses_evidence_strength(source)
+    if slot.present is None or incoming_strength > existing_strength:
+        slot.present = present
+        slot.presence_source = source
+        slot.presence_conflict = conflict
+        if not present and incoming_strength > _ses_evidence_strength(slot.device_names_source):
+            slot.device_names = []
+            slot.device_names_source = None
+        return
+    if incoming_strength < existing_strength:
+        return
+    if slot.present is not present:
+        slot.present = bool(slot.present or present)
+        slot.presence_conflict = True
+    slot.presence_conflict = slot.presence_conflict or conflict
+    slot.presence_source = slot.presence_source or source
+
+
+def _apply_ses_device_name_evidence(
+    slot: SESMapSlot,
+    device_names: list[str],
+    source: str | None,
+) -> None:
+    names = list(dict.fromkeys(name for name in device_names if name))
+    if not names:
+        return
+    existing_strength = _ses_evidence_strength(slot.device_names_source)
+    incoming_strength = _ses_evidence_strength(source)
+    if slot.present is False and _ses_evidence_strength(slot.presence_source) > incoming_strength:
+        return
+    if not slot.device_names or incoming_strength > existing_strength:
+        slot.device_names = names
+        slot.device_names_source = source
+        return
+    if incoming_strength == existing_strength:
+        slot.device_names = sorted(
+            dict.fromkeys(slot.device_names + names),
+            key=_device_name_sort_key,
+        )
+        slot.device_names_source = slot.device_names_source or source
+
+
+def _apply_ses_sas_address_evidence(
+    slot: SESMapSlot,
+    address: str | None,
+    source: str | None,
+    *,
+    conflict: bool = False,
+) -> None:
+    if address is None and not conflict:
+        return
+    existing_strength = _ses_evidence_strength(slot.sas_address_source)
+    incoming_strength = _ses_evidence_strength(source)
+    if slot.sas_address_source is None or incoming_strength > existing_strength:
+        slot.sas_address = address
+        slot.sas_address_source = source
+        slot.sas_address_conflict = conflict
+        return
+    if incoming_strength < existing_strength:
+        return
+    if slot.sas_address_conflict or conflict:
+        slot.sas_address = None
+        slot.sas_address_conflict = True
+        slot.sas_address_source = slot.sas_address_source or source
+        return
+    if slot.sas_address is None:
+        slot.sas_address = address
+    elif address is not None and slot.sas_address != address:
+        if slot.sas_address == "0":
+            slot.sas_address = address
+        elif address != "0":
+            slot.sas_address = None
+            slot.sas_address_conflict = True
+    slot.sas_address_source = slot.sas_address_source or source
+
+
 def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
     source_strength = {
         None: 0,
@@ -667,7 +777,23 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
             slot.control_targets,
         )
 
-    existing.device_names = list(dict.fromkeys(existing.device_names + slot.device_names))
+    _apply_ses_presence_evidence(
+        existing,
+        slot.present,
+        slot.presence_source,
+        conflict=slot.presence_conflict,
+    )
+    _apply_ses_device_name_evidence(
+        existing,
+        slot.device_names,
+        slot.device_names_source,
+    )
+    _apply_ses_sas_address_evidence(
+        existing,
+        slot.sas_address,
+        slot.sas_address_source,
+        conflict=slot.sas_address_conflict,
+    )
     existing.identify_active = existing.identify_active or slot.identify_active
     existing.status = existing.status or slot.status
     existing.description = existing.description or slot.description
@@ -676,7 +802,6 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
     existing.serial = existing.serial or slot.serial
     existing.model = existing.model or slot.model
     existing.size_text = existing.size_text or slot.size_text
-    existing.sas_address = existing.sas_address or slot.sas_address
     existing.sas_address_degraded = existing.sas_address_degraded or slot.sas_address_degraded
     existing.attached_sas_address = existing.attached_sas_address or slot.attached_sas_address
     existing.sas_device_type = existing.sas_device_type or slot.sas_device_type
@@ -697,10 +822,7 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
             setattr(existing, attribute, slot_value)
         elif slot_value is not None:
             setattr(existing, attribute, bool(existing_value or slot_value))
-    if existing.present is None:
-        existing.present = slot.present
-    elif slot.present is not None:
-        existing.present = existing.present or slot.present
+
 
 
 def _record_ses_slot(
@@ -852,9 +974,9 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
             if current_slot.status:
                 lowered = current_slot.status.lower()
                 if "not installed" in lowered or "absent" in lowered:
-                    current_slot.present = False
+                    _apply_ses_presence_evidence(current_slot, False, "sesutil_map")
                 elif "ok" in lowered or "ready" in lowered:
-                    current_slot.present = True
+                    _apply_ses_presence_evidence(current_slot, True, "sesutil_map")
             continue
 
         if stripped.startswith("Description:"):
@@ -883,14 +1005,13 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
 
         if stripped.startswith("Device Names:"):
             names = [item.strip() for item in stripped.split(":", 1)[1].split(",")]
-            current_slot.device_names = list(
-                dict.fromkeys(
-                    current_slot.device_names
-                    + [item for item in names if item and not item.startswith("pass")]
-                )
+            _apply_ses_device_name_evidence(
+                current_slot,
+                [item for item in names if item and not item.startswith("pass")],
+                "sesutil_map",
             )
             if current_slot.device_names:
-                current_slot.present = True
+                _apply_ses_presence_evidence(current_slot, True, "sesutil_map")
             continue
 
         if stripped.startswith("Extra status:"):
@@ -967,11 +1088,13 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
             status=status_text,
             description=normalize_text(columns[0]),
             device_names=[device_name] if device_name else [],
+            device_names_source="sesutil_show" if device_name else None,
             identify_active="led=locate" in status_lower or "identify" in status_lower,
             serial=serial,
             model=model,
             size_text=None if "not installed" in status_lower else normalize_text(status_text.split(",", 1)[0]),
             present=bool(device_name) and "not installed" not in status_lower,
+            presence_source="sesutil_show",
         )
 
     parsed = [item for item in enclosures if item.slots]
@@ -997,6 +1120,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     )
     current_slot: SESMapSlot | None = None
     in_array_slots = False
+    duplicate_slot_path = False
 
     for raw_line in output.splitlines():
         line = raw_line.rstrip()
@@ -1012,6 +1136,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
             in_array_slots = "Array device slot" in stripped
             current_slot = None
+            duplicate_slot_path = False
             continue
 
         if not in_array_slots:
@@ -1025,6 +1150,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
                 element_id=int(element_match.group("element")),
                 ses_device=ses_device,
             )
+            duplicate_slot_path = False
             continue
 
         if current_slot is None:
@@ -1039,7 +1165,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             # merge) and record the bay as empty instead of dropping it from
             # the shelf geometry.
             current_slot.description = f"Element {current_slot.element_id} (invalid AES descriptor)"
-            current_slot.present = False
+            _apply_ses_presence_evidence(current_slot, False, "sg_ses_aes")
             current_slot = _record_ses_slot(
                 enclosure,
                 current_slot,
@@ -1060,12 +1186,14 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
         if slot_match:
             reported_slot_number = int(slot_match.group("slot"))
             current_slot.description = f"Slot {reported_slot_number:02d}"
+            parsed_slot = current_slot
             current_slot = _record_ses_slot(
                 enclosure,
                 current_slot,
                 reported_slot_number=reported_slot_number,
                 source="ses_device_slot_number",
             )
+            duplicate_slot_path = current_slot is not parsed_slot
             continue
 
         if stripped.startswith("SAS device type:"):
@@ -1078,26 +1206,21 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
                 )
                 if not current_slot.sas_device_type or (current_type_is_absent and incoming_present):
                     current_slot.sas_device_type = sas_device_type
-                current_slot.present = (
-                    incoming_present
-                    if current_slot.present is None
-                    else current_slot.present or incoming_present
-                )
+                _apply_ses_presence_evidence(current_slot, incoming_present, "sg_ses_aes")
             continue
 
         if stripped.startswith("SAS address:"):
             sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
             if sas_address:
                 incoming_present = sas_address != "0"
-                if not current_slot.sas_address or (
-                    current_slot.sas_address == "0" and incoming_present
-                ):
-                    current_slot.sas_address = sas_address
-                current_slot.present = (
-                    incoming_present
-                    if current_slot.present is None
-                    else current_slot.present or incoming_present
+                preserve_existing_path_address = bool(
+                    duplicate_slot_path
+                    and current_slot.sas_address not in (None, "0")
+                    and sas_address != "0"
                 )
+                if not preserve_existing_path_address:
+                    _apply_ses_sas_address_evidence(current_slot, sas_address, "sg_ses_aes")
+                _apply_ses_presence_evidence(current_slot, incoming_present, "sg_ses_aes")
             continue
 
         if stripped.startswith("attached SAS address:"):
@@ -1195,7 +1318,7 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
         if stripped.startswith("Predicted failure=") and "status:" in stripped:
             # Shared with the join parser so the presence semantics of SES
             # status codes cannot drift between the two pages again.
-            _apply_sg_ses_status_line(current_slot, stripped)
+            _apply_sg_ses_status_line(current_slot, stripped, source="sg_ses_ec")
             continue
 
         ident_match = re.search(r"\bIdent=(?P<ident>[01])\b", stripped)
@@ -1280,7 +1403,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             continue
 
         if stripped.startswith("Predicted failure=") and "status:" in stripped:
-            _apply_sg_ses_status_line(current_slot, stripped)
+            _apply_sg_ses_status_line(current_slot, stripped, source="sg_ses_join")
             continue
 
         ident_match = re.search(r"\bIdent=(?P<ident>[01])\b", stripped)
@@ -1302,7 +1425,11 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
         if stripped.startswith("SAS device type:"):
             current_slot.sas_device_type = normalize_text(stripped.split(":", 1)[1])
             if current_slot.sas_device_type:
-                current_slot.present = "no sas device attached" not in current_slot.sas_device_type.lower()
+                _apply_ses_presence_evidence(
+                    current_slot,
+                    "no sas device attached" not in current_slot.sas_device_type.lower(),
+                    "sg_ses_join",
+                )
             continue
 
         if stripped.startswith("target port for:"):
@@ -1314,11 +1441,10 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             continue
 
         if stripped.startswith("SAS address:"):
-            current_slot.sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
-            if current_slot.sas_address == "0":
-                current_slot.present = False
-            elif current_slot.sas_address:
-                current_slot.present = True
+            sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
+            _apply_ses_sas_address_evidence(current_slot, sas_address, "sg_ses_join")
+            if sas_address:
+                _apply_ses_presence_evidence(current_slot, sas_address != "0", "sg_ses_join")
             continue
 
         if stripped.startswith("phy identifier:"):
@@ -1332,14 +1458,14 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     return enclosure
 
 
-def _apply_sg_ses_status_line(slot: SESMapSlot, line: str) -> None:
+def _apply_sg_ses_status_line(slot: SESMapSlot, line: str, *, source: str) -> None:
     slot.status = normalize_text(line.split("status:", 1)[1])
     if slot.status:
         lowered = slot.status.lower()
         if "not installed" in lowered or "absent" in lowered:
-            slot.present = False
+            _apply_ses_presence_evidence(slot, False, source)
         elif lowered.startswith("ok") or "installed" in lowered or "ready" in lowered:
-            slot.present = True
+            _apply_ses_presence_evidence(slot, True, source)
         # Condition codes such as Critical/Noncritical/Unknown/Unsupported say
         # nothing about occupancy by themselves — issue #119's shelf latches
         # Critical onto every EMPTY bay (documented minimum-drive-count rule),
@@ -1616,9 +1742,8 @@ def _apply_enclosure_sysfs_device_names(
             slot = enclosure.slots.get(slot_number)
             if slot is None:
                 continue
-            for device_name in device_names:
-                if device_name not in slot.device_names:
-                    slot.device_names.append(device_name)
+            _apply_ses_presence_evidence(slot, True, "enclosure_sysfs")
+            _apply_ses_device_name_evidence(slot, device_names, "enclosure_sysfs")
 
 
 def _flag_degraded_ses_sas_addresses(enclosure: SESMapEnclosure) -> None:
@@ -1742,6 +1867,108 @@ def _merge_control_targets(
     return merged
 
 
+def _merge_candidate_presence(
+    target: dict[str, Any],
+    incoming: dict[str, Any],
+) -> None:
+    incoming_present = incoming.get("present")
+    if not isinstance(incoming_present, bool):
+        return
+    incoming_source = normalize_text(incoming.get("presence_source"))
+    incoming_strength = _ses_evidence_strength(incoming_source)
+    existing_present = target.get("present")
+    existing_source = normalize_text(target.get("presence_source"))
+    existing_strength = _ses_evidence_strength(existing_source)
+    incoming_conflict = bool(incoming.get("presence_conflict"))
+    if not isinstance(existing_present, bool) or incoming_strength > existing_strength:
+        target["present"] = incoming_present
+        target["presence_source"] = incoming_source
+        target["presence_conflict"] = incoming_conflict
+        if not incoming_present and incoming_strength > _ses_evidence_strength(
+            normalize_text(target.get("device_names_source"))
+        ):
+            target["device_names"] = []
+            target["device_names_source"] = None
+            target["device_hint"] = None
+        return
+    if incoming_strength < existing_strength:
+        return
+    if existing_present is not incoming_present:
+        target["present"] = bool(existing_present or incoming_present)
+        target["presence_conflict"] = True
+    else:
+        target["presence_conflict"] = bool(target.get("presence_conflict")) or incoming_conflict
+    target["presence_source"] = existing_source or incoming_source
+
+
+def _merge_candidate_device_names(
+    target: dict[str, Any],
+    incoming: dict[str, Any],
+) -> None:
+    incoming_names = incoming.get("device_names")
+    incoming_names = incoming_names if isinstance(incoming_names, list) else []
+    incoming_hint = normalize_device_name(incoming.get("device_hint"))
+    names = list(
+        dict.fromkeys(
+            [name for name in incoming_names if isinstance(name, str) and name]
+            + ([incoming_hint] if incoming_hint else [])
+        )
+    )
+    if not names:
+        return
+    incoming_source = normalize_text(incoming.get("device_names_source"))
+    incoming_strength = _ses_evidence_strength(incoming_source)
+    if target.get("present") is False and _ses_evidence_strength(
+        normalize_text(target.get("presence_source"))
+    ) > incoming_strength:
+        return
+    existing_names = target.get("device_names")
+    existing_names = existing_names if isinstance(existing_names, list) else []
+    existing_hint = normalize_device_name(target.get("device_hint"))
+    if existing_hint and existing_hint not in existing_names:
+        existing_names = [*existing_names, existing_hint]
+    existing_source = normalize_text(target.get("device_names_source"))
+    existing_strength = _ses_evidence_strength(existing_source)
+    if not existing_names or incoming_strength > existing_strength:
+        target["device_names"] = names
+        target["device_names_source"] = incoming_source
+        target["device_hint"] = names[0]
+    elif incoming_strength == existing_strength:
+        merged_names = sorted(
+            dict.fromkeys(existing_names + names),
+            key=_device_name_sort_key,
+        )
+        target["device_names"] = merged_names
+        target["device_names_source"] = existing_source or incoming_source
+        target["device_hint"] = merged_names[0]
+
+
+def _merge_candidate_sas_address(
+    target: dict[str, Any],
+    incoming: dict[str, Any],
+) -> None:
+    address = normalize_hex_identifier(incoming.get("sas_address_hint"))
+    incoming_conflict = bool(incoming.get("sas_address_conflict"))
+    if address is None and not incoming_conflict:
+        return
+    source = normalize_text(incoming.get("sas_address_source"))
+    slot = SESMapSlot(
+        slot_number=-1,
+        sas_address=normalize_hex_identifier(target.get("sas_address_hint")),
+        sas_address_source=normalize_text(target.get("sas_address_source")),
+        sas_address_conflict=bool(target.get("sas_address_conflict")),
+    )
+    _apply_ses_sas_address_evidence(
+        slot,
+        address,
+        source,
+        conflict=incoming_conflict,
+    )
+    target["sas_address_hint"] = slot.sas_address
+    target["sas_address_source"] = slot.sas_address_source
+    target["sas_address_conflict"] = slot.sas_address_conflict
+
+
 def merge_slot_candidate_maps(
     base: dict[int, dict[str, Any]],
     overlay: dict[int, dict[str, Any]],
@@ -1750,11 +1977,21 @@ def merge_slot_candidate_maps(
 
     for slot, payload in overlay.items():
         target = merged.setdefault(slot, {})
+        _merge_candidate_presence(target, payload)
+        _merge_candidate_device_names(target, payload)
+        _merge_candidate_sas_address(target, payload)
         for key, value in payload.items():
-            if key == "device_names":
-                existing = target.get(key, [])
-                if isinstance(existing, list) and isinstance(value, list):
-                    target[key] = list(dict.fromkeys(existing + value))
+            if key in {
+                "present",
+                "presence_source",
+                "presence_conflict",
+                "device_names",
+                "device_names_source",
+                "device_hint",
+                "sas_address_hint",
+                "sas_address_source",
+                "sas_address_conflict",
+            }:
                 continue
             if key == "ses_targets":
                 existing = target.get(key, [])
@@ -1784,7 +2021,7 @@ def merge_slot_candidate_maps(
                         combined.append(payload)
                     target[key] = combined
                 continue
-            if key in {"identify_active", "present"}:
+            if key == "identify_active":
                 existing = target.get(key)
                 if isinstance(existing, bool) and isinstance(value, bool):
                     target[key] = existing or value
@@ -1899,6 +2136,7 @@ def build_slot_candidates_from_ses_enclosures(
                     "value": slot.status,
                     "device_hint": slot.device_names[0] if slot.device_names else None,
                     "device_names": slot.device_names,
+                    "device_names_source": slot.device_names_source,
                     "identify_active": slot.identify_active,
                     "serial_hint": slot.serial,
                     "model_hint": slot.model,
@@ -1906,6 +2144,8 @@ def build_slot_candidates_from_ses_enclosures(
                     "present": slot.present
                     if slot.present is not None
                     else bool(slot.device_names) and "not installed" not in (slot.status or "").lower(),
+                    "presence_source": slot.presence_source,
+                    "presence_conflict": slot.presence_conflict,
                     "enclosure_id": enclosure.enclosure_id,
                     "enclosure_label": enclosure.enclosure_label,
                     "enclosure_name": enclosure.enclosure_name,
@@ -1913,6 +2153,8 @@ def build_slot_candidates_from_ses_enclosures(
                     "ses_element_id": slot.element_id,
                     "ses_slot_number": slot.slot_number,
                     "sas_address_hint": None if slot.sas_address_degraded else slot.sas_address,
+                    "sas_address_source": slot.sas_address_source,
+                    "sas_address_conflict": slot.sas_address_conflict,
                     "shared_sas_address": slot.sas_address if slot.sas_address_degraded else None,
                     "sas_address_degraded": slot.sas_address_degraded,
                     "attached_sas_address": slot.attached_sas_address,
@@ -3336,26 +3578,86 @@ def parse_esxcli_smart_get(output: str, logical_block_size: int | None = None) -
     return summary
 
 
-def _parse_storcli_json(output: str) -> dict[str, Any]:
+def _storcli_controller_id(
+    controller: dict[str, Any],
+    response_data: dict[str, Any],
+    controller_index: int,
+    default_controller_id: str | None = None,
+) -> str:
+    command_status = controller.get("Command Status")
+    if isinstance(command_status, dict):
+        for key in ("Controller", "Controller Number", "Ctl"):
+            value = normalize_text(
+                str(command_status.get(key)) if command_status.get(key) is not None else None
+            )
+            if value:
+                return value.lower() if value.lower().startswith("c") else f"c{value}"
+    for key in response_data:
+        if not isinstance(key, str):
+            continue
+        match = re.search(r"/c(?P<controller>\d+)(?:/|\b)", key, re.IGNORECASE)
+        if match:
+            return f"c{match.group('controller')}"
+    return normalize_text(default_controller_id) or f"c{controller_index}"
+
+
+def _parse_storcli_controllers(
+    output: str,
+    warnings: list[str] | None = None,
+    default_controller_id: str | None = None,
+) -> list[dict[str, Any]]:
     try:
         payload = json.loads(output)
     except json.JSONDecodeError:
-        return {}
+        return []
     if not isinstance(payload, dict):
-        return {}
+        return []
     controllers = payload.get("Controllers")
     if not isinstance(controllers, list) or not controllers:
-        return {}
-    controller = controllers[0]
-    if not isinstance(controller, dict):
-        return {}
-    response_data = controller.get("Response Data")
-    if not isinstance(response_data, dict):
-        response_data = {}
-    return {
-        "command_status": controller.get("Command Status") if isinstance(controller.get("Command Status"), dict) else {},
-        "response_data": response_data,
-    }
+        return []
+    parsed: list[dict[str, Any]] = []
+    for controller_index, controller in enumerate(controllers):
+        if not isinstance(controller, dict):
+            if warnings is not None:
+                warnings.append(
+                    f"StorCLI controller block {controller_index} was invalid and was not used: "
+                    "controller entry was not an object."
+                )
+            continue
+        raw_command_status = controller.get("Command Status")
+        command_status: dict[str, Any] = (
+            raw_command_status if isinstance(raw_command_status, dict) else {}
+        )
+        response_data = controller.get("Response Data")
+        if not isinstance(response_data, dict):
+            if warnings is not None:
+                detail = normalize_text(
+                    str(command_status.get("Description") or command_status.get("Status") or "")
+                ) or "Response Data was not an object"
+                warnings.append(
+                    f"StorCLI controller block {controller_index} was invalid and was not used: "
+                    f"{detail.rstrip('.')}."
+                )
+            continue
+        parsed.append(
+            {
+                "controller_id": _storcli_controller_id(
+                    controller,
+                    response_data,
+                    controller_index,
+                    default_controller_id if len(controllers) == 1 else None,
+                ),
+                "controller_index": controller_index,
+                "command_status": command_status,
+                "response_data": response_data,
+            }
+        )
+    return parsed
+
+
+def _parse_storcli_json(output: str) -> dict[str, Any]:
+    controllers = _parse_storcli_controllers(output)
+    return controllers[0] if controllers else {}
 
 
 def _storcli_response_data(output: str) -> dict[str, Any]:
@@ -3465,8 +3767,12 @@ def _collect_storcli_physical_drive_rows(response_data: dict[str, Any]) -> list[
     return fallback_rows
 
 
-def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
-    response_data = _storcli_response_data(output)
+def _parse_storcli_physical_drive_response(
+    response_data: dict[str, Any],
+    *,
+    controller_id: str,
+    controller_index: int,
+) -> list[dict[str, Any]]:
     rows = _collect_storcli_physical_drive_rows(response_data)
     details_by_slot = _collect_storcli_drive_details(response_data)
     drives: list[dict[str, Any]] = []
@@ -3476,7 +3782,9 @@ def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
         enclosure_id, slot, slot_key = _parse_storcli_eid_slot(row.get("EID:Slt") or row.get("EID:Slt "))
         if slot_key is None:
             continue
-        row_controller_id = normalize_text(str(row.get("Ctl") or row.get("Controller") or ""))
+        row_controller_id = normalize_text(
+            str(row.get("Ctl") or row.get("Controller") or controller_id)
+        )
         detail = (
             details_by_slot.get(f"{row_controller_id.lower()}:{slot_key}", {})
             if row_controller_id
@@ -3526,7 +3834,10 @@ def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
                 "slot_key": slot_key,
                 "enclosure_id": enclosure_id,
                 "slot": slot,
-                "controller_id": normalize_text(str(detail.get("controller_id") or row_controller_id or "c0")),
+                "controller_id": normalize_text(
+                    str(detail.get("controller_id") or row_controller_id or controller_id)
+                ),
+                "controller_index": controller_index,
                 "device_id": normalize_text(str(row.get("DID") if row.get("DID") is not None else "")),
                 "state": normalize_text(str(row.get("State") or "")),
                 "drive_group": normalize_text(str(row.get("DG") if row.get("DG") is not None else "")),
@@ -3552,6 +3863,27 @@ def parse_storcli_physical_drives(output: str) -> list[dict[str, Any]]:
                 "raw": row,
                 "detail": detail,
             }
+        )
+    return drives
+
+
+def parse_storcli_physical_drives(
+    output: str,
+    warnings: list[str] | None = None,
+    default_controller_id: str | None = None,
+) -> list[dict[str, Any]]:
+    drives: list[dict[str, Any]] = []
+    for controller in _parse_storcli_controllers(
+        output,
+        warnings,
+        default_controller_id,
+    ):
+        drives.extend(
+            _parse_storcli_physical_drive_response(
+                controller["response_data"],
+                controller_id=controller["controller_id"],
+                controller_index=controller["controller_index"],
+            )
         )
     return drives
 
@@ -3587,8 +3919,12 @@ def _collect_storcli_virtual_drive_rows(response_data: dict[str, Any]) -> list[d
     return fallback_rows
 
 
-def parse_storcli_virtual_drives(output: str) -> list[dict[str, Any]]:
-    response_data = _storcli_response_data(output)
+def _parse_storcli_virtual_drive_response(
+    response_data: dict[str, Any],
+    *,
+    controller_id: str,
+    controller_index: int,
+) -> list[dict[str, Any]]:
     rows = _collect_storcli_virtual_drive_rows(response_data)
     details_by_vd = _collect_storcli_virtual_drive_details(response_data)
     virtual_drives: list[dict[str, Any]] = []
@@ -3613,6 +3949,7 @@ def parse_storcli_virtual_drives(output: str) -> list[dict[str, Any]]:
             if slot_key:
                 physical_drives.append(
                     {
+                        "controller_id": controller_id,
                         "slot_key": slot_key,
                         "enclosure_id": enclosure_id,
                         "slot": slot,
@@ -3621,6 +3958,8 @@ def parse_storcli_virtual_drives(output: str) -> list[dict[str, Any]]:
                 )
         virtual_drives.append(
             {
+                "controller_id": controller_id,
+                "controller_index": controller_index,
                 "vd_id": vd_id,
                 "name": normalize_text(str(row.get("Name") or _first_detail_value(detail, "Name") or "")),
                 "raid": normalize_text(str(row.get("TYPE") or row.get("Type") or "")),
@@ -3631,6 +3970,27 @@ def parse_storcli_virtual_drives(output: str) -> list[dict[str, Any]]:
                 "raw": row,
                 "detail": detail,
             }
+        )
+    return virtual_drives
+
+
+def parse_storcli_virtual_drives(
+    output: str,
+    warnings: list[str] | None = None,
+    default_controller_id: str | None = None,
+) -> list[dict[str, Any]]:
+    virtual_drives: list[dict[str, Any]] = []
+    for controller in _parse_storcli_controllers(
+        output,
+        warnings,
+        default_controller_id,
+    ):
+        virtual_drives.extend(
+            _parse_storcli_virtual_drive_response(
+                controller["response_data"],
+                controller_id=controller["controller_id"],
+                controller_index=controller["controller_index"],
+            )
         )
     return virtual_drives
 
@@ -3749,12 +4109,22 @@ def parse_ssh_outputs(
             if controller_info and not parsed.esxi_storcli_controller:
                 parsed.esxi_storcli_controller = controller_info
         elif re.match(r"^storcli /(?:c\d+|call)/vall show all J$", command_key):
+            controller_match = re.match(r"^storcli /(?P<controller>c\d+)/", command_key)
             parsed.esxi_storcli_virtual_drives.extend(
-                parse_storcli_virtual_drives(normalized_outputs[command_key])
+                parse_storcli_virtual_drives(
+                    normalized_outputs[command_key],
+                    parsed.warnings,
+                    controller_match.group("controller") if controller_match else None,
+                )
             )
         elif re.match(r"^storcli /(?:c\d+|call)/eall/sall show all J$", command_key):
+            controller_match = re.match(r"^storcli /(?P<controller>c\d+)/", command_key)
             parsed.esxi_storcli_physical_drives.extend(
-                parse_storcli_physical_drives(normalized_outputs[command_key])
+                parse_storcli_physical_drives(
+                    normalized_outputs[command_key],
+                    parsed.warnings,
+                    controller_match.group("controller") if controller_match else None,
+                )
             )
     if normalized_outputs.get("gmultipath list"):
         parsed.multipath_info = parse_gmultipath_list(normalized_outputs["gmultipath list"])
