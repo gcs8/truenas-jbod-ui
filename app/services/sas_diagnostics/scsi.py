@@ -854,43 +854,7 @@ def _sense_fault_family(reason: str, sense_key: str, asc: tuple[int, int] | None
 
 
 def _sense_likely_layer(family: str) -> str:
-    if family in {"sas_protocol", "link_loss", "timeout"}:
-        return "SAS path, cable, expander, or target port"
-    if family == "bus_reset":
-        return "SCSI/SAS bus recovery"
-    if family == "aborted_command":
-        return "Target or transport aborted command"
-    if family == "logical_unit_communication":
-        return "Target communication path"
-    if family == "target_failure":
-        return "SCSI target/device"
-    if family == "medium_format":
-        return "Target medium/defect management"
-    if family == "failure_prediction":
-        return "Target health prediction"
-    if family == "recovered_data":
-        return "Target media recovery"
-    if family == "write_protect":
-        return "Target write protection"
-    if family == "log_exception":
-        return "SCSI diagnostic log"
-    if family == "power_condition":
-        return "SCSI target power condition"
-    if family == "unit_attention":
-        return "SCSI target state change"
-    if family == "enclosure_warning":
-        return "SES/enclosure health"
-    if family == "pcie_fabric":
-        return "Host PCIe fabric or endpoint"
-    if family == "data_buffer_error":
-        return "SCSI data buffer transfer"
-    if family in {"write_error", "read_error"}:
-        return "Target media or command data path"
-    if family == "ses_enclosure":
-        return "SES/enclosure management path"
-    if family == "protection_error":
-        return "Block protection metadata"
-    return "SCSI target or transport"
+    return fault_family_likely_layer(family)
 
 
 def _sense_description(label: str, family: str) -> str:
