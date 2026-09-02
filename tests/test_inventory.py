@@ -36,6 +36,7 @@ from app.models.domain import (
     StorageViewRuntimeView,
     SystemLocatorStatusView,
 )
+from app.services import inventory as inventory_module
 from app.services.inventory import (
     DiskRecord,
     InventoryService,
@@ -8929,6 +8930,24 @@ Enclosure Status diagnostic page:
             self.assertIn("sudo -n /usr/sbin/nvme smart-log -o json /dev/nvme0", service.ssh_probe.commands)
             self.assertIn("sudo -n /usr/sbin/nvme id-ctrl -o json /dev/nvme0", service.ssh_probe.commands)
             self.assertIn("sudo -n /usr/sbin/nvme id-ns -o json /dev/nvme0n2", service.ssh_probe.commands)
+
+    def test_merged_smart_command_counts_mark_summary_available(self) -> None:
+        slot = SlotView(slot=0, slot_label="0", row_index=0, column_index=0)
+        merged = InventoryService._merge_missing_smart_fields(
+            SmartSummaryView(),
+            SmartSummaryView(read_commands=7),
+        )
+
+        summary = InventoryService._merge_smart_summary(slot, merged)
+
+        self.assertEqual(summary.read_commands, 7)
+        self.assertTrue(summary.available)
+
+    def test_smart_summary_value_field_contract_tracks_the_model(self) -> None:
+        self.assertEqual(
+            set(getattr(inventory_module, "SMART_SUMMARY_VALUE_FIELDS", ())),
+            set(SmartSummaryView.model_fields) - {"available", "message"},
+        )
 
 
 class InventorySlotDetailCacheTests(unittest.TestCase):
