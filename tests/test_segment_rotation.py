@@ -1659,10 +1659,22 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                     self.assertGreater(wal_path.stat().st_size, 0)
                     self.assertFalse(target_catalog.exists())
                     self.assertFalse(activation_pending_path(target_source).exists())
-                    self.assertEqual(
-                        [event["event_type"] for event in target_store.list_slot_events("target-system", "target-enclosure", 1)],
-                        ["live"],
-                    )
+                    with sqlite3.connect(target_source) as verification_connection:
+                        self.assertEqual(
+                            [
+                                row[0]
+                                for row in verification_connection.execute(
+                                    """
+                                    SELECT event_type
+                                    FROM slot_events
+                                    WHERE system_id = ? AND enclosure_key = ? AND slot = ?
+                                    ORDER BY id
+                                    """,
+                                    ("target-system", "target-enclosure", 1),
+                                )
+                            ],
+                            ["live"],
+                        )
                     reader.rollback()
                 finally:
                     reader.close()
