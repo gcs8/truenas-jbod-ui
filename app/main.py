@@ -891,10 +891,20 @@ def create_app() -> FastAPI:
         window_hours: int | None = None,
     ) -> JSONResponse:
         ensure_slot_bounds(get_settings(), slot)
+        registry = get_inventory_registry()
+        service = registry.get_service(system_id)
+        resolved_system_id = service.system.id if system_id is None else system_id
+        add_perf_metadata(
+            system_id=resolved_system_id,
+            platform=service.system.truenas.platform,
+            slot=slot,
+            enclosure_id=enclosure_id,
+            history_window_hours=window_hours,
+        )
         history_backend = get_history_backend()
         payload = await history_backend.get_slot_history(
             slot,
-            system_id,
+            resolved_system_id,
             enclosure_id,
             window_hours=window_hours,
         )
