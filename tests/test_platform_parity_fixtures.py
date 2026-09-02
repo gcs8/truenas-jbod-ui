@@ -500,6 +500,13 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bottom.id, "5eeeeeee00000084::dell-md1280-drawer-bottom-42")
             self.assertEqual(full.id, "5eeeeeee00000084")
             self.assertEqual((top.slot_count, bottom.slot_count), (42, 42))
+            self.assertEqual(snapshot.selected_enclosure_id, top.id)
+            self.assertEqual(snapshot.selected_enclosure_label, top.label)
+            self.assertIsNotNone(snapshot.selected_profile)
+            assert snapshot.selected_profile is not None
+            self.assertEqual(snapshot.selected_profile.id, "dell-md1280-drawer-top-42")
+            self.assertEqual(snapshot.layout_slot_count, top.slot_count)
+            self.assertEqual(len(snapshot.slots), top.slot_count)
 
             with patch.object(
                 service,
@@ -516,6 +523,10 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bottom_snap.layout_slot_count, 42)
             labels = sorted(slot.slot_label for slot in bottom_snap.slots)
             self.assertEqual((labels[0], labels[-1]), ("43", "84"))
+            self.assertEqual(bottom_snap.selected_enclosure_id, bottom.id)
+            self.assertEqual(bottom_snap.selected_enclosure_label, bottom.label)
+            self.assertIsNotNone(bottom_snap.selected_profile)
+            assert bottom_snap.selected_profile is not None
             self.assertEqual(bottom_snap.selected_profile.id, "dell-md1280-drawer-bottom-42")
 
             top_snap = await service.get_snapshot(selected_enclosure_id=top.id)
@@ -524,6 +535,20 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
             )
             top_labels = sorted(int(slot.slot_label) for slot in top_snap.slots)
             self.assertEqual((top_labels[0], top_labels[-1]), (1, 42))
+            self.assertEqual(top_snap.selected_enclosure_id, top.id)
+            self.assertEqual(top_snap.selected_enclosure_label, top.label)
+            self.assertIsNotNone(top_snap.selected_profile)
+            assert top_snap.selected_profile is not None
+            self.assertEqual(top_snap.selected_profile.id, "dell-md1280-drawer-top-42")
+
+            full_snap = await service.get_snapshot(selected_enclosure_id=full.id)
+            self.assertEqual(full_snap.selected_enclosure_id, full.id)
+            self.assertEqual(full_snap.selected_enclosure_label, full.label)
+            self.assertIsNotNone(full_snap.selected_profile)
+            assert full_snap.selected_profile is not None
+            self.assertEqual(full_snap.selected_profile.id, "dell-md1280-drawer-84")
+            self.assertEqual(full_snap.layout_slot_count, 84)
+            self.assertEqual(len(full_snap.slots), 84)
 
 
 if __name__ == "__main__":
