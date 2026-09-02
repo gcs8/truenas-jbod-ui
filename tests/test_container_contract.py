@@ -214,7 +214,7 @@ class ContainerResourceContractTests(unittest.TestCase):
 
         ui_secret_names = set(services["enclosure-ui"]["secrets"])
         admin_secret_names = set(services["enclosure-admin"]["secrets"])
-        self.assertEqual(ui_secret_names, set(EXPECTED_COMPOSE_SECRETS) - {"admin_auth_password"})
+        self.assertEqual(ui_secret_names, set(EXPECTED_COMPOSE_SECRETS))
         self.assertEqual(admin_secret_names, set(EXPECTED_COMPOSE_SECRETS))
 
         for secret_name, env_name in EXPECTED_COMPOSE_SECRETS.items():
@@ -231,6 +231,12 @@ class ContainerResourceContractTests(unittest.TestCase):
                 services["enclosure-ui"]["environment"][env_name],
                 f"/run/secrets/{secret_name}",
             )
+
+        deployment_guide = (
+            REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("all five files into both UI and admin", deployment_guide)
+        self.assertNotIn("only the four appliance/SSH files into the UI", deployment_guide)
 
         for compose_name in COMPOSE_FILES:
             base_compose = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))

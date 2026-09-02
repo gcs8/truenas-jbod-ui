@@ -15,6 +15,12 @@ Remote binding remains supported. The default `0.0.0.0:8082` publication assumes
 
 Auto-stop limits exposure time, but it is not authentication. The Docker socket and writable configuration mounts make reachability the authorization boundary in this mode.
 
+For the main UI on port `8080`, network mode is read-only. Inventory, history,
+SMART, export, and import-preview requests remain available, including the
+read-only POST routes they use. Persistent mapping and alias changes, confirmed
+mapping imports, enclosure or drive LED actions, and system locator changes
+return `403` until Basic authentication is enabled.
+
 ## Docker socket authority
 
 The runtime client deliberately uses only these Docker API operations for the
@@ -44,19 +50,32 @@ from every other service.
 
 ## Basic authentication mode
 
-Use built-in Basic authentication when the clients that can reach the admin port are broader than the trusted-operator population:
+Use built-in Basic authentication to enable authenticated main-UI mutations or
+when the clients that can reach the admin port are broader than the
+trusted-operator population:
 
 ```dotenv
 ADMIN_AUTH_MODE=basic
 ADMIN_AUTH_USERNAME=operator
 ADMIN_AUTH_PASSWORD=replace-with-a-long-random-secret
+APP_PUBLIC_ORIGIN=https://storage-ui.example.local
 ```
 
-Basic authentication protects the admin HTML, static assets, and management APIs. `/livez`, `/healthz`, and the configured metrics path remain anonymous so container health checks and Prometheus scraping continue to work.
+The same credentials protect main-UI mutation endpoints and all admin HTML,
+static assets, and APIs. Main-UI inventory, history, SMART, export, and
+import-preview reads remain anonymous. Main-UI `/livez`, `/healthz`, and the
+configured metrics path also remain anonymous so container health checks and
+Prometheus scraping continue to work.
 
 Basic credentials are only encoded, not encrypted. Use HTTPS through a reverse proxy or a private encrypted VPN. Do not expose Basic authentication over plaintext Internet transport. Keep the password in the ignored local `.env` or another deployment secret source, never in tracked configuration or command output.
 
-Browser mutation requests are accepted only when their `Origin` or `Referer` matches the admin service origin or `ADMIN_PUBLIC_ORIGIN`. Requests without either header remain available to CLI and automation clients. A reverse proxy that replaces Basic authentication with cookies must still provide its own CSRF controls and must prevent direct access to port `8082`.
+Main-UI browser mutations are accepted only when their `Origin` or `Referer`
+matches `APP_PUBLIC_ORIGIN`. Admin browser mutations use the separate
+`ADMIN_PUBLIC_ORIGIN` setting because the services normally publish on different
+ports. Requests without either header remain available to authenticated CLI and
+automation clients. A reverse proxy that replaces Basic authentication with
+cookies must still provide its own CSRF controls and must prevent direct access
+to the underlying service ports.
 
 ## Backup export policy
 

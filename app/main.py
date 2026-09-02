@@ -13,13 +13,19 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.config import Settings, get_settings
+from admin_service.config import get_admin_settings
 from app import __version__
+from app.config import Settings, get_settings
+from app.http_auth import (
+    basic_auth_matches,
+    configured_origin_identity,
+    request_origin_allowed,
+)
 from app.logging_config import configure_logging
 from app.models.domain import (
     InventorySnapshot,
@@ -341,8 +347,40 @@ def _clear_snapshot_export_source_cache_for_tests() -> None:
     SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
 
 
+def require_read_ui_mutation_authorization(request: Request) -> None:
+    auth_settings = request.app.state.operator_auth_settings
+    if auth_settings.auth_mode != "basic":
+        raise HTTPException(
+            status_code=403,
+            detail="Read UI mutations require ADMIN_AUTH_MODE=basic.",
+        )
+    if not basic_auth_matches(
+        request.headers.get("authorization"),
+        auth_settings.auth_username,
+        auth_settings.auth_password,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Read UI authentication required.",
+            headers={"WWW-Authenticate": 'Basic realm="truenas-jbod-ui"'},
+        )
+    if not request_origin_allowed(request, request.app.state.read_ui_public_origin):
+        raise HTTPException(
+            status_code=403,
+            detail="Cross-origin Read UI mutation rejected.",
+        )
+
+
 def create_app() -> FastAPI:
     startup_settings = get_settings()
+    operator_auth_settings = get_admin_settings()
+    if (
+        operator_auth_settings.auth_mode == "basic"
+        and configured_origin_identity(startup_settings.app.public_origin) is None
+    ):
+        raise ValueError(
+            "APP_PUBLIC_ORIGIN must be an absolute HTTP(S) origin when ADMIN_AUTH_MODE=basic."
+        )
     configure_logging(startup_settings)
 
     @asynccontextmanager
@@ -378,6 +416,9 @@ def create_app() -> FastAPI:
         redoc_url="/redoc" if startup_settings.app.debug else None,
         lifespan=lifespan,
     )
+    app.state.operator_auth_settings = operator_auth_settings
+    app.state.read_ui_public_origin = startup_settings.app.public_origin
+
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
     install_metrics(app, service_name="enclosure-ui", version=__version__)
     install_perf_timing_middleware(app, startup_settings)
@@ -498,7 +539,10 @@ def create_app() -> FastAPI:
             selected_enclosure_id=enclosure_id,
         )
 
-    @app.post("/api/sas-fabric/aliases")
+    @app.post(
+        "/api/sas-fabric/aliases",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
     async def save_sas_fabric_alias(
         payload: SasFabricAliasRequest,
         system_id: str | None = None,
@@ -543,7 +587,10 @@ def create_app() -> FastAPI:
             selected_enclosure_id=enclosure_id,
         )
 
-    @app.post("/api/slots/{slot}/led")
+    @app.post(
+        "/api/slots/{slot}/led",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
     async def set_slot_led(
         slot: int,
         payload: LedRequest,
@@ -580,7 +627,11 @@ def create_app() -> FastAPI:
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform)
         return await service.get_system_locator_status()
 
-    @app.post("/api/system-locator", response_model=SystemLocatorStatusView)
+    @app.post(
+        "/api/system-locator",
+        response_model=SystemLocatorStatusView,
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
     async def set_system_locator(
         payload: SystemLocatorRequest,
         system_id: str | None = None,
@@ -597,7 +648,10 @@ def create_app() -> FastAPI:
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post("/api/slots/{slot}/mapping")
+    @app.post(
+        "/api/slots/{slot}/mapping",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
     async def save_mapping(
         slot: int,
         payload: MappingRequest,
@@ -663,7 +717,10 @@ def create_app() -> FastAPI:
             }
         )
 
-    @app.delete("/api/slots/{slot}/mapping")
+    @app.delete(
+        "/api/slots/{slot}/mapping",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
     async def clear_mapping(
         slot: int,
         system_id: str | None = None,
@@ -725,7 +782,10 @@ def create_app() -> FastAPI:
             return JSONResponse(status_code=422, content={"detail": str(exc)})
         return JSONResponse(preview)
 
-    @app.post("/api/mappings/import")
+    @app.post(
+        "/api/mappings/import",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
     async def import_mappings(
         payload: MappingImportConfirmation,
         system_id: str | None = None,
@@ -1188,7 +1248,11 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
-        return JSONResponse({"ok": False, "detail": exc.detail}, status_code=exc.status_code)
+        return JSONResponse(
+            {"ok": False, "detail": exc.detail},
+            status_code=exc.status_code,
+            headers=exc.headers,
+        )
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:

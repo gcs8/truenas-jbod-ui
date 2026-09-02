@@ -80,6 +80,7 @@ def _legacy_container_layout_paths() -> dict[str, str]:
 class AppConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
+    public_origin: str | None = None
     refresh_interval_seconds: int = 30
     snapshot_cache_ttl_seconds: int = 10
     source_bundle_cache_ttl_seconds: int = 60
@@ -435,6 +436,7 @@ class Settings(BaseModel):
 ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "APP_HOST": ("app", "host"),
     "APP_PORT": ("app", "port"),
+    "APP_PUBLIC_ORIGIN": ("app", "public_origin"),
     "APP_REFRESH_INTERVAL": ("app", "refresh_interval_seconds"),
     "APP_SNAPSHOT_CACHE_TTL_SECONDS": ("app", "snapshot_cache_ttl_seconds"),
     "APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS": ("app", "source_bundle_cache_ttl_seconds"),
