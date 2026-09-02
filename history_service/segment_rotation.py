@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -24,6 +25,10 @@ from history_service.segment_migration import (
     _write_private_json_replace,
 )
 from history_service.segment_reader import MAX_SEGMENTS_PER_QUERY, SegmentedHistoryReader
+from history_service.segmented_restore import (
+    read_activation_journal,
+    recover_segmented_restore,
+)
 from history_service.segment_sealer import (
     HISTORY_TABLE_TIMESTAMPS,
     SEGMENT_FILE_MODE,
@@ -48,20 +53,11 @@ _SEGMENT_ID = re.compile(r"segment-(?P<sequence>[0-9]{4})\Z")
 _MAX_BACKUP_AGE = timedelta(hours=36)
 _HEADROOM_SAFETY_BYTES = 1024 * 1024
 _JOURNAL_VERSION = 1
-_MAX_JOURNAL_BYTES = 1024 * 1024
+_QUIESCENCE_OBSERVATION_SECONDS = 0.1
 
 
 def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in payload:
-            raise ValueError("Segment rotation journal contains a duplicate JSON key.")
-        payload[key] = value
-    return payload
 
 
 def _record_file(path: Path, *, final_name: str | None = None) -> dict[str, Any]:
@@ -327,48 +323,16 @@ def _require_output_directory(path: Path) -> Path:
 
 
 def _read_rotation_journal(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-    )
-    try:
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) & 0o077
-            or metadata.st_size > _MAX_JOURNAL_BYTES
-        ):
-            raise ValueError("Segment rotation journal is invalid.")
-        content = os.read(descriptor, _MAX_JOURNAL_BYTES + 1)
-        if len(content) > _MAX_JOURNAL_BYTES or os.read(descriptor, 1):
-            raise ValueError("Segment rotation journal is invalid.")
-        after = os.fstat(descriptor)
-        path_metadata = os.stat(path, follow_symlinks=False)
-        if (
-            (after.st_dev, after.st_ino, after.st_nlink, after.st_size, after.st_mtime_ns)
-            != (metadata.st_dev, metadata.st_ino, metadata.st_nlink, metadata.st_size, metadata.st_mtime_ns)
-            or (path_metadata.st_dev, path_metadata.st_ino)
-            != (metadata.st_dev, metadata.st_ino)
-        ):
-            raise ValueError("Segment rotation journal changed while it was being read.")
-    finally:
-        os.close(descriptor)
-    try:
-        payload = json.loads(content, object_pairs_hook=_reject_duplicate_json_keys)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("Segment rotation journal is invalid.") from exc
+    payload, activation_record = read_activation_journal(path)
     if (
-        not isinstance(payload, dict)
-        or payload.get("journal_version") != _JOURNAL_VERSION
-        or payload.get("operation") != "rotate"
+        payload.get("operation") != "rotate"
         or payload.get("phase") not in ROTATION_JOURNAL_PHASES
     ):
         raise ValueError("Segment rotation journal is invalid.")
     return payload, {
         "file_name": path.name,
-        "sha256": hashlib.sha256(content).hexdigest(),
-        "size_bytes": len(content),
+        "sha256": activation_record["sha256"],
+        "size_bytes": activation_record["size_bytes"],
     }
 
 
@@ -572,6 +536,29 @@ def _require_headroom(source: Path, catalog_path: Path, segments_directory: Path
             raise ValueError("Segment rotation has insufficient disk headroom.")
 
 
+def _require_repeated_quiescence(
+    source: Path,
+    expected: os.stat_result,
+) -> os.stat_result:
+    time.sleep(_QUIESCENCE_OBSERVATION_SECONDS)
+    observed = _require_regular_source(source)
+    if (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mode,
+        observed.st_size,
+        observed.st_mtime_ns,
+    ) != (
+        expected.st_dev,
+        expected.st_ino,
+        expected.st_mode,
+        expected.st_size,
+        expected.st_mtime_ns,
+    ):
+        raise ValueError("Segment rotation source changed during quiescence observation.")
+    return observed
+
+
 def _history_row_counts(path: Path) -> dict[str, int]:
     with sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True) as connection:
         connection.execute("PRAGMA query_only = ON")
@@ -632,7 +619,7 @@ def _rotate_segmented_history_locked(
     )
     _require_newer_backup(prior_catalog, backup_record)
     _require_headroom(source, catalog_path, segments_directory)
-    current_source_metadata = os.stat(source, follow_symlinks=False)
+    current_source_metadata = _require_repeated_quiescence(source, source_metadata)
     if (
         current_source_metadata.st_dev,
         current_source_metadata.st_ino,
@@ -843,12 +830,26 @@ def _recover_pending_rotation_locked(
     apply: bool,
 ) -> dict[str, Any]:
     source = source.absolute()
-    segments_directory = _require_output_directory(segments_directory.absolute())
+    segments_directory = segments_directory.absolute()
+    journal_path = activation_pending_path(source)
+    journal_pair: tuple[dict[str, Any], dict[str, Any]] | None = None
+    if path_entry_exists(journal_path):
+        journal_pair = read_activation_journal(journal_path)
+        if journal_pair[0].get("operation") == "segmented-restore":
+            return recover_segmented_restore(
+                source=source,
+                segments_directory=segments_directory,
+                journal_path=journal_path,
+                journal=journal_pair[0],
+                journal_record=journal_pair[1],
+                apply=apply,
+            )
+        journal_pair = None
+    segments_directory = _require_output_directory(segments_directory)
     source_metadata = _require_regular_source(source)
     _require_source_owner(source_metadata)
     if apply:
         segments_directory = _prepare_output_directory(segments_directory, source_metadata)
-    journal_path = activation_pending_path(source)
     if not path_entry_exists(journal_path):
         catalog_path, catalog, catalog_record = _validated_catalog(source, segments_directory)
         candidate_generation_id, _, _ = _next_generation(catalog)
@@ -902,7 +903,13 @@ def _recover_pending_rotation_locked(
             "recovery_state": "orphan-rollbacks-removed",
             "orphan_paths": [],
         }
-    journal, journal_record = _read_rotation_journal(journal_path)
+    journal, journal_record = (
+        journal_pair
+        if journal_pair is not None
+        else _read_rotation_journal(journal_path)
+    )
+    if journal.get("operation") != "rotate" or journal.get("phase") not in ROTATION_JOURNAL_PHASES:
+        raise ValueError("Segment rotation journal is invalid.")
     phase = str(journal["phase"])
     source_record = journal.get("source")
     prior_catalog_record = journal.get("prior_catalog")

@@ -10,11 +10,11 @@ import sqlite3
 import stat
 import threading
 import time
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
 from history_service.migration_lock import history_write_lock
@@ -415,9 +415,36 @@ class HistoryStore:
         normalized = parsed.astimezone(timezone.utc)
         return normalized, normalized.isoformat()
 
-    def claim_segmented_retention_backup(self, backup_at: datetime | str) -> bool:
+    @contextmanager
+    def segmented_retention_write_lock(self) -> Iterator[None]:
+        with history_write_lock(self.file_path, blocking=False):
+            yield
+
+    @contextmanager
+    def _locked_write_connection(
+        self,
+        *,
+        migration_lock_held: bool = False,
+    ) -> Iterator[sqlite3.Connection]:
+        lock_context = (
+            nullcontext()
+            if migration_lock_held
+            else history_write_lock(self.file_path, blocking=False)
+        )
+        with lock_context:
+            with closing(self._connect(migration_lock_held=True)) as connection:
+                yield connection
+
+    def claim_segmented_retention_backup(
+        self,
+        backup_at: datetime | str,
+        *,
+        migration_lock_held: bool = False,
+    ) -> bool:
         candidate, serialized = self._normalize_retention_backup_at(backup_at)
-        with closing(self._connect()) as connection:
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
@@ -457,10 +484,13 @@ class HistoryStore:
         backup_at: datetime | str,
         *,
         has_more: bool,
+        migration_lock_held: bool = False,
     ) -> None:
         _, serialized = self._normalize_retention_backup_at(backup_at)
         next_state = "ready" if has_more else "consumed"
-        with closing(self._connect()) as connection:
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 cursor = connection.execute(
@@ -478,9 +508,16 @@ class HistoryStore:
                 connection.rollback()
                 raise
 
-    def release_segmented_retention_backup(self, backup_at: datetime | str) -> None:
+    def release_segmented_retention_backup(
+        self,
+        backup_at: datetime | str,
+        *,
+        migration_lock_held: bool = False,
+    ) -> None:
         _, serialized = self._normalize_retention_backup_at(backup_at)
-        with closing(self._connect()) as connection:
+        with self._locked_write_connection(
+            migration_lock_held=migration_lock_held
+        ) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 cursor = connection.execute(
@@ -496,6 +533,35 @@ class HistoryStore:
                 connection.commit()
             except BaseException:
                 connection.rollback()
+                raise
+
+    def run_segmented_retention(
+        self,
+        backup_at: datetime | str,
+        operation: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        with self.segmented_retention_write_lock():
+            if not self.claim_segmented_retention_backup(
+                backup_at,
+                migration_lock_held=True,
+            ):
+                return None
+            retention_completed = False
+            try:
+                result = operation()
+                retention_completed = True
+                self.finish_segmented_retention_backup(
+                    backup_at,
+                    has_more=bool(result.get("has_more")),
+                    migration_lock_held=True,
+                )
+                return result
+            except BaseException:
+                if not retention_completed:
+                    self.release_segmented_retention_backup(
+                        backup_at,
+                        migration_lock_held=True,
+                    )
                 raise
 
     def _connect(self, *, migration_lock_held: bool = False) -> sqlite3.Connection:
@@ -1230,6 +1296,7 @@ class HistoryStore:
         batch_size: int,
         max_batches: int,
         should_continue: Callable[[], bool] | None = None,
+        migration_lock_held: bool = False,
     ) -> dict[str, Any]:
         retention_values = (
             raw_metric_retention_days,
@@ -1273,7 +1340,8 @@ class HistoryStore:
                         connection,
                         cutoffs=cutoffs,
                         batch_size=batch_size,
-                    )
+                    ),
+                    migration_lock_held=migration_lock_held,
                 )
             except Exception as exc:
                 summary["has_more"] = True
@@ -2675,8 +2743,13 @@ class HistoryStore:
 
         return self._execute_write(operation)
 
-    def _execute_write(self, operation: Any) -> Any:
-        with history_write_lock(self.file_path, blocking=False):
+    def _execute_write(self, operation: Any, *, migration_lock_held: bool = False) -> Any:
+        lock_context = (
+            nullcontext()
+            if migration_lock_held
+            else history_write_lock(self.file_path, blocking=False)
+        )
+        with lock_context:
             with self._lock:
                 self._require_no_pending_lifecycle_markers()
                 readonly_repair_attempted = False

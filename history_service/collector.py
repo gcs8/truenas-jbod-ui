@@ -757,30 +757,18 @@ class HistoryCollector:
     ) -> None:
         if not backup_succeeded or not self._retention_due(now):
             return
-        segmented_claimed = False
-        if self.settings.segment_catalog_path is not None:
-            if backup_at is None:
-                return
-            try:
-                segmented_claimed = self.store.claim_segmented_retention_backup(backup_at)
-            except Exception as exc:  # noqa: BLE001 - authorization failure must fail closed.
-                self.last_retention_error = type(exc).__name__
-                logger.warning(
-                    "History retention authorization failed with %s; skipping retention.",
-                    type(exc).__name__,
-                )
-                return
-            if not segmented_claimed:
-                return
+        segmented = self.settings.segment_catalog_path is not None
+        if segmented and backup_at is None:
+            return
         started = time.perf_counter()
         attempted_at = isoformat_utc(now)
-        self.last_retention_attempt_at = attempted_at
-        if backup_at is not None:
-            self.last_retention_backup_at = isoformat_utc(backup_at)
-        self._set_collection_activity("pruning and rolling up history")
-        retention_completed = False
-        try:
-            result = self.store.maintain_retention(
+
+        def maintain_retention() -> dict[str, Any]:
+            self.last_retention_attempt_at = attempted_at
+            if backup_at is not None:
+                self.last_retention_backup_at = isoformat_utc(backup_at)
+            self._set_collection_activity("pruning and rolling up history")
+            return self.store.maintain_retention(
                 now=now,
                 raw_metric_retention_days=self.settings.raw_metric_retention_days,
                 event_retention_days=self.settings.event_retention_days,
@@ -789,22 +777,21 @@ class HistoryCollector:
                 batch_size=self.settings.retention_batch_size,
                 max_batches=self.settings.retention_max_batches_per_run,
                 should_continue=lambda: not self._stopping.is_set(),
+                migration_lock_held=segmented,
             )
-            retention_completed = True
-            if segmented_claimed and backup_at is not None:
-                self.store.finish_segmented_retention_backup(
+
+        try:
+            if segmented:
+                assert backup_at is not None
+                result = self.store.run_segmented_retention(
                     backup_at,
-                    has_more=bool(result.get("has_more")),
+                    maintain_retention,
                 )
+                if result is None:
+                    return
+            else:
+                result = maintain_retention()
         except Exception as exc:  # noqa: BLE001 - retention failure must not stop collection.
-            if segmented_claimed and not retention_completed and backup_at is not None:
-                try:
-                    self.store.release_segmented_retention_backup(backup_at)
-                except Exception as release_exc:  # noqa: BLE001 - failed release remains fail closed.
-                    logger.warning(
-                        "History retention authorization release failed with %s; a newer backup is required.",
-                        type(release_exc).__name__,
-                    )
             duration = time.perf_counter() - started
             self.last_retention_duration_seconds = round(duration, 3)
             self.last_retention_error = type(exc).__name__

@@ -247,6 +247,9 @@ the journal and all evidence in place for repair.
   than the one recorded in the active catalog.
 - Check temporary and final free-space headroom on each affected filesystem
   before copying. Repeat the check before publication if the filesystems differ.
+- Observe the source identity and SQLite sidecar absence twice, with a bounded
+  delay after preflight. Abort before rollback or journal creation when a writer
+  changes the source or creates a sidecar between observations.
 - Allocate monotonic `generation-NNNN`, `segment-NNNN`, and sequence values from
   the authenticated prior catalog. Refuse overflow, collisions, or gaps.
 - Retain every prior active segment in the candidate catalog and append exactly
@@ -342,11 +345,23 @@ before packaging.
 
 Import validates the manifest before payload extraction, checks every member
 size and digest, validates every SQLite member, constructs a local catalog, and
-stages the hot file and complete segment directory. Activation uses one rollback
-journal plus a durable hot-adjacent activation marker. Segmented reads reject
-while that marker exists. The shared history lock and marker remain held through
-commit cleanup or rollback cleanup. If either hot-file or segment-directory
-activation fails, the previous state is restored before the marker is removed.
+stages the hot file and complete segment directory. Both adjacent candidates are
+closed, fsynced, and recorded with exact names, sizes, SHA-256 values,
+device/inode identities, modes, and ownership before the durable hot-adjacent
+activation marker is published. Post-marker activation reauthenticates the live
+prior and staged candidate immediately before rename, rejects any SQLite sidecar,
+uses rename-only publication, and retains exact prior-file and prior-tree records.
+Segmented reads reject while the marker exists.
+
+Recovery authenticates every live, staged, and previous artifact before acting.
+It restores the complete prior generation when publication stopped before both
+candidate targets became live. It finalizes forward only when the live hot file,
+complete segment tree, catalog digests, and catalog generation ID all match the
+journal. A divergent artifact or replaced marker is preserved and recovery fails
+closed. Ordinary commit cleanup applies the same identity-bound authentication to
+the live candidate and parked prior generation. The shared history lock and marker
+remain held through commit cleanup or rollback cleanup, and the marker is removed
+last.
 
 Schema 1 imports remain supported for hot-only deployments. Schema 2 import
 requires `HISTORY_SEGMENT_CATALOG_PATH` on the target. Multi-gigabyte schema 2
@@ -392,7 +407,10 @@ The hot database persists each backup authorization as `ready`, `claimed`, or
 to `ready`; a failed pass is also retryable. A completed pass consumes it. A
 process crash leaves the claim fail-closed so the next pass requires a newer
 successful FULL backup. This durable state prevents a service restart from
-reusing an already consumed backup.
+reusing an already consumed backup. One non-blocking history write lock covers the
+claim, every destructive retention batch, and the completion or release
+transition. Rotation and restore therefore cannot replace the generation between
+authorization and deletion.
 
 Do not delete old segment files by hand. Do not edit `catalog.json` in place.
 
