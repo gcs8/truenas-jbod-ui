@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import tempfile
 import unittest
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -98,32 +99,32 @@ class SSHProbeTests(unittest.TestCase):
         self.assertIn("--api-key=***", redacted)
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
-    def test_client_uses_tofu_host_key_pinning_by_default(
+    def test_client_rejects_unknown_host_keys_by_default(
         self,
         ssh_client_cls: MagicMock,
     ) -> None:
         ssh_client = MagicMock()
         ssh_client_cls.return_value = ssh_client
         ssh_client.connect.return_value = None
-        default_known_hosts_path = SSHConfig().known_hosts_path
 
-        with patch.object(SSHProbe, "_prepare_known_hosts_path", return_value=default_known_hosts_path) as prepare_known_hosts_path:
-            probe = SSHProbe(
-                SSHConfig(
-                    enabled=True,
-                    host="archive-core.example.test",
-                    user="jbodmap",
-                    key_path="/run/ssh/id_truenas",
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(SSHProbe, "_prepare_known_hosts_path") as prepare_known_hosts_path:
+                probe = SSHProbe(
+                    SSHConfig(
+                        enabled=True,
+                        host="archive-core.example.test",
+                        user="jbodmap",
+                        key_path="/run/ssh/id_truenas",
+                        known_hosts_path=f"{temp_dir}/missing-known-hosts",
+                    )
                 )
-            )
 
-            probe._client()
+                probe._client()
 
-        prepare_known_hosts_path.assert_called_once_with(default_known_hosts_path)
-        ssh_client.load_host_keys.assert_called_once_with(default_known_hosts_path)
+        prepare_known_hosts_path.assert_not_called()
+        ssh_client.load_host_keys.assert_not_called()
         policy = ssh_client.set_missing_host_key_policy.call_args.args[0]
-        self.assertIsInstance(policy, AutoPinHostKeyPolicy)
-        self.assertEqual(policy.known_hosts_path, default_known_hosts_path)
+        self.assertIsInstance(policy, paramiko.RejectPolicy)
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_client_uses_password_auth_when_configured(self, ssh_client_cls: MagicMock) -> None:

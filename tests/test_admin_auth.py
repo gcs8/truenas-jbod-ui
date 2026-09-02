@@ -220,12 +220,20 @@ class AdminAuthenticationTests(unittest.TestCase):
 
     def test_browser_mutations_require_same_origin_in_both_auth_modes(self) -> None:
         for settings, authorization in (
-            (AdminSettings(auth_mode="network", auto_stop_seconds=0), None),
+            (
+                AdminSettings(
+                    auth_mode="network",
+                    public_origin="http://admin.example.test",
+                    auto_stop_seconds=0,
+                ),
+                None,
+            ),
             (
                 AdminSettings(
                     auth_mode="basic",
                     auth_username="operator",
                     auth_password=SecretStr(MARKER_ALPHA),
+                    public_origin="http://admin.example.test",
                     auto_stop_seconds=0,
                 ),
                 basic_header("operator", MARKER_ALPHA),
@@ -273,6 +281,22 @@ class AdminAuthenticationTests(unittest.TestCase):
                 self.assertEqual(cross_referer_status, 403)
                 self.assertEqual(same_origin_status, 404)
                 self.assertEqual(cli_status, 404)
+
+    def test_browser_mutations_do_not_trust_a_host_derived_origin(self) -> None:
+        settings = AdminSettings(auth_mode="network", auto_stop_seconds=0)
+        with patch("admin_service.main.get_admin_settings", return_value=settings):
+            app = create_app()
+
+        status, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                origin="http://admin.example.test",
+            )
+        )
+
+        self.assertEqual(status, 403)
 
     def test_configured_public_origin_is_accepted_behind_reverse_proxy(self) -> None:
         settings = AdminSettings(

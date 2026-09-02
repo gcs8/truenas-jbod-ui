@@ -842,21 +842,13 @@ def _apply_config_path_relative_defaults(
             merged_paths[key] = derived[key]
 
     merged_ssh = merged.setdefault("ssh", {})
-    if (
-        "known_hosts_path" not in merged_ssh
-        or merged_ssh.get("known_hosts_path") in {defaults["ssh"]["known_hosts_path"], legacy["known_hosts_path"]}
-    ):
-        merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
+    merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
 
     for system_payload in merged.get("systems") or []:
         if not isinstance(system_payload, dict):
             continue
         ssh_payload = system_payload.setdefault("ssh", {})
-        if (
-            "known_hosts_path" not in ssh_payload
-            or ssh_payload.get("known_hosts_path") in {defaults["ssh"]["known_hosts_path"], legacy["known_hosts_path"]}
-        ):
-            ssh_payload["known_hosts_path"] = derived["known_hosts_path"]
+        ssh_payload["known_hosts_path"] = derived["known_hosts_path"]
 
     return merged
 

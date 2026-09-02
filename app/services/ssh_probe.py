@@ -332,11 +332,10 @@ class SSHProbe:
 
         if self.config.strict_host_key_checking:
             if self.config.known_hosts_path:
-                known_hosts_path = self._prepare_known_hosts_path(self.config.known_hosts_path)
-                client.load_host_keys(known_hosts_path)
-                client.set_missing_host_key_policy(AutoPinHostKeyPolicy(known_hosts_path))
-            else:
-                client.set_missing_host_key_policy(paramiko.RejectPolicy())
+                known_hosts_path = Path(self.config.known_hosts_path)
+                if known_hosts_path.is_file():
+                    client.load_host_keys(str(known_hosts_path))
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
         else:
             if self.config.known_hosts_path:
                 known_hosts_path = self._prepare_known_hosts_path(self.config.known_hosts_path)

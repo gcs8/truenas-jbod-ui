@@ -2256,6 +2256,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
     def test_quantastor_node_discovery_route_fills_hosts_from_ssh_gateway_ports(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/quantastor-nodes")
+        settings = Settings(ssh=SSHConfig(known_hosts_path="/runtime/data/known_hosts"))
         client = AsyncMock()
         client.fetch_all.return_value = TrueNASRawData(
             enclosures=[],
@@ -2303,27 +2304,29 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             ]
         )
 
-        with patch("admin_service.main.QuantastorRESTClient", return_value=client):
-            with patch("admin_service.main.SSHProbe", return_value=probe):
-                response = asyncio.run(
-                    route.endpoint(
-                        QuantastorNodeDiscoveryRequest(
-                            truenas_host="https://quantastor.example.test",
-                            api_user="jbodmap",
-                            api_password="secret",
-                            verify_ssl=False,
-                            ssh_enabled=True,
-                            ssh_host="quantastor.example.test",
-                            ssh_user="jbodmap",
-                            ssh_key_path="/run/ssh/id_jbodmap",
-                            ssh_known_hosts_path="/app/data/known_hosts",
-                            ha_nodes=[
-                                {"system_id": "node-a", "label": "ExampleQS Left", "host": "192.0.2.30"},
-                                {"system_id": "node-b", "label": "ExampleQS Right"},
-                            ],
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.QuantastorRESTClient", return_value=client):
+                with patch("admin_service.main.SSHProbe", return_value=probe) as ssh_probe:
+                    response = asyncio.run(
+                        route.endpoint(
+                            QuantastorNodeDiscoveryRequest(
+                                truenas_host="https://quantastor.example.test",
+                                api_user="jbodmap",
+                                api_password="secret",
+                                verify_ssl=False,
+                                ssh_enabled=True,
+                                ssh_host="quantastor.example.test",
+                                ssh_user="jbodmap",
+                                ssh_key_path="/run/ssh/id_jbodmap",
+                                ssh_known_hosts_path="/request-selected-known-hosts",
+                                ssh_strict_host_key_checking=False,
+                                ha_nodes=[
+                                    {"system_id": "node-a", "label": "ExampleQS Left", "host": "192.0.2.30"},
+                                    {"system_id": "node-b", "label": "ExampleQS Right"},
+                                ],
+                            )
                         )
                     )
-                )
 
         payload = json.loads(response.body.decode("utf-8"))
 
@@ -2332,6 +2335,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["host_discovery"]["ok"])
         self.assertEqual(payload["host_discovery"]["filled_hosts"], 1)
         probe.run_commands.assert_awaited_once()
+        self.assertEqual(ssh_probe.call_args.args[0].known_hosts_path, "/runtime/data/known_hosts")
 
     def test_live_enclosures_route_returns_resolved_profile_info(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/storage-views/live-enclosures")
