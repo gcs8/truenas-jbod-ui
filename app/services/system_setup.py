@@ -16,6 +16,7 @@ from app.config import (
     StorageViewRenderConfig,
     SystemConfig,
     TrueNASConfig,
+    _derive_runtime_layout_paths,
     _normalize_system_id,
     normalize_text,
 )
@@ -403,7 +404,7 @@ class SystemSetupService:
                         payload.ssh_sudo_password,
                         existing_system.ssh.sudo_password if existing_system is not None else None,
                     ),
-                    known_hosts_path=payload.ssh_known_hosts_path,
+                    known_hosts_path=_derive_runtime_layout_paths(self.config_path)["known_hosts_path"],
                     strict_host_key_checking=payload.ssh_strict_host_key_checking,
                     timeout_seconds=(
                         existing_system.ssh.timeout_seconds

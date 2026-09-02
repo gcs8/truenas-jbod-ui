@@ -932,7 +932,6 @@ class SystemSetupRequest(BaseModel):
     ssh_key_path: str | None = "/run/ssh/id_truenas"
     ssh_password: str | None = None
     ssh_sudo_password: str | None = None
-    ssh_known_hosts_path: str | None = "/app/data/known_hosts"
     ssh_strict_host_key_checking: bool = True
     ssh_timeout_seconds: int = 15
     ssh_commands: list[str] = Field(default_factory=list)
@@ -959,7 +958,6 @@ class SystemSetupRequest(BaseModel):
         "ssh_host",
         "ssh_user",
         "ssh_key_path",
-        "ssh_known_hosts_path",
         "bmc_host",
         "bmc_username",
         "default_profile_id",
@@ -1129,7 +1127,6 @@ class QuantastorNodeDiscoveryRequest(BaseModel):
     ssh_user: str | None = None
     ssh_key_path: str | None = None
     ssh_password: str | None = None
-    ssh_known_hosts_path: str | None = "/app/data/known_hosts"
     ssh_strict_host_key_checking: bool = True
     ssh_timeout_seconds: int = 15
     ha_nodes: list[HANodeRequest] = Field(default_factory=list)
@@ -1143,7 +1140,6 @@ class QuantastorNodeDiscoveryRequest(BaseModel):
         "ssh_host",
         "ssh_user",
         "ssh_key_path",
-        "ssh_known_hosts_path",
     )
     @classmethod
     def sanitize_text_fields(cls, value: str | None) -> str | None:
@@ -1199,7 +1195,6 @@ class SystemSetupBootstrapRequest(BaseModel):
     bootstrap_password: str | None = None
     bootstrap_sudo_password: str | None = None
     bootstrap_key_path: str | None = None
-    bootstrap_known_hosts_path: str | None = "/app/data/known_hosts"
     bootstrap_strict_host_key_checking: bool = True
     timeout_seconds: int = 15
     service_user: str = "jbodmap"
@@ -1214,7 +1209,6 @@ class SystemSetupBootstrapRequest(BaseModel):
         "host",
         "bootstrap_user",
         "bootstrap_key_path",
-        "bootstrap_known_hosts_path",
         "service_user",
         "service_shell",
         "service_key_name",
@@ -1272,12 +1266,11 @@ class ESXiHostPrepInstallRequest(BaseModel):
     user: str
     key_path: str | None = None
     password: str | None = None
-    known_hosts_path: str | None = "/app/data/known_hosts"
     strict_host_key_checking: bool = True
     timeout_seconds: int = 15
     upload_token: str
 
-    @field_validator("system_id", "host", "user", "key_path", "known_hosts_path", "upload_token")
+    @field_validator("system_id", "host", "user", "key_path", "upload_token")
     @classmethod
     def sanitize_text_fields(cls, value: str | None) -> str | None:
         return trim_optional_text(value, max_length=4096)

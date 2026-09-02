@@ -86,6 +86,12 @@ test("cleared SSH user remains intentionally blank in the setup payload", () => 
   assert.equal(payload.ssh_user, null);
 });
 
+test("setup payload does not expose a caller-controlled known-hosts path", () => {
+  const payload = collectSetupPayload();
+
+  assert.equal(Object.hasOwn(payload, "ssh_known_hosts_path"), false);
+});
+
 test("bootstrap rejects a deliberately blank service user", () => {
   const collectBootstrapSource = sourceBetween(
     "  function collectBootstrapPayload()",
@@ -108,7 +114,6 @@ test("bootstrap rejects a deliberately blank service user", () => {
         ssh_host: "host.example.test",
         ssh_port: 22,
         ssh_user: null,
-        ssh_known_hosts_path: "/app/data/known_hosts",
         ssh_strict_host_key_checking: true,
       }),
       elements,

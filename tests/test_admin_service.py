@@ -2256,6 +2256,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
     def test_quantastor_node_discovery_route_fills_hosts_from_ssh_gateway_ports(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/quantastor-nodes")
+        settings = Settings(ssh=SSHConfig(known_hosts_path="/runtime/data/known_hosts"))
         client = AsyncMock()
         client.fetch_all.return_value = TrueNASRawData(
             enclosures=[],
@@ -2303,27 +2304,29 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             ]
         )
 
-        with patch("admin_service.main.QuantastorRESTClient", return_value=client):
-            with patch("admin_service.main.SSHProbe", return_value=probe):
-                response = asyncio.run(
-                    route.endpoint(
-                        QuantastorNodeDiscoveryRequest(
-                            truenas_host="https://quantastor.example.test",
-                            api_user="jbodmap",
-                            api_password="secret",
-                            verify_ssl=False,
-                            ssh_enabled=True,
-                            ssh_host="quantastor.example.test",
-                            ssh_user="jbodmap",
-                            ssh_key_path="/run/ssh/id_jbodmap",
-                            ssh_known_hosts_path="/app/data/known_hosts",
-                            ha_nodes=[
-                                {"system_id": "node-a", "label": "ExampleQS Left", "host": "192.0.2.30"},
-                                {"system_id": "node-b", "label": "ExampleQS Right"},
-                            ],
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.QuantastorRESTClient", return_value=client):
+                with patch("admin_service.main.SSHProbe", return_value=probe) as ssh_probe:
+                    response = asyncio.run(
+                        route.endpoint(
+                            QuantastorNodeDiscoveryRequest(
+                                truenas_host="https://quantastor.example.test",
+                                api_user="jbodmap",
+                                api_password="secret",
+                                verify_ssl=False,
+                                ssh_enabled=True,
+                                ssh_host="quantastor.example.test",
+                                ssh_user="jbodmap",
+                                ssh_key_path="/run/ssh/id_jbodmap",
+                                ssh_known_hosts_path="/request-selected-known-hosts",
+                                ssh_strict_host_key_checking=False,
+                                ha_nodes=[
+                                    {"system_id": "node-a", "label": "ExampleQS Left", "host": "192.0.2.30"},
+                                    {"system_id": "node-b", "label": "ExampleQS Right"},
+                                ],
+                            )
                         )
                     )
-                )
 
         payload = json.loads(response.body.decode("utf-8"))
 
@@ -2332,6 +2335,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["host_discovery"]["ok"])
         self.assertEqual(payload["host_discovery"]["filled_hosts"], 1)
         probe.run_commands.assert_awaited_once()
+        self.assertEqual(ssh_probe.call_args.args[0].known_hosts_path, "/runtime/data/known_hosts")
 
     def test_live_enclosures_route_returns_resolved_profile_info(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/storage-views/live-enclosures")
@@ -2706,6 +2710,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
     def test_esxi_host_prep_install_route_returns_install_status_payload(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/esxi-host-prep/install")
+        settings = Settings(ssh=SSHConfig(known_hosts_path="/runtime/data/known_hosts"))
         host_prep_service = MagicMock()
         host_prep_service.install_package.return_value = {
             "ok": False,
@@ -2720,17 +2725,20 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             {"token": "storcli-1", "filename": "BCM-vmware-storcli64.zip"}
         ]
 
-        with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
-            response = asyncio.run(
-                route.endpoint(
-                    payload=ESXiHostPrepInstallRequest(
-                        host="192.0.2.121",
-                        user="root",
-                        password="secret",
-                        upload_token="storcli-1",
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+                response = asyncio.run(
+                    route.endpoint(
+                        payload=ESXiHostPrepInstallRequest(
+                            host="192.0.2.121",
+                            user="root",
+                            password="secret",
+                            known_hosts_path="/request-selected-known-hosts",
+                            strict_host_key_checking=False,
+                            upload_token="storcli-1",
+                        )
                     )
                 )
-            )
 
         payload = json.loads(response.body.decode("utf-8"))
 
@@ -2739,6 +2747,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertFalse(payload["install_ok"])
         self.assertIn("no compatible MegaRAID controller", payload["detail"])
         self.assertEqual(payload["packages"][0]["token"], "storcli-1")
+        self.assertEqual(
+            host_prep_service.install_package.call_args.kwargs["known_hosts_path"],
+            "/runtime/data/known_hosts",
+        )
 
     def test_system_setup_request_preserves_distinct_quantastor_label_only_nodes(self) -> None:
         payload = SystemSetupRequest(

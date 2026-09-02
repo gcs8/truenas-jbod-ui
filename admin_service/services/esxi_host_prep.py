@@ -74,7 +74,12 @@ class ESXiHostPrepService:
         (package_dir / "meta.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         return self._load_package(package_dir) or metadata
 
-    def install_package(self, payload: ESXiHostPrepInstallRequest) -> dict[str, Any]:
+    def install_package(
+        self,
+        payload: ESXiHostPrepInstallRequest,
+        *,
+        known_hosts_path: str | None = None,
+    ) -> dict[str, Any]:
         package = self.get_staged_package(payload.upload_token)
         local_path = Path(str(package["staged_path"]))
         filename = str(package.get("filename") or local_path.name)
@@ -85,7 +90,7 @@ class ESXiHostPrepService:
             user=payload.user,
             key_path=payload.key_path or "",
             password=payload.password or "",
-            known_hosts_path=payload.known_hosts_path,
+            known_hosts_path=known_hosts_path,
             strict_host_key_checking=payload.strict_host_key_checking,
             timeout_seconds=payload.timeout_seconds,
             commands=[],

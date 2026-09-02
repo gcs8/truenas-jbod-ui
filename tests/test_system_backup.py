@@ -4024,6 +4024,49 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(saved["systems"][0]["truenas"]["host"], "10.88.88.20")
         self.assertEqual(saved["systems"][0]["ssh"]["host"], "10.88.88.20")
 
+    def test_create_system_derives_known_hosts_path_instead_of_persisting_request_value(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(config_path, {})
+
+        service = SystemSetupService(str(config_path))
+        service.create_system(
+            SystemSetupRequest(
+                label="Example CORE",
+                platform="core",
+                truenas_host="https://core.example.test",
+                ssh_enabled=True,
+                ssh_user="jbodmap",
+                ssh_known_hosts_path=str(temp_dir / "request-selected-known-hosts"),
+            )
+        )
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["systems"][0]["ssh"]["known_hosts_path"], str(temp_dir / "known_hosts"))
+
+    def test_settings_normalizes_legacy_system_known_hosts_path(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(
+            config_path,
+            {
+                "systems": [
+                    {
+                        "id": "legacy-core",
+                        "ssh": {"known_hosts_path": str(temp_dir / "legacy-request-selected")},
+                    }
+                ]
+            },
+        )
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(config_path)}, clear=False):
+            get_settings.cache_clear()
+            settings = get_settings()
+            get_settings.cache_clear()
+
+        self.assertEqual(settings.systems[0].ssh.known_hosts_path, str(temp_dir / "known_hosts"))
+
     def test_create_system_can_persist_password_only_ssh_without_key_path(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         config_path = temp_dir / "config.yaml"

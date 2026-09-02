@@ -191,15 +191,8 @@ def _request_origin_allowed(request: Request, settings: AdminSettings) -> bool:
     candidate = _origin_identity(supplied_origin)
     if candidate is None:
         return False
-    allowed_origins = {
-        identity
-        for identity in (
-            _origin_identity(str(request.base_url)),
-            _origin_identity(settings.public_origin),
-        )
-        if identity is not None
-    }
-    return candidate in allowed_origins
+    configured_origin = _origin_identity(settings.public_origin)
+    return configured_origin is not None and candidate == configured_origin
 
 
 def validate_admin_export_policy(
@@ -769,10 +762,6 @@ def create_app() -> FastAPI:
                             and same_saved_text(payload.user, system.ssh.user)
                             and payload.strict_host_key_checking
                             == system.ssh.strict_host_key_checking
-                            and same_saved_text(
-                                payload.known_hosts_path,
-                                system.ssh.known_hosts_path,
-                            )
                         ),
                     )
                 }
@@ -781,7 +770,11 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         service = get_esxi_host_prep_service()
         try:
-            result = await asyncio.to_thread(service.install_package, payload)
+            result = await asyncio.to_thread(
+                service.install_package,
+                payload,
+                known_hosts_path=settings.ssh.known_hosts_path,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(
@@ -918,10 +911,6 @@ def create_app() -> FastAPI:
                             )
                             and payload.ssh_strict_host_key_checking
                             == system.ssh.strict_host_key_checking
-                            and same_saved_text(
-                                payload.ssh_known_hosts_path,
-                                system.ssh.known_hosts_path,
-                            )
                         ),
                     ),
                 }
@@ -948,7 +937,12 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         nodes = serialize_quantastor_nodes(raw_data)
         merge_quantastor_node_hosts(nodes, quantastor_request_node_host_map(payload))
-        host_discovery = await enrich_quantastor_nodes_from_ssh(payload, raw_data, nodes)
+        host_discovery = await enrich_quantastor_nodes_from_ssh(
+            payload,
+            raw_data,
+            nodes,
+            known_hosts_path=settings.ssh.known_hosts_path,
+        )
         return JSONResponse({"ok": True, "nodes": nodes, "host_discovery": host_discovery})
 
     @app.post("/api/admin/system-setup")
@@ -1607,7 +1601,6 @@ def serialize_systems(settings: Settings) -> list[dict[str, Any]]:
             "ssh_password_configured": bool(system.ssh.password),
             "ssh_sudo_password": "",
             "ssh_sudo_password_configured": bool(system.ssh.sudo_password),
-            "ssh_known_hosts_path": system.ssh.known_hosts_path,
             "ssh_strict_host_key_checking": bool(system.ssh.strict_host_key_checking),
             "ssh_timeout_seconds": system.ssh.timeout_seconds,
             "ssh_commands": list(system.ssh.commands),
@@ -1767,6 +1760,8 @@ async def enrich_quantastor_nodes_from_ssh(
     payload: QuantastorNodeDiscoveryRequest,
     raw_data: Any,
     nodes: list[dict[str, Any]],
+    *,
+    known_hosts_path: str | None = None,
 ) -> dict[str, Any]:
     missing_hosts = [node for node in nodes if not normalize_text(node.get("host"))]
     if not missing_hosts:
@@ -1811,7 +1806,7 @@ async def enrich_quantastor_nodes_from_ssh(
             user=payload.ssh_user or "",
             key_path=payload.ssh_key_path or "",
             password=payload.ssh_password or "",
-            known_hosts_path=payload.ssh_known_hosts_path,
+            known_hosts_path=known_hosts_path,
             strict_host_key_checking=payload.ssh_strict_host_key_checking,
             timeout_seconds=payload.ssh_timeout_seconds,
             commands=[],

@@ -8,7 +8,7 @@ from typing import Callable
 
 from cryptography.hazmat.primitives import serialization
 
-from app.config import SSHConfig
+from app.config import SSHConfig, _derive_runtime_layout_paths
 from app.models.domain import SystemSetupBootstrapRequest
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.ssh_probe import SSHProbe
@@ -163,7 +163,7 @@ class ServiceAccountBootstrapService:
             key_path=payload.bootstrap_key_path or "",
             password=payload.bootstrap_password or "",
             sudo_password=payload.bootstrap_sudo_password or "",
-            known_hosts_path=payload.bootstrap_known_hosts_path,
+            known_hosts_path=_derive_runtime_layout_paths(self.config_path)["known_hosts_path"],
             strict_host_key_checking=payload.bootstrap_strict_host_key_checking,
             timeout_seconds=payload.timeout_seconds,
             commands=[],

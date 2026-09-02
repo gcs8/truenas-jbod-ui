@@ -202,7 +202,6 @@
     setupSshPassword: document.getElementById("setup-ssh-password"),
     setupSshSudoPasswordField: document.getElementById("setup-ssh-sudo-password-field"),
     setupSshSudoPassword: document.getElementById("setup-ssh-sudo-password"),
-    setupSshKnownHosts: document.getElementById("setup-ssh-known-hosts"),
     setupSshStrictHostKey: document.getElementById("setup-ssh-strict-host-key"),
     setupBootstrapPanel: document.getElementById("setup-bootstrap-panel"),
     setupBootstrapCopy: document.getElementById("setup-bootstrap-copy"),
@@ -4550,9 +4549,6 @@
       elements.setupSshSudoPassword,
       savedSecretConfigured(system, "ssh_sudo_password_configured", "ssh_sudo_password")
     );
-    if (elements.setupSshKnownHosts) {
-      elements.setupSshKnownHosts.value = system.ssh_known_hosts_path || "/app/data/known_hosts";
-    }
     if (elements.setupSshStrictHostKey) {
       elements.setupSshStrictHostKey.checked = system.ssh_strict_host_key_checking !== false;
     }
@@ -4692,7 +4688,6 @@
             preserve: preserveRedactedSecrets,
           })
         : null,
-      ssh_known_hosts_path: elements.setupSshKnownHosts?.value?.trim() || null,
       ssh_strict_host_key_checking: Boolean(elements.setupSshStrictHostKey?.checked),
       ssh_timeout_seconds: Number(loadedSystem?.ssh_timeout_seconds) || 15,
       ssh_commands: collectSetupCommands(),
