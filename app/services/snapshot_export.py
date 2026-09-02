@@ -156,7 +156,8 @@ class SnapshotRedactor:
         self._collect_known_values(smart_summary_cache)
         for payload in extra_payloads or []:
             self._collect_known_values(payload)
-        self.serial_suffix_counts = Counter(self._serial_suffix(value) for value in self.serial_values if self._serial_suffix(value))
+        distinct_serials = {re.sub(r"\s+", "", value.strip()).upper() for value in self.serial_values}
+        self.serial_suffix_counts = Counter(self._serial_suffix(value) for value in distinct_serials if self._serial_suffix(value))
         self.token_replacements = self._build_token_replacements()
 
     def redact_snapshot(self, snapshot: InventorySnapshot) -> InventorySnapshot:

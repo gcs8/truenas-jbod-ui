@@ -1508,9 +1508,9 @@ class SnapshotRedactorIdentifierKeyTests(unittest.TestCase):
         self.assertEqual(raw_status["transport_address"], "0x50...c3f1")
         self.assertEqual(raw_status["linux_blockdevice"]["wwn"], "0x50...c3d5")
         self.assertEqual(raw_status["linux_blockdevice"]["partuuid"], "3f25...3301")
-        # The same serial appears under two keys, so the suffix-collision form is expected.
-        self.assertEqual(raw_status["linux_blockdevice"]["serial"], "MA...0001")
-        self.assertEqual(redacted.slots[0].serial, "MA...0001")
+        # Mirrored copies of one serial must not widen the disclosed prefix.
+        self.assertEqual(raw_status["linux_blockdevice"]["serial"], "...0001")
+        self.assertEqual(redacted.slots[0].serial, "...0001")
         for original in (
             "BMCSERIAL9999",
             "5000c500a1b2c3e0",
@@ -1519,6 +1519,16 @@ class SnapshotRedactorIdentifierKeyTests(unittest.TestCase):
             "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
         ):
             self.assertNotIn(original, redacted.model_dump_json())
+
+    def test_partial_redaction_disambiguates_distinct_serials_with_the_same_suffix(self) -> None:
+        snapshot = build_snapshot()
+        snapshot.slots[0].serial = "FIRSTSERIAL0001"
+        snapshot.slots[0].raw_status = {"serial_hint": "SECONDSERIAL0001"}
+
+        redacted = SnapshotRedactor(snapshot, {}, {}).redact_snapshot(snapshot)
+
+        self.assertEqual(redacted.slots[0].serial, "FI...0001")
+        self.assertEqual(redacted.slots[0].raw_status["serial_hint"], "SE...0001")
 
 
 if __name__ == "__main__":
