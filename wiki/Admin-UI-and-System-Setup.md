@@ -66,6 +66,15 @@ By default the admin sidecar:
 - stays separate from the main UI so the read path can remain standalone if
   you do not want the extra write-capable maintenance surface up all the time
 
+`ADMIN_AUTO_STOP_SECONDS=0` disables auto-stop. A positive integer is the
+number of seconds before shutdown; negative or malformed values are rejected.
+The published Compose files explicitly default to `3600`. If you change this
+environment value, recreate the admin container so the process receives it:
+
+```bash
+docker compose --profile admin up -d --force-recreate enclosure-admin
+```
+
 If the admin sidecar is reachable, the main UI on `:8080` also shows a
 `System Setup` button that opens the same page in a new tab.
 

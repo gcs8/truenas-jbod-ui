@@ -1303,7 +1303,7 @@ class AdminStatePayloadTests(unittest.TestCase):
                     with patch("admin_service.main.get_release_status_service", return_value=release_service):
                         with patch(
                             "admin_service.main.get_admin_settings",
-                            return_value=AdminSettings(auto_stop_seconds=3600),
+                            return_value=AdminSettings(),
                         ):
                             with patch(
                                 "admin_service.main.get_history_settings",
@@ -1313,6 +1313,8 @@ class AdminStatePayloadTests(unittest.TestCase):
 
         self.assertEqual(payload["release_status"]["status"], "dev-build")
         self.assertEqual(payload["release_status"]["latest_tag"], "v0.14.1")
+        self.assertEqual(payload["admin"]["auto_stop_seconds"], 0)
+        self.assertIsNone(payload["admin"]["expires_at"])
 
     def test_build_admin_state_payload_redacts_saved_secret_fields(self) -> None:
         settings = Settings(

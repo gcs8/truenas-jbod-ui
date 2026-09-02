@@ -457,6 +457,15 @@ By default the admin sidecar stops itself after `3600` seconds. Change that in
 ADMIN_AUTO_STOP_SECONDS=3600
 ```
 
+`ADMIN_AUTO_STOP_SECONDS=0` disables auto-stop. Positive integers set the
+timeout in seconds; negative or malformed values fail startup validation. After
+changing the environment value, recreate the admin container so its process
+environment is updated:
+
+```bash
+docker compose --profile admin up -d --force-recreate enclosure-admin
+```
+
 Use [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for the walkthrough.
 
 ## Start Everything
