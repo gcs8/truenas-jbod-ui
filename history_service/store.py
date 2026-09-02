@@ -333,7 +333,35 @@ class HistoryStore:
         self._segment_reader_identity: tuple[int, int, int, int] | None = None
         self._segment_reader_cache: SegmentedHistoryReader | None = None
         with history_write_lock(self.file_path, blocking=False):
+            self._require_no_pending_lifecycle_markers()
             self._initialize(migration_lock_held=True)
+
+    def _require_no_pending_lifecycle_markers(self) -> None:
+        """
+        Refuse to touch the hot database while a rotation, migration, or
+        segmented restore is pending.
+
+        The markers are honoured by the segmented reader, but `_initialize`
+        (schema executescript, column adds, table-count sync, journal-mode
+        switch) and the collector's writes used to run regardless. A service
+        restart during a pending journal then mutated the hot file, and
+        `rotate --recover` could match neither the prior nor the candidate
+        digest (issue #174). Raise the same error type the migration lock
+        raises so callers keep one failure path.
+        """
+        if path_entry_exists(activation_pending_path(self.file_path)):
+            raise sqlite3.OperationalError(
+                "Segmented history activation is pending; refusing to open the history "
+                "database for writes until the pending rotation or restore is recovered."
+            )
+        if self.segment_catalog_path is None:
+            return
+        pending_path = self.segment_catalog_path.parent / MIGRATION_PENDING_MARKER
+        if path_entry_exists(pending_path):
+            raise sqlite3.OperationalError(
+                "Segmented history migration recovery is pending; refusing to open the history "
+                "database for writes until the pending migration is recovered."
+            )
 
     def _segmented_reader(self) -> SegmentedHistoryReader | None:
         if self.segment_catalog_path is None:
@@ -2650,6 +2678,7 @@ class HistoryStore:
     def _execute_write(self, operation: Any) -> Any:
         with history_write_lock(self.file_path, blocking=False):
             with self._lock:
+                self._require_no_pending_lifecycle_markers()
                 readonly_repair_attempted = False
                 lock_retry_count = 0
                 while True:
