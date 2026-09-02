@@ -1,12 +1,15 @@
+import json
 import unittest
 from unittest.mock import patch
 
 from app.services.parsers import (
+    _apply_enclosure_sysfs_device_names,
     _merge_ses_enclosures,
     SESMapEnclosure,
     SESMapSlot,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
+    merge_slot_candidate_maps,
     parse_camcontrol_devlist,
     parse_enclosure_sysfs_map,
     parse_esxcli_smart_get,
@@ -349,6 +352,136 @@ Slot00 [0,0]  Element type: Array device slot
         self.assertEqual(parsed.esxi_storcli_physical_drives[0]["connector_name"], "C0 x4")
         self.assertEqual(parsed.esxi_storcli_physical_drives[0]["temperature_c"], 34)
         self.assertEqual(parsed.esxi_storcli_physical_drives[1]["media_errors"], 262)
+
+    def test_parse_storcli_physical_drives_reads_all_controller_blocks(self) -> None:
+        output = json.dumps(
+            {
+                "Controllers": [
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "Drive Information": [
+                                {"Ctl": "c0", "EID:Slt": "252:0", "State": "JBOD"},
+                            ]
+                        },
+                    },
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "Drive Information": [
+                                {"Ctl": "c1", "EID:Slt": "252:1", "State": "Onln"},
+                            ]
+                        },
+                    },
+                ]
+            }
+        )
+
+        parsed = parse_storcli_physical_drives(output)
+
+        self.assertEqual([drive["controller_id"] for drive in parsed], ["c0", "c1"])
+        self.assertEqual([drive["slot_key"] for drive in parsed], ["252:0", "252:1"])
+
+    def test_parse_storcli_uses_controller_id_from_single_controller_command(self) -> None:
+        output = json.dumps(
+            {
+                "Controllers": [
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "Drive Information": [
+                                {"EID:Slt": "252:0", "State": "JBOD"},
+                            ]
+                        },
+                    }
+                ]
+            }
+        )
+
+        parsed = parse_ssh_outputs(
+            {"storcli /c7/eall/sall show all J": output},
+            slot_count=1,
+            enclosure_filter=None,
+        )
+
+        self.assertEqual(parsed.esxi_storcli_physical_drives[0]["controller_id"], "c7")
+
+    def test_parse_storcli_virtual_drives_reads_all_controller_blocks(self) -> None:
+        output = json.dumps(
+            {
+                "Controllers": [
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "VD LIST": [
+                                {"DG/VD": "0/0", "Name": "boot", "TYPE": "RAID1", "State": "Optl"},
+                            ],
+                            "PDs for VD 0": [{"EID:Slt": "252:0"}],
+                        },
+                    },
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "VD LIST": [
+                                {"DG/VD": "1/1", "Name": "data", "TYPE": "RAID5", "State": "Optl"},
+                            ],
+                            "PDs for VD 1": [{"EID:Slt": "252:0"}],
+                        },
+                    },
+                ]
+            }
+        )
+
+        parsed = parse_ssh_outputs(
+            {"storcli /call/vall show all J": output},
+            slot_count=2,
+            enclosure_filter=None,
+        )
+
+        self.assertEqual(
+            [
+                (
+                    drive["controller_id"],
+                    drive["name"],
+                    drive["raid"],
+                    drive["physical_drives"][0]["controller_id"],
+                )
+                for drive in parsed.esxi_storcli_virtual_drives
+            ],
+            [("c0", "boot", "RAID1", "c0"), ("c1", "data", "RAID5", "c1")],
+        )
+
+    def test_parse_storcli_warns_when_a_controller_block_is_invalid(self) -> None:
+        output = json.dumps(
+            {
+                "Controllers": [
+                    {
+                        "Command Status": {"Status": "Success"},
+                        "Response Data": {
+                            "Drive Information": [
+                                {"Ctl": "c0", "EID:Slt": "252:0", "State": "JBOD"},
+                            ]
+                        },
+                    },
+                    {
+                        "Command Status": {"Status": "Failure", "Description": "synthetic failure"},
+                        "Response Data": "not an object",
+                    },
+                ]
+            }
+        )
+
+        parsed = parse_ssh_outputs(
+            {"storcli /call/eall/sall show all J": output},
+            slot_count=1,
+            enclosure_filter=None,
+        )
+
+        self.assertEqual([drive["controller_id"] for drive in parsed.esxi_storcli_physical_drives], ["c0"])
+        self.assertEqual(
+            parsed.warnings,
+            ["StorCLI controller block 1 was invalid and was not used: synthetic failure."],
+        )
 
     def test_parse_unifi_gpio_debug_uses_last_output_line_per_slot(self) -> None:
         output = """
@@ -796,6 +929,166 @@ ses0:
                 self.assertEqual(merged_slot.slot_number_source, "ses_device_slot_number")
                 self.assertIsNone(merged_slot.slot_number_warning)
                 self.assertEqual(merged_slot.control_targets[0]["ses_slot_number"], 7)
+
+    def test_stronger_empty_presence_clears_weaker_device_names_in_any_merge_order(self) -> None:
+        def enclosure(*, strong: bool) -> SESMapEnclosure:
+            return SESMapEnclosure(
+                enclosure_id="enc-a",
+                slots={
+                    0: SESMapSlot(
+                        slot_number=0,
+                        present=False if strong else True,
+                        presence_source="sg_ses_aes" if strong else "sesutil_show",
+                        device_names=[] if strong else ["da-old"],
+                        device_names_source=None if strong else "sesutil_show",
+                        sas_address="0" if strong else None,
+                        sas_address_source="sg_ses_aes" if strong else None,
+                    )
+                },
+            )
+
+        for enclosures in (
+            [enclosure(strong=False), enclosure(strong=True)],
+            [enclosure(strong=True), enclosure(strong=False)],
+        ):
+            with self.subTest(first=enclosures[0].slots[0].presence_source):
+                slot = _merge_ses_enclosures(enclosures)[0].slots[0]
+                self.assertIs(slot.present, False)
+                self.assertEqual(slot.presence_source, "sg_ses_aes")
+                self.assertFalse(slot.presence_conflict)
+                self.assertEqual(slot.device_names, [])
+
+    def test_equal_strength_presence_conflict_keeps_present_and_marks_conflict(self) -> None:
+        def enclosure(present: bool) -> SESMapEnclosure:
+            return SESMapEnclosure(
+                enclosure_id="enc-a",
+                slots={
+                    0: SESMapSlot(
+                        slot_number=0,
+                        present=present,
+                        presence_source="sg_ses_aes",
+                    )
+                },
+            )
+
+        for enclosures in (
+            [enclosure(False), enclosure(True)],
+            [enclosure(True), enclosure(False)],
+        ):
+            slot = _merge_ses_enclosures(enclosures)[0].slots[0]
+            self.assertIs(slot.present, True)
+            self.assertTrue(slot.presence_conflict)
+            self.assertEqual(slot.presence_source, "sg_ses_aes")
+
+    def test_equal_strength_sas_conflict_disables_address_correlation(self) -> None:
+        def enclosure(address: str) -> SESMapEnclosure:
+            return SESMapEnclosure(
+                enclosure_id="enc-a",
+                slots={
+                    0: SESMapSlot(
+                        slot_number=0,
+                        present=True,
+                        presence_source="sg_ses_aes",
+                        sas_address=address,
+                        sas_address_source="sg_ses_aes",
+                    )
+                },
+            )
+
+        for enclosures in (
+            [enclosure("5000000000000001"), enclosure("5000000000000002")],
+            [enclosure("5000000000000002"), enclosure("5000000000000001")],
+        ):
+            slot = _merge_ses_enclosures(enclosures)[0].slots[0]
+            self.assertIsNone(slot.sas_address)
+            self.assertTrue(slot.sas_address_conflict)
+            self.assertEqual(slot.sas_address_source, "sg_ses_aes")
+
+    def test_equal_strength_device_names_merge_in_deterministic_order(self) -> None:
+        def enclosure(device_name: str) -> SESMapEnclosure:
+            return SESMapEnclosure(
+                enclosure_id="enc-a",
+                slots={
+                    0: SESMapSlot(
+                        slot_number=0,
+                        present=True,
+                        presence_source="sg_ses_aes",
+                        device_names=[device_name],
+                        device_names_source="sg_ses_aes",
+                    )
+                },
+            )
+
+        candidates = [
+            {
+                0: {
+                    "present": True,
+                    "presence_source": "sg_ses_aes",
+                    "device_names": [device_name],
+                    "device_names_source": "sg_ses_aes",
+                    "device_hint": device_name,
+                }
+            }
+            for device_name in ("sdb", "sda")
+        ]
+
+        for first, second in ((0, 1), (1, 0)):
+            slot = _merge_ses_enclosures(
+                [enclosure(("sdb", "sda")[first]), enclosure(("sdb", "sda")[second])]
+            )[0].slots[0]
+            self.assertEqual(slot.device_names, ["sda", "sdb"])
+
+            candidate = merge_slot_candidate_maps(candidates[first], candidates[second])[0]
+            self.assertEqual(candidate["device_names"], ["sda", "sdb"])
+            self.assertEqual(candidate["device_hint"], "sda")
+
+    def test_sysfs_device_binding_overrides_aes_empty_evidence(self) -> None:
+        enclosure = SESMapEnclosure(
+            ses_device="/dev/sg4",
+            slots={
+                3: SESMapSlot(
+                    slot_number=3,
+                    present=False,
+                    presence_source="sg_ses_aes",
+                    sas_address="0",
+                    sas_address_source="sg_ses_aes",
+                )
+            },
+        )
+
+        _apply_enclosure_sysfs_device_names([enclosure], {"sg4": {3: ["sdb"]}})
+
+        slot = enclosure.slots[3]
+        self.assertIs(slot.present, True)
+        self.assertEqual(slot.presence_source, "enclosure_sysfs")
+        self.assertEqual(slot.device_names, ["sdb"])
+        self.assertEqual(slot.device_names_source, "enclosure_sysfs")
+
+    def test_candidate_map_keeps_stronger_empty_presence_in_any_merge_order(self) -> None:
+        strong = {
+            0: {
+                "present": False,
+                "presence_source": "sg_ses_aes",
+                "device_names": [],
+                "device_names_source": None,
+            }
+        }
+        weak = {
+            0: {
+                "present": True,
+                "presence_source": "sesutil_show",
+                "device_names": ["da-old"],
+                "device_names_source": "sesutil_show",
+                "device_hint": "da-old",
+            }
+        }
+
+        for base, overlay in ((weak, strong), (strong, weak)):
+            candidate = merge_slot_candidate_maps(base, overlay)[0]
+            self.assertIs(candidate["present"], False)
+            self.assertEqual(candidate["presence_source"], "sg_ses_aes")
+            self.assertEqual(candidate["device_names"], [])
+            self.assertIsNone(candidate.get("device_hint"))
 
     def test_zero_based_preferred_enclosure_capacity_stops_at_exact_slot_count(self) -> None:
         enclosures = [
