@@ -5,7 +5,8 @@ import json
 import os
 import sqlite3
 import stat
-from contextlib import contextmanager
+import threading
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +72,26 @@ class _CatalogSegment:
     coverage_end: datetime | None
 
 
+@dataclass(frozen=True)
+class _AuthenticatedFileIdentity:
+    device: int
+    inode: int
+    mode: int
+    link_count: int
+    owner: int
+    group: int
+    size_bytes: int
+    modified_at_ns: int
+    changed_at_ns: int
+
+
+@dataclass(frozen=True)
+class _VerifiedSegmentDigest:
+    generation_id: str
+    sha256: str
+    identity: _AuthenticatedFileIdentity
+
+
 class SegmentedHistoryReader:
     def __init__(
         self,
@@ -92,6 +113,9 @@ class SegmentedHistoryReader:
         self.activation_marker_path = activation_marker_path
         self._catalog_segments: tuple[_CatalogSegment, ...] | None = None
         self._catalog_payload: dict[str, Any] | None = None
+        self._catalog_generation_id: str | None = None
+        self._verified_segment_digests: dict[tuple[str, Path], _VerifiedSegmentDigest] = {}
+        self._verified_segment_digests_lock = threading.Lock()
 
     @classmethod
     def from_catalog(
@@ -182,6 +206,10 @@ class SegmentedHistoryReader:
         reader.segment_paths = tuple(segment.path for segment in catalog_segments)
         reader._catalog_segments = tuple(catalog_segments)
         reader._catalog_payload = catalog
+        generation_id = catalog.get("generation_id")
+        reader._catalog_generation_id = (
+            generation_id if isinstance(generation_id, str) else "legacy-v1"
+        )
         reader._verify_catalog_coverage()
         return reader
 
@@ -231,26 +259,42 @@ class SegmentedHistoryReader:
                 )
             except sqlite3.Error as exc:
                 raise ValueError("Segmented history catalog segment integrity check failed.") from exc
-            path_metadata = os.stat(path, follow_symlinks=False)
-            pinned_metadata = os.fstat(descriptor)
-            if (
-                stat.S_ISLNK(path_metadata.st_mode)
-                or not stat.S_ISREG(path_metadata.st_mode)
-                or path_metadata.st_nlink != 1
-                or pinned_metadata.st_nlink != 1
-                or (path_metadata.st_dev, path_metadata.st_ino)
-                != (pinned_metadata.st_dev, pinned_metadata.st_ino)
-            ):
-                raise ValueError("Segmented history catalog segment integrity check failed.")
+            self._authenticated_segment_identity(path, descriptor)
             if expected_size_bytes is not None and metadata.st_size != expected_size_bytes:
                 raise ValueError("Segmented history catalog segment integrity check failed.")
             if expected_sha256 is not None:
-                digest = hashlib.sha256()
-                while chunk := os.read(descriptor, HASH_CHUNK_BYTES):
-                    digest.update(chunk)
-                if digest.hexdigest() != expected_sha256:
-                    raise ValueError("Segmented history catalog segment integrity check failed.")
-                os.lseek(descriptor, 0, os.SEEK_SET)
+                cache_key = self._verified_digest_cache_key(path, expected_sha256)
+                cache_lock = (
+                    self._verified_segment_digests_lock
+                    if cache_key is not None
+                    else nullcontext()
+                )
+                with cache_lock:
+                    current_identity = self._authenticated_segment_identity(path, descriptor)
+                    if expected_size_bytes is not None and current_identity.size_bytes != expected_size_bytes:
+                        raise ValueError("Segmented history catalog segment integrity check failed.")
+                    verified = (
+                        self._verified_segment_digests.get(cache_key)
+                        if cache_key is not None
+                        else None
+                    )
+                    expected_verification = _VerifiedSegmentDigest(
+                        generation_id=cache_key[0] if cache_key is not None else "",
+                        sha256=expected_sha256,
+                        identity=current_identity,
+                    )
+                    if verified != expected_verification:
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        digest = hashlib.sha256()
+                        while chunk := os.read(descriptor, HASH_CHUNK_BYTES):
+                            digest.update(chunk)
+                        if digest.hexdigest() != expected_sha256:
+                            raise ValueError("Segmented history catalog segment integrity check failed.")
+                        if self._authenticated_segment_identity(path, descriptor) != current_identity:
+                            raise ValueError("Segmented history catalog segment integrity check failed.")
+                        if cache_key is not None:
+                            self._verified_segment_digests[cache_key] = expected_verification
+                    os.lseek(descriptor, 0, os.SEEK_SET)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only = ON")
             yield connection
@@ -258,6 +302,54 @@ class SegmentedHistoryReader:
             if connection is not None:
                 connection.close()
             os.close(descriptor)
+
+    @staticmethod
+    def _file_identity(metadata: os.stat_result) -> _AuthenticatedFileIdentity:
+        return _AuthenticatedFileIdentity(
+            device=int(metadata.st_dev),
+            inode=int(metadata.st_ino),
+            mode=int(metadata.st_mode),
+            link_count=int(metadata.st_nlink),
+            owner=int(metadata.st_uid),
+            group=int(metadata.st_gid),
+            size_bytes=int(metadata.st_size),
+            modified_at_ns=int(metadata.st_mtime_ns),
+            changed_at_ns=int(metadata.st_ctime_ns),
+        )
+
+    @classmethod
+    def _authenticated_segment_identity(
+        cls,
+        path: Path,
+        descriptor: int,
+    ) -> _AuthenticatedFileIdentity:
+        path_metadata = os.stat(path, follow_symlinks=False)
+        pinned_metadata = os.fstat(descriptor)
+        path_identity = cls._file_identity(path_metadata)
+        pinned_identity = cls._file_identity(pinned_metadata)
+        if (
+            stat.S_ISLNK(path_metadata.st_mode)
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_nlink != 1
+            or pinned_metadata.st_nlink != 1
+            or path_identity != pinned_identity
+        ):
+            raise ValueError("Segmented history catalog segment integrity check failed.")
+        return pinned_identity
+
+    def _verified_digest_cache_key(
+        self,
+        path: Path,
+        expected_sha256: str,
+    ) -> tuple[str, Path] | None:
+        if self._catalog_generation_id is None:
+            return None
+        if any(
+            segment.path == path and segment.sha256 == expected_sha256
+            for segment in self._catalog_segments or ()
+        ):
+            return (self._catalog_generation_id, path)
+        return None
 
     @staticmethod
     def _require_limit(limit: int) -> int:
