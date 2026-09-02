@@ -44,11 +44,13 @@ class _MiddlewareCallDispatcher:
             "params": params,
         }
         logger.debug("Calling TrueNAS websocket method %s", method)
-        await self.ws.send(json.dumps(payload))
         try:
+            await self.ws.send(json.dumps(payload))
             return await future
         finally:
             self._pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
 
     async def close(self) -> None:
         if self._reader_task.done():
@@ -135,14 +137,24 @@ class TrueNASWebsocketClient:
     async def fetch_all(self) -> TrueNASRawData:
         async with self._session() as ws:
             dispatcher = _MiddlewareCallDispatcher(ws)
+            fetch_tasks = [
+                asyncio.create_task(self._fetch_enclosures(dispatcher.call)),
+                asyncio.create_task(self._fetch_disks(dispatcher.call)),
+                asyncio.create_task(self._fetch_pools(dispatcher.call)),
+                asyncio.create_task(self._fetch_disk_temperatures(dispatcher.call)),
+                asyncio.create_task(self._fetch_smart_test_results(dispatcher.call)),
+            ]
             try:
-                enclosures, disks, pools, disk_temperatures, smart_test_results = await asyncio.gather(
-                    self._fetch_enclosures(dispatcher.call),
-                    self._fetch_disks(dispatcher.call),
-                    self._fetch_pools(dispatcher.call),
-                    self._fetch_disk_temperatures(dispatcher.call),
-                    self._fetch_smart_test_results(dispatcher.call),
-                )
+                enclosures, disks, pools, disk_temperatures, smart_test_results = await asyncio.gather(*fetch_tasks)
+            except BaseException:
+                # gather() propagates the first failure but leaves its siblings running.
+                # Their futures live in the dispatcher, whose reader is about to be
+                # cancelled, so nothing would ever resolve them; cancel them explicitly
+                # so a failed refresh does not leave middleware calls pending forever.
+                for task in fetch_tasks:
+                    task.cancel()
+                await asyncio.gather(*fetch_tasks, return_exceptions=True)
+                raise
             finally:
                 await dispatcher.close()
             return TrueNASRawData(
