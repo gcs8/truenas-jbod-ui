@@ -87,6 +87,10 @@ def basic_header(username: str, password: str) -> str:
 
 
 class AdminAuthenticationTests(unittest.TestCase):
+    def test_clean_backup_targets_rejects_admin_sidecar(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "clean_backup_targets"):
+            AdminSettings(clean_backup_targets=["ui", "admin"])
+
     def test_basic_auth_mode_requires_both_credentials(self) -> None:
         with self.assertRaises(ValidationError):
             AdminSettings(auth_mode="basic")

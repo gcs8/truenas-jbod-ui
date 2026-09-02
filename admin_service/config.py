@@ -32,7 +32,9 @@ class AdminSettings(BaseModel):
     auth_username: str | None = None
     auth_password: SecretStr | None = None
     allow_plaintext_backup_export: bool = False
-    clean_backup_targets: list[str] = Field(default_factory=lambda: ["ui", "history"])
+    clean_backup_targets: list[Literal["ui", "history"]] = Field(
+        default_factory=lambda: ["ui", "history"]
+    )
     host_prep_temp_dir: str = "/tmp/truenas-jbod-ui-host-prep"
 
     @model_validator(mode="after")

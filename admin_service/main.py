@@ -688,17 +688,15 @@ def create_app() -> FastAPI:
                 key for key in admin_settings.clean_backup_targets
                 if key in runtime_service.managed_containers
             )
-            if restart_services:
-                await asyncio.to_thread(runtime_service.clear_restart_required, impacted)
-                if maintenance.restart_failures:
-                    # These were stopped for the import and could not be started again;
-                    # keep them flagged so the runtime cards do not imply they came back.
-                    await asyncio.to_thread(
-                        runtime_service.mark_restart_required,
-                        tuple(maintenance.restart_failures),
-                    )
-            else:
-                await asyncio.to_thread(runtime_service.mark_restart_required, impacted)
+            restarted = tuple(
+                key for key in maintenance.restarted_containers
+                if key in impacted
+            )
+            await asyncio.to_thread(runtime_service.clear_restart_required, restarted)
+            await asyncio.to_thread(
+                runtime_service.mark_restart_required,
+                tuple(key for key in impacted if key not in restarted),
+            )
             return JSONResponse(
                 {
                     **result,
