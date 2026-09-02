@@ -41,16 +41,20 @@ OFFLINE_IMAGE_ASSETS = {
 }
 IPV4_PATTERN = re.compile(r"(?<![\dA-Fa-f:])(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?![\dA-Fa-f:])")
 IPV6_PATTERN = re.compile(r"(?<![:\w])(?P<ip>(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4})(?![:\w])")
-SERIAL_PATH_KEYS = {"serial"}
+SERIAL_PATH_KEYS = {"serial", "serial_hint"}
 PARTIAL_ID_PATH_KEYS = {
     "gptid",
     "logical_unit_id",
     "lunid",
     "sas_address",
     "attached_sas_address",
+    "sas_address_hint",
+    "transport_address",
+    "wwn",
     "namespace_eui64",
     "namespace_nguid",
     "uuid",
+    "partuuid",
     "enclosure_identifier",
 }
 ROLLUP_INTERVAL_CHOICES_SECONDS = (
@@ -198,6 +202,8 @@ class SnapshotRedactor:
         normalized = value.strip()
         if not normalized:
             return
+        if self._is_zero_identifier_sentinel(normalized) or len(normalized) < 5:
+            return
         if bucket == "serial":
             self.serial_values.append(normalized)
         elif bucket == "partial_id":
@@ -304,17 +310,27 @@ class SnapshotRedactor:
         if bucket == "enclosure":
             return self.enclosure_aliases.get(normalized, normalized)
         if bucket == "serial":
+            if self._is_zero_identifier_sentinel(normalized):
+                return value
             return self._mask_serial(normalized)
         if bucket == "partial_id":
+            if self._is_zero_identifier_sentinel(normalized):
+                return value
             return self._mask_partial_identifier(normalized)
 
         redacted = value
         for original, replacement in self.token_replacements:
             if original and original in redacted:
-                redacted = redacted.replace(original, replacement)
+                pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(original)}(?![A-Za-z0-9])")
+                redacted = pattern.sub(lambda _match: replacement, redacted)
         redacted = IPV4_PATTERN.sub(lambda match: self._mask_ipv4(match.group("ip")), redacted)
         redacted = IPV6_PATTERN.sub(lambda match: self._mask_ipv6(match.group("ip")), redacted)
         return redacted
+
+    @staticmethod
+    def _is_zero_identifier_sentinel(value: str) -> bool:
+        compact = re.sub(r"[^0-9A-Fa-f]", "", value.strip().removeprefix("0x").removeprefix("0X"))
+        return bool(compact) and set(compact) == {"0"}
 
     @staticmethod
     def _serial_suffix(value: str) -> str:
