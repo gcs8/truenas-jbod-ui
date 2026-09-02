@@ -4,6 +4,7 @@ import json
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
 
 from pydantic import ValidationError
 
@@ -56,21 +57,40 @@ class SasFabricAliasStore:
             selected[alias.object_id] = alias
         return sorted(selected.values(), key=lambda item: (item.object_kind or "", item.object_id))
 
-    def save_alias(self, alias: SasFabricAlias) -> SasFabricAlias:
+    def save_alias(
+        self,
+        alias: SasFabricAlias,
+        compatible_object_ids: Iterable[str] = (),
+    ) -> SasFabricAlias:
         with self._lock:
             current = self.load_all()
             saved = alias.model_copy(update={"updated_at": datetime.now(timezone.utc)})
+            for object_id in compatible_object_ids:
+                if object_id != saved.object_id:
+                    current.pop(self._key(saved.system_id, saved.enclosure_id, object_id), None)
             current[self._key(saved.system_id, saved.enclosure_id, saved.object_id)] = saved
             self._write(current)
         return saved
 
-    def clear_alias(self, system_id: str | None, enclosure_id: str | None, object_id: str) -> bool:
+    def clear_alias(
+        self,
+        system_id: str | None,
+        enclosure_id: str | None,
+        object_id: str,
+        compatible_object_ids: Iterable[str] = (),
+    ) -> bool:
         with self._lock:
             current = self.load_all()
-            removed = current.pop(self._key(system_id, enclosure_id, object_id), None)
-            if removed is None:
-                removed = current.pop(self._key(system_id, None, object_id), None)
-            if removed is None:
+            removed = False
+            candidate_ids = {object_id, *compatible_object_ids}
+            for candidate_id in candidate_ids:
+                if current.pop(self._key(system_id, enclosure_id, candidate_id), None) is not None:
+                    removed = True
+            if not removed and enclosure_id is not None:
+                for candidate_id in candidate_ids:
+                    if current.pop(self._key(system_id, None, candidate_id), None) is not None:
+                        removed = True
+            if not removed:
                 return False
             self._write(current)
         return True
