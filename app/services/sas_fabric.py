@@ -2986,8 +2986,18 @@ def _slot_enclosure_candidates(slot: SlotView) -> list[str]:
 
 
 def _slot_location_number_candidates(slot: SlotView) -> list[int]:
+    """
+    Return mpr location-number candidates for a slot, exact bays first.
+
+    The N-1 aliases exist for shelves whose SES slot numbers are 1-based
+    while the controller reports 0-based locations. They must only be tried
+    after every exact candidate has missed: `_lookup_mpr_device_context`
+    returns the first hit, so ordering the aliases first would attach the
+    previous bay's device context to every populated bay.
+    """
     raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
-    candidates = [slot.slot]
+    exact: list[int] = [slot.slot]
+    shifted: list[int] = []
     for value in (
         raw_status.get("ses_slot_number"),
         raw_status.get("slot_number"),
@@ -2997,10 +3007,14 @@ def _slot_location_number_candidates(slot: SlotView) -> list[int]:
         parsed = _parse_mpr_slot_number(value)
         if parsed is None:
             continue
-        candidates.append(parsed)
+        exact.append(parsed)
         if parsed > 0:
-            candidates.append(parsed - 1)
-    return _dedupe_ints(candidates)
+            shifted.append(parsed - 1)
+    ordered: list[int] = []
+    for value in (*exact, *shifted):
+        if value not in ordered:
+            ordered.append(value)
+    return ordered
 
 
 def _device_name_candidates(*values: Any) -> list[str]:
