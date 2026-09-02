@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +22,7 @@ from history_service.collector import HistoryCollectionStopping, HistoryCollecto
 from history_service.config import HistorySettings, get_history_settings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
 from history_service.migration_lock import history_lock_path, history_write_lock
+from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
 from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
 
 
@@ -755,6 +756,80 @@ class HistoryStoreTests(unittest.TestCase):
                 with self.assertRaisesRegex(sqlite3.OperationalError, "migration"):
                     with history_write_lock(database_path, blocking=False):
                         self.fail("Second migration lock owner entered")
+
+    def test_store_refuses_to_initialize_or_write_while_a_lifecycle_marker_is_pending(self) -> None:
+        # Rotation, migration and segmented restore leave a marker while their
+        # journal is pending. Only the reader used to honour it; a service
+        # restart ran _initialize and the collector kept writing, so recovery
+        # could no longer match the hot digest (issue #174).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            segments_directory = root / "segments"
+            segments_directory.mkdir()
+            catalog_path = segments_directory / "catalog.json"
+            store = HistoryStore(
+                str(database_path),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog_path,
+            )
+            store._execute_write(lambda connection: connection.execute("SELECT 1").fetchone())
+            pristine = database_path.read_bytes()
+
+            markers = (
+                (activation_pending_path(database_path), "activation is pending"),
+                (segments_directory / MIGRATION_PENDING_MARKER, "migration recovery is pending"),
+            )
+            for marker_path, message in markers:
+                marker_path.write_text("{}", encoding="utf-8")
+                try:
+                    with self.assertRaisesRegex(sqlite3.OperationalError, message):
+                        store._execute_write(
+                            lambda connection: connection.execute(
+                                "INSERT INTO history_table_counts (table_name, row_count) VALUES ('x', 1)"
+                            )
+                        )
+                    with self.assertRaisesRegex(sqlite3.OperationalError, message):
+                        HistoryStore(
+                            str(database_path),
+                            recover_unreadable_database=False,
+                            segment_catalog_path=catalog_path,
+                        )
+                    self.assertEqual(database_path.read_bytes(), pristine, marker_path.name)
+                    self.assertFalse(Path(f"{database_path}-wal").exists(), marker_path.name)
+                finally:
+                    marker_path.unlink()
+
+            recovered = HistoryStore(
+                str(database_path),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog_path,
+            )
+            self.assertEqual(
+                recovered._execute_write(lambda connection: connection.execute("SELECT 1").fetchone())[0],
+                1,
+            )
+
+    def test_store_rechecks_lifecycle_markers_after_acquiring_the_history_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "history.db"
+            marker_path = activation_pending_path(database_path)
+
+            @contextmanager
+            def lifecycle_lock_that_creates_a_pending_marker(*args: Any, **kwargs: Any):
+                with history_write_lock(*args, **kwargs):
+                    marker_path.write_text("{}", encoding="utf-8")
+                    yield
+
+            try:
+                with patch(
+                    "history_service.store.history_write_lock",
+                    lifecycle_lock_that_creates_a_pending_marker,
+                ):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "activation is pending"):
+                        HistoryStore(str(database_path), recover_unreadable_database=False)
+            finally:
+                marker_path.unlink(missing_ok=True)
 
     def test_store_initialization_rejects_while_migration_owns_shared_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
