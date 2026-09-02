@@ -4625,6 +4625,7 @@ class InventoryService:
         )
         selected_meta = self._merge_enclosure_meta(self._enclosure_option_meta(selected_option), api_selected_meta)
         selected_meta = self._merge_enclosure_meta(selected_meta, ssh_meta)
+        selected_meta.update(self._enclosure_option_meta(selected_option))
         if selected_profile is not None and selected_profile.slot_number_base is not None:
             # Chassis such as the Dell MD1280 silk-screen their bays 1-based
             # while SES device slot numbers stay 0-based; the profile carries
