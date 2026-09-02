@@ -301,7 +301,7 @@ jobs:
           log_probe.unlink()
           PY
           image_id="$(docker inspect --format '{{.Image}}' "$container_id")"
-          mkdir -p "$compose_contract_root"
+          sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$compose_contract_root"
           sudo install -d -m 0770 -o 10001 -g 10001 \
             "$compose_contract_root/config" \
             "$compose_contract_root/config/ssh" \

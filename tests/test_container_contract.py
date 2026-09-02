@@ -256,6 +256,11 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn('status["CapEff"] == "0000000000000000"', workflow)
         self.assertIn('status["NoNewPrivs"] == "1"', workflow)
         self.assertIn("compose_contract_root", workflow)
+        self.assertIn(
+            'sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$compose_contract_root"',
+            workflow,
+        )
+        self.assertNotIn('mkdir -p "$compose_contract_root"', workflow)
         self.assertIn("probe_compose_service enclosure-ui 10001 10001", workflow)
         self.assertIn("probe_compose_service enclosure-history 10001 10001", workflow)
         self.assertIn("probe_compose_service enclosure-admin 0 10001", workflow)
