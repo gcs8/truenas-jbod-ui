@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from app import __version__
 from admin_service.config import AdminSettings
 from admin_service.services.esxi_host_prep import MAX_UPLOAD_BYTES
+from admin_service.services.runtime_control import DockerRuntimeService
 from admin_service.main import app as admin_app
 from admin_service.main import annotate_runtime_versions
 from admin_service.main import build_admin_state_payload
@@ -369,6 +370,61 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertFalse(archive_path.parent.exists())
         service.import_bundle_from_file.assert_called_once()
         service.import_bundle.assert_not_called()
+
+    def test_admin_backup_import_without_stops_keeps_impacted_services_needing_restart(self) -> None:
+        request, _receive_probe = make_streaming_request([b"archive-bytes"])
+        maintenance = SimpleNamespace(
+            stopped_containers=[],
+            restarted_containers=[],
+            restart_failures={},
+        )
+        maintenance_service = MagicMock()
+        maintenance_service.import_bundle_from_file.return_value = (
+            {
+                "ok": True,
+                "systems": [],
+                "restored_paths": [],
+                "preserved_absent_groups": [],
+            },
+            maintenance,
+        )
+        runtime_service = DockerRuntimeService(
+            AdminSettings(docker_socket_path="/nonexistent.sock")
+        )
+        runtime_service.mark_restart_required(("ui",))
+        route = next(
+            route for route in admin_app.routes
+            if route.path == "/api/admin/backup/import"
+        )
+
+        with (
+            patch(
+                "admin_service.main.get_maintenance_service",
+                return_value=maintenance_service,
+            ),
+            patch(
+                "admin_service.main.reload_app_settings",
+                return_value=SimpleNamespace(default_system_id=None),
+            ),
+            patch(
+                "admin_service.main.get_runtime_service",
+                return_value=runtime_service,
+            ),
+            patch(
+                "admin_service.main.build_runtime_payload",
+                new=AsyncMock(return_value={}),
+            ),
+            patch("admin_service.main.serialize_systems", return_value=[]),
+        ):
+            asyncio.run(
+                route.endpoint(
+                    request,
+                    stop_services=False,
+                    restart_services=True,
+                )
+            )
+
+        self.assertEqual(runtime_service.pending_restart_keys, {"ui", "history"})
 
     def test_admin_backup_export_cleans_workspace_when_response_setup_fails(self) -> None:
         workspace = Path(tempfile.mkdtemp(prefix="admin-export-setup-failure-"))

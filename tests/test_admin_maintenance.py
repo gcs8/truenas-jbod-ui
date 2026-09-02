@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import http.client
 import unittest
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from admin_service.config import AdminSettings
 from admin_service.services.maintenance import (
@@ -272,6 +273,75 @@ class DockerControlTimeoutTests(unittest.TestCase):
                     service._request("GET", "/containers/json?all=1")
 
         self.assertEqual(created, [45, 30])
+
+    def test_start_container_keeps_restart_required_when_docker_returns_304(self) -> None:
+        service = self._service(30)
+        service.mark_restart_required(("ui",))
+
+        class FakeResponse:
+            status = 304
+
+            def read(self) -> bytes:
+                return b""
+
+        class FakeConnection:
+            def __init__(self, socket_path: str, timeout: int = 5) -> None:
+                pass
+
+            def request(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def getresponse(self) -> FakeResponse:
+                return FakeResponse()
+
+            def close(self) -> None:
+                pass
+
+        with (
+            patch("admin_service.services.runtime_control.Path.exists", return_value=True),
+            patch(
+                "admin_service.services.runtime_control.UnixSocketHTTPConnection",
+                FakeConnection,
+            ),
+            self.assertRaises(DockerRuntimeError),
+        ):
+            service.start_container("ui")
+
+        self.assertEqual(service.pending_restart_keys, {"ui"})
+
+    def test_request_normalizes_http_client_exceptions(self) -> None:
+        service = self._service(30)
+        errors = (
+            http.client.BadStatusLine("malformed status"),
+            http.client.IncompleteRead(b"partial", 8),
+        )
+
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                connection = MagicMock()
+                if isinstance(error, http.client.IncompleteRead):
+                    response = MagicMock()
+                    response.status = 200
+                    response.read.side_effect = error
+                    connection.getresponse.return_value = response
+                else:
+                    connection.getresponse.side_effect = error
+
+                with (
+                    patch(
+                        "admin_service.services.runtime_control.Path.exists",
+                        return_value=True,
+                    ),
+                    patch(
+                        "admin_service.services.runtime_control.UnixSocketHTTPConnection",
+                        return_value=connection,
+                    ),
+                    self.assertRaises(DockerRuntimeError) as raised,
+                ):
+                    service._request("GET", "/containers/json?all=1")
+
+                self.assertIn("Unable to talk to the Docker runtime", str(raised.exception))
+                self.assertIs(raised.exception.__cause__, error)
 
     def test_running_container_keys_fails_when_runtime_status_is_unavailable(self) -> None:
         service = self._service(30)

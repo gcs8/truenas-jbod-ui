@@ -180,12 +180,12 @@ class DockerRuntimeService:
             connection.request(method, path, body=body, headers={"Content-Type": "application/json"})
             response = connection.getresponse()
             payload = response.read()
-        except OSError as exc:
+        except (OSError, http.client.HTTPException) as exc:
             raise DockerRuntimeError(f"Unable to talk to the Docker runtime: {exc}.") from exc
         finally:
             connection.close()
 
-        if response.status >= 400:
+        if response.status >= 300:
             detail = payload.decode("utf-8", errors="replace")
             raise DockerRuntimeError(f"Docker runtime returned HTTP {response.status}: {detail}")
         return payload
