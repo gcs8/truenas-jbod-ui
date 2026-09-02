@@ -9181,6 +9181,51 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
 
 
 class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
+    async def test_core_api_enclosure_failure_preserves_cached_shelf_and_reports_source_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            truenas_client = AsyncMock()
+            truenas_client.fetch_all.side_effect = TrueNASAPIError("enclosure2.query failed: EPERM")
+            service = build_inventory_service(
+                settings,
+                system,
+                truenas_client,
+                AsyncMock(),
+                temp_dir,
+            )
+            cached_snapshot = InventorySnapshot(
+                slots=[
+                    SlotView(
+                        slot=0,
+                        slot_label="00",
+                        row_index=0,
+                        column_index=0,
+                        enclosure_id="enc-1",
+                        device_name="da0",
+                    )
+                ],
+                refresh_interval_seconds=30,
+                selected_system_id=system.id,
+                selected_system_platform="core",
+                selected_enclosure_id="enc-1",
+                enclosures=[EnclosureOption(id="enc-1", label="Synthetic Shelf")],
+                sources={
+                    "api": SourceStatus(enabled=True, ok=True, message="TrueNAS API reachable."),
+                },
+            )
+            service._cache["__default__"] = cached_snapshot
+            service._cache_until["__default__"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+            returned = await service.get_snapshot(force_refresh=True)
+
+            self.assertIs(returned, cached_snapshot)
+            self.assertIs(service._cache["__default__"], cached_snapshot)
+            self.assertIsNotNone(service._source_bundle)
+            assert service._source_bundle is not None
+            self.assertFalse(service._source_bundle.sources["api"].ok)
+            self.assertEqual(service._source_bundle.sources["api"].message, "enclosure2.query failed: EPERM")
+
     async def test_sas_fabric_snapshot_reports_stale_inventory_and_source_cache_states(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()

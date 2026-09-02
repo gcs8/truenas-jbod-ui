@@ -11,6 +11,38 @@ from app.services.truenas_ws import _MiddlewareCallDispatcher, TrueNASAPIError, 
 
 
 class TrueNASWebsocketClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_enclosure_query_failure_is_not_reported_as_an_empty_success(self) -> None:
+        client = TrueNASWebsocketClient(TrueNASConfig(api_key="token"))
+        primary_error = TrueNASAPIError("enclosure.query failed: EPERM")
+        call_method = AsyncMock(
+            side_effect=[
+                primary_error,
+                TrueNASAPIError("enclosure2.query failed: ENOMETHOD"),
+            ]
+        )
+
+        with self.assertRaises(TrueNASAPIError) as caught:
+            await client._fetch_enclosures(call_method)
+
+        self.assertIs(caught.exception, primary_error)
+        self.assertEqual(
+            [call.args for call in call_method.await_args_list],
+            [("enclosure.query", []), ("enclosure2.query", [])],
+        )
+
+    async def test_enclosure_query_uses_compatibility_fallback_when_it_succeeds(self) -> None:
+        client = TrueNASWebsocketClient(TrueNASConfig(api_key="token"))
+        call_method = AsyncMock(
+            side_effect=[
+                TrueNASAPIError("enclosure.query failed: ENOMETHOD"),
+                [{"id": "enc-1"}],
+            ]
+        )
+
+        enclosures = await client._fetch_enclosures(call_method)
+
+        self.assertEqual(enclosures, [{"id": "enc-1"}])
+
     async def test_dispatcher_cancellation_during_send_retires_pending_future(self) -> None:
         class BlockingSendWS:
             def __init__(self) -> None:
@@ -33,6 +65,16 @@ class TrueNASWebsocketClientTests(unittest.IsolatedAsyncioTestCase):
             await call_task
 
         self.assertEqual(dispatcher._pending, {})
+        await dispatcher.close()
+
+    async def test_dispatcher_close_is_idempotent_after_normal_shutdown(self) -> None:
+        class IdleWS:
+            async def recv(self) -> str:
+                await asyncio.Future()
+
+        dispatcher = _MiddlewareCallDispatcher(IdleWS())
+
+        await dispatcher.close()
         await dispatcher.close()
 
     async def test_fetch_all_collects_payloads_in_parallel(self) -> None:
@@ -130,6 +172,111 @@ class TrueNASWebsocketClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(fake_ws.methods), sorted([
             "disk.query", "disk.temperatures", "enclosure.query", "pool.query", "smart.test.results",
         ]))
+
+    async def test_fetch_all_preserves_fetch_failure_when_reader_also_fails_during_close(self) -> None:
+        primary_error = TrueNASAPIError("pool query failed first")
+        reader_error = RuntimeError("reader failed during shutdown")
+
+        class ReaderFailsDuringCloseWS:
+            async def recv(self) -> str:
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    raise reader_error
+
+        class FailingClient(TrueNASWebsocketClient):
+            @asynccontextmanager
+            async def _session(self):
+                yield ReaderFailsDuringCloseWS()
+
+            async def _fetch_pools(self, _call_method):
+                raise primary_error
+
+            async def _fetch_enclosures(self, _call_method):
+                await asyncio.Future()
+
+            async def _fetch_disks(self, _call_method):
+                await asyncio.Future()
+
+            async def _fetch_disk_temperatures(self, _call_method):
+                await asyncio.Future()
+
+            async def _fetch_smart_test_results(self, _call_method):
+                await asyncio.Future()
+
+        with self.assertRaises(TrueNASAPIError) as caught:
+            await FailingClient(TrueNASConfig(api_key="token")).fetch_all()
+
+        self.assertIs(caught.exception, primary_error)
+
+    async def test_fetch_all_preserves_caller_cancellation_when_reader_fails_during_close(self) -> None:
+        fetch_started = asyncio.Event()
+        reader_error = RuntimeError("reader failed during cancelled shutdown")
+
+        class ReaderFailsDuringCloseWS:
+            async def recv(self) -> str:
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    raise reader_error
+
+        class BlockingClient(TrueNASWebsocketClient):
+            @asynccontextmanager
+            async def _session(self):
+                yield ReaderFailsDuringCloseWS()
+
+            async def _block(self):
+                fetch_started.set()
+                await asyncio.Future()
+
+            async def _fetch_enclosures(self, _call_method):
+                await self._block()
+
+            async def _fetch_disks(self, _call_method):
+                await self._block()
+
+            async def _fetch_pools(self, _call_method):
+                await self._block()
+
+            async def _fetch_disk_temperatures(self, _call_method):
+                await self._block()
+
+            async def _fetch_smart_test_results(self, _call_method):
+                await self._block()
+
+        fetch_task = asyncio.create_task(BlockingClient(TrueNASConfig(api_key="token")).fetch_all())
+        await fetch_started.wait()
+
+        fetch_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await fetch_task
+
+    async def test_reader_failure_reaches_fetch_all_callers(self) -> None:
+        reader_error = RuntimeError("websocket reader failed")
+
+        class ReaderFailureWS:
+            def __init__(self) -> None:
+                self.sent_count = 0
+                self.all_calls_sent = asyncio.Event()
+
+            async def send(self, _raw_message: str) -> None:
+                self.sent_count += 1
+                if self.sent_count == 5:
+                    self.all_calls_sent.set()
+
+            async def recv(self) -> str:
+                await self.all_calls_sent.wait()
+                raise reader_error
+
+        class ReaderFailureClient(TrueNASWebsocketClient):
+            @asynccontextmanager
+            async def _session(self):
+                yield ReaderFailureWS()
+
+        with self.assertRaises(RuntimeError) as caught:
+            await ReaderFailureClient(TrueNASConfig(api_key="token")).fetch_all()
+
+        self.assertIs(caught.exception, reader_error)
 
     @patch("app.services.truenas_ws.connect")
     async def test_session_passes_tls_server_name_override_to_connect(self, connect_mock: MagicMock) -> None:

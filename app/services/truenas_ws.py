@@ -53,15 +53,16 @@ class _MiddlewareCallDispatcher:
                 future.cancel()
 
     async def close(self) -> None:
-        if self._reader_task.done():
-            exc = self._reader_task.exception()
-            if exc is not None:
-                raise exc
-            return
-        self._reader_task.cancel()
+        if not self._reader_task.done():
+            self._reader_task.cancel()
         try:
             await self._reader_task
         except asyncio.CancelledError:
+            pass
+        except Exception:
+            # Reader failures are delivered to every pending call. Re-raising the
+            # same failure during cleanup can mask the call failure or caller
+            # cancellation that initiated shutdown.
             pass
 
     async def _reader(self) -> None:
@@ -205,15 +206,18 @@ class TrueNASWebsocketClient:
         if self.config.platform == "scale":
             methods = ["enclosure2.query", "enclosure.query"]
 
+        first_error: TrueNASAPIError | None = None
         for method in methods:
             try:
                 result = await call_method(method, [])
-            except TrueNASAPIError:
+            except TrueNASAPIError as exc:
+                if first_error is None:
+                    first_error = exc
                 continue
             return self._ensure_list(result)
 
-        logger.warning("No supported enclosure query method succeeded; continuing without enclosure rows.")
-        return []
+        assert first_error is not None
+        raise first_error
 
     async def _fetch_disks(self, call_method: MethodCaller) -> list[dict[str, Any]]:
         try:

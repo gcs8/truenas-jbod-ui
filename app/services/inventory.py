@@ -2271,9 +2271,14 @@ class InventoryService:
 
     @staticmethod
     def _snapshot_has_trusted_topology(snapshot: InventorySnapshot) -> bool:
-        if (snapshot.selected_system_platform or "").lower() != "quantastor":
-            return True
-        return snapshot.platform_context.get("topology_complete") is not False
+        platform = (snapshot.selected_system_platform or "").lower()
+        if platform == "quantastor":
+            return snapshot.platform_context.get("topology_complete") is not False
+        if platform in {"core", "scale"}:
+            api_status = snapshot.sources.get("api")
+            if api_status and api_status.enabled and not api_status.ok and not snapshot.enclosures:
+                return False
+        return True
 
     def _schedule_background_smart_refresh(self, cache_key: SmartCacheKey, slot_view: SlotView) -> None:
         existing = self._smart_refresh_tasks.get(cache_key)
