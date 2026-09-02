@@ -152,6 +152,39 @@ test("opening and canceling the editor preserves raw context and restores focus"
   assert.equal(buttonFocused, 1);
 });
 
+test("Escape from any alias editor child closes the editor and restores focus", () => {
+  let prevented = 0;
+  let closed = 0;
+  const { handleEnclosureAliasEditorKeydown } = loadFunctions(["handleEnclosureAliasEditorKeydown"], {
+    closeEnclosureAliasEditor(restoreFocus) {
+      assert.equal(restoreFocus, true);
+      closed += 1;
+    },
+  });
+
+  handleEnclosureAliasEditorKeydown({
+    key: "Escape",
+    target: { id: "enclosure-alias-clear" },
+    preventDefault() { prevented += 1; },
+  });
+  assert.equal(prevented, 1);
+  assert.equal(closed, 1);
+
+  handleEnclosureAliasEditorKeydown({
+    key: "Enter",
+    target: { id: "enclosure-alias-clear" },
+    preventDefault() { prevented += 1; },
+  });
+  assert.equal(prevented, 1);
+  assert.equal(closed, 1);
+
+  assert.match(
+    APP_SOURCE,
+    /enclosureAliasForm\.addEventListener\("keydown", handleEnclosureAliasEditorKeydown\)/
+  );
+  assert.doesNotMatch(APP_SOURCE, /enclosureAliasInput\.addEventListener\("keydown"/);
+});
+
 test("changing the selected enclosure closes an open alias draft", () => {
   const state = {
     snapshotMode: false,
