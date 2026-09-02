@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import shlex
 import stat
@@ -1484,6 +1485,57 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertNotIn("Traceback", joined)
         self.assertNotIn("ssh-secret", joined)
         self.assertIn("see admin logs", joined)
+
+    def test_quantastor_ssh_enrichment_keeps_api_credentials_out_of_remote_arguments(self) -> None:
+        secret = "synthetic-admin-argv-marker"
+        payload = QuantastorNodeDiscoveryRequest(
+            truenas_host="https://qs.example.test",
+            api_user="readonly-user",
+            api_password=secret,
+            ssh_enabled=True,
+            ssh_host="192.0.2.10",
+            ssh_user="operator",
+            ssh_password="synthetic-ssh-password",
+        )
+        raw_data = TrueNASRawData(
+            enclosures=[],
+            disks=[],
+            pools=[],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+        nodes = [{"id": "node-a", "label": "Node A", "host": ""}]
+        captured: dict[str, object] = {}
+
+        async def run_commands(commands, *, stdin_data=None):
+            captured["commands"] = list(commands)
+            captured["stdin_data"] = stdin_data
+            raise RuntimeError("synthetic transport stop")
+
+        with patch(
+            "admin_service.main.SSHProbe.run_commands",
+            new=AsyncMock(side_effect=run_commands),
+        ):
+            result = asyncio.run(enrich_quantastor_nodes_from_ssh(payload, raw_data, nodes))
+
+        self.assertFalse(result["ok"])
+        commands = captured["commands"]
+        self.assertIsInstance(commands, list)
+        assert isinstance(commands, list)
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        self.assertNotIn(secret, command)
+        self.assertNotIn("--server", command)
+        self.assertIn("QS_SERVER", command)
+        stdin_data = captured["stdin_data"]
+        self.assertIsInstance(stdin_data, str)
+        assert isinstance(stdin_data, str)
+        encoded_spec = stdin_data.strip()
+        self.assertNotIn(encoded_spec, command)
+        self.assertEqual(
+            base64.b64decode(encoded_spec, validate=True).decode("utf-8"),
+            f"localhost,readonly-user,{secret}",
+        )
 
     def test_annotate_runtime_versions_marks_out_of_sync_services(self) -> None:
         runtime_payload = {

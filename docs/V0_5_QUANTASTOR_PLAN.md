@@ -114,7 +114,8 @@ Validated status on the current cluster:
 - `qs` CLI inventory works over SSH with explicit `--server=localhost,jbodmap,...`
 - the app now consumes `qs disk-list`, `qs hw-disk-list`, and
   `qs hw-enclosure-list` as an SSH enrichment overlay when Quantastor SSH is
-  enabled
+  enabled. The app supplies the server specification through SSH stdin and the
+  documented `QS_SERVER` environment variable rather than `qs` arguments.
 - `hw-disk-identify` and `hw-enclosure-slot-identify` both fail on the
   validated LSI controller path even when run directly against the local node
 - equivalent REST identify methods fail the same way
