@@ -4558,7 +4558,7 @@ class InventoryService:
             self.system.truenas.enclosure_filter,
             slot_count,
             self.settings.layout.api_slot_number_base,
-            None,
+            self._base_enclosure_id(selected_option.id),
         )
         selected_meta = self._merge_enclosure_meta(self._enclosure_option_meta(selected_option), api_selected_meta)
         selected_meta = self._merge_enclosure_meta(selected_meta, ssh_meta)
@@ -4718,7 +4718,13 @@ class InventoryService:
         api_topology_members = self._build_quantastor_topology_members(raw_data, disk_records)
         selected_meta = self._enclosure_option_meta(selected_option)
         empty_ssh = ParsedSSHData()
-        quantastor_ses_candidates = quantastor_ses_data.ses_slot_candidates if quantastor_ses_data.ses_slot_candidates else {}
+        quantastor_ses_candidates = self._select_quantastor_ses_candidates(
+            raw_data,
+            selected_option.id,
+            quantastor_ses_data,
+            layout_slot_count,
+            selected_profile.id,
+        )
         slot_views: list[SlotView] = []
 
         for slot in range(layout_slot_count):
@@ -4844,6 +4850,65 @@ class InventoryService:
                 )
             )
         return options
+
+    def _select_quantastor_ses_candidates(
+        self,
+        raw_data: TrueNASRawData,
+        selected_system_id: str,
+        ses_data: ParsedSSHData,
+        slot_count: int,
+        selected_profile_id: str,
+    ) -> dict[int, dict[str, Any]]:
+        if not ses_data.ses_enclosures:
+            return ses_data.ses_slot_candidates
+
+        selected_enclosure_aliases: set[str] = set()
+        for row in self._quantastor_hw_enclosure_rows(raw_data):
+            owner_id = normalize_text(
+                str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None
+            )
+            if owner_id != selected_system_id:
+                continue
+            for key in ("id", "enclosureId", "enclosure_id", "sasAddress", "sas_address", "wwn", "wwid"):
+                value = normalize_text(str(row.get(key)) if row.get(key) is not None else None)
+                if not value:
+                    continue
+                selected_enclosure_aliases.add(value)
+                normalized_hex = normalize_hex_identifier(value)
+                if normalized_hex:
+                    selected_enclosure_aliases.add(normalized_hex)
+
+        selected_enclosures = []
+        for enclosure in ses_data.ses_enclosures:
+            enclosure_id = normalize_text(enclosure.enclosure_id)
+            aliases = {enclosure_id} if enclosure_id else set()
+            normalized_hex = normalize_hex_identifier(enclosure_id)
+            if normalized_hex:
+                aliases.add(normalized_hex)
+            if aliases & selected_enclosure_aliases:
+                selected_enclosures.append(enclosure)
+
+        if not selected_enclosures:
+            profile_matches = [
+                enclosure
+                for enclosure in ses_data.ses_enclosures
+                if enclosure.profile_id == selected_profile_id
+            ]
+            if len(profile_matches) == 1:
+                selected_enclosures = profile_matches
+            elif len(ses_data.ses_enclosures) == 1:
+                selected_enclosures = list(ses_data.ses_enclosures)
+
+        if not selected_enclosures:
+            return {}
+
+        candidates, _meta = build_slot_candidates_from_ses_enclosures(
+            selected_enclosures,
+            slot_count,
+            None,
+            enclosures_are_merged=True,
+        )
+        return candidates
 
     def _build_quantastor_disk_records(self, raw_data: TrueNASRawData, selected_system_id: str | None) -> list[DiskRecord]:
         hw_slot_hints = self._build_quantastor_hw_slot_hints(raw_data, selected_system_id)
@@ -7307,6 +7372,17 @@ class InventoryService:
         authoritative: ParsedSSHData,
         overlays: list[ParsedSSHData],
     ) -> ParsedSSHData:
+        authoritative.ses_enclosures = _merge_ses_enclosures(
+            [
+                *authoritative.ses_enclosures,
+                *[
+                    enclosure
+                    for overlay in overlays
+                    if overlay is not authoritative
+                    for enclosure in overlay.ses_enclosures
+                ],
+            ]
+        )
         for overlay in overlays:
             if overlay is authoritative:
                 continue

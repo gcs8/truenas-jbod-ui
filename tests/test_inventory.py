@@ -59,6 +59,7 @@ from app.services.parsers import (
     ZpoolMember,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
+    merge_slot_candidate_maps,
     parse_ssh_outputs,
 )
 from app.services.storage_views import storage_view_slot_label
@@ -10188,6 +10189,17 @@ Enclosure Status diagnostic page:
                     ("10.0.0.30", "/dev/sg27"),
                 ],
             )
+            enclosure_slot0 = overlay.ses_enclosures[0].slots[0]
+            self.assertCountEqual(
+                [
+                    (target["ssh_host"], target["ses_device"])
+                    for target in enclosure_slot0.control_targets
+                ],
+                [
+                    ("10.0.0.20", "/dev/sg11"),
+                    ("10.0.0.30", "/dev/sg27"),
+                ],
+            )
 
     async def test_sg_ses_overlay_reuses_valid_cached_devices_without_discovery(self) -> None:
         class DummyTrueNASClient:
@@ -10673,6 +10685,175 @@ class ReviewRegressionTests(unittest.TestCase):
 
             self.assertEqual([slot.slot for slot in slots], [0, 1, 2])
             self.assertEqual(slot_count, 3)
+
+    def test_scale_linux_does_not_overlay_first_api_enclosure_on_selected_ses_enclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.layout.api_slot_number_base = 1
+            system = SystemConfig(id="multi-shelf-scale", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            ssh_data = ParsedSSHData(
+                ses_enclosures=[
+                    SESMapEnclosure(
+                        ses_device="/dev/sg20",
+                        enclosure_id="selected-jbod",
+                        enclosure_label="Selected JBOD",
+                        layout_rows=1,
+                        layout_columns=1,
+                        slot_layout=[[0]],
+                        slots={
+                            0: SESMapSlot(
+                                slot_number=0,
+                                element_id=0,
+                                ses_device="/dev/sg20",
+                                status="OK",
+                                description="Selected JBOD slot",
+                                device_names=["sdb"],
+                                present=True,
+                            )
+                        },
+                    )
+                ]
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[
+                    {
+                        "id": "api-head-unit",
+                        "label": "API Head Unit",
+                        "elements": [
+                            {
+                                "slot": 1,
+                                "dev": "sda",
+                                "status": "Critical",
+                                "descriptor": "Head-unit slot",
+                            }
+                        ],
+                    }
+                ],
+                disks=[],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            slots, _enclosures, selected_meta, _rows, _slot_count, _columns = service._correlate_scale_linux(
+                raw_data,
+                ssh_data,
+                [],
+                selected_enclosure_id="selected-jbod",
+            )
+
+            self.assertEqual(selected_meta["id"], "selected-jbod")
+            self.assertEqual(slots[0].raw_status["enclosure_id"], "selected-jbod")
+            self.assertEqual(slots[0].raw_status["descriptor"], "Selected JBOD slot")
+            self.assertNotEqual(slots[0].raw_status.get("device_hint"), "sda")
+
+    def test_quantastor_correlator_scopes_ses_candidates_to_selected_system_enclosures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="multi-enclosure-quantastor",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(platform="quantastor"),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[
+                    {"id": "node-a", "name": "Node A"},
+                    {"id": "node-b", "name": "Node B"},
+                ],
+                disks=[
+                    {
+                        "id": "disk-a",
+                        "storageSystemId": "node-a",
+                        "devicePath": "/dev/sda",
+                        "serialNumber": "SERIAL-A",
+                        "healthStatus": "ONLINE",
+                    }
+                ],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[
+                    {
+                        "id": "hw-a",
+                        "physicalDiskId": "disk-a",
+                        "storageSystemId": "node-a",
+                        "enclosureId": "enc-a",
+                        "slot": "01",
+                        "serialNum": "SERIAL-A",
+                        "sasAddress": "5000000000000001",
+                    }
+                ],
+                hw_enclosures=[
+                    {"id": "enc-a", "storageSystemId": "node-a"},
+                    {"id": "enc-b", "storageSystemId": "node-b"},
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+            enclosure_a = SESMapEnclosure(
+                ses_device="/dev/sg10",
+                enclosure_id="enc-a",
+                slots={
+                    0: SESMapSlot(
+                        slot_number=0,
+                        element_id=0,
+                        ses_device="/dev/sg10",
+                        control_targets=[
+                            {"ses_device": "/dev/sg10", "ses_element_id": 0, "ses_slot_number": 0}
+                        ],
+                        device_names=["sda"],
+                        sas_address="5000000000000001",
+                        present=True,
+                    )
+                },
+            )
+            enclosure_b = SESMapEnclosure(
+                ses_device="/dev/sg11",
+                enclosure_id="enc-b",
+                slots={
+                    0: SESMapSlot(
+                        slot_number=0,
+                        element_id=0,
+                        ses_device="/dev/sg11",
+                        control_targets=[
+                            {"ses_device": "/dev/sg11", "ses_element_id": 0, "ses_slot_number": 0}
+                        ],
+                        device_names=["sdz"],
+                        sas_address="5000000000000002",
+                        present=True,
+                    )
+                },
+            )
+            candidates_a, _meta = build_slot_candidates_from_ses_enclosures(
+                [enclosure_a], 24, None, "enc-a"
+            )
+            candidates_b, _meta = build_slot_candidates_from_ses_enclosures(
+                [enclosure_b], 24, None, "enc-b"
+            )
+            polluted_candidates = merge_slot_candidate_maps(candidates_a, candidates_b)
+            ses_data = ParsedSSHData(
+                ses_enclosures=[enclosure_a, enclosure_b],
+                ses_slot_candidates=polluted_candidates,
+            )
+
+            slots, _enclosures, _meta, _rows, _slot_count, _columns = service._correlate_quantastor(
+                raw_data,
+                [],
+                "node-a",
+                ses_data,
+            )
+
+            slot0 = slots[0]
+            self.assertEqual(slot0.device_name, "sda")
+            self.assertEqual(slot0.raw_status["sas_address_hint"], "5000000000000001")
+            self.assertEqual(slot0.raw_status["device_names"], ["sda"])
+            self.assertEqual(
+                [target["ses_device"] for target in slot0.ssh_ses_targets],
+                ["/dev/sg10"],
+            )
 
     def test_parse_size_to_bytes_binary_suffixes_use_1024(self) -> None:
         self.assertEqual(parse_size_to_bytes("1 GiB"), 1024**3)
