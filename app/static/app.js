@@ -2305,7 +2305,12 @@
   }
 
   function isSasFabricEnrichmentWarning(warning) {
-    return String(warning || "").toLowerCase().includes("sas fabric enrichment probes");
+    const text = String(warning || "").toLowerCase();
+    return text.includes("sas fabric enrichment probes")
+      || text.includes("storage fabric enrichment probes")
+      || text.includes("fabric map is built from linux ses slot evidence")
+      || text.includes("storage fabric is built from")
+      || text.includes("storage fabric map is built from");
   }
 
 
@@ -2753,24 +2758,14 @@
   }
 
   function formatTimestamp(value) {
-    if (!value) return "Unknown";
+    if (!value) {
+      return "n/a";
+    }
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) {
-      return value;
+      return String(value);
     }
-    try {
-      return date.toLocaleString([], {
-        year: "numeric",
-        month: "short",
-        day: "numeric",
-        hour: "numeric",
-        minute: "2-digit",
-        second: "2-digit",
-        timeZoneName: "short",
-      });
-    } catch (error) {
-      return date.toLocaleString();
-    }
+    return date.toLocaleString();
   }
 
   function renderSnapshotBanner() {
@@ -8726,8 +8721,8 @@
 
   async function fetchJson(url, options = {}) {
     const response = await fetch(url, {
-      headers: { "Content-Type": "application/json" },
       ...options,
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     });
     let payload;
     try {
