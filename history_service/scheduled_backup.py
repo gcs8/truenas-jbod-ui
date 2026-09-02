@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,6 +29,7 @@ _COPY_CHUNK_BYTES = 1024 * 1024
 _STATUS_SCHEMA_VERSION = 1
 _SHARED_STATUS_DIRECTORY_MODE = 0o2750
 _SHARED_STATUS_FILE_MODE = 0o640
+logger = logging.getLogger(__name__)
 _STATUS_FIELDS = {
     "schema_version",
     "enabled",
@@ -61,7 +63,7 @@ def validate_scheduled_backup_status(
         or not included_groups
         or any(not isinstance(group, str) or not group for group in included_groups)
         or len(included_groups) != len(set(included_groups))
-        or (expected_groups is not None and included_groups != list(expected_groups))
+        or (expected_groups is not None and set(included_groups) != set(expected_groups))
     ):
         raise ValueError("Scheduled backup status is invalid.")
     for key in ("success_count", "failure_count", "last_retention_removed"):
@@ -100,10 +102,10 @@ def validate_scheduled_backup_status(
         digest,
         artifact_name,
     )
-    if success_count == 0:
-        if any(value is not None for value in success_evidence):
-            raise ValueError("Scheduled backup status is invalid.")
-    elif (
+    has_success_evidence = any(value is not None for value in success_evidence)
+    if success_count == 0 and has_success_evidence:
+        raise ValueError("Scheduled backup status is invalid.")
+    if has_success_evidence and (
         success_evidence[0] is None
         or type(size_bytes) is not int
         or size_bytes <= 0
@@ -330,14 +332,16 @@ class ScheduledBackupRunner:
             raise ValueError("Scheduled backup passphrase file must not be empty.")
         return passphrase
 
-    def _validate_inputs(self) -> str:
+    def _validate_scope(self) -> None:
         if self.retention_count <= 0:
             raise ValueError("Scheduled backup retention count must be positive.")
         if not self.included_groups or len(self.included_groups) != len(set(self.included_groups)):
             raise ValueError("Scheduled backup included groups must be explicit and unique.")
-        passphrase = self._read_passphrase()
         self.backup_service.validate_scheduled_backup_scope(list(self.included_groups))
-        return passphrase
+
+    def _validate_inputs(self) -> str:
+        self._validate_scope()
+        return self._read_passphrase()
 
     def validate_configuration(self) -> str:
         self._ensure_directories()
@@ -390,7 +394,38 @@ class ScheduledBackupRunner:
         }
 
     def _validate_status(self, payload: dict[str, Any]) -> None:
-        validate_scheduled_backup_status(payload, expected_groups=self.included_groups)
+        validate_scheduled_backup_status(payload)
+
+    def _reconcile_status_groups(self, status: dict[str, Any]) -> bool:
+        previous_groups = tuple(status["included_groups"])
+        if previous_groups == self.included_groups:
+            return False
+        status["included_groups"] = list(self.included_groups)
+        if set(previous_groups) == set(self.included_groups):
+            logger.info(
+                "Scheduled backup included-group order changed; retaining compatible success "
+                "evidence: previous_groups=%s included_groups=%s",
+                list(previous_groups),
+                list(self.included_groups),
+            )
+            return False
+        status.update(
+            {
+                "last_success_at": None,
+                "last_size_bytes": None,
+                "last_sha256": None,
+                "last_artifact_name": None,
+                "last_absent_groups": [],
+                "last_retention_removed": 0,
+            }
+        )
+        logger.info(
+            "Scheduled backup included-group scope changed; clearing incompatible success "
+            "evidence: previous_groups=%s included_groups=%s",
+            list(previous_groups),
+            list(self.included_groups),
+        )
+        return True
 
     def _read_status(self) -> dict[str, Any]:
         if not self.status_file.exists():
@@ -605,7 +640,11 @@ class ScheduledBackupRunner:
             status = self._read_status()
             status["last_attempt_at"] = attempted_at.isoformat()
             try:
-                passphrase = self._validate_inputs()
+                self._validate_scope()
+                scope_changed = self._reconcile_status_groups(status)
+                if scope_changed:
+                    self._write_status(status)
+                passphrase = self._read_passphrase()
                 artifact = self.backup_service.export_scheduled_bundle_to_file(
                     passphrase=passphrase,
                     included_paths=list(self.included_groups),
