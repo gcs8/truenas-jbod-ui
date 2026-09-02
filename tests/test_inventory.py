@@ -1134,6 +1134,371 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(resolved.topology_label, "ESXi local Enc > slot 252:2 > direct disk")
         self.assertEqual(resolved.health, "ONLINE")
 
+    def test_build_esxi_disk_records_uses_selected_enclosure_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="generic-esxi",
+                truenas=TrueNASConfig(platform="esxi"),
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                esxi_storcli_physical_drives=[
+                    {
+                        "slot_key": "252:0",
+                        "enclosure_id": "252",
+                        "slot": 0,
+                        "controller_id": "c0",
+                        "state": "JBOD",
+                    }
+                ]
+            )
+
+            records = service._build_esxi_disk_records(
+                ssh_data,
+                enclosure_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+            )
+
+            self.assertEqual(records[0].enclosure_id, SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
+
+    def test_build_esxi_topology_members_uses_parsed_virtual_drive_raid_level(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="generic-esxi",
+                truenas=TrueNASConfig(platform="esxi"),
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                esxi_storcli_virtual_drives=[
+                    {
+                        "vd_id": "0",
+                        "name": "data",
+                        "raid": "RAID5",
+                        "physical_drives": [
+                            {"slot_key": "252:0", "enclosure_id": "252", "slot": 0},
+                        ],
+                    }
+                ],
+                esxi_storcli_physical_drives=[
+                    {
+                        "slot_key": "252:0",
+                        "enclosure_id": "252",
+                        "slot": 0,
+                        "controller_id": "c0",
+                        "state": "Onln",
+                    }
+                ],
+            )
+
+            record = service._build_esxi_disk_records(
+                ssh_data,
+                enclosure_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+            )[0]
+            members = service._build_esxi_topology_members([record])
+
+            self.assertEqual(record.raw["virtual_drive_raid_levels"], ["RAID5"])
+            self.assertEqual(members["252:0"].vdev_class, "raid5")
+            self.assertEqual(members["252:0"].topology_label, "data > RAID5 member > slot 252:0")
+
+    def test_build_esxi_topology_members_does_not_invent_unknown_raid_level(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="generic-esxi",
+                truenas=TrueNASConfig(platform="esxi"),
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            record = service._build_esxi_disk_records(
+                ParsedSSHData(
+                    esxi_storcli_physical_drives=[
+                        {
+                            "slot_key": "252:0",
+                            "enclosure_id": "252",
+                            "slot": 0,
+                            "controller_id": "c0",
+                            "state": "Onln",
+                        }
+                    ]
+                ),
+                enclosure_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+            )[0]
+
+            member = service._build_esxi_topology_members([record])["252:0"]
+
+            self.assertEqual(member.vdev_class, "raid")
+            self.assertEqual(member.topology_label, "ESXi local RAID > RAID member > slot 252:0")
+
+    def test_build_esxi_disk_records_qualifies_virtual_membership_by_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="multi-controller-esxi",
+                truenas=TrueNASConfig(platform="esxi"),
+                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                esxi_storcli_virtual_drives=[
+                    {
+                        "controller_id": "c0",
+                        "vd_id": "0",
+                        "name": "boot",
+                        "raid": "RAID1",
+                        "physical_drives": [
+                            {"controller_id": "c0", "slot_key": "252:0", "slot": 0},
+                        ],
+                    },
+                    {
+                        "controller_id": "c1",
+                        "vd_id": "0",
+                        "name": "data",
+                        "raid": "RAID5",
+                        "physical_drives": [
+                            {"controller_id": "c1", "slot_key": "252:0", "slot": 0},
+                        ],
+                    },
+                ],
+                esxi_storcli_physical_drives=[
+                    {
+                        "controller_id": "c0",
+                        "slot_key": "252:0",
+                        "enclosure_id": "252",
+                        "slot": 0,
+                        "state": "Onln",
+                    },
+                    {
+                        "controller_id": "c1",
+                        "slot_key": "252:0",
+                        "enclosure_id": "252",
+                        "slot": 0,
+                        "state": "Onln",
+                    },
+                ],
+            )
+
+            records = service._build_esxi_disk_records(
+                ssh_data,
+                enclosure_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+            )
+            by_controller = {record.raw["controller_id"]: record for record in records}
+
+            self.assertEqual(by_controller["c0"].pool_name, "boot")
+            self.assertEqual(by_controller["c0"].raw["virtual_drive_raid_levels"], ["RAID1"])
+            self.assertEqual(by_controller["c1"].pool_name, "data")
+            self.assertEqual(by_controller["c1"].raw["virtual_drive_raid_levels"], ["RAID5"])
+            topology = service._build_esxi_topology_members(records)
+            self.assertEqual(topology["c0:252:0"].pool_name, "boot")
+            self.assertEqual(topology["c1:252:0"].pool_name, "data")
+
+    def test_live_ses_empty_evidence_demotes_manual_mapping_without_deleting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="linux-host",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            disk = service._build_disk_records(
+                [
+                    {
+                        "name": "sda",
+                        "devname": "sda",
+                        "identifier": "{serial}SER-STALE",
+                        "serial": "SER-STALE",
+                        "model": "Synthetic Disk",
+                    }
+                ],
+                ParsedSSHData(),
+                {},
+                {},
+            )[0]
+            mapping = ManualMapping(
+                system_id=system.id,
+                enclosure_id="enc-a",
+                slot=0,
+                serial="SER-STALE",
+                gptid="gptid/stale",
+                notes="operator calibration",
+            )
+            service.mapping_store.save_mapping(mapping)
+
+            resolution = service._resolve_disk_for_slot(
+                0,
+                "enc-a",
+                mapping,
+                {"ser-stale": disk},
+                {},
+                {},
+                {
+                    "present": False,
+                    "presence_source": "sg_ses_aes",
+                    "ses_device": "/dev/sg4",
+                    "sas_address_hint": "0",
+                },
+                ParsedSSHData(),
+            )
+
+            self.assertIsNone(resolution.disk)
+            self.assertEqual(resolution.source, "ses-empty")
+            self.assertTrue(resolution.stale_manual_mapping)
+            persisted_mapping = service.mapping_store.get_mapping(system.id, "enc-a", 0)
+            self.assertIsNotNone(persisted_mapping)
+            self.assertEqual(persisted_mapping.serial if persisted_mapping else None, "SER-STALE")
+            self.assertEqual(persisted_mapping.gptid if persisted_mapping else None, "gptid/stale")
+            self.assertEqual(persisted_mapping.notes if persisted_mapping else None, "operator calibration")
+
+            slot = service._build_slot_view(
+                slot=0,
+                row_index=0,
+                column_index=0,
+                enclosure_meta={"id": "enc-a", "label": "Shelf", "name": "Shelf"},
+                raw_slot_status={
+                    "present": False,
+                    "presence_source": "sg_ses_aes",
+                    "ses_device": "/dev/sg4",
+                    "sas_address_hint": "0",
+                },
+                disk=resolution.disk,
+                mapping=mapping,
+                ssh_data=ParsedSSHData(),
+                api_topology_members={},
+                api_enclosure_ids=set(),
+                resolution_source=resolution.source,
+                stale_manual_mapping=resolution.stale_manual_mapping,
+            )
+
+            self.assertFalse(slot.present)
+            self.assertEqual(slot.state, SlotState.empty)
+            self.assertIsNone(slot.serial)
+            self.assertIsNone(slot.gptid)
+            self.assertEqual(slot.mapping_source, "ses-empty")
+            self.assertIn("Stale manual mapping", slot.notes or "")
+            self.assertTrue(slot.raw_status["stale_manual_mapping"])
+
+    def test_disk_resolution_reports_the_evidence_tier_that_matched(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="linux-host",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(systems=[system]),
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            disk = service._build_disk_records(
+                [
+                    {
+                        "name": "sda",
+                        "devname": "sda",
+                        "identifier": "{serial}SER-A",
+                        "serial": "SER-A",
+                        "gptid": "gptid/disk-a",
+                        "model": "Synthetic Disk",
+                    }
+                ],
+                ParsedSSHData(),
+                {},
+                {},
+            )[0]
+            by_key = {key: disk for key in disk.lookup_keys}
+            by_key.update({"sda": disk, "ser-a": disk, "gptid/disk-a": disk})
+            cases = [
+                (
+                    "manual",
+                    ManualMapping(slot=0, serial="SER-A"),
+                    {},
+                    {},
+                    {},
+                    ParsedSSHData(),
+                    "manual",
+                ),
+                ("api-slot", None, {("enc-a", 0): disk}, {}, {}, ParsedSSHData(), "api-slot"),
+                (
+                    "enclosure-sysfs",
+                    None,
+                    {},
+                    {},
+                    {"device_names": ["sda"], "device_names_source": "enclosure_sysfs"},
+                    ParsedSSHData(),
+                    "enclosure-sysfs",
+                ),
+                ("device-hint", None, {}, {}, {"device_hint": "sda"}, ParsedSSHData(), "device-hint"),
+                ("serial-hint", None, {}, {}, {"serial_hint": "SER-A"}, ParsedSSHData(), "serial-hint"),
+                ("gptid-hint", None, {}, {}, {"gptid_hint": "gptid/disk-a"}, ParsedSSHData(), "gptid-hint"),
+                (
+                    "sas-address",
+                    None,
+                    {},
+                    {"5000000000000001": disk},
+                    {"sas_address_hint": "5000000000000001"},
+                    ParsedSSHData(),
+                    "sas-address",
+                ),
+                (
+                    "ses-slot-map",
+                    None,
+                    {},
+                    {},
+                    {},
+                    ParsedSSHData(ses_slot_to_device={0: "sda"}),
+                    "ses-slot-map",
+                ),
+            ]
+
+            for name, mapping, by_slot, by_sas, raw_status, ssh_data, expected in cases:
+                with self.subTest(name=name):
+                    resolution = service._resolve_disk_for_slot(
+                        0,
+                        "enc-a",
+                        mapping,
+                        by_key,
+                        by_slot,
+                        by_sas,
+                        raw_status,
+                        ssh_data,
+                    )
+                    self.assertIs(resolution.disk, disk)
+                    self.assertEqual(resolution.source, expected)
+                    self.assertFalse(resolution.stale_manual_mapping)
+
     def test_correlate_esxi_host_keeps_aoc_specific_storcli_warning_on_aoc_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             system = SystemConfig(
@@ -3366,6 +3731,75 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertIn("0:0:0:0", first.lookup_keys)
             self.assertIn("ZC14D9W1".lower(), first.lookup_keys)
 
+    def test_build_linux_disk_records_supports_mmc_and_dasd_and_warns_for_unknown_disks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="generic-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {
+                        "name": "mmcblk0",
+                        "type": "disk",
+                        "path": "/dev/mmcblk0",
+                        "serial": "MMC-SYNTHETIC",
+                        "model": "Synthetic eMMC",
+                        "size": "29.1G",
+                        "tran": "mmc",
+                        "children": [
+                            {
+                                "name": "mmcblk0p1",
+                                "type": "part",
+                                "mountpoint": "/boot",
+                            }
+                        ],
+                    },
+                    {"name": "mmcblk0boot0", "type": "disk", "size": "4M"},
+                    {"name": "mmcblk0rpmb", "type": "disk", "size": "4M"},
+                    {
+                        "name": "dasda",
+                        "type": "disk",
+                        "path": "/dev/dasda",
+                        "serial": "DASD-SYNTHETIC",
+                        "model": "Synthetic DASD",
+                        "size": "10G",
+                        "tran": "ccw",
+                    },
+                    *[
+                        {"name": f"zram{index}", "type": "disk", "size": "2G"}
+                        for index in range(10)
+                    ],
+                    {"name": "loop0", "type": "loop", "size": "64M"},
+                ]
+            )
+            warnings: list[str] = []
+
+            records = service._build_linux_disk_records(ssh_data, warnings=warnings)
+
+            by_name = {record.device_name: record for record in records}
+            self.assertEqual(set(by_name), {"mmcblk0", "dasda"})
+            self.assertEqual(by_name["mmcblk0"].smart_devices, ["mmcblk0"])
+            self.assertEqual(by_name["mmcblk0"].bus, "MMC")
+            self.assertEqual(by_name["dasda"].smart_devices, ["dasda"])
+            self.assertEqual(by_name["dasda"].bus, "CCW")
+            self.assertEqual(
+                warnings,
+                [
+                    "Skipped unrecognized Linux block devices: "
+                    "zram0, zram1, zram2, zram3, zram4, zram5, zram6, zram7 (+2 more)."
+                ],
+            )
+
     def test_build_linux_disk_records_prefers_largest_data_volume_over_boot_and_swap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -3591,6 +4025,12 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                         "tran": "sata",
                         "children": [],
                     },
+                    {
+                        "name": "zram0",
+                        "type": "disk",
+                        "size": "2G",
+                        "children": [],
+                    },
                 ],
                 ubntstorage_disks=[
                     {"node": "sdb", "slot": 1, "healthy": "optimal", "state": "ready", "size": 16000000000000},
@@ -3615,8 +4055,9 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(slot_views[1].device_name, "sda")
             self.assertFalse(slot_views[2].present)
             self.assertEqual(slot_views[2].state.value, "empty")
-            self.assertEqual(slot_views[2].mapping_source, "ssh")
+            self.assertEqual(slot_views[2].mapping_source, "ubntstorage")
             self.assertTrue(any("UniFi UNVR Pro LED control is experimental." in warning for warning in warnings))
+            self.assertIn("Skipped unrecognized Linux block devices: zram0.", warnings)
 
     def test_correlate_linux_host_enables_unvr_led_backend_and_gpio_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3940,6 +4381,82 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(slot_view.vdev_class, "special")
             self.assertEqual(slot_view.gptid, "gptid/example")
             self.assertEqual(slot_view.persistent_id_label, "GPTID")
+
+    def test_build_slot_view_does_not_mark_a_not_installed_bay_present(self) -> None:
+        # API candidates carry a status string but never a `present` bool, so
+        # presence used to come from a substring scan where "Not installed"
+        # satisfied "installed" (issue #169).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="archive-core", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+
+            def build(status: str) -> SlotView:
+                return service._build_slot_view(
+                    slot=3,
+                    row_index=0,
+                    column_index=3,
+                    enclosure_meta={"id": None, "label": None, "name": None},
+                    raw_slot_status={"status": status},
+                    disk=None,
+                    mapping=None,
+                    ssh_data=ParsedSSHData(),
+                    api_topology_members={},
+                    api_enclosure_ids=set(),
+                )
+
+            not_installed = build("Not installed")
+            self.assertFalse(not_installed.present)
+            self.assertEqual(not_installed.state, SlotState.empty)
+
+            installed = build("Installed, OK")
+            self.assertTrue(installed.present)
+            self.assertNotEqual(installed.state, SlotState.empty)
+
+    def test_resolver_prefers_ses_device_name_over_the_bare_slot_bucket(self) -> None:
+        # Every disk is indexed under (None, slot) as well as (enclosure_id,
+        # slot); TrueNAS disk.query payloads carry no enclosure id the
+        # extractor recognises, so that bucket is last-writer-wins across all
+        # shelves. It used to outrank the SES device name observed in the bay
+        # (issue #164).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="archive-core", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            ssh_data = ParsedSSHData()
+            head_disk, jbod_disk = service._build_disk_records(
+                [
+                    {"name": "da10", "devname": "da10", "identifier": "{serial}HEAD-5", "serial": "HEAD-5", "slot": 6},
+                    {"name": "da11", "devname": "da11", "identifier": "{serial}JBOD-5", "serial": "JBOD-5", "slot": 6},
+                ],
+                ssh_data,
+                {},
+                {},
+            )
+            self.assertEqual((head_disk.slot, head_disk.enclosure_id), (5, None))
+            self.assertEqual((jbod_disk.slot, jbod_disk.enclosure_id), (5, None))
+
+            disks_by_key: dict[str, DiskRecord] = {}
+            disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
+            for disk in (head_disk, jbod_disk):
+                for key in disk.lookup_keys:
+                    disks_by_key[key] = disk
+                disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
+                disks_by_slot[(None, disk.slot)] = disk
+
+            def resolve(raw_slot_status: dict[str, object]) -> str | None:
+                resolved = service._resolve_disk_for_slot(
+                    5, "jbod", None, disks_by_key, disks_by_slot, {}, raw_slot_status, ssh_data
+                )
+                return resolved.disk.device_name if resolved.disk else None
+
+            # SES saw da10 in this bay; the bare slot bucket holds da11 (listed last).
+            self.assertEqual(resolve({"device_names": ["da10"]}), "da10")
+            # Without SES evidence the bare bucket still breaks the tie.
+            self.assertEqual(resolve({}), "da11")
+            # An exact (enclosure_id, slot) match keeps outranking the device name.
+            disks_by_slot[("jbod", 5)] = jbod_disk
+            self.assertEqual(resolve({"device_names": ["da10"]}), "da11")
 
     def test_attach_mapping_revisions_includes_effective_fallback_clear_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5589,7 +6106,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(slot0.vdev_name, "member-0")
             self.assertEqual(slot0.vdev_class, "data")
             self.assertIn("active on Node B", slot0.topology_label or "")
-            self.assertEqual(slot0.mapping_source, "api")
+            self.assertEqual(slot0.mapping_source, "api-slot")
             self.assertFalse(slot0.led_supported)
             self.assertIn("REST and CLI identify operations are being rejected", slot0.led_reason or "")
             slot12 = next(slot for slot in snapshot.slots if slot.slot == 12)
