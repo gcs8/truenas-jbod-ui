@@ -4,6 +4,7 @@ import asyncio
 import errno
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -15,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+
+from starlette.requests import Request
 
 from history_service import main as history_main
 from history_service import migration_lock
@@ -388,20 +391,101 @@ class HistoryConfigTests(unittest.TestCase):
 
 
 class HistoryDashboardRouteTests(unittest.TestCase):
+    @staticmethod
+    def _request(*, root_path: str = "") -> Request:
+        return Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/",
+                "raw_path": b"/",
+                "root_path": root_path,
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 80),
+                "app": history_main.app,
+            }
+        )
+
+    @staticmethod
+    def _render_dashboard(
+        status: dict[str, object],
+        counts: dict[str, object],
+        scopes: list[dict[str, object]],
+        *,
+        database_size_bytes: int = 0,
+        release_status: dict[str, object] | None = None,
+        root_path: str = "",
+    ) -> str:
+        route = next(route for route in history_main.app.routes if route.path == "/")
+        with (
+            patch.object(history_main.collector, "status", return_value=status),
+            patch.object(history_main.store, "estimated_counts", return_value=counts),
+            patch.object(history_main.store, "list_scopes", return_value=scopes),
+            patch.object(history_main.store, "database_size_bytes", return_value=database_size_bytes),
+            patch.object(
+                history_main.get_release_status_service(),
+                "snapshot",
+                return_value=release_status or {},
+            ),
+        ):
+            response = asyncio.run(
+                route.endpoint(
+                    request=HistoryDashboardRouteTests._request(root_path=root_path),
+                    exact_counts=False,
+                )
+            )
+        return response.body.decode("utf-8")
+
+    def test_dashboard_uses_template_and_gated_static_assets(self) -> None:
+        service_dir = Path(history_main.__file__).resolve().parent
+        template_path = service_dir / "templates" / "dashboard.html"
+        stylesheet_path = service_dir / "static" / "dashboard.css"
+        script_path = service_dir / "static" / "dashboard.js"
+
+        self.assertTrue(template_path.is_file(), "history dashboard template must be extracted from main.py")
+        self.assertTrue(stylesheet_path.is_file(), "history dashboard styles must be a static asset")
+        self.assertTrue(script_path.is_file(), "history dashboard JavaScript must be a static asset")
+        self.assertNotIn("<!doctype html>", Path(history_main.__file__).read_text(encoding="utf-8").lower())
+        self.assertIn("script_json_text", history_main.templates.env.filters)
+        self.assertTrue(any(route.path == "/static" for route in history_main.app.routes))
+
+        template_source = template_path.read_text(encoding="utf-8")
+        self.assertIn("dashboard.css", template_source)
+        self.assertIn("dashboard.js", template_source)
+        self.assertNotIn("<style", template_source.lower())
+        self.assertNotRegex(template_source, r"_json\s*\|\s*safe")
+        script_tags = re.findall(r"<script\b([^>]*)>", template_source, flags=re.IGNORECASE)
+        self.assertTrue(script_tags)
+        self.assertTrue(
+            all("src=" in attributes or 'type="application/json"' in attributes for attributes in script_tags),
+            "the history template must not contain executable inline JavaScript",
+        )
+
+        workflow = (service_dir.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("node --check history_service/static/dashboard.js", workflow)
+
     def test_dashboard_renders_fast_and_full_refresh_controls(self) -> None:
-        markup = history_main.render_dashboard(
+        markup = self._render_dashboard(
             {"collector_running": True},
             {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
             [],
-            app_version="0.test",
             release_status={"summary": "dev build"},
+        )
+        script_source = (Path(history_main.__file__).resolve().parent / "static" / "dashboard.js").read_text(
+            encoding="utf-8"
         )
 
         self.assertIn('id="history-refresh-fast"', markup)
         self.assertIn('id="history-refresh-full"', markup)
-        self.assertIn("/api/history/refresh?mode=", markup)
-        self.assertIn("const body = await response.text();", markup)
-        self.assertIn("JSON.parse(body)", markup)
+        self.assertIn('src="http://testserver/static/dashboard.js"', markup)
+        self.assertIn('href="http://testserver/static/dashboard.css"', markup)
+        self.assertIn("/api/history/refresh?mode=", script_source)
+        self.assertIn("const body = await response.text();", script_source)
+        self.assertIn("JSON.parse(body)", script_source)
         self.assertIn("Next background pass", markup)
         self.assertIn("Background backoff", markup)
         self.assertIn("Last collection duration", markup)
@@ -416,28 +500,27 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn("Last collection inventory", markup)
         self.assertIn("DB Size", markup)
         self.assertIn("collector-activity-banner", markup)
-        self.assertIn("pollCollectorStatus", markup)
-        self.assertIn("pollOverviewStatus", markup)
-        self.assertIn("__HISTORY_DASHBOARD_POLL", markup)
+        self.assertIn("pollCollectorStatus", script_source)
+        self.assertIn("pollOverviewStatus", script_source)
+        self.assertIn("__HISTORY_DASHBOARD_POLL", script_source)
         self.assertIn('id="status-current-collection"', markup)
         self.assertIn('id="collector-state-value"', markup)
         self.assertIn('id="tracked-scopes-body"', markup)
 
     def test_dashboard_omits_release_link_for_non_http_urls(self) -> None:
-        markup = history_main.render_dashboard(
+        markup = self._render_dashboard(
             {"collector_running": True},
             {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
             [],
-            app_version="0.test",
             release_status={"summary": "latest release", "latest_url": "javascript:alert(1)"},
         )
 
         self.assertIn("latest release", markup)
         self.assertNotIn("javascript:alert", markup)
-        self.assertNotIn("class='note-link'", markup)
+        self.assertNotIn('class="note-link"', markup)
 
     def test_dashboard_renders_collection_activity_banner_state(self) -> None:
-        markup = history_main.render_dashboard(
+        markup = self._render_dashboard(
             {
                 "collector_running": True,
                 "collection_running": True,
@@ -447,15 +530,98 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             },
             {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
             [],
-            app_version="0.test",
             database_size_bytes=1536,
+        )
+        script_source = (Path(history_main.__file__).resolve().parent / "static" / "dashboard.js").read_text(
+            encoding="utf-8"
         )
 
         self.assertIn("collecting SMART metrics", markup)
         self.assertIn("1.5 KiB", markup)
-        self.assertIn("History ${kind} collection running", markup)
-        self.assertIn("renderCollectorStatus(payload)", markup)
-        self.assertIn("renderOverview(initialOverviewPayload)", markup)
+        self.assertRegex(
+            markup,
+            r'id="status-current-collection">\s*background for 42s: collecting SMART metrics for Archive CORE / Front Shelf \(1/2\)',
+        )
+        self.assertRegex(
+            markup,
+            r'id="collector-activity-banner"[^>]*>\s*History background collection running for 42s: '
+            r'collecting SMART metrics for Archive CORE / Front Shelf \(1/2\)\.',
+        )
+        self.assertIn("History ${kind} collection running", script_source)
+        self.assertIn("renderCollectorStatus(payload)", script_source)
+        self.assertNotIn("renderOverview(initialOverviewPayload)", script_source)
+
+    def test_dashboard_server_renders_backoff_banner_without_javascript(self) -> None:
+        markup = self._render_dashboard(
+            {
+                "collector_running": True,
+                "collection_running": False,
+                "background_backoff_seconds_remaining": 125,
+            },
+            {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
+            [],
+        )
+
+        self.assertRegex(
+            markup,
+            r'id="collector-activity-banner"[^>]*>\s*History background collection is backed off for 2m 5s '
+            r'after repeated failures\.',
+        )
+        self.assertRegex(markup, r'id="status-current-collection">\s*not running')
+
+    def test_dashboard_bootstrap_is_script_safe_and_round_trips(self) -> None:
+        hostile_text = "</script><script>alert('&')</script>" + chr(0x2028) + chr(0x2029)
+        status = {
+            "collector_running": True,
+            "source_base_url": hostile_text,
+            "collection_activity": hostile_text,
+        }
+        counts = {
+            "tracked_slots": 1,
+            "event_count": 2,
+            "metric_sample_count": 3,
+            "estimated": True,
+        }
+        scopes = [
+            {
+                "system_label": hostile_text,
+                "enclosure_label": "Synthetic Shelf",
+                "tracked_slots": 1,
+                "event_count": 2,
+                "metric_sample_count": 3,
+                "last_seen_at": "2026-09-02T12:00:00+00:00",
+            }
+        ]
+
+        markup = self._render_dashboard(status, counts, scopes, database_size_bytes=1024)
+
+        match = re.search(
+            r'<script id="history-dashboard-bootstrap" type="application/json">\s*(.*?)\s*</script>',
+            markup,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        bootstrap_text = match.group(1)
+        self.assertNotIn("<", bootstrap_text)
+        self.assertNotIn(chr(0x2028), bootstrap_text)
+        self.assertNotIn(chr(0x2029), bootstrap_text)
+        self.assertEqual(
+            json.loads(bootstrap_text),
+            status,
+        )
+        self.assertNotIn(hostile_text, markup)
+        self.assertIn("&lt;/script&gt;&lt;script&gt;alert", markup)
+
+    def test_dashboard_static_urls_preserve_root_path(self) -> None:
+        markup = self._render_dashboard(
+            {"collector_running": True},
+            {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
+            [],
+            root_path="/history",
+        )
+
+        self.assertIn('href="http://testserver/history/static/dashboard.css"', markup)
+        self.assertIn('src="http://testserver/history/static/dashboard.js"', markup)
 
     def test_overview_marks_trigger_tracked_counts_as_exact(self) -> None:
         with (
@@ -664,6 +830,8 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                         stack.enter_context(
                             patch.object(history_main.store, method_name, side_effect=tracked_result(result))
                         )
+                    if route_path == "/":
+                        route_kwargs = {"request": self._request(), **route_kwargs}
                     asyncio.run(getattr(route, "endpoint")(**route_kwargs))
 
                 self.assertTrue(store_thread_ids)
