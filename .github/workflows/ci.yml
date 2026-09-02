@@ -190,6 +190,7 @@ jobs:
           node --check app/static/app.js
           node --check app/static/sas_fabric_view.js
           node --check admin_service/static/admin.js
+          node --check history_service/static/dashboard.js
           specs=(qa/*.spec.js)
           if [ ${#specs[@]} -eq 0 ]; then
             echo "No QA spec files found under qa/*.spec.js"

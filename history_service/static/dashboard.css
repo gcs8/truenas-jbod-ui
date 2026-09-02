@@ -1,0 +1,175 @@
+:root {
+  color-scheme: dark;
+  --bg: #11161c;
+  --panel: #18212b;
+  --panel-2: #202b38;
+  --text: #eef4fb;
+  --muted: #98a7ba;
+  --line: #314253;
+  --accent: #7cd4a8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+  background: radial-gradient(circle at top, #203245, var(--bg) 58%);
+  color: var(--text);
+}
+
+main {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 32px 20px 48px;
+}
+
+h1,
+h2 {
+  margin: 0 0 12px;
+}
+
+p {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 14px;
+  margin: 24px 0;
+}
+
+.card,
+table {
+  background: rgba(24, 33, 43, 0.92);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+}
+
+.card {
+  padding: 16px;
+}
+
+.label {
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.value {
+  margin-top: 8px;
+  font-size: 1.35rem;
+  font-weight: 700;
+}
+
+.note-text,
+.note-link {
+  display: block;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.note-link {
+  text-decoration: none;
+}
+
+.note-link:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  overflow: hidden;
+}
+
+th,
+td {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+}
+
+th {
+  background: rgba(32, 43, 56, 0.95);
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+tr:last-child td {
+  border-bottom: 0;
+}
+
+code {
+  color: var(--accent);
+  font-family: Consolas, monospace;
+}
+
+.status-ok {
+  color: var(--accent);
+}
+
+.status-error {
+  color: #ff8b8b;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin: 20px 0 4px;
+}
+
+button {
+  border: 1px solid #45607d;
+  border-radius: 12px;
+  background: #2c3d50;
+  color: var(--text);
+  padding: 10px 14px;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: transparent;
+  border-color: var(--line);
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.action-status {
+  min-height: 1.4em;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.collector-banner {
+  margin: 18px 0 4px;
+  padding: 12px 14px;
+  border: 1px solid #6f5f24;
+  border-radius: 12px;
+  background: rgba(96, 76, 24, 0.34);
+  color: #f5d789;
+  font-size: 0.92rem;
+}
+
+.collector-banner[hidden] {
+  display: none;
+}
+
+.tracked-scopes-section {
+  margin-top: 24px;
+}

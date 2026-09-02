@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ app_name }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='dashboard.css') }}">
+  </head>
+  <body>
+    <main>
+      <h1>{{ app_name }}</h1>
+      <p>
+        Optional sidecar for slot history and lightweight SMART snapshots. This stays separate from
+        the main UI so collection can be enabled or disabled without changing the core dashboard.
+      </p>
+      <div class="actions" aria-label="History refresh actions">
+        <button id="history-refresh-fast" type="button">Refresh Fast</button>
+        <button id="history-refresh-full" class="secondary" type="button">Refresh Full</button>
+        <span id="history-refresh-status" class="action-status" role="status" aria-live="polite"></span>
+      </div>
+      <div id="collector-activity-banner" class="collector-banner" role="status" aria-live="polite"{% if not collector_banner_text %} hidden{% endif %}>{{ collector_banner_text }}</div>
+
+      <section class="grid">
+        <div class="card">
+          <div class="label">Collector</div>
+          <div id="collector-state-value" class="value {{ 'status-ok' if status.get('collector_running') else 'status-error' }}">
+            {{ 'Running' if status.get('collector_running') else 'Stopped' }}
+          </div>
+        </div>
+        <div class="card">
+          <div class="label">Tracked Slots</div>
+          <div id="tracked-slots-value" class="value">{{ counts.get('tracked_slots', 0) }}</div>
+        </div>
+        <div class="card">
+          <div class="label">Slot Events</div>
+          <div id="slot-events-value" class="value">{{ format_count(counts.get('event_count', 0), estimated=counts_are_estimated) }}</div>
+        </div>
+        <div class="card">
+          <div class="label">Metric Samples</div>
+          <div id="metric-samples-value" class="value">{{ format_count(counts.get('metric_sample_count', 0), estimated=counts_are_estimated) }}</div>
+        </div>
+        <div class="card">
+          <div class="label">Metric Rollups</div>
+          <div id="metric-rollups-value" class="value">{{ format_count(counts.get('metric_rollup_count', 0), estimated=counts_are_estimated) }}</div>
+        </div>
+        <div class="card">
+          <div class="label">DB Size</div>
+          <div id="db-size-value" class="value">{{ database_size_label }}</div>
+        </div>
+        <div class="card">
+          <div class="label">Version</div>
+          <div class="value">{{ app_version }}</div>
+          {% if latest_url %}
+          <a class="note-link" href="{{ latest_url }}" target="_blank" rel="noopener">{{ release_summary }}</a>
+          {% else %}
+          <span class="note-text">{{ release_summary }}</span>
+          {% endif %}
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Collector Status</h2>
+        <p>
+          Current collection: <code id="status-current-collection">{{ current_collection_label }}</code><br>
+          Source: <code id="status-source-base-url">{{ status.get('source_base_url') or 'unknown' }}</code><br>
+          Database: <code id="status-sqlite-path">{{ status.get('sqlite_path') or 'unknown' }}</code><br>
+          Last inventory pass: <code id="status-last-inventory-at">{{ status.get('last_inventory_at') or 'never' }}</code><br>
+          Last fast metrics pass: <code id="status-last-fast-metrics-at">{{ status.get('last_fast_metrics_at') or 'never' }}</code><br>
+          Last slow metrics pass: <code id="status-last-slow-metrics-at">{{ status.get('last_slow_metrics_at') or 'never' }}</code><br>
+          Last backup snapshot: <code id="status-last-backup-at">{{ status.get('last_backup_at') or 'never' }}</code><br>
+          Last retention pass: <code id="status-last-retention-at">{{ status.get('last_retention_at') or 'never' }}</code><br>
+          Last retention duration: <code id="status-last-retention-duration">{{ last_retention_duration_label }}</code><br>
+          Last retention rows removed: <code id="status-last-retention-rows-removed">{{ status.get('last_retention_rows_removed') or 0 }}</code><br>
+          Retention catch-up pending: <code id="status-last-retention-has-more">{{ 'yes' if status.get('last_retention_has_more') else 'no' }}</code><br>
+          Last retention failure: <code id="status-last-retention-error">{{ status.get('last_retention_error') or 'none' }}</code><br>
+          Last collection duration: <code id="status-last-collection-duration">{{ last_collection_duration_label }}</code><br>
+          Last schedule overrun: <code id="status-last-background-overrun">{{ last_background_overrun_label }}</code><br>
+          Last collection inventory: <code id="status-last-collection-inventory">{{ last_inventory_mode }}</code><br>
+          Next background pass: <code id="status-next-collection-at">{{ status.get('next_collection_at') or 'not scheduled' }}</code><br>
+          Background failures: <code id="status-background-failures">{{ status.get('background_consecutive_failures') or 0 }}</code><br>
+          Background backoff: <code id="status-background-backoff">{{ backoff_label }}</code><br>
+          Backoff until: <code id="status-background-backoff-until">{{ status.get('background_backoff_until') or 'not active' }}</code><br>
+          Last error: <code id="status-last-error">{{ status.get('last_error') or 'none' }}</code>
+        </p>
+      </section>
+
+      <section class="tracked-scopes-section">
+        <h2>Tracked Scopes</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>System</th>
+              <th>Enclosure</th>
+              <th>Tracked Slots</th>
+              <th>Events</th>
+              <th>Metric Samples</th>
+              <th>Last Seen</th>
+            </tr>
+          </thead>
+          <tbody id="tracked-scopes-body">
+            {% for scope in scopes %}
+            <tr>
+              <td>{{ scope.get('system_label') or scope.get('system_id') or 'unknown' }}</td>
+              <td>{{ scope.get('enclosure_label') or scope.get('enclosure_id') or 'default' }}</td>
+              <td>{{ scope.get('tracked_slots') or 0 }}</td>
+              <td>{{ format_count(scope.get('event_count')) }}</td>
+              <td>{{ format_count(scope.get('metric_sample_count')) }}</td>
+              <td>{{ scope.get('last_seen_at') or 'never' }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6">No slot history has been collected yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+    </main>
+    <script id="history-dashboard-bootstrap" type="application/json">
+      {{ status_json | script_json_text }}
+    </script>
+    <script src="{{ url_for('static', path='dashboard.js') }}" defer></script>
+  </body>
+</html>
