@@ -156,6 +156,7 @@ the wiki:
 - [SSH Setup and Sudo](wiki/SSH-Setup-and-Sudo.md)
 - [Live Enclosures and Storage Views](wiki/Live-Enclosures-and-Storage-Views.md)
 - [Inventory Evidence Precedence](docs/INVENTORY_EVIDENCE_PRECEDENCE.md)
+- [Hardware Report Fixture Intake](docs/HARDWARE_REPORT_FIXTURE_INTAKE.md)
 - [History and Snapshot Export](wiki/History-and-Snapshot-Export.md)
 - [Segmented History v2](docs/SEGMENTED_HISTORY_V2.md)
 - [Demo and Offline Workflows](wiki/Demo-and-Offline-Workflows.md)
