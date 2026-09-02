@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import tempfile
 import threading
 import unittest
@@ -12,7 +14,7 @@ from unittest.mock import MagicMock, patch
 from starlette.datastructures import URLPath
 from starlette.requests import Request
 
-from app.config import Settings, get_settings
+from app.config import BMCConfig, HANodeConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig, get_settings
 from app.main import templates
 from app.models.domain import (
     EnclosureOption,
@@ -32,6 +34,7 @@ from app.services.snapshot_export import (
     EXPORT_ZIP_CACHE,
     SnapshotExportService,
     SnapshotRedactor,
+    collect_configured_hostnames,
 )
 
 
@@ -731,6 +734,208 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(redacted_cache_key, rendered.history_cache)
         self.assertTrue(rendered.history_cache[redacted_cache_key]["available"])
         self.assertEqual(rendered.history_cache[redacted_cache_key]["sample_counts"]["temperature_c"], 2)
+
+    async def test_partial_export_redacts_configured_hostnames_from_all_embedded_payloads(self) -> None:
+        hostnames = {
+            "api": "api206.redact.invalid",
+            "ssh": "ssh206.redact.invalid",
+            "extra": "extra206.redact.invalid",
+            "bmc": "bmc206.redact.invalid",
+            "ha": "ha206.redact.invalid",
+            "short": "ha1",
+        }
+        synthetic_credentials = {
+            "api": "fixture-api-credential-206",
+            "ssh": "fixture-ssh-credential-206",
+            "bmc": "fixture-bmc-credential-206",
+        }
+        source_system = SystemConfig(
+            id="archive-core",
+            label="Archive CORE",
+            truenas=TrueNASConfig(
+                host=f"https://{hostnames['api']}:8443/api/v2",
+                api_key=synthetic_credentials["api"],
+            ),
+            ssh=SSHConfig(
+                enabled=True,
+                host=hostnames["ssh"],
+                extra_hosts=[hostnames["extra"], "0", ""],
+                ha_enabled=True,
+                ha_nodes=[
+                    HANodeConfig(host=hostnames["ha"]),
+                    HANodeConfig(host=hostnames["short"]),
+                    HANodeConfig(host=None),
+                ],
+                password=synthetic_credentials["ssh"],
+            ),
+            bmc=BMCConfig(
+                enabled=True,
+                host=f"https://{hostnames['bmc']}:443/redfish/v1",
+                password=synthetic_credentials["bmc"],
+            ),
+        )
+        snapshot = build_snapshot()
+        snapshot.warnings = [
+            f"API request to https://{hostnames['api']}:8443/api/v2 failed at 2026-09-02T00:01:00Z; "
+            f"unrelated {hostnames['api']}.example and prefix{hostnames['api']} stay literal.",
+            f"SSH warning from {hostnames['ssh']}.",
+        ]
+        snapshot.slots[0].raw_status = {
+            "quantastor_ssh_hosts_by_system_id": {"archive-core": hostnames["ssh"]},
+            "sas_address_hint": "0",
+        }
+        smart_summary_cache = build_smart_summary_cache()
+        smart_summary_cache["0"]["detail"] = (
+            f"HA detail from {hostnames['ha']} and short host {hostnames['short']}; "
+            f"unrelated x{hostnames['short']} stays literal"
+        )
+        storage_view_runtime = build_storage_view_runtime()
+        storage_view_runtime.views[0].notes = [f"Storage view collected through {hostnames['extra']}"]
+        storage_view_smart_summary_cache = build_storage_view_smart_summary_cache()
+        storage_view_smart_summary_cache["boot-doms"]["0"]["detail"] = (
+            f"BMC detail from {hostnames['bmc']}"
+        )
+
+        class ConfiguredHostnameHistoryBackend(FakeHistoryBackend):
+            async def get_scope_history(self, **kwargs: Any) -> dict[int, dict[str, object]]:
+                histories = await super().get_scope_history(**kwargs)
+                for history in histories.values():
+                    history["detail"] = f"History cache fetched through {hostnames['extra']}"
+                return histories
+
+        exporter = SnapshotExportService(Settings(), ConfiguredHostnameHistoryBackend(), templates)
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=smart_summary_cache,
+            storage_view_runtime=storage_view_runtime,
+            storage_view_smart_summary_cache=storage_view_smart_summary_cache,
+            selected_slot=0,
+            history_window_hours=None,
+            history_panel_open=True,
+            io_chart_mode="total",
+            redact_sensitive=True,
+            configured_hostnames=collect_configured_hostnames(source_system.model_dump(mode="json")),
+        )
+
+        serialized_surfaces = [
+            rendered.snapshot.model_dump_json(),
+            json.dumps(rendered.history_cache),
+            json.dumps(rendered.smart_summary_cache),
+            rendered.html,
+        ]
+        for hostname in hostnames.values():
+            with self.subTest(hostname=hostname):
+                hostname_pattern = re.compile(
+                    rf"(?<![A-Za-z0-9_.-]){re.escape(hostname)}(?![A-Za-z0-9_.-])"
+                )
+                self.assertFalse(any(hostname_pattern.search(surface) for surface in serialized_surfaces))
+        for credential in synthetic_credentials.values():
+            self.assertFalse(any(credential in surface for surface in serialized_surfaces))
+        self.assertIn("https://host-01:8443/api/v2", rendered.html)
+        self.assertIn("SSH warning from host-01.", rendered.html)
+        self.assertIn("2026-09-02T00:01:00Z", rendered.html)
+        self.assertIn(f"{hostnames['api']}.example", rendered.html)
+        self.assertIn(f"prefix{hostnames['api']}", rendered.html)
+        self.assertIn(f"x{hostnames['short']}", rendered.html)
+        self.assertEqual(rendered.snapshot.slots[0].raw_status["sas_address_hint"], "0")
+        self.assertIn("host-01", rendered.html)
+        self.assertIn("enc-01", rendered.html)
+
+    def test_configured_hostname_collection_normalizes_a_dns_root_dot(self) -> None:
+        configured_hostnames = collect_configured_hostnames(
+            {
+                "truenas": {
+                    "host": "https://NAS206.EXAMPLE.INVALID.:8443/api",
+                    "tls_server_name": "TLS206.EXAMPLE.INVALID.",
+                }
+            }
+        )
+        redactor = SnapshotRedactor(
+            build_snapshot(),
+            {},
+            {},
+            configured_hostnames=configured_hostnames,
+        )
+
+        self.assertEqual(
+            configured_hostnames,
+            ["nas206.example.invalid", "tls206.example.invalid"],
+        )
+        self.assertEqual(
+            redactor.redact_object(
+                "collector failed on nas206.example.invalid for tls206.example.invalid"
+            ),
+            "collector failed on host-01 for host-01",
+        )
+
+    async def test_none_export_preserves_configured_hostname_fidelity(self) -> None:
+        api_hostname = "api206.none.invalid"
+        source_system = SystemConfig(
+            id="archive-core",
+            label="Archive CORE",
+            truenas=TrueNASConfig(host=f"https://{api_hostname}:8443/api/v2"),
+        )
+        snapshot = build_snapshot()
+        original_warning = f"API request to https://{api_hostname}:8443/api/v2 returned full identifiers"
+        snapshot.warnings = [original_warning]
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            io_chart_mode="total",
+            redact_sensitive=False,
+            configured_hostnames=collect_configured_hostnames(source_system.model_dump(mode="json")),
+        )
+
+        self.assertEqual(rendered.snapshot.warnings, [original_warning])
+        self.assertIn(original_warning, rendered.html)
+        self.assertEqual(rendered.export_meta["redaction"], "none")
+        self.assertEqual(rendered.export_meta["redaction_label"], "None")
+
+    async def test_partial_export_cache_varies_with_serialized_source_hostnames(self) -> None:
+        hostname = "cache206.redact.invalid"
+        snapshot = build_snapshot()
+        snapshot.warnings = [f"Collector failed on {hostname}"]
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+        common_args = {
+            "request": build_request(),
+            "snapshot": snapshot,
+            "smart_summary_cache": build_smart_summary_cache(),
+            "selected_slot": 0,
+            "history_window_hours": 24,
+            "io_chart_mode": "total",
+            "redact_sensitive": True,
+        }
+
+        unrecognized = await exporter.build_enclosure_snapshot_html(
+            **common_args,
+            configured_hostnames=collect_configured_hostnames(
+                SystemConfig(
+                    id="archive-core",
+                    label="Archive CORE",
+                    truenas=TrueNASConfig(host="https://other206.redact.invalid"),
+                ).model_dump(mode="json")
+            ),
+        )
+        recognized = await exporter.build_enclosure_snapshot_html(
+            **common_args,
+            configured_hostnames=collect_configured_hostnames(
+                SystemConfig(
+                    id="archive-core",
+                    label="Archive CORE",
+                    truenas=TrueNASConfig(host=f"https://{hostname}"),
+                ).model_dump(mode="json")
+            ),
+        )
+
+        self.assertIn(hostname, unrecognized.html)
+        self.assertNotIn(hostname, recognized.html)
+        self.assertIn("Collector failed on host-01", recognized.html)
 
     async def test_auto_packaging_falls_back_to_zip_when_html_exceeds_limit(self) -> None:
         snapshot = build_snapshot()
