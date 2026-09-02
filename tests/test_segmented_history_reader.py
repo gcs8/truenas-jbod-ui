@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from history_service import segment_reader
 from history_service.segment_reader import MAX_HISTORY_QUERY_LIMIT, SegmentedHistoryReader
 from history_service.store import SCHEMA, HistoryStore
 
@@ -891,6 +892,173 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
 
             self.assertEqual(reader.segment_paths, (segment_path.resolve(),))
 
+    def test_catalog_digest_verification_is_reused_across_isolated_query_connections(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            catalog_path = root / "catalog.json"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [(1, "2025-01-01T00:00:00+00:00")])
+            self._write_catalog(catalog_path, segment_path)
+            original_sha256 = hashlib.sha256
+
+            with patch.object(segment_reader.hashlib, "sha256", wraps=original_sha256) as sha256:
+                reader = SegmentedHistoryReader.from_catalog(
+                    hot_path=hot_path,
+                    catalog_path=catalog_path,
+                )
+                verified_digest_count = sha256.call_count
+                original_connect = sqlite3.connect
+                with patch.object(
+                    segment_reader.sqlite3,
+                    "connect",
+                    wraps=original_connect,
+                ) as connect:
+                    first = reader.list_slot_events("system-1", "enclosure-1", 1)
+                    second = reader.list_slot_events("system-1", "enclosure-1", 1)
+
+            self.assertEqual(verified_digest_count, 1)
+            self.assertEqual(sha256.call_count, verified_digest_count)
+            self.assertEqual(connect.call_count, 4)
+            self.assertEqual([event["id"] for event in first], [1])
+            self.assertEqual([event["id"] for event in second], [1])
+
+    def test_catalog_digest_verification_is_reused_without_generation_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            catalog_path = root / "catalog.json"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [(1, "2025-01-01T00:00:00+00:00")])
+            self._write_catalog(catalog_path, segment_path)
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            catalog.pop("generation_id")
+            catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+            original_sha256 = hashlib.sha256
+
+            with patch.object(segment_reader.hashlib, "sha256", wraps=original_sha256) as sha256:
+                reader = SegmentedHistoryReader.from_catalog(
+                    hot_path=hot_path,
+                    catalog_path=catalog_path,
+                )
+                verified_digest_count = sha256.call_count
+                reader.list_slot_events("system-1", "enclosure-1", 1)
+                reader.list_slot_events("system-1", "enclosure-1", 1)
+
+            self.assertEqual(verified_digest_count, 1)
+            self.assertEqual(sha256.call_count, verified_digest_count)
+
+    def test_catalog_digest_cache_reauthenticates_an_atomically_replaced_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            replacement_path = root / "replacement.sqlite3"
+            catalog_path = root / "catalog.json"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [(1, "2025-01-01T00:00:00+00:00")])
+            self._write_catalog(catalog_path, segment_path)
+            replacement_path.write_bytes(segment_path.read_bytes())
+            reader = SegmentedHistoryReader.from_catalog(
+                hot_path=hot_path,
+                catalog_path=catalog_path,
+            )
+            replacement_path.replace(segment_path)
+            original_sha256 = hashlib.sha256
+
+            with patch.object(segment_reader.hashlib, "sha256", wraps=original_sha256) as sha256:
+                events = reader.list_slot_events("system-1", "enclosure-1", 1)
+                reader.list_slot_events("system-1", "enclosure-1", 1)
+
+            self.assertEqual(sha256.call_count, 1)
+            self.assertEqual([event["id"] for event in events], [1])
+
+    def test_catalog_digest_cache_reauthenticates_segment_metadata_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            catalog_path = root / "catalog.json"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [(1, "2025-01-01T00:00:00+00:00")])
+            self._write_catalog(catalog_path, segment_path)
+            reader = SegmentedHistoryReader.from_catalog(
+                hot_path=hot_path,
+                catalog_path=catalog_path,
+            )
+            metadata = segment_path.stat()
+            os.utime(
+                segment_path,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
+            )
+            original_sha256 = hashlib.sha256
+
+            with patch.object(segment_reader.hashlib, "sha256", wraps=original_sha256) as sha256:
+                reader.list_slot_events("system-1", "enclosure-1", 1)
+                reader.list_slot_events("system-1", "enclosure-1", 1)
+
+            self.assertEqual(sha256.call_count, 1)
+
+    def test_catalog_generation_change_gets_a_fresh_verified_digest_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            catalog_path = root / "catalog.json"
+            successor_catalog_path = root / "successor-catalog.json"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [(1, "2025-01-01T00:00:00+00:00")])
+            self._write_catalog(catalog_path, segment_path)
+            self._write_catalog(
+                successor_catalog_path,
+                segment_path,
+                generation_id="generation-0002",
+            )
+            store = HistoryStore(
+                str(hot_path),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog_path,
+            )
+            original_sha256 = hashlib.sha256
+
+            with patch.object(segment_reader.hashlib, "sha256", wraps=original_sha256) as sha256:
+                store.list_slot_events("system-1", "enclosure-1", 1)
+                first_reader = store._segment_reader_cache
+                successor_catalog_path.replace(catalog_path)
+                store.list_slot_events("system-1", "enclosure-1", 1)
+                second_reader = store._segment_reader_cache
+                store.list_slot_events("system-1", "enclosure-1", 1)
+
+            self.assertEqual(sha256.call_count, 2)
+            self.assertIsNot(first_reader, second_reader)
+
+    def test_catalog_digest_cache_does_not_outlive_its_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hot_path = root / "hot.sqlite3"
+            segment_path = root / "segment-0001.sqlite3"
+            catalog_path = root / "catalog.json"
+            self._create_database(hot_path, [])
+            self._create_database(segment_path, [(1, "2025-01-01T00:00:00+00:00")])
+            self._write_catalog(catalog_path, segment_path)
+            original_sha256 = hashlib.sha256
+
+            with patch.object(segment_reader.hashlib, "sha256", wraps=original_sha256) as sha256:
+                first_reader = SegmentedHistoryReader.from_catalog(
+                    hot_path=hot_path,
+                    catalog_path=catalog_path,
+                )
+                first_reader.list_slot_events("system-1", "enclosure-1", 1)
+                second_reader = SegmentedHistoryReader.from_catalog(
+                    hot_path=hot_path,
+                    catalog_path=catalog_path,
+                )
+                second_reader.list_slot_events("system-1", "enclosure-1", 1)
+
+            self.assertEqual(sha256.call_count, 2)
+
     def test_cli_merges_hot_and_sealed_raw_metric_samples_newest_first(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1054,6 +1222,34 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
                 [event["observed_at"] for event in events],
                 ["2025-01-03T00:00:00+00:00", "2025-01-02T00:00:00+00:00"],
             )
+
+    @staticmethod
+    def _write_catalog(
+        catalog_path: Path,
+        segment_path: Path,
+        *,
+        generation_id: str = "generation-0001",
+    ) -> None:
+        catalog_path.write_text(
+            json.dumps(
+                {
+                    "catalog_version": 1,
+                    "generation_id": generation_id,
+                    "complete": True,
+                    "segments": [
+                        {
+                            "segment_id": "segment-0001",
+                            "file_name": segment_path.name,
+                            "size_bytes": segment_path.stat().st_size,
+                            "sha256": hashlib.sha256(segment_path.read_bytes()).hexdigest(),
+                            "coverage_start": "2025-01-01T00:00:00+00:00",
+                            "coverage_end": "2025-01-01T00:00:00+00:00",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _create_database(
