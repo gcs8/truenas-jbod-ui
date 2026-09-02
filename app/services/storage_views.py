@@ -192,7 +192,14 @@ def storage_view_slot_label(
     if template and slot_value in template.default_slot_labels:
         return template.default_slot_labels[slot_value]
     if storage_view.kind == "ses_enclosure" and selected_profile:
-        return str(slot_value).zfill(2)
+        # Live SES slots label as `slot + slot_number_base` (the Dell MD1280
+        # silk-screens bays 1-based while SES stays 0-based). The storage-view
+        # fallback used to ignore the base and print 0-based labels next to
+        # the live 1-based ones (issue #186).
+        label_base = selected_profile.slot_number_base
+        if not isinstance(label_base, int):
+            label_base = 0
+        return f"{slot_value + label_base:02d}"
     return f"Slot {slot_value + 1}"
 
 

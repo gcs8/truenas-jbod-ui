@@ -19,6 +19,7 @@ from app.config import (
 )
 from app.models.domain import (
     EnclosureOption,
+    EnclosureProfileView,
     InventorySummary,
     InventorySnapshot,
     LedAction,
@@ -59,6 +60,7 @@ from app.services.parsers import (
     canonicalize_ssh_command,
     parse_ssh_outputs,
 )
+from app.services.storage_views import storage_view_slot_label
 from app.services.profile_registry import ProfileRegistry
 from app.services.profile_registry import (
     CORE_CSE_946_PROFILE_ID,
@@ -97,6 +99,33 @@ def build_inventory_service(
 
 
 class InventoryHelpersTests(unittest.TestCase):
+    def test_storage_view_slot_label_honors_profile_slot_number_base(self) -> None:
+        storage_view = StorageViewConfig.model_validate(
+            {
+                "id": "shelf-view",
+                "label": "Shelf",
+                "kind": "ses_enclosure",
+                "template_id": "ses-auto",
+                "profile_id": "one-based-shelf",
+            }
+        )
+
+        def profile(slot_number_base: int | None) -> EnclosureProfileView:
+            return EnclosureProfileView(
+                id="one-based-shelf",
+                label="One-based shelf",
+                rows=3,
+                columns=14,
+                slot_number_base=slot_number_base,
+            )
+
+        # Live SES slots label as f"{slot + base:02d}"; the storage-view
+        # fallback for slots outside the snapshot must agree (issue #186).
+        self.assertEqual(storage_view_slot_label(storage_view, 0, selected_profile=profile(1)), "01")
+        self.assertEqual(storage_view_slot_label(storage_view, 41, selected_profile=profile(1)), "42")
+        self.assertEqual(storage_view_slot_label(storage_view, 0, selected_profile=profile(None)), "00")
+        self.assertEqual(storage_view_slot_label(storage_view, 7, selected_profile=profile(0)), "07")
+
     def test_ordered_storage_view_candidates_do_not_mutate_shared_payloads(self) -> None:
         service = object.__new__(InventoryService)
         storage_view = StorageViewConfig.model_validate(
