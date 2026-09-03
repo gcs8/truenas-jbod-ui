@@ -266,6 +266,118 @@ Slot00 [0,0]  Element type: Array device slot
         self.assertEqual(slot.sas_address, "5000cca264d473d5")
         self.assertEqual(slot.phy_identifier, "0x0")
 
+    def test_parse_sg_ses_join_filter_accepts_descriptor_variants(self) -> None:
+        headers = (
+            "[0,7]  Element type: Array device slot",
+            "Drive Bay Seven [0,7]  Element type: Array device slot",
+            "ArbitraryDescriptor [0,7]  Element type: device slot",
+        )
+
+        for header in headers:
+            with self.subTest(header=header):
+                output = "\n".join(
+                    (
+                        "ExampleCo  GenericShelf  0001",
+                        header,
+                        "  Additional Element Status:",
+                        "    number of phys: 1, not all phys: 0, device slot number: 7",
+                        "      SAS device type: end device",
+                    )
+                )
+
+                parsed = parse_sg_ses_join_filter(output, "sg_ses join /dev/sg7")
+
+                self.assertIsNotNone(parsed)
+                assert parsed is not None
+                self.assertEqual(list(parsed.slots), [7])
+                self.assertEqual(parsed.enclosure_name, "ExampleCo GenericShelf 0001")
+
+    def test_parse_sg_ses_join_filter_rekeys_to_reported_bay(self) -> None:
+        output = """
+ExampleCo  GenericShelf  0001
+Slot17 [0,17]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+  Additional Element Status:
+    number of phys: 1, not all phys: 0, device slot number: 7
+      SAS device type: end device
+""".strip()
+
+        parsed = parse_sg_ses_join_filter(output, "sg_ses join /dev/sg7")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(list(parsed.slots), [7])
+        slot = parsed.slots[7]
+        self.assertEqual(slot.slot_number, 7)
+        self.assertEqual(slot.element_id, 17)
+        self.assertEqual(
+            slot.control_targets,
+            [{"ses_device": "/dev/sg7", "ses_element_id": 17, "ses_slot_number": 7}],
+        )
+
+    def test_parse_sg_ses_join_filter_resets_on_every_non_slot_header(self) -> None:
+        output = """
+ExampleCo  GenericShelf  0001
+[0,7]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    Ident=0
+  Additional Element Status:
+    number of phys: 1, not all phys: 0, device slot number: 7
+      SAS device type: end device
+Fan0 [2,0]  Element type: Cooling
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Critical
+    Ident=1
+PSU0 [1,0]  Element type: Power supply
+  Enclosure Status:
+    Predicted failure=1, Disabled=1, Swap=0, status: Noncritical
+    Ident=1
+Temp0 [3,0]  Element type: Temperature sensor
+  Enclosure Status:
+    Predicted failure=1, Disabled=1, Swap=0, status: Critical
+    Ident=1
+""".strip()
+
+        parsed = parse_sg_ses_join_filter(output, "sg_ses join /dev/sg7")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        slot = parsed.slots[7]
+        self.assertEqual(slot.status, "OK")
+        self.assertFalse(slot.identify_active)
+        self.assertFalse(slot.predicted_failure)
+        self.assertFalse(slot.disabled)
+
+    def test_parse_sg_ses_join_filter_records_presence_from_joined_evidence(self) -> None:
+        output = """
+ExampleCo  GenericShelf  0001
+[0,7]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Noncritical
+  Additional Element Status:
+    number of phys: 1, not all phys: 0, device slot number: 7
+      SAS device type: no SAS device attached
+      SAS address: 0x0
+[0,8]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Noncritical
+  Additional Element Status:
+    number of phys: 1, not all phys: 0, device slot number: 8
+      SAS device type: end device
+      SAS address: 0x5000000000000008
+""".strip()
+
+        parsed = parse_sg_ses_join_filter(output, "sg_ses join /dev/sg7")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertFalse(parsed.slots[7].present)
+        self.assertEqual(parsed.slots[7].presence_source, "sg_ses_join")
+        self.assertTrue(parsed.slots[8].present)
+        self.assertEqual(parsed.slots[8].presence_source, "sg_ses_join")
+
     def test_canonicalize_esxi_inventory_commands(self) -> None:
         self.assertEqual(canonicalize_ssh_command("esxcli storage core device list"), "esxcli storage core device list")
         self.assertEqual(canonicalize_ssh_command("esxcli storage vmfs extent list"), "esxcli storage vmfs extent list")

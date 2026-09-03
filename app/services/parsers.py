@@ -1356,6 +1356,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
         enclosure_name=_extract_sg_ses_enclosure_name(output),
     )
     current_slot: SESMapSlot | None = None
+    descriptor_slot_number: int | None = None
 
     for raw_line in output.splitlines():
         stripped = raw_line.strip()
@@ -1366,35 +1367,38 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             enclosure.enclosure_id = normalize_text(stripped.split(":", 1)[1])
             continue
 
-        slot_match = re.match(
-            r"Slot(?P<slot>\d+)\s+\[(?P<subencl>-?\d+),(?P<element>-?\d+)\]\s+Element type:\s+Array device slot\b",
+        element_header_match = re.match(
+            r"^(?:(?P<descriptor>.*?)\s+)?"
+            r"\[(?P<subencl>-?\d+),(?P<element>-?\d+)\]\s+"
+            r"Element type:\s+(?P<element_type>.+?)\s*$",
             stripped,
             re.IGNORECASE,
         )
-        if slot_match:
-            slot_number = int(slot_match.group("slot"))
-            element_id = int(slot_match.group("element"))
-            current_slot = SESMapSlot(
-                slot_number=slot_number,
-                element_id=element_id if element_id >= 0 else slot_number,
-                ses_device=ses_device,
-                description=f"Slot {slot_number:02d}",
-            )
-            current_slot.control_targets = _merge_control_targets(
-                current_slot.control_targets,
-                [
-                    {
-                        "ses_device": ses_device,
-                        "ses_element_id": current_slot.element_id,
-                        "ses_slot_number": current_slot.slot_number,
-                    }
-                ],
-            )
-            enclosure.slots[slot_number] = current_slot
-            continue
-
-        if re.match(r"ArrayDevicesInSubEnclsr\d+\s+\[", stripped, re.IGNORECASE):
+        if element_header_match:
+            if current_slot is not None and descriptor_slot_number is not None:
+                _record_ses_slot(
+                    enclosure,
+                    current_slot,
+                    reported_slot_number=descriptor_slot_number,
+                    source="ses_description",
+                )
             current_slot = None
+            descriptor_slot_number = None
+            element_type = normalize_text(element_header_match.group("element_type")) or ""
+            if not re.fullmatch(r"(?:Array\s+)?device slot", element_type, re.IGNORECASE):
+                continue
+            element_id = int(element_header_match.group("element"))
+            if element_id < 0:
+                continue
+            descriptor = normalize_text(element_header_match.group("descriptor"))
+            descriptor_match = re.search(r"\bSlot(?P<slot>\d+)\b", descriptor or "", re.IGNORECASE)
+            if descriptor_match:
+                descriptor_slot_number = int(descriptor_match.group("slot"))
+            current_slot = SESMapSlot(
+                slot_number=-1,
+                element_id=element_id,
+                ses_device=ses_device,
+            )
             continue
 
         if current_slot is None:
@@ -1415,9 +1419,15 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
 
         slot_number_match = re.search(r"device slot number:\s*(?P<slot>\d+)", stripped, re.IGNORECASE)
         if slot_number_match:
-            current_slot.slot_number = int(slot_number_match.group("slot"))
-            current_slot.description = f"Slot {current_slot.slot_number:02d}"
-            enclosure.slots[current_slot.slot_number] = current_slot
+            reported_slot_number = int(slot_number_match.group("slot"))
+            current_slot.description = f"Slot {reported_slot_number:02d}"
+            current_slot = _record_ses_slot(
+                enclosure,
+                current_slot,
+                reported_slot_number=reported_slot_number,
+                source="ses_device_slot_number",
+            )
+            descriptor_slot_number = None
             continue
 
         if stripped.startswith("SAS device type:"):
@@ -1448,6 +1458,14 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
         if stripped.startswith("phy identifier:"):
             current_slot.phy_identifier = normalize_text(stripped.split(":", 1)[1])
             continue
+
+    if current_slot is not None and descriptor_slot_number is not None:
+        _record_ses_slot(
+            enclosure,
+            current_slot,
+            reported_slot_number=descriptor_slot_number,
+            source="ses_description",
+        )
 
     if not enclosure.slots:
         return None
@@ -1497,6 +1515,7 @@ def _extract_sg_ses_enclosure_name(output: str) -> str | None:
             lowered.startswith(stop_prefixes)
             or lowered.startswith(("element type:", "element index:", "overall descriptor:"))
             or re.match(r"slot\d+\s+\[", lowered)
+            or re.match(r"(?:.*?\s+)?\[-?\d+,-?\d+\]\s+element type:", lowered)
         ):
             break
         if lowered.startswith(ignored_prefixes):
