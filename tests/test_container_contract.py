@@ -132,6 +132,45 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("ARG APP_GID=10001", dockerfile)
         self.assertIn("USER app", dockerfile)
 
+    def test_admin_public_origin_reaches_every_compose_admin_service(self) -> None:
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load(
+                (REPO_ROOT / compose_name).read_text(encoding="utf-8")
+            )["services"]
+            self.assertEqual(
+                services["enclosure-admin"]["environment"]["ADMIN_PUBLIC_ORIGIN"],
+                "${ADMIN_PUBLIC_ORIGIN:-}",
+                compose_name,
+            )
+
+    def test_compose_ui_port_supports_an_explicit_loopback_bind(self) -> None:
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load(
+                (REPO_ROOT / compose_name).read_text(encoding="utf-8")
+            )["services"]
+            self.assertEqual(
+                services["enclosure-ui"]["ports"],
+                ["${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8080}:8000"],
+                compose_name,
+            )
+
+    def test_image_carries_source_revision_label(self) -> None:
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("ARG SOURCE_COMMIT=unknown", dockerfile)
+        self.assertIn(
+            "LABEL org.opencontainers.image.revision=$SOURCE_COMMIT",
+            dockerfile,
+        )
+        dev_compose = yaml.safe_load(
+            (REPO_ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8")
+        )
+        for service_name, service in dev_compose["services"].items():
+            self.assertEqual(
+                service["build"].get("args", {}).get("SOURCE_COMMIT"),
+                "${SOURCE_COMMIT:-unknown}",
+                service_name,
+            )
+
     def test_compose_services_use_read_only_root_filesystems_and_drop_privileges(self) -> None:
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))["services"]

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import stat
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 
 MODULE_PATH = Path(__file__).resolve().parent.parent / "scripts" / "run_perf_harness.py"
@@ -24,6 +26,44 @@ HISTORY_SPEC.loader.exec_module(run_history_perf_harness)
 
 
 class PerfHarnessTests(unittest.TestCase):
+    def test_basic_auth_loads_only_from_private_files_and_reaches_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            username_file = root / "username"
+            password_file = root / "password"
+            username_file.write_text("qa-user\n", encoding="utf-8")
+            password_file.write_text("qa-password\n", encoding="utf-8")
+            username_file.chmod(0o600)
+            password_file.chmod(0o600)
+
+            authorization = run_perf_harness.load_basic_authorization(
+                username_file,
+                password_file,
+            )
+            self.assertTrue(authorization.startswith("Basic "))
+
+            response = MagicMock()
+            response.read.return_value = b'{"ok":true}'
+            response.headers.items.return_value = []
+            response.__enter__.return_value = response
+            response.__exit__.return_value = False
+            client = run_perf_harness.ApiClient(
+                "http://127.0.0.1:8080",
+                authorization=authorization,
+            )
+            with patch.object(run_perf_harness, "urlopen", return_value=response) as open_url:
+                self.assertEqual(client.get_json("/healthz"), {"ok": True})
+            request = open_url.call_args.args[0]
+            self.assertEqual(request.get_header("Authorization"), authorization)
+
+            password_file.chmod(0o640)
+            self.assertEqual(stat.S_IMODE(password_file.stat().st_mode), 0o640)
+            with self.assertRaisesRegex(ValueError, "mode 0600"):
+                run_perf_harness.load_basic_authorization(
+                    username_file,
+                    password_file,
+                )
+
     def test_mapping_import_confirmation_uses_preview_revision_and_digest(self) -> None:
         bundle = {"schema_version": 1, "mappings": []}
         preview = {

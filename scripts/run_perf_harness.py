@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import csv
 import json
@@ -8,6 +9,7 @@ import math
 import re
 import statistics
 import subprocess
+import stat
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -51,11 +53,46 @@ class ApiResponse:
     response_bytes: int = 0
 
 
+def _read_private_credential(path: Path, label: str) -> str:
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"{label} must be a regular non-symlink file")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ValueError(f"{label} must have mode 0600")
+    value = path.read_text(encoding="utf-8").rstrip("\r\n")
+    if not value:
+        raise ValueError(f"{label} must not be empty")
+    return value
+
+
+def load_basic_authorization(username_file: Path, password_file: Path) -> str:
+    username = _read_private_credential(username_file, "username file")
+    password = _read_private_credential(password_file, "password file")
+    encoded = base64.b64encode(f"{username}:{password}".encode("utf-8"))
+    return f"Basic {encoded.decode('ascii')}"
+
+
 class ApiClient:
-    def __init__(self, base_url: str, *, system_id: str | None = None, enclosure_id: str | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+        authorization: str | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.system_id = system_id
         self.enclosure_id = enclosure_id
+        self.authorization = authorization
+
+    def _headers(self, *, content_type: str | None = None) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if self.authorization:
+            headers["Authorization"] = self.authorization
+        if content_type:
+            headers["Content-Type"] = content_type
+        return headers
 
     def _build_url(self, path: str, params: dict[str, Any] | None = None) -> str:
         merged = dict(params or {})
@@ -70,7 +107,11 @@ class ApiClient:
         return self.get_json_with_headers(path, params=params).data
 
     def get_json_with_headers(self, path: str, params: dict[str, Any] | None = None) -> ApiResponse:
-        request = Request(self._build_url(path, params=params), method="GET")
+        request = Request(
+            self._build_url(path, params=params),
+            method="GET",
+            headers=self._headers(),
+        )
         with urlopen(request, timeout=120) as response:
             body = response.read()
             return ApiResponse(
@@ -93,7 +134,7 @@ class ApiClient:
             self._build_url(path, params=params),
             data=data,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=self._headers(content_type="application/json"),
         )
         with urlopen(request, timeout=120) as response:
             body = response.read()
@@ -609,6 +650,18 @@ def render_markdown(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a lightweight read-only performance harness against the app API.")
     parser.add_argument("--base-url", default="http://127.0.0.1:8080", help="Base URL for the running app.")
+    parser.add_argument(
+        "--username-file",
+        type=Path,
+        default=None,
+        help="Optional mode-0600 file containing a Basic-auth username.",
+    )
+    parser.add_argument(
+        "--password-file",
+        type=Path,
+        default=None,
+        help="Optional mode-0600 file containing a Basic-auth password.",
+    )
     parser.add_argument("--system-id", default=None, help="Optional system id query parameter.")
     parser.add_argument("--enclosure-id", default=None, help="Optional enclosure id query parameter.")
     parser.add_argument("--iterations", type=int, default=3, help="Iterations per workflow.")
@@ -657,7 +710,19 @@ def main() -> int:
     parser.add_argument("--no-record", action="store_true", help="Do not write latest/history artifacts.")
     args = parser.parse_args()
 
-    client = ApiClient(args.base_url, system_id=args.system_id, enclosure_id=args.enclosure_id)
+    if (args.username_file is None) != (args.password_file is None):
+        parser.error("--username-file and --password-file must be provided together")
+    authorization = (
+        load_basic_authorization(args.username_file, args.password_file)
+        if args.username_file is not None and args.password_file is not None
+        else None
+    )
+    client = ApiClient(
+        args.base_url,
+        system_id=args.system_id,
+        enclosure_id=args.enclosure_id,
+        authorization=authorization,
+    )
     results: list[RunResult] = []
 
     inventory = client.get_json("/api/inventory", params={"force": "true"})

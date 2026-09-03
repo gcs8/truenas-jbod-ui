@@ -305,6 +305,7 @@ class HistoryStore:
         shared_dir_mode: int = SQLITE_SHARED_DIR_MODE,
         shared_file_mode: int = SQLITE_SHARED_FILE_MODE,
         segment_catalog_path: str | Path | None = None,
+        initialize: bool = True,
     ) -> None:
         self.file_path = Path(file_path)
         self.segment_catalog_path = (
@@ -314,6 +315,7 @@ class HistoryStore:
         )
         self.recover_unreadable_database = bool(recover_unreadable_database)
         self.permission_repair_enabled = bool(permission_repair_enabled)
+        self._initialize_enabled = bool(initialize)
         self.shared_dir_mode = int(shared_dir_mode)
         self.shared_file_mode = int(shared_file_mode)
         for label, mode in (
@@ -332,9 +334,10 @@ class HistoryStore:
         self._segment_reader_lock = threading.Lock()
         self._segment_reader_identity: tuple[int, int, int, int] | None = None
         self._segment_reader_cache: SegmentedHistoryReader | None = None
-        with history_write_lock(self.file_path, blocking=False):
-            self._require_no_pending_lifecycle_markers()
-            self._initialize(migration_lock_held=True)
+        if self._initialize_enabled:
+            with history_write_lock(self.file_path, blocking=False):
+                self._require_no_pending_lifecycle_markers()
+                self._initialize(migration_lock_held=True)
 
     def _require_no_pending_lifecycle_markers(self) -> None:
         """
@@ -872,7 +875,6 @@ class HistoryStore:
         )
         temp_metadata = os.fstat(temp_fd)
         try:
-            os.fchown(temp_fd, ownership_metadata.st_uid, ownership_metadata.st_gid)
             with self._lock:
                 with closing(sqlite3.connect(source)) as source_connection, closing(
                     sqlite3.connect(f"/proc/self/fd/{temp_fd}")
@@ -881,6 +883,7 @@ class HistoryStore:
                     source_connection.backup(restore_connection)
                     restore_connection.commit()
 
+                os.fchown(temp_fd, ownership_metadata.st_uid, ownership_metadata.st_gid)
                 publish_descriptor = temp_fd
                 temp_fd = None
                 self._publish_replacement(
@@ -892,7 +895,8 @@ class HistoryStore:
                     Path(f"{self.file_path}{suffix}").unlink(missing_ok=True)
                 self._normalize_database_permissions()
                 self._journal_mode_identity = None
-                self._initialize_schema(migration_lock_held=True)
+                if self._initialize_enabled:
+                    self._initialize_schema(migration_lock_held=True)
         finally:
             if temp_fd is not None:
                 os.close(temp_fd)

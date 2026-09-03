@@ -379,6 +379,28 @@ class SystemBackupServiceTests(unittest.TestCase):
         )
         return service, catalog_path, segments_directory / "segment-0001.sqlite3"
 
+    def test_segmented_file_inspection_aggregates_hot_and_segment_counts(self) -> None:
+        service, _catalog_path, _segment_path = self._build_segmented_debug_service()
+        artifact = service.export_bundle_to_file(
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        try:
+            result = service.inspect_bundle_file(artifact.path)
+        finally:
+            artifact.cleanup()
+
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(
+            result["aggregate_counts"]["history"],
+            {
+                "tracked_slots": 0,
+                "event_count": 2,
+                "metric_sample_count": 0,
+                "metric_rollup_count": 0,
+            },
+        )
+
     def test_segmented_debug_export_scrubs_hot_and_segment_history(self) -> None:
         service, _catalog_path, _segment_path = self._build_segmented_debug_service()
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
@@ -2911,6 +2933,99 @@ sys.stdout.flush()
                         self.assertIn("archive-core:enc-a:0", restored_slot_detail["slot_details"])
                         self.assertEqual(counts["tracked_slots"], 1)
                         self.assertEqual(counts["metric_sample_count"], 1)
+
+    def test_file_inspection_validates_without_activation_and_returns_aggregate_only(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[CONFIG_FILE_KEY, MAPPING_FILE_KEY, HISTORY_DB_KEY],
+            )
+            original_config = self.config_path.read_bytes()
+            original_mapping = self.mapping_path.read_bytes()
+            original_counts = self.store.counts()
+            try:
+                result = self.backup_service.inspect_bundle_file(artifact.path)
+            finally:
+                artifact.cleanup()
+
+        self.assertEqual(
+            set(result),
+            {
+                "ok",
+                "schema_version",
+                "app_version",
+                "exported_at",
+                "encrypted",
+                "packaging",
+                "selected_groups",
+                "present_groups",
+                "absent_groups",
+                "member_count",
+                "total_uncompressed_bytes",
+                "aggregate_counts",
+            },
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            set(result["selected_groups"]),
+            {CONFIG_FILE_KEY, MAPPING_FILE_KEY, HISTORY_DB_KEY},
+        )
+        self.assertEqual(result["absent_groups"], [])
+        self.assertGreater(result["member_count"], 0)
+        self.assertGreater(result["total_uncompressed_bytes"], 0)
+        self.assertEqual(
+            result["aggregate_counts"],
+            {
+                "systems": 1,
+                "profiles": None,
+                "storage_views": 1,
+                "mappings": 1,
+                "sas_fabric_aliases": None,
+                "slot_details": None,
+                "ssh_keys": None,
+                "tls_files": None,
+                "known_hosts": None,
+                "history": {
+                    "tracked_slots": 1,
+                    "event_count": 0,
+                    "metric_sample_count": 1,
+                    "metric_rollup_count": 0,
+                },
+            },
+        )
+        self.assertEqual(self.config_path.read_bytes(), original_config)
+        self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+        self.assertEqual(self.store.counts(), original_counts)
+
+    def test_file_inspection_counts_inferred_runtime_storage_views(self) -> None:
+        write_yaml(
+            self.config_path,
+            {
+                "default_system_id": "archive-core",
+                "systems": [
+                    {
+                        "id": "archive-core",
+                        "label": "Archive CORE",
+                        "truenas": {"platform": "core"},
+                        "storage_views": [],
+                    }
+                ],
+            },
+        )
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[CONFIG_FILE_KEY],
+            )
+            try:
+                result = self.backup_service.inspect_bundle_file(artifact.path)
+            finally:
+                artifact.cleanup()
+
+        self.assertEqual(result["aggregate_counts"]["systems"], 1)
+        self.assertEqual(result["aggregate_counts"]["storage_views"], 1)
 
     def test_encrypted_7z_import_keeps_history_file_backed_and_cleans_extraction_root(self) -> None:
         passphrase = "file-backed import passphrase"

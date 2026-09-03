@@ -237,6 +237,7 @@ class MainAppBoundaryTests(unittest.TestCase):
                 "/tmp/admin-history.sqlite3",
                 recover_unreadable_database=False,
                 segment_catalog_path="/tmp/admin-history-segments/catalog.json",
+                initialize=False,
             )
         finally:
             get_history_store.cache_clear()
@@ -371,6 +372,47 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertFalse(archive_path.parent.exists())
         service.import_bundle_from_file.assert_called_once()
         service.import_bundle.assert_not_called()
+
+    def test_admin_backup_inspection_streams_file_and_returns_only_sanitized_metadata(self) -> None:
+        request, _receive_probe = make_streaming_request([b"archive-bytes"])
+        request.scope["headers"].append(
+            (b"x-backup-passphrase-base64", b"c3ludGhldGljIHBhc3NwaHJhc2U=")
+        )
+        service = MagicMock()
+        service.inspect_bundle_file.return_value = {
+            "ok": True,
+            "schema_version": 2,
+            "app_version": "0.22.3",
+            "exported_at": "2030-01-02T03:04:05+00:00",
+            "encrypted": True,
+            "packaging": "7z",
+            "selected_groups": ["config_file", "history_db"],
+            "present_groups": ["config_file", "history_db"],
+            "absent_groups": [],
+            "member_count": 3,
+            "total_uncompressed_bytes": 4096,
+            "aggregate_counts": {
+                "systems": 2,
+                "history": {"event_count": 42},
+            },
+        }
+        route = next(
+            route for route in admin_app.routes
+            if route.path == "/api/admin/backup/inspect"
+        )
+
+        with patch("admin_service.main.get_backup_service", return_value=service):
+            response = asyncio.run(route.endpoint(request))
+
+        payload = json.loads(response.body)
+        self.assertEqual(payload, service.inspect_bundle_file.return_value)
+        inspected_path = service.inspect_bundle_file.call_args.args[0]
+        self.assertFalse(inspected_path.exists())
+        self.assertFalse(inspected_path.parent.exists())
+        self.assertEqual(
+            service.inspect_bundle_file.call_args.kwargs,
+            {"passphrase": "synthetic passphrase"},
+        )
 
     def test_admin_backup_import_without_stops_keeps_impacted_services_needing_restart(self) -> None:
         request, _receive_probe = make_streaming_request([b"archive-bytes"])
@@ -1082,6 +1124,15 @@ class AdminHeaderDecodeTests(unittest.TestCase):
     def test_decode_optional_secret_header_rejects_invalid_base64(self) -> None:
         with self.assertRaisesRegex(ValueError, "valid base64"):
             decode_optional_secret_header("not base64!!!")
+
+
+class AdminHistoryStoreTests(unittest.TestCase):
+    def test_admin_history_store_is_noninitializing_for_maintenance(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "admin_service" / "main.py").read_text(encoding="utf-8")
+        start = source.index("def get_history_store()")
+        end = source.index("\ndef decode_optional_secret_header", start)
+        self.assertIn("initialize=False", source[start:end])
 
 
 class AdminStatePayloadTests(unittest.TestCase):
