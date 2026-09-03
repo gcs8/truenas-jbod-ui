@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 import shlex
+import stat
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -76,10 +82,6 @@ class ContainerResourceContractTests(unittest.TestCase):
     def test_segmented_history_runbook_uses_compose_cli_invocations(self) -> None:
         runbook = (REPO_ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
         history_command_prefix = "docker compose run --rm --entrypoint python enclosure-history "
-        backup_command_prefix = (
-            'docker compose run --rm --user "${APP_UID:-10001}:${APP_GID:-10001}" '
-            "--entrypoint python enclosure-backup "
-        )
 
         self.assertNotRegex(
             runbook,
@@ -90,7 +92,7 @@ class ContainerResourceContractTests(unittest.TestCase):
             6,
         )
         self.assertEqual(
-            runbook.count(f"{backup_command_prefix}scripts/rotate_segmented_history.py"),
+            runbook.count(f"{history_command_prefix}scripts/rotate_segmented_history.py"),
             3,
         )
 
@@ -139,24 +141,190 @@ class ContainerResourceContractTests(unittest.TestCase):
                             f"{referenced_path} is not available to {service_name}",
                         )
 
-    def test_rotation_runbook_uses_the_history_owner_identity(self) -> None:
+    def test_rotation_runbook_does_not_cross_the_split_backup_and_history_identities(self) -> None:
         runbook = (REPO_ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
+        backup_guide = (
+            REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md"
+        ).read_text(encoding="utf-8")
         rotation_blocks = [
             block
             for block in re.findall(r"```bash\n(.*?)\n```", runbook, flags=re.DOTALL)
             if "scripts/rotate_segmented_history.py" in block
         ]
 
+        self.assertRegex(
+            backup_guide,
+            r"Archives and the passphrase remain private `0600`\s+files",
+        )
         self.assertEqual(len(rotation_blocks), 3)
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))[
+                "services"
+            ]
+            with self.subTest(compose=compose_name):
+                self.assertNotEqual(
+                    services["enclosure-history"]["user"],
+                    services["enclosure-backup"]["user"],
+                )
         for block in rotation_blocks:
             arguments = shlex.split(block.replace("\\\n", " "))
+            script_index = arguments.index("scripts/rotate_segmented_history.py")
             with self.subTest(command=arguments[-1]):
-                self.assertIn("--user", arguments)
-                user_index = arguments.index("--user")
-                self.assertEqual(
-                    arguments[user_index + 1],
-                    "${APP_UID:-10001}:${APP_GID:-10001}",
-                )
+                self.assertEqual(arguments[script_index - 1], "enclosure-history")
+                self.assertNotIn("--user", arguments)
+                self.assertNotIn("/app/backups", arguments)
+                if "--recover" not in arguments:
+                    backup_dir_index = arguments.index("--scheduled-backup-dir")
+                    status_index = arguments.index("--scheduled-backup-status")
+                    self.assertEqual(
+                        arguments[backup_dir_index + 1],
+                        "/app/history/.segment-rotation-backup",
+                    )
+                    self.assertEqual(
+                        arguments[status_index + 1],
+                        "/app/backup-status/scheduled-backup.json",
+                    )
+
+    def test_rotation_staging_copies_only_status_named_archive_for_the_app_owner(self) -> None:
+        runbook = (REPO_ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
+        staging_blocks = [
+            block
+            for block in re.findall(r"```bash\n(.*?)\n```", runbook, flags=re.DOTALL)
+            if "staged_backup=ok" in block
+        ]
+
+        self.assertEqual(len(staging_blocks), 1)
+        marker = "python3 - <<'PY'\n"
+        self.assertIn(marker, staging_blocks[0])
+        staging_script = staging_blocks[0].split(marker, 1)[1].rsplit("\nPY", 1)[0]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            status_dir = root / "backup-status"
+            backup_dir = root / "backups" / "scheduled"
+            history_dir = root / "history"
+            status_dir.mkdir(mode=0o750)
+            backup_dir.mkdir(parents=True, mode=0o700)
+            history_dir.mkdir(mode=0o700)
+            artifact_name = "jbod-scheduled-backup-20300102T030405Z-1234abcd.7z"
+            artifact_bytes = b"synthetic-private-encrypted-backup"
+            artifact = backup_dir / artifact_name
+            artifact.write_bytes(artifact_bytes)
+            artifact.chmod(0o600)
+            unrelated_archive = backup_dir / "jbod-scheduled-backup-20300101T030405Z-deadbeef.7z"
+            unrelated_archive.write_bytes(b"not-selected")
+            unrelated_archive.chmod(0o600)
+            passphrase = root / "backups" / "scheduled-backup-passphrase"
+            passphrase.write_bytes(b"not-copied")
+            passphrase.chmod(0o600)
+            status = {
+                "schema_version": 1,
+                "enabled": True,
+                "included_groups": ["config_file", "history_db"],
+                "success_count": 1,
+                "failure_count": 0,
+                "last_attempt_at": "2030-01-02T03:04:05+00:00",
+                "last_success_at": "2030-01-02T03:04:05+00:00",
+                "last_failure_at": None,
+                "last_size_bytes": len(artifact_bytes),
+                "last_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+                "last_artifact_name": artifact_name,
+                "last_absent_groups": [],
+                "last_retention_removed": 0,
+                "last_error_code": None,
+            }
+            status_path = status_dir / "scheduled-backup.json"
+            status["last_sha256"] = "0" * 64
+            status_path.write_text(json.dumps(status), encoding="utf-8")
+            status_path.chmod(0o640)
+            identity = str(os.getuid())
+            group = str(os.getgid())
+            environment = {
+                **os.environ,
+                "APP_UID": identity,
+                "APP_GID": group,
+                "BACKUP_UID": identity,
+                "BACKUP_GID": group,
+            }
+
+            rejected = subprocess.run(
+                ["python3", "-c", staging_script],
+                cwd=root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse((history_dir / ".segment-rotation-backup").exists())
+            self.assertNotIn(artifact_name, rejected.stdout + rejected.stderr)
+            self.assertNotIn("0" * 64, rejected.stdout + rejected.stderr)
+
+            status["last_sha256"] = hashlib.sha256(artifact_bytes).hexdigest()
+            status_path.write_text(json.dumps(status), encoding="utf-8")
+            status_path.chmod(0o640)
+            completed = subprocess.run(
+                ["python3", "-c", staging_script],
+                cwd=root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, "staged_backup=ok\n")
+            self.assertEqual(completed.stderr, "")
+            stage_dir = history_dir / ".segment-rotation-backup"
+            self.assertEqual(stat.S_IMODE(stage_dir.stat().st_mode), 0o700)
+            self.assertEqual((stage_dir.stat().st_uid, stage_dir.stat().st_gid), (os.getuid(), os.getgid()))
+            staged_files = list(stage_dir.iterdir())
+            self.assertEqual([path.name for path in staged_files], [artifact_name])
+            self.assertEqual(staged_files[0].read_bytes(), artifact_bytes)
+            self.assertEqual(stat.S_IMODE(staged_files[0].stat().st_mode), 0o600)
+            self.assertEqual(
+                (staged_files[0].stat().st_uid, staged_files[0].stat().st_gid),
+                (os.getuid(), os.getgid()),
+            )
+
+            staged_files[0].unlink()
+            repeated = subprocess.run(
+                ["python3", "-c", staging_script],
+                cwd=root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(repeated.returncode, 0)
+            self.assertTrue(stage_dir.is_dir())
+            self.assertEqual(list(stage_dir.iterdir()), [])
+
+    def test_rotation_staging_cleanup_is_bounded_to_the_fixed_directory(self) -> None:
+        runbook = (REPO_ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
+        cleanup_blocks = [
+            block
+            for block in re.findall(r"```bash\n(.*?)\n```", runbook, flags=re.DOTALL)
+            if "rm -rf" in block and ".segment-rotation-backup" in block
+        ]
+
+        self.assertEqual(len(cleanup_blocks), 1)
+        cleanup_arguments = shlex.split(cleanup_blocks[0].replace("\\\n", " "))
+        self.assertEqual(
+            cleanup_arguments,
+            [
+                "sudo",
+                "rm",
+                "-rf",
+                "--one-file-system",
+                "--",
+                "history/.segment-rotation-backup",
+            ],
+        )
+        self.assertRegex(
+            runbook,
+            r"(?i)after reviewing[^.]+result[^.]+remove[^.]+fixed staging directory",
+        )
 
     def test_history_reads_scheduled_backup_status_for_segmented_retention(self) -> None:
         for compose_name in COMPOSE_FILES:

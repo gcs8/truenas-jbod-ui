@@ -275,15 +275,254 @@ No source, catalog, segment, or rollback cleanup occurs when backup evidence,
 headroom, path identity, timestamp validity, row accounting, fsync, or digest
 verification fails.
 
-Dry-run the next append transaction while the history service is quiesced:
+The scheduled archive and hot database have different owners. The backup UID
+owns each private `0600` archive, while the app UID owns the hot database and
+must run the publisher. Do not override `enclosure-backup` to run as the app UID.
+It cannot read the private archive. Do not run rotation as the backup UID either;
+it does not own the hot database.
+
+After a fresh scheduled FULL backup succeeds, stop the history service cleanly
+and verify that the one-shot backup container has exited. Confirm that
+`backup-status/scheduled-backup.json` reports the successful run and that the
+configured host destination is `backups/scheduled`, corresponding to
+`/app/backups/scheduled`. Then stage only its named archive into the existing
+history bind. Set these four numeric values to the effective Compose identities
+before running the block. The defaults shown match the base Compose file.
 
 ```bash
-docker compose run --rm --user "${APP_UID:-10001}:${APP_GID:-10001}" --entrypoint python enclosure-backup scripts/rotate_segmented_history.py \
+APP_UID=10001
+APP_GID=10001
+BACKUP_UID=1000
+BACKUP_GID=1000
+sudo env APP_UID="$APP_UID" APP_GID="$APP_GID" BACKUP_UID="$BACKUP_UID" BACKUP_GID="$BACKUP_GID" python3 - <<'PY'
+import hashlib
+import json
+import os
+import re
+import stat
+
+ARCHIVE_NAME = re.compile(
+    r"jbod-scheduled-backup-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}"
+    r"(?:\.7z|\.tar\.zst\.enc)\Z"
+)
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW | CLOEXEC
+READ_FLAGS = os.O_RDONLY | NOFOLLOW | CLOEXEC
+STAGE_NAME = ".segment-rotation-backup"
+
+
+def numeric_id(name):
+    raw = os.environ.get(name, "")
+    if not raw.isdecimal():
+        raise SystemExit(f"{name} must be a numeric ID")
+    value = int(raw)
+    if value <= 0:
+        raise SystemExit(f"{name} must be a non-root numeric ID")
+    return value
+
+
+def read_regular(directory_fd, name, limit):
+    descriptor = os.open(name, READ_FLAGS, dir_fd=directory_fd)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise SystemExit("required evidence is not a single regular file")
+        chunks = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > limit or os.read(descriptor, 1):
+            raise SystemExit("required evidence exceeds its staging limit")
+        return content, metadata
+    finally:
+        os.close(descriptor)
+
+
+def hash_descriptor(descriptor):
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+        size += len(chunk)
+    return size, digest.hexdigest()
+
+
+app_uid = numeric_id("APP_UID")
+app_gid = numeric_id("APP_GID")
+backup_uid = numeric_id("BACKUP_UID")
+backup_gid = numeric_id("BACKUP_GID")
+status_directory = os.open("backup-status", DIRECTORY_FLAGS)
+backup_root = os.open("backups", DIRECTORY_FLAGS)
+backup_directory = os.open("scheduled", DIRECTORY_FLAGS, dir_fd=backup_root)
+history_directory = os.open("history", DIRECTORY_FLAGS)
+stage_directory = None
+stage_created = False
+source = None
+staged_name = None
+try:
+    backup_metadata = os.fstat(backup_directory)
+    history_metadata = os.fstat(history_directory)
+    if (
+        stat.S_IMODE(backup_metadata.st_mode) != 0o700
+        or (backup_metadata.st_uid, backup_metadata.st_gid) != (backup_uid, backup_gid)
+    ):
+        raise SystemExit("scheduled backup directory ownership or mode is invalid")
+    if (history_metadata.st_uid, history_metadata.st_gid) != (app_uid, app_gid):
+        raise SystemExit("history directory ownership is invalid")
+
+    status_bytes, status_metadata = read_regular(
+        status_directory, "scheduled-backup.json", 64 * 1024
+    )
+    if (
+        stat.S_IMODE(status_metadata.st_mode) != 0o640
+        or (status_metadata.st_uid, status_metadata.st_gid) != (backup_uid, app_gid)
+    ):
+        raise SystemExit("scheduled backup status ownership or mode is invalid")
+    try:
+        status_payload = json.loads(status_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit("scheduled backup status is invalid") from error
+    if not isinstance(status_payload, dict):
+        raise SystemExit("scheduled backup status is invalid")
+    artifact_name = status_payload.get("last_artifact_name")
+    expected_size = status_payload.get("last_size_bytes")
+    expected_digest = status_payload.get("last_sha256")
+    included_groups = status_payload.get("included_groups")
+    absent_groups = status_payload.get("last_absent_groups")
+    if (
+        status_payload.get("enabled") is not True
+        or type(status_payload.get("success_count")) is not int
+        or status_payload["success_count"] <= 0
+        or status_payload.get("last_error_code") is not None
+        or not isinstance(included_groups, list)
+        or "history_db" not in included_groups
+        or not isinstance(absent_groups, list)
+        or "history_db" in absent_groups
+        or not isinstance(artifact_name, str)
+        or ARCHIVE_NAME.fullmatch(artifact_name) is None
+        or type(expected_size) is not int
+        or expected_size <= 0
+        or not isinstance(expected_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+    ):
+        raise SystemExit("scheduled backup status lacks complete FULL backup evidence")
+
+    source = os.open(artifact_name, READ_FLAGS, dir_fd=backup_directory)
+    source_before = os.fstat(source)
+    if (
+        not stat.S_ISREG(source_before.st_mode)
+        or source_before.st_nlink != 1
+        or stat.S_IMODE(source_before.st_mode) != 0o600
+        or (source_before.st_uid, source_before.st_gid) != (backup_uid, backup_gid)
+    ):
+        raise SystemExit("scheduled backup archive ownership or mode is invalid")
+    verified_size, verified_digest = hash_descriptor(source)
+    source_verified = os.fstat(source)
+    if (
+        (source_before.st_dev, source_before.st_ino, source_before.st_size, source_before.st_mtime_ns)
+        != (source_verified.st_dev, source_verified.st_ino, source_verified.st_size, source_verified.st_mtime_ns)
+        or verified_size != expected_size
+        or verified_digest != expected_digest
+    ):
+        raise SystemExit("scheduled backup archive failed integrity verification")
+    os.lseek(source, 0, os.SEEK_SET)
+
+    os.mkdir(STAGE_NAME, 0o700, dir_fd=history_directory)
+    stage_created = True
+    stage_directory = os.open(STAGE_NAME, DIRECTORY_FLAGS, dir_fd=history_directory)
+    os.fchown(stage_directory, app_uid, app_gid)
+    os.fchmod(stage_directory, 0o700)
+    destination = os.open(
+        artifact_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC,
+        0o600,
+        dir_fd=stage_directory,
+    )
+    staged_name = artifact_name
+    copied_size = 0
+    copied_digest = hashlib.sha256()
+    try:
+        while True:
+            chunk = os.read(source, 1024 * 1024)
+            if not chunk:
+                break
+            copied_digest.update(chunk)
+            copied_size += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(destination, view):]
+        os.fsync(destination)
+        os.fchown(destination, app_uid, app_gid)
+        os.fchmod(destination, 0o600)
+        staged_metadata = os.fstat(destination)
+    finally:
+        os.close(destination)
+
+    source_after = os.fstat(source)
+    if (
+        (source_before.st_dev, source_before.st_ino, source_before.st_size, source_before.st_mtime_ns)
+        != (source_after.st_dev, source_after.st_ino, source_after.st_size, source_after.st_mtime_ns)
+        or copied_size != expected_size
+        or copied_digest.hexdigest() != expected_digest
+        or staged_metadata.st_size != expected_size
+        or stat.S_IMODE(staged_metadata.st_mode) != 0o600
+        or (staged_metadata.st_uid, staged_metadata.st_gid) != (app_uid, app_gid)
+    ):
+        raise SystemExit("scheduled backup archive changed or failed integrity verification")
+    current_status, _ = read_regular(status_directory, "scheduled-backup.json", 64 * 1024)
+    if current_status != status_bytes or os.listdir(stage_directory) != [artifact_name]:
+        raise SystemExit("scheduled backup status changed or staging is not bounded")
+    os.fsync(stage_directory)
+    os.fsync(history_directory)
+except BaseException:
+    if stage_directory is not None and staged_name is not None:
+        os.unlink(staged_name, dir_fd=stage_directory)
+    if stage_directory is not None:
+        os.close(stage_directory)
+        stage_directory = None
+    if stage_created:
+        os.rmdir(STAGE_NAME, dir_fd=history_directory)
+    raise
+finally:
+    if source is not None:
+        os.close(source)
+    if stage_directory is not None:
+        os.close(stage_directory)
+    os.close(history_directory)
+    os.close(backup_directory)
+    os.close(backup_root)
+    os.close(status_directory)
+print("staged_backup=ok")
+PY
+```
+
+The staging block refuses an existing staging directory, unsafe names, symlinks,
+hard links, wrong owners or modes, incomplete FULL-backup status, source changes,
+or a size/SHA-256 mismatch. It does not read or copy the passphrase and prints no
+artifact name or digest. The rotation dry run performs the canonical status and
+freshness validation again.
+
+Dry-run the next append transaction while the history service remains
+quiesced. `enclosure-history` keeps its normal app identity and uses only its
+existing history and read-only backup-status mounts:
+
+```bash
+docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-08-01T00:00:00+00:00 \
   --key-id generation-key-2 \
-  --scheduled-backup-dir /app/backups \
+  --scheduled-backup-dir /app/history/.segment-rotation-backup \
   --scheduled-backup-status /app/backup-status/scheduled-backup.json
 ```
 
@@ -293,12 +532,12 @@ transaction artifacts.
 Apply only after the dry run succeeds and the history service remains quiesced:
 
 ```bash
-docker compose run --rm --user "${APP_UID:-10001}:${APP_GID:-10001}" --entrypoint python enclosure-backup scripts/rotate_segmented_history.py \
+docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-08-01T00:00:00+00:00 \
   --key-id generation-key-2 \
-  --scheduled-backup-dir /app/backups \
+  --scheduled-backup-dir /app/history/.segment-rotation-backup \
   --scheduled-backup-status /app/backup-status/scheduled-backup.json \
   --apply
 ```
@@ -307,10 +546,17 @@ Inspect a pending recovery without changing files, then repeat with `--apply`
 only after reviewing the reported phase:
 
 ```bash
-docker compose run --rm --user "${APP_UID:-10001}:${APP_GID:-10001}" --entrypoint python enclosure-backup scripts/rotate_segmented_history.py \
+docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --recover
+```
+
+After reviewing the rotation result and preserving any required failure
+evidence, remove only the fixed staging directory. Do not broaden this path:
+
+```bash
+sudo rm -rf --one-file-system -- history/.segment-rotation-backup
 ```
 
 These commands define an offline operator path. They do not authorize a
