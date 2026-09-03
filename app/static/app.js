@@ -65,12 +65,13 @@
   const availableSetupProfiles = Array.isArray(bootstrap.availableSetupProfiles) ? bootstrap.availableSetupProfiles : [];
   const setupPlatformDefaults = bootstrap.setupPlatformDefaults || {};
   const snapshotHistoryAvailable = Boolean(bootstrap.historyConfigured);
-  const initialSelectedSlot = Number.isInteger(bootstrap.initialSelectedSlot)
-    ? bootstrap.initialSelectedSlot
-    : null;
-  const initialStorageViewId = snapshotMode
-    ? ""
-    : (new URLSearchParams(window.location.search).get("storage_view_id") || "");
+  const initialSelection = resolveInitialSnapshotSelection(
+    bootstrap,
+    snapshotMode,
+    window.location.search
+  );
+  const initialSelectedSlot = initialSelection.selectedSlot;
+  const initialStorageViewId = initialSelection.storageViewId;
   const state = {
     snapshotMode,
     snapshotExportMeta: bootstrap.snapshotExportMeta || null,
@@ -474,6 +475,25 @@
 
   function getStorageViewRuntimeById(viewId) {
     return storageViewRuntimeViews().find((view) => view.id === viewId) || null;
+  }
+
+  function resolveInitialSnapshotSelection(bootstrapData, isSnapshotMode, locationSearch = "") {
+    const requestedStorageViewId = typeof bootstrapData.initialSelectedStorageViewId === "string"
+      ? bootstrapData.initialSelectedStorageViewId.trim()
+      : "";
+    const availableViews = Array.isArray(bootstrapData.storageViewsRuntime?.views)
+      ? bootstrapData.storageViewsRuntime.views
+      : [];
+    const storageViewId = isSnapshotMode
+      ? (availableViews.some((view) => view.id === requestedStorageViewId) ? requestedStorageViewId : "")
+      : (new URLSearchParams(locationSearch).get("storage_view_id") || "");
+    const unresolvedSnapshotView = Boolean(
+      isSnapshotMode && requestedStorageViewId && !storageViewId
+    );
+    const selectedSlot = Number.isInteger(bootstrapData.initialSelectedSlot) && !unresolvedSnapshotView
+      ? bootstrapData.initialSelectedSlot
+      : null;
+    return { selectedSlot, storageViewId };
   }
 
   function ensureStorageViewRuntimeSelection(preferVisible = false) {
@@ -6123,6 +6143,7 @@
     const includeHistoryPanel = Boolean(state.history.panelOpen && isHistoryAvailable());
     return {
       selected_slot: state.selectedSlot,
+      selected_storage_view_id: state.selectedStorageViewRuntimeId || null,
       history_window_hours: currentHistoryWindowHours(),
       history_panel_open: includeHistoryPanel,
       io_chart_mode: state.history.ioChartMode,

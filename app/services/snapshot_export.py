@@ -489,6 +489,7 @@ class SnapshotExportService:
         storage_view_runtime: StorageViewRuntimePayload | None = None,
         storage_view_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None = None,
         selected_slot: int | None,
+        selected_storage_view_id: str | None = None,
         history_window_hours: int | None,
         history_panel_open: bool = False,
         io_chart_mode: str,
@@ -507,6 +508,7 @@ class SnapshotExportService:
                 storage_view_runtime=storage_view_runtime,
                 storage_view_smart_summary_cache=storage_view_smart_summary_cache,
                 selected_slot=selected_slot,
+                selected_storage_view_id=selected_storage_view_id,
                 history_window_hours=history_window_hours,
                 history_panel_open=history_panel_open,
                 io_chart_mode=io_chart_mode,
@@ -600,6 +602,7 @@ class SnapshotExportService:
         storage_view_runtime: StorageViewRuntimePayload | None = None,
         storage_view_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None = None,
         selected_slot: int | None,
+        selected_storage_view_id: str | None = None,
         history_window_hours: int | None,
         history_panel_open: bool = False,
         io_chart_mode: str,
@@ -618,6 +621,7 @@ class SnapshotExportService:
                 storage_view_runtime=storage_view_runtime,
                 storage_view_smart_summary_cache=storage_view_smart_summary_cache,
                 selected_slot=selected_slot,
+                selected_storage_view_id=selected_storage_view_id,
                 history_window_hours=history_window_hours,
                 history_panel_open=history_panel_open,
                 io_chart_mode=io_chart_mode,
@@ -644,6 +648,7 @@ class SnapshotExportService:
             "ok": True,
             "scope_label": rendered.export_meta.get("scope_label"),
             "selected_slot": rendered.export_meta.get("selected_slot"),
+            "selected_storage_view_id": rendered.export_meta.get("selected_storage_view_id"),
             "html_size_bytes": html_size_bytes,
             "html_size_label": format_bytes(html_size_bytes),
             "html_within_limit": html_size_bytes <= self.size_limit_bytes,
@@ -682,6 +687,7 @@ class SnapshotExportService:
         storage_view_runtime: StorageViewRuntimePayload | None = None,
         storage_view_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None = None,
         selected_slot: int | None,
+        selected_storage_view_id: str | None = None,
         history_window_hours: int | None,
         history_panel_open: bool = False,
         io_chart_mode: str,
@@ -692,7 +698,24 @@ class SnapshotExportService:
         identifier_policy_label: str | None = None,
         identifier_policy_note: str | None = None,
     ) -> RenderedSnapshotExport:
-        normalized_slot = self._normalize_selected_slot(snapshot, selected_slot)
+        normalized_storage_view_id, normalized_slot = self._normalize_initial_selection(
+            snapshot,
+            storage_view_runtime,
+            selected_storage_view_id,
+            selected_slot,
+        )
+        selected_storage_view_index = (
+            next(
+                (
+                    index
+                    for index, view in enumerate(storage_view_runtime.views)
+                    if view.id == normalized_storage_view_id
+                ),
+                None,
+            )
+            if normalized_storage_view_id is not None and storage_view_runtime is not None
+            else None
+        )
         normalized_window_hours = self._normalize_history_window_hours(history_window_hours)
         normalized_chart_mode = "average" if io_chart_mode == "average" else "total"
         live_enclosure_snapshots_for_render = self._normalize_live_enclosure_snapshots(
@@ -713,6 +736,7 @@ class SnapshotExportService:
             storage_view_runtime=storage_view_runtime,
             storage_view_smart_summary_cache=storage_view_smart_summary_cache,
             selected_slot=normalized_slot,
+            selected_storage_view_id=normalized_storage_view_id,
             history_window_hours=normalized_window_hours,
             history_panel_open=history_panel_open,
             io_chart_mode=normalized_chart_mode,
@@ -845,6 +869,19 @@ class SnapshotExportService:
                     storage_view_smart_summary_cache_for_export
                 )
 
+            initial_selected_storage_view_id = None
+            if (
+                selected_storage_view_index is not None
+                and storage_view_runtime_for_export is not None
+                and selected_storage_view_index < len(storage_view_runtime_for_export.views)
+            ):
+                initial_selected_storage_view_id = storage_view_runtime_for_export.views[
+                    selected_storage_view_index
+                ].id
+            initial_selected_slot = normalized_slot
+            if normalized_storage_view_id is not None and initial_selected_storage_view_id is None:
+                initial_selected_slot = None
+
             tracked_slots = sum(1 for payload in history_cache_for_export.values() if payload.get("available"))
             metric_sample_count = sum(
                 len(samples)
@@ -905,7 +942,8 @@ class SnapshotExportService:
                 "smart_summary_count": total_smart_summary_count,
                 "storage_view_count": len(storage_view_runtime_for_export.views) if storage_view_runtime_for_export else 0,
                 "event_count": event_count,
-                "selected_slot": normalized_slot,
+                "selected_slot": initial_selected_slot,
+                "selected_storage_view_id": initial_selected_storage_view_id,
                 "io_chart_mode": normalized_chart_mode,
                 "redaction": redaction_level,
                 "redaction_label": redaction_label,
@@ -965,10 +1003,13 @@ class SnapshotExportService:
                 "preloaded_snapshot_smart_summary_json": json.dumps(live_enclosure_smart_summary_cache_for_export),
                 "preloaded_storage_view_smart_summary_json": json.dumps(storage_view_smart_summary_cache_for_export),
                 "preloaded_history_summary_json": json.dumps(history_summary),
-                "initial_selected_slot_json": json.dumps(normalized_slot),
+                "initial_selected_slot_json": json.dumps(initial_selected_slot),
+                "initial_selected_storage_view_id_json": json.dumps(
+                    initial_selected_storage_view_id
+                ),
                 "initial_history_timeframe_hours_json": json.dumps(normalized_window_hours),
                 "initial_history_panel_open_json": json.dumps(
-                    bool(history_panel_open and normalized_slot is not None and history_available)
+                    bool(history_panel_open and initial_selected_slot is not None and history_available)
                 ),
                 "initial_history_io_chart_mode_json": json.dumps(normalized_chart_mode),
             }
@@ -1848,6 +1889,7 @@ class SnapshotExportService:
         storage_view_runtime: StorageViewRuntimePayload | None,
         storage_view_smart_summary_cache: dict[str, dict[str, dict[str, Any]]] | None,
         selected_slot: int | None,
+        selected_storage_view_id: str | None,
         history_window_hours: int | None,
         history_panel_open: bool,
         io_chart_mode: str,
@@ -1867,6 +1909,7 @@ class SnapshotExportService:
                 f"views={self._storage_view_runtime_fingerprint(storage_view_runtime)}",
                 f"viewsmart={self._storage_view_smart_summary_cache_fingerprint(storage_view_smart_summary_cache)}",
                 f"slot={selected_slot if selected_slot is not None else 'none'}",
+                f"selected-view={selected_storage_view_id or 'none'}",
                 f"window={history_window_hours if history_window_hours is not None else 'all'}",
                 f"panel={'open' if history_panel_open else 'closed'}",
                 f"io={io_chart_mode}",
@@ -1982,6 +2025,30 @@ class SnapshotExportService:
     @staticmethod
     def _normalize_packaging(packaging: str | None) -> str:
         return "zip" if packaging == "zip" else "html" if packaging == "html" else "auto"
+
+    @classmethod
+    def _normalize_initial_selection(
+        cls,
+        snapshot: InventorySnapshot,
+        storage_view_runtime: StorageViewRuntimePayload | None,
+        selected_storage_view_id: str | None,
+        selected_slot: int | None,
+    ) -> tuple[str | None, int | None]:
+        if selected_storage_view_id:
+            selected_view = next(
+                (
+                    view
+                    for view in (storage_view_runtime.views if storage_view_runtime is not None else [])
+                    if view.id == selected_storage_view_id
+                ),
+                None,
+            )
+            if selected_view is None:
+                return None, None
+            valid_slots = {slot.slot_index for slot in selected_view.slots}
+            normalized_slot = selected_slot if selected_slot in valid_slots else None
+            return selected_view.id, normalized_slot
+        return None, cls._normalize_selected_slot(snapshot, selected_slot)
 
     @staticmethod
     def _normalize_selected_slot(snapshot: InventorySnapshot, selected_slot: int | None) -> int | None:

@@ -1088,6 +1088,7 @@ class MainAppBoundaryTests(unittest.TestCase):
                     make_request(port=8080),
                     SnapshotExportRequest(
                         selected_slot=0,
+                        selected_storage_view_id="boot-doms",
                         history_window_hours=168,
                         history_panel_open=True,
                         io_chart_mode="total",
@@ -1102,6 +1103,7 @@ class MainAppBoundaryTests(unittest.TestCase):
                     make_request(port=8080),
                     SnapshotExportRequest(
                         selected_slot=0,
+                        selected_storage_view_id="boot-doms",
                         history_window_hours=168,
                         history_panel_open=True,
                         io_chart_mode="total",
@@ -1122,6 +1124,14 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertEqual(
             fake_exporter.build_enclosure_snapshot_export.await_args.kwargs.get("configured_hostnames"),
             ["api206.route.invalid", "ssh206.route.invalid", "bmc206.route.invalid"],
+        )
+        self.assertEqual(
+            fake_exporter.estimate_enclosure_snapshot_export.await_args.kwargs.get("selected_storage_view_id"),
+            "boot-doms",
+        )
+        self.assertEqual(
+            fake_exporter.build_enclosure_snapshot_export.await_args.kwargs.get("selected_storage_view_id"),
+            "boot-doms",
         )
         self.assertNotIn("source_config", fake_exporter.estimate_enclosure_snapshot_export.await_args.kwargs)
         self.assertNotIn("source_config", fake_exporter.build_enclosure_snapshot_export.await_args.kwargs)
