@@ -1,3 +1,4 @@
+import importlib
 import json
 import tempfile
 import unittest
@@ -258,6 +259,40 @@ Slots Logical ID       SEPHandle EncHandle Type
 
 
 class SasFabricParserTests(unittest.TestCase):
+    def test_focused_parser_module_owns_public_text_parsers_and_fabric_reexports_them(self) -> None:
+        parser_module = importlib.import_module("app.services.sas_fabric_parsers")
+        fabric_module = importlib.import_module("app.services.sas_fabric")
+        parser_names = (
+            "parse_mpr_adapter_summary",
+            "parse_mpr_adapter_detail",
+            "parse_mpr_devices",
+            "parse_mpr_enclosures",
+            "parse_mpr_expanders",
+            "parse_mpr_iocfacts",
+            "parse_pciconf_sas_controllers",
+            "parse_dmidecode_slots",
+            "parse_mpr_sysctl_locations",
+            "parse_mpr_dmesg_events",
+            "discover_mpr_units_from_adapter_summary",
+            "build_core_mprutil_unit_commands",
+            "_split_mpr_dmesg_timestamp",
+            "_strip_syslog_kernel_prefix",
+            "_mpr_dmesg_event_type",
+            "_mpr_dmesg_severity",
+            "_parse_mpr_sense_message",
+            "_pciconf_bus_address",
+            "_freebsd_pci_location_to_address",
+            "_mpr_unit_from_text",
+        )
+
+        for name in parser_names:
+            with self.subTest(name=name):
+                parser = getattr(parser_module, name)
+                self.assertIs(getattr(fabric_module, name), parser)
+                self.assertEqual(parser.__module__, "app.services.sas_fabric_parsers")
+
+        self.assertIs(fabric_module.CORE_MPRUTIL_UNIT_SUBCOMMANDS, parser_module.CORE_MPRUTIL_UNIT_SUBCOMMANDS)
+
     def test_device_name_candidates_ignore_empty_split_tokens(self) -> None:
         self.assertEqual(_device_name_candidates("/dev/da0"), ["da0", "/dev/da0"])
         self.assertEqual(_device_name_candidates("(da0)"), ["da0"])
@@ -1246,6 +1281,118 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 self.assertEqual(context.normalized_outputs.get("mprutil show adapters"), MPR_ADAPTERS)
                 self.assertEqual(context.alias_map["controller:mpr0"].label, "Archive left HBA")
 
+    def test_shared_evidence_labels_are_immutable_exact_tuples(self) -> None:
+        fabric_module = importlib.import_module("app.services.sas_fabric")
+        expected = {
+            "_INVENTORY_SNAPSHOT_EVIDENCE": ("inventory snapshot",),
+            "_PROFILE_SLOT_LAYOUT_EVIDENCE": ("profile slot layout",),
+            "_SLOT_MULTIPATH_EVIDENCE": ("slot.multipath.members",),
+            "_LINUX_SES_PATH_EVIDENCE": (
+                "lsscsi -g",
+                "lsscsi -g -t",
+                "sg_ses AES/EC",
+                "sg_ses --join --filter",
+            ),
+            "_LINUX_SES_ENCLOSURE_EVIDENCE": ("sg_ses AES/EC", "sg_ses --join --filter"),
+            "_LINUX_SES_BAY_EVIDENCE": (
+                "inventory snapshot",
+                "lsblk --json",
+                "lsscsi -g -t",
+                "sg_ses AES/EC",
+                "sg_ses --join --filter",
+            ),
+            "_SG_SES_AES_EVIDENCE": ("sg_ses AES/EC",),
+            "_BMC_INVENTORY_EVIDENCE": ("BMC inventory",),
+        }
+
+        for name, labels in expected.items():
+            with self.subTest(name=name):
+                value = getattr(fabric_module, name)
+                self.assertIsInstance(value, tuple)
+                self.assertEqual(value, labels)
+
+    def test_builder_wrappers_pass_the_frozen_context_without_kwargs_unpacking(self) -> None:
+        fabric_module = importlib.import_module("app.services.sas_fabric")
+        context = _build_sas_fabric_context(
+            system=SystemConfig(id="core", truenas=TrueNASConfig(platform="core")),
+            snapshot=InventorySnapshot(slots=[], refresh_interval_seconds=30),
+            ssh_outputs={},
+        )
+        cases = (
+            (fabric_module.CoreMprFabricBuilder(), "_build_core_mpr_fabric_snapshot"),
+            (fabric_module.LinuxSesFabricBuilder(), "_build_linux_ses_fabric_snapshot"),
+            (fabric_module.PlatformStorageFabricBuilder(), "_build_platform_storage_fabric_snapshot"),
+        )
+
+        for builder, target_name in cases:
+            with self.subTest(builder=builder.key):
+                expected = object()
+                with patch.object(fabric_module, target_name, return_value=expected) as target:
+                    self.assertIs(builder.build(context), expected)
+                target.assert_called_once_with(context)
+
+    def test_shared_snapshot_assembly_helpers_are_used_by_all_builders(self) -> None:
+        fabric_module = importlib.import_module("app.services.sas_fabric")
+        cases = (
+            ("core", self._storage_id_slot()),
+            ("scale", self._storage_id_slot(with_ses=True)),
+            ("linux", self._storage_id_slot()),
+        )
+
+        with (
+            patch.object(fabric_module, "_add_host_node", wraps=fabric_module._add_host_node) as add_host,
+            patch.object(
+                fabric_module,
+                "_add_backplane_zone_nodes",
+                wraps=fabric_module._add_backplane_zone_nodes,
+            ) as add_backplanes,
+            patch.object(
+                fabric_module,
+                "_add_pool_vdev_nodes_and_links",
+                wraps=fabric_module._add_pool_vdev_nodes_and_links,
+            ) as add_storage,
+            patch.object(
+                fabric_module,
+                "_build_sas_fabric_result",
+                wraps=fabric_module._build_sas_fabric_result,
+            ) as build_result,
+        ):
+            for platform, slot in cases:
+                self._build_storage_id_fabric(
+                    system_id=f"synthetic-{platform}",
+                    platform=platform,
+                    slots=[slot],
+                )
+
+        self.assertEqual(add_host.call_count, 3)
+        self.assertEqual(add_backplanes.call_count, 3)
+        self.assertEqual(add_storage.call_count, 3)
+        self.assertEqual(build_result.call_count, 3)
+
+    def test_unavailable_snapshot_helper_is_used_by_bounded_builders(self) -> None:
+        fabric_module = importlib.import_module("app.services.sas_fabric")
+        empty_snapshot = InventorySnapshot(slots=[], refresh_interval_seconds=30)
+
+        with patch.object(
+            fabric_module,
+            "_build_unavailable_sas_fabric_snapshot",
+            wraps=fabric_module._build_unavailable_sas_fabric_snapshot,
+        ) as unavailable:
+            scale_context = _build_sas_fabric_context(
+                system=SystemConfig(id="scale", truenas=TrueNASConfig(platform="scale")),
+                snapshot=empty_snapshot,
+                ssh_outputs={},
+            )
+            esxi_context = _build_sas_fabric_context(
+                system=SystemConfig(id="esxi", truenas=TrueNASConfig(platform="esxi")),
+                snapshot=empty_snapshot,
+                ssh_outputs={},
+            )
+            fabric_module._build_linux_ses_fabric_snapshot(scale_context)
+            fabric_module._build_platform_storage_fabric_snapshot(esxi_context)
+
+        self.assertEqual(unavailable.call_count, 2)
+
     def test_platform_storage_route_registry_keeps_provider_selection_explicit(self) -> None:
         def system(platform: str) -> SystemConfig:
             return SystemConfig(id=f"{platform}-system", label=platform.upper(), truenas=TrueNASConfig(platform=platform))
@@ -1339,6 +1486,128 @@ class SasFabricSnapshotTests(unittest.TestCase):
             ssh_outputs={},
             aliases=aliases,
         )
+
+    def test_builder_snapshot_contracts_pin_ids_evidence_warnings_raw_and_metrics(self) -> None:
+        cases = {
+            "core": {
+                "platform": "core",
+                "with_ses": False,
+                "node_ids": [
+                    "backplane:0",
+                    "bay:0",
+                    "controller:mpr-1",
+                    "host",
+                    "pool:Tank%20Main",
+                    "vdev:Tank%20Main/Data%2FMirror",
+                ],
+                "host_metrics": {"slot_count": 1},
+                "host_evidence": [],
+                "bay_evidence": ["inventory snapshot"],
+                "warnings": [],
+                "raw": {
+                    "commands": [],
+                    "path_counts": {},
+                    "path_slots": {},
+                    "selected_enclosure_keys": [],
+                    "selected_bay_slots": [0],
+                    "selected_disk_slots": [0],
+                    "pci_controllers": [],
+                    "pcie_slots": [],
+                    "mpr_sysctl_locations": {},
+                    "mpr_kernel_events": {"event_count": 0, "controllers": [], "devices": []},
+                    "command_failures": [],
+                },
+            },
+            "linux_ses": {
+                "platform": "scale",
+                "with_ses": True,
+                "node_ids": [
+                    "backplane:0",
+                    "bay:0",
+                    "controller:linux-ses",
+                    "host",
+                    "path:linux-ses:sg26",
+                    "pool:Tank%20Main",
+                    "ses:sg26",
+                    "vdev:Tank%20Main/Data%2FMirror",
+                ],
+                "host_metrics": {
+                    "slot_count": 1,
+                    "selected_disk_count": 1,
+                    "fabric_domain": "storage_fabric",
+                    "fabric_kind": "linux_ses",
+                },
+                "host_evidence": ["inventory snapshot"],
+                "bay_evidence": [
+                    "inventory snapshot",
+                    "lsblk --json",
+                    "lsscsi -g -t",
+                    "sg_ses AES/EC",
+                    "sg_ses --join --filter",
+                ],
+                "warnings": [
+                    "TrueNAS SCALE Storage Fabric map is built from Linux block, SCSI transport, and SES slot evidence. "
+                    "HBA and expander hop detail is not exposed by this Linux SES evidence."
+                ],
+                "raw": {
+                    "fabric_domain": "storage_fabric",
+                    "fabric_kind": "linux_ses",
+                    "ses_devices": ["/dev/sg26"],
+                    "selected_bay_slots": [0],
+                    "selected_disk_slots": [0],
+                    "command_failures": [],
+                },
+            },
+            "platform_storage": {
+                "platform": "quantastor",
+                "with_ses": False,
+                "node_ids": [
+                    "backplane:0",
+                    "bay:0",
+                    "controller:quantastor-synthetic-quantastor",
+                    "host",
+                    "path:quantastor-synthetic-quantastor:tank-main-data-mirror",
+                    "pool:Tank%20Main",
+                    "storage-enclosure:quantastor-synthetic-quantastor:synthetic-enclosure",
+                    "vdev:Tank%20Main/Data%2FMirror",
+                ],
+                "host_metrics": {
+                    "slot_count": 1,
+                    "selected_disk_count": 1,
+                    "fabric_domain": "storage_fabric",
+                    "fabric_kind": "storage_quantastor",
+                },
+                "host_evidence": ["inventory snapshot"],
+                "bay_evidence": ["inventory snapshot"],
+                "warnings": [
+                    "Quantastor Storage Fabric is built from Quantastor storage-system, HA-node, pool, disk, and optional SES/qs evidence. "
+                    "Low-level controller, path, or expander hops are shown only when those sources prove them."
+                ],
+                "raw": {
+                    "fabric_domain": "storage_fabric",
+                    "fabric_kind": "storage_quantastor",
+                    "selected_bay_slots": [0],
+                    "selected_disk_slots": [0],
+                    "command_failures": [],
+                },
+            },
+        }
+
+        for name, expected in cases.items():
+            with self.subTest(builder=name):
+                platform = expected["platform"]
+                fabric = self._build_storage_id_fabric(
+                    system_id=f"synthetic-{platform}",
+                    platform=platform,
+                    slots=[self._storage_id_slot(with_ses=expected["with_ses"])],
+                )
+                nodes = {node.id: node for node in fabric.nodes}
+                self.assertEqual([node.id for node in fabric.nodes], expected["node_ids"])
+                self.assertEqual(nodes["host"].metrics, expected["host_metrics"])
+                self.assertEqual(nodes["host"].evidence, expected["host_evidence"])
+                self.assertEqual(nodes["bay:0"].evidence, expected["bay_evidence"])
+                self.assertEqual(fabric.warnings, expected["warnings"])
+                self.assertEqual(fabric.raw, expected["raw"])
 
     def test_pool_and_vdev_ids_are_identical_across_all_fabric_builders(self) -> None:
         fabrics = {
@@ -1992,6 +2261,36 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertEqual(fabric.paths[0]["slots"], [0, 1])
         self.assertIn("SES slot evidence", fabric.warnings[0])
         self.assertNotIn("TrueNAS CORE source data only", " ".join(fabric.warnings))
+
+    def test_linux_transport_detail_helper_matches_every_bay_payload_location(self) -> None:
+        fabric_module = importlib.import_module("app.services.sas_fabric")
+        slot = self._storage_id_slot(with_ses=True)
+        slot.sg_device = "/dev/sg2"
+        slot.scsi_hctl = "1:0:1:0"
+        slot.transport_protocol = "sas"
+        slot.attached_sas_address = "5003048001c1043f"
+        slot.phy_identifier = "0x0"
+        slot.target_port_protocol = "SSP"
+        expected = {
+            "sg_device": "/dev/sg2",
+            "scsi_hctl": "1:0:1:0",
+            "transport_protocol": "sas",
+            "attached_sas_address": "5003048001c1043f",
+            "phy_identifier": "0x0",
+            "target_port_protocol": "SSP",
+        }
+
+        self.assertEqual(fabric_module._slot_linux_transport_detail(slot), expected)
+        fabric = self._build_storage_id_fabric(
+            system_id="synthetic-scale",
+            platform="scale",
+            slots=[slot],
+        )
+        bay = next(node for node in fabric.nodes if node.id == "bay:0")
+        path_state = next(trace for trace in fabric.traces if trace.id == "bay:0").metrics["path_states"][0]
+        self.assertEqual({key: bay.metrics[key] for key in expected}, expected)
+        self.assertEqual({key: bay.raw[key] for key in expected}, expected)
+        self.assertEqual({key: path_state[key] for key in expected}, expected)
 
     def test_scale_snapshot_without_ses_reports_linux_ses_boundary(self) -> None:
         fabric = build_sas_fabric_snapshot(
