@@ -240,10 +240,16 @@ The selection order is:
 ## Current Built-In Profiles
 
 - `supermicro-cse-946-top-60`
+- `dell-md1280-drawer-84`
+- `dell-md1280-drawer-top-42`
+- `dell-md1280-drawer-bottom-42`
 - `supermicro-ssg-6048r-front-24`
 - `supermicro-ssg-6048r-rear-12`
 - `supermicro-sys-2029gp-tr-right-nvme-2`
 - `supermicro-ssg-2028r-shared-front-24`
+- `supermicro-aoc-slg4-2h8m2`
+- `supermicro-fat-twin-front-6`
+- `supermicro-fat-twin-rear-2`
 - `ubiquiti-unvr-front-4`
 - `ubiquiti-unvr-pro-front-7`
 - `generic-front-24-1x24`
@@ -253,6 +259,11 @@ The selection order is:
 - `generic-front-84-6x14`
 - `generic-front-102-8x14`
 - `generic-front-106-8x14`
+
+The Dell MD1280 whole-shelf profile exposes the top and bottom drawer profiles
+as selector sub-views. Their option IDs use
+`{enclosure_id}::{profile_id}`, where `profile_id` is
+`dell-md1280-drawer-top-42` or `dell-md1280-drawer-bottom-42`.
 
 The generic profiles are intended as reusable geometry-first starting points
 for common chassis families surfaced in the Quantastor reference set. They are

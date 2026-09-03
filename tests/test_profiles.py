@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from app.config import SystemConfig, TrueNASConfig, _load_profile_yaml, get_sett
 from app.models.domain import EnclosureOption
 from app.services.profile_registry import (
     CORE_CSE_946_PROFILE_ID,
+    ENCLOSURE_SUB_VIEW_PROFILE_IDS,
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
     GENERIC_FRONT_12_3X4_PROFILE_ID,
     GENERIC_FRONT_24_1X24_PROFILE_ID,
@@ -24,10 +26,35 @@ from app.services.profile_registry import (
     ProfileRegistry,
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+    built_in_profile_ids,
 )
 
 
 class ProfileRegistryTests(unittest.TestCase):
+    def test_profile_docs_match_registry_and_document_sub_view_option_ids(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        documents = (
+            (repository / "docs" / "PROFILE_AUTHORING.md", "## Current Built-In Profiles"),
+            (repository / "wiki" / "Profiles-and-Custom-Layouts.md", "## Built-In Profiles Right Now"),
+        )
+        expected_ids = built_in_profile_ids()
+        sub_view_profile_ids = {
+            profile_id
+            for profile_ids in ENCLOSURE_SUB_VIEW_PROFILE_IDS.values()
+            for profile_id in profile_ids
+        }
+
+        for path, heading in documents:
+            with self.subTest(path=path):
+                text = path.read_text(encoding="utf-8")
+                section = text.split(heading, 1)[1].split("\n## ", 1)[0]
+                documented_ids = set(re.findall(r"^- `([^`]+)`$", section, flags=re.MULTILINE))
+
+                self.assertEqual(documented_ids, expected_ids)
+                self.assertIn("{enclosure_id}::{profile_id}", section)
+                for profile_id in sub_view_profile_ids:
+                    self.assertIn(f"`{profile_id}`", section)
+
     def test_builtin_core_profile_preserves_top_loader_layout(self) -> None:
         system = SystemConfig(id="archive-core", label="Archive CORE", truenas=TrueNASConfig(platform="core"))
         registry = ProfileRegistry(get_settings())

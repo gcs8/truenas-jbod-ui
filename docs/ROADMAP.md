@@ -1,8 +1,10 @@
 # Roadmap
 
-This file tracks the current intended release direction at the `v0.22.2`
-maintenance candidate. `v0.22.1` is the latest published release until the
-v0.22.2 release gates pass.
+This file tracks the current intended release direction after the `v0.22.2`
+maintenance release. `v0.22.2` is the latest published release, published on
+2026-09-01 from source commit
+`6473d05f46d8344146cbbd7d0cdbf44487613a3c`. See the
+[GitHub release](https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2).
 
 Older milestone notes such as [`docs/V0_2_ROADMAP.md`](./V0_2_ROADMAP.md) are
 kept for history, but this file is the active planning view.
@@ -16,13 +18,9 @@ Detailed execution plans live here:
 - [`docs/V0_9_0_PLAN.md`](./V0_9_0_PLAN.md)
 - [`docs/PROFILE_AUTHORING.md`](./PROFILE_AUTHORING.md)
 
-The old `docs/V0_11_0_PLAN.md` notes are preserved locally under
-`artifacts/deferred-docs/V0_11_0_PLAN.md` for later archaeology instead of
-remaining part of the active docs set.
-
 ## Current Snapshot
 
-`v0.22.1` closed the large file-backed history restore patch. `v0.22.2` carries
+`v0.22.1` closed the large file-backed history restore patch. `v0.22.2` shipped
 the bounded long-horizon history architecture and its first lifecycle repair:
 
 - one writable hot SQLite database plus immutable digest-checked segments
@@ -32,10 +30,11 @@ the bounded long-horizon history architecture and its first lifecycle repair:
   containing `history_db`
 - private `.env` staging during immutable deployment candidate validation
 
-The SATA/AES Linux enclosure mapping in issue #119 and draft PR #121 targets
-v0.22.3 unless real-shelf validation arrives before the v0.22.2 freeze. Automated
-generation-2 segment publication also remains v0.22.3 work because it needs a
-durable crash-recovery protocol for hot, segment, and catalog replacement.
+Post-release reconciliation: Issue #119 closed on 2026-09-01 after real-shelf
+validation, and PR #121 merged as
+`579e3bf641872d842af3639ed7bdb084c9b75aff`. Issue #124 closed later that day
+after crash-safe later-generation segment rotation landed in #162. These items
+are completed post-`v0.22.2` work, not open `v0.22.3` prerequisites.
 
 - runtime deployment can be pinned to an immutable GHCR digest with a private
   receipt, convergence checks, and rollback evidence
@@ -51,9 +50,8 @@ durable crash-recovery protocol for hot, segment, and catalog replacement.
 - CI covers Python 3.12 and 3.14, container health, browser QA, public artifacts,
   Ruff, dependency checks, and CodeQL
 
-The next development lane begins only after the v0.22.2 image, development QA,
-production deployment, and post-release reopen gates are complete. It should
-stay practical and incremental:
+Development has resumed on `main` after the v0.22.2 tag and completed release
+gates. The next lane should stay practical and incremental:
 
 - keep richer platform-native Storage Fabric enrichment in small validated
   slices
@@ -327,10 +325,6 @@ Primary outcomes:
   workaround can eventually relax
 - optional Quantastor and snapshot-export cleanup if those still look like the
   best next low-risk wins afterward
-
-Current notes:
-
-- [`docs/V0_11_0_PLAN.md`](./V0_11_0_PLAN.md)
 
 Current status:
 
