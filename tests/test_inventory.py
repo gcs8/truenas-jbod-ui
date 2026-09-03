@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import tempfile
 import unittest
@@ -102,6 +103,144 @@ def build_inventory_service(
 
 
 class InventoryHelpersTests(unittest.TestCase):
+    def test_all_platform_correlators_route_through_shared_scaffolding(self) -> None:
+        self.assertTrue(hasattr(inventory_module, "_LayoutFrame"))
+        self.assertTrue(hasattr(InventoryService, "_resolve_layout_frame"))
+        self.assertTrue(hasattr(inventory_module, "_slot_grid_position"))
+        self.assertTrue(hasattr(inventory_module, "_warn_unmatched_mapping"))
+
+        correlators = (
+            "_correlate",
+            "_correlate_linux_host",
+            "_correlate_esxi_host",
+            "_correlate_bmc_host",
+            "_correlate_scale_linux",
+            "_correlate_quantastor",
+        )
+        for method_name in correlators:
+            with self.subTest(method=method_name):
+                source = inspect.getsource(getattr(InventoryService, method_name))
+                self.assertIn("self._resolve_layout_frame(", source)
+                self.assertIn("_slot_grid_position(", source)
+                self.assertIn("_warn_unmatched_mapping(", source)
+                self.assertIn("frame.result(", source)
+
+        for method_name in ("_correlate", "_correlate_scale_linux"):
+            with self.subTest(shared_disk_index=method_name):
+                source = inspect.getsource(getattr(InventoryService, method_name))
+                self.assertIn("_index_disk_records(", source)
+
+        for method_name in (
+            "_correlate_linux_host",
+            "_correlate_esxi_host",
+            "_correlate_bmc_host",
+            "_correlate_quantastor",
+        ):
+            with self.subTest(bespoke_disk_index=method_name):
+                source = inspect.getsource(getattr(InventoryService, method_name))
+                self.assertNotIn("_index_disk_records(", source)
+
+    def test_resolve_layout_frame_copies_layout_and_builds_unchanged_result_tuple(self) -> None:
+        service = object.__new__(InventoryService)
+        service.settings = Settings(systems=[SystemConfig(id="system-a")])
+        service.system = service.settings.systems[0]
+        selected_option = EnclosureOption(
+            id="enc-a",
+            label="Enclosure A",
+            name="Shelf A",
+            rows=2,
+            columns=2,
+            slot_count=4,
+            slot_layout=[[2, None], [0, 1]],
+        )
+        selected_profile = EnclosureProfileView(
+            id="profile-a",
+            label="Profile A",
+            rows=2,
+            columns=2,
+            slot_count=4,
+            slot_layout=[[2, None], [0, 1]],
+        )
+        service.profile_registry = MagicMock()
+        service.profile_registry.resolve_for_enclosure.return_value = selected_profile
+
+        warnings: list[str] = []
+        frame = service._resolve_layout_frame(
+            [selected_option],
+            "enc-a",
+            warnings,
+        )
+
+        self.assertIsInstance(frame, inventory_module._LayoutFrame)
+        self.assertIs(frame.selected_option, selected_option)
+        self.assertIs(frame.selected_profile, selected_profile)
+        self.assertEqual(frame.selected_meta, {"id": "enc-a", "label": "Enclosure A", "name": "Shelf A"})
+        self.assertEqual(frame.layout_rows, [[2, None], [0, 1]])
+        self.assertIsNot(frame.layout_rows, selected_profile.slot_layout)
+        self.assertEqual(frame.layout_slot_count, 3)
+        self.assertEqual(frame.layout_columns, 2)
+        self.assertEqual(frame.slot_positions, {2: (0, 0), 0: (1, 0), 1: (1, 1)})
+        self.assertEqual(inventory_module._slot_grid_position(2, frame.slot_positions, 2), (0, 0))
+        self.assertEqual(inventory_module._slot_grid_position(3, frame.slot_positions, 2), (1, 1))
+        self.assertEqual(
+            frame.result([]),
+            ([], [selected_option], frame.selected_meta, [[2, None], [0, 1]], 3, 2),
+        )
+        self.assertEqual(warnings, [])
+
+    def test_unmatched_mapping_helper_preserves_all_platform_warning_text(self) -> None:
+        expected_by_platform = {
+            "core": "Manual mapping for slot 03 did not match any current disk.",
+            "scale": "Manual mapping for slot 03 did not match any current disk.",
+            "linux": "Manual mapping for slot 03 did not match any current Linux device.",
+            "esxi": "Manual mapping for slot 03 did not match any current ESXi StorCLI member.",
+            "ipmi": "Manual mapping for slot 03 did not match any current BMC disk.",
+            "quantastor": "Manual mapping for slot 03 did not match any current Quantastor disk.",
+        }
+        target_by_platform = {
+            "core": "disk",
+            "scale": "disk",
+            "linux": "Linux device",
+            "esxi": "ESXi StorCLI member",
+            "ipmi": "BMC disk",
+            "quantastor": "Quantastor disk",
+        }
+
+        for platform, expected in expected_by_platform.items():
+            with self.subTest(platform=platform):
+                warnings: list[str] = []
+                inventory_module._warn_unmatched_mapping(
+                    warnings,
+                    MagicMock(),
+                    None,
+                    3,
+                    target_by_platform[platform],
+                )
+                self.assertEqual(warnings, [expected])
+
+        warnings = []
+        inventory_module._warn_unmatched_mapping(warnings, None, None, 3, "disk")
+        inventory_module._warn_unmatched_mapping(warnings, MagicMock(), MagicMock(), 3, "disk")
+        self.assertEqual(warnings, [])
+
+    def test_index_disk_records_matches_core_and_scale_lookup_shapes(self) -> None:
+        disk = self._make_disk_record("sda", "5000c5003e8253a7")
+        disk.enclosure_id = "enc-a"
+        disk.slot = 2
+        disk.lookup_keys = {"sda", "serial-a"}
+
+        for platform in ("core", "scale"):
+            with self.subTest(platform=platform):
+                disks_by_key, disks_by_slot, disks_by_sas = inventory_module._index_disk_records(
+                    [disk],
+                    platform,
+                )
+                self.assertIs(disks_by_key["sda"], disk)
+                self.assertIs(disks_by_key["serial-a"], disk)
+                self.assertIs(disks_by_slot[("enc-a", 2)], disk)
+                self.assertIs(disks_by_slot[(None, 2)], disk)
+                self.assertIs(disks_by_sas["5000c5003e8253a7"], disk)
+
     def test_legacy_mapping_fallback_requires_one_system_and_one_enclosure(self) -> None:
         system_a = SystemConfig(id="system-a")
         service = object.__new__(InventoryService)

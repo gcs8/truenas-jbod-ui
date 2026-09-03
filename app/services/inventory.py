@@ -18,6 +18,7 @@ from app.config import Settings, StorageViewConfig, SystemConfig
 from app.models.domain import (
     CacheState,
     EnclosureOption,
+    EnclosureProfileView,
     InventorySnapshot,
     InventorySummary,
     LedAction,
@@ -259,6 +260,17 @@ def layout_slot_positions(layout_rows: list[list[int | None]]) -> dict[int, tupl
     }
 
 
+def _slot_grid_position(
+    slot: int,
+    slot_positions: dict[int, tuple[int, int]],
+    layout_columns: int,
+) -> tuple[int, int]:
+    position = slot_positions.get(slot)
+    if position is not None:
+        return position
+    return slot // max(layout_columns, 1), slot % max(layout_columns, 1)
+
+
 ENCLOSURE_OPTION_ID_TAIL_MIN_LENGTH = 4
 
 
@@ -482,6 +494,80 @@ class DiskResolution:
     disk: DiskRecord | None
     source: str
     stale_manual_mapping: bool = False
+
+
+_CorrelationResult = tuple[
+    list[SlotView],
+    list[EnclosureOption],
+    dict[str, Any],
+    list[list[int | None]],
+    int,
+    int,
+]
+
+
+@dataclass(slots=True)
+class _LayoutFrame:
+    available_enclosures: list[EnclosureOption]
+    selected_option: EnclosureOption | None
+    selected_profile: EnclosureProfileView | None
+    selected_meta: dict[str, Any]
+    layout_rows: list[list[int | None]]
+    layout_slot_count: int
+    layout_columns: int
+    slot_positions: dict[int, tuple[int, int]]
+    allow_legacy_mapping_fallback: bool
+
+    def result(
+        self,
+        slot_views: list[SlotView],
+        *,
+        selected_meta: dict[str, Any] | None = None,
+        layout_slot_count: int | None = None,
+    ) -> _CorrelationResult:
+        return (
+            slot_views,
+            self.available_enclosures,
+            self.selected_meta if selected_meta is None else selected_meta,
+            self.layout_rows,
+            self.layout_slot_count if layout_slot_count is None else layout_slot_count,
+            self.layout_columns,
+        )
+
+
+def _warn_unmatched_mapping(
+    warnings: list[str],
+    mapping: ManualMapping | None,
+    disk: DiskRecord | None,
+    slot: int,
+    target: str,
+) -> None:
+    if mapping and not disk:
+        warnings.append(f"Manual mapping for slot {slot:02d} did not match any current {target}.")
+
+
+def _index_disk_records(
+    disk_records: Iterable[DiskRecord],
+    platform: str,
+) -> tuple[
+    dict[str, DiskRecord],
+    dict[tuple[str | None, int], DiskRecord],
+    dict[str, DiskRecord],
+]:
+    records = list(disk_records)
+    disks_by_key: dict[str, DiskRecord] = {}
+    disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
+    for disk in records:
+        for key in disk.lookup_keys:
+            disks_by_key[key] = disk
+        if disk.slot is not None:
+            disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
+            disks_by_slot[(None, disk.slot)] = disk
+    disks_by_sas = index_disks_by_sas(
+        (disk, *lunid_alias_tier_sets(disk.lunid, platform))
+        for disk in records
+    )
+    return disks_by_key, disks_by_slot, disks_by_sas
 
 
 @dataclass(frozen=True, slots=True)
@@ -3839,6 +3925,93 @@ class InventoryService:
             ),
         }
 
+    def _resolve_layout_frame(
+        self,
+        available_enclosures: list[EnclosureOption],
+        selected_enclosure_id: str | None,
+        warnings: list[str],
+        *,
+        selected_meta: dict[str, Any] | None = None,
+        selection_warning: str | None = None,
+        profile_warning: str | None = None,
+        require_selected_option: bool = True,
+        require_profile: bool = True,
+    ) -> _LayoutFrame | _CorrelationResult:
+        selection_meta = selected_meta if selected_meta is not None else {}
+        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
+            available_enclosures
+        )
+        selected_option = self._resolve_selected_enclosure_option(
+            available_enclosures,
+            selected_enclosure_id,
+            selection_meta,
+        )
+        resolved_meta = (
+            selected_meta
+            if selected_meta is not None
+            else self._enclosure_option_meta(selected_option)
+            if selected_option is not None
+            else {"id": None, "label": None, "name": None}
+        )
+        if selected_option is None and require_selected_option:
+            if selection_warning:
+                warnings.append(selection_warning)
+            return [], available_enclosures, resolved_meta, [], 0, 0
+
+        fallback_slot_count = (
+            selected_option.slot_count
+            if selected_option is not None and selected_option.slot_count
+            else self.settings.layout.slot_count
+        )
+        selected_profile = self.profile_registry.resolve_for_enclosure(
+            self.system,
+            selected_option,
+            fallback_label=selected_option.label if selected_option else selection_meta.get("label"),
+            fallback_rows=selected_option.rows if selected_option and selected_option.rows else self.settings.layout.rows,
+            fallback_columns=selected_option.columns if selected_option and selected_option.columns else self.settings.layout.columns,
+            fallback_slot_count=fallback_slot_count,
+            fallback_slot_layout=selected_option.slot_layout if selected_option else None,
+        )
+        if selected_profile is None and require_profile:
+            if profile_warning:
+                warnings.append(profile_warning)
+            return [], available_enclosures, resolved_meta, [], 0, 0
+
+        layout_columns = (
+            selected_profile.columns
+            if selected_profile is not None
+            else selected_option.columns if selected_option is not None and selected_option.columns
+            else self.settings.layout.columns
+        )
+        layout_rows = (
+            copy_layout_rows(selected_profile.slot_layout)
+            if selected_profile is not None and (require_profile or selected_profile.slot_layout)
+            else copy_layout_rows(selected_option.slot_layout)
+            if selected_option is not None and selected_option.slot_layout
+            else build_layout_rows(
+                selected_option.rows if selected_option is not None and selected_option.rows else self.settings.layout.rows,
+                layout_columns,
+                fallback_slot_count,
+            )
+        )
+        layout_count_fallback = (
+            selected_option.slot_count
+            if require_profile and selected_option is not None
+            else fallback_slot_count
+        )
+        layout_slot_count = infer_slot_count_from_layout(layout_rows, layout_count_fallback)
+        return _LayoutFrame(
+            available_enclosures=available_enclosures,
+            selected_option=selected_option,
+            selected_profile=selected_profile,
+            selected_meta=resolved_meta,
+            layout_rows=layout_rows,
+            layout_slot_count=layout_slot_count,
+            layout_columns=layout_columns,
+            slot_positions=layout_slot_positions(layout_rows),
+            allow_legacy_mapping_fallback=allow_legacy_mapping_fallback,
+        )
+
     def _correlate(
         self,
         raw_data: TrueNASRawData,
@@ -3875,9 +4048,6 @@ class InventoryService:
         )
         selected_meta = self._merge_enclosure_meta(ssh_data.ses_selected_meta, api_selected_meta)
         available_enclosures = self._build_enclosure_options(raw_data, ssh_data, selected_meta)
-        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
-            available_enclosures
-        )
         api_enclosure_ids = {
             enclosure_id
             for enclosure_id in (
@@ -3889,37 +4059,17 @@ class InventoryService:
             api_enclosure_ids.add(api_selected_meta["id"])
         slot_candidates = merge_slot_candidate_maps(ssh_data.ses_slot_candidates, api_candidates)
         api_topology_members = parse_pool_query_topology(raw_data.pools)
-        selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, selected_meta)
-        selected_profile = self.profile_registry.resolve_for_enclosure(
-            self.system,
-            selected_option,
-            fallback_label=selected_option.label if selected_option else selected_meta.get("label"),
-            fallback_rows=selected_option.rows if selected_option and selected_option.rows else self.settings.layout.rows,
-            fallback_columns=selected_option.columns if selected_option and selected_option.columns else self.settings.layout.columns,
-            fallback_slot_count=selected_option.slot_count if selected_option and selected_option.slot_count else slot_count,
-            fallback_slot_layout=selected_option.slot_layout if selected_option else None,
+        frame = self._resolve_layout_frame(
+            available_enclosures,
+            selected_enclosure_id,
+            warnings,
+            selected_meta=selected_meta,
+            require_selected_option=False,
+            require_profile=False,
         )
-        layout_columns = (
-            selected_profile.columns
-            if selected_profile
-            else selected_option.columns if selected_option and selected_option.columns
-            else self.settings.layout.columns
-        )
-        layout_rows = (
-            copy_layout_rows(selected_profile.slot_layout)
-            if selected_profile and selected_profile.slot_layout
-            else copy_layout_rows(selected_option.slot_layout) if selected_option and selected_option.slot_layout
-            else build_layout_rows(
-                selected_option.rows if selected_option and selected_option.rows else self.settings.layout.rows,
-                layout_columns,
-                selected_option.slot_count if selected_option and selected_option.slot_count else slot_count,
-            )
-        )
-        layout_slot_count = infer_slot_count_from_layout(
-            layout_rows,
-            selected_option.slot_count if selected_option and selected_option.slot_count else slot_count,
-        )
-        slot_positions = layout_slot_positions(layout_rows)
+        if not isinstance(frame, _LayoutFrame):
+            return frame
+        allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
         disk_records = self._build_disk_records(
             raw_data.disks,
             ssh_data,
@@ -3927,27 +4077,20 @@ class InventoryService:
             parse_smart_test_results(raw_data.smart_test_results),
         )
 
-        disks_by_key: dict[str, DiskRecord] = {}
-        disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
-        for disk in disk_records:
-            for key in disk.lookup_keys:
-                disks_by_key[key] = disk
-            if disk.slot is not None:
-                disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
-                disks_by_slot[(None, disk.slot)] = disk
-        disks_by_sas = index_disks_by_sas(
-            (disk, *lunid_alias_tier_sets(disk.lunid, self.system.truenas.platform))
-            for disk in disk_records
+        disks_by_key, disks_by_slot, disks_by_sas = _index_disk_records(
+            disk_records,
+            self.system.truenas.platform,
         )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
         loaded_mappings = self.mapping_store.load_all()
 
         slot_views: list[SlotView] = []
 
-        for slot in range(layout_slot_count):
-            row_index, column_index = slot_positions.get(
+        for slot in range(frame.layout_slot_count):
+            row_index, column_index = _slot_grid_position(
                 slot,
-                (slot // max(layout_columns, 1), slot % max(layout_columns, 1)),
+                frame.slot_positions,
+                frame.layout_columns,
             )
             candidate = dict(slot_candidates.get(slot, {}))
             enclosure_id = selected_meta.get("id") or normalize_text(candidate.get("enclosure_id"))
@@ -3986,18 +4129,10 @@ class InventoryService:
                 api_topology_members=api_topology_members,
                 api_enclosure_ids=api_enclosure_ids,
             )
-            if mapping and not disk:
-                warnings.append(f"Manual mapping for slot {slot:02d} did not match any current disk.")
+            _warn_unmatched_mapping(warnings, mapping, disk, slot, "disk")
             slot_views.append(slot_view)
 
-        return (
-            slot_views,
-            available_enclosures,
-            selected_meta,
-            layout_rows,
-            layout_slot_count,
-            layout_columns,
-        )
+        return frame.result(slot_views)
 
     def _build_storage_view_candidate_records(
         self,
@@ -4223,31 +4358,20 @@ class InventoryService:
         selected_enclosure_id: str | None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         available_enclosures = self._build_linux_enclosure_options()
-        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
-            available_enclosures
+        frame = self._resolve_layout_frame(
+            available_enclosures,
+            selected_enclosure_id,
+            warnings,
+            selection_warning="No profile-backed Linux enclosure is configured for this host yet.",
+            profile_warning="This Linux host is missing an enclosure profile for rendering.",
         )
-        selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
-        if selected_option is None:
-            warnings.append("No profile-backed Linux enclosure is configured for this host yet.")
-            return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
-
-        selected_profile = self.profile_registry.resolve_for_enclosure(
-            self.system,
-            selected_option,
-            fallback_label=selected_option.label,
-            fallback_rows=selected_option.rows or self.settings.layout.rows,
-            fallback_columns=selected_option.columns or self.settings.layout.columns,
-            fallback_slot_count=selected_option.slot_count or self.settings.layout.slot_count,
-            fallback_slot_layout=selected_option.slot_layout,
-        )
-        if selected_profile is None:
-            warnings.append("This Linux host is missing an enclosure profile for rendering.")
-            return [], available_enclosures, self._enclosure_option_meta(selected_option), [], 0, 0
-
-        layout_rows = copy_layout_rows(selected_profile.slot_layout)
-        layout_slot_count = infer_slot_count_from_layout(layout_rows, selected_option.slot_count)
-        layout_columns = selected_profile.columns
-        slot_positions = layout_slot_positions(layout_rows)
+        if not isinstance(frame, _LayoutFrame):
+            return frame
+        selected_option = frame.selected_option
+        selected_profile = frame.selected_profile
+        if selected_option is None or selected_profile is None:
+            return frame.result([])
+        allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
 
         disk_records = self._build_linux_disk_records(ssh_data, warnings=warnings)
         disks_by_key: dict[str, DiskRecord] = {}
@@ -4263,7 +4387,7 @@ class InventoryService:
         linux_topology_members = self._build_linux_topology_members(disk_records)
         loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
-        selected_meta = self._enclosure_option_meta(selected_option)
+        selected_meta = frame.selected_meta
         vendor_slot_candidates = self._build_linux_vendor_slot_candidates(ssh_data, selected_option)
         slot_hints = selected_profile.slot_hints or {}
         if not slot_hints and not vendor_slot_candidates:
@@ -4276,8 +4400,12 @@ class InventoryService:
                 "GPIO state changes are visible, but operator-visible bay validation is still pending."
             )
 
-        for slot in range(layout_slot_count):
-            row_index, column_index = slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))
+        for slot in range(frame.layout_slot_count):
+            row_index, column_index = _slot_grid_position(
+                slot,
+                frame.slot_positions,
+                frame.layout_columns,
+            )
             hint_values = [normalize_text(value) for value in slot_hints.get(slot, []) if normalize_text(value)]
             raw_slot_status = {
                 "device_names": hint_values,
@@ -4342,18 +4470,10 @@ class InventoryService:
                 api_topology_members=linux_topology_members,
                 api_enclosure_ids=set(),
             )
-            if mapping and not disk:
-                warnings.append(f"Manual mapping for slot {slot:02d} did not match any current Linux device.")
+            _warn_unmatched_mapping(warnings, mapping, disk, slot, "Linux device")
             slot_views.append(slot_view)
 
-        return (
-            slot_views,
-            available_enclosures,
-            selected_meta,
-            layout_rows,
-            layout_slot_count,
-            layout_columns,
-        )
+        return frame.result(slot_views)
 
     def _correlate_esxi_host(
         self,
@@ -4370,26 +4490,20 @@ class InventoryService:
             )
             else self._build_esxi_enclosure_options()
         )
-        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
-            available_enclosures
+        frame = self._resolve_layout_frame(
+            available_enclosures,
+            selected_enclosure_id,
+            warnings,
+            selection_warning="No profile-backed ESXi enclosure is configured for this host yet.",
+            profile_warning="This ESXi host is missing an enclosure profile for rendering.",
         )
-        selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
-        if selected_option is None:
-            warnings.append("No profile-backed ESXi enclosure is configured for this host yet.")
-            return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
-
-        selected_profile = self.profile_registry.resolve_for_enclosure(
-            self.system,
-            selected_option,
-            fallback_label=selected_option.label,
-            fallback_rows=selected_option.rows or self.settings.layout.rows,
-            fallback_columns=selected_option.columns or self.settings.layout.columns,
-            fallback_slot_count=selected_option.slot_count or self.settings.layout.slot_count,
-            fallback_slot_layout=selected_option.slot_layout,
-        )
-        if selected_profile is None:
-            warnings.append("This ESXi host is missing an enclosure profile for rendering.")
-            return [], available_enclosures, self._enclosure_option_meta(selected_option), [], 0, 0
+        if not isinstance(frame, _LayoutFrame):
+            return frame
+        selected_option = frame.selected_option
+        selected_profile = frame.selected_profile
+        if selected_option is None or selected_profile is None:
+            return frame.result([])
+        allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
 
         if not ssh_data.esxi_storcli_physical_drives:
             if selected_profile.id == ESXI_AOC_SLG4_2H8M2_PROFILE_ID:
@@ -4403,11 +4517,7 @@ class InventoryService:
                     "details are unavailable for this chassis on the current refresh."
                 )
 
-        layout_rows = copy_layout_rows(selected_profile.slot_layout)
-        layout_slot_count = infer_slot_count_from_layout(layout_rows, selected_option.slot_count)
-        layout_columns = selected_profile.columns
-        slot_positions = layout_slot_positions(layout_rows)
-        selected_meta = self._enclosure_option_meta(selected_option)
+        selected_meta = frame.selected_meta
 
         disk_records = self._build_esxi_disk_records(
             ssh_data,
@@ -4442,8 +4552,12 @@ class InventoryService:
         }
         loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
-        for slot in range(layout_slot_count):
-            row_index, column_index = slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))
+        for slot in range(frame.layout_slot_count):
+            row_index, column_index = _slot_grid_position(
+                slot,
+                frame.slot_positions,
+                frame.layout_columns,
+            )
             hint_values = [normalize_text(value) for value in slot_hints.get(slot, []) if normalize_text(value)]
             bmc_slot_number = bmc_slot_hints.get(slot)
             slot_hint_values = list(hint_values)
@@ -4552,18 +4666,10 @@ class InventoryService:
                 api_topology_members=esxi_topology_members,
                 api_enclosure_ids=set(),
             )
-            if mapping and not disk:
-                warnings.append(f"Manual mapping for slot {slot:02d} did not match any current ESXi StorCLI member.")
+            _warn_unmatched_mapping(warnings, mapping, disk, slot, "ESXi StorCLI member")
             slot_views.append(slot_view)
 
-        return (
-            slot_views,
-            available_enclosures,
-            selected_meta,
-            layout_rows,
-            layout_slot_count,
-            layout_columns,
-        )
+        return frame.result(slot_views)
 
     def _correlate_bmc_host(
         self,
@@ -4576,32 +4682,21 @@ class InventoryService:
             return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
 
         available_enclosures = self._build_bmc_enclosure_options(bmc_inventory)
-        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
-            available_enclosures
+        frame = self._resolve_layout_frame(
+            available_enclosures,
+            selected_enclosure_id,
+            warnings,
+            selection_warning="No profile-backed BMC enclosure is configured for this host yet.",
+            profile_warning="This BMC host is missing an enclosure profile for rendering.",
         )
-        selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
-        if selected_option is None:
-            warnings.append("No profile-backed BMC enclosure is configured for this host yet.")
-            return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
-
-        selected_profile = self.profile_registry.resolve_for_enclosure(
-            self.system,
-            selected_option,
-            fallback_label=selected_option.label,
-            fallback_rows=selected_option.rows or self.settings.layout.rows,
-            fallback_columns=selected_option.columns or self.settings.layout.columns,
-            fallback_slot_count=selected_option.slot_count or self.settings.layout.slot_count,
-            fallback_slot_layout=selected_option.slot_layout,
-        )
-        if selected_profile is None:
-            warnings.append("This BMC host is missing an enclosure profile for rendering.")
-            return [], available_enclosures, self._enclosure_option_meta(selected_option), [], 0, 0
-
-        layout_rows = copy_layout_rows(selected_profile.slot_layout)
-        layout_slot_count = infer_slot_count_from_layout(layout_rows, selected_option.slot_count)
-        layout_columns = selected_profile.columns
-        slot_positions = layout_slot_positions(layout_rows)
-        selected_meta = self._enclosure_option_meta(selected_option)
+        if not isinstance(frame, _LayoutFrame):
+            return frame
+        selected_option = frame.selected_option
+        selected_profile = frame.selected_profile
+        if selected_option is None or selected_profile is None:
+            return frame.result([])
+        allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
+        selected_meta = frame.selected_meta
 
         disk_records = self._build_bmc_disk_records(bmc_inventory)
         disks_by_key: dict[str, DiskRecord] = {}
@@ -4623,8 +4718,12 @@ class InventoryService:
         empty_ssh = ParsedSSHData()
         loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
-        for slot in range(layout_slot_count):
-            row_index, column_index = slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))
+        for slot in range(frame.layout_slot_count):
+            row_index, column_index = _slot_grid_position(
+                slot,
+                frame.slot_positions,
+                frame.layout_columns,
+            )
             mapped_bmc_slot = bmc_slot_hints.get(slot)
             if mapped_bmc_slot is None and slot < len(discovered_slot_numbers):
                 mapped_bmc_slot = discovered_slot_numbers[slot]
@@ -4677,18 +4776,10 @@ class InventoryService:
                 api_topology_members={},
                 api_enclosure_ids=set(),
             )
-            if mapping and not disk:
-                warnings.append(f"Manual mapping for slot {slot:02d} did not match any current BMC disk.")
+            _warn_unmatched_mapping(warnings, mapping, disk, slot, "BMC disk")
             slot_views.append(slot_view)
 
-        return (
-            slot_views,
-            available_enclosures,
-            selected_meta,
-            layout_rows,
-            layout_slot_count,
-            layout_columns,
-        )
+        return frame.result(slot_views)
 
     def _correlate_scale_linux(
         self,
@@ -4699,27 +4790,20 @@ class InventoryService:
         bmc_inventory: BMCInventory | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, Any], list[list[int | None]], int, int]:
         available_enclosures = self._build_scale_linux_enclosure_options(ssh_data)
-        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
-            available_enclosures
+        frame = self._resolve_layout_frame(
+            available_enclosures,
+            selected_enclosure_id,
+            warnings,
+            require_profile=False,
         )
-        selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
+        if not isinstance(frame, _LayoutFrame):
+            return frame
+        selected_option = frame.selected_option
         if selected_option is None:
-            return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
-
-        selected_profile = self.profile_registry.resolve_for_enclosure(
-            self.system,
-            selected_option,
-            fallback_label=selected_option.label,
-            fallback_rows=selected_option.rows or self.settings.layout.rows,
-            fallback_columns=selected_option.columns or self.settings.layout.columns,
-            fallback_slot_count=selected_option.slot_count or self.settings.layout.slot_count,
-            fallback_slot_layout=selected_option.slot_layout,
-        )
-        slot_count = (
-            infer_slot_count_from_layout(selected_profile.slot_layout, selected_option.slot_count)
-            if selected_profile
-            else selected_option.slot_count or self.settings.layout.slot_count
-        )
+            return frame.result([])
+        selected_profile = frame.selected_profile
+        allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
+        slot_count = frame.layout_slot_count
         ssh_candidates, ssh_meta = build_slot_candidates_from_ses_enclosures(
             ssh_data.ses_enclosures,
             slot_count,
@@ -4755,42 +4839,20 @@ class InventoryService:
             parse_smart_test_results(raw_data.smart_test_results),
         )
 
-        disks_by_key: dict[str, DiskRecord] = {}
-        disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
-        for disk in disk_records:
-            for key in disk.lookup_keys:
-                disks_by_key[key] = disk
-            if disk.slot is not None:
-                disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
-                disks_by_slot[(None, disk.slot)] = disk
-        disks_by_sas = index_disks_by_sas(
-            (disk, *lunid_alias_tier_sets(disk.lunid, self.system.truenas.platform))
-            for disk in disk_records
-            if disk.lunid
+        disks_by_key, disks_by_slot, disks_by_sas = _index_disk_records(
+            disk_records,
+            self.system.truenas.platform,
         )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
 
-        columns = (
-            selected_profile.columns
-            if selected_profile
-            else selected_option.columns or self.settings.layout.columns
-        )
-        layout_rows = (
-            copy_layout_rows(selected_profile.slot_layout)
-            if selected_profile and selected_profile.slot_layout
-            else copy_layout_rows(selected_option.slot_layout) if selected_option and selected_option.slot_layout
-            else build_layout_rows(selected_option.rows or self.settings.layout.rows, columns, slot_count)
-        )
-        slot_count = infer_slot_count_from_layout(layout_rows, slot_count)
-        slot_positions = layout_slot_positions(layout_rows)
         mapping_enclosure_id = self._base_enclosure_id(selected_option.id)
         is_sub_view = mapping_enclosure_id != selected_option.id
         # Synthetic drawer sub-views render only their own layout slots. Normal
         # profiles retain the existing range behavior so sparse custom layouts
         # do not silently remove bays from inventory.
         slots_to_render = (
-            sorted(slot_positions)
-            if is_sub_view and slot_positions
+            sorted(frame.slot_positions)
+            if is_sub_view and frame.slot_positions
             else list(range(slot_count))
         )
         if is_sub_view:
@@ -4799,6 +4861,11 @@ class InventoryService:
         slot_views: list[SlotView] = []
 
         for slot in slots_to_render:
+            row_index, column_index = _slot_grid_position(
+                slot,
+                frame.slot_positions,
+                frame.layout_columns,
+            )
             candidate = dict(slot_candidates.get(slot, {}))
             mapping = self.mapping_store.get_mapping(
                 self.system.id,
@@ -4825,8 +4892,8 @@ class InventoryService:
                 self._apply_bmc_serial_match_to_raw_slot_status(candidate, bmc_disk, disk)
             slot_view = self._build_slot_view(
                 slot=slot,
-                row_index=slot_positions.get(slot, (slot // max(columns, 1), slot % max(columns, 1)))[0],
-                column_index=slot_positions.get(slot, (slot // max(columns, 1), slot % max(columns, 1)))[1],
+                row_index=row_index,
+                column_index=column_index,
                 enclosure_meta=selected_meta,
                 raw_slot_status=candidate,
                 disk=disk,
@@ -4835,17 +4902,13 @@ class InventoryService:
                 api_topology_members=api_topology_members,
                 api_enclosure_ids=api_enclosure_ids,
             )
-            if mapping and not disk:
-                warnings.append(f"Manual mapping for slot {slot:02d} did not match any current disk.")
+            _warn_unmatched_mapping(warnings, mapping, disk, slot, "disk")
             slot_views.append(slot_view)
 
-        return (
+        return frame.result(
             slot_views,
-            available_enclosures,
-            selected_meta,
-            layout_rows,
-            slot_count,
-            columns,
+            selected_meta=selected_meta,
+            layout_slot_count=slot_count,
         )
 
     def _correlate_quantastor(
@@ -4857,37 +4920,26 @@ class InventoryService:
         bmc_inventory: BMCInventory | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         available_enclosures = self._build_quantastor_enclosure_options(raw_data)
-        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
-            available_enclosures
-        )
         preferred_enclosure_id = selected_enclosure_id or self._select_quantastor_default_enclosure_id(
             raw_data,
             available_enclosures,
         )
-        selected_option = self._resolve_selected_enclosure_option(available_enclosures, preferred_enclosure_id, {})
-        if selected_option is None:
-            warnings.append("Quantastor did not return any storage-system views that can be rendered yet.")
-            return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
-
-        selected_profile = self.profile_registry.resolve_for_enclosure(
-            self.system,
-            selected_option,
-            fallback_label=selected_option.label,
-            fallback_rows=selected_option.rows or self.settings.layout.rows,
-            fallback_columns=selected_option.columns or self.settings.layout.columns,
-            fallback_slot_count=selected_option.slot_count or self.settings.layout.slot_count,
-            fallback_slot_layout=selected_option.slot_layout,
+        frame = self._resolve_layout_frame(
+            available_enclosures,
+            preferred_enclosure_id,
+            warnings,
+            selection_warning="Quantastor did not return any storage-system views that can be rendered yet.",
+            profile_warning="This Quantastor view needs a chassis profile before it can be rendered.",
         )
-        if selected_profile is None:
-            warnings.append("This Quantastor view needs a chassis profile before it can be rendered.")
-            return [], available_enclosures, self._enclosure_option_meta(selected_option), [], 0, 0
+        if not isinstance(frame, _LayoutFrame):
+            return frame
+        selected_option = frame.selected_option
+        selected_profile = frame.selected_profile
+        if selected_option is None or selected_profile is None:
+            return frame.result([])
+        allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
 
         warnings.extend(self._build_quantastor_cluster_warnings(raw_data, selected_option.id))
-
-        layout_rows = copy_layout_rows(selected_profile.slot_layout)
-        layout_slot_count = infer_slot_count_from_layout(layout_rows, selected_option.slot_count)
-        layout_columns = selected_profile.columns
-        slot_positions = layout_slot_positions(layout_rows)
 
         disk_records = self._build_quantastor_disk_records(raw_data, selected_option.id)
         disks_by_key: dict[str, DiskRecord] = {}
@@ -4904,19 +4956,24 @@ class InventoryService:
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
 
         api_topology_members = self._build_quantastor_topology_members(raw_data, disk_records)
-        selected_meta = self._enclosure_option_meta(selected_option)
+        selected_meta = frame.selected_meta
         empty_ssh = ParsedSSHData()
         quantastor_ses_candidates = self._select_quantastor_ses_candidates(
             raw_data,
             selected_option.id,
             quantastor_ses_data,
-            layout_slot_count,
+            frame.layout_slot_count,
             selected_profile.id,
         )
         loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
 
-        for slot in range(layout_slot_count):
+        for slot in range(frame.layout_slot_count):
+            row_index, column_index = _slot_grid_position(
+                slot,
+                frame.slot_positions,
+                frame.layout_columns,
+            )
             mapping = self.mapping_store.get_mapping(
                 self.system.id,
                 selected_option.id,
@@ -4969,8 +5026,8 @@ class InventoryService:
 
             slot_view = self._build_slot_view(
                 slot=slot,
-                row_index=slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))[0],
-                column_index=slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))[1],
+                row_index=row_index,
+                column_index=column_index,
                 enclosure_meta=selected_meta,
                 raw_slot_status=raw_slot_status,
                 disk=disk,
@@ -4979,18 +5036,10 @@ class InventoryService:
                 api_topology_members=api_topology_members,
                 api_enclosure_ids=set(),
             )
-            if mapping and not disk:
-                warnings.append(f"Manual mapping for slot {slot:02d} did not match any current Quantastor disk.")
+            _warn_unmatched_mapping(warnings, mapping, disk, slot, "Quantastor disk")
             slot_views.append(slot_view)
 
-        return (
-            slot_views,
-            available_enclosures,
-            selected_meta,
-            layout_rows,
-            layout_slot_count,
-            layout_columns,
-        )
+        return frame.result(slot_views)
 
     def _build_quantastor_enclosure_options(self, raw_data: TrueNASRawData) -> list[EnclosureOption]:
         profile = self.profile_registry.resolve_for_enclosure(
