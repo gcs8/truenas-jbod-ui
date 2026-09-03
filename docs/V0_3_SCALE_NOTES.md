@@ -5,7 +5,7 @@
 - Chassis: `Supermicro SSG-6048R-E1CR36L`
 - Front SAS backplane: `BPN-SAS3-846EL1`
 - Rear SAS backplane: `BPN-SAS3-826EL1-N4`
-- Host: `10.88.88.40`
+- Host: `192.0.2.10`
 - Platform: `TrueNAS SCALE`
 
 ## First-Pass Status
@@ -29,7 +29,7 @@ Working today:
 - Disk-to-slot correlation from SCALE `lunid` values plus AES `SAS address`
 - Per-slot SMART summary through `sudo -n /usr/sbin/smartctl -x -j /dev/<disk>`
 - SSH identify LED control through `sg_ses --set=ident` / `--clear=ident`
-- Physical front/rear slot geometry aligned to CryoStorage operator notes:
+- Physical front/rear slot geometry aligned to sanitized operator notes:
   - front = `4` columns by `6` rows, with each `6`-disk vertical column acting as one vdev and slot numbers running bottom-to-top within each column
   - rear = `4` columns by `3` rows
 
@@ -45,7 +45,7 @@ Not working yet:
 On `2026-04-14`, the SCALE host reported this alert:
 
 - the deprecated REST API authenticated `3` times in the last `24` hours
-- source IP reported by the alert: `10.13.37.67`
+- source IP reported by the alert: `192.0.2.11`
 - removal target called out by the appliance alert: `26.04`
 
 Important context for this app:
@@ -61,7 +61,7 @@ than from this app itself.
 
 Follow-up to keep in mind:
 
-- investigate other integrations on `10.13.37.67`
+- investigate other integrations on `192.0.2.11`
 - keep this app on the websocket / JSON-RPC path only
 - treat REST-removal compatibility as an explicit `v0.3.x` parity and hardening
   item rather than a future cleanup
@@ -162,7 +162,7 @@ rather than assuming a single 60-bay top-loader style shelf.
 
 ## Operator Notes That Change The Plan
 
-The local CryoStorage notes add several concrete mapping hints that are more
+The sanitized operator notes add several concrete mapping hints that are more
 useful than the current live API output:
 
 - EID `26` appears to be the front `24`-bay enclosure on `/dev/sg27`

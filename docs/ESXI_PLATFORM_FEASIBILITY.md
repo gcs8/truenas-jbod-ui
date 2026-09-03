@@ -15,12 +15,12 @@ to be useful?
 
 ## Current Lab Target
 
-- ESXi host: `10.88.88.20`
-- Optional IPMI/BMC: `10.88.88.10`
+- ESXi host: `192.0.2.20`
+- Optional IPMI/BMC: `192.0.2.21`
 - Optional vCenter: lab vCenter appliance
 - Adapter: Supermicro `AOC-SLG4-2H8M2`
 - Reported storage shape: two M.2 NVMe SSDs in RAID1 with two exposed LUNs
-- Observed host name: `CryoStorage-ESXi.gcs8.io`
+- Observed host name: `esxi-host.example.test`
 - Observed ESXi version: `7.0.3`, build `24411414`
 
 Do not store root credentials in the repo or docs. For live validation, use
@@ -60,9 +60,9 @@ practical.
 
 vCenter read-only access works and can see the lab inventory:
 
-- datacenters: `GCS8`, `CryoStore`
-- connected target host: `cryostorage-esxi.gcs8.io`
-- local target datastore: `CryoStore-Local`
+- datacenters: `ExampleDC`, `ExampleLab`
+- connected target host: `esxi-host.example.test`
+- local target datastore: `ExampleLab-Local`
 - datastore records include capacity, free space, VMFS type, accessibility,
   thin-provisioning support, and whether the datastore is multi-host
 
@@ -78,7 +78,7 @@ Direct ESXi SSH exposed the important hardware path:
   `Number of Physical Drives: 2`.
 - ESXi also sees a local BROADCOM `VirtualSES` enclosure-services device.
 - VMFS mapping is visible:
-  - `CryoStore-Local` is backed by the larger VM/data virtual drive.
+  - `ExampleLab-Local` is backed by the larger VM/data virtual drive.
   - `OSDATA-*` is backed by the smaller ESXi boot virtual drive.
 - `esxcli storage core device raid list` maps both logical devices to
   physical locations `enclosure 13 slot 0` and `enclosure 13 slot 1`.
@@ -159,7 +159,7 @@ The first ESXi slice is intentionally narrow:
 Generic ESXCLI logical-device/datastore parsing is present as supporting context, but the useful
 physical-slot view currently depends on StorCLI being installed and readable.
 
-Live local smoke on `2026-04-25` saved `cryostorage-esxi` through the admin route
+Live local smoke on `2026-04-25` saved `example-esxi` through the admin route
 into the ignored local config, restarted the read UI, and confirmed:
 
 - two healthy StorCLI-backed physical members (`13:0`, `13:1`)

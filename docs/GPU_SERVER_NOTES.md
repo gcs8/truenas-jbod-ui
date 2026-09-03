@@ -1,6 +1,6 @@
 # GPU Server Notes
 
-Host: `gpu-server` (`10.13.37.213`)
+Host: `gpu-host.example.test` (`192.0.2.30`)
 
 Hardware:
 - Supermicro `SYS-2029GP-TR`
@@ -28,7 +28,7 @@ Hardware:
 
 ## Current Discovery Results
 
-- SSH access works from the app VM with the existing `id_truenas` key.
+- SSH access works from the app VM with the existing `id_example` key.
 - `smartctl -x -j` works for NVMe namespaces and returns good SMART data.
 - `mdadm --detail --scan` and `mdadm --detail /dev/md5` work.
 - `lsblk -OJ` returns rich namespace, partition, mdraid, UUID, and mount data.
@@ -55,11 +55,11 @@ Conclusion:
 Linux sees two NVMe controllers, each split into multiple namespaces:
 
 - `nvme0`
-  - serial family: `20452B91C7CF`
+  - serial family: `SANITIZED-NVME-1`
   - PCIe path from `nvme list-subsys`: `10000:01:00.0`
   - matching hotplug slot in `/sys/bus/pci/slots`: `106`
 - `nvme1`
-  - serial family: `20452B91C7BF`
+  - serial family: `SANITIZED-NVME-2`
   - PCIe path from `nvme list-subsys`: `10000:02:00.0`
   - matching hotplug slot in `/sys/bus/pci/slots`: `107`
 
@@ -76,7 +76,7 @@ Data stack:
 - `nvme0n3` + `nvme1n3` -> `md2` (`raid1`)
 - `nvme0n4` + `nvme1n4` -> `md3` (`raid1`)
 - `nvme0n5` + `nvme1n5` -> `md4` (`raid1`)
-- `md1` + `md2` + `md3` + `md4` -> `md5` (`raid0`) mounted at `/mnt/nvme_raid`
+- `md1` + `md2` + `md3` + `md4` -> `md5` (`raid0`) mounted at `<storage-mount>`
 
 ## SMART Example
 
@@ -101,8 +101,8 @@ Example useful fields observed:
 - NVMe protocol version: `1.2`
 - warning temperature threshold: `75 C`
 - critical temperature threshold: `80 C`
-- namespace EUI64: `eui.00a075102b91c7cf`
-- namespace NGUID: `000000000000001000a075012b91c7cf`
+- namespace EUI64: `SANITIZED-EUI64`
+- namespace NGUID: `SANITIZED-NGUID`
 
 ## Practical Recommendation
 
@@ -123,8 +123,8 @@ If we support it in the app later, the cleanest first pass is likely:
 
 The local `v0.4.0` app now includes this host as:
 
-- system id: `gpu-server`
-- label: `GPU Server Linux`
+- system id: `example-gpu-server`
+- label: `Example GPU Linux`
 - default profile: `supermicro-sys-2029gp-tr-right-nvme-2`
 
 Current live behavior:
