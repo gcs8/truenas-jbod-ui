@@ -885,44 +885,49 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 class HistoryStoreTests(unittest.TestCase):
     def test_slot_state_column_contract_matches_existing_schema_and_projections(self) -> None:
         expected_columns = (
-            ("system_id", "TEXT NOT NULL"),
-            ("system_label", "TEXT"),
-            ("enclosure_key", "TEXT NOT NULL"),
-            ("enclosure_id", "TEXT"),
-            ("enclosure_label", "TEXT"),
-            ("slot", "INTEGER NOT NULL"),
-            ("slot_label", "TEXT NOT NULL"),
-            ("present", "INTEGER NOT NULL"),
-            ("state", "TEXT"),
-            ("identify_active", "INTEGER NOT NULL"),
-            ("device_name", "TEXT"),
-            ("serial", "TEXT"),
-            ("model", "TEXT"),
-            ("gptid", "TEXT"),
-            ("persistent_id_label", "TEXT"),
-            ("disk_identity_key", "TEXT"),
-            ("logical_unit_id", "TEXT"),
-            ("sas_address", "TEXT"),
-            ("pool_name", "TEXT"),
-            ("vdev_name", "TEXT"),
-            ("health", "TEXT"),
-            ("topology_label", "TEXT"),
-            ("multipath_device", "TEXT"),
-            ("multipath_mode", "TEXT"),
-            ("multipath_state", "TEXT"),
-            ("multipath_lunid", "TEXT"),
-            ("multipath_primary_path", "TEXT"),
-            ("multipath_alternate_path", "TEXT"),
-            ("multipath_active_paths", "TEXT"),
-            ("multipath_passive_paths", "TEXT"),
-            ("multipath_failed_paths", "TEXT"),
-            ("multipath_other_paths", "TEXT"),
-            ("multipath_active_controllers", "TEXT"),
-            ("multipath_passive_controllers", "TEXT"),
-            ("multipath_failed_controllers", "TEXT"),
-            ("last_seen_at", "TEXT NOT NULL"),
+            ("system_id", "TEXT NOT NULL", False),
+            ("system_label", "TEXT", False),
+            ("enclosure_key", "TEXT NOT NULL", False),
+            ("enclosure_id", "TEXT", False),
+            ("enclosure_label", "TEXT", False),
+            ("slot", "INTEGER NOT NULL", False),
+            ("slot_label", "TEXT NOT NULL", False),
+            ("present", "INTEGER NOT NULL", False),
+            ("state", "TEXT", False),
+            ("identify_active", "INTEGER NOT NULL", False),
+            ("device_name", "TEXT", False),
+            ("serial", "TEXT", False),
+            ("model", "TEXT", False),
+            ("gptid", "TEXT", False),
+            ("persistent_id_label", "TEXT", True),
+            ("disk_identity_key", "TEXT", True),
+            ("logical_unit_id", "TEXT", True),
+            ("sas_address", "TEXT", True),
+            ("pool_name", "TEXT", False),
+            ("vdev_name", "TEXT", False),
+            ("health", "TEXT", False),
+            ("topology_label", "TEXT", True),
+            ("multipath_device", "TEXT", True),
+            ("multipath_mode", "TEXT", True),
+            ("multipath_state", "TEXT", True),
+            ("multipath_lunid", "TEXT", True),
+            ("multipath_primary_path", "TEXT", True),
+            ("multipath_alternate_path", "TEXT", True),
+            ("multipath_active_paths", "TEXT", True),
+            ("multipath_passive_paths", "TEXT", True),
+            ("multipath_failed_paths", "TEXT", True),
+            ("multipath_other_paths", "TEXT", True),
+            ("multipath_active_controllers", "TEXT", True),
+            ("multipath_passive_controllers", "TEXT", True),
+            ("multipath_failed_controllers", "TEXT", True),
+            ("last_seen_at", "TEXT NOT NULL", False),
         )
-        expected_names = tuple(name for name, _definition in expected_columns)
+        expected_names = tuple(name for name, _definition, _optional in expected_columns)
+        expected_optional_columns = {
+            name: definition
+            for name, definition, optional in expected_columns
+            if optional
+        }
 
         expected_update_names = tuple(
             name
@@ -930,7 +935,8 @@ class HistoryStoreTests(unittest.TestCase):
             if name not in {"system_id", "enclosure_key", "slot"}
         )
         expected_schema_columns = ",\n".join(
-            f"    {name} {definition}" for name, definition in expected_columns
+            f"    {name} {definition}"
+            for name, definition, _optional in expected_columns
         )
         expected_upsert_columns = ",\n".join(
             f"                {name}" for name in expected_names
@@ -949,12 +955,20 @@ class HistoryStoreTests(unittest.TestCase):
         )
 
         self.assertEqual(history_store.SLOT_STATE_COLUMNS, expected_columns)
+        self.assertEqual(
+            history_store.SLOT_STATE_OPTIONAL_COLUMNS,
+            expected_optional_columns,
+        )
         self.assertEqual(history_store.SLOT_STATE_COLUMN_NAMES, expected_names)
         self.assertEqual(history_store.SLOT_STATE_UPSERT_COLUMNS, expected_names)
         self.assertEqual(history_store.SLOT_STATE_UPSERT_UPDATE_COLUMNS, expected_update_names)
         self.assertEqual(
             history_store.SLOT_STATE_ADOPTION_PROJECTION,
             expected_adoption_projection,
+        )
+        self.assertEqual(
+            history_store._SLOT_STATE_SCHEMA_COLUMNS_SQL,
+            expected_schema_columns,
         )
         self.assertIn(
             f"CREATE TABLE IF NOT EXISTS slot_state_current (\n{expected_schema_columns},\n"
@@ -1004,6 +1018,46 @@ class HistoryStoreTests(unittest.TestCase):
         )
         stored_row = dict(zip(expected_names, expected_parameters, strict=True))
         self.assertEqual(HistoryStore._row_to_slot_state(stored_row), record)  # type: ignore[arg-type]
+
+        sabotaged_columns = tuple(
+            (name, definition, False if name == "persistent_id_label" else optional)
+            for name, definition, optional in expected_columns
+        )
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                {
+                    name: definition
+                    for name, definition, optional in sabotaged_columns
+                    if optional
+                },
+                expected_optional_columns,
+            )
+
+    def test_slot_state_optional_columns_have_no_separate_literal_authority(self) -> None:
+        import ast
+        import inspect
+
+        module = ast.parse(inspect.getsource(history_store))
+        assignment = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "SLOT_STATE_OPTIONAL_COLUMNS"
+        )
+
+        optional_columns_expression = assignment.value
+        self.assertIsInstance(optional_columns_expression, ast.DictComp)
+        if not isinstance(optional_columns_expression, ast.DictComp):
+            self.fail("SLOT_STATE_OPTIONAL_COLUMNS must be a derived dictionary")
+        self.assertIn(
+            "SLOT_STATE_COLUMNS",
+            {
+                node.id
+                for node in ast.walk(optional_columns_expression)
+                if isinstance(node, ast.Name)
+            },
+        )
 
     def test_rollup_projection_contract_matches_existing_queries(self) -> None:
         expected_projection = """                    NULL AS id,

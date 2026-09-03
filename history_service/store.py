@@ -52,66 +52,53 @@ class SlotStateUpdate:
     observed_at: str
     events: list[SlotEvent] = field(default_factory=list)
 
-SLOT_STATE_OPTIONAL_COLUMNS: dict[str, str] = {
-    "persistent_id_label": "TEXT",
-    "disk_identity_key": "TEXT",
-    "logical_unit_id": "TEXT",
-    "sas_address": "TEXT",
-    "topology_label": "TEXT",
-    "multipath_device": "TEXT",
-    "multipath_mode": "TEXT",
-    "multipath_state": "TEXT",
-    "multipath_lunid": "TEXT",
-    "multipath_primary_path": "TEXT",
-    "multipath_alternate_path": "TEXT",
-    "multipath_active_paths": "TEXT",
-    "multipath_passive_paths": "TEXT",
-    "multipath_failed_paths": "TEXT",
-    "multipath_other_paths": "TEXT",
-    "multipath_active_controllers": "TEXT",
-    "multipath_passive_controllers": "TEXT",
-    "multipath_failed_controllers": "TEXT",
-}
-
-SLOT_STATE_COLUMNS = (
-    ("system_id", "TEXT NOT NULL"),
-    ("system_label", "TEXT"),
-    ("enclosure_key", "TEXT NOT NULL"),
-    ("enclosure_id", "TEXT"),
-    ("enclosure_label", "TEXT"),
-    ("slot", "INTEGER NOT NULL"),
-    ("slot_label", "TEXT NOT NULL"),
-    ("present", "INTEGER NOT NULL"),
-    ("state", "TEXT"),
-    ("identify_active", "INTEGER NOT NULL"),
-    ("device_name", "TEXT"),
-    ("serial", "TEXT"),
-    ("model", "TEXT"),
-    ("gptid", "TEXT"),
-    ("persistent_id_label", "TEXT"),
-    ("disk_identity_key", "TEXT"),
-    ("logical_unit_id", "TEXT"),
-    ("sas_address", "TEXT"),
-    ("pool_name", "TEXT"),
-    ("vdev_name", "TEXT"),
-    ("health", "TEXT"),
-    ("topology_label", "TEXT"),
-    ("multipath_device", "TEXT"),
-    ("multipath_mode", "TEXT"),
-    ("multipath_state", "TEXT"),
-    ("multipath_lunid", "TEXT"),
-    ("multipath_primary_path", "TEXT"),
-    ("multipath_alternate_path", "TEXT"),
-    ("multipath_active_paths", "TEXT"),
-    ("multipath_passive_paths", "TEXT"),
-    ("multipath_failed_paths", "TEXT"),
-    ("multipath_other_paths", "TEXT"),
-    ("multipath_active_controllers", "TEXT"),
-    ("multipath_passive_controllers", "TEXT"),
-    ("multipath_failed_controllers", "TEXT"),
-    ("last_seen_at", "TEXT NOT NULL"),
+# (name, SQL definition, add when missing from a legacy schema)
+SLOT_STATE_COLUMNS: tuple[tuple[str, str, bool], ...] = (
+    ("system_id", "TEXT NOT NULL", False),
+    ("system_label", "TEXT", False),
+    ("enclosure_key", "TEXT NOT NULL", False),
+    ("enclosure_id", "TEXT", False),
+    ("enclosure_label", "TEXT", False),
+    ("slot", "INTEGER NOT NULL", False),
+    ("slot_label", "TEXT NOT NULL", False),
+    ("present", "INTEGER NOT NULL", False),
+    ("state", "TEXT", False),
+    ("identify_active", "INTEGER NOT NULL", False),
+    ("device_name", "TEXT", False),
+    ("serial", "TEXT", False),
+    ("model", "TEXT", False),
+    ("gptid", "TEXT", False),
+    ("persistent_id_label", "TEXT", True),
+    ("disk_identity_key", "TEXT", True),
+    ("logical_unit_id", "TEXT", True),
+    ("sas_address", "TEXT", True),
+    ("pool_name", "TEXT", False),
+    ("vdev_name", "TEXT", False),
+    ("health", "TEXT", False),
+    ("topology_label", "TEXT", True),
+    ("multipath_device", "TEXT", True),
+    ("multipath_mode", "TEXT", True),
+    ("multipath_state", "TEXT", True),
+    ("multipath_lunid", "TEXT", True),
+    ("multipath_primary_path", "TEXT", True),
+    ("multipath_alternate_path", "TEXT", True),
+    ("multipath_active_paths", "TEXT", True),
+    ("multipath_passive_paths", "TEXT", True),
+    ("multipath_failed_paths", "TEXT", True),
+    ("multipath_other_paths", "TEXT", True),
+    ("multipath_active_controllers", "TEXT", True),
+    ("multipath_passive_controllers", "TEXT", True),
+    ("multipath_failed_controllers", "TEXT", True),
+    ("last_seen_at", "TEXT NOT NULL", False),
 )
-SLOT_STATE_COLUMN_NAMES = tuple(name for name, _definition in SLOT_STATE_COLUMNS)
+SLOT_STATE_COLUMN_NAMES = tuple(
+    name for name, _definition, _optional in SLOT_STATE_COLUMNS
+)
+SLOT_STATE_OPTIONAL_COLUMNS: dict[str, str] = {
+    name: definition
+    for name, definition, optional in SLOT_STATE_COLUMNS
+    if optional
+}
 SLOT_STATE_UPSERT_COLUMNS = SLOT_STATE_COLUMN_NAMES
 SLOT_STATE_UPSERT_UPDATE_COLUMNS = tuple(
     name
@@ -121,7 +108,8 @@ SLOT_STATE_UPSERT_UPDATE_COLUMNS = tuple(
 SLOT_STATE_ADOPTION_PROJECTION = ("?", "?", *SLOT_STATE_COLUMN_NAMES[2:])
 
 _SLOT_STATE_SCHEMA_COLUMNS_SQL = ",\n".join(
-    f"    {name} {definition}" for name, definition in SLOT_STATE_COLUMNS
+    f"    {name} {definition}"
+    for name, definition, _optional in SLOT_STATE_COLUMNS
 )
 _SLOT_STATE_UPSERT_COLUMNS_SQL = ",\n".join(
     f"                {name}" for name in SLOT_STATE_UPSERT_COLUMNS
