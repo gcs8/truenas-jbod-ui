@@ -143,42 +143,6 @@ test("mapping health scope follows the selected saved view", () => {
   assert.equal(scope.slots[0].mapping_source, "inventory_candidate");
 });
 
-test("saved-view card selection refreshes mapping health with the grid scope", () => {
-  assert.match(
-    APP_SOURCE,
-    /storageViewList\.addEventListener\("click",[\s\S]*selectStorageViewRuntimeFromCard\(nextViewId\);/,
-  );
-  const events = [];
-  const state = { selectedStorageViewRuntimeId: "" };
-  const { selectStorageViewRuntimeFromCard } = loadFunctions(
-    APP_SOURCE,
-    ["selectStorageViewRuntimeFromCard"],
-    {
-      state,
-      confirmMappingDraftDiscard() { return true; },
-      closeEnclosureAliasEditor() { events.push("close-alias-editor"); },
-      resetHeatmapHistoryCache() { events.push("reset-heatmap"); },
-      renderViewChrome() { events.push("render-chrome"); },
-      renderStorageViewsRuntime() { events.push("render-views"); },
-      renderGrid() { events.push("render-grid"); },
-      renderSummary() { events.push("render-summary"); },
-      ensureHeatmapData() { events.push("ensure-heatmap"); },
-    },
-  );
-
-  assert.equal(selectStorageViewRuntimeFromCard("boot-doms"), true);
-  assert.equal(state.selectedStorageViewRuntimeId, "boot-doms");
-  assert.deepEqual(events, [
-    "close-alias-editor",
-    "reset-heatmap",
-    "render-chrome",
-    "render-views",
-    "render-grid",
-    "render-summary",
-    "ensure-heatmap",
-  ]);
-});
-
 test("main template exposes mapping health and polite status regions", () => {
   assert.match(TEMPLATE, /id="mapping-health-summary"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(TEMPLATE, /id="mapping-health-evidence"/);

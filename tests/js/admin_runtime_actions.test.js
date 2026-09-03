@@ -79,7 +79,6 @@ const RUNTIME_FUNCTIONS = [
   "waitForRuntimeConvergence",
   "executeRuntimeAction",
   "runRuntimeAction",
-  "cancelRuntimeActionPolling",
   "cancelAllRuntimeActionPolling",
 ];
 
@@ -346,24 +345,26 @@ test("timeout reports the last observed state and always unlocks the container c
   );
 });
 
-test("pending polling can be cancelled and still unlocks controls", async () => {
+test("cancel-all aborts every pending runtime action and unlocks every container", async () => {
   const uiButton = fakeButton("ui");
+  const historyButton = fakeButton("history");
   const state = {
     runtime: runtimePayload({ running: true, health: "starting" }).runtime,
     runtimeActionPromises: new Map(),
     runtimeActionControllers: new Map(),
   };
-  let getCalls = 0;
+  const abortedKeys = [];
   const functions = loadRuntimeFunctions({
     state,
-    elements: { runtimeCards: { querySelectorAll: () => [uiButton] } },
+    elements: { runtimeCards: { querySelectorAll: () => [uiButton, historyButton] } },
     fetchJson(url, options = {}) {
-      if (options.method === "POST") {
-        return Promise.resolve(runtimePayload({ running: true, health: "starting" }));
-      }
-      getCalls += 1;
+      assert.equal(options.method, "POST");
+      const containerKey = url.split("/").at(-2);
       return new Promise((_resolve, reject) => {
-        options.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+        options.signal.addEventListener("abort", () => {
+          abortedKeys.push(containerKey);
+          reject(new DOMException("Aborted", "AbortError"));
+        }, { once: true });
       });
     },
     renderRuntimeCards() {},
@@ -371,19 +372,24 @@ test("pending polling can be cancelled and still unlocks controls", async () => 
     encodeURIComponent,
   });
 
-  const pending = functions.runRuntimeAction("ui", "restart", { maxAttempts: 20, pollIntervalMs: 0, sleep: noDelay });
-  for (let index = 0; index < 6 && getCalls === 0; index += 1) {
-    await Promise.resolve();
-  }
-  assert.equal(getCalls, 1, "the follow-up GET is in flight before cancellation");
+  const pendingUi = functions.runRuntimeAction("ui", "restart");
+  const pendingHistory = functions.runRuntimeAction("history", "start");
+  assert.deepEqual([...state.runtimeActionControllers.keys()].sort(), ["history", "ui"]);
   assert.equal(uiButton.disabled, true);
+  assert.equal(historyButton.disabled, true);
 
-  functions.cancelRuntimeActionPolling("ui");
-  const succeeded = await pending;
+  functions.cancelAllRuntimeActionPolling();
+  const succeeded = await Promise.race([
+    Promise.all([pendingUi, pendingHistory]),
+    new Promise((_resolve, reject) => {
+      setTimeout(() => reject(new Error("cancel-all left a runtime action pending")), 100);
+    }),
+  ]);
 
-  assert.equal(succeeded, false);
-  assert.equal(getCalls, 1);
+  assert.deepEqual(succeeded, [false, false]);
+  assert.deepEqual(abortedKeys.sort(), ["history", "ui"]);
   assert.equal(uiButton.disabled, false);
+  assert.equal(historyButton.disabled, false);
   assert.equal(state.runtimeActionPromises.size, 0);
   assert.equal(state.runtimeActionControllers.size, 0);
 });
