@@ -95,9 +95,9 @@ def build_inventory_service(
         truenas_client,
         ssh_probe,
         bmc_service,
-        MappingStore(f"{temp_dir}\\slot_mappings.json"),
+        MappingStore(str(Path(temp_dir) / "slot_mappings.json")),
         ProfileRegistry(settings),
-        SlotDetailStore(f"{temp_dir}\\slot_detail_cache.json"),
+        SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
     )
 
 

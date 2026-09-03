@@ -154,6 +154,56 @@ class PublicDemoArtifactTests(unittest.TestCase):
 
 
 class PublicDemoBuildScriptTests(unittest.TestCase):
+    def test_current_source_browser_fixture_requires_explicit_output(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/build_current_source_browser_fixture.py"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--output", result.stderr)
+
+    def test_current_source_browser_fixture_is_deterministic_and_inlines_candidate_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_path = Path(temp_dir) / "first.html"
+            second_path = Path(temp_dir) / "second.html"
+            results = [
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "scripts/build_current_source_browser_fixture.py",
+                        "--output",
+                        str(output_path),
+                    ],
+                    cwd=ROOT,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                for output_path in (first_path, second_path)
+            ]
+
+            for result in results:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Built current-source browser fixture", result.stdout)
+
+            first_html = first_path.read_text(encoding="utf-8")
+            self.assertEqual(first_path.read_bytes(), second_path.read_bytes())
+            for asset_name in ("app.js", "style.css"):
+                asset_bytes = (ROOT / "app" / "static" / asset_name).read_bytes()
+                self.assertIn(
+                    f"{asset_name}_sha256={hashlib.sha256(asset_bytes).hexdigest()}",
+                    first_html,
+                )
+            self.assertIn("SYNTHETIC-SLOT-0001", first_html)
+            self.assertIn('"identify_active": true', first_html)
+            self.assertNotIn('src="/static/app.js"', first_html)
+            self.assertNotIn('href="/static/style.css"', first_html)
+            self.assertNotIn("history/history.db", first_html)
+
     def test_build_script_help_marks_generation_as_local_history_path(self) -> None:
         result = subprocess.run(
             [sys.executable, "scripts/build_public_demo.py", "--help"],

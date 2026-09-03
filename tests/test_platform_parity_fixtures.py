@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
+from app.models.domain import SlotState
 from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, InventoryService
 from app.services.mapping_store import MappingStore
 from app.services.parsers import parse_sg_ses_join_filter, parse_ssh_outputs, parse_storcli_physical_drives
@@ -29,6 +30,36 @@ def fixture_text(name: str) -> str:
 def fixture_json(name: str):
     return json.loads(fixture_text(name))
 
+
+def md1280_slot_device_truth() -> dict[str, dict[int, str]]:
+    slot_serial_truth = fixture_json("scale_md1280_slot_serial_truth.json")
+    lsblk_rows = fixture_json("scale_md1280_lsblk.json")["blockdevices"]
+    device_by_serial = {
+        str(row["serial"]): str(row["name"])
+        for row in lsblk_rows
+        if row.get("serial") and row.get("name")
+    }
+    return {
+        enclosure: {
+            int(slot): device_by_serial[serial]
+            for slot, serial in slots.items()
+        }
+        for enclosure, slots in slot_serial_truth.items()
+    }
+
+
+def assert_md1280_sysfs_matches_independent_truth(probe_output: str) -> dict[str, dict[int, str]]:
+    observed: dict[str, dict[int, str]] = {}
+    for line in probe_output.splitlines():
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) == 5:
+            observed.setdefault(parts[1], {})[int(parts[2])] = parts[4]
+    expected = md1280_slot_device_truth()
+    if observed != expected:
+        raise AssertionError("MD1280 sysfs slot mapping disagrees with independent slot-to-serial truth")
+    return expected
+
+
 def build_inventory_service(
     settings: Settings,
     system: SystemConfig,
@@ -42,10 +73,11 @@ def build_inventory_service(
         truenas_client,
         ssh_probe,
         None,
-        MappingStore(f"{temp_dir}\\slot_mappings.json"),
+        MappingStore(str(Path(temp_dir) / "slot_mappings.json")),
         ProfileRegistry(settings),
-        SlotDetailStore(f"{temp_dir}\\slot_detail_cache.json"),
+        SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
     )
+
 
 class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
     async def test_scale_empty_middleware_rows_can_render_linux_ses_fixture_pack(self) -> None:
@@ -331,11 +363,7 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
         """
 
         probe_output = fixture_text("scale_md1280_sysfs.txt")
-        truth: dict[str, dict[int, str]] = {}
-        for line in probe_output.splitlines():
-            parts = [part.strip() for part in line.split("|")]
-            if len(parts) == 5:
-                truth.setdefault(parts[1], {})[int(parts[2])] = parts[4]
+        truth = assert_md1280_sysfs_matches_independent_truth(probe_output)
 
         lsblk = fixture_json("scale_md1280_lsblk.json")["blockdevices"]
         disks = []
@@ -414,7 +442,7 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
                         f"{dev} slot {slot_number} resolved {view.device_name!r}, expected {device!r}",
                     )
                     self.assertTrue(view.present, f"{dev} slot {slot_number} should be present")
-                    self.assertEqual(str(view.state), "SlotState.healthy")
+                    self.assertEqual(view.state, SlotState.healthy)
 
                 empty_views = [view for view in resolved.values() if view.slot not in gt]
                 self.assertEqual(len(empty_views), 84 - len(gt))
@@ -425,12 +453,23 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
                         if hasattr(view, "raw_status")
                         else f"{dev} empty slot {view.slot} phantom-present",
                     )
-                    self.assertEqual(str(view.state), "SlotState.empty")
+                    self.assertEqual(view.state, SlotState.empty)
 
                 self.assertFalse(
                     [w for w in snap.warnings if "shared SAS address" in w],
                     "per-phy unique addresses must not trip the shared-address guard",
                 )
+
+    def test_scale_md1280_transposed_sysfs_mapping_fails_independent_truth(self) -> None:
+        lines = fixture_text("scale_md1280_sysfs.txt").splitlines()
+        first = lines[0].split("|")
+        second = lines[1].split("|")
+        first[4], second[4] = second[4], first[4]
+        lines[0] = "|".join(first)
+        lines[1] = "|".join(second)
+
+        with self.assertRaisesRegex(AssertionError, "independent slot-to-serial truth"):
+            assert_md1280_sysfs_matches_independent_truth("\n".join(lines))
 
     def test_scale_md1280_fixture_identifiers_have_deterministic_pseudonyms(self) -> None:
         rows = fixture_json("scale_md1280_lsblk.json")["blockdevices"]
