@@ -469,6 +469,7 @@ class MappingImportConfirmation(BaseModel):
 
 class SnapshotExportRequest(BaseModel):
     selected_slot: int | None = None
+    selected_storage_view_id: str | None = None
     history_window_hours: int | None = 24
     history_panel_open: bool = False
     io_chart_mode: str = "total"
@@ -479,6 +480,11 @@ class SnapshotExportRequest(BaseModel):
     enclosure_ids: list[str] = Field(default_factory=list)
     include_storage_views: bool = False
     storage_view_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("selected_storage_view_id")
+    @classmethod
+    def sanitize_selected_storage_view_id(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=256)
 
     @field_validator("enclosure_ids", "storage_view_ids")
     @classmethod

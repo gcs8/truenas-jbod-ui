@@ -20,6 +20,7 @@ from app.models.domain import (
     EnclosureOption,
     InventorySnapshot,
     InventorySummary,
+    SnapshotExportRequest,
     SlotState,
     SlotView,
     SourceStatus,
@@ -1497,6 +1498,97 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(rendered.export_meta["metric_sample_count"], 4)
         self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
         self.assertTrue(rendered.history_cache["archive-core|storage-view:boot-doms|0"]["available"])
+
+    def test_request_sanitizes_selected_storage_view_id(self) -> None:
+        payload = SnapshotExportRequest(selected_storage_view_id="  boot-doms  ")
+
+        self.assertEqual(payload.selected_storage_view_id, "boot-doms")
+
+    async def test_storage_view_selection_is_restored_in_snapshot_bootstrap(self) -> None:
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=build_snapshot(),
+            smart_summary_cache=build_smart_summary_cache(),
+            storage_view_runtime=build_storage_view_runtime(),
+            storage_view_smart_summary_cache=build_storage_view_smart_summary_cache(),
+            selected_slot=1,
+            selected_storage_view_id="boot-doms",
+            history_window_hours=24,
+            history_panel_open=True,
+            io_chart_mode="total",
+        )
+
+        self.assertIn('initialSelectedStorageViewId: "boot-doms"', rendered.html)
+        self.assertIn("initialSelectedSlot: 1", rendered.html)
+        self.assertEqual(rendered.export_meta["selected_storage_view_id"], "boot-doms")
+        self.assertEqual(rendered.export_meta["selected_slot"], 1)
+
+    async def test_missing_selected_storage_view_clears_live_slot_selection(self) -> None:
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=build_snapshot(),
+            smart_summary_cache=build_smart_summary_cache(),
+            storage_view_runtime=None,
+            selected_slot=0,
+            selected_storage_view_id="boot-doms",
+            history_window_hours=24,
+            history_panel_open=True,
+            io_chart_mode="total",
+        )
+
+        self.assertIn("initialSelectedStorageViewId: null", rendered.html)
+        self.assertIn("initialSelectedSlot: null", rendered.html)
+        self.assertIn("initialHistoryPanelOpen: false", rendered.html)
+        self.assertIsNone(rendered.export_meta["selected_storage_view_id"])
+        self.assertIsNone(rendered.export_meta["selected_slot"])
+
+    async def test_live_slot_selection_remains_unchanged_without_storage_view(self) -> None:
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=build_snapshot(),
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            selected_storage_view_id=None,
+            history_window_hours=24,
+            history_panel_open=True,
+            io_chart_mode="total",
+        )
+
+        self.assertIn("initialSelectedStorageViewId: null", rendered.html)
+        self.assertIn("initialSelectedSlot: 0", rendered.html)
+        self.assertEqual(rendered.export_meta["selected_slot"], 0)
+
+    async def test_render_cache_separates_live_and_storage_view_selection(self) -> None:
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+        common = {
+            "request": build_request(),
+            "snapshot": build_snapshot(),
+            "smart_summary_cache": build_smart_summary_cache(),
+            "storage_view_runtime": build_storage_view_runtime(),
+            "selected_slot": 0,
+            "history_window_hours": 24,
+            "history_panel_open": True,
+            "io_chart_mode": "total",
+        }
+
+        live = await exporter.build_enclosure_snapshot_html(
+            **common,
+            selected_storage_view_id=None,
+        )
+        storage_view = await exporter.build_enclosure_snapshot_html(
+            **common,
+            selected_storage_view_id="boot-doms",
+        )
+
+        self.assertNotEqual(live.cache_key, storage_view.cache_key)
+        self.assertIn("initialSelectedStorageViewId: null", live.html)
+        self.assertIn('initialSelectedStorageViewId: "boot-doms"', storage_view.html)
 
     async def test_service_embeds_live_enclosure_snapshots_smart_and_history(self) -> None:
         snapshot = build_snapshot_with_rear_option()
