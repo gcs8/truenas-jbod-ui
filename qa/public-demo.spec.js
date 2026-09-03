@@ -53,9 +53,10 @@ function resolvePublicDemoArtifact() {
 }
 
 function resolveSlotFocusArtifact() {
-  return process.env.SLOT_FOCUS_ARTIFACT
-    ? resolveArtifactPath(process.env.SLOT_FOCUS_ARTIFACT)
-    : null;
+  if (!process.env.SLOT_FOCUS_ARTIFACT) {
+    throw new Error("Set SLOT_FOCUS_ARTIFACT to a current-source synthetic snapshot.");
+  }
+  return resolveArtifactPath(process.env.SLOT_FOCUS_ARTIFACT);
 }
 
 test("public demo static artifact is explorable without a live backend", async ({ page }) => {
@@ -131,7 +132,6 @@ test("public demo static artifact is explorable without a live backend", async (
 
 test("slot keyboard selection preserves the focused tile DOM identity", async ({ page }) => {
   const demoPath = resolveSlotFocusArtifact();
-  test.skip(!demoPath, "Set SLOT_FOCUS_ARTIFACT to a current-source synthetic snapshot.");
   await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });
 
   const tile = page.locator("#slot-grid .slot-tile:not(.filtered-out)").first();
@@ -154,7 +154,6 @@ test("slot keyboard selection preserves the focused tile DOM identity", async ({
 
 test("slot grid arrow navigation moves visible focus", async ({ page }) => {
   const demoPath = resolveSlotFocusArtifact();
-  test.skip(!demoPath, "Set SLOT_FOCUS_ARTIFACT to a current-source synthetic snapshot.");
   await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });
 
   const tiles = page.locator("#slot-grid .slot-tile:not(.filtered-out)");
@@ -182,7 +181,6 @@ test("slot grid arrow navigation moves visible focus", async ({ page }) => {
 
 test("delegated slot hover preserves identify state and tooltip behavior", async ({ page }) => {
   const demoPath = resolveSlotFocusArtifact();
-  test.skip(!demoPath, "Set SLOT_FOCUS_ARTIFACT to a current-source synthetic snapshot.");
   await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });
 
   const identifyTile = page.locator("#slot-grid .slot-tile.state-identify:not(.filtered-out)").first();
@@ -198,7 +196,6 @@ test("delegated slot hover preserves identify state and tooltip behavior", async
 
 test("slot grid rebuild restores focus to the same visible slot", async ({ page }) => {
   const demoPath = resolveSlotFocusArtifact();
-  test.skip(!demoPath, "Set SLOT_FOCUS_ARTIFACT to a current-source synthetic snapshot.");
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
   await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });

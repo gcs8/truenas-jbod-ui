@@ -10,6 +10,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_DIR = ROOT / ".github" / "workflows"
 CI_WORKFLOW = WORKFLOW_DIR / "ci.yml"
+PUBLISH_GHCR_WORKFLOW = WORKFLOW_DIR / "publish-ghcr.yml"
+PUBLISH_PUBLIC_DEMO_WORKFLOW = WORKFLOW_DIR / "publish-public-demo.yml"
+PUBLIC_DEMO_SPEC = ROOT / "qa" / "public-demo.spec.js"
 ADMIN_CLEANROOM_CONFIG = ROOT / "qa" / "fixtures" / "admin-cleanroom-config.yaml"
 ADMIN_CLEANROOM_SPEC = ROOT / "qa" / "admin-operations.spec.js"
 LIVE_UI_SPEC = ROOT / "qa" / "ui-switching.spec.js"
@@ -143,12 +146,97 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
-    def test_public_demo_artifact_and_browser_smoke_remain_in_ci(self) -> None:
-        workflow_text = self.read(CI_WORKFLOW)
+    def test_all_workflow_checkouts_disable_persisted_credentials(self) -> None:
+        violations: list[str] = []
+        for workflow_path in sorted(WORKFLOW_DIR.glob("*.y*ml")):
+            workflow = yaml.safe_load(self.read(workflow_path))
+            for job_name, job in workflow.get("jobs", {}).items():
+                for step in job.get("steps", []):
+                    if str(step.get("uses", "")).startswith("actions/checkout@"):
+                        if step.get("with", {}).get("persist-credentials") is not False:
+                            violations.append(f"{workflow_path.name}:{job_name}:{step.get('name')}")
 
-        self.assertIn("python scripts/check_public_demo_artifact.py public-demo", workflow_text)
-        self.assertIn("npx playwright test qa/public-demo.spec.js", workflow_text)
-        self.assertIn("npm ci --ignore-scripts", workflow_text)
+        self.assertEqual(violations, [])
+
+    def test_all_workflow_npm_ci_commands_ignore_lifecycle_scripts(self) -> None:
+        violations: list[str] = []
+        for workflow_path in sorted(WORKFLOW_DIR.glob("*.y*ml")):
+            workflow = yaml.safe_load(self.read(workflow_path))
+            for job_name, job in workflow.get("jobs", {}).items():
+                for step in job.get("steps", []):
+                    for line in str(step.get("run", "")).splitlines():
+                        if re.search(r"(?:^|\s)npm\s+ci(?:\s|$)", line) and "--ignore-scripts" not in line:
+                            violations.append(f"{workflow_path.name}:{job_name}:{step.get('name')}")
+
+        self.assertEqual(violations, [])
+
+    def test_release_tag_expression_is_passed_via_step_environment(self) -> None:
+        workflow = yaml.safe_load(self.read(PUBLISH_GHCR_WORKFLOW))
+        prep_step = next(
+            step
+            for step in workflow["jobs"]["publish"]["steps"]
+            if step.get("name") == "Resolve publish tags"
+        )
+
+        self.assertEqual(prep_step["env"]["RELEASE_TAG"], "${{ github.event.release.tag_name }}")
+        self.assertNotIn("${{ github.event.release.tag_name }}", prep_step["run"])
+        self.assertIn('release_tag="$RELEASE_TAG"', prep_step["run"])
+
+    def test_current_source_fixture_jobs_install_runtime_requirements_before_generation(self) -> None:
+        jobs = (
+            (CI_WORKFLOW, "public-demo-artifact"),
+            (PUBLISH_PUBLIC_DEMO_WORKFLOW, "verify"),
+        )
+        for workflow_path, job_name in jobs:
+            with self.subTest(workflow=workflow_path.name, job=job_name):
+                workflow = yaml.safe_load(self.read(workflow_path))
+                steps = workflow["jobs"][job_name]["steps"]
+                setup_index = next(
+                    index
+                    for index, step in enumerate(steps)
+                    if str(step.get("uses", "")).startswith("actions/setup-python@")
+                )
+                install_index = next(
+                    index
+                    for index, step in enumerate(steps)
+                    if "python -m pip install -r requirements.txt" in str(step.get("run", ""))
+                )
+                generator_index = next(
+                    index
+                    for index, step in enumerate(steps)
+                    if "python scripts/build_current_source_browser_fixture.py" in str(step.get("run", ""))
+                )
+
+                self.assertLess(setup_index, install_index)
+                self.assertLess(install_index, generator_index)
+                self.assertNotIn("requirements-dev.txt", str(steps[install_index].get("run", "")))
+
+    def test_public_demo_publish_push_trigger_requires_checked_in_artifact_change(self) -> None:
+        workflow = yaml.safe_load(self.read(PUBLISH_PUBLIC_DEMO_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+
+        self.assertIn(".github/workflows/publish-public-demo.yml", triggers["pull_request"]["paths"])
+        self.assertIn("scripts/build_current_source_browser_fixture.py", triggers["pull_request"]["paths"])
+        self.assertEqual(triggers["push"]["branches"], ["main"])
+        self.assertEqual(triggers["push"]["paths"], ["public-demo/**"])
+        self.assertIn("workflow_dispatch", triggers)
+
+    def test_public_demo_artifact_and_browser_smoke_remain_in_ci(self) -> None:
+        spec = self.read(PUBLIC_DEMO_SPEC)
+        self.assertNotIn("test.skip", spec)
+        self.assertIn("SLOT_FOCUS_ARTIFACT", spec)
+
+        for workflow_path in (CI_WORKFLOW, PUBLISH_PUBLIC_DEMO_WORKFLOW):
+            with self.subTest(workflow=workflow_path.name):
+                workflow_text = self.read(workflow_path)
+                self.assertIn("python scripts/check_public_demo_artifact.py public-demo", workflow_text)
+                self.assertIn("python scripts/build_current_source_browser_fixture.py", workflow_text)
+                self.assertIn("PUBLIC_DEMO_ARTIFACT: public-demo/index.html", workflow_text)
+                self.assertIn("SLOT_FOCUS_ARTIFACT:", workflow_text)
+                self.assertIn("npx playwright test qa/public-demo.spec.js --retries=0", workflow_text)
+                self.assertIn("npm ci --ignore-scripts", workflow_text)
+                self.assertIn('rm -rf "$fixture_root"', workflow_text)
+                self.assertIn("git status --short", workflow_text)
 
     def test_dependabot_keeps_immutable_actions_maintained(self) -> None:
         config = yaml.safe_load(self.read(ROOT / ".github" / "dependabot.yml"))

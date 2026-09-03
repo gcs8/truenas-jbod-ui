@@ -4,17 +4,19 @@ on:
   pull_request:
     paths:
       - ".github/workflows/publish-public-demo.yml"
+      - "app/services/snapshot_export.py"
+      - "app/static/app.js"
+      - "app/static/style.css"
+      - "app/templates/**"
       - "public-demo/**"
       - "qa/public-demo.spec.js"
+      - "scripts/build_current_source_browser_fixture.py"
       - "scripts/check_public_demo_artifact.py"
   push:
     branches:
       - main
     paths:
-      - ".github/workflows/publish-public-demo.yml"
       - "public-demo/**"
-      - "qa/public-demo.spec.js"
-      - "scripts/check_public_demo_artifact.py"
   workflow_dispatch:
 
 permissions:
@@ -31,11 +33,18 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip check
 
       - name: Check publishable artifact
         run: python scripts/check_public_demo_artifact.py public-demo
@@ -47,16 +56,34 @@ jobs:
           cache: npm
 
       - name: Install browser QA dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Use hosted Chrome for browser smoke tests
         run: google-chrome --version
 
-      - name: Smoke test checked-in artifact
+      - name: Smoke test checked-in artifact and current-source fixture
         env:
           PUBLIC_DEMO_ARTIFACT: public-demo/index.html
+          SLOT_FOCUS_ARTIFACT: ${{ runner.temp }}/truenas-jbod-ui-current-source-browser/index.html
           PLAYWRIGHT_BROWSER_CHANNEL: chrome
-        run: npx playwright test qa/public-demo.spec.js
+        run: |
+          set -euo pipefail
+          fixture_root="$(dirname "$SLOT_FOCUS_ARTIFACT")"
+          cleanup() {
+            result=$?
+            rm -rf "$fixture_root"
+            status="$(git status --short)"
+            if [ -n "$status" ]; then
+              printf '%s\n' "$status"
+              exit 1
+            fi
+            exit "$result"
+          }
+          trap cleanup EXIT
+          rm -rf "$fixture_root"
+          mkdir -p "$fixture_root"
+          python scripts/build_current_source_browser_fixture.py --output "$SLOT_FOCUS_ARTIFACT"
+          npx playwright test qa/public-demo.spec.js --retries=0
 
       - name: Configure Pages
         if: github.event_name != 'pull_request'
