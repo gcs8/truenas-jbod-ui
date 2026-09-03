@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,9 +17,12 @@ from app.config import (
     runtime_behavior_settings_payload,
     save_runtime_behavior_overrides,
 )
+from app.logging_config import JsonFormatter
+from app.metrics import install_metrics
 from app.perf import (
     PerfStageSample,
     PerfTrace,
+    add_perf_metadata,
     build_server_timing_header,
     install_perf_timing_middleware,
     perf_stage,
@@ -248,7 +252,7 @@ class PerfTraceTests(unittest.TestCase):
         self.assertIn('stage-1;desc="inventory.build_snapshot x2";dur=60.5', header)
         self.assertIn('stage-2;desc="inventory.api.fetch_all";dur=30.0', header)
 
-    def test_perf_middleware_sets_request_id_and_logs_stage_summary(self) -> None:
+    def test_perf_middleware_reuses_canonical_request_id_and_logs_only_bounded_fields(self) -> None:
         app = FastAPI()
         settings = Settings(
             perf=PerfConfig(
@@ -258,11 +262,13 @@ class PerfTraceTests(unittest.TestCase):
                 slow_stage_ms=60_000,
             )
         )
+        install_metrics(app, service_name="enclosure-ui", version="0.0.0-test")
         install_perf_timing_middleware(app, settings)
 
-        @app.get("/ping")
-        async def ping() -> JSONResponse:
-            with perf_stage("test.stage"):
+        @app.get("/items/{item_id}")
+        async def item(item_id: str) -> JSONResponse:
+            add_perf_metadata(system_id=item_id, path=f"/private/{item_id}.db")
+            with perf_stage("test.stage", system_id=item_id):
                 pass
             return JSONResponse({"ok": True})
 
@@ -282,9 +288,9 @@ class PerfTraceTests(unittest.TestCase):
                     "http_version": "1.1",
                     "method": "GET",
                     "scheme": "http",
-                    "path": "/ping",
-                    "raw_path": b"/ping",
-                    "query_string": b"",
+                    "path": "/items/private-system-alpha",
+                    "raw_path": b"/items/private-system-alpha",
+                    "query_string": b"token=secret-token",
                     "root_path": "",
                     "headers": [],
                     "client": ("127.0.0.1", 1234),
@@ -301,7 +307,26 @@ class PerfTraceTests(unittest.TestCase):
         start = next(message for message in messages if message["type"] == "http.response.start")
         headers = {key.decode("latin-1"): value.decode("latin-1") for key, value in start["headers"]}
         self.assertEqual(start["status"], 200)
-        self.assertTrue(headers.get("x-request-id"))
+        self.assertRegex(headers["x-request-id"], r"^[0-9a-f]{32}$")
         self.assertIn("server-timing", headers)
-        self.assertIn('test.stage', headers["server-timing"])
-        self.assertTrue(any("test.stage" in entry for entry in captured.output))
+        self.assertIn("test.stage", headers["server-timing"])
+
+        record = captured.records[-1]
+        payload = json.loads(JsonFormatter(service_name="enclosure-ui").format(record))
+        self.assertEqual(payload["message"], "http_performance")
+        self.assertEqual(payload["request_id"], headers["x-request-id"])
+        self.assertEqual(payload["route"], "/items/{item_id}")
+        self.assertEqual(payload["method"], "GET")
+        self.assertEqual(payload["status_code"], 200)
+        self.assertEqual(payload["component"], "enclosure-ui")
+        self.assertEqual(payload["release"], "0.22.2")
+        serialized = json.dumps(payload)
+        for forbidden in (
+            "private-system-alpha",
+            "secret-token",
+            "/private/",
+            "system_id",
+            "path=",
+            "stages=",
+        ):
+            self.assertNotIn(forbidden, serialized)

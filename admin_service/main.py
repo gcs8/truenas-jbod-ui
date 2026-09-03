@@ -9,7 +9,7 @@ import signal
 import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -37,7 +37,7 @@ from app.config import (
 )
 from app.logging_config import configure_service_logging
 from app.http_auth import basic_auth_matches, request_origin_allowed
-from app.metrics import install_metrics, metrics_path
+from app.metrics import install_metrics, metrics_path, observe_backup_operation
 from app.script_json import register_script_json_filters
 from app.models.domain import (
     DebugBundleExportRequest,
@@ -135,6 +135,33 @@ configure_service_logging(
     service_name="enclosure-admin",
 )
 logger = logging.getLogger(__name__)
+
+
+def observe_backup_route(operation: str):
+    def decorator(handler: Callable[..., Any]):
+        @wraps(handler)
+        async def observed_handler(*args: Any, **kwargs: Any):
+            started = asyncio.get_running_loop().time()
+            outcome = "error"
+            try:
+                response = await handler(*args, **kwargs)
+                outcome = "success"
+                return response
+            except HTTPException as exc:
+                if 400 <= exc.status_code < 500:
+                    outcome = "rejected"
+                raise
+            finally:
+                observe_backup_operation(
+                    service_name="enclosure-admin",
+                    operation=operation,
+                    outcome=outcome,
+                    duration_seconds=max(0.0, asyncio.get_running_loop().time() - started),
+                )
+
+        return observed_handler
+
+    return decorator
 
 
 def _basic_auth_matches(authorization: str | None, settings: AdminSettings) -> bool:
@@ -608,6 +635,7 @@ def create_app() -> FastAPI:
             raise
 
     @app.post("/api/admin/backup/inspect")
+    @observe_backup_route("inspect")
     async def inspect_backup(request: Request) -> JSONResponse:
         archive_path = await stream_limited_request_body_to_file(
             request,
@@ -638,6 +666,7 @@ def create_app() -> FastAPI:
             archive_path.parent.rmdir()
 
     @app.post("/api/admin/backup/import")
+    @observe_backup_route("import")
     async def import_backup(
         request: Request,
         stop_services: bool = Query(default=True),

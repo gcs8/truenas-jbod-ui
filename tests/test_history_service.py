@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from starlette.requests import Request
 
+from app.request_context import request_context
 from history_service import main as history_main
 from history_service import migration_lock
 from history_service.collector import HistoryCollectionStopping, HistoryCollector, ScopeSnapshot
@@ -860,6 +861,24 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             "POST http://enclosure-ui:8000/api/slots/smart-batch?system_id=scale-a&fresh=true timed out after 7s",
             str(captured.exception),
         )
+
+    def test_history_collector_propagates_current_server_request_id(self) -> None:
+        collector = HistoryCollector(
+            HistorySettings(source_base_url="http://enclosure-ui:8000", request_timeout_seconds=7),
+            MagicMock(),
+        )
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok":true}'
+
+        with (
+            request_context("d" * 32),
+            patch("history_service.collector.urllib.request.urlopen", return_value=response) as urlopen,
+        ):
+            payload = collector._fetch_json_sync("/healthz", {}, "GET", None, {})
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(request.get_header("X-request-id"), "d" * 32)
 
 
 class HistoryStoreTests(unittest.TestCase):

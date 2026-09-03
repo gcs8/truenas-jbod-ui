@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import platform
 import time
@@ -8,8 +9,14 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Request
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, Counter, Gauge, Histogram, Info, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
+from app.request_context import (
+    REQUEST_ID_HEADER,
+    generate_request_id,
+    request_context,
+    validate_request_id,
+)
 from history_service.scheduled_backup import read_scheduled_backup_status
 
 METRICS_NAMESPACE = "truenas_jbod_ui"
@@ -30,6 +37,7 @@ HTTP_DURATION_BUCKETS = (
     60.0,
 )
 INVENTORY_DURATION_BUCKETS = HTTP_DURATION_BUCKETS + (120.0,)
+logger = logging.getLogger("app.observability")
 
 HTTP_REQUESTS_TOTAL = Counter(
     "http_requests_total",
@@ -295,6 +303,19 @@ SNAPSHOT_EXPORT_CACHE_BYTES = Gauge(
     labelnames=("service", "cache"),
     namespace=METRICS_NAMESPACE,
 )
+BACKUP_OPERATIONS_TOTAL = Counter(
+    "backup_operations_total",
+    "Backup inspection and import operations.",
+    labelnames=("service", "operation", "outcome"),
+    namespace=METRICS_NAMESPACE,
+)
+BACKUP_OPERATION_DURATION_SECONDS = Histogram(
+    "backup_operation_duration_seconds",
+    "Backup inspection and import duration in seconds.",
+    labelnames=("service", "operation", "outcome"),
+    namespace=METRICS_NAMESPACE,
+    buckets=HTTP_DURATION_BUCKETS,
+)
 
 
 def metrics_enabled() -> bool:
@@ -314,47 +335,103 @@ def install_metrics(app: FastAPI, *, service_name: str, version: str) -> None:
         return
     setattr(app, "_metrics_installed", True)
     _set_build_info(service_name, version)
-    if not metrics_enabled():
-        return
-
+    enabled = metrics_enabled()
     metrics_mount_path = metrics_path()
 
-    @app.get(metrics_mount_path, include_in_schema=False)
-    async def prometheus_metrics_endpoint() -> Response:
-        return Response(
-            content=generate_latest(),
-            headers={"Content-Type": CONTENT_TYPE_LATEST},
-        )
+    if enabled:
+        @app.get(metrics_mount_path, include_in_schema=False)
+        async def prometheus_metrics_endpoint() -> Response:
+            return Response(
+                content=generate_latest(),
+                headers={"Content-Type": CONTENT_TYPE_LATEST},
+            )
 
     @app.middleware("http")
     async def prometheus_metrics_middleware(request: Request, call_next) -> Response:
-        if request.url.path == metrics_mount_path:
-            return await call_next(request)
-
+        request_id = generate_request_id()
+        parent_request_id = validate_request_id(request.headers.get(REQUEST_ID_HEADER))
+        instrument_request = not (enabled and request.url.path == metrics_mount_path)
         labels = {"service": service_name}
-        HTTP_REQUESTS_IN_PROGRESS.labels(**labels).inc()
+        if enabled and instrument_request:
+            HTTP_REQUESTS_IN_PROGRESS.labels(**labels).inc()
         started = time.perf_counter()
-        response: Response | None = None
-        status_code = "500"
-        try:
-            response = await call_next(request)
-            status_code = str(response.status_code)
-            return response
-        finally:
-            route_label = _route_label(request)
-            elapsed = max(0.0, time.perf_counter() - started)
-            HTTP_REQUESTS_TOTAL.labels(
-                service=service_name,
-                method=request.method,
-                route=route_label,
-                status_code=status_code,
-            ).inc()
-            HTTP_REQUEST_DURATION_SECONDS.labels(
-                service=service_name,
-                method=request.method,
-                route=route_label,
-            ).observe(elapsed)
-            HTTP_REQUESTS_IN_PROGRESS.labels(**labels).dec()
+        status_code = 500
+        exception_class: str | None = None
+        with request_context(request_id, parent_request_id):
+            try:
+                response = await call_next(request)
+                status_code = response.status_code
+                response.headers[REQUEST_ID_HEADER] = request_id
+                return response
+            except Exception as exc:
+                exception_class = type(exc).__name__
+                status_code = 500
+                response = JSONResponse(
+                    {
+                        "ok": False,
+                        "detail": "Unhandled application error; see application logs.",
+                        "request_id": request_id,
+                    },
+                    status_code=status_code,
+                )
+                response.headers[REQUEST_ID_HEADER] = request_id
+                return response
+            finally:
+                if instrument_request:
+                    route_label = _route_label(request)
+                    elapsed = max(0.0, time.perf_counter() - started)
+                    if enabled:
+                        HTTP_REQUESTS_TOTAL.labels(
+                            service=service_name,
+                            method=request.method,
+                            route=route_label,
+                            status_code=str(status_code),
+                        ).inc()
+                        HTTP_REQUEST_DURATION_SECONDS.labels(
+                            service=service_name,
+                            method=request.method,
+                            route=route_label,
+                        ).observe(elapsed)
+                        HTTP_REQUESTS_IN_PROGRESS.labels(**labels).dec()
+                    log_fields: dict[str, object] = {
+                        "event": "http_request_complete",
+                        "component": service_name,
+                        "release": version,
+                        "request_id": request_id,
+                        "method": request.method,
+                        "route": route_label,
+                        "status_code": status_code,
+                        "duration_ms": round(elapsed * 1000, 3),
+                    }
+                    if parent_request_id is not None:
+                        log_fields["parent_request_id"] = parent_request_id
+                    if exception_class is not None:
+                        log_fields["exception_class"] = exception_class
+                    logger.log(
+                        logging.ERROR if exception_class is not None else logging.INFO,
+                        "http_request_complete",
+                        extra=log_fields,
+                    )
+
+
+def observe_backup_operation(
+    *,
+    service_name: str,
+    operation: str,
+    outcome: str,
+    duration_seconds: float,
+) -> None:
+    if not metrics_enabled():
+        return
+    normalized_operation = operation if operation in {"inspect", "import"} else "unknown"
+    normalized_outcome = outcome if outcome in {"success", "rejected", "error"} else "error"
+    labels = {
+        "service": service_name,
+        "operation": normalized_operation,
+        "outcome": normalized_outcome,
+    }
+    BACKUP_OPERATIONS_TOTAL.labels(**labels).inc()
+    BACKUP_OPERATION_DURATION_SECONDS.labels(**labels).observe(max(0.0, duration_seconds))
 
 
 def set_history_collector_running(service_name: str, running: bool) -> None:

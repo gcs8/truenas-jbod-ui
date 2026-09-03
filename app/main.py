@@ -27,6 +27,7 @@ from app.http_auth import (
     request_origin_allowed,
 )
 from app.logging_config import configure_logging
+from app.request_context import request_id_headers
 from app.models.domain import (
     InventorySnapshot,
     LedAction,
@@ -1378,8 +1379,12 @@ def resolve_admin_launch_url(request: Request, settings: Settings) -> str | None
         return None
 
     health_url = f"{service_url.rstrip('/')}/healthz"
+    health_request = urllib.request.Request(
+        health_url,
+        headers=request_id_headers({"Accept": "application/json"}),
+    )
     try:
-        with urllib.request.urlopen(health_url, timeout=settings.admin.timeout_seconds) as response:
+        with urllib.request.urlopen(health_request, timeout=settings.admin.timeout_seconds) as response:
             if getattr(response, "status", 200) >= 400:
                 return None
     except (TimeoutError, urllib.error.URLError, ValueError):

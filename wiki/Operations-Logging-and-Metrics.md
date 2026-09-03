@@ -91,6 +91,27 @@ LOG_FORMAT=json
 
 The default text format is easier for quick local reads.
 
+### Request correlation
+
+The UI, history sidecar, and admin sidecar generate a fresh 32-character
+lowercase hexadecimal request ID for every inbound HTTP request. Each response
+returns it in `X-Request-ID`. A caller-supplied value never becomes the current
+service request ID. A valid value can appear as `parent_request_id` so an
+internal call can be followed across services.
+
+Internal UI, history, and admin HTTP clients forward the current server-issued
+ID in `X-Request-ID`. Completion records include only the component, release,
+request ID, optional parent request ID, method, normalized route template,
+status, duration, and exception class. They do not include raw paths, query
+strings, bodies, cookies, authorization headers, user or system identifiers,
+credentials, exception messages, or stack traces. Treat request IDs as
+diagnostic correlation values, not authentication or authorization tokens.
+The raw Uvicorn access log is disabled because it would duplicate these records
+with an unnormalized request target. Uvicorn lifecycle and error logs remain
+enabled. Performance warnings reuse the same request ID and normalized route.
+They omit per-request metadata and stage details; bounded stage timing remains
+available in the response's `Server-Timing` header.
+
 ## Optional Syslog Shipping
 
 If you want the normal `docker compose up -d` path to ship container logs to a
@@ -139,6 +160,20 @@ The first pass includes:
 - build/version info for the running service
 - history-sidecar collector state, tracked-slot counts, and collection-pass
   duration
+- admin backup inspection and import counts and duration
+
+The admin backup metrics are:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `truenas_jbod_ui_backup_operations_total` | `service`, `operation`, `outcome` | Completed backup inspection and import operations |
+| `truenas_jbod_ui_backup_operation_duration_seconds` | `service`, `operation`, `outcome` | End-to-end operation duration, including bounded request streaming and private cleanup |
+
+Allowed `operation` values: `inspect`, `import`, or `unknown`. Allowed
+`outcome` values: `success`, `rejected`, or `error`. Unknown values fail into
+the bounded `unknown` or `error` buckets. Request IDs never become metric labels.
+Paths, archive names, system identifiers, credentials, request content, and
+exception messages are also excluded from these metrics.
 
 The starter alert rules use these bounded history-sidecar gauges. Every gauge
 has only the `service` application label:

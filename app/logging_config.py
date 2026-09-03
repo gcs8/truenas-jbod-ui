@@ -9,6 +9,21 @@ from typing import Any
 
 from app.config import Settings
 
+OBSERVABILITY_FIELDS = (
+    "event",
+    "component",
+    "release",
+    "request_id",
+    "parent_request_id",
+    "method",
+    "route",
+    "status_code",
+    "duration_ms",
+    "operation",
+    "outcome",
+    "exception_class",
+)
+
 
 class JsonFormatter(logging.Formatter):
     def __init__(self, *, service_name: str | None = None) -> None:
@@ -24,10 +39,12 @@ class JsonFormatter(logging.Formatter):
         }
         if self.service_name:
             payload["service"] = self.service_name
-        if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
-        if record.stack_info:
-            payload["stack_info"] = self.formatStack(record.stack_info)
+        for field_name in OBSERVABILITY_FIELDS:
+            value = getattr(record, field_name, None)
+            if isinstance(value, str | int | float | bool):
+                payload[field_name] = value
+        if record.exc_info and record.exc_info[0] is not None:
+            payload["exception_class"] = record.exc_info[0].__name__
         return json.dumps(payload, ensure_ascii=False)
 
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
@@ -39,17 +56,46 @@ def _normalize_log_format(value: str | None) -> str:
     return "json" if (value or "").strip().lower() == "json" else "text"
 
 
-def _text_formatter() -> logging.Formatter:
-    return logging.Formatter(
-        fmt="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+class SafeTextFormatter(logging.Formatter):
+    def __init__(self, *, service_name: str | None = None) -> None:
+        super().__init__(
+            fmt="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        self.service_name = service_name
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        fields: dict[str, str | int | float | bool] = {}
+        if self.service_name:
+            fields["service"] = self.service_name
+        for field_name in OBSERVABILITY_FIELDS:
+            value = getattr(record, field_name, None)
+            if isinstance(value, str | int | float | bool):
+                fields[field_name] = value
+        if record.exc_info and record.exc_info[0] is not None:
+            fields["exception_class"] = record.exc_info[0].__name__
+        if not fields:
+            return rendered
+        suffix = " ".join(f"{key}={value}" for key, value in fields.items())
+        return f"{rendered} {suffix}"
+
+    def formatException(self, ei) -> str:
+        exception_type = ei[0]
+        return exception_type.__name__ if exception_type is not None else "Exception"
+
+    def formatStack(self, stack_info: str) -> str:
+        return ""
+
+
+def _text_formatter(*, service_name: str | None = None) -> logging.Formatter:
+    return SafeTextFormatter(service_name=service_name)
 
 
 def _stream_formatter(*, log_format: str, service_name: str | None) -> logging.Formatter:
     if log_format == "json":
         return JsonFormatter(service_name=service_name)
-    return _text_formatter()
+    return _text_formatter(service_name=service_name)
 
 
 def configure_service_logging(
@@ -89,14 +135,20 @@ def configure_service_logging(
             )
         else:
             # Keep the on-disk log human-readable even when stdout/syslog is JSON.
-            file_handler.setFormatter(_text_formatter())
+            file_handler.setFormatter(_text_formatter(service_name=service_name))
             root.addHandler(file_handler)
 
-    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for logger_name in ("uvicorn", "uvicorn.error"):
         logger = logging.getLogger(logger_name)
         logger.handlers.clear()
         logger.propagate = True
+        logger.disabled = False
         logger.setLevel(log_level.upper())
+
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.handlers.clear()
+    access_logger.propagate = False
+    access_logger.disabled = True
 
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("paramiko").setLevel(logging.WARNING)

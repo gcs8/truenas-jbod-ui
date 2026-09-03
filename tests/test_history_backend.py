@@ -5,9 +5,10 @@ import io
 import unittest
 import urllib.error
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config import ENV_OVERRIDES, HistoryConfig
+from app.request_context import request_context
 from app.services.history_backend import (
     HISTORY_BACKEND_FAILURE_DETAIL,
     HistoryBackendClient,
@@ -17,6 +18,23 @@ from app.services.history_backend import (
 
 
 class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
+    def test_request_bytes_sync_propagates_current_server_request_id(self) -> None:
+        client = HistoryBackendClient(
+            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
+        )
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"{}"
+        response.__enter__.return_value.headers.items.return_value = []
+
+        with (
+            request_context("c" * 32),
+            patch("app.services.history_backend.urllib.request.urlopen", return_value=response) as urlopen,
+        ):
+            client._request_bytes_sync("/healthz")
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("X-request-id"), "c" * 32)
+
     def test_request_bytes_sync_preserves_list_query_params(self) -> None:
         client = HistoryBackendClient(
             HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)

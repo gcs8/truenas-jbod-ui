@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from admin_service.config import AdminSettings
+from app.request_context import request_id_headers
 
 
 class DockerRuntimeError(RuntimeError):
@@ -275,10 +276,12 @@ class DockerRuntimeService:
     def _probe_running_version(self, livez_url: str) -> str:
         request = urllib.request.Request(
             livez_url,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "truenas-jbod-admin/runtime-version-probe",
-            },
+            headers=request_id_headers(
+                {
+                    "Accept": "application/json",
+                    "User-Agent": "truenas-jbod-admin/runtime-version-probe",
+                }
+            ),
         )
         try:
             with urllib.request.urlopen(request, timeout=self.settings.container_version_probe_timeout_seconds) as response:
