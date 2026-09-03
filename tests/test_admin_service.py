@@ -28,6 +28,7 @@ from admin_service.main import build_admin_state_payload
 from admin_service.main import decode_optional_secret_header
 from admin_service.main import enrich_quantastor_nodes_from_ssh
 from admin_service.main import get_history_store
+from admin_service.main import observe_backup_route
 from admin_service.main import stream_limited_request_body_to_file
 from admin_service.main import templates as admin_templates
 from app.config import (
@@ -53,6 +54,7 @@ from app.models.domain import SystemSetupBootstrapRequest
 from app.models.domain import SystemSetupRequest
 from app.models.domain import SystemSetupSudoPreviewRequest
 from app.models.domain import SystemBackupExportRequest
+from app.request_context import request_context
 from app.services.profile_registry import UNIFI_UNVR_FRONT_4_PROFILE_ID
 from app.services.ssh_probe import SSHCommandResult
 from app.services.snapshot_export import PackagedSnapshotExport
@@ -125,6 +127,17 @@ def make_streaming_request(
 
 
 class BackupImportRequestLimitTests(unittest.TestCase):
+    def test_backup_observer_classifies_http_5xx_as_error(self) -> None:
+        @observe_backup_route("inspect")
+        async def unavailable() -> None:
+            raise HTTPException(status_code=503, detail="synthetic unavailable")
+
+        with patch("admin_service.main.observe_backup_operation") as observe_operation:
+            with self.assertRaises(HTTPException):
+                asyncio.run(unavailable())
+
+        self.assertEqual(observe_operation.call_args.kwargs["outcome"], "error")
+
     def test_declared_oversize_body_is_rejected_without_reading_stream(self) -> None:
         request, receive_probe = make_streaming_request([b"ignored"], content_length=5)
 
@@ -345,6 +358,7 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         with (
             patch("admin_service.main.get_maintenance_service", return_value=service),
+            patch("admin_service.main.observe_backup_operation") as observe_operation,
             patch(
                 "admin_service.main.reload_app_settings",
                 return_value=SimpleNamespace(default_system_id=None),
@@ -373,6 +387,10 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertFalse(archive_path.parent.exists())
         service.import_bundle_from_file.assert_called_once()
         service.import_bundle.assert_not_called()
+        observed_metric = observe_operation.call_args.kwargs
+        self.assertEqual(observed_metric["operation"], "import")
+        self.assertEqual(observed_metric["outcome"], "success")
+        self.assertGreaterEqual(observed_metric["duration_seconds"], 0)
 
     def test_admin_backup_inspection_streams_file_and_returns_only_sanitized_metadata(self) -> None:
         request, _receive_probe = make_streaming_request([b"archive-bytes"])
@@ -402,7 +420,10 @@ class MainAppBoundaryTests(unittest.TestCase):
             if route.path == "/api/admin/backup/inspect"
         )
 
-        with patch("admin_service.main.get_backup_service", return_value=service):
+        with (
+            patch("admin_service.main.get_backup_service", return_value=service),
+            patch("admin_service.main.observe_backup_operation") as observe_operation,
+        ):
             response = asyncio.run(route.endpoint(request))
 
         payload = json.loads(response.body)
@@ -414,6 +435,62 @@ class MainAppBoundaryTests(unittest.TestCase):
             service.inspect_bundle_file.call_args.kwargs,
             {"passphrase": "synthetic passphrase"},
         )
+        observed_metric = observe_operation.call_args.kwargs
+        self.assertEqual(observed_metric["operation"], "inspect")
+        self.assertEqual(observed_metric["outcome"], "success")
+        self.assertGreaterEqual(observed_metric["duration_seconds"], 0)
+
+    def test_admin_backup_import_rejection_records_only_bounded_outcome(self) -> None:
+        request, _receive_probe = make_streaming_request([])
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
+
+        with patch("admin_service.main.observe_backup_operation") as observe_operation:
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(
+                    route.endpoint(
+                        request,
+                        stop_services=True,
+                        restart_services=True,
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        observed_metric = observe_operation.call_args.kwargs
+        self.assertEqual(
+            set(observed_metric),
+            {"service_name", "operation", "outcome", "duration_seconds"},
+        )
+        self.assertEqual(observed_metric["operation"], "import")
+        self.assertEqual(observed_metric["outcome"], "rejected")
+
+    def test_admin_backup_inspection_error_records_no_exception_content(self) -> None:
+        request, _receive_probe = make_streaming_request([b"archive-bytes"])
+        service = MagicMock()
+        service.inspect_bundle_file.side_effect = RuntimeError(
+            "secret-token /private/history.db system-alpha"
+        )
+        route = next(
+            route for route in admin_app.routes
+            if route.path == "/api/admin/backup/inspect"
+        )
+
+        with (
+            patch("admin_service.main.get_backup_service", return_value=service),
+            patch("admin_service.main.observe_backup_operation") as observe_operation,
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(route.endpoint(request))
+
+        observed_metric = observe_operation.call_args.kwargs
+        self.assertEqual(
+            set(observed_metric),
+            {"service_name", "operation", "outcome", "duration_seconds"},
+        )
+        self.assertEqual(observed_metric["operation"], "inspect")
+        self.assertEqual(observed_metric["outcome"], "error")
+        serialized = json.dumps(observed_metric)
+        for forbidden in ("secret-token", "/private/history.db", "system-alpha", "RuntimeError"):
+            self.assertNotIn(forbidden, serialized)
 
     def test_admin_backup_import_without_stops_keeps_impacted_services_needing_restart(self) -> None:
         request, _receive_probe = make_streaming_request([b"archive-bytes"])
@@ -1070,10 +1147,15 @@ class MainAppBoundaryTests(unittest.TestCase):
         response = MagicMock()
         response.__enter__.return_value.status = 200
 
-        with patch("app.main.urllib.request.urlopen", return_value=response):
+        with (
+            request_context("e" * 32),
+            patch("app.main.urllib.request.urlopen", return_value=response) as urlopen,
+        ):
             launch_url = resolve_admin_launch_url(request, settings)
 
         self.assertEqual(launch_url, "http://127.0.0.1:8082")
+        outbound_request = urlopen.call_args.args[0]
+        self.assertEqual(outbound_request.get_header("X-request-id"), "e" * 32)
 
     def test_resolve_admin_launch_url_hides_button_when_sidecar_is_down(self) -> None:
         request = make_request(port=8080)
@@ -1112,6 +1194,21 @@ class MainAppBoundaryTests(unittest.TestCase):
             launch_url = resolve_admin_launch_url(request, settings)
 
         self.assertIsNone(launch_url)
+
+    def test_admin_runtime_version_probe_propagates_current_server_request_id(self) -> None:
+        service = DockerRuntimeService(AdminSettings(docker_socket_path="/nonexistent.sock"))
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({"version": "0.22.3"}).encode()
+
+        with (
+            request_context("f" * 32),
+            patch("admin_service.services.runtime_control.urllib.request.urlopen", return_value=response) as urlopen,
+        ):
+            version = service._probe_running_version("http://enclosure-ui:8000/livez")
+
+        outbound_request = urlopen.call_args.args[0]
+        self.assertEqual(version, "0.22.3")
+        self.assertEqual(outbound_request.get_header("X-request-id"), "f" * 32)
 
 
 class AdminHeaderDecodeTests(unittest.TestCase):

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from history_service.config import HistorySettings
+from app.request_context import request_id_headers
 from app.metrics import (
     observe_history_collection_run,
     observe_history_retention_run,
@@ -1584,7 +1585,12 @@ class HistoryCollector:
         if query:
             url = f"{url}?{query}"
 
-        request = urllib.request.Request(url, data=body, method=method, headers=headers)
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method=method,
+            headers=request_id_headers(headers),
+        )
         request_timeout_seconds = timeout_seconds or self.settings.request_timeout_seconds
         try:
             with urllib.request.urlopen(request, timeout=request_timeout_seconds) as response:

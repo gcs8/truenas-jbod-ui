@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-import uuid
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -12,7 +11,14 @@ from typing import Any, Iterator
 from fastapi import FastAPI, Request
 from starlette.responses import Response
 
+from app import __version__
 from app.config import PerfConfig, Settings
+from app.request_context import (
+    REQUEST_ID_HEADER,
+    current_request_id,
+    generate_request_id,
+    validate_request_id,
+)
 
 logger = logging.getLogger("app.perf")
 
@@ -115,25 +121,30 @@ def _should_log_trace(trace: PerfTrace, perf: PerfConfig) -> bool:
     return perf.log_all_requests or trace.duration_ms >= perf.slow_request_ms or trace.has_slow_stage(perf.slow_stage_ms)
 
 
-def _log_trace(trace: PerfTrace, perf: PerfConfig, *, status_code: int | None, method: str, path: str) -> None:
+def _log_trace(trace: PerfTrace, perf: PerfConfig, *, status_code: int, method: str, route: str) -> None:
     if not _should_log_trace(trace, perf):
         return
     level = logging.WARNING if trace.duration_ms >= perf.slow_request_ms or trace.has_slow_stage(perf.slow_stage_ms) else logging.INFO
-    metadata = " ".join(f"{key}={value}" for key, value in sorted(trace.metadata.items()))
-    metadata_suffix = f" {metadata}" if metadata else ""
-    stage_summary = trace.stage_summary()
-    stage_suffix = f" stages=[{stage_summary}]" if stage_summary else ""
     logger.log(
         level,
-        "Perf request id=%s %s %s status=%s duration_ms=%.1f%s%s",
-        trace.request_id,
-        method,
-        path,
-        status_code if status_code is not None else "unknown",
-        trace.duration_ms,
-        metadata_suffix,
-        stage_suffix,
+        "http_performance",
+        extra={
+            "event": "http_performance",
+            "component": "enclosure-ui",
+            "release": __version__,
+            "request_id": trace.request_id,
+            "method": method,
+            "route": route,
+            "status_code": status_code,
+            "duration_ms": round(trace.duration_ms, 1),
+        },
     )
+
+
+def _route_label(request: Request) -> str:
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+    return route_path if isinstance(route_path, str) and route_path else "unmatched"
 
 
 def _quote_server_timing_desc(value: str) -> str:
@@ -155,24 +166,27 @@ def install_perf_timing_middleware(app: FastAPI, settings: Settings) -> None:
     @app.middleware("http")
     async def perf_timing_middleware(request: Request, call_next) -> Response:
         trace = PerfTrace(
-            request_id=uuid.uuid4().hex[:8],
-            operation=f"{request.method} {request.url.path}",
+            request_id=current_request_id() or generate_request_id(),
+            operation=request.method,
         )
-        trace.add_metadata(method=request.method, path=request.url.path)
-        request.state.request_id = trace.request_id
         token = _CURRENT_TRACE.set(trace)
         response: Response | None = None
         try:
-            response = await call_next(request)
-            response.headers["X-Request-Id"] = trace.request_id
-            response.headers["Server-Timing"] = build_server_timing_header(trace)
-            return response
+            current_response = await call_next(request)
+            response = current_response
+            response_request_id = validate_request_id(current_response.headers.get(REQUEST_ID_HEADER))
+            if response_request_id is not None:
+                trace.request_id = response_request_id
+            else:
+                current_response.headers[REQUEST_ID_HEADER] = trace.request_id
+            current_response.headers["Server-Timing"] = build_server_timing_header(trace)
+            return current_response
         finally:
             _CURRENT_TRACE.reset(token)
             _log_trace(
                 trace,
                 settings.perf,
-                status_code=response.status_code if response is not None else None,
+                status_code=response.status_code if response is not None else 500,
                 method=request.method,
-                path=request.url.path,
+                route=_route_label(request),
             )

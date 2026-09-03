@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -13,15 +14,24 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from prometheus_client.parser import text_string_to_metric_families
 
 from app.config import Settings, SystemConfig, TrueNASConfig
+from app.logging_config import JsonFormatter
 from app.metrics import (
     ScheduledBackupStatusCollector,
     install_metrics,
+    observe_backup_operation,
     observe_history_collection_run,
     observe_history_retention_run,
     set_history_collection_schedule_overrun,
     set_history_collector_running,
+)
+from app.request_context import (
+    current_parent_request_id,
+    current_request_id,
+    request_id_headers,
+    validate_request_id,
 )
 from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView
 from app.services.inventory import InventoryService
@@ -37,7 +47,12 @@ from app.services.snapshot_export import (
 from app.services.truenas_ws import TrueNASRawData
 
 
-async def invoke_asgi(app: FastAPI, path: str) -> list[dict[str, object]]:
+async def invoke_asgi(
+    app: FastAPI,
+    path: str,
+    *,
+    headers: list[tuple[bytes, bytes]] | None = None,
+) -> list[dict[str, object]]:
     messages: list[dict[str, object]] = []
 
     async def receive() -> dict[str, object]:
@@ -57,7 +72,7 @@ async def invoke_asgi(app: FastAPI, path: str) -> list[dict[str, object]]:
             "raw_path": path.encode("ascii"),
             "query_string": b"",
             "root_path": "",
-            "headers": [],
+            "headers": headers or [],
             "client": ("127.0.0.1", 1234),
             "server": ("testserver", 80),
         },
@@ -74,6 +89,14 @@ def response_body(messages: list[dict[str, object]]) -> str:
         if message.get("type") == "http.response.body"
     ]
     return b"".join(body_chunks).decode("utf-8")
+
+
+def response_headers(messages: list[dict[str, object]]) -> dict[str, str]:
+    start = next(message for message in messages if message.get("type") == "http.response.start")
+    return {
+        key.decode("latin-1").lower(): value.decode("latin-1")
+        for key, value in start.get("headers", [])
+    }
 
 
 def build_inventory_service(
@@ -98,6 +121,193 @@ def build_inventory_service(
 
 
 class MetricsRouteTests(unittest.TestCase):
+    def test_operations_docs_define_request_and_backup_metric_privacy_contract(self) -> None:
+        operations_doc = (
+            Path(__file__).resolve().parents[1]
+            / "wiki"
+            / "Operations-Logging-and-Metrics.md"
+        ).read_text(encoding="utf-8")
+
+        for required in (
+            "`X-Request-ID`",
+            "`truenas_jbod_ui_backup_operations_total`",
+            "`truenas_jbod_ui_backup_operation_duration_seconds`",
+            "`operation` values: `inspect`, `import`, or `unknown`",
+            "`outcome` values: `success`, `rejected`, or `error`",
+            "Request IDs never become metric labels",
+            "raw Uvicorn access log is disabled",
+            "Performance warnings reuse the same request ID and normalized route",
+            "exception messages",
+        ):
+            self.assertIn(required, operations_doc)
+
+    def test_observability_middleware_generates_and_propagates_server_request_id(self) -> None:
+        app = FastAPI()
+        incoming_request_id = "a" * 32
+
+        with patch.dict("os.environ", {"METRICS_ENABLED": "false"}, clear=False):
+            install_metrics(app, service_name="test-request-id", version="0.0.0-test")
+
+        @app.get("/items/{item_id}")
+        async def item(item_id: str) -> JSONResponse:
+            return JSONResponse(
+                {
+                    "item": item_id,
+                    "request_id": current_request_id(),
+                    "parent_request_id": current_parent_request_id(),
+                    "outbound_headers": request_id_headers(
+                        {
+                            "Accept": "application/json",
+                            "x-request-id": "client-controlled",
+                        }
+                    ),
+                }
+            )
+
+        messages = asyncio.run(
+            invoke_asgi(
+                app,
+                "/items/private-system-name",
+                headers=[(b"x-request-id", incoming_request_id.encode("ascii"))],
+            )
+        )
+        payload = json.loads(response_body(messages))
+        headers = response_headers(messages)
+
+        self.assertRegex(payload["request_id"], r"^[0-9a-f]{32}$")
+        self.assertNotEqual(payload["request_id"], incoming_request_id)
+        self.assertEqual(payload["parent_request_id"], incoming_request_id)
+        self.assertEqual(payload["outbound_headers"]["X-Request-ID"], payload["request_id"])
+        self.assertEqual(payload["outbound_headers"]["Accept"], "application/json")
+        self.assertNotIn("x-request-id", payload["outbound_headers"])
+        self.assertEqual(headers["x-request-id"], payload["request_id"])
+        self.assertIsNone(current_request_id())
+        self.assertIsNone(current_parent_request_id())
+
+    def test_parent_request_id_validation_requires_exact_shape(self) -> None:
+        valid = "a" * 32
+        self.assertEqual(validate_request_id(valid), valid)
+        for invalid in (
+            f" {valid}",
+            f"{valid} ",
+            valid.upper(),
+            "a" * 31,
+            "a" * 33,
+            "../private/history.db",
+        ):
+            with self.subTest(value=invalid):
+                self.assertIsNone(validate_request_id(invalid))
+
+    def test_all_three_services_return_server_request_ids(self) -> None:
+        from admin_service.config import AdminSettings
+        from admin_service.main import app as admin_app, create_app as create_admin_app
+        from app.main import app as ui_app
+        from history_service.main import app as history_app
+
+        for service_app in (ui_app, history_app, admin_app):
+            with self.subTest(title=service_app.title):
+                messages = asyncio.run(
+                    invoke_asgi(
+                        service_app,
+                        "/livez",
+                        headers=[(b"x-request-id", b"forged-client-value")],
+                    )
+                )
+                request_id = response_headers(messages)["x-request-id"]
+                self.assertRegex(request_id, r"^[0-9a-f]{32}$")
+                self.assertNotEqual(request_id, "forged-client-value")
+
+        with patch(
+            "admin_service.main.get_admin_settings",
+            return_value=AdminSettings(
+                auth_mode="basic",
+                auth_username="synthetic-user",
+                auth_password="synthetic-password",
+            ),
+        ):
+            basic_admin_app = create_admin_app()
+        unauthorized = asyncio.run(
+            invoke_asgi(
+                basic_admin_app,
+                "/",
+                headers=[(b"x-request-id", b"a" * 32)],
+            )
+        )
+        self.assertEqual(
+            next(message["status"] for message in unauthorized if message.get("type") == "http.response.start"),
+            401,
+        )
+        self.assertRegex(response_headers(unauthorized)["x-request-id"], r"^[0-9a-f]{32}$")
+
+    def test_request_error_log_uses_route_template_and_omits_exception_text(self) -> None:
+        app = FastAPI()
+        with patch.dict("os.environ", {"METRICS_ENABLED": "false"}, clear=False):
+            install_metrics(app, service_name="test-error-log", version="0.0.0-test")
+
+        @app.get("/items/{item_id}")
+        async def fail(item_id: str) -> JSONResponse:
+            raise RuntimeError(f"secret-token /private/{item_id}.db")
+
+        with self.assertLogs("app.observability", level="ERROR") as captured:
+            messages = asyncio.run(invoke_asgi(app, "/items/system-alpha"))
+
+        payload = json.loads(JsonFormatter(service_name="test-error-log").format(captured.records[-1]))
+        error_payload = json.loads(response_body(messages))
+        request_id = response_headers(messages)["x-request-id"]
+        self.assertEqual(
+            next(message["status"] for message in messages if message.get("type") == "http.response.start"),
+            500,
+        )
+        self.assertEqual(
+            error_payload,
+            {
+                "ok": False,
+                "detail": "Unhandled application error; see application logs.",
+                "request_id": request_id,
+            },
+        )
+        self.assertEqual(payload["route"], "/items/{item_id}")
+        self.assertEqual(payload["exception_class"], "RuntimeError")
+        self.assertEqual(payload["request_id"], request_id)
+        serialized = json.dumps(payload)
+        for forbidden in ("system-alpha", "secret-token", "/private/"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_json_observability_record_excludes_exception_text_and_unknown_fields(self) -> None:
+        formatter = JsonFormatter(service_name="enclosure-admin")
+        try:
+            raise RuntimeError("secret-token /private/history.db system-alpha")
+        except RuntimeError:
+            exc_info = sys.exc_info()
+        record = logging.LogRecord(
+            name="app.observability",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="http_request_error",
+            args=(),
+            exc_info=exc_info,
+        )
+        record.event = "http_request_error"
+        record.request_id = "b" * 32
+        record.method = "POST"
+        record.route = "/api/admin/backup/import"
+        record.status_code = 500
+        record.duration_ms = 12.5
+        record.private_path = "/private/history.db"
+        record.system_id = "system-alpha"
+        record.password = "secret-token"
+
+        payload = json.loads(formatter.format(record))
+
+        self.assertEqual(payload["request_id"], "b" * 32)
+        self.assertEqual(payload["exception_class"], "RuntimeError")
+        self.assertEqual(payload["route"], "/api/admin/backup/import")
+        serialized = json.dumps(payload)
+        for forbidden in ("secret-token", "/private/history.db", "system-alpha", "Traceback"):
+            self.assertNotIn(forbidden, serialized)
+        self.assertNotIn("exc_info", payload)
+
     def test_install_metrics_mounts_metrics_and_records_http_samples(self) -> None:
         app = FastAPI()
         service_name = "test-metrics-route"
@@ -126,6 +336,42 @@ class MetricsRouteTests(unittest.TestCase):
 
         paths = {getattr(route, "path", None) for route in app.routes}
         self.assertNotIn("/metrics", paths)
+
+        with self.assertLogs("app.observability", level="INFO") as captured:
+            messages = asyncio.run(invoke_asgi(app, "/metrics"))
+
+        self.assertEqual(
+            next(message["status"] for message in messages if message.get("type") == "http.response.start"),
+            404,
+        )
+        self.assertRegex(response_headers(messages)["x-request-id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(getattr(captured.records[-1], "route"), "unmatched")
+
+    def test_backup_operation_metrics_use_only_bounded_labels(self) -> None:
+        app = FastAPI()
+        with patch.dict("os.environ", {"METRICS_ENABLED": "true", "METRICS_PATH": "/metrics"}, clear=False):
+            install_metrics(app, service_name="test-backup-metrics", version="0.0.0-test")
+            observe_backup_operation(
+                service_name="enclosure-admin",
+                operation="inspect",
+                outcome="success",
+                duration_seconds=1.25,
+            )
+            observe_backup_operation(
+                service_name="enclosure-admin",
+                operation="private/system-alpha/history.db",
+                outcome="secret-token",
+                duration_seconds=2.5,
+            )
+
+        metrics_text = response_body(asyncio.run(invoke_asgi(app, "/metrics")))
+
+        self.assertIn("truenas_jbod_ui_backup_operations_total", metrics_text)
+        self.assertIn('operation="inspect",outcome="success"', metrics_text)
+        self.assertIn('operation="unknown",outcome="error"', metrics_text)
+        self.assertIn("truenas_jbod_ui_backup_operation_duration_seconds", metrics_text)
+        for forbidden in ("private/system-alpha/history.db", "secret-token", "request_id", "exception"):
+            self.assertNotIn(forbidden, metrics_text)
 
 
 class SnapshotExportMetricsTests(unittest.TestCase):
@@ -174,8 +420,16 @@ class SnapshotExportMetricsTests(unittest.TestCase):
             metrics_text,
             rf'truenas_jbod_ui_snapshot_export_cache_bytes\{{cache="render",service="{service_name}"\}} 4\.0',
         )
+        serialized_labels = json.dumps(
+            [
+                sample.labels
+                for family in text_string_to_metric_families(metrics_text)
+                for sample in family.samples
+            ],
+            sort_keys=True,
+        )
         for forbidden in ("history-key", "render-key", "zip-key", "123456"):
-            self.assertNotIn(forbidden, metrics_text)
+            self.assertNotIn(forbidden, serialized_labels)
 
 
 class HistoryMetricsTests(unittest.TestCase):

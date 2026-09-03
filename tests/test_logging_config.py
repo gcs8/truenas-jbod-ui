@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import unittest
 from unittest.mock import patch
 
 from app.config import PathConfig, Settings
-from app.logging_config import JsonFormatter, configure_logging, configure_service_logging
+from app.logging_config import (
+    JsonFormatter,
+    SafeTextFormatter,
+    configure_logging,
+    configure_service_logging,
+)
 
 
 class LoggingConfigTests(unittest.TestCase):
@@ -82,6 +88,48 @@ class LoggingConfigTests(unittest.TestCase):
         self.assertIn('"service": "enclosure-ui"', payload)
         self.assertIn('"message": "hello world"', payload)
 
+    def test_safe_text_formatter_keeps_bounded_request_fields_without_exception_text(self) -> None:
+        formatter = SafeTextFormatter(service_name="enclosure-admin")
+        try:
+            raise RuntimeError("secret-token /private/history.db system-alpha")
+        except RuntimeError:
+            exc_info = sys.exc_info()
+        record = logging.LogRecord(
+            name="app.observability",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="http_request_complete",
+            args=(),
+            exc_info=exc_info,
+        )
+        record.event = "http_request_complete"
+        record.request_id = "a" * 32
+        record.method = "POST"
+        record.route = "/api/admin/backup/import"
+        record.status_code = 500
+        record.duration_ms = 12.5
+        record.release = "0.22.3"
+        record.private_path = "/private/history.db"
+        record.system_id = "system-alpha"
+        record.password = "secret-token"
+
+        rendered = formatter.format(record)
+
+        for expected in (
+            "service=enclosure-admin",
+            f"request_id={'a' * 32}",
+            "method=POST",
+            "route=/api/admin/backup/import",
+            "status_code=500",
+            "duration_ms=12.5",
+            "release=0.22.3",
+            "exception_class=RuntimeError",
+        ):
+            self.assertIn(expected, rendered)
+        for forbidden in ("secret-token", "/private/history.db", "system-alpha", "Traceback"):
+            self.assertNotIn(forbidden, rendered)
+
     def test_configure_logging_uses_json_stream_when_requested(self) -> None:
         settings = Settings(
             paths=PathConfig(
@@ -101,3 +149,20 @@ class LoggingConfigTests(unittest.TestCase):
             if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
         )
         self.assertIsInstance(stream_handler.formatter, JsonFormatter)
+
+    def test_configure_service_logging_disables_raw_uvicorn_access_log(self) -> None:
+        access_logger = logging.getLogger("uvicorn.access")
+        error_logger = logging.getLogger("uvicorn.error")
+        original_access_disabled = access_logger.disabled
+        original_error_disabled = error_logger.disabled
+        self.addCleanup(setattr, access_logger, "disabled", original_access_disabled)
+        self.addCleanup(setattr, error_logger, "disabled", original_error_disabled)
+
+        configure_service_logging(
+            log_level="INFO",
+            service_name="enclosure-ui",
+        )
+
+        self.assertTrue(access_logger.disabled)
+        self.assertFalse(error_logger.disabled)
+        self.assertTrue(error_logger.propagate)

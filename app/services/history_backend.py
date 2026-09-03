@@ -12,6 +12,7 @@ from typing import Any
 
 from app.config import HistoryConfig
 from app.models.domain import utcnow
+from app.request_context import request_id_headers
 
 
 logger = logging.getLogger(__name__)
@@ -344,7 +345,12 @@ class HistoryBackendClient:
         if query:
             url = f"{url}?{query}"
 
-        request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method=method,
+            headers=request_id_headers(headers),
+        )
         try:
             with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
                 return response.read(), dict(response.headers.items())
