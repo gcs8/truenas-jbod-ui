@@ -635,8 +635,10 @@ class InventoryService:
         force_refresh: bool = False,
         selected_enclosure_id: str | None = None,
         allow_stale_cache: bool = False,
+        force_source_refresh: bool | None = None,
     ) -> CacheResult[InventorySnapshot]:
         cache_key = selected_enclosure_id or "__default__"
+        refresh_sources = force_refresh if force_source_refresh is None else force_source_refresh
         cached = self._cache.get(cache_key)
         cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
         now = utcnow()
@@ -670,7 +672,7 @@ class InventoryService:
             with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=selected_enclosure_id):
                 snapshot = await self._build_snapshot(
                     selected_enclosure_id=selected_enclosure_id,
-                    force_source_refresh=force_refresh,
+                    force_source_refresh=refresh_sources,
                 )
             self._observe_inventory_snapshot_build(
                 trigger=refresh_trigger,
@@ -1551,10 +1553,12 @@ class InventoryService:
         *,
         force_refresh: bool = False,
         allow_stale_cache: bool = False,
+        invalidate_sg_ses_device_cache: bool = True,
     ) -> InventorySourceBundle:
         result = await self._get_inventory_source_bundle_result(
             force_refresh=force_refresh,
             allow_stale_cache=allow_stale_cache,
+            invalidate_sg_ses_device_cache=invalidate_sg_ses_device_cache,
         )
         return result.value
 
@@ -1563,6 +1567,7 @@ class InventoryService:
         *,
         force_refresh: bool = False,
         allow_stale_cache: bool = False,
+        invalidate_sg_ses_device_cache: bool = True,
     ) -> CacheResult[InventorySourceBundle]:
         now = utcnow()
         if not force_refresh and self._source_bundle is not None and now < self._source_bundle_until:
@@ -1583,7 +1588,7 @@ class InventoryService:
                 return CacheResult(self._source_bundle, "hit-after-wait")
 
             refresh_trigger: CacheState = "forced-refresh" if force_refresh else "miss"
-            if force_refresh:
+            if force_refresh and invalidate_sg_ses_device_cache:
                 self._sg_ses_device_cache.clear()
             add_perf_metadata(
                 inventory_source_cache=refresh_trigger,
@@ -1603,10 +1608,10 @@ class InventoryService:
             self._observe_inventory_source_bundle_request(refresh_trigger)
             return CacheResult(bundle, refresh_trigger)
 
-    def _schedule_background_source_bundle_refresh(self) -> None:
+    def _schedule_background_source_bundle_refresh(self) -> asyncio.Task[None]:
         existing = self._source_bundle_refresh_task
         if existing is not None and not existing.done():
-            return
+            return existing
 
         task = asyncio.create_task(self._background_source_bundle_refresh())
         self._source_bundle_refresh_task = task
@@ -1621,10 +1626,14 @@ class InventoryService:
                 logger.warning("Background inventory source refresh failed: %s", exc)
 
         task.add_done_callback(_cleanup)
+        return task
 
     async def _background_source_bundle_refresh(self) -> None:
         try:
-            await self._get_inventory_source_bundle(force_refresh=True)
+            await self._get_inventory_source_bundle(
+                force_refresh=True,
+                invalidate_sg_ses_device_cache=False,
+            )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background inventory source refresh failed")
 
@@ -2374,7 +2383,12 @@ class InventoryService:
 
     async def _background_snapshot_refresh(self, cache_key: str, selected_enclosure_id: str | None) -> None:
         try:
-            await self.get_snapshot(force_refresh=True, selected_enclosure_id=selected_enclosure_id)
+            await asyncio.shield(self._schedule_background_source_bundle_refresh())
+            await self._get_snapshot_result(
+                force_refresh=True,
+                selected_enclosure_id=selected_enclosure_id,
+                force_source_refresh=False,
+            )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background snapshot refresh failed for %s", cache_key)
 
