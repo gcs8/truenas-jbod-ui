@@ -75,6 +75,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_platform_parity_fixtures",
             "tests.test_public_demo_fixture",
             "tests.test_read_ui_auth",
+            "tests.test_route_contracts",
             "tests.test_sas_fabric",
             "tests.test_scheduled_backup",
             "tests.test_script_json",
