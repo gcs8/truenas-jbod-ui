@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, InventoryService
 from app.services.mapping_store import MappingStore
-from app.services.parsers import parse_ssh_outputs, parse_storcli_physical_drives
+from app.services.parsers import parse_sg_ses_join_filter, parse_ssh_outputs, parse_storcli_physical_drives
 from app.services.profile_registry import (
     ProfileRegistry,
     SCALE_SSG_FRONT_24_PROFILE_ID,
@@ -293,6 +293,31 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
                 any("shared SAS address" in warning for warning in snapshot.warnings),
                 snapshot.warnings,
             )
+
+    def test_scale_md1280_join_captures_parse_all_reported_bays(self) -> None:
+        for dev in ("sg1", "sg76"):
+            with self.subTest(dev=dev):
+                parsed = parse_sg_ses_join_filter(
+                    fixture_text(f"scale_md1280_{dev}_join.txt"),
+                    f"sg_ses join /dev/{dev}",
+                )
+
+                self.assertIsNotNone(parsed)
+                assert parsed is not None
+                self.assertEqual(list(parsed.slots), list(range(84)))
+                slot = parsed.slots[73]
+                self.assertEqual(slot.slot_number_source, "ses_device_slot_number")
+                self.assertEqual(
+                    slot.control_targets,
+                    [
+                        {
+                            "ses_device": f"/dev/{dev}",
+                            "ses_element_id": 73,
+                            "ses_slot_number": 73,
+                        }
+                    ],
+                )
+                self.assertEqual(slot.presence_source, "sg_ses_join")
 
     async def test_scale_md1280_real_captures_map_via_enclosure_driver(self) -> None:
         """
