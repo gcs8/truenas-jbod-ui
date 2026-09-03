@@ -41,6 +41,48 @@ class ReleaseStatusTests(unittest.TestCase):
                 self.assertIn(release_url, current_doc)
                 self.assertNotIn("v0.22.1` is the latest published release", current_doc)
 
+    def test_post_v0222_roadmap_reconciles_completed_follow_up_work(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
+
+        for marker in (
+            "Issue #119 closed",
+            "PR #121 merged",
+            "579e3bf641872d842af3639ed7bdb084c9b75aff",
+            "Issue #124 closed",
+            "#162",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, roadmap)
+
+        self.assertNotIn("issue #119 and draft PR #121 remains", roadmap)
+        self.assertNotIn("publication also remains v0.22.3 work", roadmap)
+
+    def test_unreleased_changelog_records_selected_post_v0222_changes(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## v0.22.2", maxsplit=1)[0]
+
+        for heading in ("### Added", "### Changed", "### Fixed"):
+            with self.subTest(heading=heading):
+                self.assertIn(heading, unreleased)
+
+        for marker in (
+            "#121",
+            "SATA",
+            "#157",
+            "MD1280",
+            "#161",
+            "legacy",
+            "#162",
+            "crash-safe",
+            "#171",
+            "joined SES",
+            "82e49a05f5e820d3360998d2590dfe33a1e5bad7",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, unreleased)
+
     def test_describe_release_status_reports_update_available_for_older_build(self) -> None:
         status, summary = describe_release_status("0.14.0", "v0.14.1")
 

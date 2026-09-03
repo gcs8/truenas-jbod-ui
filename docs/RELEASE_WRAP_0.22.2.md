@@ -27,6 +27,11 @@ later-generation segment publication remained tracked in issue #124 for v0.22.3
 because the initial migration journal does not cover a later hot, segment, and
 catalog replacement transaction.
 
+Post-release reconciliation: Issue #119 closed after real-shelf validation and
+PR #121 merged as `579e3bf641872d842af3639ed7bdb084c9b75aff`. Issue #124 closed
+after crash-safe later-generation rotation landed in #162. The paragraph above
+records release-time state only.
+
 Validated against `docs/RELEASE_CHECKLIST.md`.
 
 ## Checklist evidence
@@ -46,7 +51,7 @@ Validated against `docs/RELEASE_CHECKLIST.md`.
 | Snapshot/export/offline artifact gate | yes | Offline snapshot and checked-in public-demo browser checks passed; snapshot estimate dialog passed in the final live suite | Pass |  |
 | Docs/wiki/public-demo gate | yes | Version alignment, changelog, v0.22.2 release notes/wrap, segmented operations, setgid status setup, release checklist, and wiki consistency are updated; source contract tests pass | Pass |  |
 | GHCR publish verification | yes | [Publish GHCR workflow run 33505635256](https://github.com/gcs8/truenas-jbod-ui/actions/runs/33505635256) completed successfully for source `6473d05f46d8344146cbbd7d0cdbf44487613a3c`; anonymous registry readback returned `ghcr.io/gcs8/truenas-jbod-ui@sha256:4bfa37a4c40a058055aef384194f98248722eca25f7fb429d6a5a34446d647a7`, and the linux/amd64 image label carries the same source revision | Pass |  |
-| Deployment refresh/sniff tests | yes | Bounded private production readback confirmed the UI and history services healthy at version `0.22.2` on the published digest and source revision; the admin sidecar was intentionally stopped. Private deployment identifiers are not retained here | Pass |  |
+| Deployment refresh/sniff tests | yes | The private deployment receipt was validated and runtime convergence was reverified against `v0.22.2`: the expected and running digests matched, required services had zero restarts, and health probes passed. Private deployment identifiers are not retained here | Pass |  |
 | Post-release reopen | yes | Development resumed on `main` after the tag; `CHANGELOG.md` now carries an `Unreleased` section while application version `0.22.2` remains unchanged | Pass |  |
 
 ## Safety boundary
@@ -64,7 +69,6 @@ Validated against `docs/RELEASE_CHECKLIST.md`.
 - Pre-release backup diagnostics that reached the bounded 7z cap failed closed.
   The final production outcome is summarized above without retaining private
   backup or deployment receipt details.
-- PR #121 remains draft. Synthetic fixtures do not replace real-shelf validation.
 
 ## Validator status
 

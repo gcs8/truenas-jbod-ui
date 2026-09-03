@@ -3,7 +3,39 @@
 ## Unreleased
 
 Development has resumed on `main` after `v0.22.2`. Changes recorded here are
-not part of that published tag.
+not part of that published tag. These are selected post-release changes, not a
+complete release-note draft.
+
+### Added
+
+- Added full-chassis and per-drawer Dell MD1280 profiles with the validated
+  84-bay layout and 42-bay drawer views (#157).
+- Added crash-safe later-generation segmented-history rotation with an explicit
+  journal, authenticated rollback artifacts, and fail-closed recovery (#162).
+- Added enclosure aliases across platform builders (#236), request correlation,
+  and backup metrics (#248).
+
+### Changed
+
+- Required local authentication for mutating main-UI requests and hardened the
+  default Compose runtime contract (#245 and #246).
+- Expanded the private QA restore matrix and its sanitized deployment evidence
+  checks without publishing private runtime details (#247).
+
+### Fixed
+
+- Mapped SATA bays through the Linux enclosure driver when shared AES addresses
+  cannot distinguish the slots (#121).
+- Preserved legacy chassis slot widths when rendering older saved layouts
+  (#161).
+- Corrected joined SES slot parsing so wrapped descriptor rows stay attached to
+  their slots (#171, merged to `main` as
+  `82e49a05f5e820d3360998d2590dfe33a1e5bad7`).
+- Recovered interrupted segmented-history restores and aligned segmented
+  exports, rollups, and verified-digest caching (#230, #231, and #234).
+- Tightened post-release inventory identity, route selection, backup state,
+  export redaction, and mapping-error boundaries across the subsequent
+  maintenance fixes through #251.
 
 ## v0.22.2 - 2026-09-01
 

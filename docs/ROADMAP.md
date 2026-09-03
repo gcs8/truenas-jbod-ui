@@ -34,10 +34,11 @@ the bounded long-horizon history architecture and its first lifecycle repair:
   containing `history_db`
 - private `.env` staging during immutable deployment candidate validation
 
-The SATA/AES Linux enclosure mapping in issue #119 and draft PR #121 remains
-v0.22.3 work pending real-shelf validation. Automated generation-2 segment
-publication also remains v0.22.3 work because it needs a durable crash-recovery
-protocol for hot, segment, and catalog replacement.
+Post-release reconciliation: Issue #119 closed on 2026-09-01 after real-shelf
+validation, and PR #121 merged as
+`579e3bf641872d842af3639ed7bdb084c9b75aff`. Issue #124 closed later that day
+after crash-safe later-generation segment rotation landed in #162. These items
+are completed post-`v0.22.2` work, not open `v0.22.3` prerequisites.
 
 - runtime deployment can be pinned to an immutable GHCR digest with a private
   receipt, convergence checks, and rollback evidence

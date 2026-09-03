@@ -40,6 +40,26 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
         self.assertNotIn("Tag: `v0.22.2` pending", text)
         self.assertNotIn("Release candidate commit: pending", text)
 
+    def test_v0222_release_wrap_reconciles_pr121_after_release(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        text = (repository / "docs" / "RELEASE_WRAP_0.22.2.md").read_text(encoding="utf-8")
+
+        self.assertIn("Post-release reconciliation", text)
+        self.assertIn("PR #121 merged", text)
+        self.assertIn("Issue #124 closed", text)
+        self.assertNotIn("PR #121 remains draft", text)
+
+    def test_v0222_deployment_gate_records_private_receipt_validation(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        text = (repository / "docs" / "RELEASE_WRAP_0.22.2.md").read_text(encoding="utf-8")
+        deployment_row = next(
+            line for line in text.splitlines() if line.startswith("| Deployment refresh/sniff tests |")
+        )
+
+        self.assertIn("private deployment receipt was validated", deployment_row)
+        self.assertIn("runtime convergence was reverified", deployment_row)
+        self.assertIn("Private deployment identifiers are not retained", deployment_row)
+
     def test_accepts_complete_release_wrap_evidence_table(self) -> None:
         issues = validate_release_wrap_text(_wrap_with_rows({}))
 
