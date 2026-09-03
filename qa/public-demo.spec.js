@@ -82,11 +82,12 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator("#export-snapshot-button")).toHaveCount(0);
   await expect(page.locator("#status-text")).toContainText("Frozen offline snapshot loaded");
 
-  const storageFabricAction = page.locator("#sas-fabric-view-link");
-  await expect(storageFabricAction).toHaveAttribute("href", "#sas-fabric-panel");
-  await storageFabricAction.click();
+  await expect(page.locator("#sas-fabric-view-link")).toHaveCount(0);
+  await page.locator("#sas-fabric-toggle-button").click();
   await expect(page.locator("#sas-fabric-panel")).toBeVisible();
-  await expect(page).toHaveURL(/#sas-fabric-panel$/);
+  await expect(page.locator("#sas-fabric-status")).toContainText(
+    "Offline snapshots do not include live Storage Fabric refresh yet."
+  );
 
   await expect(selector).toBeEnabled();
   await expect(page.locator("#chassis-shell")).toHaveAttribute("data-face-style", "top-loader");

@@ -1622,14 +1622,6 @@
     }
   }
 
-  function handleSasFabricViewLinkClick() {
-    if (!state.snapshotMode) {
-      return true;
-    }
-    openSasFabricPanel();
-    return true;
-  }
-
   function sasFabricList(value) {
     return Array.isArray(value) ? value : [];
   }
@@ -9679,9 +9671,6 @@
         openSasFabricPanel();
       }
     });
-  }
-  if (sasFabricViewLink) {
-    sasFabricViewLink.addEventListener("click", handleSasFabricViewLinkClick);
   }
   if (sasFabricRefreshButton) {
     sasFabricRefreshButton.addEventListener("click", () => {

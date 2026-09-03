@@ -103,8 +103,8 @@ trusted local ignored history input, then reviews and commits that new capture.
 1. The local build script generates `public-demo/index.html` from scrubbed
    live-derived TN Core source data.
 2. The checked-in artifact loads directly in the browser and reuses the normal
-   enclosure, slot detail, storage-view, heat-map, and in-page Storage Fabric
-   interaction patterns.
+   enclosure, slot detail, storage-view, and heat-map interaction patterns. It
+   omits the live-only dedicated Storage Fabric route action.
 3. Live-only controls are hidden or disabled by snapshot mode.
 4. `.github/workflows/publish-public-demo.yml` checks the artifact, runs the
    static Playwright smoke, uploads `public-demo/`, and deploys with GitHub
