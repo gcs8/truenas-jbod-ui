@@ -17,17 +17,32 @@ from app.models.domain import (
     SourceStatus,
     SlotView,
 )
-from app.services.sas_diagnostics import (
-    finalize_mpr_event_summary,
-    make_decoded_event_record,
-    new_mpr_event_summary,
-    record_mpr_event_summary,
-)
-from app.services.sas_diagnostics.decoder import bound_diagnostic_value
 from app.services.parsers import canonicalize_ssh_command, normalize_text
+from app.services.sas_fabric_parsers import (
+    CORE_MPRUTIL_UNIT_SUBCOMMANDS as CORE_MPRUTIL_UNIT_SUBCOMMANDS,
+    _freebsd_pci_location_to_address as _freebsd_pci_location_to_address,
+    _mpr_dmesg_event_type as _mpr_dmesg_event_type,
+    _mpr_dmesg_severity as _mpr_dmesg_severity,
+    _mpr_unit_from_text,
+    _parse_mpr_sense_message as _parse_mpr_sense_message,
+    _pciconf_bus_address as _pciconf_bus_address,
+    _split_mpr_dmesg_timestamp as _split_mpr_dmesg_timestamp,
+    _strip_syslog_kernel_prefix as _strip_syslog_kernel_prefix,
+    build_core_mprutil_unit_commands as build_core_mprutil_unit_commands,
+    discover_mpr_units_from_adapter_summary,
+    parse_dmidecode_slots,
+    parse_mpr_adapter_detail,
+    parse_mpr_adapter_summary,
+    parse_mpr_devices,
+    parse_mpr_dmesg_events,
+    parse_mpr_enclosures,
+    parse_mpr_expanders,
+    parse_mpr_iocfacts,
+    parse_mpr_sysctl_locations,
+    parse_pciconf_sas_controllers,
+)
 
 
-CORE_MPRUTIL_UNIT_SUBCOMMANDS = ("adapter", "devices", "enclosures", "expanders", "iocfacts")
 SAS_FABRIC_CANONICAL_ALIAS_SOURCE = "operator-canonical-v1"
 CORE_MESSAGES_TAIL_COMMAND = "tail -n 4000 /var/log/messages"
 CORE_MESSAGES_TAIL_SUDO_COMMAND = "sudo -n /usr/bin/tail -n 4000 /var/log/messages"
@@ -47,522 +62,25 @@ CORE_MPR_SYSCTL_LOCATION_COMMAND = (
     "sysctl -a 2>/dev/null | egrep '^dev\\.mpr\\.[0-9]+\\.%(location|parent):' || true"
 )
 
-def parse_mpr_adapter_summary(text: str) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for line in text.splitlines():
-        if not line.strip().startswith("/dev/"):
-            continue
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        rows.append(
-            {
-                "device": parts[0],
-                "unit": _mpr_unit_from_text(parts[0]),
-                "chip": parts[1],
-                "board": " ".join(parts[2:-1]),
-                "firmware": parts[-1],
-            }
-        )
-    return rows
-
-
-def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
-    detail: dict[str, Any] = {"phy_rows": []}
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.endswith("Adapter:"):
-            detail["name"] = stripped.removesuffix(" Adapter:")
-            continue
-        if ":" in stripped and not re.match(r"^\d+\s+", stripped):
-            key, value = stripped.split(":", 1)
-            detail[re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")] = value.strip()
-            continue
-        if re.match(r"^\d+\s+", stripped):
-            parts = stripped.split()
-            if len(parts) >= 8:
-                detail["phy_rows"].append(
-                    {
-                        "phy": parts[0],
-                        "controller_handle": parts[1],
-                        "device_handle": parts[2],
-                        "disabled": parts[3],
-                        "speed": parts[4],
-                        "min": parts[5],
-                        "max": parts[6],
-                        "device": " ".join(parts[7:]),
-                    }
-                )
-    detail["phy_count"] = len(detail.get("phy_rows") or [])
-    detail["linked_phy_count"] = sum(
-        1
-        for row in detail.get("phy_rows") or []
-        if row.get("device") and row.get("device") != "No Device"
-    )
-    return detail
-
-
-def parse_mpr_devices(text: str) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not re.search(r"\b(SAS|SATA|SMP|SEP)\s+Target\b", stripped):
-            continue
-        parts = stripped.split()
-        sas_index = next((index for index, part in enumerate(parts) if re.fullmatch(r"[0-9a-fA-F]{16}", part)), None)
-        if sas_index is None or len(parts) <= sas_index + 6:
-            continue
-        bus = parts[0] if sas_index >= 2 and re.fullmatch(r"\d+", parts[0]) else None
-        target = parts[1] if sas_index >= 2 and re.fullmatch(r"\d+", parts[1]) else None
-        device_words: list[str] = []
-        index = sas_index + 3
-        while index < len(parts) and not re.fullmatch(r"\d+(?:\.\d+)?", parts[index]):
-            device_words.append(parts[index])
-            index += 1
-        if index + 2 >= len(parts):
-            continue
-        rows.append(
-            {
-                "sas_address": parts[sas_index],
-                "handle": parts[sas_index + 1],
-                "parent": parts[sas_index + 2],
-                "device": " ".join(device_words),
-                "speed": parts[index],
-                "enclosure_handle": parts[index + 1],
-                "slot": parts[index + 2],
-                "bus": bus,
-                "target": target,
-            }
-        )
-    return rows
-
-
-def parse_mpr_enclosures(text: str) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not re.match(r"^\d+\s+[0-9a-fA-F]{8,}", stripped):
-            continue
-        parts = stripped.split()
-        if len(parts) < 5:
-            continue
-        rows.append(
-            {
-                "slots": parts[0],
-                "logical_id": parts[1],
-                "sep_handle": parts[2],
-                "enc_handle": parts[3],
-                "type": " ".join(parts[4:]),
-            }
-        )
-    return rows
-
-
-def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
-    expanders: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    header_pattern = re.compile(
-        r"^\s*(\d+)\s+([0-9a-fA-F]{16})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+(\d+)\s*$"
-    )
-    phy_pattern = re.compile(
-        r"^\s*(\d+)\s+(?:(\d+)\s+([0-9a-fA-F]{4})\s+([\d.]+)|)\s*([\d.]+|\?\?\?)\s+([\d.]+|\?\?\?)\s+(.+?)\s*$"
-    )
-    for line in text.splitlines():
-        header = header_pattern.match(line)
-        if header:
-            current = {
-                "num_phys": header.group(1),
-                "sas_address": header.group(2),
-                "dev_handle": header.group(3),
-                "parent": header.group(4),
-                "enc_handle": header.group(5),
-                "sas_level": header.group(6),
-                "phys": [],
-            }
-            expanders.append(current)
-            continue
-        if current is None:
-            continue
-        phy = phy_pattern.match(line)
-        if not phy:
-            continue
-        device = phy.group(7).strip()
-        if device.lower().startswith("phy "):
-            continue
-        current["phys"].append(
-            {
-                "phy": phy.group(1),
-                "remote_phy": phy.group(2),
-                "dev_handle": phy.group(3),
-                "speed": phy.group(4),
-                "min": phy.group(5),
-                "max": phy.group(6),
-                "device": device,
-            }
-        )
-    for expander in expanders:
-        counts = Counter(str(row.get("device") or "unknown").strip() for row in expander.get("phys") or [])
-        expander["device_counts"] = dict(counts)
-        expander["linked_phys"] = sum(1 for row in expander.get("phys") or [] if row.get("device") != "No Device")
-    return expanders
-
-
-def parse_mpr_iocfacts(text: str) -> dict[str, str]:
-    facts: dict[str, str] = {}
-    for line in text.splitlines():
-        stripped = line.strip()
-        if ":" not in stripped:
-            continue
-        key, value = stripped.split(":", 1)
-        normalized_key = re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")
-        if normalized_key and value.strip():
-            facts[normalized_key] = value.strip()
-    return facts
-
-
-def parse_pciconf_sas_controllers(text: str) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    current: dict[str, str] | None = None
-    header_pattern = re.compile(
-        r"^(?P<driver>[A-Za-z0-9_.-]+)@pci(?P<domain>\d+):(?P<bus>\d+):(?P<slot>\d+):"
-        r"(?P<function>\d+):\s*(?P<attrs>.*)$"
-    )
-    for line in text.splitlines():
-        header = header_pattern.match(line.strip())
-        if header:
-            driver = header.group("driver")
-            if not re.match(r"^(?:mpr|mps)\d+$", driver, flags=re.IGNORECASE):
-                current = None
-                continue
-            current = {
-                "controller": driver,
-                "unit": _mpr_unit_from_text(driver) or "",
-                "pci_location": (
-                    f"pci{header.group('domain')}:{header.group('bus')}:"
-                    f"{header.group('slot')}:{header.group('function')}"
-                ),
-                "pci_address": _pciconf_bus_address(
-                    header.group("domain"),
-                    header.group("bus"),
-                    header.group("slot"),
-                    header.group("function"),
-                ),
-            }
-            for key, value in re.findall(r"([A-Za-z0-9_]+)=([^\s]+)", header.group("attrs")):
-                normalized_key = key.lower()
-                if normalized_key == "class":
-                    current["class_code"] = value
-                elif normalized_key == "rev":
-                    current["revision"] = value
-                elif normalized_key == "vendor":
-                    current["vendor_id"] = value
-                elif normalized_key == "device":
-                    current["device_id"] = value
-                elif normalized_key in {"subvendor", "subdevice"}:
-                    current[f"{normalized_key}_id"] = value
-                else:
-                    current[normalized_key] = value
-            rows.append(current)
-            continue
-
-        if current is None:
-            continue
-        stripped = line.strip()
-        if "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        normalized_key = key.strip().lower().replace(" ", "_")
-        cleaned_value = value.strip().strip("'\"")
-        if normalized_key == "vendor":
-            current["vendor_name"] = cleaned_value
-        elif normalized_key == "device":
-            current["device_name"] = cleaned_value
-        elif normalized_key == "class":
-            current["class_name"] = cleaned_value
-        elif normalized_key == "subclass":
-            current["subclass_name"] = cleaned_value
-        else:
-            current[normalized_key] = cleaned_value
-    return rows
-
-
-def parse_dmidecode_slots(text: str) -> list[dict[str, Any]]:
-    slots: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    collecting_characteristics = False
-
-    def flush_current() -> None:
-        nonlocal current
-        if current and (current.get("designation") or current.get("bus_address")):
-            slots.append(current)
-        current = None
-
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Handle "):
-            flush_current()
-            collecting_characteristics = False
-            continue
-        if stripped == "System Slot Information":
-            current = {}
-            collecting_characteristics = False
-            continue
-        if current is None:
-            continue
-        if not stripped:
-            flush_current()
-            collecting_characteristics = False
-            continue
-        if stripped == "Characteristics:":
-            current["characteristics"] = []
-            collecting_characteristics = True
-            continue
-        if collecting_characteristics and ":" not in stripped:
-            current.setdefault("characteristics", []).append(stripped)
-            continue
-        if ":" not in stripped:
-            continue
-        key, value = stripped.split(":", 1)
-        normalized_key = re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")
-        cleaned_value = value.strip()
-        if not normalized_key or not cleaned_value:
-            continue
-        if normalized_key == "id":
-            normalized_key = "slot_id"
-        elif normalized_key == "bus_address":
-            cleaned_value = cleaned_value.lower()
-        current[normalized_key] = cleaned_value
-        collecting_characteristics = False
-
-    flush_current()
-    return slots
-
-
-def parse_mpr_sysctl_locations(text: str) -> dict[str, dict[str, str]]:
-    controllers: dict[str, dict[str, str]] = {}
-    location_pattern = re.compile(r"^dev\.mpr\.(?P<unit>\d+)\.%location:\s*(?P<value>.+)$")
-    parent_pattern = re.compile(r"^dev\.mpr\.(?P<unit>\d+)\.%parent:\s*(?P<value>.+)$")
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        location_match = location_pattern.match(stripped)
-        if location_match:
-            controller = f"mpr{location_match.group('unit')}"
-            row = controllers.setdefault(controller, {"controller": controller, "unit": location_match.group("unit")})
-            for key, value in re.findall(r"([a-zA-Z_]+)=([^\s]+)", location_match.group("value")):
-                normalized_key = key.lower()
-                if normalized_key == "dbsf":
-                    row["pci_location"] = value
-                    row["pci_address"] = _freebsd_pci_location_to_address(value)
-                elif normalized_key == "handle":
-                    row["acpi_handle"] = value
-                else:
-                    row[f"pci_{normalized_key}"] = value
-            row["raw_location"] = location_match.group("value").strip()
-            continue
-        parent_match = parent_pattern.match(stripped)
-        if parent_match:
-            controller = f"mpr{parent_match.group('unit')}"
-            row = controllers.setdefault(controller, {"controller": controller, "unit": parent_match.group("unit")})
-            row["pci_parent"] = parent_match.group("value").strip()
-    return controllers
-
-
-def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
-    controller_pattern = re.compile(
-        r"^(?P<controller>mpr\d+):\s+(?P<message>.+?)"
-        r"(?:\s+tgt\s+(?P<target>\d+)\s+SMID\s+(?P<smid>\d+)\s+loginfo\s+(?P<loginfo>[0-9a-fA-F]+))?$"
-    )
-    disk_pattern = re.compile(
-        r"^\((?P<device>da\d+):(?P<controller>mpr\d+):(?P<bus>\d+):"
-        r"(?P<target>\d+):(?P<lun>\d+)\):\s+(?P<message>.+)$"
-    )
-    summaries = {
-        "by_controller": defaultdict(new_mpr_event_summary),
-        "by_device": defaultdict(new_mpr_event_summary),
-        "by_controller_target": defaultdict(new_mpr_event_summary),
-    }
-    recent_events: list[dict[str, Any]] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        source_timestamp, source_line = _split_mpr_dmesg_timestamp(stripped)
-        event: dict[str, Any] | None = None
-        disk_match = disk_pattern.match(source_line)
-        if disk_match:
-            message = disk_match.group("message").strip()
-            event = {
-                "source": "cam",
-                "controller": disk_match.group("controller"),
-                "device": disk_match.group("device"),
-                "bus": disk_match.group("bus"),
-                "target": disk_match.group("target"),
-                "lun": disk_match.group("lun"),
-                "message": message,
-                "event_type": _mpr_dmesg_event_type(message),
-                "severity": _mpr_dmesg_severity(message),
-                "line": stripped,
-            }
-            if source_timestamp:
-                event["timestamp_raw"] = source_timestamp
-            sense = _parse_mpr_sense_message(message)
-            if sense:
-                event.update(sense)
-        else:
-            controller_match = controller_pattern.match(source_line)
-            if controller_match:
-                message = controller_match.group("message").strip()
-                event = {
-                    "source": "controller",
-                    "controller": controller_match.group("controller"),
-                    "target": controller_match.group("target"),
-                    "smid": controller_match.group("smid"),
-                    "loginfo": controller_match.group("loginfo"),
-                    "message": message,
-                    "event_type": _mpr_dmesg_event_type(message),
-                    "severity": "error",
-                    "line": stripped,
-                }
-                if source_timestamp:
-                    event["timestamp_raw"] = source_timestamp
-        if not event:
-            continue
-        event_id = f"mpr-dmesg-{len(recent_events) + 1:04d}"
-        event["event_id"] = event_id
-        decoded_record = make_decoded_event_record(event, event_id=event_id, sequence=len(recent_events))
-        recent_events.append(bound_diagnostic_value(event))
-        record_mpr_event_summary(summaries["by_controller"][event["controller"]], event, decoded_record)
-        if event.get("device"):
-            record_mpr_event_summary(summaries["by_device"][event["device"]], event, decoded_record)
-        if event.get("target"):
-            key = f"{event['controller']}:{event['target']}"
-            record_mpr_event_summary(summaries["by_controller_target"][key], event, decoded_record)
-
-    return {
-        "event_count": len(recent_events),
-        "recent_events": recent_events[-40:],
-        "by_controller": {
-            key: finalize_mpr_event_summary(summary)
-            for key, summary in sorted(summaries["by_controller"].items())
-        },
-        "by_device": {
-            key: finalize_mpr_event_summary(summary)
-            for key, summary in sorted(summaries["by_device"].items())
-        },
-        "by_controller_target": {
-            key: finalize_mpr_event_summary(summary)
-            for key, summary in sorted(summaries["by_controller_target"].items())
-        },
-    }
-
-
-def _split_mpr_dmesg_timestamp(line: str) -> tuple[str | None, str]:
-    bracketed_match = re.match(r"^\[(?P<timestamp>\s*\d+(?:\.\d+)?)\]\s+(?P<rest>.+)$", line)
-    if bracketed_match:
-        return f"[{bracketed_match.group('timestamp').strip()}]", bracketed_match.group("rest").strip()
-
-    iso_match = re.match(
-        r"^(?P<timestamp>\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+(?P<rest>.+)$",
-        line,
-    )
-    if iso_match:
-        return iso_match.group("timestamp"), _strip_syslog_kernel_prefix(iso_match.group("rest").strip())
-
-    syslog_match = re.match(
-        r"^(?P<timestamp>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<rest>.+)$",
-        line,
-    )
-    if syslog_match:
-        return syslog_match.group("timestamp"), _strip_syslog_kernel_prefix(syslog_match.group("rest").strip())
-
-    return None, line
-
-
-def _strip_syslog_kernel_prefix(line: str) -> str:
-    kernel_match = re.match(r"^(?:\S+\s+)?kernel:\s+(?P<rest>.+)$", line)
-    if kernel_match:
-        return kernel_match.group("rest").strip()
-    host_prefixed_match = re.match(
-        r"^\S+\s+(?P<rest>(?:mpr\d+:|\(da\d+:mpr\d+:).+)$",
-        line,
-    )
-    return host_prefixed_match.group("rest").strip() if host_prefixed_match else line
-
-
-def _mpr_dmesg_event_type(message: str) -> str:
-    lowered = message.lower()
-    if "controller reported" in lowered or "ioc terminated" in lowered:
-        return "ioc_terminated"
-    if lowered.startswith("cam status:"):
-        return "cam_status"
-    if re.match(r"error\s+\d+\s*,", lowered):
-        return "cam_error"
-    if lowered.startswith("scsi sense:"):
-        return "scsi_sense"
-    if lowered.startswith("scsi status:"):
-        return "scsi_status"
-    if lowered.startswith("retrying"):
-        return "retry"
-    if ". cdb:" in lowered or " cdb:" in lowered:
-        return "cdb"
-    return "message"
-
-
-def _mpr_dmesg_severity(message: str) -> str:
-    lowered = message.lower()
-    if any(token in lowered for token in ("error", "aborted", "nak", "timeout", "connection lost", "terminated")):
-        return "error"
-    if lowered.startswith("scsi status:") and any(
-        token in lowered
-        for token in (
-            "check condition",
-            "busy",
-            "reservation conflict",
-            "task set full",
-            "aca active",
-        )
-    ):
-        return "warning"
-    if lowered.startswith("retrying"):
-        return "warning"
-    return "info"
-
-
-def _parse_mpr_sense_message(message: str) -> dict[str, str]:
-    match = re.search(r"SCSI sense:\s*(?P<sense>.+?)\s+asc:(?P<asc>[0-9a-fA-F]+,[0-9a-fA-F]+)\s+\((?P<reason>.+)\)", message)
-    if not match:
-        return {}
-    return {
-        "sense": match.group("sense").strip(),
-        "sense_key": match.group("sense").strip().upper(),
-        "asc": match.group("asc").lower(),
-        "reason": match.group("reason").strip(),
-    }
-
-
-def discover_mpr_units_from_adapter_summary(text: str) -> list[int]:
-    units: set[int] = set()
-    for row in parse_mpr_adapter_summary(text):
-        unit = row.get("unit")
-        if unit is not None and str(unit).isdigit():
-            units.add(int(unit))
-    return sorted(units)
-
-
-def build_core_mprutil_unit_commands(adapter_summary_output: str, seen_commands: set[str] | None = None) -> list[str]:
-    seen = seen_commands or set()
-    commands: list[str] = []
-    for unit in discover_mpr_units_from_adapter_summary(adapter_summary_output):
-        for subcommand in CORE_MPRUTIL_UNIT_SUBCOMMANDS:
-            command = f"sudo -n /usr/sbin/mprutil -u {unit} show {subcommand}"
-            if canonicalize_ssh_command(command) in seen:
-                continue
-            commands.append(command)
-    return commands
+_INVENTORY_SNAPSHOT_EVIDENCE = ("inventory snapshot",)
+_PROFILE_SLOT_LAYOUT_EVIDENCE = ("profile slot layout",)
+_SLOT_MULTIPATH_EVIDENCE = ("slot.multipath.members",)
+_LINUX_SES_PATH_EVIDENCE = (
+    "lsscsi -g",
+    "lsscsi -g -t",
+    "sg_ses AES/EC",
+    "sg_ses --join --filter",
+)
+_LINUX_SES_ENCLOSURE_EVIDENCE = ("sg_ses AES/EC", "sg_ses --join --filter")
+_LINUX_SES_BAY_EVIDENCE = (
+    "inventory snapshot",
+    "lsblk --json",
+    "lsscsi -g -t",
+    "sg_ses AES/EC",
+    "sg_ses --join --filter",
+)
+_SG_SES_AES_EVIDENCE = ("sg_ses AES/EC",)
+_BMC_INVENTORY_EVIDENCE = ("BMC inventory",)
 
 
 def _select_sas_fabric_builder_key(system: SystemConfig, snapshot: InventorySnapshot) -> str:
@@ -597,46 +115,21 @@ class CoreMprFabricBuilder:
     key = "core_mpr"
 
     def build(self, context: SasFabricBuildContext) -> SasFabricSnapshot:
-        return _build_core_mpr_fabric_snapshot(
-            system=context.system,
-            snapshot=context.snapshot,
-            normalized_outputs=context.normalized_outputs,
-            sources=context.sources,
-            warnings=context.warnings,
-            command_failures=context.command_failures,
-            aliases=context.aliases,
-            alias_map=context.alias_map,
-        )
+        return _build_core_mpr_fabric_snapshot(context)
 
 
 class LinuxSesFabricBuilder:
     key = "linux_ses"
 
     def build(self, context: SasFabricBuildContext) -> SasFabricSnapshot:
-        return _build_linux_ses_fabric_snapshot(
-            system=context.system,
-            snapshot=context.snapshot,
-            sources=context.sources,
-            warnings=context.warnings,
-            command_failures=context.command_failures,
-            aliases=context.aliases,
-            alias_map=context.alias_map,
-        )
+        return _build_linux_ses_fabric_snapshot(context)
 
 
 class PlatformStorageFabricBuilder:
     key = "platform_storage"
 
     def build(self, context: SasFabricBuildContext) -> SasFabricSnapshot:
-        return _build_platform_storage_fabric_snapshot(
-            system=context.system,
-            snapshot=context.snapshot,
-            sources=context.sources,
-            warnings=context.warnings,
-            command_failures=context.command_failures,
-            aliases=context.aliases,
-            alias_map=context.alias_map,
-        )
+        return _build_platform_storage_fabric_snapshot(context)
 
 
 _SAS_FABRIC_BUILDERS: tuple[SasFabricBuilder, ...] = (
@@ -701,17 +194,166 @@ def build_sas_fabric_snapshot(
     return _select_sas_fabric_builder(context).build(context)
 
 
-def _build_core_mpr_fabric_snapshot(
+def _build_sas_fabric_result(
+    *,
+    available: bool,
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    nodes: dict[str, SasFabricNode] | None = None,
+    links: dict[str, SasFabricLink] | None = None,
+    traces: dict[str, SasFabricTrace] | None = None,
+    controllers: list[dict[str, Any]] | None = None,
+    expanders: list[dict[str, Any]] | None = None,
+    enclosures: list[dict[str, Any]] | None = None,
+    paths: list[dict[str, Any]] | None = None,
+    aliases: list[SasFabricAlias] | None = None,
+    warnings: list[str] | None = None,
+    sources: dict[str, SourceStatus] | None = None,
+    raw: dict[str, Any] | None = None,
+    sort_controllers: bool = False,
+) -> SasFabricSnapshot:
+    controller_rows = controllers or []
+    if sort_controllers:
+        controller_rows = sorted(controller_rows, key=lambda item: str(item.get("name") or ""))
+    return SasFabricSnapshot(
+        available=available,
+        system_id=system.id,
+        system_label=system.label,
+        platform=system.truenas.platform,
+        selected_enclosure_id=snapshot.selected_enclosure_id,
+        selected_enclosure_label=snapshot.selected_enclosure_label,
+        nodes=sorted((nodes or {}).values(), key=lambda node: (node.kind, node.id)),
+        links=sorted((links or {}).values(), key=lambda link: link.id),
+        traces=sorted((traces or {}).values(), key=lambda trace: trace.id),
+        controllers=controller_rows,
+        expanders=sorted(expanders or [], key=lambda item: str(item.get("id") or "")),
+        enclosures=sorted(enclosures or [], key=lambda item: str(item.get("id") or "")),
+        paths=paths or [],
+        aliases=aliases or [],
+        warnings=warnings or [],
+        sources=sources or {},
+        raw=raw or {},
+    )
+
+
+def _build_unavailable_sas_fabric_snapshot(
     *,
     system: SystemConfig,
     snapshot: InventorySnapshot,
-    normalized_outputs: dict[str, str],
-    sources: dict[str, SourceStatus] | None = None,
-    warnings: list[str] | None = None,
-    command_failures: list[dict[str, Any]] | None = None,
-    aliases: list[SasFabricAlias] | None = None,
-    alias_map: dict[str, SasFabricAlias] | None = None,
+    fabric_kind: str,
+    warnings: list[str],
+    sources: dict[str, SourceStatus] | None,
+    aliases: list[SasFabricAlias] | None,
+    command_failures: list[dict[str, Any]] | None,
 ) -> SasFabricSnapshot:
+    return _build_sas_fabric_result(
+        available=False,
+        system=system,
+        snapshot=snapshot,
+        aliases=list(aliases or []),
+        warnings=warnings,
+        sources=sources,
+        raw={
+            "fabric_domain": "storage_fabric",
+            "fabric_kind": fabric_kind,
+            "command_failures": list(command_failures or []),
+        },
+    )
+
+
+def _add_host_node(
+    nodes: dict[str, SasFabricNode],
+    *,
+    system: SystemConfig,
+    snapshot: InventorySnapshot,
+    metrics: dict[str, Any] | None = None,
+    evidence: tuple[str, ...] = (),
+    raw: dict[str, Any] | None = None,
+) -> SasFabricNode:
+    return add_node(
+        nodes,
+        SasFabricNode(
+            id="host",
+            kind="host",
+            label=system.label or system.id,
+            raw_id=system.id,
+            metrics={"slot_count": len(snapshot.slots), **(metrics or {})},
+            evidence=list(evidence),
+            raw=raw or {},
+        ),
+    )
+
+
+def _add_backplane_zone_nodes(
+    nodes: dict[str, SasFabricNode],
+    snapshot: InventorySnapshot,
+) -> dict[int, dict[str, Any]]:
+    backplane_zones = _backplane_zones_for_slots(snapshot.slots)
+    for zone in backplane_zones.values():
+        add_node(
+            nodes,
+            SasFabricNode(
+                id=zone["id"],
+                kind="backplane",
+                label=zone["label"],
+                related_slots=zone["slots"],
+                metrics={
+                    "zone": zone["index"] + 1,
+                    "slot_range": zone["range"],
+                    "slot_count": len(zone["slots"]),
+                },
+                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
+                raw=zone,
+            ),
+        )
+    return backplane_zones
+
+
+def _add_pool_vdev_nodes_and_links(
+    *,
+    slot: SlotView,
+    nodes: dict[str, SasFabricNode],
+    links: dict[str, SasFabricLink],
+    bay_id: str,
+    bay_related_nodes: list[str],
+    bay_related_links: list[str],
+) -> None:
+    related_slots = [slot.slot]
+    if slot.pool_name:
+        pool_id = _pool_node_id(slot.pool_name)
+        add_node(nodes, SasFabricNode(id=pool_id, kind="pool", label=slot.pool_name, related_slots=related_slots))
+        link = add_link(links, bay_id, pool_id, "bay-pool", slot=slot.slot, related_slots=related_slots)
+        bay_related_nodes.append(pool_id)
+        bay_related_links.append(link.id)
+    if slot.vdev_name:
+        vdev_id = _vdev_node_id(slot.vdev_name, slot.pool_name)
+        add_node(nodes, SasFabricNode(id=vdev_id, kind="vdev", label=slot.vdev_name, related_slots=related_slots))
+        target_id = _pool_node_id(slot.pool_name) if slot.pool_name else bay_id
+        link = add_link(links, target_id, vdev_id, "pool-vdev", slot=slot.slot, related_slots=related_slots)
+        bay_related_nodes.append(vdev_id)
+        bay_related_links.append(link.id)
+
+
+def _slot_linux_transport_detail(slot: SlotView) -> dict[str, Any]:
+    return {
+        "sg_device": getattr(slot, "sg_device", None),
+        "scsi_hctl": getattr(slot, "scsi_hctl", None),
+        "transport_protocol": getattr(slot, "transport_protocol", None),
+        "attached_sas_address": getattr(slot, "attached_sas_address", None),
+        "phy_identifier": getattr(slot, "phy_identifier", None),
+        "target_port_protocol": getattr(slot, "target_port_protocol", None),
+    }
+
+
+def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabricSnapshot:
+    system = context.system
+    snapshot = context.snapshot
+    normalized_outputs = context.normalized_outputs
+    sources = context.sources
+    warnings = context.warnings
+    command_failures = context.command_failures
+    aliases = context.aliases
+    alias_map = context.alias_map
     fabric_warnings = list(warnings or [])
     aliases_by_id = alias_map or _sas_fabric_alias_map(aliases or [])
     selected_enclosure_keys = _selected_enclosure_keys(snapshot)
@@ -719,15 +361,10 @@ def _build_core_mpr_fabric_snapshot(
     links: dict[str, SasFabricLink] = {}
     traces: dict[str, SasFabricTrace] = {}
     mpr_kernel_diagnostics = parse_mpr_dmesg_events(normalized_outputs.get("dmesg mpr events", ""))
-    add_node(
+    _add_host_node(
         nodes,
-        SasFabricNode(
-            id="host",
-            kind="host",
-            label=system.label or system.id,
-            raw_id=system.id,
-            metrics={"slot_count": len(snapshot.slots)},
-        ),
+        system=system,
+        snapshot=snapshot,
     )
 
     adapter_summary = parse_mpr_adapter_summary(normalized_outputs.get("mprutil show adapters", ""))
@@ -844,7 +481,7 @@ def _build_core_mpr_fabric_snapshot(
                     controller_id=controller_id,
                     related_slots=slots,
                     metrics={"count": count},
-                    evidence=["slot.multipath.members"],
+                    evidence=list(_SLOT_MULTIPATH_EVIDENCE),
                 ),
             )
             add_link(links, controller_id, path_id, "controller-path", status=state, related_slots=slots)
@@ -856,7 +493,7 @@ def _build_core_mpr_fabric_snapshot(
                 link_ids=[_link_id("host", controller_id, "host-controller"), _link_id(controller_id, path_id, "controller-path")],
                 slots=slots,
                 metrics={"count": count, "state": state},
-                evidence=["slot.multipath.members"],
+                evidence=list(_SLOT_MULTIPATH_EVIDENCE),
             )
 
     ses_devices_by_slot = _ses_devices_by_slot(snapshot.slots)
@@ -872,24 +509,7 @@ def _build_core_mpr_fabric_snapshot(
         controllers=controllers,
         diagnostics=mpr_kernel_diagnostics,
     )
-    backplane_zones = _backplane_zones_for_slots(snapshot.slots)
-    for zone in backplane_zones.values():
-        add_node(
-            nodes,
-            SasFabricNode(
-                id=zone["id"],
-                kind="backplane",
-                label=zone["label"],
-                related_slots=zone["slots"],
-                metrics={
-                    "zone": zone["index"] + 1,
-                    "slot_range": zone["range"],
-                    "slot_count": len(zone["slots"]),
-                },
-                evidence=["profile slot layout"],
-                raw=zone,
-            ),
-        )
+    backplane_zones = _add_backplane_zone_nodes(nodes, snapshot)
 
     for slot in snapshot.slots:
         bay_id = f"bay:{slot.slot}"
@@ -913,7 +533,7 @@ def _build_core_mpr_fabric_snapshot(
                     "device_name": slot.device_name,
                     "health": slot.health,
                 },
-                evidence=["inventory snapshot"],
+                evidence=list(_INVENTORY_SNAPSHOT_EVIDENCE),
             ),
         )
         if backplane_zone:
@@ -924,7 +544,7 @@ def _build_core_mpr_fabric_snapshot(
                 "backplane-bay",
                 slot=slot.slot,
                 related_slots=[slot.slot],
-                evidence=["profile slot layout"],
+                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
             )
             bay_related_nodes.append(backplane_zone["id"])
             bay_related_links.append(backplane_link.id)
@@ -999,19 +619,14 @@ def _build_core_mpr_fabric_snapshot(
             link = add_link(links, ses_id, bay_id, "ses-bay", slot=slot.slot, related_slots=[slot.slot])
             bay_related_nodes.append(ses_id)
             bay_related_links.append(link.id)
-        if slot.pool_name:
-            pool_id = _pool_node_id(slot.pool_name)
-            add_node(nodes, SasFabricNode(id=pool_id, kind="pool", label=slot.pool_name, related_slots=[slot.slot]))
-            link = add_link(links, bay_id, pool_id, "bay-pool", slot=slot.slot, related_slots=[slot.slot])
-            bay_related_nodes.append(pool_id)
-            bay_related_links.append(link.id)
-        if slot.vdev_name:
-            vdev_id = _vdev_node_id(slot.vdev_name, slot.pool_name)
-            add_node(nodes, SasFabricNode(id=vdev_id, kind="vdev", label=slot.vdev_name, related_slots=[slot.slot]))
-            target_id = _pool_node_id(slot.pool_name) if slot.pool_name else bay_id
-            link = add_link(links, target_id, vdev_id, "pool-vdev", slot=slot.slot, related_slots=[slot.slot])
-            bay_related_nodes.append(vdev_id)
-            bay_related_links.append(link.id)
+        _add_pool_vdev_nodes_and_links(
+            slot=slot,
+            nodes=nodes,
+            links=links,
+            bay_id=bay_id,
+            bay_related_nodes=bay_related_nodes,
+            bay_related_links=bay_related_links,
+        )
         traces[bay_id] = SasFabricTrace(
             id=bay_id,
             label=f"Bay {slot.slot:02d}",
@@ -1066,23 +681,20 @@ def _build_core_mpr_fabric_snapshot(
     if not controller_names and not paths:
         fabric_warnings.append("No CORE SAS controller/path data is available yet. Check SSH and mprutil permissions.")
 
-    return SasFabricSnapshot(
+    return _build_sas_fabric_result(
         available=bool(controller_names or paths or expanders or enclosures),
-        system_id=system.id,
-        system_label=system.label,
-        platform=system.truenas.platform,
-        selected_enclosure_id=snapshot.selected_enclosure_id,
-        selected_enclosure_label=snapshot.selected_enclosure_label,
-        nodes=sorted(nodes.values(), key=lambda node: (node.kind, node.id)),
-        links=sorted(links.values(), key=lambda link: link.id),
-        traces=sorted(traces.values(), key=lambda trace: trace.id),
+        system=system,
+        snapshot=snapshot,
+        nodes=nodes,
+        links=links,
+        traces=traces,
         controllers=controllers,
-        expanders=sorted(expanders, key=lambda item: str(item.get("id") or "")),
-        enclosures=sorted(enclosures, key=lambda item: str(item.get("id") or "")),
+        expanders=expanders,
+        enclosures=enclosures,
         paths=paths,
         aliases=list(aliases_by_id.values()),
         warnings=fabric_warnings,
-        sources=sources or {},
+        sources=sources,
         raw={
             "commands": sorted(normalized_outputs),
             "path_counts": {controller: dict(counts) for controller, counts in sorted(path_counts.items())},
@@ -1150,16 +762,14 @@ def _slot_storage_identity(slot: SlotView) -> dict[str, Any]:
     }
 
 
-def _build_linux_ses_fabric_snapshot(
-    *,
-    system: SystemConfig,
-    snapshot: InventorySnapshot,
-    sources: dict[str, SourceStatus] | None = None,
-    warnings: list[str] | None = None,
-    command_failures: list[dict[str, Any]] | None = None,
-    aliases: list[SasFabricAlias] | None = None,
-    alias_map: dict[str, SasFabricAlias] | None = None,
-) -> SasFabricSnapshot:
+def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabricSnapshot:
+    system = context.system
+    snapshot = context.snapshot
+    sources = context.sources
+    warnings = context.warnings
+    command_failures = context.command_failures
+    aliases = context.aliases
+    alias_map = context.alias_map
     fabric_warnings = list(warnings or [])
     aliases_by_id = alias_map or _sas_fabric_alias_map(aliases or [])
     slots_with_ses = [
@@ -1173,21 +783,14 @@ def _build_linux_ses_fabric_snapshot(
             f"No {_linux_ses_platform_phrase(platform_label)} slot evidence is available for this selection. "
             "Run stable lsblk --json, lsscsi -g -t, and sg_ses AES/EC/join probes before rendering a SCALE/Linux Storage Fabric map."
         )
-        return SasFabricSnapshot(
-            available=False,
-            system_id=system.id,
-            system_label=system.label,
-            platform=system.truenas.platform,
-            selected_enclosure_id=snapshot.selected_enclosure_id,
-            selected_enclosure_label=snapshot.selected_enclosure_label,
+        return _build_unavailable_sas_fabric_snapshot(
+            system=system,
+            snapshot=snapshot,
+            fabric_kind="linux_ses",
             warnings=fabric_warnings,
-            sources=sources or {},
-            aliases=list(aliases or []),
-            raw={
-                "fabric_domain": "storage_fabric",
-                "fabric_kind": "linux_ses",
-                "command_failures": list(command_failures or []),
-            },
+            sources=sources,
+            aliases=aliases,
+            command_failures=command_failures,
         )
 
     nodes: dict[str, SasFabricNode] = {}
@@ -1204,22 +807,17 @@ def _build_linux_ses_fabric_snapshot(
     controller_id = "controller:linux-ses"
     controller_name = "linux-ses"
     ses_device_count = len(ses_slots)
-    add_node(
+    _add_host_node(
         nodes,
-        SasFabricNode(
-            id="host",
-            kind="host",
-            label=system.label or system.id,
-            raw_id=system.id,
-            metrics={
-                "slot_count": len(snapshot.slots),
-                "selected_disk_count": len(selected_disk_slots),
-                "fabric_domain": "storage_fabric",
-                "fabric_kind": "linux_ses",
-            },
-            evidence=["inventory snapshot"],
-            raw={"platform": system.truenas.platform, "fabric_domain": "storage_fabric", "fabric_kind": "linux_ses"},
-        ),
+        system=system,
+        snapshot=snapshot,
+        metrics={
+            "selected_disk_count": len(selected_disk_slots),
+            "fabric_domain": "storage_fabric",
+            "fabric_kind": "linux_ses",
+        },
+        evidence=_INVENTORY_SNAPSHOT_EVIDENCE,
+        raw={"platform": system.truenas.platform, "fabric_domain": "storage_fabric", "fabric_kind": "linux_ses"},
     )
     add_node(
         nodes,
@@ -1237,7 +835,7 @@ def _build_linux_ses_fabric_snapshot(
                 "selected_disk_count": len(selected_disk_slots),
                 "fabric_kind": "linux_ses",
             },
-            evidence=["lsscsi -g", "lsscsi -g -t", "sg_ses AES/EC", "sg_ses --join --filter"],
+            evidence=list(_LINUX_SES_PATH_EVIDENCE),
             raw={
                 "device": "lsscsi -g -t",
                 "board": f"{platform_label} Linux SES",
@@ -1254,7 +852,7 @@ def _build_linux_ses_fabric_snapshot(
         controller_id,
         "host-controller",
         related_slots=selected_slots,
-        evidence=["inventory snapshot"],
+        evidence=list(_INVENTORY_SNAPSHOT_EVIDENCE),
     )
 
     paths: list[dict[str, Any]] = []
@@ -1288,7 +886,7 @@ def _build_linux_ses_fabric_snapshot(
                 controller_id=controller_id,
                 related_slots=ses_slot_numbers,
                 metrics={"count": len(ses_slot_numbers), "ses_device": ses_device},
-                evidence=["lsscsi -g", "lsscsi -g -t", "sg_ses AES/EC", "sg_ses --join --filter"],
+                evidence=list(_LINUX_SES_PATH_EVIDENCE),
                 raw={"ses_device": ses_device, "source": "linux_ses", "fabric_domain": "storage_fabric", "fabric_kind": "linux_ses"},
             ),
         )
@@ -1307,7 +905,7 @@ def _build_linux_ses_fabric_snapshot(
                     "selected_enclosure": True,
                     "selected_disk_count": len([slot for slot in slots if _slot_has_disk(slot)]),
                 },
-                evidence=["sg_ses AES/EC", "sg_ses --join --filter"],
+                evidence=list(_LINUX_SES_ENCLOSURE_EVIDENCE),
                 raw={
                     "id": ses_id,
                     "ses_device": ses_device,
@@ -1336,7 +934,7 @@ def _build_linux_ses_fabric_snapshot(
             "path-ses-enclosure",
             status="mapped",
             related_slots=ses_slot_numbers,
-            evidence=["sg_ses AES/EC", "sg_ses --join --filter"],
+            evidence=list(_LINUX_SES_ENCLOSURE_EVIDENCE),
         )
         traces[path_id] = SasFabricTrace(
             id=path_id,
@@ -1350,30 +948,14 @@ def _build_linux_ses_fabric_snapshot(
             ],
             slots=ses_slot_numbers,
             metrics={"count": len(ses_slot_numbers), "state": "mapped", "ses_device": ses_device},
-            evidence=["lsscsi -g", "lsscsi -g -t", "sg_ses AES/EC", "sg_ses --join --filter"],
+            evidence=list(_LINUX_SES_PATH_EVIDENCE),
         )
 
-    backplane_zones = _backplane_zones_for_slots(snapshot.slots)
-    for zone in backplane_zones.values():
-        add_node(
-            nodes,
-            SasFabricNode(
-                id=zone["id"],
-                kind="backplane",
-                label=zone["label"],
-                related_slots=zone["slots"],
-                metrics={
-                    "zone": zone["index"] + 1,
-                    "slot_range": zone["range"],
-                    "slot_count": len(zone["slots"]),
-                },
-                evidence=["profile slot layout"],
-                raw=zone,
-            ),
-        )
+    backplane_zones = _add_backplane_zone_nodes(nodes, snapshot)
 
     for slot in snapshot.slots:
         slot_identity = _slot_storage_identity(slot)
+        transport_detail = _slot_linux_transport_detail(slot)
         bay_id = f"bay:{slot.slot}"
         ses_device = _slot_primary_ses_device(slot)
         ses_id = enclosures_by_ses.get(ses_device or "")
@@ -1401,28 +983,18 @@ def _build_linux_ses_fabric_snapshot(
                     "device_name": slot.device_name,
                     "health": slot.health,
                     "sas_address": slot.sas_address,
-                    "attached_sas_address": getattr(slot, "attached_sas_address", None),
-                    "transport_protocol": getattr(slot, "transport_protocol", None),
-                    "sg_device": getattr(slot, "sg_device", None),
-                    "scsi_hctl": getattr(slot, "scsi_hctl", None),
-                    "phy_identifier": getattr(slot, "phy_identifier", None),
-                    "target_port_protocol": getattr(slot, "target_port_protocol", None),
+                    **transport_detail,
                     "ses_device": ses_device,
                     "ses_element_id": slot.ssh_ses_element_id,
                     **slot_identity,
                 },
-                evidence=["inventory snapshot", "lsblk --json", "lsscsi -g -t", "sg_ses AES/EC", "sg_ses --join --filter"],
+                evidence=list(_LINUX_SES_BAY_EVIDENCE),
                 raw={
                     **slot_identity,
                     "ses_device": ses_device,
                     "ses_element_id": slot.ssh_ses_element_id,
                     "ses_targets": list(slot.ssh_ses_targets),
-                    "sg_device": getattr(slot, "sg_device", None),
-                    "scsi_hctl": getattr(slot, "scsi_hctl", None),
-                    "transport_protocol": getattr(slot, "transport_protocol", None),
-                    "attached_sas_address": getattr(slot, "attached_sas_address", None),
-                    "phy_identifier": getattr(slot, "phy_identifier", None),
-                    "target_port_protocol": getattr(slot, "target_port_protocol", None),
+                    **transport_detail,
                     "linux_blockdevice": slot.raw_status.get("linux_blockdevice") if isinstance(slot.raw_status, dict) else None,
                     "linux_scsi_device": slot.raw_status.get("linux_scsi_device") if isinstance(slot.raw_status, dict) else None,
                     "mapping_source": slot.mapping_source,
@@ -1440,7 +1012,7 @@ def _build_linux_ses_fabric_snapshot(
                 "backplane-bay",
                 slot=slot.slot,
                 related_slots=[slot.slot],
-                evidence=["profile slot layout"],
+                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
             )
             bay_related_nodes.append(backplane_zone["id"])
             bay_related_links.append(backplane_link.id)
@@ -1452,22 +1024,17 @@ def _build_linux_ses_fabric_snapshot(
                 "ses-bay",
                 slot=slot.slot,
                 related_slots=[slot.slot],
-                evidence=["sg_ses AES/EC"],
+                evidence=list(_SG_SES_AES_EVIDENCE),
             )
             bay_related_links.append(ses_link.id)
-        if slot.pool_name:
-            pool_id = _pool_node_id(slot.pool_name)
-            add_node(nodes, SasFabricNode(id=pool_id, kind="pool", label=slot.pool_name, related_slots=[slot.slot]))
-            link = add_link(links, bay_id, pool_id, "bay-pool", slot=slot.slot, related_slots=[slot.slot])
-            bay_related_nodes.append(pool_id)
-            bay_related_links.append(link.id)
-        if slot.vdev_name:
-            vdev_id = _vdev_node_id(slot.vdev_name, slot.pool_name)
-            add_node(nodes, SasFabricNode(id=vdev_id, kind="vdev", label=slot.vdev_name, related_slots=[slot.slot]))
-            target_id = _pool_node_id(slot.pool_name) if slot.pool_name else bay_id
-            link = add_link(links, target_id, vdev_id, "pool-vdev", slot=slot.slot, related_slots=[slot.slot])
-            bay_related_nodes.append(vdev_id)
-            bay_related_links.append(link.id)
+        _add_pool_vdev_nodes_and_links(
+            slot=slot,
+            nodes=nodes,
+            links=links,
+            bay_id=bay_id,
+            bay_related_nodes=bay_related_nodes,
+            bay_related_links=bay_related_links,
+        )
         traces[bay_id] = SasFabricTrace(
             id=bay_id,
             label=f"Bay {slot.slot:02d}",
@@ -1489,12 +1056,7 @@ def _build_linux_ses_fabric_snapshot(
                         "pool_name": slot.pool_name,
                         "vdev_name": slot.vdev_name,
                         "ses_device": ses_device,
-                        "sg_device": getattr(slot, "sg_device", None),
-                        "scsi_hctl": getattr(slot, "scsi_hctl", None),
-                        "transport_protocol": getattr(slot, "transport_protocol", None),
-                        "target_port_protocol": getattr(slot, "target_port_protocol", None),
-                        "attached_sas_address": getattr(slot, "attached_sas_address", None),
-                        "phy_identifier": getattr(slot, "phy_identifier", None),
+                        **transport_detail,
                         "path_id": path_id,
                         **slot_identity,
                     }
@@ -1503,7 +1065,7 @@ def _build_linux_ses_fabric_snapshot(
                 "ses_device": ses_device,
                 "ses_element_id": slot.ssh_ses_element_id,
             },
-            evidence=["inventory snapshot", "lsblk --json", "lsscsi -g -t", "sg_ses AES/EC", "sg_ses --join --filter"],
+            evidence=list(_LINUX_SES_BAY_EVIDENCE),
         )
 
     controllers = [
@@ -1535,23 +1097,20 @@ def _build_linux_ses_fabric_snapshot(
         f"{platform_label} Storage Fabric map is built from Linux block, SCSI transport, and SES slot evidence. "
         "HBA and expander hop detail is not exposed by this Linux SES evidence."
     )
-    return SasFabricSnapshot(
+    return _build_sas_fabric_result(
         available=True,
-        system_id=system.id,
-        system_label=system.label,
-        platform=system.truenas.platform,
-        selected_enclosure_id=snapshot.selected_enclosure_id,
-        selected_enclosure_label=snapshot.selected_enclosure_label,
-        nodes=sorted(nodes.values(), key=lambda node: (node.kind, node.id)),
-        links=sorted(links.values(), key=lambda link: link.id),
-        traces=sorted(traces.values(), key=lambda trace: trace.id),
+        system=system,
+        snapshot=snapshot,
+        nodes=nodes,
+        links=links,
+        traces=traces,
         controllers=controllers,
         expanders=[],
-        enclosures=sorted(enclosures, key=lambda item: str(item.get("id") or "")),
+        enclosures=enclosures,
         paths=paths,
         aliases=list(aliases_by_id.values()),
         warnings=fabric_warnings,
-        sources=sources or {},
+        sources=sources,
         raw={
             "fabric_domain": "storage_fabric",
             "fabric_kind": "linux_ses",
@@ -1563,16 +1122,14 @@ def _build_linux_ses_fabric_snapshot(
     )
 
 
-def _build_platform_storage_fabric_snapshot(
-    *,
-    system: SystemConfig,
-    snapshot: InventorySnapshot,
-    sources: dict[str, SourceStatus] | None = None,
-    warnings: list[str] | None = None,
-    command_failures: list[dict[str, Any]] | None = None,
-    aliases: list[SasFabricAlias] | None = None,
-    alias_map: dict[str, SasFabricAlias] | None = None,
-) -> SasFabricSnapshot:
+def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> SasFabricSnapshot:
+    system = context.system
+    snapshot = context.snapshot
+    sources = context.sources
+    warnings = context.warnings
+    command_failures = context.command_failures
+    aliases = context.aliases
+    alias_map = context.alias_map
     fabric_warnings = list(warnings or [])
     aliases_by_id = alias_map or _sas_fabric_alias_map(aliases or [])
     platform = normalize_text(system.truenas.platform).lower()
@@ -1585,21 +1142,14 @@ def _build_platform_storage_fabric_snapshot(
             f"No Storage Fabric evidence is available for {platform_label}. "
             "This selection needs platform inventory, slot, block-device, controller, or BMC evidence before a graph can render."
         )
-        return SasFabricSnapshot(
-            available=False,
-            system_id=system.id,
-            system_label=system.label,
-            platform=system.truenas.platform,
-            selected_enclosure_id=snapshot.selected_enclosure_id,
-            selected_enclosure_label=snapshot.selected_enclosure_label,
+        return _build_unavailable_sas_fabric_snapshot(
+            system=system,
+            snapshot=snapshot,
+            fabric_kind=fabric_kind,
             warnings=fabric_warnings,
-            sources=sources or {},
-            aliases=list(aliases or []),
-            raw={
-                "fabric_domain": "storage_fabric",
-                "fabric_kind": fabric_kind,
-                "command_failures": list(command_failures or []),
-            },
+            sources=sources,
+            aliases=aliases,
+            command_failures=command_failures,
         )
 
     nodes: dict[str, SasFabricNode] = {}
@@ -1607,45 +1157,23 @@ def _build_platform_storage_fabric_snapshot(
     traces: dict[str, SasFabricTrace] = {}
     selected_slots = _snapshot_slot_numbers(snapshot.slots)
     selected_disk_slots = _snapshot_disk_slot_numbers(snapshot.slots)
-    add_node(
+    _add_host_node(
         nodes,
-        SasFabricNode(
-            id="host",
-            kind="host",
-            label=system.label or system.id,
-            raw_id=system.id,
-            metrics={
-                "slot_count": len(snapshot.slots),
-                "selected_disk_count": len(selected_disk_slots),
-                "fabric_domain": "storage_fabric",
-                "fabric_kind": fabric_kind,
-            },
-            evidence=["inventory snapshot"],
-            raw={"platform": system.truenas.platform, "fabric_kind": fabric_kind},
-        ),
+        system=system,
+        snapshot=snapshot,
+        metrics={
+            "selected_disk_count": len(selected_disk_slots),
+            "fabric_domain": "storage_fabric",
+            "fabric_kind": fabric_kind,
+        },
+        evidence=_INVENTORY_SNAPSHOT_EVIDENCE,
+        raw={"platform": system.truenas.platform, "fabric_kind": fabric_kind},
     )
 
     controllers_by_name: dict[str, dict[str, Any]] = {}
     paths_by_id: dict[str, dict[str, Any]] = {}
     enclosure_nodes: dict[str, SasFabricNode] = {}
-    backplane_zones = _backplane_zones_for_slots(snapshot.slots)
-    for zone in backplane_zones.values():
-        add_node(
-            nodes,
-            SasFabricNode(
-                id=zone["id"],
-                kind="backplane",
-                label=zone["label"],
-                related_slots=zone["slots"],
-                metrics={
-                    "zone": zone["index"] + 1,
-                    "slot_range": zone["range"],
-                    "slot_count": len(zone["slots"]),
-                },
-                evidence=["profile slot layout"],
-                raw=zone,
-            ),
-        )
+    backplane_zones = _add_backplane_zone_nodes(nodes, snapshot)
 
     for slot in evidence_slots:
         raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
@@ -1706,7 +1234,7 @@ def _build_platform_storage_fabric_snapshot(
             controller_id,
             "host-controller",
             related_slots=slot_numbers,
-            evidence=["inventory snapshot"],
+            evidence=list(_INVENTORY_SNAPSHOT_EVIDENCE),
         )
 
         path = paths_by_id.setdefault(
@@ -1819,7 +1347,7 @@ def _build_platform_storage_fabric_snapshot(
                     "transport_protocol": raw_status.get("transport_protocol") or raw_status.get("esxi_transport"),
                     "fabric_kind": fabric_kind,
                 },
-                evidence=["inventory snapshot"],
+                evidence=list(_INVENTORY_SNAPSHOT_EVIDENCE),
                 raw={
                     "source": route.get("source"),
                     "fabric_kind": fabric_kind,
@@ -1836,7 +1364,7 @@ def _build_platform_storage_fabric_snapshot(
                 "backplane-bay",
                 slot=slot.slot,
                 related_slots=slot_numbers,
-                evidence=["profile slot layout"],
+                evidence=list(_PROFILE_SLOT_LAYOUT_EVIDENCE),
             )
             bay_related_links.append(backplane_link.id)
         enclosure_link = add_link(
@@ -1850,19 +1378,14 @@ def _build_platform_storage_fabric_snapshot(
         )
         bay_related_links.append(enclosure_link.id)
 
-        if slot.pool_name:
-            pool_id = _pool_node_id(slot.pool_name)
-            add_node(nodes, SasFabricNode(id=pool_id, kind="pool", label=slot.pool_name, related_slots=slot_numbers))
-            link = add_link(links, bay_id, pool_id, "bay-pool", slot=slot.slot, related_slots=slot_numbers)
-            bay_related_nodes.append(pool_id)
-            bay_related_links.append(link.id)
-        if slot.vdev_name:
-            vdev_id = _vdev_node_id(slot.vdev_name, slot.pool_name)
-            add_node(nodes, SasFabricNode(id=vdev_id, kind="vdev", label=slot.vdev_name, related_slots=slot_numbers))
-            target_id = _pool_node_id(slot.pool_name) if slot.pool_name else bay_id
-            link = add_link(links, target_id, vdev_id, "pool-vdev", slot=slot.slot, related_slots=slot_numbers)
-            bay_related_nodes.append(vdev_id)
-            bay_related_links.append(link.id)
+        _add_pool_vdev_nodes_and_links(
+            slot=slot,
+            nodes=nodes,
+            links=links,
+            bay_id=bay_id,
+            bay_related_nodes=bay_related_nodes,
+            bay_related_links=bay_related_links,
+        )
 
         traces[bay_id] = SasFabricTrace(
             id=bay_id,
@@ -1908,7 +1431,7 @@ def _build_platform_storage_fabric_snapshot(
                 "source": path.get("source"),
                 "fabric_kind": fabric_kind,
             },
-            evidence=["inventory snapshot"],
+            evidence=list(_INVENTORY_SNAPSHOT_EVIDENCE),
         )
 
     controllers = []
@@ -1926,23 +1449,21 @@ def _build_platform_storage_fabric_snapshot(
     )
     enclosures = [_node_raw_for_payload(node) for node in enclosure_nodes.values()]
     fabric_warnings.append(_storage_fabric_scope_warning(platform_label, fabric_kind))
-    return SasFabricSnapshot(
+    return _build_sas_fabric_result(
         available=True,
-        system_id=system.id,
-        system_label=system.label,
-        platform=system.truenas.platform,
-        selected_enclosure_id=snapshot.selected_enclosure_id,
-        selected_enclosure_label=snapshot.selected_enclosure_label,
-        nodes=sorted(nodes.values(), key=lambda node: (node.kind, node.id)),
-        links=sorted(links.values(), key=lambda link: link.id),
-        traces=sorted(traces.values(), key=lambda trace: trace.id),
-        controllers=sorted(controllers, key=lambda item: str(item.get("name") or "")),
+        system=system,
+        snapshot=snapshot,
+        nodes=nodes,
+        links=links,
+        traces=traces,
+        controllers=controllers,
         expanders=[],
-        enclosures=sorted(enclosures, key=lambda item: str(item.get("id") or "")),
+        enclosures=enclosures,
         paths=paths,
         aliases=list(aliases_by_id.values()),
         warnings=fabric_warnings,
-        sources=sources or {},
+        sources=sources,
+        sort_controllers=True,
         raw={
             "fabric_domain": "storage_fabric",
             "fabric_kind": fabric_kind,
@@ -2020,27 +1541,6 @@ def _canonical_outputs(ssh_outputs: dict[str, str]) -> dict[str, str]:
         if output is not None
     }
 
-
-def _pciconf_bus_address(domain: str, bus: str, slot: str, function: str) -> str:
-    try:
-        return f"{int(domain, 10):04x}:{int(bus, 10):02x}:{int(slot, 10):02x}.{int(function, 10)}"
-    except ValueError:
-        return f"{domain}:{bus}:{slot}.{function}".lower()
-
-
-def _freebsd_pci_location_to_address(location: str) -> str:
-    match = re.match(
-        r"^pci(?P<domain>\d+):(?P<bus>\d+):(?P<slot>\d+):(?P<function>\d+)$",
-        normalize_text(location),
-    )
-    if not match:
-        return normalize_text(location)
-    return _pciconf_bus_address(
-        match.group("domain"),
-        match.group("bus"),
-        match.group("slot"),
-        match.group("function"),
-    )
 
 
 def _pci_inventory_by_controller(
@@ -2486,7 +1986,7 @@ def _quantastor_storage_route(
         "enclosure_kind": enclosure_kind,
         "enclosure_label": snapshot.selected_enclosure_label or selected_label,
         "enclosure_raw_id": ses_device or snapshot.selected_enclosure_id,
-        "enclosure_evidence": ["sg_ses AES/EC"] if ses_device else ["Quantastor REST"],
+        "enclosure_evidence": list(_SG_SES_AES_EVIDENCE) if ses_device else ["Quantastor REST"],
         "enclosure_raw": {
             "source": "quantastor",
             "fabric_kind": fabric_kind,
@@ -2661,7 +2161,7 @@ def _bmc_storage_route(
         "controller_label": "BMC / IPMI",
         "controller_device": raw_status.get("bmc_controller_id") or "ipmi",
         "controller_status": "present" if slot.present else "mapped",
-        "controller_evidence": ["BMC inventory"],
+        "controller_evidence": list(_BMC_INVENTORY_EVIDENCE),
         "controller_raw": {
             "bmc_controller_id": raw_status.get("bmc_controller_id"),
             "bmc_physical_index": raw_status.get("bmc_physical_index"),
@@ -2670,7 +2170,7 @@ def _bmc_storage_route(
         "path_label": path_label,
         "path_state": "present" if slot.present else "mapped",
         "path_type": "bmc-slot",
-        "path_evidence": ["BMC inventory"],
+        "path_evidence": list(_BMC_INVENTORY_EVIDENCE),
         "path_raw": {
             "source": "bmc",
             "fabric_kind": fabric_kind,
@@ -2681,7 +2181,7 @@ def _bmc_storage_route(
         "enclosure_kind": "storage-enclosure",
         "enclosure_label": chassis_label,
         "enclosure_raw_id": snapshot.selected_enclosure_id,
-        "enclosure_evidence": ["BMC inventory"],
+        "enclosure_evidence": list(_BMC_INVENTORY_EVIDENCE),
         "enclosure_raw": {
             "source": "bmc",
             "fabric_kind": fabric_kind,
@@ -3479,13 +2979,6 @@ def _controller_status(counts: dict[str, int]) -> str | None:
     if counts.get("active") or counts.get("passive"):
         return "online"
     return None
-
-
-def _mpr_unit_from_text(value: str | None) -> str | None:
-    if not value:
-        return None
-    match = re.search(r"\bmpr(?P<unit>\d+)\b", value)
-    return match.group("unit") if match else None
 
 
 def _path_state_sort_key(state: str) -> int:
