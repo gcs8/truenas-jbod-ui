@@ -629,14 +629,14 @@ def _display_scsi_status_label(label: str) -> str:
 
 
 def _cdb_fault_family(operation: str) -> str:
+    upper = operation.upper()
+    if upper.startswith("READ CAPACITY"):
+        return "capacity_query"
     direction = _cdb_direction(operation)
     if direction == "write":
         return "write_io"
     if direction == "read":
         return "read_io"
-    upper = operation.upper()
-    if upper.startswith("READ CAPACITY"):
-        return "capacity_query"
     if upper == "LOG SENSE":
         return "log_sense"
     if "PERSISTENT RESERVE" in upper or upper in {

@@ -124,6 +124,8 @@ class SESMapSlot:
     description: str | None = None
     slot_number_source: str | None = None
     slot_number_warning: str | None = None
+    reported_slot_number: int | None = None
+    slot_number_degraded: bool = False
     device_names: list[str] = field(default_factory=list)
     identify_active: bool = False
     serial: str | None = None
@@ -670,6 +672,14 @@ def _device_name_sort_key(name: str) -> tuple[str, str]:
     return natural_name, name
 
 
+def _is_ses_device_slot_type(value: str | None) -> bool:
+    element_type = normalize_text(value)
+    return bool(
+        element_type
+        and re.fullmatch(r"(?:Array\s+)?device slot", element_type, re.IGNORECASE)
+    )
+
+
 def _apply_ses_presence_evidence(
     slot: SESMapSlot,
     present: bool | None,
@@ -770,6 +780,8 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
         existing.slot_number = slot.slot_number
         existing.slot_number_source = slot.slot_number_source
         existing.slot_number_warning = slot.slot_number_warning
+        existing.reported_slot_number = slot.reported_slot_number
+        existing.slot_number_degraded = slot.slot_number_degraded
         existing.description = slot.description or existing.description
         if slot.element_id is not None:
             existing.element_id = slot.element_id
@@ -781,6 +793,14 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
         if incoming_strength == existing_strength:
             existing.slot_number_warning = (
                 existing.slot_number_warning or slot.slot_number_warning
+            )
+            existing.reported_slot_number = (
+                existing.reported_slot_number
+                if existing.reported_slot_number is not None
+                else slot.reported_slot_number
+            )
+            existing.slot_number_degraded = (
+                existing.slot_number_degraded or slot.slot_number_degraded
             )
         existing.control_targets = _merge_control_targets(
             existing.control_targets,
@@ -833,6 +853,114 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
         elif slot_value is not None:
             setattr(existing, attribute, bool(existing_value or slot_value))
 
+
+
+def _demote_repeated_ses_slot_number(
+    enclosure: SESMapEnclosure,
+    slot: SESMapSlot,
+    reported_slot_number: int,
+) -> SESMapSlot:
+    slot.slot_number = -1
+    slot.reported_slot_number = reported_slot_number
+    slot.slot_number_source = "ses_device_slot_number"
+    slot.slot_number_degraded = True
+    slot.slot_number_warning = (
+        f"SES reports device slot number {reported_slot_number} for multiple distinct "
+        f"elements; preserving element {slot.element_id} as unmapped SES evidence."
+    )
+    slot.control_targets = [
+        {
+            "ses_device": slot.ses_device or enclosure.ses_device,
+            "ses_element_id": slot.element_id,
+            "ses_slot_number": None,
+        }
+    ]
+    existing_unmapped = next(
+        (
+            candidate
+            for candidate in enclosure.unmapped_slots
+            if candidate.element_id == slot.element_id
+            and candidate.ses_device == slot.ses_device
+        ),
+        None,
+    )
+    if existing_unmapped is None:
+        enclosure.unmapped_slots.append(slot)
+        return slot
+    if existing_unmapped is not slot:
+        _merge_ses_slot_evidence(existing_unmapped, slot)
+    return existing_unmapped
+
+
+def _stage_ses_device_slot_evidence(
+    evidence: list[SESMapSlot],
+    enclosure: SESMapEnclosure,
+    slot: SESMapSlot,
+    reported_slot_number: int,
+) -> SESMapSlot:
+    slot.slot_number = reported_slot_number
+    slot.reported_slot_number = reported_slot_number
+    slot.slot_number_source = "ses_device_slot_number"
+    slot.control_targets = _merge_control_targets(
+        slot.control_targets,
+        [
+            {
+                "ses_device": slot.ses_device or enclosure.ses_device,
+                "ses_element_id": slot.element_id,
+                "ses_slot_number": reported_slot_number,
+            }
+        ],
+    )
+    evidence.append(slot)
+    return slot
+
+
+def _finalize_ses_device_slot_evidence(
+    enclosure: SESMapEnclosure,
+    evidence: list[SESMapSlot],
+) -> None:
+    grouped: dict[int, list[SESMapSlot]] = {}
+    for slot in evidence:
+        if slot.reported_slot_number is not None:
+            grouped.setdefault(slot.reported_slot_number, []).append(slot)
+
+    for reported_slot_number, slots in grouped.items():
+        distinct_elements = {slot.element_id for slot in slots}
+        if len(distinct_elements) > 2:
+            for slot in slots:
+                _demote_repeated_ses_slot_number(
+                    enclosure,
+                    slot,
+                    reported_slot_number,
+                )
+            continue
+
+        for slot in slots:
+            existing = enclosure.slots.get(reported_slot_number)
+            if (
+                existing is not None
+                and existing.sas_address not in (None, "0")
+                and slot.sas_address not in (None, "0")
+                and existing.sas_address != slot.sas_address
+            ):
+                # Two descriptors for one bay are a supported dual-path shape.
+                # Keep the first nonzero path address as required by #129.
+                slot.sas_address = None
+                slot.sas_address_source = None
+            if (
+                existing is not None
+                and existing.sas_device_type
+                and "no sas device attached" in existing.sas_device_type.lower()
+                and slot.sas_device_type
+                and "no sas device attached" not in slot.sas_device_type.lower()
+            ):
+                existing.sas_device_type = slot.sas_device_type
+            _record_ses_slot(
+                enclosure,
+                slot,
+                reported_slot_number=reported_slot_number,
+                source="ses_device_slot_number",
+            )
 
 
 def _record_ses_slot(
@@ -905,7 +1033,12 @@ def _record_ses_slot(
 
 
 def _record_sg_ses_aes_fallback_slot(enclosure: SESMapEnclosure, slot: SESMapSlot | None) -> None:
-    if slot is None or slot.slot_number >= 0 or slot.element_id is None:
+    if (
+        slot is None
+        or slot.slot_number >= 0
+        or slot.element_id is None
+        or slot.slot_number_degraded
+    ):
         return
     slot.description = slot.description or f"SES element {slot.element_id}"
     _record_ses_slot(
@@ -962,7 +1095,7 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
         if element_match:
             current_slot = None
             in_extra_status = False
-            if "Array Device Slot" in element_match.group("type"):
+            if _is_ses_device_slot_type(element_match.group("type")):
                 current_slot = SESMapSlot(
                     slot_number=-1,
                     element_id=int(element_match.group("element")),
@@ -1118,7 +1251,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     )
     current_slot: SESMapSlot | None = None
     in_array_slots = False
-    duplicate_slot_path = False
+    device_slot_evidence: list[SESMapSlot] = []
 
     for raw_line in output.splitlines():
         line = raw_line.rstrip()
@@ -1132,23 +1265,32 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
 
         if stripped.startswith("Element type:"):
             _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
-            in_array_slots = "Array device slot" in stripped
+            element_type = stripped.split(":", 1)[1].split(",", 1)[0]
+            in_array_slots = _is_ses_device_slot_type(element_type)
             current_slot = None
-            duplicate_slot_path = False
             continue
 
         if not in_array_slots:
             continue
 
-        element_match = re.match(r"Element index:\s*(?P<element>\d+)", stripped)
+        element_match = re.match(
+            r"Element index:\s*(?P<element>\d+)(?:\s+eiioe=(?P<eiioe>\d+))?",
+            stripped,
+            re.IGNORECASE,
+        )
         if element_match:
             _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
+            raw_element_id = int(element_match.group("element"))
+            eiioe = int(element_match.group("eiioe") or 0)
+            element_id = raw_element_id - 1 if eiioe == 1 else raw_element_id
+            if element_id < 0:
+                current_slot = None
+                continue
             current_slot = SESMapSlot(
                 slot_number=-1,
-                element_id=int(element_match.group("element")),
+                element_id=element_id,
                 ses_device=ses_device,
             )
-            duplicate_slot_path = False
             continue
 
         if current_slot is None:
@@ -1184,14 +1326,12 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
         if slot_match:
             reported_slot_number = int(slot_match.group("slot"))
             current_slot.description = f"Slot {reported_slot_number:02d}"
-            parsed_slot = current_slot
-            current_slot = _record_ses_slot(
+            current_slot = _stage_ses_device_slot_evidence(
+                device_slot_evidence,
                 enclosure,
                 current_slot,
-                reported_slot_number=reported_slot_number,
-                source="ses_device_slot_number",
+                reported_slot_number,
             )
-            duplicate_slot_path = current_slot is not parsed_slot
             continue
 
         if stripped.startswith("SAS device type:"):
@@ -1211,13 +1351,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
             if sas_address:
                 incoming_present = sas_address != "0"
-                preserve_existing_path_address = bool(
-                    duplicate_slot_path
-                    and current_slot.sas_address not in (None, "0")
-                    and sas_address != "0"
-                )
-                if not preserve_existing_path_address:
-                    _apply_ses_sas_address_evidence(current_slot, sas_address, "sg_ses_aes")
+                _apply_ses_sas_address_evidence(current_slot, sas_address, "sg_ses_aes")
                 _apply_ses_presence_evidence(current_slot, incoming_present, "sg_ses_aes")
             continue
 
@@ -1245,6 +1379,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             continue
 
     _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
+    _finalize_ses_device_slot_evidence(enclosure, device_slot_evidence)
     if not enclosure.slots and not enclosure.unmapped_slots:
         return None
 
@@ -1280,7 +1415,8 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
             continue
 
         if stripped.startswith("Element type:"):
-            in_array_slots = "Array device slot" in stripped
+            element_type = stripped.split(":", 1)[1].split(",", 1)[0]
+            in_array_slots = _is_ses_device_slot_type(element_type)
             current_slot = None
             continue
 
@@ -1357,6 +1493,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     )
     current_slot: SESMapSlot | None = None
     descriptor_slot_number: int | None = None
+    device_slot_evidence: list[SESMapSlot] = []
 
     for raw_line in output.splitlines():
         stripped = raw_line.strip()
@@ -1385,7 +1522,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             current_slot = None
             descriptor_slot_number = None
             element_type = normalize_text(element_header_match.group("element_type")) or ""
-            if not re.fullmatch(r"(?:Array\s+)?device slot", element_type, re.IGNORECASE):
+            if not _is_ses_device_slot_type(element_type):
                 continue
             element_id = int(element_header_match.group("element"))
             if element_id < 0:
@@ -1421,11 +1558,11 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
         if slot_number_match:
             reported_slot_number = int(slot_number_match.group("slot"))
             current_slot.description = f"Slot {reported_slot_number:02d}"
-            current_slot = _record_ses_slot(
+            current_slot = _stage_ses_device_slot_evidence(
+                device_slot_evidence,
                 enclosure,
                 current_slot,
-                reported_slot_number=reported_slot_number,
-                source="ses_device_slot_number",
+                reported_slot_number,
             )
             descriptor_slot_number = None
             continue
@@ -1466,8 +1603,9 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             reported_slot_number=descriptor_slot_number,
             source="ses_description",
         )
+    _finalize_ses_device_slot_evidence(enclosure, device_slot_evidence)
 
-    if not enclosure.slots:
+    if not enclosure.slots and not enclosure.unmapped_slots:
         return None
 
     _apply_inferred_ses_profile(enclosure)
@@ -1625,6 +1763,7 @@ def _infer_scale_enclosure_profile(
 
 def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclosure]:
     merged: dict[str, SESMapEnclosure] = {}
+    slot_evidence: dict[str, list[SESMapSlot]] = {}
 
     for enclosure in enclosures:
         key: str | None = None
@@ -1656,6 +1795,7 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
                 slot_layout=enclosure.slot_layout,
                 slots={},
             )
+            slot_evidence[key] = []
         target = merged[key]
         target.enclosure_id = target.enclosure_id or enclosure.enclosure_id
         target.enclosure_name = target.enclosure_name or enclosure.enclosure_name
@@ -1665,14 +1805,7 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
         target.layout_rows = target.layout_rows or enclosure.layout_rows
         target.layout_columns = target.layout_columns or enclosure.layout_columns
         target.slot_layout = target.slot_layout or enclosure.slot_layout
-
-        for slot_number, slot in enclosure.slots.items():
-            existing = target.slots.get(slot_number)
-            if existing is None:
-                target.slots[slot_number] = slot
-                continue
-            # Dual-path SAS shelves often expose the same physical slot twice.
-            _merge_ses_slot_evidence(existing, slot)
+        slot_evidence[key].extend(enclosure.slots.values())
 
         for slot in enclosure.unmapped_slots:
             existing_unmapped = next(
@@ -1680,6 +1813,7 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
                     candidate
                     for candidate in target.unmapped_slots
                     if candidate.element_id == slot.element_id
+                    and candidate.ses_device == slot.ses_device
                 ),
                 None,
             )
@@ -1687,6 +1821,31 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
                 target.unmapped_slots.append(slot)
             else:
                 _merge_ses_slot_evidence(existing_unmapped, slot)
+
+    for key, target in merged.items():
+        slots_by_element: list[SESMapSlot] = []
+        element_positions: dict[tuple[str, int], int] = {}
+        for slot in slot_evidence[key]:
+            ses_device = slot.ses_device or target.ses_device or ""
+            identity = (
+                (ses_device, slot.element_id)
+                if slot.element_id is not None
+                else None
+            )
+            if identity is None or identity not in element_positions:
+                if identity is not None:
+                    element_positions[identity] = len(slots_by_element)
+                slots_by_element.append(slot)
+                continue
+            _merge_ses_slot_evidence(slots_by_element[element_positions[identity]], slot)
+
+        for slot in slots_by_element:
+            existing = target.slots.get(slot.slot_number)
+            if existing is None:
+                target.slots[slot.slot_number] = slot
+                continue
+            # Independent SES paths can expose the same physical bay.
+            _merge_ses_slot_evidence(existing, slot)
 
     return list(merged.values())
 
@@ -1805,27 +1964,23 @@ def _degraded_slot_presence(slot: SESMapSlot) -> bool | None:
     return None
 
 
-def _enclosure_sort_key(item: SESMapEnclosure) -> tuple[int, int, int, str, str]:
-    name = (item.enclosure_name or "").lower()
+def _enclosure_sort_key(item: SESMapEnclosure) -> tuple[int, str, str, str, str, str]:
+    label = item.enclosure_label or item.enclosure_name or ""
+    lowered_label = label.casefold()
     priority = 2
-    if "front" in name:
+    if "front" in lowered_label:
         priority = 0
-    elif "rear" in name:
+    elif "rear" in lowered_label:
         priority = 1
-
-    present_slots = sum(
-        1
-        for slot in item.slots.values()
-        if slot.present or slot.device_names or (slot.status and "not installed" not in slot.status.lower())
-    )
-    max_slot = max(item.slots.keys()) if item.slots else 0
+    natural_device, ses_device = _device_name_sort_key(item.ses_device or "")
 
     return (
         priority,
-        -present_slots,
-        -max_slot,
-        item.enclosure_name or "",
+        lowered_label,
+        natural_device,
+        ses_device,
         item.enclosure_id or "",
+        item.enclosure_name or "",
     )
 
 
@@ -2209,6 +2364,8 @@ def build_slot_candidates_from_ses_enclosures(
                 "descriptor": slot.description,
                 "slot_number_source": slot.slot_number_source,
                 "slot_number_warning": warning,
+                "reported_slot_number": slot.reported_slot_number,
+                "slot_number_degraded": slot.slot_number_degraded,
                 "device_names": slot.device_names,
                 "enclosure_id": enclosure.enclosure_id,
                 "enclosure_label": enclosure.enclosure_label,

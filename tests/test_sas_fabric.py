@@ -23,7 +23,7 @@ from app.services.sas_diagnostics.decoder import (
     bound_diagnostic_value,
 )
 from app.services.sas_diagnostics.common import fault_family_likely_layer
-from app.services.sas_diagnostics.scsi import _sense_likely_layer
+from app.services.sas_diagnostics.scsi import _sense_likely_layer, decode_scsi_cdb_message
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.sas_fabric import (
     CORE_DMIDECODE_SLOT_COMMAND,
@@ -75,6 +75,17 @@ class SasDiagnosticLayerTests(unittest.TestCase):
         for family in families:
             with self.subTest(family=family):
                 self.assertEqual(_sense_likely_layer(family), fault_family_likely_layer(family))
+
+    def test_read_capacity_commands_are_capacity_queries_not_read_io(self) -> None:
+        messages = (
+            "READ CAPACITY(10). CDB: 25 00 00 00 00 00 00 00 00 00",
+            "SERVICE ACTION IN(16). CDB: 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00",
+        )
+
+        for message in messages:
+            with self.subTest(message=message):
+                decoded = decode_scsi_cdb_message(message)
+                self.assertEqual(decoded["family"], "capacity_query")
 
 
 MPR_ADAPTERS = """
