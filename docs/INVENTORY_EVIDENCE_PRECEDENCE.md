@@ -35,11 +35,18 @@ BMC, StorCLI, appliance APIs, and vendor tools do not enter the SES merge at an 
 - Equal-strength names are combined without duplicates and sorted by case-insensitive natural device order, so merge input order cannot choose the first disk match.
 - Device names from `enclosure_sysfs` outrank AES, join, `sesutil map`, EC, and `sesutil show` evidence.
 
+### SES element and slot coordinates
+
+- EC `Element N descriptor` values are type-local individual-element coordinates. AES evidence is merged with EC by `(ses_device, element_id)`, not by the device slot number.
+- For the required first Device Slot/Array Device Slot type header, AES `eiioe=1` includes the Enclosure Status overall element. The parser subtracts that one-element offset before correlating with EC or exposing the element control coordinate. `eiioe=0` remains unchanged.
+- The AES `device slot number` remains the physical bay coordinate and the `--dev-slot-num` control target after EC metadata is merged.
+- One or two AES element descriptors may describe a bounded dual-path bay and are merged under the existing evidence rules. More than two distinct elements reporting one device slot number is degraded/systemic numbering evidence. Every affected element is preserved as unmapped evidence with a warning; none is silently collapsed into a physical bay.
+
 ### SAS addresses
 
 - A stronger source replaces a weaker address.
 - Equal-strength, nonzero addresses from independent enclosure evidence are treated as contradictory. Correlation clears the address and sets `sas_address_conflict=true` rather than choosing an input-order winner.
-- Duplicate descriptors inside one AES report represent multiple paths through the same enclosure. The parser keeps the first nonzero path address, while still allowing a later valid path to replace an earlier zero or absent value.
+- Up to two descriptors for one bay inside one AES report represent a bounded dual-path shape. The parser keeps the first nonzero path address, while still allowing a later valid path to replace an earlier zero or absent value.
 
 ### Stored manual mappings
 
