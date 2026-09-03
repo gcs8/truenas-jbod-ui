@@ -10,13 +10,140 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, Callable
 from unittest.mock import patch
 
+from history_service import segment_sealer
 from history_service.segment_sealer import seal_history_segment
 from history_service.store import SCHEMA
 
 
 class SegmentSealerCliTests(unittest.TestCase):
+    def test_sealer_allows_atime_only_source_metadata_change_during_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            output_directory = root / "segments"
+            self._create_source_database(source)
+            receipt = self._seal_with_post_copy_stat(
+                source,
+                output_directory,
+                lambda metadata: self._stat_result_with(
+                    metadata,
+                    st_atime_ns=metadata.st_atime_ns + 1_000_000_000,
+                ),
+            )
+
+            self.assertTrue(Path(receipt["path"]).is_file())
+            self.assertEqual(list(output_directory.glob(".segment-*")), [])
+
+    def test_sealer_rejects_size_only_source_change_during_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            output_directory = root / "segments"
+            self._create_source_database(source)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "History segment source changed while it was being sealed",
+            ):
+                self._seal_with_post_copy_stat(
+                    source,
+                    output_directory,
+                    lambda metadata: self._stat_result_with(
+                        metadata,
+                        st_size=metadata.st_size + 1,
+                    ),
+                )
+
+            self.assertFalse((output_directory / "segment-0001.sqlite3").exists())
+            self.assertEqual(list(output_directory.glob(".segment-*")), [])
+
+    def test_sealer_rejects_mtime_only_source_change_during_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            output_directory = root / "segments"
+            self._create_source_database(source)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "History segment source changed while it was being sealed",
+            ):
+                self._seal_with_post_copy_stat(
+                    source,
+                    output_directory,
+                    lambda metadata: self._stat_result_with(
+                        metadata,
+                        st_mtime_ns=metadata.st_mtime_ns + 1_000_000_000,
+                    ),
+                )
+
+            self.assertFalse((output_directory / "segment-0001.sqlite3").exists())
+            self.assertEqual(list(output_directory.glob(".segment-*")), [])
+
+    def test_sealer_rejects_source_replacement_during_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            output_directory = root / "segments"
+            self._create_source_database(source)
+            original_inode = source.stat().st_ino
+            original_copy_and_prune = segment_sealer._copy_and_prune
+
+            def copy_and_replace(copy_source: Path, destination: Path, cutoff: str) -> dict[str, int]:
+                row_counts = original_copy_and_prune(copy_source, destination, cutoff)
+                replacement = root / "replacement.db"
+                replacement.write_bytes(copy_source.read_bytes())
+                os.replace(replacement, copy_source)
+                return row_counts
+
+            with (
+                patch(
+                    "history_service.segment_sealer._copy_and_prune",
+                    side_effect=copy_and_replace,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "History segment source changed while it was being sealed",
+                ),
+            ):
+                seal_history_segment(
+                    source=source,
+                    output_directory=output_directory,
+                    segment_id="segment-0001",
+                    cutoff="2025-01-02T00:00:00+00:00",
+                    key_id="test-key-1",
+                )
+
+            self.assertNotEqual(source.stat().st_ino, original_inode)
+            self.assertFalse((output_directory / "segment-0001.sqlite3").exists())
+            self.assertEqual(list(output_directory.glob(".segment-*")), [])
+
+    def test_sealer_rejects_ctime_only_source_metadata_change_during_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            output_directory = root / "segments"
+            self._create_source_database(source)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "History segment source changed while it was being sealed",
+            ):
+                self._seal_with_post_copy_stat(
+                    source,
+                    output_directory,
+                    lambda metadata: self._stat_result_with(
+                        metadata,
+                        st_ctime_ns=metadata.st_ctime_ns + 1_000_000_000,
+                    ),
+                )
+
+            self.assertFalse((output_directory / "segment-0001.sqlite3").exists())
+            self.assertEqual(list(output_directory.glob(".segment-*")), [])
+
     def test_sealer_snaps_cutoff_to_the_utc_day_bucket_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -276,3 +403,71 @@ class SegmentSealerCliTests(unittest.TestCase):
                         observed_at,
                     ),
                 )
+
+    @staticmethod
+    def _stat_result_with(
+        metadata: os.stat_result,
+        *,
+        st_atime_ns: int | None = None,
+        st_ino: int | None = None,
+        st_size: int | None = None,
+        st_mtime_ns: int | None = None,
+        st_ctime_ns: int | None = None,
+    ) -> os.stat_result:
+        values = list(metadata)
+        nanoseconds = {
+            "st_atime_ns": metadata.st_atime_ns,
+            "st_mtime_ns": metadata.st_mtime_ns,
+            "st_ctime_ns": metadata.st_ctime_ns,
+        }
+        if st_ino is not None:
+            values[1] = st_ino
+        if st_size is not None:
+            values[6] = st_size
+        if st_atime_ns is not None:
+            values[7] = st_atime_ns / 1_000_000_000
+            nanoseconds["st_atime_ns"] = st_atime_ns
+        if st_mtime_ns is not None:
+            values[8] = st_mtime_ns / 1_000_000_000
+            nanoseconds["st_mtime_ns"] = st_mtime_ns
+        if st_ctime_ns is not None:
+            values[9] = st_ctime_ns / 1_000_000_000
+            nanoseconds["st_ctime_ns"] = st_ctime_ns
+        return os.stat_result(values, nanoseconds)
+
+    def _seal_with_post_copy_stat(
+        self,
+        source: Path,
+        output_directory: Path,
+        transform: Callable[[os.stat_result], os.stat_result],
+    ) -> dict[str, Any]:
+        original_copy_and_prune = segment_sealer._copy_and_prune
+        original_stat = os.stat
+        copy_finished = False
+
+        def copy_and_prune(copy_source: Path, destination: Path, cutoff: str) -> dict[str, int]:
+            nonlocal copy_finished
+            row_counts = original_copy_and_prune(copy_source, destination, cutoff)
+            copy_finished = True
+            return row_counts
+
+        def stat_after_copy(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            metadata = original_stat(path, *args, **kwargs)
+            if copy_finished and Path(path) == source:
+                return transform(metadata)
+            return metadata
+
+        with (
+            patch(
+                "history_service.segment_sealer._copy_and_prune",
+                side_effect=copy_and_prune,
+            ),
+            patch("history_service.segment_sealer.os.stat", side_effect=stat_after_copy),
+        ):
+            return seal_history_segment(
+                source=source,
+                output_directory=output_directory,
+                segment_id="segment-0001",
+                cutoff="2025-01-02T00:00:00+00:00",
+                key_id="test-key-1",
+            )

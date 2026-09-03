@@ -98,6 +98,19 @@ def _require_source_owner(source_metadata: os.stat_result) -> None:
         raise ValueError("History segment publisher must own the hot history database.")
 
 
+def _source_stability_key(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def _require_output_directory(
     output_directory: Path,
     *,
@@ -211,6 +224,7 @@ def seal_history_segment(
     source = source.absolute()
     source_metadata = _require_regular_source(source)
     _require_source_owner(source_metadata)
+    source_stability_key = _source_stability_key(source_metadata)
     output_directory = _prepare_output_directory(output_directory.absolute(), source_metadata)
     destination = output_directory / f"{segment_id}.sqlite3"
     try:
@@ -239,7 +253,7 @@ def seal_history_segment(
         os.close(descriptor)
         descriptor = -1
         row_counts = _copy_and_prune(source, temporary_path, cutoff)
-        if os.stat(source, follow_symlinks=False) != source_metadata:
+        if _source_stability_key(os.stat(source, follow_symlinks=False)) != source_stability_key:
             raise ValueError("History segment source changed while it was being sealed.")
         coverage_start, coverage_end = _segment_coverage(temporary_path)
         size_bytes = temporary_path.stat().st_size
