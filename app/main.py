@@ -64,6 +64,7 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 register_script_json_filters(templates.env)
 
 logger = logging.getLogger(__name__)
+INVALID_MAPPING_BUNDLE_DETAIL = "Mapping bundle is invalid."
 
 
 @dataclass(slots=True)
@@ -683,7 +684,7 @@ def create_app() -> FastAPI:
                 content={
                     "ok": False,
                     "error": "mapping_revision_conflict",
-                    "detail": str(exc),
+                    "detail": MappingRevisionConflict.public_detail,
                     "current_revision": exc.current_revision,
                 },
             )
@@ -745,7 +746,7 @@ def create_app() -> FastAPI:
                 content={
                     "ok": False,
                     "error": "mapping_revision_conflict",
-                    "detail": str(exc),
+                    "detail": MappingRevisionConflict.public_detail,
                     "current_revision": exc.current_revision,
                 },
             )
@@ -779,8 +780,8 @@ def create_app() -> FastAPI:
                 payload,
                 selected_enclosure_id=enclosure_id,
             )
-        except ValueError as exc:
-            return JSONResponse(status_code=422, content={"detail": str(exc)})
+        except ValueError:
+            return JSONResponse(status_code=422, content={"detail": INVALID_MAPPING_BUNDLE_DETAIL})
         return JSONResponse(preview)
 
     @app.post(
@@ -808,7 +809,7 @@ def create_app() -> FastAPI:
                 content={
                     "ok": False,
                     "error": "mapping_revision_conflict",
-                    "detail": str(exc),
+                    "detail": MappingRevisionConflict.public_detail,
                     "current_revision": exc.current_revision,
                 },
             )
@@ -818,13 +819,13 @@ def create_app() -> FastAPI:
                 content={
                     "ok": False,
                     "error": "mapping_import_digest_mismatch",
-                    "detail": str(exc),
+                    "detail": MappingImportDigestMismatch.public_detail,
                     "current_revision": exc.current_revision,
                     "current_import_digest": exc.current_import_digest,
                 },
             )
-        except ValueError as exc:
-            return JSONResponse(status_code=422, content={"detail": str(exc)})
+        except ValueError:
+            return JSONResponse(status_code=422, content={"detail": INVALID_MAPPING_BUNDLE_DETAIL})
         service.invalidate_snapshot_cache(reason="route.import_mappings")
         snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
         return JSONResponse(
