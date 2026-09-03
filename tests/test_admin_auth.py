@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 from pydantic import SecretStr, ValidationError
 from fastapi import HTTPException
+from fastapi.routing import APIRoute
 
 from admin_service.config import AdminSettings, get_admin_settings
 from admin_service.main import (
@@ -213,6 +215,75 @@ class AdminAuthenticationTests(unittest.TestCase):
         metrics_status, _headers, _body = asyncio.run(invoke_asgi(app, "/metrics"))
         self.assertEqual(health_status, 200)
         self.assertEqual(metrics_status, 200)
+
+    def test_basic_auth_wraps_every_privileged_admin_router_endpoint(self) -> None:
+        settings = AdminSettings(
+            auth_mode="basic",
+            auth_username="operator",
+            auth_password=SecretStr(MARKER_ALPHA),
+            auto_stop_seconds=0,
+        )
+        with patch("admin_service.main.get_admin_settings", return_value=settings):
+            app = create_app()
+
+        public_paths = {"/healthz", "/livez", "/metrics"}
+        privileged_routes = [
+            route
+            for route in app.routes
+            if isinstance(route, APIRoute) and route.path not in public_paths
+        ]
+        self.assertGreater(len(privileged_routes), 30)
+        for route in privileged_routes:
+            method = sorted((route.methods or {"GET"}) - {"HEAD", "OPTIONS"})[0]
+            path = re.sub(r"\{[^}]+\}", "synthetic", route.path)
+            with self.subTest(method=method, path=route.path):
+                status, headers, _body = asyncio.run(
+                    invoke_asgi(app, path, method=method)
+                )
+                self.assertEqual(status, 401)
+                self.assertEqual(
+                    headers.get("www-authenticate"),
+                    'Basic realm="truenas-jbod-admin"',
+                )
+
+        static_status, _headers, _body = asyncio.run(
+            invoke_asgi(app, "/static/missing.css")
+        )
+        self.assertEqual(static_status, 401)
+
+    def test_origin_gate_wraps_every_admin_router_mutation(self) -> None:
+        settings = AdminSettings(
+            auth_mode="network",
+            public_origin="http://admin.example.test",
+            auto_stop_seconds=0,
+        )
+        with patch("admin_service.main.get_admin_settings", return_value=settings):
+            app = create_app()
+
+        mutation_methods = {"POST", "PUT", "PATCH", "DELETE"}
+        mutation_routes = [
+            (route, method)
+            for route in app.routes
+            if isinstance(route, APIRoute)
+            for method in sorted((route.methods or set()) & mutation_methods)
+        ]
+        self.assertGreater(len(mutation_routes), 20)
+        for route, method in mutation_routes:
+            path = re.sub(r"\{[^}]+\}", "synthetic", route.path)
+            with self.subTest(method=method, path=route.path):
+                status, _headers, body = asyncio.run(
+                    invoke_asgi(
+                        app,
+                        path,
+                        method=method,
+                        origin="https://attacker.example",
+                    )
+                )
+                self.assertEqual(status, 403)
+                self.assertEqual(
+                    body,
+                    b'{"detail":"Cross-origin admin mutation rejected."}',
+                )
 
     def test_network_boundary_mode_preserves_remote_unauthenticated_contract(self) -> None:
         settings = AdminSettings(auth_mode="network", auto_stop_seconds=0)
