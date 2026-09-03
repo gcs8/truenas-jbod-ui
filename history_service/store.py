@@ -2510,6 +2510,8 @@ class HistoryStore:
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
             return segmented_reader.list_history_system_summaries(normalized_excludes)
+        if not self.file_path.exists():
+            return []
         with closing(self._connect()) as connection:
             return self._list_history_system_summaries(connection, exclude_system_ids=normalized_excludes)
 

@@ -59,6 +59,7 @@ from app.services.snapshot_export import PackagedSnapshotExport
 from app.services.system_setup import PRESERVE_SECRET_SENTINEL
 from history_service.config import HistorySettings
 from history_service.main import app as history_app
+from history_service.store import HistoryStore
 from history_service.system_backup import FileBackupArtifact
 from app.services.truenas_ws import TrueNASRawData
 
@@ -2205,6 +2206,27 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["orphaned_systems"][0]["system_id"], "qs-cryostorage")
         self.assertEqual(payload["valid_system_ids"], ["archive-core"])
         history_store.list_history_system_summaries.assert_called_once_with(["archive-core"])
+
+    def test_list_orphaned_history_route_treats_missing_noninitializing_database_as_empty(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned")
+        settings = Settings(systems=[])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "history" / "history.db"
+            history_store = HistoryStore(
+                str(db_path),
+                recover_unreadable_database=False,
+                initialize=False,
+            )
+
+            with patch("admin_service.main.reload_app_settings", return_value=settings):
+                with patch("admin_service.main.get_history_store", return_value=history_store):
+                    response = asyncio.run(route.endpoint())
+
+            payload = json.loads(response.body.decode("utf-8"))
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(payload["orphaned_systems"], [])
+            self.assertFalse(db_path.exists())
 
     def test_adopt_removed_system_history_route_redacts_inspection_failure_detail(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
