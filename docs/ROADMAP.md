@@ -18,10 +18,6 @@ Detailed execution plans live here:
 - [`docs/V0_9_0_PLAN.md`](./V0_9_0_PLAN.md)
 - [`docs/PROFILE_AUTHORING.md`](./PROFILE_AUTHORING.md)
 
-The old `docs/V0_11_0_PLAN.md` notes are preserved locally under
-`artifacts/deferred-docs/V0_11_0_PLAN.md` for later archaeology instead of
-remaining part of the active docs set.
-
 ## Current Snapshot
 
 `v0.22.1` closed the large file-backed history restore patch. `v0.22.2` shipped
@@ -329,11 +325,6 @@ Primary outcomes:
   workaround can eventually relax
 - optional Quantastor and snapshot-export cleanup if those still look like the
   best next low-risk wins afterward
-
-Current notes:
-
-- `docs/V0_11_0_PLAN.md` (preserved locally under
-  `artifacts/deferred-docs/`)
 
 Current status:
 

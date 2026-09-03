@@ -58,6 +58,15 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertNotIn("issue #119 and draft PR #121 remains", roadmap)
         self.assertNotIn("publication also remains v0.22.3 work", roadmap)
 
+    def test_roadmap_does_not_claim_absent_v011_plan_is_preserved_locally(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
+
+        self.assertNotRegex(
+            roadmap,
+            r"artifacts/deferred-docs/V0_11_0_PLAN\.md|preserved locally",
+        )
+
     def test_unreleased_changelog_records_selected_post_v0222_changes(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
