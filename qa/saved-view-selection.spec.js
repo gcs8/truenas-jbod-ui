@@ -56,119 +56,25 @@ const syntheticRuntime = {
 function buildCurrentSourceFixture() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-saved-view-selection-"));
   const outputPath = path.join(tempDir, "index.html");
+  const runtimePath = path.join(tempDir, "storage-view-runtime.json");
+  const malformedConfigPath = path.join(tempDir, "malformed-config.yaml");
+  fs.writeFileSync(runtimePath, JSON.stringify(syntheticRuntime), "utf8");
+  fs.writeFileSync(malformedConfigPath, "systems: [\n", "utf8");
   const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
-  const script = String.raw`
-import pathlib
-import json
-import sys
-
-from starlette.requests import Request
-
-from app import main as app_main
-from app.config import Settings
-from app.models.domain import InventorySnapshot, StorageViewRuntimePayload
-
-request = Request({
-    "type": "http",
-    "http_version": "1.1",
-    "method": "GET",
-    "scheme": "http",
-    "path": "/",
-    "raw_path": b"/",
-    "query_string": b"",
-    "root_path": "",
-    "headers": [],
-    "client": ("testclient", 50000),
-    "server": ("issue149.test", 80),
-    "app": app_main.app,
-    "router": app_main.app.router,
-})
-snapshot = InventorySnapshot.model_validate({
-    "slots": [{
-        "slot": 0,
-        "slot_label": "00",
-        "row_index": 0,
-        "column_index": 0,
-        "enclosure_id": "enc-a",
-        "enclosure_label": "Live Shelf",
-        "present": True,
-        "state": "healthy",
-        "device_name": "sdx",
-        "serial": "LIVE-SERIAL-0",
-        "model": "Synthetic Disk",
-        "size_human": "1 TB",
-        "gptid": "synthetic-gptid-0",
-        "pool_name": "synthetic-pool",
-        "vdev_name": "mirror-0",
-        "health": "ONLINE",
-        "mapping_source": "manual",
-        "notes": "Saved mapping note",
-    }],
-    "layout_rows": [[0]],
-    "layout_slot_count": 1,
-    "layout_columns": 1,
-    "refresh_interval_seconds": 300,
-    "selected_system_id": "synthetic-system",
-    "selected_system_label": "Synthetic System",
-    "selected_system_platform": "linux",
-    "selected_enclosure_id": "enc-a",
-    "selected_enclosure_label": "Live Shelf",
-    "selected_profile": {
-        "id": "synthetic-profile",
-        "label": "Synthetic Profile",
-        "panel_title": "Live Shelf",
-        "face_style": "generic",
-        "latch_edge": "bottom",
-        "bay_size": "3.5",
-        "rows": 1,
-        "columns": 1,
-        "slot_count": 1,
-        "slot_layout": [[0]],
-    },
-    "systems": [{"id": "synthetic-system", "label": "Synthetic System", "platform": "linux"}],
-    "enclosures": [{
-        "id": "enc-a",
-        "label": "Live Shelf",
-        "raw_label": "Raw Shelf",
-        "alias": "Live Shelf",
-        "profile_id": "synthetic-profile",
-        "rows": 1,
-        "columns": 1,
-        "slot_count": 1,
-        "slot_layout": [[0]],
-    }],
-    "sources": {
-        "api": {"enabled": True, "ok": True, "message": "Synthetic API fixture"},
-        "ssh": {"enabled": False, "ok": True, "message": "SSH disabled for fixture"},
-    },
-    "summary": {
-        "disk_count": 1,
-        "pool_count": 1,
-        "enclosure_count": 1,
-        "mapped_slot_count": 1,
-        "manual_mapping_count": 1,
-        "ssh_slot_hint_count": 0,
-    },
-})
-runtime = StorageViewRuntimePayload.model_validate(json.loads(r'''${JSON.stringify(syntheticRuntime)}'''))
-context = app_main.build_index_context(
-    request=request,
-    snapshot=snapshot,
-    storage_view_runtime=runtime,
-    settings=Settings(),
-    history_configured=False,
-    snapshot_mode=False,
-    initial_selected_slot_json="0",
-)
-html = app_main.templates.get_template("index.html").render(context)
-pathlib.Path(sys.argv[1]).write_text(html, encoding="utf-8")
-`;
-  const result = spawnSync(python, ["-c", script, outputPath], {
-    cwd: repoRoot,
-    encoding: "utf8",
-  });
+  const generatorPath = path.join(repoRoot, "scripts/build_current_source_browser_fixture.py");
+  const result = spawnSync(
+    python,
+    [generatorPath, "--output", outputPath, "--live-mode-runtime", runtimePath],
+    {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: { ...process.env, APP_CONFIG_PATH: malformedConfigPath },
+    }
+  );
   if (result.status !== 0) {
-    throw new Error(`Current-source fixture generation failed:\n${result.stdout}\n${result.stderr}`);
+    const error = new Error(`Current-source fixture generation failed:\n${result.stdout}\n${result.stderr}`);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    throw error;
   }
   return { tempDir, html: fs.readFileSync(outputPath, "utf8") };
 }
@@ -201,7 +107,7 @@ test("saved-view selection protects and then rebinds the real mapping form", asy
     else await dialog.dismiss();
   });
 
-  await page.route("http://issue149.test/**", async (route) => {
+  await page.route("https://synthetic.invalid/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname === "/") {
       await route.fulfill({ status: 200, contentType: "text/html", body: fixture.html });
@@ -238,7 +144,7 @@ test("saved-view selection protects and then rebinds the real mapping form", asy
     await route.fulfill({ status: 404, contentType: "text/plain", body: "not found" });
   });
 
-  await page.goto("http://issue149.test/", { waitUntil: "domcontentloaded" });
+  await page.goto("https://synthetic.invalid/", { waitUntil: "domcontentloaded" });
   await expect(page.locator("#enclosure-select")).toHaveValue("enclosure:enc-a");
   await expect(page.locator('#slot-grid .slot-tile[data-slot="0"]')).toHaveClass(/selected/);
   await expect(page.locator("#detail-slot-title")).toHaveText("Slot 00");
