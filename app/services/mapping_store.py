@@ -58,14 +58,30 @@ class MappingStore:
             return {}
         return loaded
 
-    def get_mapping(self, system_id: str | None, enclosure_id: str | None, slot: int) -> ManualMapping | None:
+    def get_mapping(
+        self,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        allow_legacy_fallback: bool = False,
+    ) -> ManualMapping | None:
         current = self.load_all()
-        return (
-            current.get(self._slot_key(system_id, enclosure_id, slot))
-            or current.get(self._slot_key(system_id, None, slot))
-            or current.get(f"{enclosure_id or 'default'}:{slot}")
-            or current.get(f"default:{slot}")
-        )
+        keys = [self._slot_key(system_id, enclosure_id, slot)]
+        if allow_legacy_fallback:
+            keys.extend((
+                self._slot_key(system_id, None, slot),
+                f"{enclosure_id or 'default'}:{slot}",
+                f"default:{slot}",
+            ))
+        for key in keys:
+            candidate = current.get(key)
+            if candidate is None:
+                continue
+            if not self._mapping_matches_system(key, candidate, system_id):
+                continue
+            return candidate
+        return None
 
     def count_for_system(self, system_id: str | None) -> int:
         mappings = self.load_all()
@@ -113,6 +129,7 @@ class MappingStore:
                 update={"updated_at": datetime.now(timezone.utc)}
             )
             current.pop(f"{mapping.enclosure_id or 'default'}:{mapping.slot}", None)
+            current.pop(f"default:{mapping.slot}", None)
             current[self._slot_key(mapping.system_id, mapping.enclosure_id, mapping.slot)] = saved
             self._write(current)
         return saved

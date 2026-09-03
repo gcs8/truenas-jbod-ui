@@ -3855,6 +3855,9 @@ class InventoryService:
         )
         selected_meta = self._merge_enclosure_meta(ssh_data.ses_selected_meta, api_selected_meta)
         available_enclosures = self._build_enclosure_options(raw_data, ssh_data, selected_meta)
+        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
+            available_enclosures
+        )
         api_enclosure_ids = {
             enclosure_id
             for enclosure_id in (
@@ -3927,7 +3930,12 @@ class InventoryService:
             )
             candidate = dict(slot_candidates.get(slot, {}))
             enclosure_id = selected_meta.get("id") or normalize_text(candidate.get("enclosure_id"))
-            mapping = self.mapping_store.get_mapping(self.system.id, enclosure_id, slot)
+            mapping = self.mapping_store.get_mapping(
+                self.system.id,
+                enclosure_id,
+                slot,
+                allow_legacy_fallback=allow_legacy_mapping_fallback,
+            )
             resolution = self._resolve_disk_for_slot(
                 slot,
                 enclosure_id,
@@ -4193,6 +4201,9 @@ class InventoryService:
         selected_enclosure_id: str | None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         available_enclosures = self._build_linux_enclosure_options()
+        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
+            available_enclosures
+        )
         selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
         if selected_option is None:
             warnings.append("No profile-backed Linux enclosure is configured for this host yet.")
@@ -4272,7 +4283,12 @@ class InventoryService:
                         if key not in {"device_names", "device_hint"} and value is not None
                     }
                 )
-            mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            mapping = self.mapping_store.get_mapping(
+                self.system.id,
+                selected_option.id,
+                slot,
+                allow_legacy_fallback=allow_legacy_mapping_fallback,
+            )
             resolution = self._resolve_disk_for_slot(
                 slot,
                 selected_option.id,
@@ -4329,6 +4345,9 @@ class InventoryService:
                 or self._infer_bmc_profile_id(bmc_inventory) == SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID
             )
             else self._build_esxi_enclosure_options()
+        )
+        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
+            available_enclosures
         )
         selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
         if selected_option is None:
@@ -4471,7 +4490,12 @@ class InventoryService:
                         "esxi_raid_level": disk.raw.get("esxi_raid_level"),
                     }
                 )
-            mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            mapping = self.mapping_store.get_mapping(
+                self.system.id,
+                selected_option.id,
+                slot,
+                allow_legacy_fallback=allow_legacy_mapping_fallback,
+            )
             resolution = DiskResolution(
                 disk=disk,
                 source="storcli-slot" if disk is not None else "unknown",
@@ -4526,6 +4550,9 @@ class InventoryService:
             return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
 
         available_enclosures = self._build_bmc_enclosure_options(bmc_inventory)
+        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
+            available_enclosures
+        )
         selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
         if selected_option is None:
             warnings.append("No profile-backed BMC enclosure is configured for this host yet.")
@@ -4586,7 +4613,12 @@ class InventoryService:
             disk = disks_by_slot.get(mapped_bmc_slot) if isinstance(mapped_bmc_slot, int) else None
             if disk is not None:
                 self._apply_bmc_drive_to_raw_slot_status(raw_slot_status, disk)
-            mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            mapping = self.mapping_store.get_mapping(
+                self.system.id,
+                selected_option.id,
+                slot,
+                allow_legacy_fallback=allow_legacy_mapping_fallback,
+            )
             resolution = DiskResolution(
                 disk=disk,
                 source="bmc-slot" if disk is not None else "unknown",
@@ -4639,6 +4671,9 @@ class InventoryService:
         bmc_inventory: BMCInventory | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, Any], list[list[int | None]], int, int]:
         available_enclosures = self._build_scale_linux_enclosure_options(ssh_data)
+        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
+            available_enclosures
+        )
         selected_option = self._resolve_selected_enclosure_option(available_enclosures, selected_enclosure_id, {})
         if selected_option is None:
             return [], [], {"id": None, "label": None, "name": None}, [], 0, 0
@@ -4736,7 +4771,12 @@ class InventoryService:
 
         for slot in slots_to_render:
             candidate = dict(slot_candidates.get(slot, {}))
-            mapping = self.mapping_store.get_mapping(self.system.id, mapping_enclosure_id, slot)
+            mapping = self.mapping_store.get_mapping(
+                self.system.id,
+                mapping_enclosure_id,
+                slot,
+                allow_legacy_fallback=allow_legacy_mapping_fallback,
+            )
             resolution = self._resolve_disk_for_slot(
                 slot,
                 mapping_enclosure_id,
@@ -4787,6 +4827,9 @@ class InventoryService:
         bmc_inventory: BMCInventory | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
         available_enclosures = self._build_quantastor_enclosure_options(raw_data)
+        allow_legacy_mapping_fallback = self._legacy_mapping_fallback_allowed(
+            available_enclosures
+        )
         preferred_enclosure_id = selected_enclosure_id or self._select_quantastor_default_enclosure_id(
             raw_data,
             available_enclosures,
@@ -4843,7 +4886,12 @@ class InventoryService:
         slot_views: list[SlotView] = []
 
         for slot in range(layout_slot_count):
-            mapping = self.mapping_store.get_mapping(self.system.id, selected_option.id, slot)
+            mapping = self.mapping_store.get_mapping(
+                self.system.id,
+                selected_option.id,
+                slot,
+                allow_legacy_fallback=allow_legacy_mapping_fallback,
+            )
             ses_candidate = quantastor_ses_candidates.get(slot, {})
             slot_hints = {
                 "present": False,
@@ -8252,6 +8300,18 @@ class InventoryService:
         if not option_id:
             return option_id
         return option_id.split("::", 1)[0]
+
+    def _legacy_mapping_fallback_allowed(
+        self,
+        available_enclosures: list[EnclosureOption],
+    ) -> bool:
+        base_enclosure_ids = {
+            base_id
+            for option in available_enclosures
+            if (base_id := self._base_enclosure_id(option.id))
+        }
+        configured_system_count = max(1, len(self.settings.systems))
+        return configured_system_count == 1 and len(base_enclosure_ids) == 1
 
     @staticmethod
     def _enclosure_option_meta(option: EnclosureOption) -> dict[str, str | None]:
