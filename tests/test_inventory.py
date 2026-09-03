@@ -103,6 +103,20 @@ def build_inventory_service(
 
 
 class InventoryHelpersTests(unittest.TestCase):
+    def test_enclosure_meta_merge_delegates_through_inventory_module_binding(self) -> None:
+        delegated = {"delegated": True}
+        with patch("app.services.inventory.merge_enclosure_meta", return_value=delegated) as merge:
+            result = InventoryService._merge_enclosure_meta(
+                {"enclosure_id": "base"},
+                {"enclosure_name": "overlay"},
+            )
+
+        self.assertIs(result, delegated)
+        merge.assert_called_once_with(
+            {"enclosure_id": "base"},
+            {"enclosure_name": "overlay"},
+        )
+
     def test_all_platform_correlators_route_through_shared_scaffolding(self) -> None:
         self.assertTrue(hasattr(inventory_module, "_LayoutFrame"))
         self.assertTrue(hasattr(InventoryService, "_resolve_layout_frame"))

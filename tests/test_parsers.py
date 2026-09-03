@@ -1,9 +1,11 @@
+import inspect
 import json
 import re
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app.services import parsers
 from app.services.parsers import (
     _apply_enclosure_sysfs_device_names,
     _merge_ses_enclosures,
@@ -2749,6 +2751,398 @@ Additional element status diagnostic page:
         # A stronger reported slot number must still win on merge.
         self.assertIs(parsed.slots[0].present, True)
         self.assertEqual(parsed.slots[0].slot_number_source, "ses_device_slot_number")
+
+
+class ParserConsolidationTests(unittest.TestCase):
+    def test_smart_summary_finalizer_preserves_order_and_messages(self) -> None:
+        unavailable = parsers._finalize_summary(
+            {"temperature_c": None, "namespace_nguid": None},
+            "No fields.",
+        )
+        available = parsers._finalize_summary(
+            {"temperature_c": 0, "namespace_nguid": None},
+            "No fields.",
+        )
+
+        self.assertEqual(
+            list(unavailable),
+            ["available", "temperature_c", "namespace_nguid", "message"],
+        )
+        self.assertEqual(unavailable["message"], "No fields.")
+        self.assertFalse(unavailable["available"])
+        self.assertIsNone(available["message"])
+        self.assertTrue(available["available"])
+
+    def test_five_smart_summary_parsers_use_shared_finalizer(self) -> None:
+        for parser in (
+            parsers.parse_smartctl_summary,
+            parsers.parse_nvme_smart_log_summary,
+            parsers.parse_nvme_id_ctrl_summary,
+            parsers.parse_nvme_id_ns_summary,
+            parsers.parse_esxcli_smart_get,
+        ):
+            with self.subTest(parser=parser.__name__):
+                self.assertIn("_finalize_summary(", inspect.getsource(parser))
+
+    def test_smartctl_named_extractors_preserve_waterfall_test_and_phy_values(self) -> None:
+        payload = {
+            "logical_block_size": 512,
+            "power_on_time": {"hours": 1000},
+            "ata_smart_attributes": {
+                "table": [
+                    {"id": 232, "raw": {"value": 90}},
+                    {"id": 241, "raw": {"value": 10}},
+                    {"id": 242, "raw": {"value": 20}},
+                ]
+            },
+            "ata_smart_self_test_log": {
+                "standard": {
+                    "table": [
+                        {
+                            "type": {"string": "Short offline"},
+                            "status": {"string": "Completed without error"},
+                            "lifetime_hours": 990,
+                        }
+                    ]
+                }
+            },
+            "scsi_sas_port_0": {
+                "phy_0": {
+                    "attached_device_type": "no device attached",
+                    "sas_address": "0x5000000000000001",
+                    "attached_sas_address": "0x0",
+                },
+                "phy_1": {
+                    "attached_device_type": "expander device",
+                    "sas_address": "0x5000000000000002",
+                    "attached_sas_address": "0x5000000000000003",
+                    "negotiated_logical_link_rate": "12 Gbps",
+                },
+            },
+        }
+
+        traffic = parsers._extract_smartctl_traffic_and_wear(payload, 1000, 512)
+        latest_test = parsers._extract_smartctl_latest_test(payload)
+        sas_phy = parsers._extract_smartctl_sas_phy(payload)
+
+        self.assertEqual(traffic["available_spare_percent"], 90)
+        self.assertEqual(traffic["bytes_read"], 10240)
+        self.assertEqual(traffic["bytes_written"], 5120)
+        self.assertEqual(traffic["estimated_remaining_bytes_written"], None)
+        self.assertEqual(
+            latest_test,
+            ("Short offline", "Completed without error", 990),
+        )
+        self.assertEqual(
+            sas_phy,
+            ("0x5000000000000002", "0x5000000000000003", "12 Gbps"),
+        )
+
+    def test_ata_iterators_and_enabled_toggle_share_normalization(self) -> None:
+        payload = {
+            "ata_smart_attributes": {
+                "table": [
+                    {"id": 12, "raw": {"value": 7}},
+                    "ignored",
+                ]
+            },
+            "ata_device_statistics": {
+                "pages": [
+                    {"table": [{"name": "Number of Read Commands", "value": 11}]},
+                    {"table": "ignored"},
+                ]
+            },
+        }
+
+        self.assertEqual(
+            list(parsers._iter_ata_attribute_entries(payload)),
+            [{"id": 12, "raw": {"value": 7}}],
+        )
+        self.assertEqual(
+            list(parsers._iter_ata_device_stat_entries(payload)),
+            [{"name": "Number of Read Commands", "value": 11}],
+        )
+        self.assertIs(parsers._parse_enabled_disabled(" Enabled, supported "), True)
+        self.assertIs(parsers._parse_enabled_disabled("DISABLED"), False)
+        self.assertIsNone(parsers._parse_enabled_disabled("unknown"))
+        enrichment = parsers.parse_smartctl_text_enrichment(
+            "Read Cache is: Enabled\n"
+            "Rd look-ahead is: unknown\n"
+            "Writeback Cache is: Enabled\n"
+            "Write cache is: unknown"
+        )
+        self.assertIs(enrichment["read_cache_enabled"], True)
+        self.assertIs(enrichment["writeback_cache_enabled"], True)
+
+    def test_sg_ses_common_field_table_and_helper_cover_only_five_prefixes(self) -> None:
+        self.assertEqual(
+            parsers.SG_SES_COMMON_FIELD_PREFIXES,
+            {
+                "Primary enclosure logical identifier": ("enclosure_id", ":", "hex_text"),
+                "Transport protocol:": ("transport_protocol", ":", "text"),
+                "attached SAS address:": ("attached_sas_address", ":", "hex"),
+                "target port for:": ("target_port_protocol", ":", "text"),
+                "phy identifier:": ("phy_identifier", ":", "text"),
+            },
+        )
+        self.assertEqual(
+            parsers._parse_sg_ses_common_field("attached SAS address: 0x0000ABCD"),
+            ("attached_sas_address", "abcd"),
+        )
+        self.assertEqual(
+            parsers._parse_sg_ses_common_field(
+                "Primary enclosure logical identifier (hex): 5000000000000001"
+            ),
+            ("enclosure_id", "5000000000000001"),
+        )
+        self.assertIsNone(parsers._parse_sg_ses_common_field("SAS address: 0x1234"))
+        self.assertIsNone(parsers._parse_sg_ses_common_field("SAS device type: end device"))
+
+    def test_ec_and_join_share_status_line_helper(self) -> None:
+        for parser in (
+            parsers.parse_sg_ses_enclosure_status,
+            parsers.parse_sg_ses_join_filter,
+        ):
+            with self.subTest(parser=parser.__name__):
+                source = inspect.getsource(parser)
+                self.assertIn("_apply_sg_ses_status_line(", source)
+                self.assertNotIn("slot.status =", source)
+
+    def test_aes_and_join_use_common_field_parser_but_keep_assignment_policies(self) -> None:
+        for parser in (parsers.parse_sg_ses_aes, parsers.parse_sg_ses_join_filter):
+            with self.subTest(parser=parser.__name__):
+                self.assertIn("_parse_sg_ses_common_field(", inspect.getsource(parser))
+
+        aes = parsers.parse_sg_ses_aes(
+            """ExampleCo Shelf 0001
+Element type: Array device slot
+Element index: 0
+Transport protocol: SAS
+Transport protocol: ATA
+number of phys: 1, device slot number: 0
+target port for: SSP
+target port for: SATA_device
+attached SAS address: 0x5000000000000001
+attached SAS address: 0x5000000000000002
+phy identifier: 0x0
+phy identifier: 0x1""",
+            "sg_ses aes /dev/sg7",
+        )
+        joined = parsers.parse_sg_ses_join_filter(
+            """ExampleCo Shelf 0001
+Slot00 [0,0] Element type: Array device slot
+Transport protocol: SAS
+Transport protocol: ATA
+number of phys: 1, device slot number: 0
+target port for: SSP
+target port for: SATA_device
+attached SAS address: 0x5000000000000001
+attached SAS address: 0x5000000000000002
+phy identifier: 0x0
+phy identifier: 0x1""",
+            "sg_ses join /dev/sg7",
+        )
+
+        self.assertIsNotNone(aes)
+        self.assertIsNotNone(joined)
+        assert aes is not None and joined is not None
+        self.assertEqual(aes.slots[0].transport_protocol, "ATA")
+        self.assertEqual(aes.slots[0].target_port_protocol, "SSP")
+        self.assertEqual(aes.slots[0].attached_sas_address, "5000000000000001")
+        self.assertEqual(aes.slots[0].phy_identifier, "0x0")
+        self.assertEqual(joined.slots[0].transport_protocol, "ATA")
+        self.assertEqual(joined.slots[0].target_port_protocol, "SATA_device")
+        self.assertEqual(joined.slots[0].attached_sas_address, "5000000000000002")
+        self.assertEqual(joined.slots[0].phy_identifier, "0x1")
+
+    def test_simple_ssh_command_tables_cover_all_pure_prefix_rows(self) -> None:
+        self.assertEqual(
+            parsers.SIMPLE_SSH_COMMAND_PREFIXES,
+            {
+                ("glabel", ("status",)): "glabel status",
+                ("gmultipath", ("list",)): "gmultipath list",
+                ("sesutil", ("map",)): "sesutil map",
+                ("sesutil", ("show",)): "sesutil show",
+                ("mdadm", ("--detail", "--scan")): "mdadm --detail --scan",
+                ("ubntstorage", ("disk", "inspect")): "ubntstorage disk inspect",
+                ("ubntstorage", ("space", "inspect")): "ubntstorage space inspect",
+            },
+        )
+        self.assertEqual(
+            parsers.CASEFOLDED_SSH_COMMAND_PREFIXES,
+            {
+                ("esxcli", ("storage", "core", "adapter", "list")): "esxcli storage core adapter list",
+                ("esxcli", ("storage", "core", "device", "list")): "esxcli storage core device list",
+                ("esxcli", ("storage", "core", "path", "list")): "esxcli storage core path list",
+                ("esxcli", ("storage", "filesystem", "list")): "esxcli storage filesystem list",
+                ("esxcli", ("storage", "vmfs", "extent", "list")): "esxcli storage vmfs extent list",
+                ("esxcli", ("storage", "san", "sas", "list")): "esxcli storage san sas list",
+                ("esxcli", ("hardware", "pci", "pcipassthru", "list")): "esxcli hardware pci pcipassthru list",
+            },
+        )
+        self.assertEqual(parsers.SIMPLE_SSH_EXECUTABLES, {"lspci": "lspci"})
+        self.assertEqual(
+            parsers.TRAILING_CASEFOLDED_SSH_COMMAND_PREFIXES,
+            {
+                ("nvme", ("list-subsys", "-o", "json")): "nvme list-subsys -o json",
+                ("nvme", ("list", "-o", "json")): "nvme list -o json",
+            },
+        )
+
+    def test_canonicalize_all_simple_command_rows(self) -> None:
+        cases = {
+            "/sbin/glabel status -s": "glabel status",
+            "/sbin/gmultipath list verbose": "gmultipath list",
+            "sudo -n /usr/sbin/sesutil map extra": "sesutil map",
+            "/usr/sbin/sesutil show extra": "sesutil show",
+            "/sbin/mdadm --detail --scan --verbose": "mdadm --detail --scan",
+            "/usr/sbin/ubntstorage disk inspect --json": "ubntstorage disk inspect",
+            "/usr/sbin/ubntstorage space inspect --json": "ubntstorage space inspect",
+            "esxcli STORAGE CORE ADAPTER LIST --formatter csv": "esxcli storage core adapter list",
+            "esxcli storage core device list --device naa.example": "esxcli storage core device list",
+            "esxcli storage core path list --device naa.example": "esxcli storage core path list",
+            "esxcli storage filesystem list --formatter csv": "esxcli storage filesystem list",
+            "esxcli storage vmfs extent list --formatter csv": "esxcli storage vmfs extent list",
+            "esxcli storage san sas list --formatter csv": "esxcli storage san sas list",
+            "esxcli hardware pci pcipassthru list --formatter csv": "esxcli hardware pci pcipassthru list",
+            "/usr/bin/lspci -nn": "lspci",
+            "/sbin/nvme list-subsys -o JSON ignored": "nvme list-subsys -o json",
+            "/sbin/nvme list -o JsOn ignored": "nvme list -o json",
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(canonicalize_ssh_command(command), expected)
+
+    def test_ssh_output_dispatch_table_covers_only_one_to_one_assignments(self) -> None:
+        self.assertEqual(
+            {
+                command: (attribute, parser.__name__)
+                for command, (attribute, parser) in parsers.SSH_OUTPUT_PARSERS.items()
+            },
+            {
+                "glabel status": ("glabel", "parse_glabel_status"),
+                "zpool status -gP": ("zpool_members", "parse_zpool_status"),
+                "lsblk -OJ": ("linux_blockdevices", "parse_lsblk_json"),
+                "mdadm --detail --scan": ("linux_mdadm_arrays", "parse_mdadm_detail_scan"),
+                "nvme list-subsys -o json": ("linux_nvme_subsystems", "parse_nvme_list_subsys_json"),
+                "ubntstorage disk inspect": ("ubntstorage_disks", "parse_ubntstorage_json"),
+                "ubntstorage space inspect": ("ubntstorage_spaces", "parse_ubntstorage_json"),
+                "gpio debug": ("unifi_led_states", "parse_unifi_gpio_debug"),
+                "esxcli storage core adapter list": ("esxi_storage_adapters", "parse_esxcli_table"),
+                "esxcli storage core device list": ("esxi_storage_devices", "parse_esxcli_key_value_sections"),
+                "esxcli storage core path list": ("esxi_storage_paths", "parse_esxcli_key_value_sections"),
+                "esxcli storage filesystem list": ("esxi_filesystems", "parse_esxcli_table"),
+                "esxcli storage vmfs extent list": ("esxi_vmfs_extents", "parse_esxcli_table"),
+                "esxcli storage san sas list": ("esxi_sas_adapters", "parse_esxcli_key_value_sections"),
+                "gmultipath list": ("multipath_info", "parse_gmultipath_list"),
+            },
+        )
+
+    def test_parse_ssh_outputs_uses_dispatch_table_and_shared_camcontrol_loop(self) -> None:
+        with patch.dict(
+            parsers.SSH_OUTPUT_PARSERS,
+            {"synthetic parser": ("linux_blockdevices", lambda output: [{"raw": output}])},
+        ):
+            parsed = parse_ssh_outputs(
+                {
+                    "synthetic parser": "table row",
+                    "camcontrol devlist": "scbus0 on mpr0 bus 0:\n<A First R1> at scbus0 target 0 lun 0 (da0)",
+                    "camcontrol devlist -v": "scbus1 on mpr1 bus 0:\n<B Second R2> at scbus1 target 1 lun 0 (da1)",
+                },
+                slot_count=0,
+                enclosure_filter=None,
+            )
+
+        self.assertEqual(parsed.linux_blockdevices, [{"raw": "table row"}])
+        self.assertEqual(parsed.camcontrol_models, {"da1": "B Second R2"})
+        source = inspect.getsource(parsers.parse_ssh_outputs)
+        self.assertIn("SSH_OUTPUT_PARSERS.items()", source)
+        self.assertEqual(source.count("parse_camcontrol_devlist("), 1)
+
+    def test_control_target_helper_preserves_strict_and_lax_policies(self) -> None:
+        base = [
+            {
+                "ssh_host": " host-a ",
+                "ses_device": "/dev/sg1",
+                "ses_element_id": 4,
+                "ses_slot_number": 5,
+            },
+            {
+                "ssh_host": "host-b",
+                "ses_device": None,
+                "ses_element_id": "raw-element",
+                "ses_slot_number": "raw-slot",
+            },
+        ]
+        overlay = [
+            {
+                "ssh_host": "host-a",
+                "ses_device": "/dev/sg1",
+                "ses_element_id": 4,
+                "ses_slot_number": 99,
+            }
+        ]
+
+        self.assertEqual(
+            parsers._merge_control_targets(base, overlay, strict=True),
+            [
+                {
+                    "ses_device": "/dev/sg1",
+                    "ses_element_id": 4,
+                    "ses_slot_number": 5,
+                    "ssh_host": "host-a",
+                }
+            ],
+        )
+        self.assertEqual(
+            parsers._merge_control_targets(base, overlay, strict=False),
+            [
+                {
+                    "ses_device": "/dev/sg1",
+                    "ses_element_id": 4,
+                    "ses_slot_number": 5,
+                    "ssh_host": "host-a",
+                },
+                {
+                    "ses_device": None,
+                    "ses_element_id": "raw-element",
+                    "ses_slot_number": None,
+                    "ssh_host": "host-b",
+                },
+            ],
+        )
+
+    def test_candidate_map_uses_lax_control_target_policy(self) -> None:
+        merged = merge_slot_candidate_maps(
+            {},
+            {
+                0: {
+                    "ses_targets": [
+                        {
+                            "ssh_host": "host-b",
+                            "ses_device": None,
+                            "ses_element_id": "raw-element",
+                            "ses_slot_number": "raw-slot",
+                        }
+                    ]
+                }
+            },
+        )
+
+        self.assertEqual(
+            merged[0]["ses_targets"],
+            [
+                {
+                    "ses_device": None,
+                    "ses_element_id": "raw-element",
+                    "ses_slot_number": None,
+                    "ssh_host": "host-b",
+                }
+            ],
+        )
+        source = inspect.getsource(parsers.merge_slot_candidate_maps)
+        self.assertIn("_merge_control_targets(", source)
+        self.assertIn("strict=False", source)
 
 
 class DellMd1280ProfileInferenceTests(unittest.TestCase):

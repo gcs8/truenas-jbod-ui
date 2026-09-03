@@ -89,6 +89,7 @@ from app.services.parsers import (
     extract_nvme_controller_name,
     extract_enclosure_slot_candidates,
     format_bytes,
+    merge_enclosure_meta,
     merge_slot_candidate_maps,
     normalize_device_name,
     normalize_gptid,
@@ -10395,14 +10396,7 @@ class InventoryService:
         base: dict[str, Any],
         overlay: dict[str, Any],
     ) -> dict[str, Any]:
-        merged = dict(base)
-        for key, value in overlay.items():
-            if value is None:
-                continue
-            if isinstance(value, str) and not value.strip():
-                continue
-            merged[key] = value
-        return merged
+        return merge_enclosure_meta(base, overlay)
 
     def _lookup_zpool_member(
         self,
