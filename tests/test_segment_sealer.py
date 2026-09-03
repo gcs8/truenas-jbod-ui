@@ -37,7 +37,7 @@ class SegmentSealerCliTests(unittest.TestCase):
             self.assertTrue(Path(receipt["path"]).is_file())
             self.assertEqual(list(output_directory.glob(".segment-*")), [])
 
-    def test_sealer_rejects_size_and_mtime_source_change_during_copy(self) -> None:
+    def test_sealer_rejects_size_only_source_change_during_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             source = root / "history.db"
@@ -54,6 +54,28 @@ class SegmentSealerCliTests(unittest.TestCase):
                     lambda metadata: self._stat_result_with(
                         metadata,
                         st_size=metadata.st_size + 1,
+                    ),
+                )
+
+            self.assertFalse((output_directory / "segment-0001.sqlite3").exists())
+            self.assertEqual(list(output_directory.glob(".segment-*")), [])
+
+    def test_sealer_rejects_mtime_only_source_change_during_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            output_directory = root / "segments"
+            self._create_source_database(source)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "History segment source changed while it was being sealed",
+            ):
+                self._seal_with_post_copy_stat(
+                    source,
+                    output_directory,
+                    lambda metadata: self._stat_result_with(
+                        metadata,
                         st_mtime_ns=metadata.st_mtime_ns + 1_000_000_000,
                     ),
                 )
