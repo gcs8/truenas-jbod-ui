@@ -508,6 +508,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip check
+
       - name: Verify checked-in public demo is publishable
         run: python scripts/check_public_demo_artifact.py public-demo
 

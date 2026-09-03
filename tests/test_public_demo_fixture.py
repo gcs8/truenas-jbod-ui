@@ -166,6 +166,53 @@ class PublicDemoBuildScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--output", result.stderr)
 
+    def test_current_source_browser_fixture_ignores_malformed_operator_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            malformed_config = Path(temp_dir) / "malformed.yaml"
+            malformed_config.write_text("systems: [\n", encoding="utf-8")
+            malformed_output = Path(temp_dir) / "malformed-config.html"
+            clean_output = Path(temp_dir) / "clean-env.html"
+            malformed_env = os.environ.copy()
+            malformed_env["APP_CONFIG_PATH"] = str(malformed_config)
+            clean_env = os.environ.copy()
+            clean_env.pop("APP_CONFIG_PATH", None)
+
+            malformed_result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/build_current_source_browser_fixture.py",
+                    "--output",
+                    str(malformed_output),
+                ],
+                cwd=ROOT,
+                env=malformed_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            clean_result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/build_current_source_browser_fixture.py",
+                    "--output",
+                    str(clean_output),
+                ],
+                cwd=ROOT,
+                env=clean_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(malformed_result.returncode, 0, malformed_result.stderr)
+            self.assertNotIn("Traceback", malformed_result.stderr)
+            self.assertEqual(clean_result.returncode, 0, clean_result.stderr)
+            self.assertEqual(malformed_output.read_bytes(), clean_output.read_bytes())
+            self.assertIn(
+                "current-source-browser-fixture",
+                malformed_output.read_text(encoding="utf-8"),
+            )
+
     def test_current_source_browser_fixture_is_deterministic_and_inlines_candidate_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             first_path = Path(temp_dir) / "first.html"

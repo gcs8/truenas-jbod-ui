@@ -16,15 +16,7 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflows/publish-public-demo.yml"
-      - "app/services/snapshot_export.py"
-      - "app/static/app.js"
-      - "app/static/style.css"
-      - "app/templates/**"
       - "public-demo/**"
-      - "qa/public-demo.spec.js"
-      - "scripts/build_current_source_browser_fixture.py"
-      - "scripts/check_public_demo_artifact.py"
   workflow_dispatch:
 
 permissions:
@@ -48,6 +40,11 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip check
 
       - name: Check publishable artifact
         run: python scripts/check_public_demo_artifact.py public-demo

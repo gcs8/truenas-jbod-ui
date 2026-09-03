@@ -182,6 +182,45 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("${{ github.event.release.tag_name }}", prep_step["run"])
         self.assertIn('release_tag="$RELEASE_TAG"', prep_step["run"])
 
+    def test_current_source_fixture_jobs_install_runtime_requirements_before_generation(self) -> None:
+        jobs = (
+            (CI_WORKFLOW, "public-demo-artifact"),
+            (PUBLISH_PUBLIC_DEMO_WORKFLOW, "verify"),
+        )
+        for workflow_path, job_name in jobs:
+            with self.subTest(workflow=workflow_path.name, job=job_name):
+                workflow = yaml.safe_load(self.read(workflow_path))
+                steps = workflow["jobs"][job_name]["steps"]
+                setup_index = next(
+                    index
+                    for index, step in enumerate(steps)
+                    if str(step.get("uses", "")).startswith("actions/setup-python@")
+                )
+                install_index = next(
+                    index
+                    for index, step in enumerate(steps)
+                    if "python -m pip install -r requirements.txt" in str(step.get("run", ""))
+                )
+                generator_index = next(
+                    index
+                    for index, step in enumerate(steps)
+                    if "python scripts/build_current_source_browser_fixture.py" in str(step.get("run", ""))
+                )
+
+                self.assertLess(setup_index, install_index)
+                self.assertLess(install_index, generator_index)
+                self.assertNotIn("requirements-dev.txt", str(steps[install_index].get("run", "")))
+
+    def test_public_demo_publish_push_trigger_requires_checked_in_artifact_change(self) -> None:
+        workflow = yaml.safe_load(self.read(PUBLISH_PUBLIC_DEMO_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+
+        self.assertIn(".github/workflows/publish-public-demo.yml", triggers["pull_request"]["paths"])
+        self.assertIn("scripts/build_current_source_browser_fixture.py", triggers["pull_request"]["paths"])
+        self.assertEqual(triggers["push"]["branches"], ["main"])
+        self.assertEqual(triggers["push"]["paths"], ["public-demo/**"])
+        self.assertIn("workflow_dispatch", triggers)
+
     def test_public_demo_artifact_and_browser_smoke_remain_in_ci(self) -> None:
         spec = self.read(PUBLIC_DEMO_SPEC)
         self.assertNotIn("test.skip", spec)

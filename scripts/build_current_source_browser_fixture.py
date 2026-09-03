@@ -7,6 +7,7 @@ import hashlib
 from pathlib import Path
 import sys
 
+from fastapi.templating import Jinja2Templates
 from starlette.datastructures import URLPath
 from starlette.requests import Request
 
@@ -16,7 +17,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config import Settings  # noqa: E402
-from app.main import templates  # noqa: E402
 from app.models.domain import (  # noqa: E402
     EnclosureOption,
     EnclosureProfileView,
@@ -27,11 +27,14 @@ from app.models.domain import (  # noqa: E402
     SourceStatus,
     SystemOption,
 )
+from app.script_json import register_script_json_filters  # noqa: E402
 from app.services.history_backend import HistoryBackendClient  # noqa: E402
 from app.services.snapshot_export import SnapshotExportService  # noqa: E402
 
 
 FIXTURE_GENERATED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
+TEMPLATES = Jinja2Templates(directory=str(ROOT / "app" / "templates"))
+register_script_json_filters(TEMPLATES.env)
 
 
 def build_synthetic_snapshot() -> InventorySnapshot:
@@ -137,7 +140,7 @@ def build_fixture_request() -> Request:
 
 async def build_fixture_html() -> str:
     settings = Settings()
-    exporter = SnapshotExportService(settings, HistoryBackendClient(settings.history), templates)
+    exporter = SnapshotExportService(settings, HistoryBackendClient(settings.history), TEMPLATES)
     rendered = await exporter.build_enclosure_snapshot_html(
         request=build_fixture_request(),
         snapshot=build_synthetic_snapshot(),
