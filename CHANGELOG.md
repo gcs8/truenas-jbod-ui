@@ -1,6 +1,11 @@
 # Changelog
 
-## v0.22.2 - 2026-08-31
+## Unreleased
+
+Development has resumed on `main` after `v0.22.2`. Changes recorded here are
+not part of that published tag.
+
+## v0.22.2 - 2026-09-01
 
 - Added bounded segmented history with one writable hot SQLite database,
   immutable digest-checked segments, segment-aware reads, recoverable migration

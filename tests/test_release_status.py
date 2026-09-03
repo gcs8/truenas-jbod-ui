@@ -16,6 +16,8 @@ class ReleaseStatusTests(unittest.TestCase):
         package = json.loads((repository / "package.json").read_text(encoding="utf-8"))
         package_lock = json.loads((repository / "package-lock.json").read_text(encoding="utf-8"))
         changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
+        roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
+        wiki_home = (repository / "wiki" / "Home.md").read_text(encoding="utf-8")
         release_notes = (repository / "docs" / "RELEASE_NOTES_0.22.2.md").read_text(encoding="utf-8")
 
         from app import __version__
@@ -24,9 +26,20 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertEqual(package["version"], "0.22.2")
         self.assertEqual(package_lock["version"], "0.22.2")
         self.assertEqual(package_lock["packages"][""]["version"], "0.22.2")
-        self.assertIn("## v0.22.2 - 2026-08-31", changelog)
+        self.assertIn("## Unreleased", changelog)
+        self.assertLess(changelog.index("## Unreleased"), changelog.index("## v0.22.2"))
+        self.assertIn("## v0.22.2 - 2026-09-01", changelog)
         self.assertIn("# Release Notes - v0.22.2", release_notes)
         self.assertIn("issue #124", release_notes)
+
+        release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2"
+        for current_doc in (roadmap, wiki_home):
+            with self.subTest(document=current_doc[:40]):
+                self.assertIn("v0.22.2", current_doc)
+                self.assertIn("latest published release", current_doc)
+                self.assertIn("2026-09-01", current_doc)
+                self.assertIn(release_url, current_doc)
+                self.assertNotIn("v0.22.1` is the latest published release", current_doc)
 
     def test_describe_release_status_reports_update_available_for_older_build(self) -> None:
         status, summary = describe_release_status("0.14.0", "v0.14.1")

@@ -116,10 +116,10 @@ setup notes.
 
 ## Current Version
 
-`0.22.2` is the current maintenance candidate. It adds bounded segmented
-history, encrypted schema-v2 FULL backup and restore, scheduled-backup-gated hot
-retention, and the immutable deployment staging fix. `0.22.1` is the latest
-published release until the v0.22.2 release gates pass.
+`v0.22.2` is the latest published release, published on 2026-09-01. It adds
+bounded segmented history, encrypted schema-v2 FULL backup and restore,
+scheduled-backup-gated hot retention, and the immutable deployment staging fix.
+See the [GitHub release](https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2).
 
 The public demo from `0.19.0` remains a static GitHub Pages sample data
 experience, not a hosted copy of the live Docker app. Open

@@ -57,6 +57,15 @@ python scripts/build_perf_baseline.py --check
 
 Review fixture and baseline changes together. Do not raise a ceiling only to make CI pass. Explain why the payload or cache contract changed and retain useful headroom.
 
-## Deferred work
+## Active performance semantics
 
-Issue #36 owns zero-rebuild slot selection and focus preservation. Issue #55 owns parser and SAS diagnostic payload budgets. Issues #48 and #56 own browser history-cache and refresh behavior. This budget suite must not add permissive baselines for those unfinished paths.
+- Selection and focus updates must not rebuild a stable enclosure grid.
+- Parser and SAS diagnostic payloads remain bounded before they reach API,
+  browser, or diagnostic surfaces.
+- Browser history caches remain bounded by age, entry count, and bytes.
+- Refresh paths preserve cached state while it is valid and invalidate only the
+  affected scope.
+
+The deterministic baseline above covers its named inventory, history, export,
+query, and cache metrics. Other performance-sensitive paths require focused
+contract tests and measured limits rather than permissive placeholder baselines.

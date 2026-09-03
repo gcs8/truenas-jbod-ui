@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from scripts.validate_release_wrap import REQUIRED_GATES, validate_release_wrap_text
 
@@ -21,6 +22,24 @@ def _wrap_with_rows(rows: dict[str, tuple[str, str, str, str]]) -> str:
 
 
 class ReleaseWrapValidatorTests(unittest.TestCase):
+    def test_v0222_final_release_wrap_is_complete(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        text = (repository / "docs" / "RELEASE_WRAP_0.22.2.md").read_text(encoding="utf-8")
+
+        self.assertEqual(validate_release_wrap_text(text), [])
+        for marker in (
+            "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2",
+            "https://github.com/gcs8/truenas-jbod-ui/actions/runs/33505635256",
+            "6473d05f46d8344146cbbd7d0cdbf44487613a3c",
+            "sha256:4bfa37a4c40a058055aef384194f98248722eca25f7fb429d6a5a34446d647a7",
+            "Development resumed on `main` after the tag",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, text)
+
+        self.assertNotIn("Tag: `v0.22.2` pending", text)
+        self.assertNotIn("Release candidate commit: pending", text)
+
     def test_accepts_complete_release_wrap_evidence_table(self) -> None:
         issues = validate_release_wrap_text(_wrap_with_rows({}))
 

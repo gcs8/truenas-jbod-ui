@@ -287,17 +287,19 @@ class ModeledPerfFixtureTests(unittest.TestCase):
             "wall-clock durations are report-only",
             "python scripts/build_perf_baseline.py --check",
             "python scripts/build_perf_baseline.py --write",
-            "#36",
-            "#55",
-            "#48",
-            "#56",
             "shared 32 mib",
             "oversized entries are returned but not cached",
             "snapshot_export_cache_bytes",
             "python scripts/benchmark_snapshot_export_cache.py",
+            "selection and focus updates must not rebuild",
+            "parser and sas diagnostic payloads remain bounded",
+            "browser history caches remain bounded",
+            "refresh paths preserve cached state",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, documentation)
+
+        self.assertIsNone(re.search(r"#(?:36|48|55|56)\b", documentation))
 
     def test_report_only_snapshot_export_cache_benchmark_uses_modeled_fixture(self) -> None:
         result = subprocess.run(
