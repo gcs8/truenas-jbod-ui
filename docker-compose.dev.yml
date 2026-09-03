@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        SOURCE_COMMIT: ${SOURCE_COMMIT:-unknown}
     container_name: truenas-jbod-ui
     user: "${APP_UID:-10001}:${APP_GID:-10001}"
     read_only: true
@@ -27,7 +29,7 @@ services:
       ADMIN_AUTH_PASSWORD: ${ADMIN_AUTH_PASSWORD:-}
       SCHEDULED_BACKUP_STATUS_FILE: ${SCHEDULED_BACKUP_STATUS_FILE:-}
     ports:
-      - "${APP_PORT:-8080}:8000"
+      - "${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8080}:8000"
     volumes:
       - ./config:/app/config:ro
       - ./data:/app/data
@@ -43,6 +45,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        SOURCE_COMMIT: ${SOURCE_COMMIT:-unknown}
     container_name: truenas-jbod-history
     user: "${APP_UID:-10001}:${APP_GID:-10001}"
     read_only: true
@@ -112,6 +116,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        SOURCE_COMMIT: ${SOURCE_COMMIT:-unknown}
     container_name: truenas-jbod-admin
     user: "0:${APP_GID:-10001}"
     read_only: true
@@ -135,6 +141,7 @@ services:
       HISTORY_LONG_TERM_BACKUP_DIR: ${HISTORY_LONG_TERM_BACKUP_DIR:-/app/history/backups/long-term}
       ADMIN_PORT: 8002
       ADMIN_BIND_ADDRESS: ${ADMIN_BIND_ADDRESS:-0.0.0.0}
+      ADMIN_PUBLIC_ORIGIN: ${ADMIN_PUBLIC_ORIGIN:-}
       ADMIN_AUTO_STOP_SECONDS: ${ADMIN_AUTO_STOP_SECONDS:-3600}
       ADMIN_CONTAINER_UI_NAME: truenas-jbod-ui
       ADMIN_CONTAINER_HISTORY_NAME: truenas-jbod-history
@@ -167,6 +174,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        SOURCE_COMMIT: ${SOURCE_COMMIT:-unknown}
     command: ["python", "-m", "history_service.scheduled_backup_main"]
     user: "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}"
     read_only: true

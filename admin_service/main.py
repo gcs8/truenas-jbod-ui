@@ -228,6 +228,7 @@ def get_history_store() -> HistoryStore:
         history_settings.sqlite_path,
         recover_unreadable_database=False,
         segment_catalog_path=history_settings.segment_catalog_path,
+        initialize=False,
     )
 
 
@@ -605,6 +606,36 @@ def create_app() -> FastAPI:
         except Exception:
             artifact.cleanup()
             raise
+
+    @app.post("/api/admin/backup/inspect")
+    async def inspect_backup(request: Request) -> JSONResponse:
+        archive_path = await stream_limited_request_body_to_file(
+            request,
+            body_description="Backup inspection",
+        )
+        try:
+            if archive_path.stat().st_size == 0:
+                raise HTTPException(status_code=400, detail="Backup inspection request body was empty.")
+            try:
+                passphrase = decode_optional_secret_header(
+                    request.headers.get("X-Backup-Passphrase-Base64")
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if passphrase is None:
+                passphrase = request.headers.get("X-Backup-Passphrase") or None
+            try:
+                result = await asyncio.to_thread(
+                    get_backup_service().inspect_bundle_file,
+                    archive_path,
+                    passphrase=passphrase,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return JSONResponse(result)
+        finally:
+            archive_path.unlink(missing_ok=True)
+            archive_path.parent.rmdir()
 
     @app.post("/api/admin/backup/import")
     async def import_backup(

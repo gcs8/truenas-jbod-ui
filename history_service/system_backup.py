@@ -37,9 +37,18 @@ except ImportError:  # pragma: no cover - exercised in runtime validation instea
     zstd = None
 
 from app import __version__
-from app.config import EnclosureProfileConfig, Settings, _derive_runtime_layout_paths, get_settings
+from app.config import (
+    EnclosureProfileConfig,
+    Settings,
+    _deep_merge,
+    _derive_runtime_layout_paths,
+    _normalize_systems,
+    get_settings,
+)
 from app.models.domain import ManualMapping, SasFabricAlias
+from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailCacheEntry
+from app.services.storage_views import resolve_system_storage_views
 from history_service.config import HistorySettings
 from history_service.segment_catalog import (
     HISTORY_SEGMENT_GROUP_KEY,
@@ -1702,6 +1711,258 @@ class SystemBackupService:
         except Exception:
             artifact.cleanup()
             raise
+
+    def _inspection_file_payload(
+        self,
+        manifest: dict[str, Any],
+        extracted: dict[str, ExtractedMember],
+        group_entries: dict[str, dict[str, Any]],
+        group_key: str,
+    ) -> bytes | None:
+        group = group_entries.get(group_key)
+        if (
+            not self._manifest_group_selected(group)
+            or not self._manifest_group_present(group)
+        ):
+            return None
+        member = self._first_group_member(manifest, group_key)
+        if member is None:
+            return None
+        return self._extracted_member_bytes(extracted[member["key"]])
+
+    @staticmethod
+    def _inspection_history_member_counts(
+        content: ExtractedMember,
+        *,
+        include_tracked_slots: bool,
+    ) -> dict[str, int]:
+        temporary_path: Path | None = None
+        try:
+            if isinstance(content, bytes):
+                descriptor, raw_path = tempfile.mkstemp(
+                    prefix="truenas-jbod-ui-inspect-history-",
+                    suffix=".sqlite3",
+                )
+                temporary_path = Path(raw_path)
+                with os.fdopen(descriptor, "wb") as output:
+                    output.write(content)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.chmod(temporary_path, 0o600)
+                resolved_path = temporary_path
+            else:
+                resolved_path = content.resolve(strict=True)
+            connection = sqlite3.connect(
+                f"file:{resolved_path}?mode=ro&immutable=1",
+                uri=True,
+            )
+            with closing(connection):
+                return {
+                    "tracked_slots": (
+                        int(
+                            connection.execute(
+                                "SELECT COUNT(*) FROM slot_state_current"
+                            ).fetchone()[0]
+                        )
+                        if include_tracked_slots
+                        else 0
+                    ),
+                    "event_count": int(
+                        connection.execute("SELECT COUNT(*) FROM slot_events").fetchone()[0]
+                    ),
+                    "metric_sample_count": int(
+                        connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0]
+                    ),
+                    "metric_rollup_count": int(
+                        connection.execute("SELECT COUNT(*) FROM metric_rollups").fetchone()[0]
+                    ),
+                }
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    def _inspection_aggregate_counts(
+        self,
+        manifest: dict[str, Any],
+        extracted: dict[str, ExtractedMember],
+        group_entries: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        config_content = self._inspection_file_payload(
+            manifest, extracted, group_entries, CONFIG_FILE_KEY
+        )
+        runtime_overrides_content = self._inspection_file_payload(
+            manifest, extracted, group_entries, RUNTIME_OVERRIDES_FILE_KEY
+        )
+        profiles_content = self._inspection_file_payload(
+            manifest, extracted, group_entries, PROFILE_FILE_KEY
+        )
+        mapping_content = self._inspection_file_payload(
+            manifest, extracted, group_entries, MAPPING_FILE_KEY
+        )
+        alias_content = self._inspection_file_payload(
+            manifest, extracted, group_entries, SAS_FABRIC_ALIAS_FILE_KEY
+        )
+        slot_detail_content = self._inspection_file_payload(
+            manifest, extracted, group_entries, SLOT_DETAIL_FILE_KEY
+        )
+
+        system_count: int | None = None
+        storage_view_count: int | None = None
+        if config_content is not None:
+            merged_config = _deep_merge(
+                Settings().model_dump(),
+                self._load_yaml_mapping(config_content),
+            )
+            if runtime_overrides_content is not None:
+                merged_config = _deep_merge(
+                    merged_config,
+                    self._load_yaml_mapping(runtime_overrides_content),
+                )
+            if profiles_content is not None:
+                profile_payload = yaml.safe_load(profiles_content.decode("utf-8")) or {}
+                inspected_profiles = (
+                    profile_payload
+                    if isinstance(profile_payload, list)
+                    else profile_payload.get("profiles")
+                    if isinstance(profile_payload, dict)
+                    else []
+                )
+                merged_config["profiles"] = [
+                    *(merged_config.get("profiles") or []),
+                    *(inspected_profiles or []),
+                ]
+            inspected_settings = _normalize_systems(Settings.model_validate(merged_config))
+            profile_registry = ProfileRegistry(inspected_settings)
+            system_count = len(inspected_settings.systems)
+            storage_view_count = sum(
+                len(resolve_system_storage_views(system, profile_registry))
+                for system in inspected_settings.systems
+            )
+
+        profile_count: int | None = None
+        if profiles_content is not None:
+            profile_payload = yaml.safe_load(profiles_content.decode("utf-8")) or {}
+            profiles = (
+                profile_payload
+                if isinstance(profile_payload, list)
+                else profile_payload.get("profiles")
+                if isinstance(profile_payload, dict)
+                else None
+            )
+            profile_count = len(profiles) if isinstance(profiles, list) else 0
+
+        def json_entry_count(content: bytes | None, key: str) -> int | None:
+            if content is None:
+                return None
+            entries = self._load_json_mapping(content).get(key)
+            return len(entries) if isinstance(entries, dict) else 0
+
+        history_counts: dict[str, int] | None = None
+        history_group = group_entries.get(HISTORY_DB_KEY)
+        if (
+            self._manifest_group_selected(history_group)
+            and self._manifest_group_present(history_group)
+        ):
+            history_member = self._first_group_member(manifest, HISTORY_DB_KEY)
+            if history_member is not None:
+                history_counts = self._inspection_history_member_counts(
+                    extracted[history_member["key"]],
+                    include_tracked_slots=True,
+                )
+                history_catalog = manifest.get("history_catalog")
+                segments = (
+                    history_catalog.get("segments")
+                    if isinstance(history_catalog, dict)
+                    else []
+                )
+                for segment in segments or []:
+                    if not isinstance(segment, dict):
+                        continue
+                    member_key = segment.get("member_key")
+                    if not isinstance(member_key, str) or member_key not in extracted:
+                        continue
+                    segment_counts = self._inspection_history_member_counts(
+                        extracted[member_key],
+                        include_tracked_slots=False,
+                    )
+                    for key, value in segment_counts.items():
+                        history_counts[key] += value
+
+        def directory_member_count(group_key: str) -> int | None:
+            group = group_entries.get(group_key)
+            if not self._manifest_group_selected(group):
+                return None
+            if not self._manifest_group_present(group):
+                return 0
+            return len(self._group_members(manifest, group_key))
+
+        return {
+            "systems": system_count,
+            "profiles": profile_count,
+            "storage_views": storage_view_count,
+            "mappings": json_entry_count(mapping_content, "slot_mappings"),
+            "sas_fabric_aliases": json_entry_count(alias_content, "sas_fabric_aliases"),
+            "slot_details": json_entry_count(slot_detail_content, "slot_details"),
+            "ssh_keys": directory_member_count(SSH_KEYS_KEY),
+            "tls_files": directory_member_count(TLS_TRUST_KEY),
+            "known_hosts": directory_member_count(KNOWN_HOSTS_KEY),
+            "history": history_counts,
+        }
+
+    def inspect_bundle_file(
+        self,
+        archive_path: str | Path,
+        *,
+        passphrase: str | None = None,
+    ) -> dict[str, Any]:
+        manifest, extracted, detected_packaging, archive_meta = self._read_archive_file(
+            Path(archive_path),
+            passphrase=passphrase,
+        )
+        cleanup_root = archive_meta.pop("_cleanup_root", None)
+        try:
+            group_entries = self._manifest_group_entries(manifest)
+            selected_groups = [
+                key
+                for key, entry in group_entries.items()
+                if self._manifest_group_selected(entry)
+            ]
+            present_groups = [
+                key
+                for key in selected_groups
+                if self._manifest_group_present(group_entries.get(key))
+            ]
+            absent_groups = [
+                key
+                for key in selected_groups
+                if not self._manifest_group_present(group_entries.get(key))
+            ]
+            self._validate_manifest_member_metadata(manifest, extracted)
+            self._preflight_selected_group_members(manifest, group_entries, extracted)
+            self._preflight_import_members(manifest, group_entries, extracted)
+            return {
+                "ok": True,
+                "schema_version": manifest.get("schema_version"),
+                "app_version": manifest.get("app_version"),
+                "exported_at": manifest.get("exported_at"),
+                "encrypted": bool(archive_meta.get("encrypted")),
+                "packaging": manifest.get("packaging") or detected_packaging,
+                "selected_groups": selected_groups,
+                "present_groups": present_groups,
+                "absent_groups": absent_groups,
+                "member_count": len(extracted),
+                "total_uncompressed_bytes": sum(
+                    self._extracted_member_size(content)
+                    for content in extracted.values()
+                ),
+                "aggregate_counts": self._inspection_aggregate_counts(
+                    manifest,
+                    extracted,
+                    group_entries,
+                ),
+            }
+        finally:
+            self._cleanup_extracted_archive(cleanup_root)
 
     def preflight_scheduled_bundle_file(
         self,

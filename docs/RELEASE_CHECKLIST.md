@@ -147,12 +147,27 @@ the final release-wrap validator:
   - compare the generated `data/perf/latest.md`, `data/perf/history.csv`,
     `data/history-perf/latest.md`, and `data/history-perf/history.csv`
 - rebuild the Docker image from the current branch tip:
-  - `docker compose -f docker-compose.dev.yml up -d --build`
+  - `SOURCE_COMMIT="$(git rev-parse HEAD)" docker compose -f docker-compose.dev.yml up -d --build`
+  - verify the exact image ID carries
+    `org.opencontainers.image.revision=$(git rev-parse HEAD)` before using it in
+    the private restore gate
 - confirm the app is healthy:
   - `curl http://localhost:8080/livez`
   - `curl http://localhost:8080/healthz`
   - record the running version from `/livez` in the release wrap
 - validate every optional-sidecar runtime mode from the same branch tip:
+  - Run `scripts/run_compose_runtime_matrix.py` on the local Docker QA VM
+    against the exact built image and base Compose file. It verifies the service
+    set, health, auth boundary, exact OCI source revision, and authenticated alias
+    and slot-mapping save/readback/restart/readback/clear cycles for every
+    UI-bearing mode. Keep this full matrix
+    off hosted CI. This synthetic gate does not use appliance or private data; a
+    production-derived restore is a separate private QA gate
+  - Before the local matrix, require at least 3,072 MiB of available memory,
+    5 GiB of free scratch space, no existing containers with the reserved JBOD
+    UI names, and three unused loopback ports. Choose the ports from live state;
+    for example,
+    `--ui-port 19080 --history-port 19081 --admin-port 19082`
   - **UI only:** stop `enclosure-history` and `enclosure-admin`, keep
     `enclosure-ui` running, then confirm `:8080/livez`, `:8080/healthz`, and
     the browser smoke path still work without either sidecar
@@ -163,6 +178,10 @@ the final release-wrap validator:
     `enclosure-history` stopped, then confirm `:8080/livez`, `:8082/livez`,
     `:8082/healthz`, admin setup/maintenance surfaces, and runtime cards for
     the intentionally stopped history sidecar
+  - **Admin only / initial setup:** start only `enclosure-admin`, confirm no UI
+    or history service started, save a synthetic demo system/profile, read the
+    files back, then start the UI from that saved configuration and verify it
+    becomes healthy without rebuilding or weakening mount permissions
   - **UI + history + admin:** run all three services, then confirm UI,
     history, and admin health plus `Runtime Control` cards showing aligned
     running versions after startup or sidecar restarts
@@ -190,13 +209,14 @@ the final release-wrap validator:
   - example export request:
     `POST http://127.0.0.1:8082/api/admin/backup/export?stop_services=false&restart_services=true`
     with JSON body
-    `{"encrypt":false,"packaging":"tar.zst","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db"]}`
+    `{"encrypt":true,"packaging":"7z","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db"]}`
   - copy that exported bundle to the Linux release target
   - create a disposable QA Docker stack on the Linux target using the current
     release-candidate source/image, a separate Compose project name, separate
     runtime directories, and a different port range such as
-    `APP_PORT=18080`, `HISTORY_PORT=18081`, `ADMIN_PORT=18082`, and
-    `HISTORY_BIND_ADDRESS=0.0.0.0`
+    `APP_BIND_ADDRESS=127.0.0.1`, `APP_PORT=18080`,
+    `HISTORY_BIND_ADDRESS=127.0.0.1`, `HISTORY_PORT=18081`,
+    `ADMIN_BIND_ADDRESS=127.0.0.1`, and `ADMIN_PORT=18082`
   - import the backup through the disposable Linux admin API:
     `POST http://127.0.0.1:18082/api/admin/backup/import?stop_services=true&restart_services=true`
     with the exported bundle as `application/octet-stream`

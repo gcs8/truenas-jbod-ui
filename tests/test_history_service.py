@@ -863,6 +863,72 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
 
 class HistoryStoreTests(unittest.TestCase):
+    def test_noninitializing_store_skips_schema_writes_for_maintenance(self) -> None:
+        import inspect
+
+        self.assertIn("initialize", inspect.signature(HistoryStore).parameters)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "history.db"
+            with patch.object(HistoryStore, "_initialize") as initialize:
+                store = HistoryStore(database, initialize=False)
+            initialize.assert_not_called()
+            self.assertEqual(store.file_path, database)
+
+    def test_restore_changes_replacement_owner_after_sqlite_closes(self) -> None:
+        events: list[str] = []
+
+        class FakeConnection:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, _statement: str) -> None:
+                events.append(f"{self.name}:execute")
+
+            def backup(self, _target: object) -> None:
+                events.append(f"{self.name}:backup")
+
+            def commit(self) -> None:
+                events.append(f"{self.name}:commit")
+
+            def close(self) -> None:
+                events.append(f"{self.name}:close")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.db"
+            source.write_bytes(b"synthetic sqlite source")
+            store = HistoryStore(str(root / "target.db"), initialize=False)
+
+            def publish(
+                temp_path: Path,
+                _target_path: Path,
+                *,
+                temp_descriptor: int,
+            ) -> None:
+                events.append("publish")
+                os.close(temp_descriptor)
+                temp_path.unlink()
+
+            with (
+                patch(
+                    "history_service.store.sqlite3.connect",
+                    side_effect=(FakeConnection("source"), FakeConnection("replacement")),
+                ),
+                patch(
+                    "history_service.store.os.fchown",
+                    side_effect=lambda *_args: events.append("fchown"),
+                ),
+                patch.object(store, "_publish_replacement", side_effect=publish),
+                patch.object(store, "_normalize_database_permissions"),
+                patch.object(store, "_initialize_schema") as initialize_schema,
+            ):
+                store._restore_backup_locked(source)
+
+        initialize_schema.assert_not_called()
+        self.assertLess(events.index("source:close"), events.index("fchown"))
+        self.assertLess(events.index("replacement:close"), events.index("fchown"))
+        self.assertLess(events.index("fchown"), events.index("publish"))
+
     def test_segmented_retention_claim_is_fail_closed_across_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "history.db"

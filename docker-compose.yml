@@ -25,7 +25,7 @@ services:
       ADMIN_AUTH_PASSWORD: ${ADMIN_AUTH_PASSWORD:-}
       SCHEDULED_BACKUP_STATUS_FILE: ${SCHEDULED_BACKUP_STATUS_FILE:-}
     ports:
-      - "${APP_PORT:-8080}:8000"
+      - "${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8080}:8000"
     volumes:
       - ./config:/app/config:ro
       - ./data:/app/data
@@ -129,6 +129,7 @@ services:
       HISTORY_LONG_TERM_BACKUP_DIR: ${HISTORY_LONG_TERM_BACKUP_DIR:-/app/history/backups/long-term}
       ADMIN_PORT: 8002
       ADMIN_BIND_ADDRESS: ${ADMIN_BIND_ADDRESS:-0.0.0.0}
+      ADMIN_PUBLIC_ORIGIN: ${ADMIN_PUBLIC_ORIGIN:-}
       ADMIN_AUTO_STOP_SECONDS: ${ADMIN_AUTO_STOP_SECONDS:-3600}
       ADMIN_CONTAINER_UI_NAME: truenas-jbod-ui
       ADMIN_CONTAINER_HISTORY_NAME: truenas-jbod-history
