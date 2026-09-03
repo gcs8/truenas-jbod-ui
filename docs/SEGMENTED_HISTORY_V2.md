@@ -278,7 +278,7 @@ verification fails.
 Dry-run the next append transaction while the history service is quiesced:
 
 ```bash
-docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
+docker compose run --rm --user "${APP_UID:-10001}:${APP_GID:-10001}" --entrypoint python enclosure-backup scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-08-01T00:00:00+00:00 \
@@ -293,7 +293,7 @@ transaction artifacts.
 Apply only after the dry run succeeds and the history service remains quiesced:
 
 ```bash
-docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
+docker compose run --rm --user "${APP_UID:-10001}:${APP_GID:-10001}" --entrypoint python enclosure-backup scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-08-01T00:00:00+00:00 \
@@ -307,7 +307,7 @@ Inspect a pending recovery without changing files, then repeat with `--apply`
 only after reviewing the reported phase:
 
 ```bash
-docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
+docker compose run --rm --user "${APP_UID:-10001}:${APP_GID:-10001}" --entrypoint python enclosure-backup scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --recover

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+import shlex
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -74,20 +75,88 @@ class ContainerResourceContractTests(unittest.TestCase):
 
     def test_segmented_history_runbook_uses_compose_cli_invocations(self) -> None:
         runbook = (REPO_ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
-        command_prefix = "docker compose run --rm --entrypoint python enclosure-history "
+        history_command_prefix = "docker compose run --rm --entrypoint python enclosure-history "
+        backup_command_prefix = (
+            'docker compose run --rm --user "${APP_UID:-10001}:${APP_GID:-10001}" '
+            "--entrypoint python enclosure-backup "
+        )
 
         self.assertNotRegex(
             runbook,
             r"(?m)^python scripts/(?:migrate|rotate)_segmented_history\.py",
         )
         self.assertEqual(
-            runbook.count(f"{command_prefix}scripts/migrate_segmented_history.py"),
+            runbook.count(f"{history_command_prefix}scripts/migrate_segmented_history.py"),
             6,
         )
         self.assertEqual(
-            runbook.count(f"{command_prefix}scripts/rotate_segmented_history.py"),
+            runbook.count(f"{backup_command_prefix}scripts/rotate_segmented_history.py"),
             3,
         )
+
+    def test_segmented_history_runbook_commands_use_available_service_paths(self) -> None:
+        runbook = (REPO_ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
+        command_blocks = [
+            block
+            for block in re.findall(r"```bash\n(.*?)\n```", runbook, flags=re.DOTALL)
+            if block.startswith("docker compose run --rm ")
+        ]
+
+        self.assertTrue(command_blocks)
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))[
+                "services"
+            ]
+            for block in command_blocks:
+                arguments = shlex.split(block.replace("\\\n", " "))
+                script_index = next(
+                    index
+                    for index, argument in enumerate(arguments)
+                    if argument.startswith("scripts/") and argument.endswith(".py")
+                )
+                service_name = arguments[script_index - 1]
+                mounted_roots = {
+                    PurePosixPath(volume.split(":")[1])
+                    for volume in services[service_name].get("volumes", [])
+                    if isinstance(volume, str) and len(volume.split(":")) >= 2
+                }
+                referenced_paths = {
+                    PurePosixPath(argument)
+                    for argument in arguments
+                    if argument.startswith("/app/")
+                }
+                for referenced_path in referenced_paths:
+                    with self.subTest(
+                        compose=compose_name,
+                        service=service_name,
+                        path=str(referenced_path),
+                    ):
+                        self.assertTrue(
+                            any(
+                                referenced_path == root or root in referenced_path.parents
+                                for root in mounted_roots
+                            ),
+                            f"{referenced_path} is not available to {service_name}",
+                        )
+
+    def test_rotation_runbook_uses_the_history_owner_identity(self) -> None:
+        runbook = (REPO_ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
+        rotation_blocks = [
+            block
+            for block in re.findall(r"```bash\n(.*?)\n```", runbook, flags=re.DOTALL)
+            if "scripts/rotate_segmented_history.py" in block
+        ]
+
+        self.assertEqual(len(rotation_blocks), 3)
+        for block in rotation_blocks:
+            arguments = shlex.split(block.replace("\\\n", " "))
+            with self.subTest(command=arguments[-1]):
+                self.assertIn("--user", arguments)
+                user_index = arguments.index("--user")
+                self.assertEqual(
+                    arguments[user_index + 1],
+                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                )
 
     def test_history_reads_scheduled_backup_status_for_segmented_retention(self) -> None:
         for compose_name in COMPOSE_FILES:
