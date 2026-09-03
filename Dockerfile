@@ -23,6 +23,10 @@ RUN apt-get update \
 COPY app /app/app
 COPY history_service /app/history_service
 COPY admin_service /app/admin_service
+COPY scripts/migrate_segmented_history.py /app/scripts/migrate_segmented_history.py
+COPY scripts/rotate_segmented_history.py /app/scripts/rotate_segmented_history.py
+COPY scripts/query_segmented_history.py /app/scripts/query_segmented_history.py
+COPY scripts/seal_history_segment.py /app/scripts/seal_history_segment.py
 COPY config/config.example.yaml /app/config/config.example.yaml
 
 RUN groupadd --gid "$APP_GID" app \
