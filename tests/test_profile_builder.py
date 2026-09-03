@@ -62,26 +62,20 @@ class ProfileBuilderServiceTests(unittest.TestCase):
                         slot_layout=[[0]],
                     )
 
-    def test_request_rejects_visible_slot_id_outside_explicit_slot_count(self) -> None:
-        with self.assertRaisesRegex(ValueError, "less than slot_count"):
-            EnclosureProfileRequest(
-                id="invalid-slot-id",
-                label="Invalid Slot Id",
-                rows=1,
-                columns=2,
-                slot_count=2,
-                slot_layout=[[0, 2]],
-            )
+    def test_profile_models_accept_noncontiguous_slot_ids_above_visible_count(self) -> None:
+        for model in (EnclosureProfileConfig, EnclosureProfileRequest):
+            with self.subTest(model=model.__name__):
+                profile = model(
+                    id="noncontiguous-slot-ids",
+                    label="Noncontiguous Slot Ids",
+                    rows=1,
+                    columns=2,
+                    slot_count=2,
+                    slot_layout=[[9, 3]],
+                )
 
-        with self.assertRaisesRegex(ValueError, "less than slot_count"):
-            EnclosureProfileConfig(
-                id="invalid-slot-id",
-                label="Invalid Slot Id",
-                rows=1,
-                columns=2,
-                slot_count=2,
-                slot_layout=[[0, 2]],
-            )
+                self.assertEqual(profile.slot_layout, [[9, 3]])
+                self.assertEqual(profile.slot_count, 2)
 
     def test_save_profile_infers_omitted_slot_count_from_visible_sparse_slots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -104,6 +98,12 @@ class ProfileBuilderServiceTests(unittest.TestCase):
 
             self.assertEqual(profile.slot_layout, [[9, None], [None, 3]])
             self.assertEqual(profile.slot_count, 2)
+
+            reloaded_profiles = service._load_profiles()
+
+            self.assertEqual(len(reloaded_profiles), 1)
+            self.assertEqual(reloaded_profiles[0].slot_layout, [[9, None], [None, 3]])
+            self.assertEqual(reloaded_profiles[0].slot_count, 2)
 
     def test_built_in_profile_layouts_keep_their_validated_physical_counts(self) -> None:
         profiles = ProfileRegistry(Settings()).list_profiles()

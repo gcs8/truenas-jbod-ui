@@ -60,8 +60,6 @@ def validate_slot_layout(
     count = visible_slot_count(layout)
     if slot_count is None:
         return count
-    if any(slot is not None and slot >= slot_count for row in layout for slot in row):
-        raise ValueError("slot_layout values must be less than slot_count.")
     if count != slot_count:
         raise ValueError("slot_layout must contain exactly slot_count visible slots.")
     return slot_count
