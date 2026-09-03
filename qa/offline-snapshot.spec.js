@@ -297,12 +297,20 @@ spec.loader.exec_module(module)
 
 async def main():
     snapshot = module.build_snapshot()
+    storage_view_runtime = module.build_storage_view_runtime()
+    nvme_view = storage_view_runtime.views[0].model_copy(deep=True)
+    nvme_view.id = "nvme-carrier"
+    nvme_view.label = "Synthetic NVMe Carrier"
+    nvme_view.kind = "nvme_carrier"
+    nvme_view.template_id = "nvme-carrier-4"
+    nvme_view.template_label = "NVMe Carrier"
+    storage_view_runtime.views.append(nvme_view)
     exporter = module.SnapshotExportService(module.Settings(), module.FakeHistoryBackend(), module.templates)
     rendered = await exporter.build_enclosure_snapshot_html(
         request=module.build_request(),
         snapshot=snapshot,
         smart_summary_cache=module.build_smart_summary_cache(),
-        storage_view_runtime=module.build_storage_view_runtime(),
+        storage_view_runtime=storage_view_runtime,
         storage_view_smart_summary_cache=module.build_storage_view_smart_summary_cache(),
         selected_slot=0,
         history_window_hours=24,
@@ -593,6 +601,59 @@ test("offline snapshot can navigate preloaded storage views without a live backe
   await page.locator("#heatmap-toggle-button").click();
   await expect(page.locator("#slot-grid .slot-tile[data-slot=\"0\"] .slot-heatmap-value")).toBeVisible();
   expect(consoleErrors).toEqual([]);
+});
+
+test("arrow navigation handles storage and NVMe grids while excluding unavailable tiles", async ({ page }) => {
+  const snapshotPath = buildOfflineSnapshotWithViewsFixture();
+  const consoleErrors = [];
+  const pageErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+
+  await page.evaluate(() => {
+    window.__arrowDefaultPrevented = [];
+    document.addEventListener("keydown", (event) => {
+      if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+        window.__arrowDefaultPrevented.push({ key: event.key, defaultPrevented: event.defaultPrevented });
+      }
+    });
+  });
+
+  const selector = page.locator("#enclosure-select");
+  await selector.selectOption("view:boot-doms");
+  await expect(page.locator("#chassis-shell")).toHaveAttribute("data-face-style", "boot-devices");
+  let tiles = page.locator("#slot-grid .slot-tile");
+  await expect(tiles).toHaveCount(2);
+  const firstStorageSlot = await tiles.first().getAttribute("data-slot");
+  await tiles.first().focus();
+  await tiles.nth(1).evaluate((tile) => tile.classList.add("filtered-out"));
+  await page.keyboard.press("ArrowRight");
+  expect(await page.evaluate(() => document.activeElement?.dataset?.slot || null)).toBe(firstStorageSlot);
+  await tiles.nth(1).evaluate((tile) => tile.classList.remove("filtered-out"));
+  await page.keyboard.press("ArrowRight");
+  expect(await page.evaluate(() => document.activeElement?.dataset?.slot || null)).not.toBe(firstStorageSlot);
+
+  await selector.selectOption("view:nvme-carrier");
+  await expect(page.locator("#chassis-shell")).toHaveAttribute("data-face-style", "nvme-carrier");
+  tiles = page.locator("#slot-grid .slot-tile:not(.filtered-out):not(:disabled)");
+  await expect(tiles).toHaveCount(2);
+  const firstNvmeSlot = await tiles.first().getAttribute("data-slot");
+  await tiles.first().focus();
+  await page.keyboard.press("ArrowRight");
+  expect(await page.evaluate(() => document.activeElement?.dataset?.slot || null)).not.toBe(firstNvmeSlot);
+
+  expect(await page.evaluate(() => window.__arrowDefaultPrevented)).toEqual([
+    { key: "ArrowRight", defaultPrevented: false },
+    { key: "ArrowRight", defaultPrevented: true },
+    { key: "ArrowRight", defaultPrevented: true },
+  ]);
+  expect(consoleErrors).toEqual([]);
+  expect(pageErrors).toEqual([]);
 });
 
 test("offline snapshot can navigate preloaded live enclosures without a live backend", async ({ page }) => {

@@ -5671,8 +5671,13 @@
   }
 
   function delegatedLiveTile(event) {
+    const tile = delegatedGridTile(event);
+    return tile && delegatedLiveSlot(tile) ? tile : null;
+  }
+
+  function delegatedGridTile(event) {
     const tile = event.target?.closest?.(".slot-tile[data-slot]") || null;
-    return tile && grid.contains(tile) && delegatedLiveSlot(tile) ? tile : null;
+    return tile && grid.contains(tile) ? tile : null;
   }
 
   function bindDelegatedLiveGridInteractions() {
@@ -5736,8 +5741,11 @@
         selectSlot(slotNumber);
       }
     });
+  }
+
+  function bindDelegatedGridKeyboardNavigation() {
     grid.addEventListener("keydown", (event) => {
-      const tile = delegatedLiveTile(event);
+      const tile = delegatedGridTile(event);
       if (!tile || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
         return;
       }
@@ -8634,6 +8642,24 @@
     if (!select || select.innerHTML === optionsHtml) {
       return false;
     }
+    const comparisonSelect = select.ownerDocument?.createElement?.("select")
+      || (typeof document !== "undefined" ? document.createElement("select") : null);
+    if (comparisonSelect && select.options) {
+      comparisonSelect.innerHTML = optionsHtml;
+      const currentOptions = Array.from(select.options);
+      const desiredOptions = Array.from(comparisonSelect.options);
+      const optionsMatch = currentOptions.length === desiredOptions.length
+        && currentOptions.every((option, index) => {
+          const desired = desiredOptions[index];
+          return option.value === desired.value
+            && option.text === desired.text
+            && option.selected === desired.selected
+            && option.disabled === desired.disabled;
+        });
+      if (optionsMatch) {
+        return false;
+      }
+    }
     select.innerHTML = optionsHtml;
     return true;
   }
@@ -9523,6 +9549,7 @@
   }
 
   bindDelegatedLiveGridInteractions();
+  bindDelegatedGridKeyboardNavigation();
 
   searchBox.addEventListener("input", (event) => {
     state.search = event.target.value.trim().toLowerCase();

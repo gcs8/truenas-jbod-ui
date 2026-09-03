@@ -130,6 +130,107 @@ test("public demo static artifact is explorable without a live backend", async (
   expect(consoleErrors).toEqual([]);
 });
 
+test("current-source heat-map overlays win the face and empty-bay cascade", async ({ page }) => {
+  const artifactPath = resolveSlotFocusArtifact();
+  const consoleErrors = [];
+  const pageErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.goto(pathToFileURL(artifactPath).href, { waitUntil: "load" });
+
+  const computedOverlays = await page.locator("#slot-grid .slot-tile").first().evaluate((tile) => {
+    const shell = document.getElementById("chassis-shell");
+    const results = {};
+    const faces = [
+      { name: "generic", faceStyle: "generic", layoutMode: "standard-3.5" },
+      { name: "top-loader", faceStyle: "top-loader", layoutMode: "top-loader-3.5" },
+      { name: "unifi-drive", faceStyle: "unifi-drive", layoutMode: "unifi-1row" },
+    ];
+    for (const face of faces) {
+      shell.dataset.faceStyle = face.faceStyle;
+      shell.dataset.layoutMode = face.layoutMode;
+      for (const stateName of ["state-healthy", "state-empty"]) {
+        tile.className = `slot-tile ${stateName} heatmap-active`;
+        tile.style.setProperty("--heatmap-rgb", "17, 34, 51");
+        tile.style.setProperty("--heatmap-alpha", "0.62");
+        const activeStyle = getComputedStyle(tile, "::before");
+        results[`${face.name}:${stateName}:active`] = {
+          content: activeStyle.content,
+          backgroundImage: activeStyle.backgroundImage,
+        };
+
+        tile.className = `slot-tile ${stateName} heatmap-missing`;
+        const missingStyle = getComputedStyle(tile, "::before");
+        results[`${face.name}:${stateName}:missing`] = {
+          content: missingStyle.content,
+          backgroundImage: missingStyle.backgroundImage,
+        };
+      }
+    }
+    return results;
+  });
+
+  const activeFailures = Object.entries(computedOverlays)
+    .filter(([key, style]) => key.endsWith(":active") && (
+      style.content === "none" || !style.backgroundImage.includes("17, 34, 51")
+    ))
+    .map(([key]) => key);
+  const missingFailures = Object.entries(computedOverlays)
+    .filter(([key, style]) => key.endsWith(":missing") && (
+      style.content === "none" || !style.backgroundImage.includes("repeating-linear-gradient(135deg")
+    ))
+    .map(([key]) => key);
+  expect.soft(activeFailures, "every face/state must retain active heat-map paint").toEqual([]);
+  expect.soft(missingFailures, "every face/state must retain the missing-data hatch").toEqual([]);
+  expect(consoleErrors).toEqual([]);
+  expect(pageErrors).toEqual([]);
+});
+
+test("semantic selector rendering preserves option nodes without child mutations", async ({ page }) => {
+  const artifactPath = resolveSlotFocusArtifact();
+  const consoleErrors = [];
+  const pageErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.goto(pathToFileURL(artifactPath).href, { waitUntil: "load" });
+
+  const observation = await page.evaluate(async () => {
+    const select = document.getElementById("system-select");
+    const originalOption = select.options[0];
+    const mutations = [];
+    const observer = new MutationObserver((records) => mutations.push(...records));
+    observer.observe(select, { childList: true, subtree: true });
+    document.getElementById("sas-fabric-toggle-button").click();
+    await new Promise((resolve) => queueMicrotask(resolve));
+    observer.disconnect();
+    return {
+      childMutations: mutations.filter((record) => record.type === "childList").length,
+      sameOption: originalOption === select.options[0] && originalOption.isConnected,
+      selected: select.options[0].selected,
+      value: select.options[0].value,
+      text: select.options[0].text,
+    };
+  });
+
+  expect(observation).toEqual({
+    childMutations: 0,
+    sameOption: true,
+    selected: true,
+    value: "synthetic-system",
+    text: "Synthetic System",
+  });
+  expect(consoleErrors).toEqual([]);
+  expect(pageErrors).toEqual([]);
+});
+
 test("slot keyboard selection preserves the focused tile DOM identity", async ({ page }) => {
   const demoPath = resolveSlotFocusArtifact();
   await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });
