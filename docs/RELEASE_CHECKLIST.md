@@ -99,10 +99,18 @@ the final release-wrap validator:
 
 ## Code And Runtime
 
-- run full Python unit discovery, not only a targeted subset:
-  - `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v`
-  - record the final test count in the release wrap
-- run targeted Python suites in addition to full discovery when the release
+- run the authoritative platform-aware full source gate from the repository
+  root:
+  - POSIX: `python scripts/dev_check.py --full`
+  - Windows: `.\.venv\Scripts\python.exe scripts\dev_check.py --full`
+  - on POSIX this runs full unittest discovery plus the shared source gates;
+    record the final test count in the release wrap
+  - on Windows this runs the centrally classified Windows portable suite and
+    names every excluded suite/category/reason; record every named `SKIP` in the
+    release wrap and use POSIX CI/Linux evidence for those contracts
+  - the Windows result does not claim POSIX `fcntl`, ownership, permission,
+    link, descriptor, or process-identity tests passed
+- run targeted Python suites in addition to the wrapper when the release
   touches risky or recently changed surfaces:
   - Storage Fabric and platform data:
     `.\.venv\Scripts\python.exe -m unittest tests.test_sas_fabric tests.test_inventory tests.test_parsers tests.test_platform_parity_fixtures -v`
@@ -114,17 +122,19 @@ the final release-wrap validator:
     `.\.venv\Scripts\python.exe -m unittest tests.test_segment_migration tests.test_segment_sealer tests.test_segmented_history_reader tests.test_segmented_history tests.test_system_backup -v`
   - release/version behavior:
     `.\.venv\Scripts\python.exe -m unittest tests.test_release_status -v`
-- run Python syntax/compile coverage for changed Python plus shared app/test
-  packages:
-  - `.\.venv\Scripts\python.exe -m compileall app admin_service history_service scripts tests`
+- use the wrapper's Python compileall result for changed Python plus shared
+  app/test packages; raw reference:
+  - `python -m compileall app admin_service history_service scripts tests`
 - validate the target release wrap before tagging:
   - `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --phase pre-tag`
     (run the no-flag final validator after post-publish evidence exists)
-- run JavaScript syntax gates for app, admin, QA, and changed JS files:
+- use the wrapper's dynamic JavaScript syntax gates for app, admin, history,
+  every `qa/*.spec.js`, and changed JS files; raw reference:
   - `node --check app/static/app.js`
   - `node --check app/static/sas_fabric_view.js`
   - `node --check admin_service/static/admin.js`
-  - `node --check qa/public-demo.spec.js`
+  - `node --check history_service/static/dashboard.js`
+  - `for spec in qa/*.spec.js; do node --check "$spec"; done`
 - run the browser smoke suites. Live-appliance specs require explicit opt-in;
   a bare `npx playwright test` is not a portable release command:
   - `npx playwright test qa/public-demo.spec.js qa/offline-snapshot.spec.js`

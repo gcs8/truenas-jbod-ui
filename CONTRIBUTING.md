@@ -194,7 +194,35 @@ Useful orientation files:
 Use for docs, source-only changes, parser work, tests, and JavaScript syntax
 safety.
 
-Common commands:
+The authoritative Tier 1 source-validation entrypoint is the platform-aware
+wrapper. Run it from the repository root:
+
+```bash
+python scripts/dev_check.py --safe
+```
+
+It runs the applicable Python suite, compileall, bounded Ruff, every maintained
+JavaScript source and `qa/*.spec.js` syntax check, diff hygiene, JavaScript unit
+tests, the checked-in performance baseline check, and Prometheus rule validation
+when `promtool` is available. The final named summary reports every gate as
+`PASS`, `FAIL`, or `SKIP`; a missing `promtool` is an explicit `SKIP` with a
+reason rather than silent success.
+
+On POSIX, `--safe` runs full unittest discovery to mirror the source-level CI
+test boundary. On Windows, use the project virtualenv interpreter when present:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\dev_check.py --safe
+```
+
+Windows runs the centrally classified portable Python suite. It explicitly
+skips and names suites that transitively import the POSIX-only `fcntl` backup
+path or assert POSIX ownership, permission, link, descriptor, or process-ID
+semantics. Do not replace that honest result with full unittest discovery or
+claim those POSIX contracts were validated on Windows. Run the POSIX CI/Linux
+gate for their coverage.
+
+Raw command reference (the wrapper remains authoritative):
 
 ```bash
 python -m unittest discover -s tests -p "test_*.py" -v
@@ -203,7 +231,8 @@ python -m compileall app admin_service history_service scripts tests
 node --check app/static/app.js
 node --check app/static/sas_fabric_view.js
 node --check admin_service/static/admin.js
-node --check qa/public-demo.spec.js
+node --check history_service/static/dashboard.js
+for spec in qa/*.spec.js; do node --check "$spec"; done
 git diff --check
 ruff check app admin_service history_service scripts tests --select E4,E7,E9,F
 npm run test:unit
@@ -211,20 +240,12 @@ python scripts/build_perf_baseline.py --check
 promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml
 ```
 
-The last four commands mirror CI gates. The Prometheus rule check applies when
-alert rules change and may be left to CI when the pinned `promtool` binary is
-not available locally.
+The source commands shared with CI are contract-tested against
+`.github/workflows/ci.yml`; the performance baseline is an additional Tier 1
+gate. Set `PROMTOOL_BINARY` to an installed executable when it is not on `PATH`.
 
-On Windows, use the project virtualenv interpreter when present, for example:
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
-.\.venv\Scripts\coverage.exe run -m unittest discover -s tests -p "test_*.py" -v; .\.venv\Scripts\coverage.exe report
-.\.venv\Scripts\python.exe -m compileall app admin_service history_service scripts tests
-```
-
-Install dev-only validation tools before running the coverage command in a fresh
-environment:
+Install dev-only validation tools before running the wrapper or coverage command
+in a fresh environment:
 
 ```bash
 python -m pip install -r requirements-dev.txt
