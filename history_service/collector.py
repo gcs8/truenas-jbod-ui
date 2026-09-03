@@ -1272,28 +1272,14 @@ class HistoryCollector:
                             snapshot=system_snapshot,
                         )
                     )
-                try:
-                    storage_view_scopes = await self._enumerate_storage_view_scopes(
-                        system_id,
-                        system_snapshot,
-                        force_inventory=force_inventory,
-                    )
-                except Exception as exc:  # noqa: BLE001 - storage views should not kill the whole sweep.
-                    logger.warning("Skipping history storage-view enumeration for %s: %s", system_id, exc)
-                    storage_view_scopes = []
-                    self._record_collection_stage(
-                        "storage_views.failed",
-                        time.perf_counter() - system_started,
-                        system_id=system_id,
-                        inventory_forced=force_inventory,
-                        error=str(exc),
-                    )
-                for scope in storage_view_scopes:
-                    storage_scope_key = (scope.system_id, scope.enclosure_id)
-                    if storage_scope_key in seen:
-                        continue
-                    seen.add(storage_scope_key)
-                    scopes.append(scope)
+                await self._append_storage_view_scopes(
+                    scopes,
+                    seen,
+                    system_id=system_id,
+                    system_snapshot=system_snapshot,
+                    force_inventory=force_inventory,
+                    system_started=system_started,
+                )
                 self._record_collection_stage(
                     "inventory.system",
                     time.perf_counter() - system_started,
@@ -1349,28 +1335,14 @@ class HistoryCollector:
                         snapshot=snapshot,
                     )
                 )
-            try:
-                storage_view_scopes = await self._enumerate_storage_view_scopes(
-                    system_id,
-                    system_snapshot,
-                    force_inventory=force_inventory,
-                )
-            except Exception as exc:  # noqa: BLE001 - storage views should not kill the whole sweep.
-                logger.warning("Skipping history storage-view enumeration for %s: %s", system_id, exc)
-                storage_view_scopes = []
-                self._record_collection_stage(
-                    "storage_views.failed",
-                    time.perf_counter() - system_started,
-                    system_id=system_id,
-                    inventory_forced=force_inventory,
-                    error=str(exc),
-                )
-            for scope in storage_view_scopes:
-                scope_key = (scope.system_id, scope.enclosure_id)
-                if scope_key in seen:
-                    continue
-                seen.add(scope_key)
-                scopes.append(scope)
+            await self._append_storage_view_scopes(
+                scopes,
+                seen,
+                system_id=system_id,
+                system_snapshot=system_snapshot,
+                force_inventory=force_inventory,
+                system_started=system_started,
+            )
             self._record_collection_stage(
                 "inventory.system",
                 time.perf_counter() - system_started,
@@ -1381,6 +1353,40 @@ class HistoryCollector:
                 scope_count=len(scopes) - system_scope_start,
             )
         return scopes
+
+    async def _append_storage_view_scopes(
+        self,
+        scopes: list[ScopeSnapshot],
+        seen: set[tuple[str, str | None]],
+        *,
+        system_id: str,
+        system_snapshot: dict[str, Any],
+        force_inventory: bool,
+        system_started: float,
+    ) -> None:
+        try:
+            storage_view_scopes = await self._enumerate_storage_view_scopes(
+                system_id,
+                system_snapshot,
+                force_inventory=force_inventory,
+            )
+        except Exception as exc:  # noqa: BLE001 - storage views should not kill the whole sweep.
+            logger.warning("Skipping history storage-view enumeration for %s: %s", system_id, exc)
+            self._record_collection_stage(
+                "storage_views.failed",
+                time.perf_counter() - system_started,
+                system_id=system_id,
+                inventory_forced=force_inventory,
+                error=str(exc),
+            )
+            return
+
+        for scope in storage_view_scopes:
+            scope_key = (scope.system_id, scope.enclosure_id)
+            if scope_key in seen:
+                continue
+            seen.add(scope_key)
+            scopes.append(scope)
 
     async def _fetch_inventory(
         self,

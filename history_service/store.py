@@ -14,7 +14,7 @@ from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
 from history_service.migration_lock import history_write_lock
@@ -52,26 +52,107 @@ class SlotStateUpdate:
     observed_at: str
     events: list[SlotEvent] = field(default_factory=list)
 
+# (name, SQL definition, add when missing from a legacy schema)
+SLOT_STATE_COLUMNS: tuple[tuple[str, str, bool], ...] = (
+    ("system_id", "TEXT NOT NULL", False),
+    ("system_label", "TEXT", False),
+    ("enclosure_key", "TEXT NOT NULL", False),
+    ("enclosure_id", "TEXT", False),
+    ("enclosure_label", "TEXT", False),
+    ("slot", "INTEGER NOT NULL", False),
+    ("slot_label", "TEXT NOT NULL", False),
+    ("present", "INTEGER NOT NULL", False),
+    ("state", "TEXT", False),
+    ("identify_active", "INTEGER NOT NULL", False),
+    ("device_name", "TEXT", False),
+    ("serial", "TEXT", False),
+    ("model", "TEXT", False),
+    ("gptid", "TEXT", False),
+    ("persistent_id_label", "TEXT", True),
+    ("disk_identity_key", "TEXT", True),
+    ("logical_unit_id", "TEXT", True),
+    ("sas_address", "TEXT", True),
+    ("pool_name", "TEXT", False),
+    ("vdev_name", "TEXT", False),
+    ("health", "TEXT", False),
+    ("topology_label", "TEXT", True),
+    ("multipath_device", "TEXT", True),
+    ("multipath_mode", "TEXT", True),
+    ("multipath_state", "TEXT", True),
+    ("multipath_lunid", "TEXT", True),
+    ("multipath_primary_path", "TEXT", True),
+    ("multipath_alternate_path", "TEXT", True),
+    ("multipath_active_paths", "TEXT", True),
+    ("multipath_passive_paths", "TEXT", True),
+    ("multipath_failed_paths", "TEXT", True),
+    ("multipath_other_paths", "TEXT", True),
+    ("multipath_active_controllers", "TEXT", True),
+    ("multipath_passive_controllers", "TEXT", True),
+    ("multipath_failed_controllers", "TEXT", True),
+    ("last_seen_at", "TEXT NOT NULL", False),
+)
+SLOT_STATE_COLUMN_NAMES = tuple(
+    name for name, _definition, _optional in SLOT_STATE_COLUMNS
+)
 SLOT_STATE_OPTIONAL_COLUMNS: dict[str, str] = {
-    "persistent_id_label": "TEXT",
-    "disk_identity_key": "TEXT",
-    "logical_unit_id": "TEXT",
-    "sas_address": "TEXT",
-    "topology_label": "TEXT",
-    "multipath_device": "TEXT",
-    "multipath_mode": "TEXT",
-    "multipath_state": "TEXT",
-    "multipath_lunid": "TEXT",
-    "multipath_primary_path": "TEXT",
-    "multipath_alternate_path": "TEXT",
-    "multipath_active_paths": "TEXT",
-    "multipath_passive_paths": "TEXT",
-    "multipath_failed_paths": "TEXT",
-    "multipath_other_paths": "TEXT",
-    "multipath_active_controllers": "TEXT",
-    "multipath_passive_controllers": "TEXT",
-    "multipath_failed_controllers": "TEXT",
+    name: definition
+    for name, definition, optional in SLOT_STATE_COLUMNS
+    if optional
 }
+SLOT_STATE_UPSERT_COLUMNS = SLOT_STATE_COLUMN_NAMES
+SLOT_STATE_UPSERT_UPDATE_COLUMNS = tuple(
+    name
+    for name in SLOT_STATE_COLUMN_NAMES
+    if name not in {"system_id", "enclosure_key", "slot"}
+)
+SLOT_STATE_ADOPTION_PROJECTION = ("?", "?", *SLOT_STATE_COLUMN_NAMES[2:])
+
+_SLOT_STATE_SCHEMA_COLUMNS_SQL = ",\n".join(
+    f"    {name} {definition}"
+    for name, definition, _optional in SLOT_STATE_COLUMNS
+)
+_SLOT_STATE_UPSERT_COLUMNS_SQL = ",\n".join(
+    f"                {name}" for name in SLOT_STATE_UPSERT_COLUMNS
+)
+_SLOT_STATE_UPSERT_VALUES_SQL = ", ".join("?" for _name in SLOT_STATE_UPSERT_COLUMNS)
+_SLOT_STATE_UPSERT_UPDATE_SQL = ",\n".join(
+    f"                {name} = excluded.{name}"
+    for name in SLOT_STATE_UPSERT_UPDATE_COLUMNS
+)
+SLOT_STATE_UPSERT_SQL = f"""
+            INSERT INTO slot_state_current (
+{_SLOT_STATE_UPSERT_COLUMNS_SQL}
+            ) VALUES ({_SLOT_STATE_UPSERT_VALUES_SQL})
+            ON CONFLICT(system_id, enclosure_key, slot) DO UPDATE SET
+{_SLOT_STATE_UPSERT_UPDATE_SQL}
+            """
+
+_SLOT_STATE_ADOPTION_COLUMNS_SQL = ",\n".join(
+    f"                        {name}" for name in SLOT_STATE_COLUMN_NAMES
+)
+_SLOT_STATE_ADOPTION_PROJECTION_SQL = ",\n".join(
+    f"                        {projection}" for projection in SLOT_STATE_ADOPTION_PROJECTION
+)
+SLOT_STATE_ADOPTION_SQL = f"""
+                    INSERT OR IGNORE INTO slot_state_current (
+{_SLOT_STATE_ADOPTION_COLUMNS_SQL}
+                    )
+                    SELECT
+{_SLOT_STATE_ADOPTION_PROJECTION_SQL}
+                    FROM slot_state_current
+                    WHERE system_id = ?
+                    """
+
+
+def _slot_state_record_values(record: SlotStateRecord, observed_at: str) -> tuple[Any, ...]:
+    values = []
+    for column_name in SLOT_STATE_COLUMN_NAMES:
+        value = observed_at if column_name == "last_seen_at" else getattr(record, column_name)
+        if column_name in {"present", "identify_active"}:
+            value = int(value)
+        values.append(value)
+    return tuple(values)
+
 
 SLOT_EVENT_OPTIONAL_COLUMNS: dict[str, str] = {
     "gptid": "TEXT",
@@ -89,45 +170,51 @@ METRIC_SAMPLE_OPTIONAL_COLUMNS: dict[str, str] = {
     "sas_address": "TEXT",
 }
 
+ROLLUP_COUNTER_METRICS = ("bytes_read", "bytes_written", "power_on_hours")
+_ROLLUP_COUNTER_METRICS_SQL = ", ".join(f"'{metric_name}'" for metric_name in ROLLUP_COUNTER_METRICS)
+ROLLUP_TO_SAMPLE_PROJECTION = f"""                    NULL AS id,
+                    CASE
+                        WHEN metric_name IN ({_ROLLUP_COUNTER_METRICS_SQL})
+                        THEN last_observed_at
+                        ELSE bucket_start
+                    END AS observed_at,
+                    system_id,
+                    system_label,
+                    enclosure_key,
+                    enclosure_id,
+                    enclosure_label,
+                    slot,
+                    slot_label,
+                    metric_name,
+                    NULL AS value_integer,
+                    CASE
+                        WHEN metric_name IN ({_ROLLUP_COUNTER_METRICS_SQL})
+                        THEN last_value
+                        ELSE value_sum / sample_count
+                    END AS value_real,
+                    device_name,
+                    serial,
+                    model,
+                    state,
+                    gptid,
+                    persistent_id_label,
+                    NULLIF(disk_identity_key, '') AS disk_identity_key,
+                    logical_unit_id,
+                    sas_address,
+                    bucket_seconds AS rollup_seconds,
+                    sample_count,
+                    value_min,
+                    value_max"""
 
-SCHEMA = """
+
+def _indent_sql(sql: str, spaces: int) -> str:
+    prefix = " " * spaces
+    return prefix + sql.replace("\n", f"\n{prefix}")
+
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS slot_state_current (
-    system_id TEXT NOT NULL,
-    system_label TEXT,
-    enclosure_key TEXT NOT NULL,
-    enclosure_id TEXT,
-    enclosure_label TEXT,
-    slot INTEGER NOT NULL,
-    slot_label TEXT NOT NULL,
-    present INTEGER NOT NULL,
-    state TEXT,
-    identify_active INTEGER NOT NULL,
-    device_name TEXT,
-    serial TEXT,
-    model TEXT,
-    gptid TEXT,
-    persistent_id_label TEXT,
-    disk_identity_key TEXT,
-    logical_unit_id TEXT,
-    sas_address TEXT,
-    pool_name TEXT,
-    vdev_name TEXT,
-    health TEXT,
-    topology_label TEXT,
-    multipath_device TEXT,
-    multipath_mode TEXT,
-    multipath_state TEXT,
-    multipath_lunid TEXT,
-    multipath_primary_path TEXT,
-    multipath_alternate_path TEXT,
-    multipath_active_paths TEXT,
-    multipath_passive_paths TEXT,
-    multipath_failed_paths TEXT,
-    multipath_other_paths TEXT,
-    multipath_active_controllers TEXT,
-    multipath_passive_controllers TEXT,
-    multipath_failed_controllers TEXT,
-    last_seen_at TEXT NOT NULL,
+{_SLOT_STATE_SCHEMA_COLUMNS_SQL},
     PRIMARY KEY (system_id, enclosure_key, slot)
 );
 
@@ -1025,118 +1112,8 @@ class HistoryStore:
     @staticmethod
     def _upsert_slot_state_row(connection: sqlite3.Connection, record: SlotStateRecord, observed_at: str) -> None:
         connection.execute(
-            """
-            INSERT INTO slot_state_current (
-                system_id,
-                system_label,
-                enclosure_key,
-                enclosure_id,
-                enclosure_label,
-                slot,
-                slot_label,
-                present,
-                state,
-                identify_active,
-                device_name,
-                serial,
-                model,
-                gptid,
-                persistent_id_label,
-                disk_identity_key,
-                logical_unit_id,
-                sas_address,
-                pool_name,
-                vdev_name,
-                health,
-                topology_label,
-                multipath_device,
-                multipath_mode,
-                multipath_state,
-                multipath_lunid,
-                multipath_primary_path,
-                multipath_alternate_path,
-                multipath_active_paths,
-                multipath_passive_paths,
-                multipath_failed_paths,
-                multipath_other_paths,
-                multipath_active_controllers,
-                multipath_passive_controllers,
-                multipath_failed_controllers,
-                last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(system_id, enclosure_key, slot) DO UPDATE SET
-                system_label = excluded.system_label,
-                enclosure_id = excluded.enclosure_id,
-                enclosure_label = excluded.enclosure_label,
-                slot_label = excluded.slot_label,
-                present = excluded.present,
-                state = excluded.state,
-                identify_active = excluded.identify_active,
-                device_name = excluded.device_name,
-                serial = excluded.serial,
-                model = excluded.model,
-                gptid = excluded.gptid,
-                persistent_id_label = excluded.persistent_id_label,
-                disk_identity_key = excluded.disk_identity_key,
-                logical_unit_id = excluded.logical_unit_id,
-                sas_address = excluded.sas_address,
-                pool_name = excluded.pool_name,
-                vdev_name = excluded.vdev_name,
-                health = excluded.health,
-                topology_label = excluded.topology_label,
-                multipath_device = excluded.multipath_device,
-                multipath_mode = excluded.multipath_mode,
-                multipath_state = excluded.multipath_state,
-                multipath_lunid = excluded.multipath_lunid,
-                multipath_primary_path = excluded.multipath_primary_path,
-                multipath_alternate_path = excluded.multipath_alternate_path,
-                multipath_active_paths = excluded.multipath_active_paths,
-                multipath_passive_paths = excluded.multipath_passive_paths,
-                multipath_failed_paths = excluded.multipath_failed_paths,
-                multipath_other_paths = excluded.multipath_other_paths,
-                multipath_active_controllers = excluded.multipath_active_controllers,
-                multipath_passive_controllers = excluded.multipath_passive_controllers,
-                multipath_failed_controllers = excluded.multipath_failed_controllers,
-                last_seen_at = excluded.last_seen_at
-            """,
-            (
-                record.system_id,
-                record.system_label,
-                record.enclosure_key,
-                record.enclosure_id,
-                record.enclosure_label,
-                record.slot,
-                record.slot_label,
-                int(record.present),
-                record.state,
-                int(record.identify_active),
-                record.device_name,
-                record.serial,
-                record.model,
-                record.gptid,
-                record.persistent_id_label,
-                record.disk_identity_key,
-                record.logical_unit_id,
-                record.sas_address,
-                record.pool_name,
-                record.vdev_name,
-                record.health,
-                record.topology_label,
-                record.multipath_device,
-                record.multipath_mode,
-                record.multipath_state,
-                record.multipath_lunid,
-                record.multipath_primary_path,
-                record.multipath_alternate_path,
-                record.multipath_active_paths,
-                record.multipath_passive_paths,
-                record.multipath_failed_paths,
-                record.multipath_other_paths,
-                record.multipath_active_controllers,
-                record.multipath_passive_controllers,
-                record.multipath_failed_controllers,
-                observed_at,
-            ),
+            SLOT_STATE_UPSERT_SQL,
+            _slot_state_record_values(record, observed_at),
         )
 
     def insert_events(self, events: list[SlotEvent]) -> None:
@@ -1806,39 +1783,7 @@ class HistoryStore:
             rows = connection.execute(
                 f"""
                 SELECT
-                    NULL AS id,
-                    CASE
-                        WHEN metric_name IN ('bytes_read', 'bytes_written', 'power_on_hours')
-                        THEN last_observed_at
-                        ELSE bucket_start
-                    END AS observed_at,
-                    system_id,
-                    system_label,
-                    enclosure_key,
-                    enclosure_id,
-                    enclosure_label,
-                    slot,
-                    slot_label,
-                    metric_name,
-                    NULL AS value_integer,
-                    CASE
-                        WHEN metric_name IN ('bytes_read', 'bytes_written', 'power_on_hours')
-                        THEN last_value
-                        ELSE value_sum / sample_count
-                    END AS value_real,
-                    device_name,
-                    serial,
-                    model,
-                    state,
-                    gptid,
-                    persistent_id_label,
-                    NULLIF(disk_identity_key, '') AS disk_identity_key,
-                    logical_unit_id,
-                    sas_address,
-                    bucket_seconds AS rollup_seconds,
-                    sample_count,
-                    value_min,
-                    value_max
+{ROLLUP_TO_SAMPLE_PROJECTION}
                 FROM metric_rollups
                 WHERE {' AND '.join(rollup_where)}
                 ORDER BY bucket_start DESC
@@ -2143,39 +2088,7 @@ class HistoryStore:
                 SELECT *
                 FROM (
                     SELECT
-                        NULL AS id,
-                        CASE
-                            WHEN metric_name IN ('bytes_read', 'bytes_written', 'power_on_hours')
-                            THEN last_observed_at
-                            ELSE bucket_start
-                        END AS observed_at,
-                        system_id,
-                        system_label,
-                        enclosure_key,
-                        enclosure_id,
-                        enclosure_label,
-                        slot,
-                        slot_label,
-                        metric_name,
-                        NULL AS value_integer,
-                        CASE
-                            WHEN metric_name IN ('bytes_read', 'bytes_written', 'power_on_hours')
-                            THEN last_value
-                            ELSE value_sum / sample_count
-                        END AS value_real,
-                        device_name,
-                        serial,
-                        model,
-                        state,
-                        gptid,
-                        persistent_id_label,
-                        NULLIF(disk_identity_key, '') AS disk_identity_key,
-                        logical_unit_id,
-                        sas_address,
-                        bucket_seconds AS rollup_seconds,
-                        sample_count,
-                        value_min,
-                        value_max,
+{_indent_sql(ROLLUP_TO_SAMPLE_PROJECTION, 4)},
                         ROW_NUMBER() OVER (
                             PARTITION BY slot, metric_name
                             ORDER BY bucket_start DESC
@@ -2220,6 +2133,15 @@ class HistoryStore:
                         hourly_rollup_added = True
                     before = str(additions[-1]["observed_at"])
 
+    @staticmethod
+    def _empty_slot_history_payload(metric_names: Iterable[str]) -> dict[str, Any]:
+        return {
+            "events": [],
+            "metrics": {metric_name: [] for metric_name in metric_names},
+            "sample_counts": {},
+            "latest_values": {},
+        }
+
     def list_scope_history(
         self,
         system_id: str,
@@ -2244,15 +2166,7 @@ class HistoryStore:
         slot_numbers = sorted({int(slot) for slot in (slots or [])})
         metric_limits = metric_limits or {}
         payload_by_slot: dict[int, dict[str, Any]] = {
-            slot: {
-                "events": [],
-                "metrics": {
-                    metric_name: []
-                    for metric_name in metric_limits
-                },
-                "sample_counts": {},
-                "latest_values": {},
-            }
+            slot: self._empty_slot_history_payload(metric_limits)
             for slot in slot_numbers
         }
 
@@ -2278,15 +2192,7 @@ class HistoryStore:
                 slot = int(row["slot"])
                 payload_by_slot.setdefault(
                     slot,
-                    {
-                        "events": [],
-                        "metrics": {
-                            metric_name: []
-                            for metric_name in metric_limits
-                        },
-                        "sample_counts": {},
-                        "latest_values": {},
-                    },
+                    self._empty_slot_history_payload(metric_limits),
                 )
 
             if event_limit > 0:
@@ -2314,15 +2220,7 @@ class HistoryStore:
                     item.pop("row_number", None)
                     payload_by_slot.setdefault(
                         slot,
-                        {
-                            "events": [],
-                            "metrics": {
-                                metric_name: []
-                                for metric_name in metric_limits
-                            },
-                            "sample_counts": {},
-                            "latest_values": {},
-                        },
+                        self._empty_slot_history_payload(metric_limits),
                     )["events"].append(item)
 
             for metric_name, limit in metric_limits.items():
@@ -2356,15 +2254,7 @@ class HistoryStore:
                     item.pop("row_number", None)
                     payload_by_slot.setdefault(
                         slot,
-                        {
-                            "events": [],
-                            "metrics": {
-                                key: []
-                                for key in metric_limits
-                            },
-                            "sample_counts": {},
-                            "latest_values": {},
-                        },
+                        self._empty_slot_history_payload(metric_limits),
                     )["metrics"].setdefault(metric_name, []).append(item)
                 self._append_scope_metric_rollups(
                     connection,
@@ -2571,85 +2461,7 @@ class HistoryStore:
             )
             inserted_slot_count = int(
                 connection.execute(
-                    """
-                    INSERT OR IGNORE INTO slot_state_current (
-                        system_id,
-                        system_label,
-                        enclosure_key,
-                        enclosure_id,
-                        enclosure_label,
-                        slot,
-                        slot_label,
-                        present,
-                        state,
-                        identify_active,
-                        device_name,
-                        serial,
-                        model,
-                        gptid,
-                        persistent_id_label,
-                        disk_identity_key,
-                        logical_unit_id,
-                        sas_address,
-                        pool_name,
-                        vdev_name,
-                        health,
-                        topology_label,
-                        multipath_device,
-                        multipath_mode,
-                        multipath_state,
-                        multipath_lunid,
-                        multipath_primary_path,
-                        multipath_alternate_path,
-                        multipath_active_paths,
-                        multipath_passive_paths,
-                        multipath_failed_paths,
-                        multipath_other_paths,
-                        multipath_active_controllers,
-                        multipath_passive_controllers,
-                        multipath_failed_controllers,
-                        last_seen_at
-                    )
-                    SELECT
-                        ?,
-                        ?,
-                        enclosure_key,
-                        enclosure_id,
-                        enclosure_label,
-                        slot,
-                        slot_label,
-                        present,
-                        state,
-                        identify_active,
-                        device_name,
-                        serial,
-                        model,
-                        gptid,
-                        persistent_id_label,
-                        disk_identity_key,
-                        logical_unit_id,
-                        sas_address,
-                        pool_name,
-                        vdev_name,
-                        health,
-                        topology_label,
-                        multipath_device,
-                        multipath_mode,
-                        multipath_state,
-                        multipath_lunid,
-                        multipath_primary_path,
-                        multipath_alternate_path,
-                        multipath_active_paths,
-                        multipath_passive_paths,
-                        multipath_failed_paths,
-                        multipath_other_paths,
-                        multipath_active_controllers,
-                        multipath_passive_controllers,
-                        multipath_failed_controllers,
-                        last_seen_at
-                    FROM slot_state_current
-                    WHERE system_id = ?
-                    """,
+                    SLOT_STATE_ADOPTION_SQL,
                     (
                         normalized_target_id,
                         normalized_target_label,
@@ -3366,40 +3178,14 @@ class HistoryStore:
 
     @staticmethod
     def _row_to_slot_state(row: sqlite3.Row) -> SlotStateRecord:
-        return SlotStateRecord(
-            system_id=str(row["system_id"]),
-            system_label=row["system_label"],
-            enclosure_key=str(row["enclosure_key"]),
-            enclosure_id=row["enclosure_id"],
-            enclosure_label=row["enclosure_label"],
-            slot=int(row["slot"]),
-            slot_label=str(row["slot_label"]),
-            present=bool(row["present"]),
-            state=row["state"],
-            identify_active=bool(row["identify_active"]),
-            device_name=row["device_name"],
-            serial=row["serial"],
-            model=row["model"],
-            gptid=row["gptid"],
-            persistent_id_label=row["persistent_id_label"],
-            disk_identity_key=row["disk_identity_key"],
-            logical_unit_id=row["logical_unit_id"],
-            sas_address=row["sas_address"],
-            pool_name=row["pool_name"],
-            vdev_name=row["vdev_name"],
-            health=row["health"],
-            topology_label=row["topology_label"],
-            multipath_device=row["multipath_device"],
-            multipath_mode=row["multipath_mode"],
-            multipath_state=row["multipath_state"],
-            multipath_lunid=row["multipath_lunid"],
-            multipath_primary_path=row["multipath_primary_path"],
-            multipath_alternate_path=row["multipath_alternate_path"],
-            multipath_active_paths=row["multipath_active_paths"],
-            multipath_passive_paths=row["multipath_passive_paths"],
-            multipath_failed_paths=row["multipath_failed_paths"],
-            multipath_other_paths=row["multipath_other_paths"],
-            multipath_active_controllers=row["multipath_active_controllers"],
-            multipath_passive_controllers=row["multipath_passive_controllers"],
-            multipath_failed_controllers=row["multipath_failed_controllers"],
-        )
+        values = {
+            column_name: row[column_name]
+            for column_name in SLOT_STATE_COLUMN_NAMES
+            if column_name != "last_seen_at"
+        }
+        for column_name in ("system_id", "enclosure_key", "slot_label"):
+            values[column_name] = str(values[column_name])
+        values["slot"] = int(values["slot"])
+        for column_name in ("present", "identify_active"):
+            values[column_name] = bool(values[column_name])
+        return SlotStateRecord(**values)
