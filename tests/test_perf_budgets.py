@@ -32,7 +32,8 @@ from tests.perf_fixtures import (
     build_modeled_inventory_snapshot,
     build_modeled_scope_history,
 )
-from scripts.build_perf_baseline import compare_baselines
+from scripts import build_perf_baseline
+from scripts.build_perf_baseline import build_baseline, compare_baselines
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,6 +98,55 @@ class ModeledPerfFixtureTests(unittest.TestCase):
         errors = compare_baselines(baseline, measured)
 
         self.assertTrue(any("hard ceiling" in error for error in errors), errors)
+
+    def test_generated_baseline_rejects_inlined_static_assets_over_hard_ceiling(self) -> None:
+        baseline = build_baseline()
+        measured = copy.deepcopy(baseline)
+
+        for slot_count in MODELED_SLOT_COUNTS:
+            with self.subTest(slot_count=slot_count):
+                case_name = str(slot_count)
+                ceiling = baseline["cases"][case_name]["thresholds"][
+                    "inlined_static_asset_bytes"
+                ]
+                baseline["cases"][case_name]["inlined_static_asset_bytes"] = ceiling + 1
+                measured["cases"][case_name]["inlined_static_asset_bytes"] = ceiling + 1
+
+                errors = compare_baselines(baseline, measured)
+
+                self.assertTrue(
+                    any(
+                        f"case {case_name} inlined_static_asset_bytes exceeds hard ceiling"
+                        in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_write_rejects_over_ceiling_static_assets_without_mutating_baseline(self) -> None:
+        measured = build_baseline()
+        case = measured["cases"]["60"]
+        ceiling = 2_097_152
+        case["thresholds"]["inlined_static_asset_bytes"] = ceiling
+        case["inlined_static_asset_bytes"] = ceiling + 1
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            baseline_path = root / "docs" / "performance-baseline-v1.json"
+            baseline_path.parent.mkdir()
+            original_bytes = b"existing reviewed baseline\n"
+            baseline_path.write_bytes(original_bytes)
+
+            with (
+                patch.object(build_perf_baseline, "ROOT", root),
+                patch.object(build_perf_baseline, "BASELINE_PATH", baseline_path),
+                patch.object(build_perf_baseline, "build_baseline", return_value=measured),
+                patch.object(sys, "argv", ["build_perf_baseline.py", "--write"]),
+            ):
+                result = build_perf_baseline.main()
+
+            self.assertNotEqual(result, 0)
+            self.assertEqual(baseline_path.read_bytes(), original_bytes)
 
     def test_baseline_comparison_keeps_query_invariants_exact(self) -> None:
         baseline = self._comparison_payload()

@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 from tests.perf_fixtures import (  # noqa: E402
     FIXTURE_VERSION,
     MODELED_SLOT_COUNTS,
+    MODELED_THRESHOLDS,
     measure_modeled_perf_case,
 )
 
@@ -76,7 +77,7 @@ def build_baseline() -> dict[str, Any]:
     }
 
 
-def _is_measurement(value: object) -> bool:
+def _is_measurement(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
@@ -208,6 +209,37 @@ def compare_baselines(baseline: dict[str, Any], measured: dict[str, Any]) -> lis
     return errors
 
 
+def validate_authoritative_hard_ceilings(measured: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    measured_cases = measured.get("cases")
+    if not isinstance(measured_cases, dict):
+        return ["cases must be an object"]
+
+    for slot_count, authoritative_thresholds in MODELED_THRESHOLDS.items():
+        case_name = str(slot_count)
+        measured_case = measured_cases.get(case_name)
+        if not isinstance(measured_case, dict):
+            errors.append(f"case {case_name} must be an object")
+            continue
+        if measured_case.get("thresholds") != authoritative_thresholds:
+            errors.append(
+                f"case {case_name} thresholds do not match authoritative MODELED_THRESHOLDS"
+            )
+            continue
+        for metric, ceiling in authoritative_thresholds.items():
+            measured_value = measured_case.get(metric)
+            if not _is_measurement(ceiling) or not _is_measurement(measured_value):
+                errors.append(f"case {case_name} hard ceiling for {metric} must use integers")
+                continue
+            if measured_value > ceiling:
+                errors.append(
+                    f"case {case_name} {metric} exceeds hard ceiling: "
+                    f"measured={measured_value}, ceiling={ceiling}"
+                )
+
+    return errors
+
+
 def render_baseline(payload: dict[str, Any]) -> bytes:
     return (json.dumps(payload, indent=2, sort_keys=False) + "\n").encode("utf-8")
 
@@ -250,6 +282,16 @@ def main() -> int:
 
     measured = build_baseline()
     if args.write:
+        errors = validate_authoritative_hard_ceilings(measured)
+        if errors:
+            print(
+                f"Refusing to write {BASELINE_PATH.relative_to(ROOT)}; "
+                "measured values violate authoritative hard ceilings.",
+                file=sys.stderr,
+            )
+            for error in errors:
+                print(f"- {error}", file=sys.stderr)
+            return 1
         write_baseline(render_baseline(measured))
         print(f"Wrote {BASELINE_PATH.relative_to(ROOT)}")
         return 0

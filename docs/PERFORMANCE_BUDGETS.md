@@ -14,7 +14,7 @@ The gate compares structural, cardinality, query, and cache invariants exactly. 
 
 Byte measurements use a symmetric bounded-drift policy: the allowed difference from the reviewed baseline is 10% or 4,096 bytes, whichever is larger. Hard ceilings always apply, even when a measurement remains inside its drift band. A payload that crosses a ceiling therefore fails immediately, and a large regression cannot be hidden by refreshing ordinary asset measurements.
 
-Export measurements report the pre-inline HTML document bytes and the inlined static asset bytes separately, as well as the complete HTML and retained-cache totals. Normal `app.js`, `style.css`, or offline-image edits inside the bounded band do not require baseline regeneration. Growth beyond the band still fails, while the complete export remains subject to its hard ceiling.
+Export measurements report the pre-inline HTML document bytes and the inlined static asset bytes separately, as well as the complete HTML and retained-cache totals. Normal `app.js`, `style.css`, or offline-image edits inside the bounded band do not require baseline regeneration. Growth beyond the band still fails. Inlined static assets also have an independent 2 MiB hard ceiling for both modeled scales; the current 1,597,836-byte bundle retains about 24% headroom, while the complete export remains subject to its separate hard ceiling.
 
 The three export caches use a shared 32 MiB logical payload budget by default. Accounting uses UTF-8 bytes for rendered HTML, raw bytes for ZIP archives, and compact JSON bytes for retained snapshot, history, SMART, and export metadata. The gate does not use `tracemalloc` or `sys.getsizeof`.
 
@@ -47,7 +47,7 @@ python scripts/build_perf_baseline.py --write
 python scripts/build_perf_baseline.py --check
 ```
 
-Review fixture and baseline changes together. Do not raise a ceiling only to make CI pass. Explain why the payload or cache contract changed and retain useful headroom.
+Review fixture and baseline changes together. The write command validates measured values against authoritative hard ceilings before replacing the checked artifact, so an oversized bundle exits nonzero and leaves the existing baseline untouched. Do not raise a ceiling only to make CI pass. Explain why the payload or cache contract changed and retain useful headroom.
 
 ## Active performance semantics
 

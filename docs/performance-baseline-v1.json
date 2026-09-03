@@ -62,6 +62,7 @@
         "inventory_response_bytes": 98304,
         "scope_history_response_bytes": 655360,
         "scope_history_select_statements": 20,
+        "inlined_static_asset_bytes": 2097152,
         "export_html_bytes": 8388608,
         "logical_retained_bytes": 20971520
       }
@@ -93,6 +94,7 @@
         "inventory_response_bytes": 524288,
         "scope_history_response_bytes": 3145728,
         "scope_history_select_statements": 20,
+        "inlined_static_asset_bytes": 2097152,
         "export_html_bytes": 12582912,
         "logical_retained_bytes": 33554432
       }
