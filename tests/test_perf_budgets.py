@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 import subprocess
@@ -27,9 +28,11 @@ from tests.perf_fixtures import (
     FIXTURE_GENERATED_AT,
     HISTORY_METRIC_NAMES,
     MODELED_SLOT_COUNTS,
+    MODELED_THRESHOLDS,
     build_modeled_inventory_snapshot,
     build_modeled_scope_history,
 )
+from scripts.build_perf_baseline import compare_baselines
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +48,76 @@ def compact_json_bytes(value: object) -> bytes:
 
 
 class ModeledPerfFixtureTests(unittest.TestCase):
+    @staticmethod
+    def _comparison_payload() -> dict[str, object]:
+        return {
+            "schema_version": 3,
+            "fixture_version": 1,
+            "modeled": True,
+            "wall_clock_policy": "report-only",
+            "comparison_policy": {
+                "exact_metrics": ["slot_count", "query_count"],
+                "byte_metrics": ["payload_bytes"],
+                "byte_drift_percent": 10,
+                "minimum_byte_drift": 4096,
+                "byte_drift_direction": "symmetric",
+            },
+            "cases": {
+                "60": {
+                    "slot_count": 60,
+                    "query_count": 1,
+                    "payload_bytes": 50_000,
+                    "thresholds": {"payload_bytes": 75_000},
+                }
+            },
+        }
+
+    def test_baseline_comparison_allows_bounded_byte_drift(self) -> None:
+        baseline = self._comparison_payload()
+        measured = copy.deepcopy(baseline)
+        measured["cases"]["60"]["payload_bytes"] = 54_096  # type: ignore[index]
+
+        self.assertEqual(compare_baselines(baseline, measured), [])
+
+    def test_baseline_comparison_rejects_byte_drift_beyond_policy(self) -> None:
+        baseline = self._comparison_payload()
+        measured = copy.deepcopy(baseline)
+        measured["cases"]["60"]["payload_bytes"] = 55_001  # type: ignore[index]
+
+        errors = compare_baselines(baseline, measured)
+
+        self.assertTrue(any("payload_bytes drifted" in error for error in errors), errors)
+
+    def test_baseline_comparison_rejects_hard_ceiling_even_within_drift(self) -> None:
+        baseline = self._comparison_payload()
+        baseline["cases"]["60"]["thresholds"]["payload_bytes"] = 50_100  # type: ignore[index]
+        measured = copy.deepcopy(baseline)
+        measured["cases"]["60"]["payload_bytes"] = 50_101  # type: ignore[index]
+
+        errors = compare_baselines(baseline, measured)
+
+        self.assertTrue(any("hard ceiling" in error for error in errors), errors)
+
+    def test_baseline_comparison_keeps_query_invariants_exact(self) -> None:
+        baseline = self._comparison_payload()
+        measured = copy.deepcopy(baseline)
+        measured["cases"]["60"]["query_count"] = 2  # type: ignore[index]
+
+        errors = compare_baselines(baseline, measured)
+
+        self.assertTrue(any("query_count changed" in error for error in errors), errors)
+
+    def test_modeled_measurement_reports_inlined_static_assets_separately(self) -> None:
+        from tests.perf_fixtures import measure_modeled_perf_case
+
+        case = measure_modeled_perf_case(60)
+
+        self.assertGreater(case["inlined_static_asset_bytes"], 0)
+        self.assertEqual(
+            case["export_html_bytes"],
+            case["export_html_document_bytes"] + case["inlined_static_asset_bytes"],
+        )
+
     def test_modeled_60_and_347_fixtures_are_deterministic_and_sanitized(self) -> None:
         for slot_count in MODELED_SLOT_COUNTS:
             with self.subTest(slot_count=slot_count):
@@ -80,7 +153,10 @@ class ModeledPerfFixtureTests(unittest.TestCase):
                 self.assertIsNone(PRIVATE_OR_SECRET_PATTERN.search(fixture_text))
 
     def test_inventory_snapshot_serialized_byte_budgets(self) -> None:
-        byte_budgets = {60: 98_304, 347: 524_288}
+        byte_budgets = {
+            slot_count: thresholds["inventory_response_bytes"]
+            for slot_count, thresholds in MODELED_THRESHOLDS.items()
+        }
 
         for slot_count, byte_budget in byte_budgets.items():
             with self.subTest(slot_count=slot_count):
@@ -124,7 +200,10 @@ class ModeledPerfFixtureTests(unittest.TestCase):
 
                 self.assertEqual(list(histories), list(range(slot_count)))
                 self.assertEqual(connection_count, 1)
-                self.assertLessEqual(len(select_statements), 20)
+                self.assertLessEqual(
+                    len(select_statements),
+                    MODELED_THRESHOLDS[slot_count]["scope_history_select_statements"],
+                )
                 for slot in (0, slot_count - 1):
                     self.assertEqual(len(histories[slot]["events"]), 1)
                     self.assertEqual(
@@ -136,7 +215,10 @@ class ModeledPerfFixtureTests(unittest.TestCase):
         from history_service import main as history_main
         from tests.perf_fixtures import populate_modeled_history_store
 
-        byte_budgets = {60: 655_360, 347: 3_145_728}
+        byte_budgets = {
+            slot_count: thresholds["scope_history_response_bytes"]
+            for slot_count, thresholds in MODELED_THRESHOLDS.items()
+        }
         for slot_count, byte_budget in byte_budgets.items():
             with self.subTest(slot_count=slot_count), tempfile.TemporaryDirectory() as temp_dir:
                 store = HistoryStore(str(Path(temp_dir) / "history.db"))
@@ -163,8 +245,14 @@ class ModeledPerfFixtureTests(unittest.TestCase):
     def test_snapshot_export_html_cache_and_retained_byte_budgets(self) -> None:
         from tests.perf_fixtures import ModeledHistoryBackend, build_modeled_request
 
-        html_byte_budgets = {60: 8_388_608, 347: 12_582_912}
-        retained_byte_budgets = {60: 20_971_520, 347: 33_554_432}
+        html_byte_budgets = {
+            slot_count: thresholds["export_html_bytes"]
+            for slot_count, thresholds in MODELED_THRESHOLDS.items()
+        }
+        retained_byte_budgets = {
+            slot_count: thresholds["logical_retained_bytes"]
+            for slot_count, thresholds in MODELED_THRESHOLDS.items()
+        }
         for slot_count in MODELED_SLOT_COUNTS:
             with self.subTest(slot_count=slot_count):
                 EXPORT_HISTORY_CACHE.clear()
@@ -233,7 +321,7 @@ class ModeledPerfFixtureTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         baseline = json.loads((ROOT / "docs" / "performance-baseline-v1.json").read_text(encoding="utf-8"))
-        self.assertEqual(baseline["schema_version"], 2)
+        self.assertEqual(baseline["schema_version"], 3)
         self.assertEqual(baseline["fixture_version"], FIXTURE_VERSION)
         self.assertTrue(baseline["modeled"])
         self.assertEqual(baseline["wall_clock_policy"], "report-only")
@@ -259,6 +347,8 @@ class ModeledPerfFixtureTests(unittest.TestCase):
             "export_cache_total_bytes",
             "export_cache_max_bytes",
             "export_html_bytes",
+            "export_html_document_bytes",
+            "inlined_static_asset_bytes",
             "logical_retained_bytes",
             "thresholds",
         }
@@ -266,7 +356,11 @@ class ModeledPerfFixtureTests(unittest.TestCase):
             case = baseline["cases"][str(slot_count)]
             self.assertEqual(set(case), required_metrics)
             self.assertEqual(case["slot_count"], slot_count)
-            self.assertLessEqual(case["scope_history_select_statements"], 20)
+            self.assertEqual(case["thresholds"], MODELED_THRESHOLDS[slot_count])
+            self.assertLessEqual(
+                case["scope_history_select_statements"],
+                MODELED_THRESHOLDS[slot_count]["scope_history_select_statements"],
+            )
             self.assertEqual(case["history_scope_calls"], 1)
             self.assertEqual(case["history_slot_calls"], 0)
             self.assertEqual(case["zip_build_calls"], 0)
@@ -275,6 +369,10 @@ class ModeledPerfFixtureTests(unittest.TestCase):
                 case["history_cache_bytes"] + case["render_cache_bytes"] + case["zip_cache_bytes"],
             )
             self.assertLessEqual(case["export_cache_total_bytes"], case["export_cache_max_bytes"])
+            self.assertEqual(
+                case["export_html_bytes"],
+                case["export_html_document_bytes"] + case["inlined_static_asset_bytes"],
+            )
             self.assertNotIn("duration_budget_ms", case)
 
     def test_performance_budget_docs_define_modeled_scope_and_refresh_policy(self) -> None:
@@ -287,6 +385,10 @@ class ModeledPerfFixtureTests(unittest.TestCase):
             "wall-clock durations are report-only",
             "python scripts/build_perf_baseline.py --check",
             "python scripts/build_perf_baseline.py --write",
+            "10%",
+            "4,096 bytes",
+            "inlined static asset bytes",
+            "hard ceilings always apply",
             "shared 32 mib",
             "oversized entries are returned but not cached",
             "snapshot_export_cache_bytes",
@@ -327,12 +429,12 @@ class ModeledPerfFixtureTests(unittest.TestCase):
         self.assertGreaterEqual(case["elapsed_ms"], 0)
         self.assertLessEqual(case["export_cache_total_bytes"], case["export_cache_max_bytes"])
 
-    def test_python_ci_checks_the_deterministic_performance_baseline(self) -> None:
+    def test_python_ci_does_not_repeat_baseline_check_outside_unittest(self) -> None:
         workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
         python_steps = workflow["jobs"]["python-source"]["steps"]
         run_commands = "\n".join(str(step.get("run") or "") for step in python_steps)
 
-        self.assertIn("python scripts/build_perf_baseline.py --check", run_commands)
+        self.assertNotIn("python scripts/build_perf_baseline.py --check", run_commands)
 
 
 if __name__ == "__main__":

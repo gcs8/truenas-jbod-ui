@@ -6,23 +6,15 @@ This repository uses public, deterministic modeled fixtures for 60-slot and 347-
 
 `tests/perf_fixtures.py` fixes the fixture timestamp and ordering. Each case has the exact requested slot count. Every slot has one modeled event and two samples for each of six history metrics, for 12 metric samples per slot. The tests serialize through `InventorySnapshot`, `HistoryStore.list_scope_history`, the history scope route shape, and `SnapshotExportService`.
 
-The checked artifact is `docs/performance-baseline-v1.json`. It records `fixture_version`, `modeled: true`, measured stable counts and bytes, and the applicable ceilings.
+The checked artifact is `docs/performance-baseline-v1.json`. It records `fixture_version`, `modeled: true`, measured stable counts and bytes, and the comparison policy. `MODELED_THRESHOLDS` in `tests/perf_fixtures.py` is the authoritative source for hard ceilings; tests consume that mapping directly and the generated artifact records the values used for each case.
 
 ## Blocking budgets
 
-| Metric | 60 slots | 347 slots |
-| --- | ---: | ---: |
-| Inventory compact JSON | 98,304 bytes | 524,288 bytes |
-| Scope-history compact JSON | 655,360 bytes | 3,145,728 bytes |
-| Scope-history connections | 1 | 1 |
-| Scope-history `SELECT` statements | 20 | 20 |
-| Export HTML | 8,388,608 bytes | 12,582,912 bytes |
-| Accounted export-cache bytes | 20,971,520 bytes | 33,554,432 bytes |
-| History status calls across two identical exports | 1 | 1 |
-| Scope-history calls across two identical exports | 1 | 1 |
-| Per-slot history fallback calls | 0 | 0 |
-| Template renders across two identical exports | 1 | 1 |
-| ZIP builds and cache entries for HTML export | 0 | 0 |
+The gate compares structural, cardinality, query, and cache invariants exactly. This includes slot counts, database connection and `SELECT` counts, history calls, template and ZIP work, cache entry counts, and the configured cache maximum.
+
+Byte measurements use a symmetric bounded-drift policy: the allowed difference from the reviewed baseline is 10% or 4,096 bytes, whichever is larger. Hard ceilings always apply, even when a measurement remains inside its drift band. A payload that crosses a ceiling therefore fails immediately, and a large regression cannot be hidden by refreshing ordinary asset measurements.
+
+Export measurements report the pre-inline HTML document bytes and the inlined static asset bytes separately, as well as the complete HTML and retained-cache totals. Normal `app.js`, `style.css`, or offline-image edits inside the bounded band do not require baseline regeneration. Growth beyond the band still fails, while the complete export remains subject to its hard ceiling.
 
 The three export caches use a shared 32 MiB logical payload budget by default. Accounting uses UTF-8 bytes for rendered HTML, raw bytes for ZIP archives, and compact JSON bytes for retained snapshot, history, SMART, and export metadata. The gate does not use `tracemalloc` or `sys.getsizeof`.
 
@@ -30,7 +22,7 @@ Global LRU eviction runs after per-cache entry limits and TTL cleanup. A cache h
 
 Prometheus exposes `snapshot_export_cache_entries`, `snapshot_export_cache_bytes`, request outcomes, eviction reasons, and oversized-entry rejections. Labels are limited to the fixed cache names `history`, `render`, and `zip`; cache keys and payload content are never labels.
 
-Wall-clock durations are report-only. Shared CI runner timing cannot fail this gate. Stable cardinality, query, cache, and byte regressions can.
+Wall-clock durations are report-only. Shared CI runner timing cannot fail this gate. Stable cardinality, query, cache, and byte regressions can. The deterministic unittest suite runs the baseline check once; CI does not invoke the same check again outside that suite.
 
 Run the repeatable report-only cache and latency benchmark with:
 
@@ -48,7 +40,7 @@ Run the normal check with:
 python scripts/build_perf_baseline.py --check
 ```
 
-When an intentional shape change needs new measurements, inspect the diff and then refresh atomically with:
+When an intentional fixture, schema, policy, or meaningful payload-shape change needs new reviewed measurements, inspect the diff and then refresh atomically with:
 
 ```bash
 python scripts/build_perf_baseline.py --write

@@ -539,8 +539,11 @@ def measure_modeled_perf_case(slot_count: int) -> dict[str, Any]:
     exporter = SnapshotExportService(Settings(), history_backend, templates)
     render_calls = 0
     zip_build_calls = 0
+    export_html_document_bytes = 0
+    inlined_static_asset_bytes = 0
     original_render = exporter._render_template_with_assets
     original_zip_builder = exporter._build_zip_archive
+    original_inline_assets = exporter._inline_static_assets
 
     def counting_render(*args, **kwargs):
         nonlocal render_calls
@@ -552,8 +555,16 @@ def measure_modeled_perf_case(slot_count: int) -> dict[str, Any]:
         zip_build_calls += 1
         return original_zip_builder(*args, **kwargs)
 
+    def measuring_inline_assets(request, html):
+        nonlocal export_html_document_bytes, inlined_static_asset_bytes
+        export_html_document_bytes = len(html.encode("utf-8"))
+        rendered = original_inline_assets(request, html)
+        inlined_static_asset_bytes = len(rendered.encode("utf-8")) - export_html_document_bytes
+        return rendered
+
     exporter._render_template_with_assets = counting_render  # type: ignore[method-assign]
     exporter._build_zip_archive = counting_zip_builder  # type: ignore[method-assign]
+    exporter._inline_static_assets = measuring_inline_assets  # type: ignore[method-assign]
     arguments = {
         "request": build_modeled_request(),
         "snapshot": snapshot,
@@ -594,6 +605,8 @@ def measure_modeled_perf_case(slot_count: int) -> dict[str, Any]:
         "export_cache_total_bytes": export_cache_total_bytes,
         "export_cache_max_bytes": exporter.settings.app.export_cache_max_bytes,
         "export_html_bytes": len(html_bytes),
+        "export_html_document_bytes": export_html_document_bytes,
+        "inlined_static_asset_bytes": inlined_static_asset_bytes,
         "logical_retained_bytes": export_cache_total_bytes,
         "thresholds": dict(MODELED_THRESHOLDS[slot_count]),
     }
