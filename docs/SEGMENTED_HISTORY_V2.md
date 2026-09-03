@@ -70,6 +70,14 @@ Use schema-v2 full backup/restore for segmented history. Tombstone-aware
 maintenance must be available before destructive history maintenance is enabled
 again.
 
+The production image packages only these bounded segmented-history CLI entry
+points under `/app/scripts`:
+
+- `scripts/migrate_segmented_history.py`
+- `scripts/rotate_segmented_history.py`
+- `scripts/query_segmented_history.py`
+- `scripts/seal_history_segment.py`
+
 ## Offline migration
 
 Stop or otherwise quiesce the history service. Confirm the SQLite main file has
@@ -87,7 +95,7 @@ missing history table.
 Dry run:
 
 ```bash
-python scripts/migrate_segmented_history.py \
+docker compose run --rm --entrypoint python enclosure-history scripts/migrate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-01-01T00:00:00+00:00 \
@@ -97,7 +105,7 @@ python scripts/migrate_segmented_history.py \
 Apply:
 
 ```bash
-python scripts/migrate_segmented_history.py \
+docker compose run --rm --entrypoint python enclosure-history scripts/migrate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-01-01T00:00:00+00:00 \
@@ -128,7 +136,7 @@ Inspect first without `--apply`.
 Interrupted migration recovery:
 
 ```bash
-python scripts/migrate_segmented_history.py \
+docker compose run --rm --entrypoint python enclosure-history scripts/migrate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --recover-rollback
@@ -137,7 +145,7 @@ python scripts/migrate_segmented_history.py \
 Apply the reported recovery:
 
 ```bash
-python scripts/migrate_segmented_history.py \
+docker compose run --rm --entrypoint python enclosure-history scripts/migrate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --recover-rollback \
@@ -153,12 +161,12 @@ publication state match the journal.
 Rollback a completed cataloged migration:
 
 ```bash
-python scripts/migrate_segmented_history.py \
+docker compose run --rm --entrypoint python enclosure-history scripts/migrate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --rollback
 
-python scripts/migrate_segmented_history.py \
+docker compose run --rm --entrypoint python enclosure-history scripts/migrate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --rollback \
@@ -270,7 +278,7 @@ verification fails.
 Dry-run the next append transaction while the history service is quiesced:
 
 ```bash
-python scripts/rotate_segmented_history.py \
+docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-08-01T00:00:00+00:00 \
@@ -285,7 +293,7 @@ transaction artifacts.
 Apply only after the dry run succeeds and the history service remains quiesced:
 
 ```bash
-python scripts/rotate_segmented_history.py \
+docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-08-01T00:00:00+00:00 \
@@ -299,7 +307,7 @@ Inspect a pending recovery without changing files, then repeat with `--apply`
 only after reviewing the reported phase:
 
 ```bash
-python scripts/rotate_segmented_history.py \
+docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --recover

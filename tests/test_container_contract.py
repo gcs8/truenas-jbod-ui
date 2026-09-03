@@ -29,6 +29,12 @@ EXPECTED_HISTORY_PERMISSION_ENV = {
     "HISTORY_SHARED_DIR_MODE": "${HISTORY_SHARED_DIR_MODE:-0770}",
     "HISTORY_SHARED_FILE_MODE": "${HISTORY_SHARED_FILE_MODE:-0660}",
 }
+SEGMENTED_HISTORY_CLI_PATHS = (
+    "scripts/migrate_segmented_history.py",
+    "scripts/rotate_segmented_history.py",
+    "scripts/query_segmented_history.py",
+    "scripts/seal_history_segment.py",
+)
 
 
 def writable_volume_targets(service: dict[str, Any]) -> set[str]:
@@ -44,6 +50,45 @@ def writable_volume_targets(service: dict[str, Any]) -> set[str]:
 
 
 class ContainerResourceContractTests(unittest.TestCase):
+    def test_documented_segmented_history_cli_sources_exist(self) -> None:
+        runbook = (REPO_ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
+        documented_paths = set(
+            re.findall(r"`(scripts/(?:migrate|rotate|query|seal)[^`]+\.py)`", runbook)
+        )
+
+        self.assertEqual(documented_paths, set(SEGMENTED_HISTORY_CLI_PATHS))
+        for relative_path in documented_paths:
+            with self.subTest(script=relative_path):
+                self.assertTrue((REPO_ROOT / relative_path).is_file())
+
+    def test_production_image_packages_documented_segmented_history_clis(self) -> None:
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+        for relative_path in SEGMENTED_HISTORY_CLI_PATHS:
+            with self.subTest(script=relative_path):
+                self.assertIn(
+                    f"COPY {relative_path} /app/{relative_path}",
+                    dockerfile,
+                )
+        self.assertNotIn("COPY scripts /app/scripts", dockerfile)
+
+    def test_segmented_history_runbook_uses_compose_cli_invocations(self) -> None:
+        runbook = (REPO_ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
+        command_prefix = "docker compose run --rm --entrypoint python enclosure-history "
+
+        self.assertNotRegex(
+            runbook,
+            r"(?m)^python scripts/(?:migrate|rotate)_segmented_history\.py",
+        )
+        self.assertEqual(
+            runbook.count(f"{command_prefix}scripts/migrate_segmented_history.py"),
+            6,
+        )
+        self.assertEqual(
+            runbook.count(f"{command_prefix}scripts/rotate_segmented_history.py"),
+            3,
+        )
+
     def test_history_reads_scheduled_backup_status_for_segmented_retention(self) -> None:
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))[
