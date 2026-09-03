@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.slot_layout import normalize_slot_layout, validate_slot_layout
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -308,6 +310,7 @@ class EnclosureProfileView(BaseModel):
     bay_size: str | None = None
     rows: int
     columns: int
+    slot_count: int = 0
     slot_layout: list[list[int | None]] = Field(default_factory=list)
     row_groups: list[int] = Field(default_factory=list)
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
@@ -597,9 +600,9 @@ class EnclosureProfileRequest(BaseModel):
     face_style: str = "front-drive"
     latch_edge: Literal["top", "bottom", "left", "right"] = "bottom"
     bay_size: Literal["3.5", "2.5"] | None = None
-    rows: int = 1
-    columns: int = 1
-    slot_count: int | None = None
+    rows: int = Field(default=1, ge=1, le=256)
+    columns: int = Field(default=1, ge=1, le=256)
+    slot_count: int | None = Field(default=None, ge=1, le=4096)
     row_groups: list[int] = Field(default_factory=list)
     slot_layout: list[list[int | None]] | None = None
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
@@ -638,29 +641,7 @@ class EnclosureProfileRequest(BaseModel):
     @field_validator("slot_layout", mode="before")
     @classmethod
     def sanitize_slot_layout(cls, value: Any) -> list[list[int | None]] | None:
-        if value is None or value == "":
-            return None
-        if not isinstance(value, list):
-            raise ValueError("slot_layout must be a list of rows.")
-        normalized_rows: list[list[int | None]] = []
-        seen_slots: set[int] = set()
-        for row in value:
-            if not isinstance(row, list):
-                raise ValueError("slot_layout rows must be lists.")
-            normalized_row: list[int | None] = []
-            for raw_slot in row:
-                if raw_slot is None or raw_slot == "":
-                    normalized_row.append(None)
-                    continue
-                slot_number = int(raw_slot)
-                if slot_number < 0:
-                    raise ValueError("slot_layout values must be non-negative integers or null.")
-                if slot_number in seen_slots:
-                    raise ValueError("slot_layout slot numbers must be unique.")
-                seen_slots.add(slot_number)
-                normalized_row.append(slot_number)
-            normalized_rows.append(normalized_row)
-        return normalized_rows
+        return normalize_slot_layout(value)
 
     @field_validator("slot_hints", mode="before")
     @classmethod
@@ -691,21 +672,15 @@ class EnclosureProfileRequest(BaseModel):
     def validate_profile_builder_request(self) -> "EnclosureProfileRequest":
         if not self.label:
             raise ValueError("A profile label is required.")
-        if self.slot_layout is not None:
-            if len(self.slot_layout) != self.rows:
-                raise ValueError("slot_layout row count must match rows.")
-            widest_row = max((len(row) for row in self.slot_layout), default=0)
-            if widest_row > self.columns:
-                raise ValueError("slot_layout rows cannot be wider than columns.")
-            if self.slot_count is not None:
-                layout_slot_count = sum(
-                    1
-                    for row in self.slot_layout
-                    for slot in row
-                    if isinstance(slot, int)
-                )
-                if layout_slot_count != self.slot_count:
-                    raise ValueError("slot_layout must contain exactly slot_count visible slots.")
+        slot_count_was_set = "slot_count" in self.model_fields_set
+        self.slot_count = validate_slot_layout(
+            self.slot_layout,
+            rows=self.rows,
+            columns=self.columns,
+            slot_count=self.slot_count,
+        )
+        if not slot_count_was_set:
+            self.model_fields_set.discard("slot_count")
         if self.slot_count is not None and self.slot_layout is None and self.slot_count > (self.rows * self.columns):
             raise ValueError("slot_count cannot exceed rows x columns for the rectangular builder.")
         if self.row_groups and sum(self.row_groups) != self.columns:

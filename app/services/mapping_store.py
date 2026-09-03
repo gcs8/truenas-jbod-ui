@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -69,8 +70,9 @@ class MappingStore:
         slot: int,
         *,
         allow_legacy_fallback: bool = False,
+        loaded_entries: Mapping[str, ManualMapping] | None = None,
     ) -> ManualMapping | None:
-        current = self.load_all()
+        current = self.load_all() if loaded_entries is None else loaded_entries
         keys = [self._slot_key(system_id, enclosure_id, slot)]
         if allow_legacy_fallback:
             keys.extend((

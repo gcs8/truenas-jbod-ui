@@ -12,6 +12,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
@@ -1244,6 +1245,123 @@ class AdminHistoryStoreTests(unittest.TestCase):
 
 
 class AdminStatePayloadTests(unittest.TestCase):
+    @staticmethod
+    def _build_minimal_state(settings: Settings) -> dict[str, Any]:
+        request = make_request(port=8082)
+        runtime_service = MagicMock()
+        key_manager = MagicMock()
+        key_manager.list_keys.return_value = []
+        host_prep_service = MagicMock()
+        host_prep_service.list_staged_packages.return_value = []
+        release_service = MagicMock()
+        release_service.snapshot.return_value = {}
+        with (
+            patch("admin_service.main.reload_app_settings", return_value=settings),
+            patch("admin_service.main.get_runtime_service", return_value=runtime_service),
+            patch("admin_service.main.build_runtime_payload", new=AsyncMock(return_value={})),
+            patch("admin_service.main.SSHKeyManager", return_value=key_manager),
+            patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
+            patch("admin_service.main.get_release_status_service", return_value=release_service),
+            patch("admin_service.main.get_admin_settings", return_value=AdminSettings()),
+            patch("admin_service.main.get_history_settings", return_value=HistorySettings()),
+        ):
+            return asyncio.run(build_admin_state_payload(request))
+
+    def test_admin_healthz_shape_remains_minimal_and_backward_compatible(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/healthz")
+
+        with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+            response = asyncio.run(route.endpoint())
+
+        self.assertEqual(set(json.loads(response.body)), {"status", "started_at", "expires_at"})
+
+    def test_build_admin_state_payload_warns_for_missing_profile_references(self) -> None:
+        private_host = "private-host.example.invalid"
+        private_secret = "PRIVATE-SECRET-MARKER"
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="system-a",
+                    default_profile_id="missing-default",
+                    enclosure_profiles={"enc-a": "missing-enclosure"},
+                    truenas=TrueNASConfig(host=private_host, api_key=private_secret),
+                )
+            ]
+        )
+
+        payload = self._build_minimal_state(settings)
+
+        warnings = payload["configuration_warnings"]
+        self.assertEqual(len(warnings), 2)
+        self.assertEqual(
+            {(warning["reference_type"], warning["profile_id"]) for warning in warnings},
+            {
+                ("default_profile_id", "missing-default"),
+                ("enclosure_profiles", "missing-enclosure"),
+            },
+        )
+        self.assertEqual({warning["system_id"] for warning in warnings}, {"system-a"})
+        self.assertEqual(
+            {warning.get("enclosure_id") for warning in warnings if warning["reference_type"] == "enclosure_profiles"},
+            {"enc-a"},
+        )
+        serialized = json.dumps(warnings)
+        self.assertNotIn(private_host, serialized)
+        self.assertNotIn(private_secret, serialized)
+
+    def test_build_admin_state_payload_omits_warnings_for_valid_profiles(self) -> None:
+        settings = Settings(
+            profiles=[
+                EnclosureProfileConfig(
+                    id="custom-profile",
+                    label="Custom",
+                    rows=1,
+                    columns=1,
+                    slot_layout=[[0]],
+                )
+            ],
+            systems=[
+                SystemConfig(
+                    id="system-a",
+                    default_profile_id="generic-front-24-1x24",
+                    enclosure_profiles={"enc-a": "custom-profile"},
+                )
+            ],
+        )
+
+        payload = self._build_minimal_state(settings)
+
+        self.assertEqual(payload["configuration_warnings"], [])
+
+    def test_build_admin_state_payload_bounds_missing_profile_warnings(self) -> None:
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id=f"system-{index}",
+                    default_profile_id=f"missing-default-{index}-" + ("x" * 512),
+                    enclosure_profiles={
+                        f"enc-{index}": f"missing-enclosure-{index}-" + ("y" * 512)
+                    },
+                )
+                for index in range(80)
+            ]
+        )
+
+        warnings = self._build_minimal_state(settings)["configuration_warnings"]
+
+        self.assertLessEqual(len(warnings), 50)
+        self.assertTrue(warnings)
+        self.assertTrue(all(len(json.dumps(warning)) <= 768 for warning in warnings))
+
+    def test_admin_ui_renders_configuration_warnings_from_state(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        template = (root / "admin_service" / "templates" / "index.html").read_text(encoding="utf-8")
+        script = (root / "admin_service" / "static" / "admin.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="admin-configuration-warnings"', template)
+        self.assertIn("configuration_warnings", script)
+        self.assertIn("renderConfigurationWarnings", script)
+
     def test_build_admin_state_payload_includes_profile_defaults_and_public_origin(self) -> None:
         settings = Settings(
             config_file="C:/tmp/config/config.yaml",
@@ -1375,6 +1493,7 @@ class AdminStatePayloadTests(unittest.TestCase):
                                 payload = asyncio.run(build_admin_state_payload(request))
 
         self.assertTrue(payload["ok"])
+        self.assertEqual(payload["configuration_warnings"], [])
         self.assertEqual(payload["app_version"], __version__)
         self.assertEqual(payload["admin"]["public_origin"], "http://localhost:8082")
         self.assertEqual(payload["default_system_id"], "archive-core")
