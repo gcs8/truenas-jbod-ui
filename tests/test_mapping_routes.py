@@ -21,6 +21,14 @@ from app.services.mapping_store import (
 )
 
 
+PRIVATE_EXCEPTION_DETAIL = "Traceback: /srv/private/mappings.json contained operator data"
+
+
+def with_private_exception_detail(error: Exception) -> Exception:
+    error.args = (PRIVATE_EXCEPTION_DETAIL,)
+    return error
+
+
 class MappingImportRouteTests(unittest.TestCase):
     def test_mapping_import_preview_route_exists(self) -> None:
         routes = {
@@ -267,7 +275,7 @@ class MappingImportRouteTests(unittest.TestCase):
             invalidate_source_bundle=True,
         )
 
-    def test_stale_single_mapping_mutations_return_409_before_side_effects(self) -> None:
+    def test_stale_single_mapping_mutations_redact_exception_details(self) -> None:
         save_route = next(
             route
             for route in app_main.app.routes
@@ -295,8 +303,16 @@ class MappingImportRouteTests(unittest.TestCase):
                 service = Mock()
                 service.system.id = "system-a"
                 service.system.truenas.platform = "core"
-                service.save_mapping = AsyncMock(side_effect=MappingRevisionConflict("c" * 64))
-                service.clear_mapping = AsyncMock(side_effect=MappingRevisionConflict("c" * 64))
+                service.save_mapping = AsyncMock(
+                    side_effect=with_private_exception_detail(
+                        MappingRevisionConflict("c" * 64)
+                    )
+                )
+                service.clear_mapping = AsyncMock(
+                    side_effect=with_private_exception_detail(
+                        MappingRevisionConflict("c" * 64)
+                    )
+                )
                 service.set_slot_led = AsyncMock()
                 service.get_snapshot = AsyncMock()
                 registry = Mock()
@@ -319,7 +335,11 @@ class MappingImportRouteTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 409)
                 self.assertEqual(body["error"], "mapping_revision_conflict")
                 self.assertEqual(body["current_revision"], "c" * 64)
-                self.assertNotIn("import", body["detail"].lower())
+                self.assertEqual(
+                    body["detail"],
+                    "Mapping scope revision changed before this write.",
+                )
+                self.assertNotIn(PRIVATE_EXCEPTION_DETAIL, response.body.decode("utf-8"))
                 service.set_slot_led.assert_not_awaited()
                 service.invalidate_snapshot_cache.assert_not_called()
                 service.get_snapshot.assert_not_awaited()
@@ -384,18 +404,26 @@ class MappingImportRouteTests(unittest.TestCase):
             import_digest="b" * 64,
             confirmed=True,
         )
+        revision_error = with_private_exception_detail(
+            MappingRevisionConflict("c" * 64)
+        )
+        digest_error = with_private_exception_detail(
+            MappingImportDigestMismatch("c" * 64, "d" * 64)
+        )
         cases = [
             (
-                MappingRevisionConflict("c" * 64),
+                revision_error,
                 {
                     "error": "mapping_revision_conflict",
+                    "detail": "Mapping scope revision changed before this write.",
                     "current_revision": "c" * 64,
                 },
             ),
             (
-                MappingImportDigestMismatch("c" * 64, "d" * 64),
+                digest_error,
                 {
                     "error": "mapping_import_digest_mismatch",
+                    "detail": "Mapping import digest does not match the confirmed preview.",
                     "current_revision": "c" * 64,
                     "current_import_digest": "d" * 64,
                 },
@@ -418,10 +446,11 @@ class MappingImportRouteTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 409)
                 for key, value in expected.items():
                     self.assertEqual(body[key], value)
+                self.assertNotIn(PRIVATE_EXCEPTION_DETAIL, response.body.decode("utf-8"))
                 service.invalidate_snapshot_cache.assert_not_called()
                 service.get_snapshot.assert_not_awaited()
 
-    def test_duplicate_active_scope_rows_return_422_without_mutation(self) -> None:
+    def test_invalid_mapping_bundles_return_generic_422_without_mutation(self) -> None:
         routes = {
             getattr(route, "path", ""): route
             for route in app_main.app.routes
@@ -447,10 +476,10 @@ class MappingImportRouteTests(unittest.TestCase):
             with self.subTest(path=route.path):
                 service = Mock()
                 service.preview_mapping_bundle = AsyncMock(
-                    side_effect=ValueError("Duplicate mapping for enclosure enc-a slot 2.")
+                    side_effect=ValueError(PRIVATE_EXCEPTION_DETAIL)
                 )
                 service.import_mapping_bundle = AsyncMock(
-                    side_effect=ValueError("Duplicate mapping for enclosure enc-a slot 2.")
+                    side_effect=ValueError(PRIVATE_EXCEPTION_DETAIL)
                 )
                 service.get_snapshot = AsyncMock()
                 registry = Mock()
@@ -465,7 +494,11 @@ class MappingImportRouteTests(unittest.TestCase):
                     )
 
                 self.assertEqual(response.status_code, 422)
-                self.assertIn("Duplicate mapping", json.loads(response.body)["detail"])
+                self.assertEqual(
+                    json.loads(response.body)["detail"],
+                    "Mapping bundle is invalid.",
+                )
+                self.assertNotIn(PRIVATE_EXCEPTION_DETAIL, response.body.decode("utf-8"))
                 service.invalidate_snapshot_cache.assert_not_called()
                 service.get_snapshot.assert_not_awaited()
 

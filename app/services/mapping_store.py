@@ -13,14 +13,18 @@ from app.models.domain import ManualMapping
 
 
 class MappingRevisionConflict(RuntimeError):
+    public_detail = "Mapping scope revision changed before this write."
+
     def __init__(self, current_revision: str) -> None:
-        super().__init__("Mapping scope revision changed before this write.")
+        super().__init__(self.public_detail)
         self.current_revision = current_revision
 
 
 class MappingImportDigestMismatch(RuntimeError):
+    public_detail = "Mapping import digest does not match the confirmed preview."
+
     def __init__(self, current_revision: str, current_import_digest: str) -> None:
-        super().__init__("Mapping import digest does not match the confirmed preview.")
+        super().__init__(self.public_detail)
         self.current_revision = current_revision
         self.current_import_digest = current_import_digest
 
