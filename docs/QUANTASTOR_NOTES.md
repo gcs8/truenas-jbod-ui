@@ -56,7 +56,7 @@ Current built-in profile:
 
 Quantastor appliance layout reference:
 
-- local file provided for inspection: `D:\qs_enclosure_layout.conf`
+- local file provided for inspection: `<local-checkout>/references/quantastor-layout`
 - Quantastor ships a matching `supermicro/supermicro_cib_24bay` cluster layout
   for `SSG-2028R-DE2CR24L`
 - that built-in Quantastor layout is currently modeled as:
@@ -126,8 +126,8 @@ Validated live CLI notes:
   stdin and exports the documented `QS_SERVER` variable before executing `qs`.
   The remote command arguments do not contain the API password.
 - local-node CLI inventory works:
-  - `qs hw-enclosure-list --json --server=10.13.37.30,jbodmap,...`
-  - `qs hw-disk-list --json --controller=<controller-id> --server=10.13.37.30,jbodmap,...`
+  - `qs hw-enclosure-list --json --server=192.0.2.40,jbodmap,...`
+  - `qs hw-disk-list --json --controller=<controller-id> --server=192.0.2.40,jbodmap,...`
 - the app now uses SSH `qs disk-list`, `qs hw-disk-list`, and
   `qs hw-enclosure-list` to supplement the REST payload for the validated
   cluster
@@ -163,14 +163,14 @@ Validated live CLI notes:
 
 Validated live operator-context example:
 
-- selected app view: `QSOSN-Left`
-- current cluster master: `QSOSN-Right`
+- selected app view: `ExampleQS-Left`
+- current cluster master: `ExampleQS-Right`
 - validated spare disk: physical slot `12`
 - slot `12` is currently:
-  - presented by `QSOSN-Left`
-  - pool-owned on `QSOSN-Right`
-  - fenced on `QSOSN-Right`
-  - visible on both `QSOSN-Left` and `QSOSN-Right`
+  - presented by `ExampleQS-Left`
+  - pool-owned on `ExampleQS-Right`
+  - fenced on `ExampleQS-Right`
+  - visible on both `ExampleQS-Left` and `ExampleQS-Right`
 
 ## Known Gaps
 

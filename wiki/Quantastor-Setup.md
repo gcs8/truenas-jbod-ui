@@ -126,8 +126,8 @@ like this:
         mode: hybrid
         target_system_id: 11111111-1111-4111-8111-111111111111
         serials:
-          - SMC0515D92721DUK2088
-          - SMC0515D92721DUK4173
+          - SANITIZED-SATADOM-1
+          - SANITIZED-SATADOM-2
     - id: boot-satadoms-right
       label: Boot SATADOMs Right
       kind: boot_devices
@@ -137,8 +137,8 @@ like this:
         mode: hybrid
         target_system_id: 22222222-2222-4222-8222-222222222222
         serials:
-          - SMC0515D92721DUJ6071
-          - SMC0515D92721DUK3185
+          - SANITIZED-SATADOM-3
+          - SANITIZED-SATADOM-4
 ```
 
 Notes:
