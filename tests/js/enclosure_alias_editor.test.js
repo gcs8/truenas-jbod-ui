@@ -239,10 +239,6 @@ test("live navigation closes an alias draft before changing selection", () => {
     APP_SOURCE,
     /enclosureSelect\.addEventListener\("change",[\s\S]*closeEnclosureAliasEditor\(false\);[\s\S]*state\.selectedEnclosureId =/
   );
-  assert.match(
-    APP_SOURCE,
-    /function selectStorageViewRuntimeFromCard[\s\S]*closeEnclosureAliasEditor\(false\);[\s\S]*state\.selectedStorageViewRuntimeId = nextViewId;/
-  );
 });
 
 test("blank submit clears the base enclosure alias and refreshes the live snapshot", async () => {

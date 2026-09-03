@@ -280,16 +280,6 @@
   const summarySshSlotHintCount = document.getElementById("summary-ssh-slot-hint-count");
   const mappingHealthSummary = document.getElementById("mapping-health-summary");
   const mappingHealthEvidence = document.getElementById("mapping-health-evidence");
-  const storageViewsPanel = document.getElementById("storage-views-panel");
-  const storageViewsSummary = document.getElementById("storage-views-summary");
-  const storageViewList = document.getElementById("storage-view-list");
-  const storageViewEmpty = document.getElementById("storage-view-empty");
-  const storageViewContent = document.getElementById("storage-view-content");
-  const storageViewTitle = document.getElementById("storage-view-title");
-  const storageViewNote = document.getElementById("storage-view-note");
-  const storageViewMeta = document.getElementById("storage-view-meta");
-  const storageViewGrid = document.getElementById("storage-view-grid");
-  const storageViewMappingList = document.getElementById("storage-view-mapping-list");
   const mappingForm = document.getElementById("mapping-form");
   const clearMappingButton = document.getElementById("clear-mapping-button");
   const prefillMappingButton = document.getElementById("prefill-mapping-button");
@@ -547,22 +537,6 @@
       return Number(selectedView.slot_count) || countLayoutSlots(activeLayoutRows()) || 0;
     }
     return Number(state.snapshot.layout_slot_count) || countLayoutSlots(activeLayoutRows()) || 0;
-  }
-
-  function storageViewRuntimeMeta(view) {
-    if (!view) {
-      return [];
-    }
-    return [
-      view.kind ? view.kind.replace(/_/g, " ") : null,
-      view.template_label || view.template_id || null,
-      Number.isFinite(Number(view.slot_count)) ? `${Number(view.slot_count)} slots` : null,
-      Number.isFinite(Number(view.matched_count)) ? `${Number(view.matched_count)} matched` : null,
-      view.binding?.mode ? `binding: ${view.binding.mode}` : null,
-      view.render?.show_in_main_ui === false ? "maintenance-only view" : "main UI view",
-      view.backing_enclosure_label ? `live: ${view.backing_enclosure_label}` : null,
-      view.source === "selected_enclosure_snapshot" ? "live enclosure snapshot" : "inventory binding",
-    ].filter(Boolean);
   }
 
   function selectorLabelForEnclosureOption(enclosure) {
@@ -1142,127 +1116,6 @@
     board.appendChild(edgeNote);
 
     grid.appendChild(board);
-  }
-
-  function renderStorageViewsRuntime() {
-    if (!storageViewList || !storageViewEmpty || !storageViewContent || !storageViewTitle || !storageViewNote || !storageViewMeta || !storageViewGrid || !storageViewMappingList) {
-      return;
-    }
-
-    const views = storageViewRuntimeViews();
-    const selectedView = ensureStorageViewRuntimeSelection();
-    if (storageViewsPanel) {
-      storageViewsPanel.classList.toggle("hidden", !views.length);
-    }
-    if (storageViewsSummary) {
-      if (state.storageViewsRuntimeLoading) {
-        storageViewsSummary.textContent = `Inspecting runtime storage-view matches on ${state.selectedSystemId || state.snapshot.selected_system_id || "the selected system"}...`;
-      } else if (!views.length) {
-        storageViewsSummary.textContent = "No saved chassis or virtual storage views are configured for this system yet. Live discovered enclosures still show up in the selector above.";
-      } else {
-        storageViewsSummary.textContent = `Read-only runtime mapping for ${views.length} saved chassis or virtual storage view${views.length === 1 ? "" : "s"} on ${state.storageViewsRuntime?.system_label || state.snapshot.selected_system_label || state.selectedSystemId || "the selected system"}.`;
-      }
-    }
-
-    storageViewList.innerHTML = views
-      .map((view) => `
-        <button
-          class="storage-view-card${view.id === state.selectedStorageViewRuntimeId ? " is-selected" : ""}${view.render?.show_in_main_ui === false ? " is-hidden" : ""}"
-          type="button"
-          data-storage-view-runtime-id="${escapeHtml(view.id)}"
-        >
-          <div class="storage-view-card-header">
-            <div>
-              <h4>${escapeHtml(view.label || view.id)}</h4>
-              <p class="subtle">${escapeHtml(view.notes?.[0] || "Runtime storage-view mapping.")}</p>
-            </div>
-            <span class="state-pill state-${view.enabled === false ? "empty" : "healthy"}">${escapeHtml(view.enabled === false ? "Disabled" : "Enabled")}</span>
-          </div>
-          <div class="profile-preview-meta">
-            ${storageViewRuntimeMeta(view).map((item) => `<span class="meta-chip">${escapeHtml(item)}</span>`).join("")}
-          </div>
-        </button>
-      `)
-      .join("");
-
-    if (!selectedView) {
-      storageViewEmpty.classList.remove("hidden");
-      storageViewContent.classList.add("hidden");
-      return;
-    }
-
-    storageViewEmpty.classList.add("hidden");
-    storageViewContent.classList.remove("hidden");
-    storageViewTitle.textContent = selectedView.label || selectedView.id;
-    storageViewNote.textContent = (selectedView.notes || []).join(" ");
-    storageViewMeta.innerHTML = storageViewRuntimeMeta(selectedView)
-      .map((item) => `<span class="meta-chip">${escapeHtml(item)}</span>`)
-      .join("");
-
-    const slotLayout = Array.isArray(selectedView.slot_layout) ? selectedView.slot_layout : [];
-    const columnCount = Math.max(1, ...slotLayout.map((row) => (Array.isArray(row) ? row.length : 0)), 1);
-    const slotsByIndex = new Map((selectedView.slots || []).map((slot) => [Number(slot.slot_index), slot]));
-    storageViewGrid.style.gridTemplateColumns = `repeat(${columnCount}, minmax(0, 1fr))`;
-    storageViewGrid.classList.toggle("is-nvme-carrier", selectedView.kind === "nvme_carrier");
-    storageViewGrid.innerHTML = slotLayout
-      .flat()
-      .map((slotIndex) => {
-        if (!Number.isInteger(slotIndex)) {
-          return '<div class="storage-view-runtime-cell is-gap" aria-hidden="true"></div>';
-        }
-        const slot = slotsByIndex.get(Number(slotIndex));
-        const stateClass = slot?.state || "empty";
-        return `
-          <article class="storage-view-runtime-cell state-${escapeHtml(stateClass)}${selectedView.kind === "ses_enclosure" ? " is-ses" : ""}${selectedView.kind === "nvme_carrier" ? " is-nvme" : ""}">
-            ${selectedView.kind === "nvme_carrier"
-              ? `
-                <div class="storage-view-runtime-cell-card">
-                  <div class="storage-view-runtime-card storage-view-runtime-card--nvme" data-slot-size="${escapeHtml(slot?.slot_size || "")}">
-                    <span class="storage-view-runtime-card-hole" aria-hidden="true"></span>
-                    <div class="storage-view-runtime-card-content">
-                      <span class="storage-view-runtime-card-slot">${escapeHtml(slot?.slot_label || `Slot ${Number(slotIndex) + 1}`)}</span>
-                      <span class="storage-view-runtime-card-size">${escapeHtml(slot?.slot_size || "auto")}</span>
-                      <span class="storage-view-runtime-card-device">${escapeHtml(storageViewRuntimeTilePrimary(slot, selectedView))}</span>
-                      <span class="storage-view-runtime-card-summary">${escapeHtml(storageViewRuntimeTileSummary(slot, selectedView))}</span>
-                    </div>
-                    <span class="storage-view-runtime-card-latch" aria-hidden="true"></span>
-                  </div>
-                </div>
-              `
-              : `
-                <span class="storage-view-runtime-slot-label">${escapeHtml(slot?.slot_label || `Slot ${Number(slotIndex) + 1}`)}</span>
-                <div class="storage-view-runtime-device">${escapeHtml(storageViewRuntimeShortLabel(slot))}</div>
-                <div class="storage-view-runtime-secondary">${escapeHtml(storageViewRuntimeSecondaryLabel(slot))}</div>
-              `}
-          </article>
-        `;
-      })
-      .join("");
-
-    storageViewMappingList.innerHTML = (selectedView.slots || [])
-      .map((slot) => `
-        <article class="storage-view-mapping-item${slot.occupied ? "" : " is-empty"}">
-          <div class="storage-view-mapping-slot">${escapeHtml(slot.slot_label)}</div>
-          <div class="storage-view-mapping-body">
-            <div class="storage-view-mapping-title">${escapeHtml(storageViewRuntimeShortLabel(slot))}</div>
-            <div class="storage-view-mapping-copy">
-              ${escapeHtml(
-                slot.occupied
-                  ? [
-                      slot.device_name ? `device ${slot.device_name}` : null,
-                      slot.pool_name ? `pool ${slot.pool_name}` : null,
-                      slot.transport_address ? `PCIe ${slot.transport_address}` : null,
-                      slot.snapshot_slot !== null && slot.snapshot_slot !== undefined ? `live slot ${slot.snapshot_slot}` : null,
-                      slot.placement_key ? `placement ${slot.placement_key}` : null,
-                      Array.isArray(slot.match_reasons) && slot.match_reasons.length ? `matched by ${slot.match_reasons.join(", ")}` : null,
-                    ].filter(Boolean).join(" • ")
-                  : "No live disk is currently matched to this layout slot."
-              )}
-            </div>
-          </div>
-        </article>
-      `)
-      .join("");
   }
 
   function usesGenericPersistentIdLabel() {
@@ -8852,7 +8705,6 @@
     renderSasFabric();
     renderGrid();
     renderDetail();
-    renderStorageViewsRuntime();
     renderWarnings();
     renderStatus();
     renderSummary();
@@ -8926,7 +8778,6 @@
     const requestToken = ++state.storageViewsRuntimeRequestToken;
     try {
       state.storageViewsRuntimeLoading = true;
-      renderStorageViewsRuntime();
       renderSelectors();
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
@@ -9091,7 +8942,6 @@
         markHistoryCachesStale(error);
         renderHistoryPanel();
         renderHeatmapControls();
-        renderStorageViewsRuntime();
         setStatus(`Refresh failed: ${error.message || error}`, "error");
       }
     } finally {
@@ -9650,30 +9500,6 @@
         return;
       }
       clearSelectedSlot();
-    });
-  }
-  function selectStorageViewRuntimeFromCard(nextViewId) {
-    if (nextViewId !== state.selectedStorageViewRuntimeId && !confirmMappingDraftDiscard()) {
-      return false;
-    }
-    closeEnclosureAliasEditor(false);
-    state.selectedStorageViewRuntimeId = nextViewId;
-    resetHeatmapHistoryCache();
-    renderViewChrome();
-    renderStorageViewsRuntime();
-    renderGrid();
-    renderSummary();
-    ensureHeatmapData();
-    return true;
-  }
-  if (storageViewList) {
-    storageViewList.addEventListener("click", (event) => {
-      const button = event.target.closest("[data-storage-view-runtime-id]");
-      if (!button) {
-        return;
-      }
-      const nextViewId = button.dataset.storageViewRuntimeId || "";
-      selectStorageViewRuntimeFromCard(nextViewId);
     });
   }
   autoRefreshToggle.addEventListener("change", (event) => {

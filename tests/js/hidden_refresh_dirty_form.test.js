@@ -315,7 +315,6 @@ test("a draft started during an automatic refresh blocks its response render", a
     markHistoryCachesStale() {},
     renderHistoryPanel() {},
     renderHeatmapControls() {},
-    renderStorageViewsRuntime() {},
     scheduleAutoRefresh() { events.push("schedule"); },
   });
 
@@ -438,7 +437,7 @@ test("fabric slot controls do not synchronize trace state before dirty navigatio
   assert.deepEqual(events, ["select:2"]);
 });
 
-test("system, enclosure, and saved-view navigation guard dirty calibration drafts", () => {
+test("system and enclosure/view navigation guard dirty calibration drafts", () => {
   for (const [marker, length] of [
     ['systemSelect.addEventListener("change"', 500],
     ['enclosureSelect.addEventListener("change"', 500],
@@ -452,18 +451,4 @@ test("system, enclosure, and saved-view navigation guard dirty calibration draft
     );
   }
 
-  const cardHandlerStart = APP_SOURCE.indexOf('storageViewList.addEventListener("click"');
-  assert.notEqual(cardHandlerStart, -1, "saved-view card handler must exist");
-  assert.match(
-    APP_SOURCE.slice(cardHandlerStart, cardHandlerStart + 500),
-    /selectStorageViewRuntimeFromCard\(nextViewId\)/,
-    "saved-view cards must use the guarded scope transition"
-  );
-  const guardedHelperStart = APP_SOURCE.indexOf("function selectStorageViewRuntimeFromCard(");
-  assert.notEqual(guardedHelperStart, -1, "saved-view guarded transition must exist");
-  assert.match(
-    APP_SOURCE.slice(guardedHelperStart, guardedHelperStart + 500),
-    /confirmMappingDraftDiscard\(\)/,
-    "saved-view guarded transition must protect dirty mapping navigation"
-  );
 });

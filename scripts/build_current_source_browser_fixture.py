@@ -4,6 +4,7 @@ import argparse
 import asyncio
 from datetime import datetime, timezone
 import hashlib
+import json
 from pathlib import Path
 import sys
 
@@ -16,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app import __version__  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.models.domain import (  # noqa: E402
     EnclosureOption,
@@ -25,6 +27,7 @@ from app.models.domain import (  # noqa: E402
     SlotState,
     SlotView,
     SourceStatus,
+    StorageViewRuntimePayload,
     SystemOption,
 )
 from app.script_json import register_script_json_filters  # noqa: E402
@@ -113,6 +116,98 @@ def build_synthetic_snapshot() -> InventorySnapshot:
     )
 
 
+def build_synthetic_live_snapshot() -> InventorySnapshot:
+    return InventorySnapshot.model_validate(
+        {
+            "slots": [
+                {
+                    "slot": 0,
+                    "slot_label": "00",
+                    "row_index": 0,
+                    "column_index": 0,
+                    "enclosure_id": "enc-a",
+                    "enclosure_label": "Live Shelf",
+                    "present": True,
+                    "state": "healthy",
+                    "device_name": "sdx",
+                    "serial": "LIVE-SERIAL-0",
+                    "model": "Synthetic Disk",
+                    "size_human": "1 TB",
+                    "gptid": "synthetic-gptid-0",
+                    "pool_name": "synthetic-pool",
+                    "vdev_name": "mirror-0",
+                    "health": "ONLINE",
+                    "mapping_source": "manual",
+                    "notes": "Saved mapping note",
+                }
+            ],
+            "layout_rows": [[0]],
+            "layout_slot_count": 1,
+            "layout_columns": 1,
+            "last_updated": FIXTURE_GENERATED_AT,
+            "generated_at": FIXTURE_GENERATED_AT,
+            "refresh_interval_seconds": 300,
+            "selected_system_id": "synthetic-system",
+            "selected_system_label": "Synthetic System",
+            "selected_system_platform": "linux",
+            "selected_enclosure_id": "enc-a",
+            "selected_enclosure_label": "Live Shelf",
+            "selected_profile": {
+                "id": "synthetic-profile",
+                "label": "Synthetic Profile",
+                "panel_title": "Live Shelf",
+                "face_style": "generic",
+                "latch_edge": "bottom",
+                "bay_size": "3.5",
+                "rows": 1,
+                "columns": 1,
+                "slot_count": 1,
+                "slot_layout": [[0]],
+            },
+            "systems": [
+                {
+                    "id": "synthetic-system",
+                    "label": "Synthetic System",
+                    "platform": "linux",
+                }
+            ],
+            "enclosures": [
+                {
+                    "id": "enc-a",
+                    "label": "Live Shelf",
+                    "raw_label": "Raw Shelf",
+                    "alias": "Live Shelf",
+                    "profile_id": "synthetic-profile",
+                    "rows": 1,
+                    "columns": 1,
+                    "slot_count": 1,
+                    "slot_layout": [[0]],
+                }
+            ],
+            "sources": {
+                "api": {
+                    "enabled": True,
+                    "ok": True,
+                    "message": "Synthetic API fixture",
+                },
+                "ssh": {
+                    "enabled": False,
+                    "ok": True,
+                    "message": "SSH disabled for fixture",
+                },
+            },
+            "summary": {
+                "disk_count": 1,
+                "pool_count": 1,
+                "enclosure_count": 1,
+                "mapped_slot_count": 1,
+                "manual_mapping_count": 1,
+                "ssh_slot_hint_count": 0,
+            },
+        }
+    )
+
+
 def build_fixture_request() -> Request:
     request = Request(
         {
@@ -165,6 +260,48 @@ async def build_fixture_html() -> str:
     return source_manifest + rendered.html
 
 
+def build_live_fixture_html(storage_view_runtime: StorageViewRuntimePayload) -> str:
+    snapshot = build_synthetic_live_snapshot()
+    settings = Settings()
+    context = {
+        "request": build_fixture_request(),
+        "snapshot": snapshot,
+        "storage_view_runtime": storage_view_runtime,
+        "settings": settings,
+        "initial_snapshot_json": json.dumps(snapshot.model_dump(mode="json")),
+        "initial_storage_view_runtime_json": json.dumps(storage_view_runtime.model_dump(mode="json")),
+        "history_configured": False,
+        "app_version": __version__,
+        "release_status": {},
+        "snapshot_mode": False,
+        "sas_fabric_view_url": "/sas-fabric",
+        "snapshot_export_meta": {},
+        "snapshot_export_meta_json": "null",
+        "preloaded_history_json": "{}",
+        "preloaded_smart_summary_json": "{}",
+        "preloaded_snapshots_json": "{}",
+        "preloaded_snapshot_smart_summary_json": "{}",
+        "preloaded_storage_view_smart_summary_json": "{}",
+        "preloaded_history_summary_json": '{"counts": {}, "collector": {}}',
+        "initial_selected_slot_json": "0",
+        "initial_selected_storage_view_id_json": "null",
+        "initial_history_timeframe_hours_json": "24",
+        "initial_history_panel_open_json": "false",
+        "initial_history_io_chart_mode_json": '"total"',
+        "admin_launch_url": None,
+    }
+    asset_hashes = {
+        asset_name: hashlib.sha256((ROOT / "app" / "static" / asset_name).read_bytes()).hexdigest()
+        for asset_name in ("app.js", "style.css")
+    }
+    source_manifest = (
+        "<!-- current-source-browser-fixture "
+        f"app.js_sha256={asset_hashes['app.js']} "
+        f"style.css_sha256={asset_hashes['style.css']} -->\n"
+    )
+    return source_manifest + TEMPLATES.env.get_template("index.html").render(context)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build a deterministic browser fixture with current source assets inlined."
@@ -175,13 +312,29 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="HTML output path. Use a temporary path; the generated artifact is disposable.",
     )
+    parser.add_argument(
+        "--live-mode-runtime",
+        type=Path,
+        help="Synthetic storage-view runtime JSON for a disposable live-mode browser fixture.",
+    )
     return parser.parse_args()
 
 
 async def run() -> int:
     args = parse_args()
     output_path = args.output if args.output.is_absolute() else ROOT / args.output
-    html = await build_fixture_html()
+    if args.live_mode_runtime is not None:
+        runtime_path = (
+            args.live_mode_runtime
+            if args.live_mode_runtime.is_absolute()
+            else ROOT / args.live_mode_runtime
+        )
+        storage_view_runtime = StorageViewRuntimePayload.model_validate_json(
+            runtime_path.read_text(encoding="utf-8")
+        )
+        html = build_live_fixture_html(storage_view_runtime)
+    else:
+        html = await build_fixture_html()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html, encoding="utf-8")
     print(f"Built current-source browser fixture {output_path} ({len(html.encode('utf-8'))} bytes)")

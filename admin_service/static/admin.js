@@ -5653,10 +5653,6 @@
     return pending;
   }
 
-  function cancelRuntimeActionPolling(containerKey) {
-    state.runtimeActionControllers.get(String(containerKey || ""))?.abort();
-  }
-
   function cancelAllRuntimeActionPolling() {
     state.runtimeActionControllers.forEach((controller) => controller.abort());
   }

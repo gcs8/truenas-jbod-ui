@@ -139,7 +139,6 @@ test("overlapping manual, selection, and auto refreshes schedule exactly one nex
     markHistoryCachesStale() {},
     renderHistoryPanel() {},
     renderHeatmapControls() {},
-    renderStorageViewsRuntime() {},
     scheduleAutoRefresh() { scheduled += 1; },
   });
 
@@ -204,7 +203,6 @@ test("successful inventory refresh invalidates history before render and a faile
     markHistoryCachesStale(error) { events.push(`stale:${error.message || error}`); },
     renderHistoryPanel() {},
     renderHeatmapControls() {},
-    renderStorageViewsRuntime() {},
     scheduleAutoRefresh() {},
   });
 
@@ -218,7 +216,7 @@ test("successful inventory refresh invalidates history before render and a faile
   assert.deepEqual(events, ["stale:inventory unavailable"]);
 });
 
-test("storage-view refresh renders loading state once and completion once", async () => {
+test("storage-view refresh updates the live selector before the completed main render", async () => {
   const state = {
     snapshotMode: false,
     storageViewsRuntimeRequestToken: 0,
@@ -227,7 +225,6 @@ test("storage-view refresh renders loading state once and completion once", asyn
   const events = [];
   const { fn: fetchStorageViewRuntime } = loadFunction(APP_SOURCE, "fetchStorageViewRuntime", {
     state,
-    renderStorageViewsRuntime() { events.push("loading-panel"); },
     renderSelectors() { events.push("loading-selectors"); },
     buildSelectionParams() { return new URLSearchParams(); },
     URLSearchParams,
@@ -239,7 +236,7 @@ test("storage-view refresh renders loading state once and completion once", asyn
 
   await fetchStorageViewRuntime();
 
-  assert.deepEqual(events, ["loading-panel", "loading-selectors", "apply", "complete"]);
+  assert.deepEqual(events, ["loading-selectors", "apply", "complete"]);
   assert.equal(state.storageViewsRuntimeLoading, false);
 });
 
