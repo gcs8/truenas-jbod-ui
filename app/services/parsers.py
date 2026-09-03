@@ -1826,10 +1826,10 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
         slots_by_element: list[SESMapSlot] = []
         element_positions: dict[tuple[str, int], int] = {}
         for slot in slot_evidence[key]:
-            ses_device = slot.ses_device or target.ses_device
+            ses_device = slot.ses_device or target.ses_device or ""
             identity = (
                 (ses_device, slot.element_id)
-                if ses_device and slot.element_id is not None
+                if slot.element_id is not None
                 else None
             )
             if identity is None or identity not in element_positions:

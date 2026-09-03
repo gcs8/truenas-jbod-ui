@@ -1313,6 +1313,44 @@ ses0:
         self.assertEqual(parsed[0].unmapped_slots[0].element_id, 7)
         self.assertEqual(parsed[0].unmapped_slots[0].device_names, ["da7"])
 
+    def test_commandless_ec_and_aes_merge_by_element_identity_in_any_order(self) -> None:
+        def enclosure(source: str) -> SESMapEnclosure:
+            if source == "aes":
+                return SESMapEnclosure(
+                    enclosure_id="enc-a",
+                    enclosure_name="Shelf",
+                    slots={
+                        1: SESMapSlot(
+                            slot_number=1,
+                            element_id=0,
+                            slot_number_source="ses_device_slot_number",
+                            present=True,
+                            presence_source="sg_ses_aes",
+                        )
+                    },
+                )
+            return SESMapEnclosure(
+                enclosure_id="enc-a",
+                enclosure_name="Shelf",
+                slots={
+                    0: SESMapSlot(
+                        slot_number=0,
+                        element_id=0,
+                        status="OK",
+                        identify_active=True,
+                    )
+                },
+            )
+
+        for first, second in (("aes", "ec"), ("ec", "aes")):
+            with self.subTest(first=first):
+                merged = _merge_ses_enclosures([enclosure(first), enclosure(second)])[0]
+                self.assertIsNone(merged.ses_device)
+                self.assertEqual(list(merged.slots), [1])
+                self.assertEqual(merged.slots[1].status, "OK")
+                self.assertTrue(merged.slots[1].identify_active)
+                self.assertTrue(merged.slots[1].present)
+
     def test_reported_slot_provenance_wins_regardless_of_merge_order(self) -> None:
         def enclosure(source: str) -> SESMapEnclosure:
             is_reported = source == "ses_device_slot_number"
