@@ -190,7 +190,12 @@ class MappingStoreImportTests(unittest.TestCase):
                     expected_revision=clear_revision,
                 )
 
-            current = store.get_mapping("system-a", None, 0)
+            current = store.get_mapping(
+                "system-a",
+                None,
+                0,
+                allow_legacy_fallback=True,
+            )
             self.assertIsNotNone(current)
             assert current is not None
             self.assertEqual(current.serial, "LEGACY-NEW")
@@ -251,7 +256,12 @@ class MappingStoreImportTests(unittest.TestCase):
                     expected_revision=clear_revision,
                 )
 
-            current = store.get_mapping("system-a", "enc-a", 0)
+            current = store.get_mapping(
+                "system-a",
+                "enc-a",
+                0,
+                allow_legacy_fallback=True,
+            )
             self.assertIsNotNone(current)
             assert current is not None
             self.assertEqual(current.serial, "LEGACY-NEW")
@@ -272,6 +282,65 @@ class MappingStoreImportTests(unittest.TestCase):
                 [mapping.serial for mapping in store.list_mappings("system-a", "enc-a")],
                 ["LEGACY"],
             )
+
+    def test_unscoped_legacy_mapping_requires_single_scope_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            legacy = ManualMapping(
+                system_id=None,
+                enclosure_id=None,
+                slot=3,
+                device_name="sda",
+            )
+            store._write({"default:3": legacy})
+
+            self.assertIsNone(store.get_mapping("system-b", "enc-b", 3))
+            admitted = store.get_mapping(
+                "system-b",
+                "enc-b",
+                3,
+                allow_legacy_fallback=True,
+            )
+            self.assertIsNotNone(admitted)
+            assert admitted is not None
+            self.assertEqual(admitted.device_name, "sda")
+
+    def test_enclosureless_mapping_requires_single_scope_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            store.save_mapping(
+                ManualMapping(
+                    system_id="system-a",
+                    enclosure_id=None,
+                    slot=3,
+                    serial="SYSTEM-FALLBACK",
+                )
+            )
+
+            self.assertIsNone(store.get_mapping("system-a", "enc-b", 3))
+            admitted = store.get_mapping(
+                "system-a",
+                "enc-b",
+                3,
+                allow_legacy_fallback=True,
+            )
+            self.assertIsNotNone(admitted)
+            assert admitted is not None
+            self.assertEqual(admitted.serial, "SYSTEM-FALLBACK")
+
+    def test_exact_key_rejects_mapping_owned_by_another_system(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            store._write({
+                store._slot_key("system-b", "enc-b", 3): ManualMapping(
+                    system_id="system-a",
+                    enclosure_id="enc-b",
+                    slot=3,
+                    serial="WRONG-SYSTEM",
+                )
+            })
+
+            self.assertIsNone(store.get_mapping("system-b", "enc-b", 3))
 
     def test_colon_bearing_legacy_enclosure_key_remains_unscoped(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -335,6 +404,34 @@ class MappingStoreImportTests(unittest.TestCase):
                     list(current),
                     [store._slot_key("system-a", enclosure_id, 0)],
                 )
+
+    def test_canonical_save_removes_global_legacy_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            store._write({
+                "default:0": ManualMapping(
+                    system_id=None,
+                    enclosure_id=None,
+                    slot=0,
+                    serial="LEGACY",
+                )
+            })
+
+            store.save_mapping(
+                ManualMapping(
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    slot=0,
+                    serial="CANONICAL",
+                )
+            )
+
+            current = store.load_all()
+            self.assertNotIn("default:0", current)
+            self.assertEqual(
+                list(current),
+                [store._slot_key("system-a", "enc-a", 0)],
+            )
 
     def test_preexisting_legacy_alias_collapses_to_canonical_effective_row(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

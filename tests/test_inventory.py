@@ -102,6 +102,33 @@ def build_inventory_service(
 
 
 class InventoryHelpersTests(unittest.TestCase):
+    def test_legacy_mapping_fallback_requires_one_system_and_one_enclosure(self) -> None:
+        system_a = SystemConfig(id="system-a")
+        service = object.__new__(InventoryService)
+        service.settings = Settings(systems=[system_a])
+        one_enclosure = [EnclosureOption(id="enc-a", label="Enclosure A")]
+
+        self.assertTrue(service._legacy_mapping_fallback_allowed(one_enclosure))
+
+        service.settings = Settings(
+            systems=[system_a, SystemConfig(id="system-b")]
+        )
+        self.assertFalse(service._legacy_mapping_fallback_allowed(one_enclosure))
+
+        service.settings = Settings(systems=[system_a])
+        self.assertFalse(
+            service._legacy_mapping_fallback_allowed([
+                *one_enclosure,
+                EnclosureOption(id="enc-b", label="Enclosure B"),
+            ])
+        )
+        self.assertTrue(
+            service._legacy_mapping_fallback_allowed([
+                EnclosureOption(id="enc-a::drawer-a", label="Drawer A"),
+                EnclosureOption(id="enc-a::drawer-b", label="Drawer B"),
+            ])
+        )
+
     def test_storage_view_slot_label_honors_profile_slot_number_base(self) -> None:
         storage_view = StorageViewConfig.model_validate(
             {
