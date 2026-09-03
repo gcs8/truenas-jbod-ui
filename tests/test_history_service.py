@@ -22,6 +22,7 @@ from starlette.requests import Request
 from app.request_context import request_context
 from history_service import main as history_main
 from history_service import migration_lock
+from history_service import store as history_store
 from history_service.collector import HistoryCollectionStopping, HistoryCollector, ScopeSnapshot
 from history_service.config import HistorySettings, get_history_settings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
@@ -882,6 +883,187 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
 
 class HistoryStoreTests(unittest.TestCase):
+    def test_slot_state_column_contract_matches_existing_schema_and_projections(self) -> None:
+        expected_columns = (
+            ("system_id", "TEXT NOT NULL"),
+            ("system_label", "TEXT"),
+            ("enclosure_key", "TEXT NOT NULL"),
+            ("enclosure_id", "TEXT"),
+            ("enclosure_label", "TEXT"),
+            ("slot", "INTEGER NOT NULL"),
+            ("slot_label", "TEXT NOT NULL"),
+            ("present", "INTEGER NOT NULL"),
+            ("state", "TEXT"),
+            ("identify_active", "INTEGER NOT NULL"),
+            ("device_name", "TEXT"),
+            ("serial", "TEXT"),
+            ("model", "TEXT"),
+            ("gptid", "TEXT"),
+            ("persistent_id_label", "TEXT"),
+            ("disk_identity_key", "TEXT"),
+            ("logical_unit_id", "TEXT"),
+            ("sas_address", "TEXT"),
+            ("pool_name", "TEXT"),
+            ("vdev_name", "TEXT"),
+            ("health", "TEXT"),
+            ("topology_label", "TEXT"),
+            ("multipath_device", "TEXT"),
+            ("multipath_mode", "TEXT"),
+            ("multipath_state", "TEXT"),
+            ("multipath_lunid", "TEXT"),
+            ("multipath_primary_path", "TEXT"),
+            ("multipath_alternate_path", "TEXT"),
+            ("multipath_active_paths", "TEXT"),
+            ("multipath_passive_paths", "TEXT"),
+            ("multipath_failed_paths", "TEXT"),
+            ("multipath_other_paths", "TEXT"),
+            ("multipath_active_controllers", "TEXT"),
+            ("multipath_passive_controllers", "TEXT"),
+            ("multipath_failed_controllers", "TEXT"),
+            ("last_seen_at", "TEXT NOT NULL"),
+        )
+        expected_names = tuple(name for name, _definition in expected_columns)
+
+        expected_update_names = tuple(
+            name
+            for name in expected_names
+            if name not in {"system_id", "enclosure_key", "slot"}
+        )
+        expected_schema_columns = ",\n".join(
+            f"    {name} {definition}" for name, definition in expected_columns
+        )
+        expected_upsert_columns = ",\n".join(
+            f"                {name}" for name in expected_names
+        )
+        expected_upsert_updates = ",\n".join(
+            f"                {name} = excluded.{name}"
+            for name in expected_update_names
+        )
+        expected_adoption_projection = ("?", "?", *expected_names[2:])
+        expected_adoption_columns = ",\n".join(
+            f"                        {name}" for name in expected_names
+        )
+        expected_adoption_select = ",\n".join(
+            f"                        {projection}"
+            for projection in expected_adoption_projection
+        )
+
+        self.assertEqual(history_store.SLOT_STATE_COLUMNS, expected_columns)
+        self.assertEqual(history_store.SLOT_STATE_COLUMN_NAMES, expected_names)
+        self.assertEqual(history_store.SLOT_STATE_UPSERT_COLUMNS, expected_names)
+        self.assertEqual(history_store.SLOT_STATE_UPSERT_UPDATE_COLUMNS, expected_update_names)
+        self.assertEqual(
+            history_store.SLOT_STATE_ADOPTION_PROJECTION,
+            expected_adoption_projection,
+        )
+        self.assertIn(
+            f"CREATE TABLE IF NOT EXISTS slot_state_current (\n{expected_schema_columns},\n"
+            "    PRIMARY KEY (system_id, enclosure_key, slot)\n);",
+            history_store.SCHEMA,
+        )
+        self.assertEqual(
+            history_store.SLOT_STATE_UPSERT_SQL,
+            "\n            INSERT INTO slot_state_current (\n"
+            f"{expected_upsert_columns}\n"
+            f"            ) VALUES ({', '.join('?' for _name in expected_names)})\n"
+            "            ON CONFLICT(system_id, enclosure_key, slot) DO UPDATE SET\n"
+            f"{expected_upsert_updates}\n"
+            "            ",
+        )
+        self.assertEqual(
+            history_store.SLOT_STATE_ADOPTION_SQL,
+            "\n                    INSERT OR IGNORE INTO slot_state_current (\n"
+            f"{expected_adoption_columns}\n"
+            "                    )\n"
+            "                    SELECT\n"
+            f"{expected_adoption_select}\n"
+            "                    FROM slot_state_current\n"
+            "                    WHERE system_id = ?\n"
+            "                    ",
+        )
+
+        record_values: dict[str, Any] = {
+            name: f"value-{name}"
+            for name in expected_names
+            if name != "last_seen_at"
+        }
+        record_values.update(slot=17, present=True, identify_active=False)
+        record = SlotStateRecord(**record_values)
+        observed_at = "2030-01-02T03:04:05+00:00"
+        expected_parameters = tuple(
+            observed_at
+            if name == "last_seen_at"
+            else int(getattr(record, name))
+            if name in {"present", "identify_active"}
+            else getattr(record, name)
+            for name in expected_names
+        )
+        self.assertEqual(
+            history_store._slot_state_record_values(record, observed_at),
+            expected_parameters,
+        )
+        stored_row = dict(zip(expected_names, expected_parameters, strict=True))
+        self.assertEqual(HistoryStore._row_to_slot_state(stored_row), record)  # type: ignore[arg-type]
+
+    def test_rollup_projection_contract_matches_existing_queries(self) -> None:
+        expected_projection = """                    NULL AS id,
+                    CASE
+                        WHEN metric_name IN ('bytes_read', 'bytes_written', 'power_on_hours')
+                        THEN last_observed_at
+                        ELSE bucket_start
+                    END AS observed_at,
+                    system_id,
+                    system_label,
+                    enclosure_key,
+                    enclosure_id,
+                    enclosure_label,
+                    slot,
+                    slot_label,
+                    metric_name,
+                    NULL AS value_integer,
+                    CASE
+                        WHEN metric_name IN ('bytes_read', 'bytes_written', 'power_on_hours')
+                        THEN last_value
+                        ELSE value_sum / sample_count
+                    END AS value_real,
+                    device_name,
+                    serial,
+                    model,
+                    state,
+                    gptid,
+                    persistent_id_label,
+                    NULLIF(disk_identity_key, '') AS disk_identity_key,
+                    logical_unit_id,
+                    sas_address,
+                    bucket_seconds AS rollup_seconds,
+                    sample_count,
+                    value_min,
+                    value_max"""
+
+        self.assertEqual(
+            history_store.ROLLUP_COUNTER_METRICS,
+            ("bytes_read", "bytes_written", "power_on_hours"),
+        )
+        self.assertEqual(history_store.ROLLUP_TO_SAMPLE_PROJECTION, expected_projection)
+
+    def test_empty_slot_history_payload_is_exact_and_fresh(self) -> None:
+        first = HistoryStore._empty_slot_history_payload(("temperature_c", "power_on_hours"))
+        second = HistoryStore._empty_slot_history_payload(("temperature_c", "power_on_hours"))
+
+        self.assertEqual(
+            first,
+            {
+                "events": [],
+                "metrics": {"temperature_c": [], "power_on_hours": []},
+                "sample_counts": {},
+                "latest_values": {},
+            },
+        )
+        first["events"].append({"id": 1})
+        first["metrics"]["temperature_c"].append({"value": 30})
+        self.assertEqual(second["events"], [])
+        self.assertEqual(second["metrics"]["temperature_c"], [])
+
     def test_noninitializing_store_skips_schema_writes_for_maintenance(self) -> None:
         import inspect
 
@@ -5444,6 +5626,61 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(
             collector._fetch_storage_views.await_args.kwargs,  # type: ignore[attr-defined]
             {"system_id": "archive-core", "force": True},
+        )
+
+    def test_enumerate_scopes_appends_storage_views_after_enclosure_walk(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        root_snapshot = {
+            "systems": [{"id": "archive-core", "label": "Archive CORE"}],
+        }
+        system_snapshot = {
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+            "selected_system_platform": "core",
+            "selected_enclosure_id": "enc-a",
+            "selected_enclosure_label": "Front Shelf",
+            "enclosures": [{"id": "enc-a", "label": "Front Shelf"}],
+            "slots": [],
+        }
+        storage_views_payload = {
+            "system_label": "Archive CORE",
+            "views": [
+                {
+                    "id": "boot-doms",
+                    "label": "Boot SATADOMs",
+                    "source": "inventory_binding",
+                    "slots": [
+                        {
+                            "slot_index": 0,
+                            "slot_label": "DOM-A",
+                            "occupied": True,
+                            "state": "matched",
+                        }
+                    ],
+                }
+            ],
+        }
+        collector._fetch_inventory = AsyncMock(side_effect=[root_snapshot, system_snapshot])  # type: ignore[method-assign]
+        collector._fetch_storage_views = AsyncMock(return_value=storage_views_payload)  # type: ignore[method-assign]
+
+        scopes = asyncio.run(collector._enumerate_scopes())
+
+        self.assertEqual(
+            [scope.enclosure_id for scope in scopes],
+            ["enc-a", "storage-view:boot-doms"],
+        )
+        collector._fetch_storage_views.assert_awaited_once_with(  # type: ignore[attr-defined]
+            system_id="archive-core",
+            force=True,
         )
 
     def test_enumerate_scopes_can_use_cached_inventory_for_lazy_fast_passes(self) -> None:
