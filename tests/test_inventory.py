@@ -9587,6 +9587,52 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(service._source_bundle, refreshed_bundle)
             self.assertEqual(service._sg_ses_device_cache["10.0.0.10"], valid_sg_cache)
 
+    async def test_failed_background_source_refresh_does_not_rebuild_stale_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="offsite-scale", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            stale_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_id=system.id,
+                selected_system_platform="scale",
+            )
+            stale_bundle = self._empty_source_bundle(warning="stale source bundle")
+            stale_snapshot_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+            stale_source_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._cache["__default__"] = stale_snapshot
+            service._cache_until["__default__"] = stale_snapshot_until
+            service._source_bundle = stale_bundle
+            service._source_bundle_until = stale_source_until
+            valid_sg_cache = (
+                ["/dev/sg26"],
+                datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+            service._sg_ses_device_cache["10.0.0.10"] = valid_sg_cache
+            service._collect_inventory_source_bundle = AsyncMock(
+                side_effect=[RuntimeError("source collection failed"), stale_bundle]
+            )
+            service._build_snapshot = AsyncMock(wraps=service._build_snapshot)
+
+            await service._background_snapshot_refresh("__default__", None)
+            await asyncio.sleep(0)
+
+            service._build_snapshot.assert_not_awaited()
+            self.assertIs(service._cache["__default__"], stale_snapshot)
+            self.assertEqual(service._cache_until["__default__"], stale_snapshot_until)
+            self.assertIs(service._source_bundle, stale_bundle)
+            self.assertEqual(service._source_bundle_until, stale_source_until)
+            self.assertEqual(service._sg_ses_device_cache["10.0.0.10"], valid_sg_cache)
+            self.assertIsNone(service._source_bundle_refresh_task)
+            service._collect_inventory_source_bundle.assert_awaited_once_with()
+
     async def test_background_stale_snapshot_views_share_one_source_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()

@@ -537,7 +537,7 @@ class InventoryService:
         self._ssh_session_locks: dict[str, asyncio.Lock] = {}
         self._optional_ssh_backoff_until: dict[str, datetime] = {}
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
-        self._source_bundle_refresh_task: asyncio.Task[None] | None = None
+        self._source_bundle_refresh_task: asyncio.Task[bool] | None = None
         self._smart_refresh_tasks: dict[SmartCacheKey, asyncio.Task[None]] = {}
         self._background_smart_refresh_semaphore = asyncio.Semaphore(
             max(1, self.settings.app.smart_batch_max_concurrency)
@@ -1608,7 +1608,7 @@ class InventoryService:
             self._observe_inventory_source_bundle_request(refresh_trigger)
             return CacheResult(bundle, refresh_trigger)
 
-    def _schedule_background_source_bundle_refresh(self) -> asyncio.Task[None]:
+    def _schedule_background_source_bundle_refresh(self) -> asyncio.Task[bool]:
         existing = self._source_bundle_refresh_task
         if existing is not None and not existing.done():
             return existing
@@ -1616,7 +1616,7 @@ class InventoryService:
         task = asyncio.create_task(self._background_source_bundle_refresh())
         self._source_bundle_refresh_task = task
 
-        def _cleanup(completed: asyncio.Task[None]) -> None:
+        def _cleanup(completed: asyncio.Task[bool]) -> None:
             if self._source_bundle_refresh_task is completed:
                 self._source_bundle_refresh_task = None
             if completed.cancelled():
@@ -1628,7 +1628,7 @@ class InventoryService:
         task.add_done_callback(_cleanup)
         return task
 
-    async def _background_source_bundle_refresh(self) -> None:
+    async def _background_source_bundle_refresh(self) -> bool:
         try:
             await self._get_inventory_source_bundle(
                 force_refresh=True,
@@ -1636,6 +1636,8 @@ class InventoryService:
             )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background inventory source refresh failed")
+            return False
+        return True
 
     def _get_snapshot_lock(self, cache_key: str) -> asyncio.Lock:
         lock = self._snapshot_locks.get(cache_key)
@@ -2383,7 +2385,9 @@ class InventoryService:
 
     async def _background_snapshot_refresh(self, cache_key: str, selected_enclosure_id: str | None) -> None:
         try:
-            await asyncio.shield(self._schedule_background_source_bundle_refresh())
+            source_refresh_succeeded = await asyncio.shield(self._schedule_background_source_bundle_refresh())
+            if not source_refresh_succeeded:
+                return
             await self._get_snapshot_result(
                 force_refresh=True,
                 selected_enclosure_id=selected_enclosure_id,
