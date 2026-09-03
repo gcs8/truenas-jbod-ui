@@ -51,6 +51,7 @@ from app.script_json import register_script_json_filters
 from app.services.history_backend import HistoryBackendClient
 from app.services.inventory_registry import InventoryRegistry
 from app.services.mapping_store import MappingImportDigestMismatch, MappingRevisionConflict
+from app.services.profile_registry import build_profile_reference_warnings
 from app.services.release_status import ReleaseStatusService
 from app.services.snapshot_export import (
     SnapshotExportService,
@@ -384,6 +385,8 @@ def create_app() -> FastAPI:
             "APP_PUBLIC_ORIGIN must be an absolute HTTP(S) origin when ADMIN_AUTH_MODE=basic."
         )
     configure_logging(startup_settings)
+    for warning in build_profile_reference_warnings(startup_settings):
+        logger.warning("Configuration warning: %s", warning["message"])
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):

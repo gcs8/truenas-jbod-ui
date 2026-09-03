@@ -331,7 +331,7 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.face_style, "unifi-drive")
         self.assertEqual(profile.latch_edge, "bottom")
         self.assertEqual(profile.bay_size, "3.5")
-        self.assertEqual(profile.slot_layout, [[0, 1, 2], [3, 4, 5, 6]])
+        self.assertEqual(profile.slot_layout, [[0, 1, 2, None], [3, 4, 5, 6]])
         self.assertEqual(profile.slot_hints[0], ["7:0:0:0"])
         self.assertEqual(profile.slot_hints[1], ["5:0:0:0"])
 

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from app.config import EnclosureProfileConfig, Settings, SystemConfig, normalize_text
+from app.config import EnclosureProfileConfig, Settings, SystemConfig
 from app.models.domain import EnclosureOption, EnclosureProfileView
+
+MAX_PROFILE_REFERENCE_WARNINGS = 50
+MAX_PROFILE_REFERENCE_IDENTIFIER_LENGTH = 128
 
 CORE_CSE_946_PROFILE_ID = "supermicro-cse-946-top-60"
 DELL_MD1280_PROFILE_ID = "dell-md1280-drawer-84"
@@ -61,7 +64,7 @@ def merge_slot_layout_sections(*sections: list[list[int | None]]) -> list[list[i
 def default_slot_layout(rows: int, columns: int, slot_count: int) -> list[list[int | None]]:
     full_layout = sparse_slot_layout(rows, columns)
     return [
-        [slot for slot in row if isinstance(slot, int) and slot < slot_count]
+        [slot if slot is not None and slot < slot_count else None for slot in row]
         for row in full_layout
     ]
 
@@ -294,7 +297,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             rows=2,
             columns=4,
             slot_layout=[
-                [0, 1, 2],
+                [0, 1, 2, None],
                 [3, 4, 5, 6],
             ],
             slot_hints={
@@ -539,6 +542,7 @@ def _profile_to_view(profile: EnclosureProfileConfig) -> EnclosureProfileView:
         bay_size=profile.bay_size,
         rows=profile.rows,
         columns=profile.columns,
+        slot_count=profile.slot_count or (profile.rows * profile.columns),
         slot_layout=slot_layout,
         row_groups=list(profile.row_groups),
         slot_hints={int(slot): list(hints) for slot, hints in (profile.slot_hints or {}).items()},
@@ -548,6 +552,68 @@ def _profile_to_view(profile: EnclosureProfileConfig) -> EnclosureProfileView:
 
 def built_in_profile_ids() -> set[str]:
     return {profile.id for profile in _built_in_profiles()}
+
+
+def _bounded_profile_reference_identifier(value: object) -> str:
+    return str(value or "")[:MAX_PROFILE_REFERENCE_IDENTIFIER_LENGTH]
+
+
+def build_profile_reference_warnings(settings: Settings) -> list[dict[str, str]]:
+    """Describe unknown saved profile references without exposing unrelated config."""
+    known_profile_ids = built_in_profile_ids() | {profile.id for profile in settings.profiles}
+    warnings: list[dict[str, str]] = []
+
+    def append_warning(
+        *,
+        system_id: str,
+        profile_id: str,
+        reference_type: str,
+        enclosure_id: str | None = None,
+    ) -> None:
+        bounded_system_id = _bounded_profile_reference_identifier(system_id)
+        bounded_profile_id = _bounded_profile_reference_identifier(profile_id)
+        warning = {
+            "code": "unknown_enclosure_profile",
+            "system_id": bounded_system_id,
+            "profile_id": bounded_profile_id,
+            "reference_type": reference_type,
+        }
+        if enclosure_id is not None:
+            bounded_enclosure_id = _bounded_profile_reference_identifier(enclosure_id)
+            warning["enclosure_id"] = bounded_enclosure_id
+            warning["message"] = (
+                f"System {bounded_system_id} enclosure {bounded_enclosure_id} references unknown profile "
+                f"{bounded_profile_id}. Runtime geometry fallback will be used."
+            )
+        else:
+            warning["message"] = (
+                f"System {bounded_system_id} references unknown default profile {bounded_profile_id}. "
+                "Runtime geometry fallback will be used."
+            )
+        warnings.append(warning)
+
+    for system in settings.systems:
+        default_profile_id = (system.default_profile_id or "").strip()
+        if default_profile_id and default_profile_id not in known_profile_ids:
+            append_warning(
+                system_id=system.id,
+                profile_id=default_profile_id,
+                reference_type="default_profile_id",
+            )
+            if len(warnings) >= MAX_PROFILE_REFERENCE_WARNINGS:
+                return warnings
+        for enclosure_id, profile_id in (system.enclosure_profiles or {}).items():
+            normalized_profile_id = (profile_id or "").strip()
+            if normalized_profile_id and normalized_profile_id not in known_profile_ids:
+                append_warning(
+                    system_id=system.id,
+                    profile_id=normalized_profile_id,
+                    reference_type="enclosure_profiles",
+                    enclosure_id=str(enclosure_id),
+                )
+                if len(warnings) >= MAX_PROFILE_REFERENCE_WARNINGS:
+                    return warnings
+    return warnings
 
 
 class ProfileRegistry:
@@ -595,7 +661,7 @@ class ProfileRegistry:
         slot_layout = fallback_slot_layout or (enclosure.slot_layout if enclosure else None)
         label = fallback_label or (enclosure.label if enclosure else None)
         if rows and columns:
-            runtime_id = normalize_text(profile_id) or f"runtime-{(enclosure.id if enclosure else 'enclosure')}"
+            runtime_id = f"runtime-{(enclosure.id if enclosure else 'enclosure')}"
             return EnclosureProfileView(
                 id=runtime_id,
                 label=label or "Runtime Enclosure",
@@ -608,6 +674,7 @@ class ProfileRegistry:
                 bay_size=None,
                 rows=rows,
                 columns=columns,
+                slot_count=slot_count or (rows * columns),
                 slot_layout=slot_layout or default_slot_layout(rows, columns, slot_count or rows * columns),
                 row_groups=[],
             )

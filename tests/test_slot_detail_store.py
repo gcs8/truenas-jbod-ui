@@ -70,6 +70,59 @@ class SlotDetailStorePruneTests(unittest.TestCase):
                 self.assertEqual(removed, 0)
                 self.assertEqual(path.read_bytes(), original)
 
+    def test_load_all_rejects_malformed_container_shapes_without_raising(self) -> None:
+        malformed_payloads = [
+            None,
+            [],
+            {"slot_details": []},
+            {"slot_details": "not-a-mapping"},
+        ]
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "slot_detail_cache.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+
+                self.assertEqual(SlotDetailStore(str(path)).load_all(), {})
+
+    def test_load_all_drops_only_invalid_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "slot_detail_cache.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "slot_details": {
+                            "system-a:enc-1:0": self._entry("system-a", 0).model_dump(mode="json"),
+                            "system-a:enc-1:1": {"system_id": "system-a", "slot": "not-an-integer"},
+                            "system-a:enc-1:2": self._entry("system-a", 2).model_dump(mode="json"),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = SlotDetailStore(str(path)).load_all()
+
+            self.assertEqual(list(loaded), ["system-a:enc-1:0", "system-a:enc-1:2"])
+            self.assertEqual([entry.slot for entry in loaded.values()], [0, 2])
+
+    def test_save_entries_self_heals_malformed_content(self) -> None:
+        malformed_payloads = [
+            [],
+            {"slot_details": []},
+            {"slot_details": {"bad": {"system_id": "system-a", "slot": "bad"}}},
+        ]
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "slot_detail_cache.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                store = SlotDetailStore(str(path))
+
+                store.save_entries([self._entry("system-a", 3)])
+
+                loaded = SlotDetailStore(str(path)).load_all()
+                self.assertEqual(list(loaded), ["system-a:enc-1:3"])
+                self.assertEqual(loaded["system-a:enc-1:3"].slot, 3)
+
     def test_registry_prunes_unknown_system_rows_and_logs_the_count(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

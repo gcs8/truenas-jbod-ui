@@ -58,7 +58,7 @@ from app.models.domain import (
 from app.services.profile_builder import ProfileBuilderService, collect_profile_references
 from app.services.demo_system_factory import DemoSystemFactory
 from app.services.inventory import InventoryService
-from app.services.profile_registry import ProfileRegistry
+from app.services.profile_registry import ProfileRegistry, build_profile_reference_warnings
 from app.services.inventory_registry import InventoryRegistry
 from app.services.quantastor_cli import build_quantastor_cli_invocation
 from app.services.quantastor_api import QuantastorRESTClient
@@ -1419,6 +1419,7 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
         "systems": serialize_systems(settings),
         "default_system_id": settings.default_system_id,
         "profiles": serialize_profiles(settings),
+        "configuration_warnings": build_profile_reference_warnings(settings),
         "storage_view_templates": serialize_storage_view_templates(),
         "setup_platform_defaults": serialize_platform_defaults(),
         "ssh_keys": ssh_keys,
@@ -1709,18 +1710,12 @@ def serialize_profiles(settings: Settings) -> list[dict[str, Any]]:
     reference_map = collect_profile_references(settings)
     profiles = []
     for profile in registry.list_profiles():
-        slot_count = sum(
-            1
-            for row in profile.slot_layout
-            for slot in row
-            if isinstance(slot, int)
-        )
         references = reference_map.get(profile.id, {})
         is_custom = profile.id in custom_profile_ids
         profiles.append(
             {
                 **profile.model_dump(mode="json"),
-                "slot_count": slot_count,
+                "slot_count": profile.slot_count,
                 "is_custom": is_custom,
                 "source": "custom" if is_custom else "built-in",
                 "reference_count": int(references.get("count", 0) or 0),

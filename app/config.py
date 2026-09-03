@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.secret_files import load_secret_environment_value
+from app.slot_layout import normalize_slot_layout, validate_slot_layout
 
 
 def _standard_runtime_config_path() -> Path:
@@ -220,8 +221,9 @@ class EnclosureProfileConfig(BaseModel):
     face_style: str = "generic"
     latch_edge: str = "bottom"
     bay_size: str | None = None
-    rows: int
-    columns: int
+    rows: int = Field(ge=1, le=256)
+    columns: int = Field(ge=1, le=256)
+    slot_count: int | None = Field(default=None, ge=1, le=4096)
     slot_layout: list[list[int | None]] | None = None
     row_groups: list[int] = Field(default_factory=list)
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
@@ -243,6 +245,21 @@ class EnclosureProfileConfig(BaseModel):
         if normalized not in {"3.5", "2.5"}:
             raise ValueError("bay_size must be 3.5 or 2.5")
         return normalized
+
+    @field_validator("slot_layout", mode="before")
+    @classmethod
+    def _normalize_slot_layout(cls, value: Any) -> list[list[int | None]] | None:
+        return normalize_slot_layout(value)
+
+    @model_validator(mode="after")
+    def _validate_slot_layout(self) -> "EnclosureProfileConfig":
+        self.slot_count = validate_slot_layout(
+            self.slot_layout,
+            rows=self.rows,
+            columns=self.columns,
+            slot_count=self.slot_count,
+        )
+        return self
 
 
 StorageViewKind = Literal["ses_enclosure", "nvme_carrier", "boot_devices", "manual"]

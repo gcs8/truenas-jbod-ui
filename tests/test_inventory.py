@@ -193,19 +193,41 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(ordered[1]["_placement_key"], "pool match: boot-pool")
         self.assertTrue(all("_placement_key" not in candidate for candidate in candidates))
 
-    def test_infer_slot_count_from_layout_ignores_gap_cells(self) -> None:
-        layout_rows = [
-            [88, 89, 90, 91, 92, 93, None, None, 94, 95, 96, 97, 98, 99],
-            [76, 77, 78, 79, 80, 81, None, None, 82, 83, 84, 85, 86, 87],
-            [64, 65, 66, 67, 68, 69, None, None, 70, 71, 72, 73, 74, 75],
-            [52, 53, 54, 55, 56, 57, None, None, 58, 59, 60, 61, 62, 63],
-            [40, 41, 42, 43, 44, 45, None, None, 46, 47, 48, 49, 50, 51],
-            list(range(28, 42)),
-            list(range(14, 28)),
-            list(range(0, 14)),
-        ]
+    def test_infer_slot_count_from_layout_counts_visible_slots_instead_of_max_id(self) -> None:
+        self.assertEqual(infer_slot_count_from_layout([[9, None], [None, 3]]), 2)
+        self.assertEqual(infer_slot_count_from_layout([[0, 1, 2, 38]], fallback=4), 4)
 
-        self.assertEqual(infer_slot_count_from_layout(layout_rows), 100)
+    def test_create_app_bounds_unknown_profile_startup_warnings(self) -> None:
+        from admin_service.config import AdminSettings
+        from app import main as app_main
+
+        private_marker = "/private/config/path/PRIVATE-MARKER"
+        settings = Settings(
+            config_file=private_marker,
+            systems=[
+                SystemConfig(
+                    id=f"system-{index}-" + ("s" * 512),
+                    default_profile_id=f"missing-default-{index}-" + ("p" * 512),
+                    enclosure_profiles={
+                        f"enclosure-{index}-" + ("e" * 512): f"missing-enclosure-{index}-" + ("q" * 512)
+                    },
+                )
+                for index in range(80)
+            ],
+        )
+
+        with (
+            patch.object(app_main, "get_settings", return_value=settings),
+            patch.object(app_main, "get_admin_settings", return_value=AdminSettings()),
+            patch.object(app_main, "configure_logging"),
+            self.assertLogs("app.main", level="WARNING") as captured,
+        ):
+            created = app_main.create_app()
+
+        self.assertIsNotNone(created)
+        self.assertEqual(len(captured.records), 50)
+        self.assertTrue(all(len(record.getMessage()) <= 512 for record in captured.records))
+        self.assertNotIn(private_marker, "\n".join(record.getMessage() for record in captured.records))
 
     def test_build_lunid_aliases_core_keeps_narrow_match_window(self) -> None:
         aliases = build_lunid_aliases("5000c5003e8253a7", "core")
@@ -821,6 +843,9 @@ class InventoryHelpersTests(unittest.TestCase):
             )
             settings = Settings(systems=[system])
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            loaded_mappings: dict[str, ManualMapping] = {}
+            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             ssh_data = ParsedSSHData(
                 esxi_storcli_virtual_drives=[
                     {
@@ -902,6 +927,11 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertEqual(slots[0].device_name, "13:0")
             self.assertEqual(slots[0].pool_name, "ESXi + VMs")
             self.assertEqual(slots[0].temperature_c, 34)
+            service.mapping_store.load_all.assert_called_once_with()
+            self.assertEqual(service.mapping_store.get_mapping.call_count, slot_count)
+            self.assertTrue(
+                all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
+            )
             self.assertFalse(slots[0].led_supported)
             self.assertIn("LED control is not enabled for ESXi", slots[0].led_reason or "")
 
@@ -4056,6 +4086,9 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 AsyncMock(),
                 temp_dir,
             )
+            loaded_mappings: dict[str, ManualMapping] = {}
+            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             ssh_data = ParsedSSHData(
                 linux_blockdevices=[
                     {
@@ -4112,6 +4145,11 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(slot_count, 7)
             self.assertEqual(slot_views[0].device_name, "sdb")
             self.assertEqual(slot_views[1].device_name, "sda")
+            service.mapping_store.load_all.assert_called_once_with()
+            self.assertEqual(service.mapping_store.get_mapping.call_count, slot_count)
+            self.assertTrue(
+                all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
+            )
             self.assertFalse(slot_views[2].present)
             self.assertEqual(slot_views[2].state.value, "empty")
             self.assertEqual(slot_views[2].mapping_source, "ubntstorage")
@@ -4569,6 +4607,9 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
                 temp_dir,
                 bmc_service=MagicMock(),
             )
+            loaded_mappings: dict[str, ManualMapping] = {}
+            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             warnings: list[str] = []
             bmc_inventory = BMCInventory(
                 system_model="SuperServer SYS-F629P3-RC1B",
@@ -4598,6 +4639,11 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
             self.assertEqual(enclosures[0].id, SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
             self.assertEqual(selected_meta["id"], SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
             self.assertEqual(layout_slot_count, 6)
+            service.mapping_store.load_all.assert_called_once_with()
+            self.assertEqual(service.mapping_store.get_mapping.call_count, layout_slot_count)
+            self.assertTrue(
+                all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
+            )
             self.assertFalse(slot_views[0].present)
             self.assertTrue(slot_views[2].present)
             self.assertEqual(slot_views[2].serial, "SERIAL-1")
@@ -11175,6 +11221,9 @@ class ReviewRegressionTests(unittest.TestCase):
             settings.layout.slot_count = 1
             system = SystemConfig(id="zero-column-generic", truenas=TrueNASConfig(platform="scale"))
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            loaded_mappings: dict[str, ManualMapping] = {}
+            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             profile = MagicMock()
             profile.columns = 0
             profile.slot_layout = [[0]]
@@ -11193,6 +11242,9 @@ class ReviewRegressionTests(unittest.TestCase):
             )
 
             self.assertEqual(columns, 0)
+            service.mapping_store.load_all.assert_called_once_with()
+            self.assertEqual(service.mapping_store.get_mapping.call_count, 1)
+            self.assertIs(service.mapping_store.get_mapping.call_args.kwargs["loaded_entries"], loaded_mappings)
             self.assertEqual((slots[0].row_index, slots[0].column_index), (0, 0))
 
     def test_scale_linux_correlator_zero_columns_does_not_evaluate_division_default(self) -> None:
@@ -11235,6 +11287,9 @@ class ReviewRegressionTests(unittest.TestCase):
             settings = Settings()
             system = SystemConfig(id="sparse-scale", truenas=TrueNASConfig(platform="scale"))
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            loaded_mappings: dict[str, ManualMapping] = {}
+            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             selected_option = EnclosureOption(
                 id="enc-a",
                 label="Sparse shelf",
@@ -11265,6 +11320,11 @@ class ReviewRegressionTests(unittest.TestCase):
 
             self.assertEqual([slot.slot for slot in slots], [0, 1, 2])
             self.assertEqual(slot_count, 3)
+            service.mapping_store.load_all.assert_called_once_with()
+            self.assertEqual(service.mapping_store.get_mapping.call_count, slot_count)
+            self.assertTrue(
+                all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
+            )
 
     def test_scale_linux_does_not_overlay_first_api_enclosure_on_selected_ses_enclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -11337,6 +11397,9 @@ class ReviewRegressionTests(unittest.TestCase):
                 truenas=TrueNASConfig(platform="quantastor"),
             )
             service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            loaded_mappings: dict[str, ManualMapping] = {}
+            service.mapping_store.load_all = MagicMock(return_value=loaded_mappings)  # type: ignore[method-assign]
+            service.mapping_store.get_mapping = MagicMock(return_value=None)  # type: ignore[method-assign]
             raw_data = TrueNASRawData(
                 enclosures=[],
                 systems=[
@@ -11427,6 +11490,11 @@ class ReviewRegressionTests(unittest.TestCase):
             )
 
             slot0 = slots[0]
+            service.mapping_store.load_all.assert_called_once_with()
+            self.assertEqual(service.mapping_store.get_mapping.call_count, len(slots))
+            self.assertTrue(
+                all(call.kwargs["loaded_entries"] is loaded_mappings for call in service.mapping_store.get_mapping.call_args_list)
+            )
             self.assertEqual(slot0.device_name, "sda")
             self.assertEqual(slot0.raw_status["sas_address_hint"], "5000000000000001")
             self.assertEqual(slot0.raw_status["device_names"], ["sda"])

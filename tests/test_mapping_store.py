@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from app.models.domain import ManualMapping
 from app.services.mapping_store import MappingStore
@@ -11,6 +12,83 @@ from app.services.mapping_store import MappingStore
 class MappingStoreImportTests(unittest.TestCase):
     def make_store(self, root: str) -> MappingStore:
         return MappingStore(str(Path(root) / "mappings.json"))
+
+    def test_preloaded_entries_bound_load_and_validation_for_large_slot_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            slot_count = 347
+            store._write(
+                {
+                    store._slot_key("system-a", "enc-a", slot): ManualMapping(
+                        system_id="system-a",
+                        enclosure_id="enc-a",
+                        slot=slot,
+                        serial=f"SER-{slot}",
+                    )
+                    for slot in range(slot_count)
+                }
+            )
+            store.load_all = MagicMock(wraps=store.load_all)  # type: ignore[method-assign]
+
+            with patch.object(ManualMapping, "model_validate", wraps=ManualMapping.model_validate) as validate:
+                loaded_entries = store.load_all()
+                resolved = [
+                    store.get_mapping(
+                        "system-a",
+                        "enc-a",
+                        slot,
+                        loaded_entries=loaded_entries,
+                    )
+                    for slot in range(slot_count)
+                ]
+
+            self.assertEqual(store.load_all.call_count, 1)
+            self.assertEqual(validate.call_count, slot_count)
+            self.assertEqual([mapping.slot for mapping in resolved if mapping is not None], list(range(slot_count)))
+
+    def test_get_mapping_uses_supplied_empty_mapping_without_reloading(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            store.load_all = MagicMock(wraps=store.load_all)  # type: ignore[method-assign]
+
+            mapping = store.get_mapping("system-a", "enc-a", 0, loaded_entries={})
+
+            self.assertIsNone(mapping)
+            store.load_all.assert_not_called()
+
+    def test_preloaded_entries_preserve_exact_and_legacy_fallback_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            exact = ManualMapping(system_id="system-a", enclosure_id="enc-a", slot=3, serial="EXACT")
+            fallback = ManualMapping(system_id="system-a", enclosure_id=None, slot=3, serial="FALLBACK")
+            loaded_entries = {
+                store._slot_key("system-a", "enc-a", 3): exact,
+                store._slot_key("system-a", None, 3): fallback,
+            }
+            store.load_all = MagicMock(side_effect=AssertionError("preloaded lookup must not reload"))  # type: ignore[method-assign]
+
+            self.assertIs(store.get_mapping("system-a", "enc-a", 3, loaded_entries=loaded_entries), exact)
+            self.assertIsNone(store.get_mapping("system-a", "enc-b", 3, loaded_entries=loaded_entries))
+            self.assertIs(
+                store.get_mapping(
+                    "system-a",
+                    "enc-b",
+                    3,
+                    allow_legacy_fallback=True,
+                    loaded_entries=loaded_entries,
+                ),
+                fallback,
+            )
+            self.assertIsNone(
+                store.get_mapping(
+                    "system-b",
+                    "enc-b",
+                    3,
+                    allow_legacy_fallback=True,
+                    loaded_entries=loaded_entries,
+                )
+            )
+            store.load_all.assert_not_called()
 
     def test_preview_is_deterministic_and_classifies_semantic_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

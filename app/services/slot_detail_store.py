@@ -42,9 +42,18 @@ class SlotDetailStore:
         except (OSError, json.JSONDecodeError):
             return {}
 
+        if not isinstance(payload, dict):
+            return {}
+        raw_entries = payload.get("slot_details", {})
+        if not isinstance(raw_entries, dict):
+            return {}
+
         loaded: dict[str, SlotDetailCacheEntry] = {}
-        for key, value in payload.get("slot_details", {}).items():
-            loaded[key] = SlotDetailCacheEntry.model_validate(value)
+        for key, value in raw_entries.items():
+            try:
+                loaded[key] = SlotDetailCacheEntry.model_validate(value)
+            except (TypeError, ValidationError):
+                continue
         return loaded
 
     def get_entry(

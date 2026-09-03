@@ -8,6 +8,7 @@
     systems: Array.isArray(bootstrap.systems) ? bootstrap.systems : [],
     defaultSystemId: bootstrap.default_system_id || null,
     profiles: Array.isArray(bootstrap.profiles) ? bootstrap.profiles : [],
+    configurationWarnings: Array.isArray(bootstrap.configuration_warnings) ? bootstrap.configuration_warnings : [],
     storageViewTemplates: Array.isArray(bootstrap.storage_view_templates) ? bootstrap.storage_view_templates : [],
     platformDefaults: bootstrap.setup_platform_defaults || {},
     sshKeys: Array.isArray(bootstrap.ssh_keys) ? bootstrap.ssh_keys : [],
@@ -91,6 +92,8 @@
 
   const elements = {
     banner: document.getElementById("admin-status-banner"),
+    configurationWarnings: document.getElementById("admin-configuration-warnings"),
+    configurationWarningList: document.getElementById("admin-configuration-warning-list"),
     refreshStateButton: document.getElementById("refresh-state-button"),
     adminOriginLink: document.getElementById("admin-origin-link"),
     adminViewButtons: Array.from(document.querySelectorAll("[data-admin-view-button]")),
@@ -338,6 +341,20 @@
     } else if (tone === "success") {
       elements.banner.classList.add("is-success");
     }
+  }
+
+  function renderConfigurationWarnings() {
+    if (!elements.configurationWarnings || !elements.configurationWarningList) {
+      return;
+    }
+    const warnings = Array.isArray(state.configurationWarnings) ? state.configurationWarnings : [];
+    elements.configurationWarningList.replaceChildren();
+    warnings.forEach((warning) => {
+      const item = document.createElement("li");
+      item.textContent = String(warning?.message || "Unknown enclosure profile reference.");
+      elements.configurationWarningList.appendChild(item);
+    });
+    elements.configurationWarnings.classList.toggle("hidden", warnings.length === 0);
   }
 
   function defaultTlsTrustDetail({
@@ -5385,6 +5402,7 @@
       state.systems = Array.isArray(payload.systems) ? payload.systems : [];
       state.defaultSystemId = payload.default_system_id || null;
       state.profiles = Array.isArray(payload.profiles) ? payload.profiles : [];
+      state.configurationWarnings = Array.isArray(payload.configuration_warnings) ? payload.configuration_warnings : [];
       state.storageViewTemplates = Array.isArray(payload.storage_view_templates) ? payload.storage_view_templates : [];
       state.platformDefaults = payload.setup_platform_defaults || {};
       state.sshKeys = Array.isArray(payload.ssh_keys) ? payload.ssh_keys : [];
@@ -6436,6 +6454,7 @@
 
   function renderAll() {
     updateAdminMeta();
+    renderConfigurationWarnings();
     renderAdminView();
     renderBackupPaths();
     renderHistoryMaintenance();

@@ -23,15 +23,6 @@ def _normalize_profile_id(value: str | None, fallback_index: int) -> str:
     return normalized or f"custom-profile-{fallback_index}"
 
 
-def _layout_slot_count(layout: list[list[int | None]] | None) -> int:
-    return sum(
-        1
-        for row in (layout or [])
-        for slot in row
-        if isinstance(slot, int)
-    )
-
-
 def _normalize_row_groups(row_groups: list[int], columns: int) -> list[int]:
     normalized = [int(group) for group in row_groups if isinstance(group, int) and int(group) > 0]
     if not normalized:
@@ -121,7 +112,7 @@ class ProfileBuilderService:
                     f"Profile id '{profile_id}' is reserved by a built-in profile. Save this as a new custom id instead."
                 )
 
-            slot_count = int(payload.slot_count or 0) or _layout_slot_count(payload.slot_layout)
+            slot_count = int(payload.slot_count or 0)
             if slot_count <= 0:
                 slot_count = int(payload.rows) * int(payload.columns)
 
@@ -140,7 +131,7 @@ class ProfileBuilderService:
                 existing_profile is not None
                 and int(existing_profile.rows) == int(payload.rows)
                 and int(existing_profile.columns) == int(payload.columns)
-                and _layout_slot_count(existing_profile.slot_layout) == slot_count
+                and existing_profile.slot_count == slot_count
             ):
                 slot_layout = [list(row) for row in (existing_profile.slot_layout or [])]
                 slot_hints = {
@@ -151,7 +142,7 @@ class ProfileBuilderService:
                 source_profile is not None
                 and int(source_profile.rows) == int(payload.rows)
                 and int(source_profile.columns) == int(payload.columns)
-                and _layout_slot_count(source_profile.slot_layout) == slot_count
+                and source_profile.slot_count == slot_count
             ):
                 slot_layout = [list(row) for row in source_profile.slot_layout]
                 slot_hints = {
@@ -179,6 +170,7 @@ class ProfileBuilderService:
                 bay_size=payload.bay_size,
                 rows=int(payload.rows),
                 columns=int(payload.columns),
+                slot_count=slot_count if "slot_count" in payload.model_fields_set else None,
                 slot_layout=slot_layout,
                 row_groups=_normalize_row_groups(payload.row_groups, int(payload.columns)),
                 slot_hints=slot_hints,

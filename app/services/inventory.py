@@ -329,8 +329,10 @@ def finalize_enclosure_option_labels(
 
 def infer_slot_count_from_layout(layout_rows: list[list[int | None]], fallback: int | None = None) -> int:
     slots = [slot for row in layout_rows for slot in row if slot is not None]
+    if fallback is not None and slots and max(slots) + 1 == fallback:
+        return fallback
     if slots:
-        return max(slots) + 1
+        return len(slots)
     return fallback or 0
 
 
@@ -3938,6 +3940,7 @@ class InventoryService:
             for disk in disk_records
         )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
+        loaded_mappings = self.mapping_store.load_all()
 
         slot_views: list[SlotView] = []
 
@@ -3953,6 +3956,7 @@ class InventoryService:
                 enclosure_id,
                 slot,
                 allow_legacy_fallback=allow_legacy_mapping_fallback,
+                loaded_entries=loaded_mappings,
             )
             resolution = self._resolve_disk_for_slot(
                 slot,
@@ -4257,6 +4261,7 @@ class InventoryService:
                 disks_by_slot[(None, vendor_slot)] = disk
 
         linux_topology_members = self._build_linux_topology_members(disk_records)
+        loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
         selected_meta = self._enclosure_option_meta(selected_option)
         vendor_slot_candidates = self._build_linux_vendor_slot_candidates(ssh_data, selected_option)
@@ -4306,6 +4311,7 @@ class InventoryService:
                 selected_option.id,
                 slot,
                 allow_legacy_fallback=allow_legacy_mapping_fallback,
+                loaded_entries=loaded_mappings,
             )
             resolution = self._resolve_disk_for_slot(
                 slot,
@@ -4434,6 +4440,7 @@ class InventoryService:
             for disk in bmc_disk_records
             if isinstance(disk.slot, int)
         }
+        loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
         for slot in range(layout_slot_count):
             row_index, column_index = slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))
@@ -4513,6 +4520,7 @@ class InventoryService:
                 selected_option.id,
                 slot,
                 allow_legacy_fallback=allow_legacy_mapping_fallback,
+                loaded_entries=loaded_mappings,
             )
             resolution = DiskResolution(
                 disk=disk,
@@ -4613,6 +4621,7 @@ class InventoryService:
             )
 
         empty_ssh = ParsedSSHData()
+        loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
         for slot in range(layout_slot_count):
             row_index, column_index = slot_positions.get(slot, (slot // max(layout_columns, 1), slot % max(layout_columns, 1)))
@@ -4636,6 +4645,7 @@ class InventoryService:
                 selected_option.id,
                 slot,
                 allow_legacy_fallback=allow_legacy_mapping_fallback,
+                loaded_entries=loaded_mappings,
             )
             resolution = DiskResolution(
                 disk=disk,
@@ -4785,6 +4795,7 @@ class InventoryService:
         )
         if is_sub_view:
             slot_count = len(slots_to_render)
+        loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
 
         for slot in slots_to_render:
@@ -4794,6 +4805,7 @@ class InventoryService:
                 mapping_enclosure_id,
                 slot,
                 allow_legacy_fallback=allow_legacy_mapping_fallback,
+                loaded_entries=loaded_mappings,
             )
             resolution = self._resolve_disk_for_slot(
                 slot,
@@ -4901,6 +4913,7 @@ class InventoryService:
             layout_slot_count,
             selected_profile.id,
         )
+        loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
 
         for slot in range(layout_slot_count):
@@ -4909,6 +4922,7 @@ class InventoryService:
                 selected_option.id,
                 slot,
                 allow_legacy_fallback=allow_legacy_mapping_fallback,
+                loaded_entries=loaded_mappings,
             )
             ses_candidate = quantastor_ses_candidates.get(slot, {})
             slot_hints = {
