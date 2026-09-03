@@ -28,6 +28,8 @@ LOCAL_WINDOWS_PATH = re.compile(r"(?i)(?<![\w])(?:[a-z]:[\\/])[^\s`\"']+")
 INTERNAL_HOST_SUFFIX = re.compile(
     r"(?i)\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.(?:local|lan|internal)\b"
 )
+COMPACT_LAB_HOST_ID = re.compile(r"(?i)(?<![a-z0-9])[hn][0-9a-f]{4}(?![a-z0-9])")
+SAS_WWN_IDENTIFIER = re.compile(r"(?i)(?<![a-z0-9])(?:0x)?[0-9a-f]{16}(?![a-z0-9])")
 HOST_FIELD = re.compile(r"(?i)\b[^`\n:]*host(?:\s*name)?\s*:\s*`([^`]+)`")
 YAML_HOST_FIELD = re.compile(r"(?i)^\s*host\s*:\s*([^\s#]+)")
 INLINE_SERIAL = re.compile(r"(?i)\bserial(?: number| family)?\s*:\s*`([^`]+)`")
@@ -64,6 +66,8 @@ def scan_public_docs() -> Counter[str]:
         findings["private_posix_host_path"] += len(PRIVATE_POSIX_PATH.findall(text))
         findings["local_windows_drive_path"] += len(LOCAL_WINDOWS_PATH.findall(text))
         findings["internal_hostname"] += len(INTERNAL_HOST_SUFFIX.findall(text))
+        findings["compact_lab_host_id"] += len(COMPACT_LAB_HOST_ID.findall(text))
+        findings["sas_wwn_identifier"] += len(SAS_WWN_IDENTIFIER.findall(text))
 
         serial_list_indent: int | None = None
         for line in text.splitlines():
