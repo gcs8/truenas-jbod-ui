@@ -4988,6 +4988,54 @@ button.fabric-trace-crumb:hover {
   opacity: 1;
 }
 
+/* Heat-map overlays must outrank later face and empty-bay decoration. */
+.slot-tile.heatmap-active::before {
+  content: "";
+  z-index: 2;
+  inset: 5px 5px 22px;
+  border-radius: 5px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.04) 20%, rgba(0, 0, 0, 0.14) 100%),
+    linear-gradient(180deg, rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)), rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -14px 18px rgba(0, 0, 0, 0.22),
+    0 0 16px rgba(var(--heatmap-rgb), 0.18);
+}
+
+.slot-tile.heatmap-missing::before,
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile.heatmap-missing::before {
+  content: "";
+  z-index: 2;
+  background:
+    repeating-linear-gradient(135deg, rgba(255, 255, 255, 0.12) 0 6px, rgba(255, 255, 255, 0.02) 6px 13px),
+    linear-gradient(180deg, rgba(95, 105, 116, 0.62), rgba(36, 43, 50, 0.72));
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-tile.heatmap-active::before {
+  content: "";
+  z-index: 2;
+  inset: 8px 18px 8px 10px;
+  border-radius: 3px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.04) 20%, rgba(0, 0, 0, 0.14) 100%),
+    linear-gradient(180deg, rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)), rgba(var(--heatmap-rgb), var(--heatmap-alpha, 0.62)));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -14px 18px rgba(0, 0, 0, 0.22),
+    0 0 16px rgba(var(--heatmap-rgb), 0.18);
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-tile.heatmap-missing::before {
+  content: "";
+  z-index: 2;
+  inset: 8px 18px 8px 10px;
+  border-radius: 3px;
+  background:
+    repeating-linear-gradient(135deg, rgba(255, 255, 255, 0.12) 0 6px, rgba(255, 255, 255, 0.02) 6px 13px),
+    linear-gradient(180deg, rgba(95, 105, 116, 0.62), rgba(36, 43, 50, 0.72));
+}
+
 .chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty .slot-device,
 .chassis-shell[data-layout-mode^="top-loader"] .slot-tile.state-empty .slot-pool {
   opacity: 0.72;
