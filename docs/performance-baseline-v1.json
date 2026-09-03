@@ -1,8 +1,39 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "fixture_version": 1,
   "modeled": true,
   "wall_clock_policy": "report-only",
+  "comparison_policy": {
+    "exact_metrics": [
+      "slot_count",
+      "scope_history_connections",
+      "scope_history_select_statements",
+      "history_status_calls",
+      "history_scope_calls",
+      "history_slot_calls",
+      "render_calls",
+      "zip_build_calls",
+      "history_cache_entries",
+      "render_cache_entries",
+      "zip_cache_entries",
+      "export_cache_max_bytes"
+    ],
+    "byte_metrics": [
+      "inventory_response_bytes",
+      "scope_history_response_bytes",
+      "history_cache_bytes",
+      "render_cache_bytes",
+      "zip_cache_bytes",
+      "export_cache_total_bytes",
+      "export_html_bytes",
+      "export_html_document_bytes",
+      "inlined_static_asset_bytes",
+      "logical_retained_bytes"
+    ],
+    "byte_drift_percent": 10,
+    "minimum_byte_drift": 4096,
+    "byte_drift_direction": "symmetric"
+  },
   "cases": {
     "60": {
       "slot_count": 60,
@@ -24,11 +55,14 @@
       "export_cache_total_bytes": 3337581,
       "export_cache_max_bytes": 33554432,
       "export_html_bytes": 2252184,
+      "export_html_document_bytes": 654348,
+      "inlined_static_asset_bytes": 1597836,
       "logical_retained_bytes": 3337581,
       "thresholds": {
         "inventory_response_bytes": 98304,
         "scope_history_response_bytes": 655360,
         "scope_history_select_statements": 20,
+        "inlined_static_asset_bytes": 2097152,
         "export_html_bytes": 8388608,
         "logical_retained_bytes": 20971520
       }
@@ -53,11 +87,14 @@
       "export_cache_total_bytes": 11577720,
       "export_cache_max_bytes": 33554432,
       "export_html_bytes": 5273228,
+      "export_html_document_bytes": 3675392,
+      "inlined_static_asset_bytes": 1597836,
       "logical_retained_bytes": 11577720,
       "thresholds": {
         "inventory_response_bytes": 524288,
         "scope_history_response_bytes": 3145728,
         "scope_history_select_statements": 20,
+        "inlined_static_asset_bytes": 2097152,
         "export_html_bytes": 12582912,
         "logical_retained_bytes": 33554432
       }

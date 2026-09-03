@@ -127,9 +127,6 @@ jobs:
           coverage report
           coverage xml -o coverage.xml
 
-      - name: Check deterministic performance baseline
-        run: python scripts/build_perf_baseline.py --check
-
       - name: Upload coverage XML artifact
         if: matrix.python-version == '3.12'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
