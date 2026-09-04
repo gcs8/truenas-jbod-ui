@@ -715,6 +715,16 @@ def _apply_ses_presence_evidence(
     slot.presence_source = slot.presence_source or source
 
 
+def _apply_resolved_ses_descriptor_presence(
+    slot: SESMapSlot | None,
+    evidence: list[bool],
+    source: str,
+) -> None:
+    if slot is None or not evidence:
+        return
+    _apply_ses_presence_evidence(slot, any(evidence), source)
+
+
 def _apply_ses_device_name_evidence(
     slot: SESMapSlot,
     device_names: list[str],
@@ -1072,6 +1082,7 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
     current_enclosure: SESMapEnclosure | None = None
     current_slot: SESMapSlot | None = None
     in_extra_status = False
+    descriptor_presence_evidence: list[bool] = []
 
     for raw_line in output.splitlines():
         line = raw_line.rstrip()
@@ -1081,10 +1092,16 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
 
         ses_match = re.match(r"^(ses\d+):\s*$", stripped)
         if ses_match:
+            _apply_resolved_ses_descriptor_presence(
+                current_slot,
+                descriptor_presence_evidence,
+                "sesutil_map",
+            )
             current_enclosure = SESMapEnclosure(ses_device=f"/dev/{ses_match.group(1)}")
             enclosures.append(current_enclosure)
             current_slot = None
             in_extra_status = False
+            descriptor_presence_evidence = []
             continue
 
         if current_enclosure is None:
@@ -1100,8 +1117,14 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
 
         element_match = re.match(r"Element\s+(?P<element>\d+),\s+Type:\s+(?P<type>.+)$", stripped)
         if element_match:
+            _apply_resolved_ses_descriptor_presence(
+                current_slot,
+                descriptor_presence_evidence,
+                "sesutil_map",
+            )
             current_slot = None
             in_extra_status = False
+            descriptor_presence_evidence = []
             if _is_ses_device_slot_type(element_match.group("type")):
                 current_slot = SESMapSlot(
                     slot_number=-1,
@@ -1118,9 +1141,9 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
             if current_slot.status:
                 lowered = current_slot.status.lower()
                 if "not installed" in lowered or "absent" in lowered:
-                    _apply_ses_presence_evidence(current_slot, False, "sesutil_map")
+                    descriptor_presence_evidence.append(False)
                 elif "ok" in lowered or "ready" in lowered:
-                    _apply_ses_presence_evidence(current_slot, True, "sesutil_map")
+                    descriptor_presence_evidence.append(True)
             continue
 
         if stripped.startswith("Description:"):
@@ -1155,7 +1178,7 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
                 "sesutil_map",
             )
             if current_slot.device_names:
-                _apply_ses_presence_evidence(current_slot, True, "sesutil_map")
+                descriptor_presence_evidence.append(True)
             continue
 
         if stripped.startswith("Extra status:"):
@@ -1165,6 +1188,11 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
         if in_extra_status and "LED=locate" in stripped:
             current_slot.identify_active = True
 
+    _apply_resolved_ses_descriptor_presence(
+        current_slot,
+        descriptor_presence_evidence,
+        "sesutil_map",
+    )
     parsed = [item for item in enclosures if item.slots or item.unmapped_slots]
     for enclosure in parsed:
         _apply_inferred_ses_profile(enclosure)
@@ -1279,6 +1307,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     current_slot: SESMapSlot | None = None
     in_array_slots = False
     device_slot_evidence: list[SESMapSlot] = []
+    descriptor_presence_evidence: list[bool] = []
 
     for raw_line in output.splitlines():
         line = raw_line.rstrip()
@@ -1292,10 +1321,16 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             continue
 
         if stripped.startswith("Element type:"):
+            _apply_resolved_ses_descriptor_presence(
+                current_slot,
+                descriptor_presence_evidence,
+                "sg_ses_aes",
+            )
             _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
             element_type = stripped.split(":", 1)[1].split(",", 1)[0]
             in_array_slots = _is_ses_device_slot_type(element_type)
             current_slot = None
+            descriptor_presence_evidence = []
             continue
 
         if not in_array_slots:
@@ -1307,7 +1342,13 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             re.IGNORECASE,
         )
         if element_match:
+            _apply_resolved_ses_descriptor_presence(
+                current_slot,
+                descriptor_presence_evidence,
+                "sg_ses_aes",
+            )
             _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
+            descriptor_presence_evidence = []
             raw_element_id = int(element_match.group("element"))
             eiioe = int(element_match.group("eiioe") or 0)
             element_id = raw_element_id - 1 if eiioe == 1 else raw_element_id
@@ -1333,7 +1374,13 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             # merge) and record the bay as empty instead of dropping it from
             # the shelf geometry.
             current_slot.description = f"Element {current_slot.element_id} (invalid AES descriptor)"
-            _apply_ses_presence_evidence(current_slot, False, "sg_ses_aes")
+            descriptor_presence_evidence.append(False)
+            _apply_resolved_ses_descriptor_presence(
+                current_slot,
+                descriptor_presence_evidence,
+                "sg_ses_aes",
+            )
+            descriptor_presence_evidence = []
             current_slot = _record_ses_slot(
                 enclosure,
                 current_slot,
@@ -1383,7 +1430,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
                 )
                 if not current_slot.sas_device_type or (current_type_is_absent and incoming_present):
                     current_slot.sas_device_type = sas_device_type
-                _apply_ses_presence_evidence(current_slot, incoming_present, "sg_ses_aes")
+                descriptor_presence_evidence.append(incoming_present)
             continue
 
         if stripped.startswith("SAS address:"):
@@ -1391,9 +1438,14 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             if sas_address:
                 incoming_present = sas_address != "0"
                 _apply_ses_sas_address_evidence(current_slot, sas_address, "sg_ses_aes")
-                _apply_ses_presence_evidence(current_slot, incoming_present, "sg_ses_aes")
+                descriptor_presence_evidence.append(incoming_present)
             continue
 
+    _apply_resolved_ses_descriptor_presence(
+        current_slot,
+        descriptor_presence_evidence,
+        "sg_ses_aes",
+    )
     _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
     _finalize_ses_device_slot_evidence(enclosure, device_slot_evidence)
     if not enclosure.slots and not enclosure.unmapped_slots:
@@ -1510,6 +1562,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     current_slot: SESMapSlot | None = None
     descriptor_slot_number: int | None = None
     device_slot_evidence: list[SESMapSlot] = []
+    descriptor_presence_evidence: list[bool] = []
 
     for raw_line in output.splitlines():
         stripped = raw_line.strip()
@@ -1529,6 +1582,11 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             re.IGNORECASE,
         )
         if element_header_match:
+            _apply_resolved_ses_descriptor_presence(
+                current_slot,
+                descriptor_presence_evidence,
+                "sg_ses_join",
+            )
             if current_slot is not None and descriptor_slot_number is not None:
                 _record_ses_slot(
                     enclosure,
@@ -1538,6 +1596,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
                 )
             current_slot = None
             descriptor_slot_number = None
+            descriptor_presence_evidence = []
             element_type = normalize_text(element_header_match.group("element_type")) or ""
             if not _is_ses_device_slot_type(element_type):
                 continue
@@ -1559,7 +1618,14 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             continue
 
         if stripped.startswith("Predicted failure=") and "status:" in stripped:
-            _apply_sg_ses_status_line(current_slot, stripped, source="sg_ses_join")
+            status_presence = _apply_sg_ses_status_line(
+                current_slot,
+                stripped,
+                source="sg_ses_join",
+                apply_presence=False,
+            )
+            if status_presence is not None:
+                descriptor_presence_evidence.append(status_presence)
             continue
 
         ident_match = re.search(r"\bIdent=(?P<ident>[01])\b", stripped)
@@ -1587,10 +1653,8 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
         if stripped.startswith("SAS device type:"):
             current_slot.sas_device_type = normalize_text(stripped.split(":", 1)[1])
             if current_slot.sas_device_type:
-                _apply_ses_presence_evidence(
-                    current_slot,
+                descriptor_presence_evidence.append(
                     "no sas device attached" not in current_slot.sas_device_type.lower(),
-                    "sg_ses_join",
                 )
             continue
 
@@ -1598,9 +1662,14 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             sas_address = normalize_hex_identifier(stripped.split(":", 1)[1])
             _apply_ses_sas_address_evidence(current_slot, sas_address, "sg_ses_join")
             if sas_address:
-                _apply_ses_presence_evidence(current_slot, sas_address != "0", "sg_ses_join")
+                descriptor_presence_evidence.append(sas_address != "0")
             continue
 
+    _apply_resolved_ses_descriptor_presence(
+        current_slot,
+        descriptor_presence_evidence,
+        "sg_ses_join",
+    )
     if current_slot is not None and descriptor_slot_number is not None:
         _record_ses_slot(
             enclosure,
@@ -1617,14 +1686,21 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     return enclosure
 
 
-def _apply_sg_ses_status_line(slot: SESMapSlot, line: str, *, source: str) -> None:
+def _apply_sg_ses_status_line(
+    slot: SESMapSlot,
+    line: str,
+    *,
+    source: str,
+    apply_presence: bool = True,
+) -> bool | None:
     slot.status = normalize_text(line.split("status:", 1)[1])
+    presence: bool | None = None
     if slot.status:
         lowered = slot.status.lower()
         if "not installed" in lowered or "absent" in lowered:
-            _apply_ses_presence_evidence(slot, False, source)
+            presence = False
         elif lowered.startswith("ok") or "installed" in lowered or "ready" in lowered:
-            _apply_ses_presence_evidence(slot, True, source)
+            presence = True
         # Condition codes such as Critical/Noncritical/Unknown/Unsupported say
         # nothing about occupancy by themselves — issue #119's shelf latches
         # Critical onto every EMPTY bay (documented minimum-drive-count rule),
@@ -1638,6 +1714,9 @@ def _apply_sg_ses_status_line(slot: SESMapSlot, line: str, *, source: str) -> No
         match = re.search(rf"{re.escape(field_name)}=(?P<value>[01])", line)
         if match:
             setattr(slot, attribute, match.group("value") == "1")
+    if apply_presence:
+        _apply_ses_presence_evidence(slot, presence, source)
+    return presence
 
 
 def _extract_sg_ses_enclosure_name(output: str) -> str | None:

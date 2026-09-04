@@ -382,6 +382,47 @@ ExampleCo  GenericShelf  0001
         self.assertTrue(parsed.slots[8].present)
         self.assertEqual(parsed.slots[8].presence_source, "sg_ses_join")
 
+    def test_sg_ses_descriptor_refines_presence_without_conflict(self) -> None:
+        fixtures = (
+            (
+                "aes",
+                parse_sg_ses_aes,
+                """
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        device slot number: 0
+        SAS device type: no SAS device attached
+        SAS address: 0x5000000000000001
+""".strip(),
+            ),
+            (
+                "join",
+                parse_sg_ses_join_filter,
+                """
+[0,0]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Noncritical
+  Additional Element Status:
+    device slot number: 0
+    SAS device type: no SAS device attached
+    SAS address: 0x5000000000000001
+""".strip(),
+            ),
+        )
+
+        for source, parser, output in fixtures:
+            with self.subTest(source=source):
+                parsed = parser(output, f"sg_ses {source} /dev/sg0")
+
+                self.assertIsNotNone(parsed)
+                assert parsed is not None
+                slot = parsed.slots[0]
+                self.assertIs(slot.present, True)
+                self.assertEqual(slot.presence_source, f"sg_ses_{source}")
+                self.assertFalse(slot.presence_conflict)
+
     def test_canonicalize_esxi_inventory_commands(self) -> None:
         self.assertEqual(canonicalize_ssh_command("esxcli storage core device list"), "esxcli storage core device list")
         self.assertEqual(canonicalize_ssh_command("esxcli storage vmfs extent list"), "esxcli storage vmfs extent list")
@@ -1117,6 +1158,24 @@ ses0:
         self.assertEqual(selected["unmapped_ses_elements"][0]["ses_element_id"], 7)
         self.assertEqual(selected["unmapped_ses_elements"][0]["device_names"], ["da7"])
         self.assertIn("unrecognized SES slot description", selected["warnings"][0])
+
+    def test_parse_sesutil_map_refines_same_record_presence_without_conflict(self) -> None:
+        parsed = parse_sesutil_map(
+            """
+ses0:
+  Enclosure Name: ExampleCo GenericShelf
+  Enclosure ID: 5000000000000007
+  Element 0, Type: Array Device Slot
+    Status: Not installed
+    Description: Slot00
+    Device Names: da0, pass0
+""".strip()
+        )
+
+        slot = parsed[0].slots[0]
+        self.assertIs(slot.present, True)
+        self.assertEqual(slot.presence_source, "sesutil_map")
+        self.assertFalse(slot.presence_conflict)
 
     def test_parse_sg_ses_aes_preserves_slot_without_device_slot_number(self) -> None:
         output = """
