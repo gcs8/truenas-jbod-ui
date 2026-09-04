@@ -1242,8 +1242,8 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                 )
                 self.assertEqual(len(generated_unexpected_paths), 1)
                 extra_unexpected_paths = [
-                    root / ".history.db.segmented-z-extra.sqlite3",
-                    segments_directory / ".rotation-catalog-a-extra.json",
+                    root / ".history.db.segmented-hostile\nname,extra.sqlite3",
+                    segments_directory / ".rotation-catalog-hostile\x1b[31m.json",
                 ]
                 for index, path in enumerate(extra_unexpected_paths):
                     path.write_bytes(f"unexpected-{index}".encode())
@@ -1264,12 +1264,15 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                         segments_directory=segments_directory,
                         apply=True,
                     )
+                message = str(raised.exception)
                 self.assertEqual(
-                    str(raised.exception),
+                    message,
                     "Segment rotation found unauthenticated staging artifacts: "
-                    + ", ".join(str(path) for path in unexpected_paths)
+                    + ", ".join(json.dumps(str(path)) for path in unexpected_paths)
                     + ".",
                 )
+                self.assertNotIn("\n", message)
+                self.assertNotIn("\x1b", message)
                 self.assertEqual(marker_path.read_bytes(), journal_bytes)
                 self.assertEqual(
                     {path: path.read_bytes() for path in staging_paths},

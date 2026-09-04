@@ -957,7 +957,7 @@ def _recover_pending_rotation_locked(
     if unexpected_staging_paths:
         raise ValueError(
             "Segment rotation found unauthenticated staging artifacts: "
-            + ", ".join(str(path) for path in unexpected_staging_paths)
+            + ", ".join(json.dumps(str(path)) for path in unexpected_staging_paths)
             + "."
         )
     rollback_hot_path = _record_path(
