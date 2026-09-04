@@ -42,9 +42,9 @@ class FakeSFTP:
         self.put_error = put_error
 
     def put(self, local_path: str, remote_path: str) -> None:
+        self.uploads.append((local_path, remote_path))
         if self.put_error is not None:
             raise self.put_error
-        self.uploads.append((local_path, remote_path))
 
     def __enter__(self) -> "FakeSFTP":
         return self
@@ -587,6 +587,56 @@ class ESXiHostPrepServiceTests(unittest.TestCase):
                         upload_token=staged["token"],
                     )
                 )
+            self.assertFalse(package_dir.exists())
+
+    def test_partial_sftp_upload_failure_is_cleaned_without_masking_upload_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ESXiHostPrepService(temp_dir, probe_factory=FakeProbe)
+            staged = service.stage_package("BCM-vmware-storcli64.zip", b"payload")
+            package_dir = Path(str(staged["staged_path"])).parent
+            remote_path = f"/tmp/truenas-jbod-ui-{staged['token'][:12]}-BCM-vmware-storcli64.zip"
+            payload = ESXiHostPrepInstallRequest(
+                host="192.0.2.46",
+                user="root",
+                password="synthetic",
+                timeout_seconds=15,
+                upload_token=staged["token"],
+            )
+            FakeProbe.next_client = FakeClient(
+                {},
+                put_error=OSError("partial upload failed"),
+            )
+            pre_upload_cleanup = SSHCommandResult(
+                command="bounded pre-upload cleanup",
+                ok=True,
+                stdout="",
+                stderr="",
+                exit_code=0,
+            )
+
+            with patch.object(
+                service,
+                "_run_remote_command",
+                side_effect=[
+                    pre_upload_cleanup,
+                    RuntimeError("post-upload cleanup failed"),
+                ],
+            ) as run_remote_command:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"Remote upload error: partial upload failed$",
+                ):
+                    service.install_package(payload)
+
+            self.assertEqual(run_remote_command.call_count, 2)
+            self.assertEqual(
+                run_remote_command.call_args_list[1].args,
+                (FakeProbe.next_client, f"rm -f {remote_path}", payload.timeout_seconds),
+            )
+            self.assertEqual(
+                FakeProbe.next_client.sftp.uploads,
+                [(str(staged["staged_path"]), remote_path)],
+            )
             self.assertFalse(package_dir.exists())
 
     def test_install_package_raises_readable_error_when_remote_command_times_out(self) -> None:

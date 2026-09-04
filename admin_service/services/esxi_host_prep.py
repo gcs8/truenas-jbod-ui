@@ -469,7 +469,7 @@ class ESXiHostPrepService:
                         f"Unable to clear the previous ESXi temp file at {remote_path} before upload: "
                         f"{cleanup_detail}"
                     )
-                remote_uploaded = False
+                remote_cleanup_required = True
                 try:
                     try:
                         with client.open_sftp() as sftp:
@@ -480,12 +480,11 @@ class ESXiHostPrepService:
                             "The admin flow clears any previous temp file at that path before upload, "
                             f"so this was not a simple existing-file conflict. Remote upload error: {exc}"
                         ) from exc
-                    remote_uploaded = True
                     install_command = self._build_install_command(remote_path, str(package["extension"]))
                     install_result = self._run_remote_command(client, install_command, payload.timeout_seconds)
                     verification = self._run_verification_commands(client, payload.timeout_seconds)
                 finally:
-                    if remote_uploaded:
+                    if remote_cleanup_required:
                         try:
                             cleanup_result = self._run_remote_command(
                                 client,
