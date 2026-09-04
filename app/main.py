@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -567,21 +567,43 @@ def build_index_context(
     }
 
 
-def check_slot_bounds(slot: int, slot_count: int) -> None:
-    if slot < 0 or slot >= slot_count:
+def check_slot_bounds(slot: int, layout_slots: Collection[int]) -> None:
+    if slot < 0 or slot not in layout_slots:
         raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
 
 
-async def resolve_layout_slot_count(
+def snapshot_layout_slots(snapshot: Any) -> frozenset[int]:
+    """Return the set of slot numbers the snapshot actually renders.
+
+    ``layout_slot_count`` only says how many bays a view shows; a drawer
+    sub-view such as the MD1280 bottom drawer shows 42 bays numbered 42-83,
+    and operator profiles may use absolute or noncontiguous bay ids (#275).
+    The rendered ``SlotView`` numbers are authoritative; the layout rows stand
+    in before any bay has been rendered, and a bare count is only trusted when
+    the snapshot carries neither (a zero-based ``range``).
+    """
+    rendered = {int(view.slot) for view in (getattr(snapshot, "slots", None) or [])}
+    if rendered:
+        return frozenset(rendered)
+    layout_rows = getattr(snapshot, "layout_rows", None) or []
+    positioned = {int(slot) for row in layout_rows for slot in (row or []) if slot is not None}
+    if positioned:
+        return frozenset(positioned)
+    layout_slot_count = int(getattr(snapshot, "layout_slot_count", 0) or 0)
+    return frozenset(range(max(layout_slot_count, 0)))
+
+
+async def resolve_layout_slots(
     service: Any | None = None,
     selected_enclosure_id: str | None = None,
-) -> int:
-    """Return the selected enclosure's authoritative physical bay count.
+) -> frozenset[int]:
+    """Return the slot numbers the selected enclosure view actually renders.
 
     A global ``LAYOUT_SLOT_COUNT`` cannot represent mixed shelves or systems
-    with large disk inventories (#168, #213). Missing, empty, or mismatched
-    snapshot evidence therefore fails closed instead of permitting a mutation
-    against an unrelated global bound.
+    with large disk inventories (#168, #213), and a bay *count* cannot
+    represent a view whose bays do not start at zero (#275). Missing, empty,
+    or mismatched snapshot evidence therefore fails closed instead of
+    permitting a mutation against an unrelated bound.
     """
     if service is None:
         raise HTTPException(status_code=503, detail="Unable to resolve selected enclosure layout.")
@@ -601,10 +623,10 @@ async def resolve_layout_slot_count(
             status_code=404,
             detail=f"Enclosure {selected_enclosure_id!r} is not available for this system.",
         )
-    layout_slot_count = int(getattr(snapshot, "layout_slot_count", 0) or 0)
-    if layout_slot_count <= 0:
+    layout_slots = snapshot_layout_slots(snapshot)
+    if not layout_slots:
         raise HTTPException(status_code=503, detail="Unable to resolve selected enclosure layout.")
-    return layout_slot_count
+    return layout_slots
 
 
 async def ensure_slot_bounds(
@@ -614,7 +636,7 @@ async def ensure_slot_bounds(
 ) -> None:
     if slot < 0:
         raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
-    check_slot_bounds(slot, await resolve_layout_slot_count(service, selected_enclosure_id))
+    check_slot_bounds(slot, await resolve_layout_slots(service, selected_enclosure_id))
 
 
 def resolve_admin_launch_url(request: Request, settings: Settings) -> str | None:
