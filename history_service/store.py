@@ -446,13 +446,16 @@ class HistoryStore:
         switch) and the collector's writes used to run regardless. A service
         restart during a pending journal then mutated the hot file, and
         `rotate --recover` could match neither the prior nor the candidate
-        digest (issue #174). Raise the same error type the migration lock
-        raises so callers keep one failure path.
+        digest (issue #174). Plain reads and the segmented-retention claim
+        writes reached `_connect` without this check and rewrote the journal
+        header the same way (issue #279), so `_connect` now calls it for every
+        connection. Raise the same error type the migration lock raises so
+        callers keep one failure path.
         """
         if path_entry_exists(activation_pending_path(self.file_path)):
             raise sqlite3.OperationalError(
                 "Segmented history activation is pending; refusing to open the history "
-                "database for writes until the pending rotation or restore is recovered."
+                "database until the pending rotation or restore is recovered."
             )
         if self.segment_catalog_path is None:
             return
@@ -460,7 +463,7 @@ class HistoryStore:
         if path_entry_exists(pending_path):
             raise sqlite3.OperationalError(
                 "Segmented history migration recovery is pending; refusing to open the history "
-                "database for writes until the pending migration is recovered."
+                "database until the pending migration is recovered."
             )
 
     def _segmented_reader(self) -> SegmentedHistoryReader | None:
@@ -665,6 +668,12 @@ class HistoryStore:
                 raise
 
     def _connect(self, *, migration_lock_held: bool = False) -> sqlite3.Connection:
+        # Every reader and writer opens the hot database here. Check the
+        # lifecycle markers before connecting: _ensure_journal_mode rewrites the
+        # header (PRAGMA journal_mode=WAL) whenever the hot inode changed, which
+        # is exactly the state a crashed rotation or restore leaves behind, so a
+        # plain read used to make the hot diverge from the journal (issue #279).
+        self._require_no_pending_lifecycle_markers()
         connection = sqlite3.connect(
             self.file_path,
             timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,

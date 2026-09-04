@@ -1335,6 +1335,67 @@ class HistoryStoreTests(unittest.TestCase):
                 1,
             )
 
+    def test_store_refuses_reads_and_retention_claims_while_a_lifecycle_marker_is_pending(self) -> None:
+        # PR #191 gated __init__ and _execute_write, but plain reads and the
+        # segmented-retention claim/finish/release writes reached _connect
+        # directly. _connect -> _ensure_journal_mode rewrites the hot header
+        # (PRAGMA journal_mode=WAL) whenever the hot inode changed, which is
+        # exactly what a crashed restore or rotation leaves behind, so one
+        # collector read made the hot diverge from the journal digest (issue #279).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            segments_directory = root / "segments"
+            segments_directory.mkdir()
+            catalog_path = segments_directory / "catalog.json"
+            store = HistoryStore(
+                str(database_path),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog_path,
+            )
+            # Replace the hot with a DELETE-mode candidate at a new inode, the
+            # state a crashed segmented restore leaves after publishing its marker.
+            candidate_path = root / "candidate.db"
+            connection = sqlite3.connect(candidate_path)
+            try:
+                connection.executescript(history_store.SCHEMA)
+                connection.execute("PRAGMA journal_mode=DELETE")
+                connection.commit()
+            finally:
+                connection.close()
+            for suffix in ("-wal", "-shm"):
+                Path(f"{database_path}{suffix}").unlink(missing_ok=True)
+            os.replace(candidate_path, database_path)
+            self.assertEqual(database_path.read_bytes()[18:20], b"\x01\x01")
+            pristine = database_path.read_bytes()
+            backup_at = datetime(2030, 1, 1, tzinfo=timezone.utc)
+            operations = (
+                ("get_slot_states", lambda: store.get_slot_states("synthetic-system", None)),
+                ("get_slot_state", lambda: store.get_slot_state("synthetic-system", None, 1)),
+                ("claim", lambda: store.claim_segmented_retention_backup(backup_at)),
+                ("finish", lambda: store.finish_segmented_retention_backup(backup_at, has_more=False)),
+                ("release", lambda: store.release_segmented_retention_backup(backup_at)),
+            )
+
+            markers = (
+                (activation_pending_path(database_path), "activation is pending"),
+                (segments_directory / MIGRATION_PENDING_MARKER, "migration recovery is pending"),
+            )
+            for marker_path, message in markers:
+                marker_path.write_text("{}", encoding="utf-8")
+                try:
+                    for label, operation in operations:
+                        with self.subTest(marker=marker_path.name, operation=label):
+                            with self.assertRaisesRegex(sqlite3.OperationalError, message):
+                                operation()
+                            self.assertEqual(database_path.read_bytes(), pristine)
+                            self.assertFalse(Path(f"{database_path}-wal").exists())
+                finally:
+                    marker_path.unlink()
+
+            # Without a marker the same store adopts the replaced hot normally.
+            self.assertEqual(store.get_slot_states("synthetic-system", None), {})
+
     def test_store_rechecks_lifecycle_markers_after_acquiring_the_history_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "history.db"
