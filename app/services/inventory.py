@@ -519,6 +519,22 @@ class _LayoutFrame:
     slot_positions: dict[int, tuple[int, int]]
     allow_legacy_mapping_fallback: bool
 
+    def slot_ids(self) -> list[int]:
+        """Bay ids to render, in ascending order.
+
+        Profiles may carry noncontiguous or offset bay ids (drawer sub-views,
+        custom layouts with a gap), so iterate the layout's actual ids rather
+        than ``range(layout_slot_count)``; the zero-based range only applies
+        to layouts without an explicit grid (issue #290).
+        """
+        if self.slot_positions:
+            return sorted(self.slot_positions)
+        return list(range(self.layout_slot_count))
+
+    def candidate_slot_limit(self) -> int:
+        slot_ids = self.slot_ids()
+        return max(slot_ids, default=-1) + 1
+
     def result(
         self,
         slot_views: list[SlotView],
@@ -4087,7 +4103,7 @@ class InventoryService:
 
         slot_views: list[SlotView] = []
 
-        for slot in range(frame.layout_slot_count):
+        for slot in frame.slot_ids():
             row_index, column_index = _slot_grid_position(
                 slot,
                 frame.slot_positions,
@@ -4401,7 +4417,7 @@ class InventoryService:
                 "GPIO state changes are visible, but operator-visible bay validation is still pending."
             )
 
-        for slot in range(frame.layout_slot_count):
+        for slot in frame.slot_ids():
             row_index, column_index = _slot_grid_position(
                 slot,
                 frame.slot_positions,
@@ -4553,7 +4569,7 @@ class InventoryService:
         }
         loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
-        for slot in range(frame.layout_slot_count):
+        for slot in frame.slot_ids():
             row_index, column_index = _slot_grid_position(
                 slot,
                 frame.slot_positions,
@@ -4719,15 +4735,15 @@ class InventoryService:
         empty_ssh = ParsedSSHData()
         loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
-        for slot in range(frame.layout_slot_count):
+        for ordinal, slot in enumerate(frame.slot_ids()):
             row_index, column_index = _slot_grid_position(
                 slot,
                 frame.slot_positions,
                 frame.layout_columns,
             )
             mapped_bmc_slot = bmc_slot_hints.get(slot)
-            if mapped_bmc_slot is None and slot < len(discovered_slot_numbers):
-                mapped_bmc_slot = discovered_slot_numbers[slot]
+            if mapped_bmc_slot is None and ordinal < len(discovered_slot_numbers):
+                mapped_bmc_slot = discovered_slot_numbers[ordinal]
             slot_hint = f"bmc-slot:{mapped_bmc_slot}" if isinstance(mapped_bmc_slot, int) else None
             raw_slot_status: dict[str, Any] = {
                 "device_names": [slot_hint] if slot_hint else [],
@@ -4805,9 +4821,10 @@ class InventoryService:
         selected_profile = frame.selected_profile
         allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
         slot_count = frame.layout_slot_count
+        candidate_slot_limit = frame.candidate_slot_limit()
         ssh_candidates, ssh_meta = build_slot_candidates_from_ses_enclosures(
             ssh_data.ses_enclosures,
-            slot_count,
+            candidate_slot_limit,
             self.system.truenas.enclosure_filter,
             self._base_enclosure_id(selected_option.id),
         )
@@ -4818,7 +4835,7 @@ class InventoryService:
         api_candidates, api_selected_meta = extract_enclosure_slot_candidates(
             raw_data.enclosures,
             self.system.truenas.enclosure_filter,
-            slot_count,
+            candidate_slot_limit,
             self.settings.layout.api_slot_number_base,
             self._base_enclosure_id(selected_option.id),
         )
@@ -4848,14 +4865,9 @@ class InventoryService:
 
         mapping_enclosure_id = self._base_enclosure_id(selected_option.id)
         is_sub_view = mapping_enclosure_id != selected_option.id
-        # Synthetic drawer sub-views render only their own layout slots. Normal
-        # profiles retain the existing range behavior so sparse custom layouts
-        # do not silently remove bays from inventory.
-        slots_to_render = (
-            sorted(frame.slot_positions)
-            if is_sub_view and frame.slot_positions
-            else list(range(slot_count))
-        )
+        # Render exactly the layout's bay ids: drawer sub-views carry an
+        # offset range and custom profiles may leave a gap (issue #290).
+        slots_to_render = frame.slot_ids()
         if is_sub_view:
             slot_count = len(slots_to_render)
         loaded_mappings = self.mapping_store.load_all()
@@ -4963,13 +4975,13 @@ class InventoryService:
             raw_data,
             selected_option.id,
             quantastor_ses_data,
-            frame.layout_slot_count,
+            frame.candidate_slot_limit(),
             selected_profile.id,
         )
         loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
 
-        for slot in range(frame.layout_slot_count):
+        for slot in frame.slot_ids():
             row_index, column_index = _slot_grid_position(
                 slot,
                 frame.slot_positions,
