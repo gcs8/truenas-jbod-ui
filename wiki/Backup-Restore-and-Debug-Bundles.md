@@ -29,7 +29,14 @@ Open the admin sidecar on `:8082` for these workflows.
 
 Use a full backup when you may want to restore the app state later.
 
-The default plaintext scope covers core state:
+Full Backup exports must be encrypted. The export is a portable `.7z` archive
+with a passphrase. A plaintext export is rejected with HTTP 400
+(`Plaintext backup export is disabled.`) unless the admin service runs with
+`ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true`; the published Compose file passes it
+through as `false`. Enable plaintext only in a trusted-operator deployment where
+the archive itself is protected separately.
+
+The core state scope covers:
 
 - `config/config.yaml`
 - `config/profiles.yaml`
@@ -43,9 +50,9 @@ trust roots:
 - imported TLS trust bundles
 - shared `known_hosts`
 
-Selecting any locked path forces encrypted portable `.7z` export. That keeps
-secret material out of plaintext bundles while still letting the admin import
-path restore those same selected files later.
+Selecting any locked path forces encrypted export even when plaintext is
+allowed. That keeps secret material out of plaintext bundles while still letting
+the admin import path restore those same selected files later.
 
 The admin service supplies the 7z passphrase through a private, bounded terminal
 prompt. It does not place the passphrase in the 7z process arguments or command
@@ -56,10 +63,15 @@ contain carriage returns or line feeds because the 7z prompt is line-oriented.
 
 Scheduled backups use a separate one-shot container. The container has no
 published port, network, or Docker socket. A host timer starts it, so the
-privileged admin sidecar keeps its default one-hour auto-stop boundary.
-New scheduled archives use encrypted portable `.7z` and file-backed validation,
-including segmented history. Existing `.tar.zst.enc` scheduled archives remain
-recognized for retention and bounded compatibility restore.
+privileged admin sidecar keeps the auto-stop boundary the Compose file gives it
+(`3600` seconds unless you changed `ADMIN_AUTO_STOP_SECONDS`).
+
+The selected backup scope determines the archive format. Scopes that include
+`history_db` produce encrypted `.7z` archives. Scopes without `history_db`
+produce encrypted `.tar.zst.enc` archives, using an AES-256-GCM envelope around
+the validated system backup. Both paths validate the finished archive through
+the normal restore preflight before publication. Retention and bounded restore
+recognize both formats.
 
 Create a private passphrase file under `config/backup-secrets` and make it
 readable only by its owner. The Compose files mount that directory read-only at
@@ -131,10 +143,11 @@ docker compose --profile backup run --rm enclosure-backup
 The runner creates private `0600` files in the destination, verifies the copied
 archive through the normal restore preflight, publishes without overwriting an
 existing name, publishes shared-read-only `0640` status under the prepared
-`2750` directory, and prunes only files matching its owned filename contract. It
-publishes `.tar.zst.enc` bundles. The inner archive is the validated system
-backup format. The outer envelope uses AES-256-GCM with a per-file salt and
-nonce. Import the file through the normal admin restore path and supply the same
+`2750` directory, and prunes only files matching its owned filename contract.
+The example scope above includes `history_db`, so it publishes the same encrypted
+portable `.7z` FULL archive the admin export produces. Remove `history_db` from
+the scope and the runner instead publishes encrypted `.tar.zst.enc`. Import
+either format through the normal admin restore path and supply the same
 passphrase.
 
 The repository includes `deploy/systemd/truenas-jbod-system-backup.service` and
@@ -190,12 +203,23 @@ archive headroom for the hot file plus all selected segments. Each 7z create,
 verify, list, or extract operation remains bounded to 10 minutes. Archive
 creation uses normal compression with one worker thread.
 
-The native scheduled `.tar.zst.enc` path supports schema 2 and uses the same
-staged restore contract. Schema 2 restore requires the target to configure
-`HISTORY_SEGMENT_CATALOG_PATH`.
+All scheduled archives use the same staged restore contract. A schema 2 archive
+includes `history_db` and therefore uses `.7z`; restoring it requires the target
+to configure `HISTORY_SEGMENT_CATALOG_PATH`.
 
-See [Segmented history v2](../docs/SEGMENTED_HISTORY_V2.md) for migration,
-recovery, rollback, catalog, and release-gate details.
+The four segmented-history tools are packaged in images built from current
+`main`, but they are not present in the published `v0.22.2` image. Use these
+paths only with a source-built current-main image or a later release that
+contains them:
+
+`/app/scripts/migrate_segmented_history.py`,
+`/app/scripts/rotate_segmented_history.py`,
+`/app/scripts/query_segmented_history.py`, and
+`/app/scripts/seal_history_segment.py`. Run them through the history service,
+for example
+`docker compose run --rm enclosure-history python /app/scripts/query_segmented_history.py --help`.
+Migration, recovery, rollback, catalog, and release-gate details are in
+[Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md).
 
 ## Restore Pattern
 
@@ -235,7 +259,9 @@ for the current enclosure or storage view.
 
 That is useful when you want someone to inspect a physical slot map without
 connecting to the live app. It is not a restore path and does not carry the full
-local stack state.
+local stack state. The dialog's `Redact sensitive IDs` toggle aliases system,
+enclosure, and hostname identifiers and masks serials, path identifiers, and IP
+addresses; the table on the export page lists exactly what changes.
 
 See [[History and Snapshot Export|History-and-Snapshot-Export]].
 

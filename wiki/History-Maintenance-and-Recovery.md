@@ -7,6 +7,18 @@ The admin maintenance area now exposes the safe paths directly:
 
 ![Admin maintenance bundle and history tools](images/admin-maintenance-v0.18.0.png)
 
+## Segmented Deployments
+
+When `HISTORY_SEGMENT_CATALOG_PATH` is set, the whole-system tools on this page
+refuse to run: `Purge Orphaned Data`, `Adopt Removed System History`, and
+`Delete + Purge History` return
+`History <operation> is unavailable while segmented history is active.`, and so
+do v1 (hot-only) backup and restore. Immutable segments are never edited in
+place, so removing or rehoming history there means publishing a new catalog
+generation. See the segmented section of
+[[Advanced Configuration|Advanced-Configuration]] and the runbook linked from
+[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]].
+
 ## Export First If The History Matters
 
 Before a destructive cleanup, export a full backup bundle from the same admin
@@ -67,7 +79,7 @@ The current first pass is intentionally whole-system-id based:
 
 This is the right tool for cases like:
 
-- `qs-cryostorage` -> `qsosn-ha`
+- `old-qs-id` -> `new-qs-id`
 - lab rebuilds where the appliance identity changed but the chassis history is
   still worth keeping
 

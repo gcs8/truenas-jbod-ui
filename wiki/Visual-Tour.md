@@ -14,7 +14,8 @@ For installation steps, start with [[Quick Start|Quick-Start]]. For the
 container/service map, use
 [[Architecture and Services|Architecture-and-Services]].
 
-Screenshots on this page were refreshed from the `0.18.0` UI.
+Screenshots on this page were last refreshed from the `v0.18.0` UI and may lag
+the current release in small details.
 
 ## Main Enclosure View
 

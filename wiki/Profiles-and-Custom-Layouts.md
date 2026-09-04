@@ -88,8 +88,8 @@ Hand-editing `profiles.yaml` is still useful when:
 
 - you want to keep the file under your own version control
 - you need fields the current builder does not expose yet
-- you are experimenting with sparse/gapped layouts or other later-work schema
-  details
+- you need noncontiguous bay ids; they are accepted, but the rendering of
+  gapped layouts is not yet reliable (see issue #290), so check the result
 
 ## Example Custom Profile
 
@@ -117,11 +117,15 @@ profiles:
 - `label`
 - `panel_title`
 - `edge_label`
-- `face_style`
+- `face_style`: one of `front-drive`, `rear-drive`, `top-loader`, `drawer`,
+  `nvme-carrier`, `unifi-drive`, or `generic`
 - `latch_edge`
 - `bay_size`
 - `rows`
 - `columns`
+- `slot_number_base`: the number shown for the first bay; leave it unset for
+  `0`-based chassis and set `1` for shelves that count from one, as the Dell
+  MD1280 profiles do
 - `slot_layout`
 - `row_groups`
 - `slot_hints`

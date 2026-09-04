@@ -156,6 +156,76 @@ Then open:
 http://your-docker-host:8082
 ```
 
+## Main UI write authorization differs by version
+
+`v0.22.2` does not enforce `ADMIN_AUTH_MODE` on main-UI writes. If those writes
+succeed in network mode, changing the variables below will not add main-UI write
+protection to that release. Restrict port `8080` to trusted clients and upgrade
+to a release that contains the current-main server policy when one is published.
+
+Current `main` rejects these writes unless `ADMIN_AUTH_MODE=basic`. A rejected
+network-mode request returns `Read UI mutations require
+ADMIN_AUTH_MODE=basic.` Current `main` leaves the controls enabled and reports
+the rejection through the existing error path; it does not disable them before
+the click or after a 401/403. For a source-built current-main image, set:
+
+```dotenv
+ADMIN_AUTH_MODE=basic
+ADMIN_AUTH_USERNAME=operator
+ADMIN_AUTH_PASSWORD=replace-with-a-long-random-secret
+APP_PUBLIC_ORIGIN=http://your-docker-host:8080
+```
+
+`APP_PUBLIC_ORIGIN` must be the exact origin your browser shows for the main
+UI. If it does not match, current-main writes fail with
+`Cross-origin Read UI mutation rejected.` Recreate `enclosure-ui` after changing
+these values. The disabled-control behavior is proposed in PR #322; it is not in
+`v0.22.2` or current `main`.
+
+## The Admin Page Rejects Every Change With 403
+
+`Cross-origin admin mutation rejected.` means `ADMIN_PUBLIC_ORIGIN` is unset,
+malformed, or does not match the origin your browser shows for the admin UI.
+`v0.22.2` and current `main` still start in that state; browser mutations are
+rejected at request time with `403 Cross-origin admin mutation rejected.` Set
+the exact origin, for example `http://your-docker-host:8082`, then recreate
+`enclosure-admin`:
+
+```bash
+docker compose --profile admin up -d --force-recreate enclosure-admin
+```
+
+Startup refusal for an empty or invalid value is proposed in PR #321; it is not
+part of `v0.22.2` or current `main`.
+
+## Full Backup Export Fails With 400
+
+`Plaintext backup export is disabled.` means encryption was turned off for a
+Full Backup. Exports must be encrypted unless the admin service runs with
+`ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true`, which is meant only for a
+trusted-operator deployment where the archive itself is protected separately.
+Turn encryption back on, or set that variable and recreate `enclosure-admin`.
+
+## Permission Errors After Switching To The Non-Root Compose File
+
+The non-root Compose file (unreleased, on `main`) runs the UI and history
+services as `10001:10001`. On a folder created by an older root-owned
+deployment they cannot write `data/`, `history/`, or `logs/`, and the logs show
+`PermissionError` or read-only database failures.
+
+Stop the stack and run the ownership helper, dry run first:
+
+```bash
+docker compose down
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
+docker compose up -d
+docker compose exec enclosure-ui id
+```
+
+See the non-root runtime section in
+[[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]].
+
 ## The Browser Keeps Showing Old UI
 
 Try these in order:

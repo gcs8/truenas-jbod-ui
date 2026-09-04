@@ -67,8 +67,19 @@ history, scope history, counts, and summaries across databases. They do not use
 SQLite `ATTACH`. A query selects at most 32 segments and 5,000 rows; broader
 requests fail rather than silently omitting older history.
 
-Migration, recovery, and rollback commands are documented in
-[Segmented history v2](../docs/SEGMENTED_HISTORY_V2.md).
+The four segmented-history tools are packaged in images built from current
+`main`, but they are not present in the published `v0.22.2` image. Use these
+paths only with a source-built current-main image or a later release that
+contains them:
+
+`/app/scripts/migrate_segmented_history.py`,
+`/app/scripts/rotate_segmented_history.py`,
+`/app/scripts/query_segmented_history.py`, and
+`/app/scripts/seal_history_segment.py`. Run them through the history service,
+for example
+`docker compose run --rm enclosure-history python /app/scripts/query_segmented_history.py --help`.
+Migration, recovery, rollback, catalog, and release-gate details are in
+[Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md).
 
 ## History Sidecar Dashboard
 
@@ -147,6 +158,31 @@ Things to notice:
 
 If you want a different snapshot history range, change the window in the
 History drawer first, then open the export dialog.
+
+## What `Redact sensitive IDs` Does
+
+The export dialog has one redaction toggle. With it on, the export is written at
+the `Partial` level; with it off, nothing is changed. Partial redaction applies
+to every embedded payload: the snapshot, history samples, SMART summaries, and
+warnings.
+
+| Data | Partial redaction |
+| --- | --- |
+| system ids and labels, and the hostnames in your saved config | replaced by `host-NN` aliases; a configured hostname shares its system's alias |
+| enclosure ids, labels, aliases, and names | replaced by `enc-NN` aliases |
+| serials (`serial`, `serial_hint`) | masked to the last four characters, for example `...1234`; a two-character prefix is kept when several serials share that suffix |
+| path and transport identifiers (`gptid`, `logical_unit_id`, `lunid`, `sas_address`, `attached_sas_address`, `sas_address_hint`, `transport_address`, `wwn`, `namespace_eui64`, `namespace_nguid`, `uuid`, `partuuid`, `enclosure_identifier`) | masked to the leading and trailing characters, for example `5003...043f` |
+| IPv4 addresses anywhere in text | `x.x.x.N`, keeping the last octet |
+| canonical eight-group IPv6 addresses in text | `x:x:` plus the last two groups; compressed IPv6 forms are not currently matched and require manual review |
+| everything else, for example slot numbers, models, capacities, pool names, SMART values, and timestamps | unchanged |
+
+A configured hostname is matched in the form you saved it. That rule is being
+extended so that the short and fully qualified forms of the same host both
+collapse to one alias, and so that a system or enclosure id that appears only
+in history rows still receives an alias.
+
+Redaction is a sharing aid, not a guarantee. Review an exported file before you
+hand it to someone outside your team.
 
 ## What The Offline Snapshot Looks Like
 

@@ -522,11 +522,33 @@ class ContainerResourceContractTests(unittest.TestCase):
 
         self.assertIn("default non-root UI and history services", env_example)
         self.assertIn("Default non-root runtime", deployment_guide)
-        self.assertRegex(deployment_guide, r"before\s+the first v0\.22\.3 start")
+        self.assertRegex(deployment_guide, r"before\s+the first start on the non-root Compose file")
+        self.assertNotIn("v0.22.3", deployment_guide)
+        self.assertNotIn("v0.22.3", quick_start)
         self.assertIn("prepare_nonroot_bind_mounts.py", readme)
         self.assertIn("prepare_nonroot_bind_mounts.py", quick_start)
         self.assertIn("--apply", quick_start)
         self.assertNotIn("The base Compose file keeps the existing root-compatible", deployment_guide)
+
+    def test_v0222_install_does_not_apply_current_nonroot_ownership(self) -> None:
+        quick_start = (REPO_ROOT / "wiki/Quick-Start.md").read_text(encoding="utf-8")
+        deployment_guide = (
+            REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md"
+        ).read_text(encoding="utf-8")
+        pinned_sections = {
+            "quick-start": quick_start.split("## Updates", maxsplit=1)[0],
+            "deployment-guide": deployment_guide.split("## Default non-root runtime", maxsplit=1)[0],
+        }
+
+        for guide_name, section in pinned_sections.items():
+            normalized = " ".join(section.split())
+            with self.subTest(guide=guide_name):
+                self.assertNotIn("prepare_nonroot_bind_mounts.py", section)
+                self.assertNotIn("--uid 10001", section)
+                self.assertNotIn("--gid 10001", section)
+                self.assertIn("Do not run the current-main non-root ownership helper", normalized)
+                self.assertIn("backup service", normalized)
+                self.assertIn("1000:1000", section)
 
     def test_nonroot_overlay_preserves_backup_identity_with_app_data_group(self) -> None:
         overlay = yaml.safe_load(
@@ -642,10 +664,114 @@ class ContainerResourceContractTests(unittest.TestCase):
         ):
             guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
             with self.subTest(guide=relative_path):
-                self.assertIn("../docs/ADMIN_TRUST_BOUNDARY.md", guide)
+                self.assertIn(
+                    "https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md",
+                    guide,
+                )
+                self.assertNotIn("../docs/", guide)
+                self.assertIn("ADMIN_PUBLIC_ORIGIN", guide)
                 self.assertIn("trusted operator", guide)
                 self.assertIn("Docker socket", guide)
                 self.assertIn("Auto-stop limits exposure; it is not authentication", guide)
+
+    def test_main_ui_write_authorization_is_version_gated_in_published_guides(self) -> None:
+        for relative_path in (
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+            "wiki/Troubleshooting.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            guide_text = " ".join(guide.split())
+            with self.subTest(guide=relative_path):
+                self.assertIn(
+                    "`v0.22.2` does not enforce `ADMIN_AUTH_MODE` on main-UI writes",
+                    guide_text,
+                )
+                self.assertIn(
+                    "Current `main` rejects these writes unless `ADMIN_AUTH_MODE=basic`",
+                    guide_text,
+                )
+
+    def test_main_ui_write_control_state_matches_current_main(self) -> None:
+        for relative_path in (
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+            "wiki/Troubleshooting.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            guide_text = " ".join(guide.split()).lower()
+            with self.subTest(guide=relative_path):
+                self.assertIn("current `main` leaves the controls enabled", guide_text)
+                self.assertNotIn("renders those write controls disabled", guide_text)
+                self.assertNotIn("renders the write controls disabled", guide_text)
+                self.assertNotIn("disables them again", guide_text)
+
+    def test_admin_origin_startup_behavior_is_not_overstated(self) -> None:
+        for relative_path in (
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+            "wiki/Admin-UI-and-System-Setup.md",
+            "wiki/Troubleshooting.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            guide_text = " ".join(guide.split())
+            with self.subTest(guide=relative_path):
+                self.assertIn("`v0.22.2` and current `main` still start", guide_text)
+                self.assertIn("rejected at request time with `403", guide_text)
+                self.assertNotIn("refuses to start while", guide_text)
+
+    def test_segmented_history_tools_are_version_gated(self) -> None:
+        for relative_path in (
+            "wiki/Backup-Restore-and-Debug-Bundles.md",
+            "wiki/History-and-Snapshot-Export.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            guide_text = " ".join(guide.split())
+            with self.subTest(guide=relative_path):
+                self.assertIn("packaged in images built from current `main`", guide_text)
+                self.assertIn("not present in the published `v0.22.2` image", guide_text)
+
+    def test_snapshot_export_guide_does_not_overpromise_ipv6_redaction(self) -> None:
+        guide = (REPO_ROOT / "wiki/History-and-Snapshot-Export.md").read_text(
+            encoding="utf-8"
+        )
+        guide_text = " ".join(guide.split())
+        self.assertIn("compressed IPv6 forms are not currently matched", guide_text)
+        self.assertNotIn("IPv6 addresses anywhere in text", guide_text)
+
+    def test_strict_host_key_guides_require_verified_preloading(self) -> None:
+        for relative_path in (
+            "wiki/SSH-Setup-and-Sudo.md",
+            "wiki/Quantastor-Setup.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            guide_text = " ".join(guide.split())
+            with self.subTest(guide=relative_path):
+                self.assertIn("current `main` uses Paramiko `RejectPolicy`", guide_text)
+                self.assertIn("verify every host-key fingerprint", guide_text)
+                self.assertIn("preload", guide_text)
+                self.assertIn("`v0.22.2` instead uses trust on first use", guide_text)
+                self.assertNotIn("first successful SSH connection pins", guide_text)
+
+        ssh_guide = (REPO_ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text(encoding="utf-8")
+        self.assertIn("ssh-keyscan -T 5 -p 22 storage.example.test", ssh_guide)
+        self.assertIn('ssh-keygen -lf "$known_hosts_candidate"', ssh_guide)
+        self.assertIn("does not authenticate the key", ssh_guide)
+
+    def test_scheduled_backup_archive_format_follows_scope(self) -> None:
+        guide = (REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md").read_text(
+            encoding="utf-8"
+        )
+        guide_text = " ".join(guide.split())
+
+        self.assertIn("Scopes that include `history_db` produce encrypted `.7z` archives", guide_text)
+        self.assertIn(
+            "Scopes without `history_db` produce encrypted `.tar.zst.enc` archives",
+            guide_text,
+        )
+        self.assertIn("Both paths validate the finished archive", guide_text)
+        self.assertNotIn("Legacy `.tar.zst.enc`", guide_text)
+        self.assertNotIn("Both scheduled archive formats support schema 2", guide_text)
 
     def test_secret_overlay_grants_only_required_service_scoped_files(self) -> None:
         overlay_path = REPO_ROOT / "docker-compose.secrets.yml"

@@ -52,13 +52,30 @@ sudo chmod 600 /home/jbodmap/.ssh/authorized_keys
 
 ## 3. Minimal Generic Linux Sudo
 
+This block matches the list the one-time bootstrap in the admin sidecar grants
+for Linux as of #333. The `sg_ses` rules matter only on hosts that expose SES
+devices; `--join --filter` is the probe that supplies slot names and fan/PSU
+state, the `--set=ident`/`--clear=ident` rules are for identify LEDs, the
+`smartctl -d *` forms cover boot media that needs an explicit device type, and
+the `nvme` rules feed NVMe enrichment:
+
 ```bash
 sudo tee /etc/sudoers.d/jbodmap-storage > /dev/null <<'EOF'
 Defaults:jbodmap !requiretty
-jbodmap ALL=(root) NOPASSWD: /usr/bin/lsblk -OJ
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail --scan
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/sd*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/nvme*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p aes /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p ec /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --join --filter /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -d * -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -d * -x *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -d * -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -d * -x *
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*
@@ -85,7 +102,6 @@ systems:
       host: gpu-server.example.local
       user: jbodmap
       key_path: /run/ssh/id_truenas
-      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /usr/bin/lsblk -OJ
@@ -112,7 +128,6 @@ systems:
       user: root
       key_path: ""
       password: "REPLACE_ME"
-      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /bin/lsblk -OJ
