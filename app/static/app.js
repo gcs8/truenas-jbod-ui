@@ -99,7 +99,7 @@
     timerDelayMs: 0,
     timingTickId: null,
     identifyVerifyTimerId: null,
-    diskInventorySync: { armedMode: null, armTimerId: null, inFlight: false },
+    diskInventorySync: { armedMode: null, armedSystemId: null, armTimerId: null, inFlight: false },
     refreshesInFlight: 0,
     latestRefreshToken: 0,
     storageViewsRuntimeRequestToken: 0,
@@ -2394,9 +2394,13 @@
 
   function applySnapshot(snapshot) {
     rememberReusableSnapshot(snapshot);
+    const nextSystemId = snapshot.selected_system_id || state.selectedSystemId;
+    if (nextSystemId !== state.selectedSystemId) {
+      disarmDiskInventorySync();
+    }
     state.snapshot = snapshot;
     state.layoutRows = snapshot.layout_rows || state.layoutRows || [];
-    state.selectedSystemId = snapshot.selected_system_id || state.selectedSystemId;
+    state.selectedSystemId = nextSystemId;
     state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
     pruneSmartSummaryCache();
     if (state.selectedSlot !== null && !getSlotById(state.selectedSlot) && !getSelectedStorageViewRuntimeSlot(state.selectedSlot)) {
@@ -9179,6 +9183,12 @@
         reason: "TrueNAS disk inventory sync is unsupported on this platform because it needs the TrueNAS middleware.",
       };
     }
+    if (typeof writePolicyAllowsWrites === "function" && !writePolicyAllowsWrites()) {
+      const reason = typeof writePolicyReason === "function"
+        ? writePolicyReason()
+        : "Writes are disabled for this deployment.";
+      return { available: false, reason };
+    }
     if (mode === "multipath" && platform !== "core") {
       return { available: false, reason: "Multipath table sync is only available on TrueNAS CORE." };
     }
@@ -9208,7 +9218,10 @@
       }
       return;
     }
-    const armedMode = state.diskInventorySync.armedMode;
+    const currentSystemId = state.selectedSystemId || state.snapshot?.selected_system_id;
+    const armedMode = state.diskInventorySync.armedSystemId === currentSystemId
+      ? state.diskInventorySync.armedMode
+      : null;
     diskInventorySyncButtons.forEach((button) => {
       const mode = button.dataset.diskInventorySyncMode;
       const spec = diskInventorySyncModeSpec(mode);
@@ -9237,10 +9250,11 @@
       window.clearTimeout(state.diskInventorySync.armTimerId);
       state.diskInventorySync.armTimerId = null;
     }
-    if (!state.diskInventorySync.armedMode) {
+    if (!state.diskInventorySync.armedMode && !state.diskInventorySync.armedSystemId) {
       return;
     }
     state.diskInventorySync.armedMode = null;
+    state.diskInventorySync.armedSystemId = null;
     renderDiskInventorySyncControls();
   }
 
@@ -9249,6 +9263,7 @@
       window.clearTimeout(state.diskInventorySync.armTimerId);
     }
     state.diskInventorySync.armedMode = mode;
+    state.diskInventorySync.armedSystemId = state.selectedSystemId || state.snapshot?.selected_system_id || null;
     // Confirm window: the second click has to land within 6 s or the button disarms.
     state.diskInventorySync.armTimerId = window.setTimeout(() => {
       state.diskInventorySync.armTimerId = null;
@@ -9265,12 +9280,17 @@
     const availability = diskInventorySyncModeAvailability(mode);
     if (!availability.available) {
       disarmDiskInventorySync();
+      renderDiskInventorySyncControls();
       setStatus(availability.reason, "error");
       return;
     }
-    if (state.diskInventorySync.armedMode === mode) {
+    const systemId = state.selectedSystemId || state.snapshot?.selected_system_id || null;
+    if (
+      state.diskInventorySync.armedMode === mode
+      && state.diskInventorySync.armedSystemId === systemId
+    ) {
       disarmDiskInventorySync();
-      void runDiskInventorySync(mode);
+      void runDiskInventorySync(mode, systemId);
       return;
     }
     armDiskInventorySync(mode);
@@ -9292,9 +9312,11 @@
     return `${result?.message || "TrueNAS disk inventory sync finished."}${summary}${error}`;
   }
 
-  async function runDiskInventorySync(mode) {
+  async function runDiskInventorySync(
+    mode,
+    systemId = state.selectedSystemId || state.snapshot?.selected_system_id,
+  ) {
     const spec = diskInventorySyncModeSpec(mode);
-    const systemId = state.selectedSystemId || state.snapshot?.selected_system_id;
     if (!spec || !systemId) {
       setStatus("Select a system before syncing its TrueNAS disk inventory.", "error");
       return;
@@ -9311,6 +9333,7 @@
     try {
       const result = await fetchJson(`/api/systems/${encodeURIComponent(systemId)}/disk-inventory-sync`, {
         method: "POST",
+        readUiAuth: true,
         body: JSON.stringify({ mode, confirm: true }),
       });
       window.clearInterval(progressTimerId);
@@ -9815,6 +9838,9 @@
         return;
       }
       closeEnclosureAliasEditor(false);
+      if (nextSystemId !== state.selectedSystemId) {
+        disarmDiskInventorySync();
+      }
       state.selectedSystemId = nextSystemId;
       state.selectedEnclosureId = null;
       state.storageViewsRuntime = {

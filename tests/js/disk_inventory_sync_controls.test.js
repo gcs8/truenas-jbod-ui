@@ -76,12 +76,16 @@ const FUNCTION_NAMES = [
   "handleDiskInventorySyncClick",
 ];
 
-function loadFunctions(context) {
+function loadNamedFunctions(names, context) {
   const sandbox = vm.createContext(context);
-  const source = FUNCTION_NAMES.map((name) => functionSource(APP_SOURCE, name)).join("\n");
-  const exports = FUNCTION_NAMES.map((name) => `this.__${name} = ${name};`).join("\n");
+  const source = names.map((name) => functionSource(APP_SOURCE, name)).join("\n");
+  const exports = names.map((name) => `this.__${name} = ${name};`).join("\n");
   vm.runInContext(`${source}\n${exports}`, sandbox, { filename: "disk-inventory-sync.behavior.js" });
-  return Object.fromEntries(FUNCTION_NAMES.map((name) => [name, sandbox[`__${name}`]]));
+  return Object.fromEntries(names.map((name) => [name, sandbox[`__${name}`]]));
+}
+
+function loadFunctions(context) {
+  return loadNamedFunctions(FUNCTION_NAMES, context);
 }
 
 function classList(initial = []) {
@@ -102,32 +106,44 @@ function button(mode) {
   return { dataset: { diskInventorySyncMode: mode }, classList: classList([]), disabled: false, title: "", textContent: "" };
 }
 
-function harness({ platform = "core", sshEnabled = true, snapshotMode = false } = {}) {
+function harness({
+  platform = "core",
+  sshEnabled = true,
+  snapshotMode = false,
+  writePolicyAllowed,
+  writePolicyBlockReason = "Writes are disabled by policy.",
+} = {}) {
   const timers = [];
   const cleared = [];
   const statuses = [];
   const runs = [];
   const state = {
     snapshotMode,
+    selectedSystemId: "system-a",
     snapshot: { sources: { ssh: { enabled: sshEnabled, ok: true } } },
-    diskInventorySync: { armedMode: null, armTimerId: null, inFlight: false },
+    diskInventorySync: { armedMode: null, armedSystemId: null, armTimerId: null, inFlight: false },
   };
   const buttons = { multipath: button("multipath"), full: button("full") };
   const controls = { classList: classList(["hidden"]) };
   const hint = { classList: classList(["hidden"]), textContent: "" };
-  const fns = loadFunctions({
+  const context = {
     state,
     currentPlatform: () => platform,
     diskInventorySyncControls: controls,
     diskInventorySyncHint: hint,
     diskInventorySyncButtons: [buttons.multipath, buttons.full],
     setStatus: (message, tone = "info") => statuses.push({ message, tone }),
-    runDiskInventorySync: (mode) => { runs.push(mode); return Promise.resolve(); },
+    runDiskInventorySync: (mode, systemId) => { runs.push({ mode, systemId }); return Promise.resolve(); },
     window: {
       setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; },
       clearTimeout(id) { cleared.push(id); },
     },
-  });
+  };
+  if (writePolicyAllowed !== undefined) {
+    context.writePolicyAllowsWrites = () => writePolicyAllowed;
+    context.writePolicyReason = () => writePolicyBlockReason;
+  }
+  const fns = loadFunctions(context);
   return { fns, state, buttons, controls, hint, timers, cleared, statuses, runs };
 }
 
@@ -180,7 +196,7 @@ test("first click arms with the explanation, second click runs exactly once and 
   assert.deepEqual(h.runs, []);
 
   h.fns.handleDiskInventorySyncClick("multipath");
-  assert.deepEqual(h.runs, ["multipath"]);
+  assert.deepEqual(h.runs, [{ mode: "multipath", systemId: "system-a" }]);
   assert.equal(h.state.diskInventorySync.armedMode, null);
   assert.equal(h.buttons.multipath.textContent, "Sync multipath table");
   assert.equal(h.buttons.multipath.dataset.armed, "false");
@@ -197,6 +213,23 @@ test("arming the other mode re-arms instead of running", () => {
   assert.match(h.hint.textContent, /disk\.sync_all/);
   assert.equal(h.buttons.multipath.textContent, "Sync multipath table");
   assert.equal(h.buttons.full.textContent, "Confirm sync");
+});
+
+test("changing systems after arming requires a fresh confirmation for the exact new system", () => {
+  const h = harness({ platform: "core" });
+
+  h.fns.handleDiskInventorySyncClick("full");
+  assert.equal(h.state.diskInventorySync.armedSystemId, "system-a");
+
+  h.state.selectedSystemId = "system-b";
+  h.fns.handleDiskInventorySyncClick("full");
+
+  assert.deepEqual(h.runs, [], "system B must not inherit system A's confirmation");
+  assert.equal(h.state.diskInventorySync.armedMode, "full");
+  assert.equal(h.state.diskInventorySync.armedSystemId, "system-b");
+
+  h.fns.handleDiskInventorySyncClick("full");
+  assert.deepEqual(h.runs, [{ mode: "full", systemId: "system-b" }]);
 });
 
 test("the arm window expiring or an outside disarm resets without running", () => {
@@ -239,6 +272,77 @@ test("buttons are disabled with a title reason for SSH off, in-flight sync, and 
   scale.fns.renderDiskInventorySyncControls();
   assert.equal(scale.buttons.full.disabled, false);
   assert.match(scale.buttons.full.title, /disk\.sync_all/);
+});
+
+test("optional write-policy hooks disable the controls and click handler with the exact reason", () => {
+  const reason = "Sign in to enable this write.";
+  const blocked = harness({ platform: "core", writePolicyAllowed: false, writePolicyBlockReason: reason });
+
+  blocked.fns.renderDiskInventorySyncControls();
+  assert.equal(blocked.buttons.full.disabled, true);
+  assert.equal(blocked.buttons.full.title, reason);
+
+  const clickBlocked = harness({ platform: "core", writePolicyAllowed: false, writePolicyBlockReason: reason });
+  clickBlocked.fns.handleDiskInventorySyncClick("full");
+  assert.deepEqual(clickBlocked.runs, []);
+  assert.equal(clickBlocked.state.diskInventorySync.armedMode, null);
+  assert.equal(clickBlocked.buttons.full.disabled, true);
+  assert.equal(clickBlocked.buttons.full.title, reason);
+  assert.deepEqual(clickBlocked.statuses.at(-1), { message: reason, tone: "error" });
+
+  const prePolicyMerge = harness({ platform: "core" });
+  prePolicyMerge.fns.renderDiskInventorySyncControls();
+  assert.equal(prePolicyMerge.buttons.full.disabled, false);
+});
+
+function diskInventorySyncRunHarness(selectedSystemId = "system-a") {
+  const requests = [];
+  const state = {
+    selectedSystemId,
+    snapshot: { selected_system_id: selectedSystemId },
+    diskInventorySync: { armedMode: null, armedSystemId: null, armTimerId: null, inFlight: false },
+  };
+  const fns = loadNamedFunctions(
+    ["diskInventorySyncModeSpec", "formatDiskInventorySyncResult", "runDiskInventorySync"],
+    {
+      state,
+      renderDiskInventorySyncControls() {},
+      setStatus() {},
+      refreshSnapshot() { throw new Error("a failed job must not refresh"); },
+      encodeURIComponent,
+      Date,
+      fetchJson: async (url, options) => {
+        requests.push({ url, options });
+        state.selectedSystemId = "system-c";
+        return { state: "FAILED", message: "Synthetic failure.", elapsed_seconds: 0 };
+      },
+      window: {
+        setInterval() { return 1; },
+        clearInterval() {},
+      },
+    },
+  );
+  return { fns, requests };
+}
+
+test("run keeps the confirmed system target immutable", async () => {
+  const { fns, requests } = diskInventorySyncRunHarness("system-b");
+
+  await fns.runDiskInventorySync("full", "system-a");
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "/api/systems/system-a/disk-inventory-sync");
+});
+
+test("run passes the in-page Basic-auth option to fetchJson", async () => {
+  const { fns, requests } = diskInventorySyncRunHarness();
+
+  await fns.runDiskInventorySync("full", "system-a");
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].options.method, "POST");
+  assert.equal(requests[0].options.readUiAuth, true);
+  assert.deepEqual(JSON.parse(requests[0].options.body), { mode: "full", confirm: true });
 });
 
 test("template places the action group in the enclosure header beside the view toggles", () => {

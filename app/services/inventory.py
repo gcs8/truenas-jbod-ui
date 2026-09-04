@@ -184,6 +184,7 @@ DISK_INVENTORY_SYNC_MIDCLT_BY_PLATFORM: dict[str, str] = {
     "core": "/usr/local/bin/midclt",
     "scale": "/usr/bin/midclt",
 }
+DISK_INVENTORY_SYNC_JOB_STATES = frozenset({"WAITING", "RUNNING", "SUCCESS", "FAILED", "ABORTED"})
 DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES = frozenset({"SUCCESS", "FAILED", "ABORTED"})
 DISK_INVENTORY_SYNC_ERROR_MAX_CHARS = 400
 
@@ -240,7 +241,10 @@ def _parse_disk_inventory_sync_job(stdout: str, job_id: int) -> tuple[str, str |
     )
     if entry is None:
         raise TrueNASAPIError(f"TrueNAS no longer lists disk sync job {job_id}.")
-    state = str(entry.get("state") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    raw_state = entry.get("state")
+    state = raw_state.strip().upper() if isinstance(raw_state, str) else "UNKNOWN"
+    if state not in DISK_INVENTORY_SYNC_JOB_STATES:
+        state = "UNKNOWN"
     return state, _bounded_middleware_text(entry.get("error"))
 
 

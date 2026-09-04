@@ -436,7 +436,7 @@ class DiskInventorySyncMode(str, Enum):
 
 class DiskInventorySyncRequest(BaseModel):
     mode: DiskInventorySyncMode
-    confirm: bool = False
+    confirm: bool = Field(default=False, strict=True)
 
 
 class DiskInventorySyncResult(BaseModel):

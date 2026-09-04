@@ -21,6 +21,7 @@ from app.services.inventory import (
     DiskInventorySyncBusy,
     DiskInventorySyncUnavailable,
     InventoryService,
+    _parse_disk_inventory_sync_job,
 )
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import ProfileRegistry
@@ -243,6 +244,25 @@ class DiskInventorySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.message, "TrueNAS reported disk sync job 7 failed.")
         self.assertNotEqual(service._cache, {})
 
+    async def test_job_parser_replaces_unrecognized_state_text_with_unknown(self) -> None:
+        injected_state = "INJECT-" + ("x" * 593)
+        self.assertEqual(len(injected_state), 600)
+
+        state, error = _parse_disk_inventory_sync_job(job_payload(7, injected_state), 7)
+
+        self.assertEqual(state, "UNKNOWN")
+        self.assertNotIn("INJECT", state)
+        self.assertIsNone(error)
+
+    async def test_job_parser_accepts_only_the_documented_state_vocabulary(self) -> None:
+        for documented_state in ("WAITING", "RUNNING", "SUCCESS", "FAILED", "ABORTED"):
+            with self.subTest(state=documented_state):
+                state, _error = _parse_disk_inventory_sync_job(
+                    job_payload(7, documented_state.lower()),
+                    7,
+                )
+                self.assertEqual(state, documented_state)
+
     async def test_full_mode_refuses_when_no_job_id_comes_back(self) -> None:
         service = self.build_service(platform="core")
         service._run_ssh_command = RecordingSSHRunner([ok("null")])
@@ -388,6 +408,20 @@ class DiskInventorySyncRouteTests(unittest.TestCase):
     def test_request_model_rejects_unknown_modes(self) -> None:
         with self.assertRaises(ValueError):
             DiskInventorySyncRequest.model_validate({"mode": "everything", "confirm": True})
+
+    def test_request_model_requires_a_literal_boolean_confirmation(self) -> None:
+        for coercive_value in ("yes", "true", 1):
+            with self.subTest(confirm=coercive_value), self.assertRaises(ValueError):
+                DiskInventorySyncRequest.model_validate({"mode": "full", "confirm": coercive_value})
+
+        self.assertIs(
+            DiskInventorySyncRequest.model_validate({"mode": "full", "confirm": True}).confirm,
+            True,
+        )
+        self.assertIs(
+            DiskInventorySyncRequest.model_validate({"mode": "full", "confirm": False}).confirm,
+            False,
+        )
 
 
 if __name__ == "__main__":
