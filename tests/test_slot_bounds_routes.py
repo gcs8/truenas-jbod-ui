@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, call, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -410,6 +410,58 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         self.assertEqual(payload["layout_bounds"], "unavailable")
         self.assertEqual(payload["histories"], {"5": {"metrics": {}}})
 
+    def test_history_scope_rejects_absolute_request_count_before_degraded_fallback(self) -> None:
+        route = _route("/api/history/scope", "GET")
+        history_backend = Mock()
+        history_backend.configured = True
+        history_backend.get_scope_history = AsyncMock(return_value={})
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_main, "get_history_backend", return_value=history_backend),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(
+                    route.endpoint(
+                        system_id="system-a",
+                        enclosure_id="enc-a",
+                        slots=[5] * (SMART_BATCH_MAX_SLOTS + 1),
+                        window_hours=24,
+                        metrics=None,
+                        event_limit=12,
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.registry.get_service.assert_not_called()
+        history_backend.get_scope_history.assert_not_awaited()
+
+    def test_history_scope_rejects_oversized_slot_value_before_degraded_fallback(self) -> None:
+        route = _route("/api/history/scope", "GET")
+        history_backend = Mock()
+        history_backend.configured = True
+        history_backend.get_scope_history = AsyncMock(return_value={})
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_main, "get_history_backend", return_value=history_backend),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(
+                    route.endpoint(
+                        system_id="system-a",
+                        enclosure_id="enc-a",
+                        slots=[SMART_BATCH_MAX_SLOTS + 1],
+                        window_hours=24,
+                        metrics=None,
+                        event_limit=12,
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.registry.get_service.assert_not_called()
+        history_backend.get_scope_history.assert_not_awaited()
+
     def test_cached_smart_read_continues_when_layout_is_unavailable(self) -> None:
         route = _route("/api/slots/{slot}/smart", "GET")
         self.service.get_cached_slot_smart_summary_without_layout = Mock(
@@ -494,7 +546,7 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
 
     def test_cached_smart_batch_continues_when_layout_is_unavailable(self) -> None:
         route = _route("/api/slots/smart-batch", "POST")
-        self.service.get_cached_slot_smart_summary_without_layout = Mock(return_value=None)
+        self.service.get_cached_slot_smart_summaries_without_layout = Mock(return_value={})
         self.service.get_slot_smart_summaries = AsyncMock(return_value=[])
         payload = Mock(slots=[5, 6], max_concurrency=2)
 
@@ -514,12 +566,9 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         self.assertEqual(response.layout_bounds, "unavailable")
         self.assertEqual([item.slot for item in response.summaries], [5, 6])
         self.assertTrue(all(not item.summary.available for item in response.summaries))
-        self.assertEqual(
-            self.service.get_cached_slot_smart_summary_without_layout.call_args_list,
-            [
-                call(5, selected_enclosure_id="enc-a", loaded_entries=None),
-                call(6, selected_enclosure_id="enc-a", loaded_entries=None),
-            ],
+        self.service.get_cached_slot_smart_summaries_without_layout.assert_called_once_with(
+            [5, 6],
+            selected_enclosure_id="enc-a",
         )
         self.service.get_slot_smart_summaries.assert_not_awaited()
 
@@ -543,6 +592,9 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         registry = Mock()
         registry.get_service.return_value = service
         payload = Mock(slots=[5, 6], max_concurrency=2)
+        service._evict_expired_smart_cache_entries = Mock(
+            wraps=service._evict_expired_smart_cache_entries
+        )
 
         with (
             patch.object(app_main, "get_inventory_registry", return_value=registry),
@@ -563,6 +615,7 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         )
         self.assertEqual(response.layout_bounds, "unavailable")
         self.assertEqual(snapshot_lookup.await_count, 1)
+        service._evict_expired_smart_cache_entries.assert_called_once_with()
 
     def test_layout_unavailable_smart_batch_loads_persisted_entries_once(self) -> None:
         route = _route("/api/slots/smart-batch", "POST")

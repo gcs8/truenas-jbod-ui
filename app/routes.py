@@ -612,20 +612,15 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             if layout_bounds == "unavailable":
                 summaries = []
                 seen_slots: set[int] = set()
-                loaded_entries = (
-                    service.slot_detail_store.load_all()
-                    if payload.slots and service.slot_detail_store is not None
-                    else None
+                cached_summaries = service.get_cached_slot_smart_summaries_without_layout(
+                    payload.slots,
+                    selected_enclosure_id=enclosure_id,
                 )
                 for slot in payload.slots:
                     if slot in seen_slots:
                         continue
                     seen_slots.add(slot)
-                    summary = service.get_cached_slot_smart_summary_without_layout(
-                        slot,
-                        selected_enclosure_id=enclosure_id,
-                        loaded_entries=loaded_entries,
-                    ) or SmartSummaryView(
+                    summary = cached_summaries.get(slot) or SmartSummaryView(
                         available=False,
                         message=(
                             "Cached SMART data is unavailable while the inventory "
@@ -685,15 +680,27 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         metrics: list[str] | None = Query(default=None),
         event_limit: int = Query(default=12, ge=0, le=1000),
     ) -> JSONResponse:
+        requested_slots = [int(slot) for slot in (slots or [])]
+        if len(requested_slots) > SMART_BATCH_MAX_SLOTS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"At most {SMART_BATCH_MAX_SLOTS} history slots may be requested.",
+            )
+        for slot in requested_slots:
+            if slot < 0:
+                check_slot_bounds(slot, ())
+            if slot > SMART_BATCH_MAX_SLOTS:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"History slot values must not exceed {SMART_BATCH_MAX_SLOTS}.",
+                )
+        normalized_slots = sorted(set(requested_slots))
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        normalized_slots = sorted({int(slot) for slot in (slots or [])})
         layout_bounds = "verified"
         if normalized_slots:
             layout_slots, layout_bounds = await resolve_read_layout_slots(service, enclosure_id)
             for slot in normalized_slots:
-                if slot < 0:
-                    check_slot_bounds(slot, ())
                 if layout_slots is not None:
                     check_slot_bounds(slot, layout_slots)
         add_perf_metadata(

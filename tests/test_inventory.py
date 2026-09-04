@@ -5677,6 +5677,47 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIs(returned, expected)
 
+    async def test_degraded_smart_scope_resolution_is_independent_of_requested_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="cache-host", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+            default_key = (system.id, "core", "enc-default-24", 5, ("da0",))
+            wide_key = (system.id, "core", "enc-wide-84", 83, ("da83",))
+            service._smart_cache[default_key] = SmartSummaryView(
+                available=True,
+                temperature_c=31,
+            )
+            service._smart_cache[wide_key] = SmartSummaryView(
+                available=True,
+                temperature_c=42,
+            )
+            service._smart_cache_until[default_key] = expiry
+            service._smart_cache_until[wide_key] = expiry
+
+            returned = service.get_cached_slot_smart_summary_without_layout(83)
+
+            self.assertIsNone(returned)
+
+    async def test_degraded_smart_cache_never_uses_synthetic_default_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="cache-host", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            cache_key = (system.id, "core", "__default__", 5, ("da0",))
+            service._smart_cache[cache_key] = SmartSummaryView(
+                available=True,
+                temperature_c=99,
+            )
+            service._smart_cache_until[cache_key] = datetime.now(timezone.utc) + timedelta(
+                minutes=5
+            )
+
+            returned = service.get_cached_slot_smart_summary_without_layout(5)
+
+            self.assertIsNone(returned)
+
     async def test_degraded_smart_cache_rejects_ambiguous_omitted_enclosure_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()

@@ -34,6 +34,7 @@ from app.logging_config import configure_logging
 from app.request_context import request_id_headers
 from app.models.domain import (
     DiskInventorySyncRequest,
+    SMART_BATCH_MAX_SLOTS,
     InventorySnapshot,
     LedAction,
     LedRequest,
