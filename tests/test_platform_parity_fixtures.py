@@ -390,6 +390,10 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
                     [{"ses_device": "/dev/sg9", "ses_element_id": 2, "ses_slot_number": 3}],
                 )
                 self.assertEqual(parsed.ses_slot_to_device, expected_devices)
+                self.assertEqual(
+                    [w for w in parsed.ses_selected_meta["warnings"] if "Kernel enclosure bindings" in w],
+                    [],
+                )
 
         with self.subTest(case="ec-only+sysfs"):
             parsed = parse_ssh_outputs(
@@ -412,6 +416,14 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(candidates[0]["present"])
             self.assertFalse(candidates[2]["present"])
             self.assertEqual(candidates[2]["presence_source"], "sg_ses_ec")
+            # Dropping the bindings is reported once per sg device, not per bay.
+            self.assertEqual(
+                [w for w in parsed.ses_selected_meta["warnings"] if "Kernel enclosure bindings" in w],
+                [
+                    "Kernel enclosure bindings for /dev/sg9 could not be placed: "
+                    "SES reported no device slot numbers for 3 bound devices."
+                ],
+            )
 
     def test_scale_md1280_join_captures_parse_all_reported_bays(self) -> None:
         for dev in ("sg1", "sg76"):

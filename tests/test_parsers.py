@@ -1539,12 +1539,13 @@ ses0:
                     presence_source="sg_ses_aes",
                 ),
                 3: SESMapSlot(slot_number=3, element_id=2, slot_number_source="ses_description"),
+                4: SESMapSlot(slot_number=4, element_id=3, slot_number_source="ses_device_slot_number"),
             },
         )
 
         _apply_enclosure_sysfs_device_names(
             [enclosure],
-            {"sg4": {1: ["sda"], 2: ["sdb"], 3: ["sdc"]}},
+            {"sg4": {1: ["sda"], 2: ["sdb"], 3: ["sdc"], 4: ["sdd"]}},
         )
 
         self.assertEqual(enclosure.slots[1].device_names, [])
@@ -1552,9 +1553,14 @@ ses0:
         self.assertEqual(enclosure.slots[2].device_names, [])
         self.assertIs(enclosure.slots[2].present, False)
         self.assertEqual(enclosure.slots[2].presence_source, "sg_ses_aes")
-        # Description-derived slot numbers (join/sesutil `SlotNN`) are bay numbers.
-        self.assertEqual(enclosure.slots[3].device_names, ["sdc"])
-        self.assertEqual(enclosure.slots[3].device_names_source, "enclosure_sysfs")
+        # `SlotNN` descriptor text has no checked-in evidence of equalling the
+        # device slot number, so it is not a joinable coordinate either.
+        self.assertEqual(enclosure.slots[3].device_names, [])
+        self.assertEqual(enclosure.slots[4].device_names, ["sdd"])
+        self.assertEqual(enclosure.slots[4].device_names_source, "enclosure_sysfs")
+        # Every dropped binding is counted once on the enclosure for the
+        # operator-facing warning; the placed one is not.
+        self.assertEqual(enclosure.unplaced_sysfs_bindings, 3)
 
     def test_candidate_map_keeps_stronger_empty_presence_in_any_merge_order(self) -> None:
         strong = {
