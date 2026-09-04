@@ -38,13 +38,15 @@ REQUIRED_GATES = (
     "Post-release reopen",
 )
 
+DOCS_PUBLICATION_GATE = "Docs/wiki/public-demo publication"
 POST_PUBLISH_GATES = {
-    "docs/wiki/public-demo gate",
+    DOCS_PUBLICATION_GATE.lower(),
     "ghcr publish verification",
     "deployment refresh/sniff tests",
     "post-release reopen",
 }
 
+OWNER_PUBLICATION_TARGETS = {"external wiki", "public demo"}
 VALID_RESULTS = {"pass", "blocked", "n/a"}
 WIKI_DRIFT_REQUIRED_FROM = (0, 22, 3)
 VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?")
@@ -97,6 +99,28 @@ def parse_checklist_evidence_table(text: str) -> dict[str, list[str]]:
     return rows
 
 
+def _has_pending_owner_publication_evidence(evidence: str) -> bool:
+    match = re.fullmatch(r"Pending owner publication:\s*(.+)", evidence, flags=re.IGNORECASE)
+    if match is None:
+        return False
+    targets = {
+        target.strip().lower()
+        for target in re.split(r"\s*(?:,|;|\band\b)\s*", match.group(1), flags=re.IGNORECASE)
+        if target.strip()
+    }
+    return bool(targets) and targets <= OWNER_PUBLICATION_TARGETS
+
+
+def _docs_publication_is_deferred(rows: dict[str, list[str]], phase: str) -> bool:
+    row = rows.get(DOCS_PUBLICATION_GATE.lower())
+    return bool(
+        row
+        and phase == "pre-tag"
+        and row[3].lower() == "blocked"
+        and _has_pending_owner_publication_evidence(row[2])
+    )
+
+
 def validate_release_wrap_text(
     text: str,
     *,
@@ -118,7 +142,11 @@ def validate_release_wrap_text(
         issues.append(ValidationIssue("release wrap is missing the checklist evidence table"))
         return issues
 
-    for gate in REQUIRED_GATES:
+    required_gates = REQUIRED_GATES
+    if require_wiki_verification:
+        required_gates += (DOCS_PUBLICATION_GATE,)
+
+    for gate in required_gates:
         row = rows.get(gate.lower())
         if row is None:
             issues.append(ValidationIssue(f"missing checklist evidence row: {gate}"))
@@ -141,36 +169,43 @@ def validate_release_wrap_text(
                 issues.append(ValidationIssue(f"{gate}: Blocked gates cannot ship"))
         if normalized_result == "blocked" and not evidence:
             issues.append(ValidationIssue(f"{gate}: Blocked requires evidence"))
+        if (
+            gate == DOCS_PUBLICATION_GATE
+            and normalized_phase == "pre-tag"
+            and normalized_result == "blocked"
+            and not _has_pending_owner_publication_evidence(evidence)
+        ):
+            issues.append(
+                ValidationIssue(
+                    f"{DOCS_PUBLICATION_GATE}: Blocked evidence must identify pending owner publication"
+                )
+            )
         if normalized_result == "n/a" and reason.lower() in {"", "-", "n/a", "none", "reason"}:
             issues.append(ValidationIssue(f"{gate}: N/A requires a concrete reason"))
 
-    wiki_row = rows.get("docs/wiki/public-demo gate")
-    wiki_is_deferred = bool(
-        wiki_row
-        and normalized_phase == "pre-tag"
-        and wiki_row[3].lower() == "blocked"
-    )
+    wiki_row = rows.get(DOCS_PUBLICATION_GATE.lower())
+    wiki_is_deferred = _docs_publication_is_deferred(rows, normalized_phase)
     if require_wiki_verification and not wiki_is_deferred:
         if wiki_row is not None and wiki_row[3].lower() != "pass":
             issues.append(
                 ValidationIssue(
-                    "Docs/wiki/public-demo gate: Result must be Pass after wiki publication"
+                    f"{DOCS_PUBLICATION_GATE}: Result must be Pass after publication"
                 )
             )
         if wiki_verification is None:
             issues.append(
-                ValidationIssue("Docs/wiki/public-demo gate: wiki drift verification was not run")
+                ValidationIssue(f"{DOCS_PUBLICATION_GATE}: wiki drift verification was not run")
             )
         elif not wiki_verification.matches:
             issues.append(
                 ValidationIssue(
-                    "Docs/wiki/public-demo gate: external wiki differs from repository wiki/"
+                    f"{DOCS_PUBLICATION_GATE}: external wiki differs from repository wiki/"
                 )
             )
         elif wiki_row is not None and wiki_verification.release_evidence() not in wiki_row[2]:
             issues.append(
                 ValidationIssue(
-                    "Docs/wiki/public-demo gate: evidence does not contain the exact wiki "
+                    f"{DOCS_PUBLICATION_GATE}: evidence does not contain the exact wiki "
                     "verification receipt"
                 )
             )
@@ -242,12 +277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     rows = {}
     if path.exists():
         rows = parse_checklist_evidence_table(path.read_text(encoding="utf-8"))
-    wiki_row = rows.get("docs/wiki/public-demo gate")
-    wiki_is_deferred = bool(
-        wiki_row
-        and args.phase == "pre-tag"
-        and wiki_row[3].lower() == "blocked"
-    )
+    wiki_is_deferred = _docs_publication_is_deferred(rows, args.phase)
     if require_wiki_verification and not wiki_is_deferred:
         required_arguments = {
             "--repository-commit": args.repository_commit,
@@ -273,7 +303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repository_authority_label=repository_authority_label,
             )
         except (OSError, UnicodeError, WikiVerificationError) as exc:
-            print(f"- Docs/wiki/public-demo gate: wiki verification failed: {exc}")
+            print(f"- {DOCS_PUBLICATION_GATE}: wiki verification failed: {exc}")
             return 1
     issues = validate_release_wrap_path(
         path,

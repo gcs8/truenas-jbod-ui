@@ -17,9 +17,10 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   time" is not a valid reason; stop the release instead.
 - Do not push the release tag until the pre-tag release wrap proves every
   pre-publish gate is `Pass` or justified `N/A`. Only inherently post-publish
-  gates may remain `Blocked` at this point: owner-approved wiki/public-demo
-  publication, GHCR publish verification, deployment refresh/sniff tests, and
-  post-release reopen.
+  rows may remain `Blocked` at this point: `Docs/wiki/public-demo publication`,
+  GHCR publish verification, deployment refresh/sniff tests, and post-release
+  reopen. The separate `Docs/wiki/public-demo gate` covers the source review,
+  diff, privacy, and checked-in artifact checks and must pass before tagging.
 - Do not call the release complete until the final release wrap proves every
   required gate is `Pass` or justified `N/A`, including GHCR, deployment sniff
   tests, and the next development reopen.
@@ -48,7 +49,8 @@ using this shape:
 | Linux QA restore gate | yes | target, counts, health, smoke evidence | Pass/Blocked/N/A | reason |
 | Restored Linux QA perf harnesses | yes | artifact path and summary | Pass/Blocked/N/A | reason |
 | Snapshot/export/offline artifact gate | yes | command and browser smoke | Pass/Blocked/N/A | reason |
-| Docs/wiki/public-demo gate | yes | changed files, exact wiki verification receipt, URLs, workflow runs | Pass/Blocked/N/A | reason |
+| Docs/wiki/public-demo gate | yes | changed files, reviewed source diff, privacy checks, checked-in artifact commands and results | Pass/Blocked/N/A | reason |
+| Docs/wiki/public-demo publication | yes | exact wiki verification receipt, public-demo workflow run and Pages URL when applicable | Pass/Blocked/N/A | reason |
 | GHCR publish verification | yes | workflow URL, full `name@sha256` image reference, and exact source revision | Pass/Blocked/N/A | reason |
 | Deployment refresh/sniff tests | yes | validated private deployment receipt, exact Compose project/file/profile/service contract, pre-update rollback digest, running container image IDs, health/restart evidence, and rollback result | Pass/Blocked/N/A | reason |
 | Post-release reopen | yes | branch, commit, version | Pass/Blocked/N/A | reason |
@@ -98,10 +100,12 @@ python scripts/validate_release_wrap.py "$version" \
    feature release, patch, hotfix, docs-only correction, or process correction.
 3. Draft or update the release notes and release wrap before tagging.
 4. Run local unit, syntax, hygiene, Docker health, optional-sidecar, browser,
-   feature-specific, public-demo, and perf gates.
+   feature-specific, public-demo, perf, docs/wiki source-diff, and privacy gates.
 5. Run the Linux QA Docker restore gate and restored-stack perf/browser gates.
 6. Fill in the release wrap checklist evidence table and pass the pre-tag
-   validator.
+   validator. The `Docs/wiki/public-demo gate` must be `Pass`; only its distinct
+   publication row may remain `Blocked` with canonical owner-publication
+   evidence.
 7. Only after the pre-tag table is complete, merge/cut the release commit, tag
    it, push it, publish the GitHub release, and verify GHCR digest convergence.
 8. Refresh and sniff-test local, Linux, and production deployments after GHCR
@@ -431,17 +435,24 @@ python scripts/validate_release_wrap.py "$version" \
   Compared files: <count>
   ```
 
-  Copy the four values into the `Docs/wiki/public-demo gate` evidence cell on
-  one line, separated by semicolons. A missing, extra, or changed page or image
-  keeps that row `Blocked`. The verifier does not publish anything.
+  Copy the four values into the `Docs/wiki/public-demo publication` evidence
+  cell on one line, separated by semicolons. A missing, extra, or changed page
+  or image keeps that row `Blocked`. The verifier does not publish anything.
 - for every release after v0.22.2, run the complete final release-wrap
   validator command under `Required Release Wrap Evidence`. It resolves the
   repository commit from the immutable version tag; the validator rejects a
   supplied commit that does not match that tag
 
-  During the pre-tag phase, the row may remain `Blocked` while it waits for the
-  owner-approved publication. A `Pass` row always requires the live comparison
-  and exact receipt.
+  During the pre-tag phase, the `Docs/wiki/public-demo gate` must record `Pass`
+  evidence for every applicable source review, source diff, privacy scan, and
+  checked-in artifact check. Publication is recorded separately. The
+  `Docs/wiki/public-demo publication` row may remain `Blocked` only with the
+  machine-readable evidence form
+  `Pending owner publication: external wiki`,
+  `Pending owner publication: public demo`, or
+  `Pending owner publication: external wiki, public demo`. A blocker for GHCR,
+  deployment, reopen work, or any other gate does not satisfy this row. A
+  publication `Pass` always requires the live comparison and exact receipt.
 - add the completed checklist evidence table to the release wrap before the
   tag is cut
 - if the release changes public-demo behavior or data, regenerate and verify
@@ -454,6 +465,9 @@ python scripts/validate_release_wrap.py "$version" \
   - `.\.venv\Scripts\python.exe scripts\check_public_demo_artifact.py public-demo`
   - `set PUBLIC_DEMO_ARTIFACT=public-demo/index.html`
   - `npx playwright test qa/public-demo.spec.js`
+  - record the changed files, artifact publishability/privacy result, and
+    browser result in `Docs/wiki/public-demo gate` before tagging; record the
+    Pages workflow run and URL later in `Docs/wiki/public-demo publication`
 
 ## Config And Examples
 
@@ -487,7 +501,7 @@ python scripts/validate_release_wrap.py "$version" \
   automatically
 - read back the public wiki HEAD with `scripts/verify_wiki_drift.py`; require a
   byte-for-byte pass and put its exact repository commit, external wiki commit,
-  and file count in the release wrap
+  and file count in the `Docs/wiki/public-demo publication` row
 - create the GitHub release notes from the final changelog section
 - publish the GitHub release page so the `Publish GHCR Image` workflow runs
 - wait for the `Publish GHCR Image` Actions run to finish successfully

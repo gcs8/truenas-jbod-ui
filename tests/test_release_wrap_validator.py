@@ -19,6 +19,11 @@ def _wrap_with_rows(rows: dict[str, tuple[str, str, str, str]]) -> str:
     for gate in REQUIRED_GATES:
         required, evidence, result, reason = rows.get(gate, ("yes", "evidence", "Pass", ""))
         lines.append(f"| {gate} | {required} | {evidence} | {result} | {reason} |")
+    for gate in rows:
+        if gate in REQUIRED_GATES:
+            continue
+        required, evidence, result, reason = rows[gate]
+        lines.append(f"| {gate} | {required} | {evidence} | {result} | {reason} |")
     return "\n".join(lines)
 
 
@@ -37,6 +42,14 @@ def _wiki_result(*, changed: bool = False) -> WikiVerificationResult:
 
 
 class ReleaseWrapValidatorTests(unittest.TestCase):
+    def test_release_checklist_separates_source_and_publication_gates(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        text = (repository / "docs" / "RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
+
+        self.assertIn("| Docs/wiki/public-demo gate |", text)
+        self.assertIn("| Docs/wiki/public-demo publication |", text)
+        self.assertIn("Pending owner publication: external wiki, public demo", text)
+
     def test_v0222_final_release_wrap_is_complete(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         text = (repository / "docs" / "RELEASE_WRAP_0.22.2.md").read_text(encoding="utf-8")
@@ -80,37 +93,67 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
 
         self.assertEqual(issues, [])
 
-    def test_wiki_gate_pass_requires_a_verification_run(self) -> None:
+    def test_wiki_verification_requires_a_distinct_publication_row(self) -> None:
         issues = validate_release_wrap_text(
             _wrap_with_rows({}),
+            phase="pre-tag",
             require_wiki_verification=True,
         )
 
         self.assertIn(
-            "Docs/wiki/public-demo gate: wiki drift verification was not run",
+            "missing checklist evidence row: Docs/wiki/public-demo publication",
             [issue.message for issue in issues],
         )
 
-    def test_wiki_gate_pass_rejects_a_drift_result(self) -> None:
+    def test_wiki_publication_gate_pass_requires_a_verification_run(self) -> None:
+        issues = validate_release_wrap_text(
+            _wrap_with_rows(
+                {
+                    "Docs/wiki/public-demo publication": (
+                        "yes",
+                        "publication evidence",
+                        "Pass",
+                        "",
+                    ),
+                }
+            ),
+            require_wiki_verification=True,
+        )
+
+        self.assertIn(
+            "Docs/wiki/public-demo publication: wiki drift verification was not run",
+            [issue.message for issue in issues],
+        )
+
+    def test_wiki_publication_gate_pass_rejects_a_drift_result(self) -> None:
         result = _wiki_result(changed=True)
         issues = validate_release_wrap_text(
-            _wrap_with_rows({}),
+            _wrap_with_rows(
+                {
+                    "Docs/wiki/public-demo publication": (
+                        "yes",
+                        "publication evidence",
+                        "Pass",
+                        "",
+                    ),
+                }
+            ),
             require_wiki_verification=True,
             wiki_verification=result,
         )
 
         self.assertIn(
-            "Docs/wiki/public-demo gate: external wiki differs from repository wiki/",
+            "Docs/wiki/public-demo publication: external wiki differs from repository wiki/",
             [issue.message for issue in issues],
         )
         with self.assertRaisesRegex(ValueError, "cannot create PASS evidence from wiki drift"):
             result.release_evidence()
 
-    def test_wiki_gate_requires_pass_after_publication(self) -> None:
+    def test_wiki_publication_gate_requires_pass_after_publication(self) -> None:
         result = _wiki_result()
         text = _wrap_with_rows(
             {
-                "Docs/wiki/public-demo gate": (
+                "Docs/wiki/public-demo publication": (
                     "yes",
                     result.release_evidence(),
                     "N/A",
@@ -126,26 +169,35 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "Docs/wiki/public-demo gate: Result must be Pass after wiki publication",
+            "Docs/wiki/public-demo publication: Result must be Pass after publication",
             [issue.message for issue in issues],
         )
 
-    def test_wiki_gate_requires_exact_commit_evidence(self) -> None:
+    def test_wiki_publication_gate_requires_exact_commit_evidence(self) -> None:
         result = _wiki_result()
         issues = validate_release_wrap_text(
-            _wrap_with_rows({}),
+            _wrap_with_rows(
+                {
+                    "Docs/wiki/public-demo publication": (
+                        "yes",
+                        "publication evidence",
+                        "Pass",
+                        "",
+                    ),
+                }
+            ),
             require_wiki_verification=True,
             wiki_verification=result,
         )
 
         self.assertIn(
-            "Docs/wiki/public-demo gate: evidence does not contain the exact wiki verification receipt",
+            "Docs/wiki/public-demo publication: evidence does not contain the exact wiki verification receipt",
             [issue.message for issue in issues],
         )
 
         text = _wrap_with_rows(
             {
-                "Docs/wiki/public-demo gate": (
+                "Docs/wiki/public-demo publication": (
                     "yes",
                     result.release_evidence(),
                     "Pass",
@@ -162,12 +214,47 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
             [],
         )
 
-    def test_pre_tag_allows_wiki_publication_to_remain_blocked(self) -> None:
+    def test_pre_tag_requires_docs_source_checks_before_publication(self) -> None:
         text = _wrap_with_rows(
             {
                 "Docs/wiki/public-demo gate": (
                     "yes",
                     "awaiting owner-approved wiki publication",
+                    "Blocked",
+                    "",
+                ),
+                "Docs/wiki/public-demo publication": (
+                    "yes",
+                    "Pending owner publication: external wiki",
+                    "Blocked",
+                    "",
+                ),
+            }
+        )
+
+        issues = validate_release_wrap_text(
+            text,
+            phase="pre-tag",
+            require_wiki_verification=True,
+        )
+
+        self.assertIn(
+            "Docs/wiki/public-demo gate: Blocked gates cannot ship",
+            [issue.message for issue in issues],
+        )
+
+    def test_pre_tag_allows_only_docs_publication_to_remain_blocked(self) -> None:
+        text = _wrap_with_rows(
+            {
+                "Docs/wiki/public-demo gate": (
+                    "yes",
+                    "source, diff, privacy, and checked-in artifact checks passed",
+                    "Pass",
+                    "",
+                ),
+                "Docs/wiki/public-demo publication": (
+                    "yes",
+                    "Pending owner publication: external wiki; public demo",
                     "Blocked",
                     "",
                 ),
@@ -181,6 +268,29 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
                 require_wiki_verification=True,
             ),
             [],
+        )
+
+    def test_pre_tag_rejects_unrelated_publication_blocker_evidence(self) -> None:
+        text = _wrap_with_rows(
+            {
+                "Docs/wiki/public-demo publication": (
+                    "yes",
+                    "awaiting GHCR image",
+                    "Blocked",
+                    "",
+                ),
+            }
+        )
+
+        issues = validate_release_wrap_text(
+            text,
+            phase="pre-tag",
+            require_wiki_verification=True,
+        )
+
+        self.assertIn(
+            "Docs/wiki/public-demo publication: Blocked evidence must identify pending owner publication",
+            [issue.message for issue in issues],
         )
 
     def test_requires_all_global_checklist_rows(self) -> None:

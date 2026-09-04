@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.validate_release_wrap import REQUIRED_GATES
+from scripts.validate_release_wrap import DOCS_PUBLICATION_GATE, REQUIRED_GATES
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -105,8 +105,8 @@ class WikiDriftVerifierTests(unittest.TestCase):
             "| --- | --- | --- | --- | --- |",
         ]
         for gate in REQUIRED_GATES:
-            gate_evidence = evidence if gate == "Docs/wiki/public-demo gate" else "evidence"
-            lines.append(f"| {gate} | yes | {gate_evidence} | Pass |  |")
+            lines.append(f"| {gate} | yes | evidence | Pass |  |")
+        lines.append(f"| {DOCS_PUBLICATION_GATE} | yes | {evidence} | Pass |  |")
         self._write(
             self.repository / "docs" / "RELEASE_WRAP_0.22.3.md",
             "\n".join(lines).encode(),
