@@ -1,0 +1,57 @@
+  SYNTH     OFFSET1BASED      0100
+  Primary enclosure logical identifier (hex): 5eeeeeee00001b45
+[0,-1]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+Slot01 [0,0]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    App client bypass B=0, Fault sensed=0, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 0, device slot number: 1
+    phy index: 0
+      SAS device type: end device
+      target port for: SSP
+      attached SAS address: 0x5eeeeeee00001b40
+      SAS address: 0x5aaaaaaa00001b01
+      phy identifier: 0x0
+Slot02 [0,1]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    App client bypass B=0, Fault sensed=0, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 0, device slot number: 2
+    phy index: 0
+      SAS device type: end device
+      target port for: SSP
+      attached SAS address: 0x5eeeeeee00001b40
+      SAS address: 0x5aaaaaaa00001b02
+      phy identifier: 0x0
+Slot03 [0,2]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+    App client bypass B=0, Fault sensed=0, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 0, device slot number: 3
+    phy index: 0
+      SAS device type: no SAS device attached
+      target port for: SSP
+      attached SAS address: 0x5eeeeeee00001b40
+      SAS address: 0x0
+      phy identifier: 0x0
+Slot04 [0,3]  Element type: Array device slot
+  Enclosure Status:
+    Predicted failure=0, Disabled=0, Swap=0, status: OK
+    App client bypass B=0, Fault sensed=0, Fault reqstd=0, Device off=0
+  Additional Element Status:
+    Transport protocol: SAS
+    number of phys: 1, not all phys: 0, device slot number: 4
+    phy index: 0
+      SAS device type: end device
+      target port for: SSP
+      attached SAS address: 0x5eeeeeee00001b40
+      SAS address: 0x5aaaaaaa00001b04
+      phy identifier: 0x0

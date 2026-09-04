@@ -1906,10 +1906,28 @@ def parse_enclosure_sysfs_map(output: str) -> dict[str, dict[int, list[str]]]:
     return mapping
 
 
+# Slot-number provenance that carries a bay number the kernel enclosure
+# driver's `slot` attribute can be joined against: the AES/join `device slot
+# number` and `SlotNN` descriptor text. EC `Element N descriptor` indexes and
+# the invalid-AES-descriptor element-index fallback are element coordinates,
+# which differ from the device slot number on shelves that number bays from 1.
+SYSFS_JOINABLE_SLOT_NUMBER_SOURCES = frozenset({"ses_device_slot_number", "ses_description"})
+
+
 def _apply_enclosure_sysfs_device_names(
     enclosures: list[SESMapEnclosure],
     sysfs_slots: dict[str, dict[int, list[str]]],
 ) -> None:
+    """
+    Attach kernel enclosure-driver device bindings to merged SES slots.
+
+    Must run after `_merge_ses_enclosures` so each bay is one record keyed by
+    its strongest slot number, and only bays whose number came from a device
+    slot number source take a hint (issue #276: keying the sysfs `slot`
+    attribute onto EC element indexes showed bay N holding bay N+k's disk and
+    turned empty bays present). EC-only enclosures therefore get no device
+    names from sysfs rather than a neighbour's.
+    """
     for enclosure in enclosures:
         sg_name = (enclosure.ses_device or "").rsplit("/", 1)[-1]
         slot_hints = sysfs_slots.get(sg_name)
@@ -1917,7 +1935,7 @@ def _apply_enclosure_sysfs_device_names(
             continue
         for slot_number, device_names in slot_hints.items():
             slot = enclosure.slots.get(slot_number)
-            if slot is None:
+            if slot is None or slot.slot_number_source not in SYSFS_JOINABLE_SLOT_NUMBER_SOURCES:
                 continue
             _apply_ses_presence_evidence(slot, True, "enclosure_sysfs")
             _apply_ses_device_name_evidence(slot, device_names, "enclosure_sysfs")
@@ -4315,14 +4333,15 @@ def parse_ssh_outputs(
         if enclosure:
             parsed.ses_enclosures.append(enclosure)
 
-    enclosure_sysfs_output = normalized_outputs.get("enclosure sysfs map")
-    if enclosure_sysfs_output and parsed.ses_enclosures:
-        enclosure_sysfs_slots = parse_enclosure_sysfs_map(enclosure_sysfs_output)
-        if enclosure_sysfs_slots:
-            _apply_enclosure_sysfs_device_names(parsed.ses_enclosures, enclosure_sysfs_slots)
-
     if parsed.ses_enclosures:
         parsed.ses_enclosures = _merge_ses_enclosures(parsed.ses_enclosures)
+        # Kernel enclosure-driver hints are keyed by device slot number, so
+        # they join the merged bays, not the per-page pre-merge records.
+        enclosure_sysfs_output = normalized_outputs.get("enclosure sysfs map")
+        if enclosure_sysfs_output:
+            enclosure_sysfs_slots = parse_enclosure_sysfs_map(enclosure_sysfs_output)
+            if enclosure_sysfs_slots:
+                _apply_enclosure_sysfs_device_names(parsed.ses_enclosures, enclosure_sysfs_slots)
         for enclosure in parsed.ses_enclosures:
             _flag_degraded_ses_sas_addresses(enclosure)
     if parsed.ses_enclosures or ses_map_output or ses_show_output:

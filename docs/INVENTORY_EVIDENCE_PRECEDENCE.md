@@ -40,6 +40,7 @@ BMC, StorCLI, appliance APIs, and vendor tools do not enter the SES merge at an 
 - EC `Element N descriptor` values are type-local individual-element coordinates. AES evidence is merged with EC by `(ses_device, element_id)`, not by the device slot number.
 - For the required first Device Slot/Array Device Slot type header, AES `eiioe=1` includes the Enclosure Status overall element. The parser subtracts that one-element offset before correlating with EC or exposing the element control coordinate. `eiioe=0` remains unchanged.
 - The AES `device slot number` remains the physical bay coordinate and the `--dev-slot-num` control target after EC metadata is merged.
+- The kernel enclosure-driver `slot` attribute is a device slot number. `enclosure_sysfs` device bindings are applied after the SES pages are merged and only to bays whose slot number came from `device slot number` or `SlotNN` descriptor text. Bays keyed by an EC element index or by the invalid-descriptor element-index fallback take no sysfs hint, so an EC-only enclosure reports no device names rather than a neighbouring bay's disk.
 - One or two AES element descriptors may describe a bounded dual-path bay and are merged under the existing evidence rules. More than two distinct elements reporting one device slot number is degraded/systemic numbering evidence. Every affected element is preserved as unmapped evidence with a warning; none is silently collapsed into a physical bay.
 
 ### SAS addresses

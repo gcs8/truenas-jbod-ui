@@ -326,6 +326,93 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
                 snapshot.warnings,
             )
 
+    def test_scale_offset_device_slot_numbers_keep_sysfs_hints_in_their_own_bay(self) -> None:
+        """
+        Issue #276: a synthetic shelf whose AES ``device slot number`` is
+        1-based while the EC ``Element N descriptor`` index is 0-based. The
+        kernel enclosure-driver ``slot`` attribute carries the device slot
+        number, so a hint may only land on a bay keyed by that number. Keying
+        it onto the EC element index showed bay N holding bay N+1's disk and
+        made the empty bay read as populated; an EC-only shelf must get no
+        device names at all rather than every neighbour's disk.
+        """
+
+        aes_command = "sudo -n /usr/bin/sg_ses -p aes /dev/sg9"
+        ec_command = "sudo -n /usr/bin/sg_ses -p ec /dev/sg9"
+        join_command = "sudo -n /usr/bin/sg_ses --join --filter /dev/sg9"
+        aes_text = fixture_text("scale_offset_1based_aes.txt")
+        ec_text = fixture_text("scale_offset_1based_ec.txt")
+        join_text = fixture_text("scale_offset_1based_join.txt")
+        sysfs_text = fixture_text("scale_offset_1based_sysfs.txt")
+        # 0-based bay -> bound block device; bay 2 (device slot 3) is empty.
+        expected_devices = {0: "sda", 1: "sdb", 3: "sdd"}
+
+        cases = {
+            "aes+ec+sysfs": {
+                aes_command: aes_text,
+                ec_command: ec_text,
+                LINUX_ENCLOSURE_SYSFS_MAP_COMMAND: sysfs_text,
+            },
+            "aes+ec+join+sysfs": {
+                aes_command: aes_text,
+                ec_command: ec_text,
+                join_command: join_text,
+                LINUX_ENCLOSURE_SYSFS_MAP_COMMAND: sysfs_text,
+            },
+        }
+        for label, outputs in cases.items():
+            with self.subTest(case=label):
+                parsed = parse_ssh_outputs(outputs, 4, None, None)
+                candidates = parsed.ses_slot_candidates
+                self.assertEqual(sorted(candidates), [0, 1, 2, 3])
+                for bay, device in expected_devices.items():
+                    candidate = candidates[bay]
+                    self.assertEqual(
+                        candidate.get("device_names"),
+                        [device],
+                        f"{label}: bay {bay} resolved {candidate.get('device_names')!r}, expected [{device!r}]",
+                    )
+                    self.assertTrue(candidate["present"], f"{label}: bay {bay} should be present")
+                    self.assertEqual(candidate["ses_element_id"], bay)
+                    self.assertEqual(candidate["ses_slot_number"], bay + 1)
+                    self.assertEqual(
+                        candidate["ses_targets"],
+                        [{"ses_device": "/dev/sg9", "ses_element_id": bay, "ses_slot_number": bay + 1}],
+                    )
+                empty = candidates[2]
+                self.assertFalse(
+                    empty["present"],
+                    f"{label}: empty bay 2 phantom-present with {empty.get('device_names')!r}",
+                )
+                self.assertFalse(empty.get("device_names"))
+                self.assertEqual(
+                    empty["ses_targets"],
+                    [{"ses_device": "/dev/sg9", "ses_element_id": 2, "ses_slot_number": 3}],
+                )
+                self.assertEqual(parsed.ses_slot_to_device, expected_devices)
+
+        with self.subTest(case="ec-only+sysfs"):
+            parsed = parse_ssh_outputs(
+                {ec_command: ec_text, LINUX_ENCLOSURE_SYSFS_MAP_COMMAND: sysfs_text},
+                4,
+                None,
+                None,
+            )
+            candidates = parsed.ses_slot_candidates
+            self.assertEqual(sorted(candidates), [0, 1, 2, 3])
+            # EC element indexes are not device slot numbers, so the kernel
+            # bindings cannot be placed; no bay may borrow a neighbour's disk.
+            for bay in range(4):
+                self.assertFalse(
+                    candidates[bay].get("device_names"),
+                    f"ec-only: bay {bay} borrowed {candidates[bay].get('device_names')!r}",
+                )
+                self.assertIsNone(candidates[bay].get("device_hint"))
+            self.assertEqual(parsed.ses_slot_to_device, {})
+            self.assertTrue(candidates[0]["present"])
+            self.assertFalse(candidates[2]["present"])
+            self.assertEqual(candidates[2]["presence_source"], "sg_ses_ec")
+
     def test_scale_md1280_join_captures_parse_all_reported_bays(self) -> None:
         for dev in ("sg1", "sg76"):
             with self.subTest(dev=dev):

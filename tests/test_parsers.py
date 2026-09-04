@@ -1505,6 +1505,7 @@ ses0:
             slots={
                 3: SESMapSlot(
                     slot_number=3,
+                    slot_number_source="ses_device_slot_number",
                     present=False,
                     presence_source="sg_ses_aes",
                     sas_address="0",
@@ -1520,6 +1521,40 @@ ses0:
         self.assertEqual(slot.presence_source, "enclosure_sysfs")
         self.assertEqual(slot.device_names, ["sdb"])
         self.assertEqual(slot.device_names_source, "enclosure_sysfs")
+
+    def test_sysfs_device_binding_skips_slots_not_keyed_by_device_slot_number(self) -> None:
+        # The kernel `slot` attribute is the SES device slot number. Slots
+        # keyed by an EC element index (no source) or by an invalid AES
+        # descriptor's element index share no coordinate with it, so the
+        # hint has no bay to land on (issue #276).
+        enclosure = SESMapEnclosure(
+            ses_device="/dev/sg4",
+            slots={
+                1: SESMapSlot(slot_number=1, element_id=1, present=True, presence_source="sg_ses_ec"),
+                2: SESMapSlot(
+                    slot_number=2,
+                    element_id=2,
+                    slot_number_source="ses_element_index_invalid_descriptor",
+                    present=False,
+                    presence_source="sg_ses_aes",
+                ),
+                3: SESMapSlot(slot_number=3, element_id=2, slot_number_source="ses_description"),
+            },
+        )
+
+        _apply_enclosure_sysfs_device_names(
+            [enclosure],
+            {"sg4": {1: ["sda"], 2: ["sdb"], 3: ["sdc"]}},
+        )
+
+        self.assertEqual(enclosure.slots[1].device_names, [])
+        self.assertIsNone(enclosure.slots[1].device_names_source)
+        self.assertEqual(enclosure.slots[2].device_names, [])
+        self.assertIs(enclosure.slots[2].present, False)
+        self.assertEqual(enclosure.slots[2].presence_source, "sg_ses_aes")
+        # Description-derived slot numbers (join/sesutil `SlotNN`) are bay numbers.
+        self.assertEqual(enclosure.slots[3].device_names, ["sdc"])
+        self.assertEqual(enclosure.slots[3].device_names_source, "enclosure_sysfs")
 
     def test_candidate_map_keeps_stronger_empty_presence_in_any_merge_order(self) -> None:
         strong = {

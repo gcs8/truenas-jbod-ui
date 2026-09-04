@@ -1,0 +1,46 @@
+  SYNTH     OFFSET1BASED      0100
+  Primary enclosure logical identifier (hex): 5eeeeeee00001b45
+Additional element status diagnostic page:
+  generation code: 0x0
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 1
+        phy index: 0
+          SAS device type: end device
+          initiator port for:
+          target port for: SSP
+          attached SAS address: 0x5eeeeeee00001b40
+          SAS address: 0x5aaaaaaa00001b01
+          phy identifier: 0x0
+      Element index: 1  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 2
+        phy index: 0
+          SAS device type: end device
+          initiator port for:
+          target port for: SSP
+          attached SAS address: 0x5eeeeeee00001b40
+          SAS address: 0x5aaaaaaa00001b02
+          phy identifier: 0x0
+      Element index: 2  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 3
+        phy index: 0
+          SAS device type: no SAS device attached
+          initiator port for:
+          target port for: SSP
+          attached SAS address: 0x5eeeeeee00001b40
+          SAS address: 0x0
+          phy identifier: 0x0
+      Element index: 3  eiioe=0
+        Transport protocol: SAS
+        number of phys: 1, not all phys: 0, device slot number: 4
+        phy index: 0
+          SAS device type: end device
+          initiator port for:
+          target port for: SSP
+          attached SAS address: 0x5eeeeeee00001b40
+          SAS address: 0x5aaaaaaa00001b04
+          phy identifier: 0x0
