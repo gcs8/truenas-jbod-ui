@@ -68,6 +68,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_history_routes",
             "tests.test_history_service",
             "tests.test_inventory",
+            "tests.test_inventory_registry_routes",
             "tests.test_mapping_routes",
             "tests.test_metrics",
             "tests.test_perf",

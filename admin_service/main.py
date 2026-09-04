@@ -63,7 +63,7 @@ from app.services.profile_builder import ProfileBuilderService, collect_profile_
 from app.services.demo_system_factory import DemoSystemFactory
 from app.services.inventory import InventoryService
 from app.services.profile_registry import ProfileRegistry, build_profile_reference_warnings
-from app.services.inventory_registry import InventoryRegistry
+from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
 from app.services.quantastor_cli import build_quantastor_cli_invocation
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.release_status import ReleaseStatusService, describe_release_status
@@ -139,6 +139,16 @@ configure_service_logging(
     service_name="enclosure-admin",
 )
 logger = logging.getLogger(__name__)
+
+
+async def system_not_configured_exception_handler(
+    _: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "detail": str(exc)},
+        status_code=404,
+    )
 
 
 def observe_backup_route(operation: str):
@@ -499,6 +509,10 @@ def create_app() -> FastAPI:
     include_router_preserving_route_objects(
         app,
         build_router(sys.modules[__name__], admin_settings),
+    )
+    app.add_exception_handler(
+        SystemNotConfiguredError,
+        system_not_configured_exception_handler,
     )
 
     @app.exception_handler(HTTPException)

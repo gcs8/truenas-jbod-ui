@@ -80,7 +80,13 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         enclosure_id: str | None = None,
     ) -> HTMLResponse:
         current_settings = get_settings()
-        service = route_service(system_id, enclosure_id=enclosure_id)
+        configured_system_ids = {system.id for system in current_settings.systems}
+        selected_system_id = (
+            system_id
+            if system_id in configured_system_ids
+            else current_settings.default_system_id
+        )
+        service = route_service(selected_system_id, enclosure_id=enclosure_id)
         admin_launch_url = await asyncio.to_thread(resolve_admin_launch_url, request, current_settings)
         snapshot = await service.get_snapshot(
             selected_enclosure_id=enclosure_id,
@@ -559,7 +565,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         await ensure_slot_bounds(slot, service, enclosure_id)
-        resolved_system_id = service.system.id if system_id is None else system_id
+        resolved_system_id = service.system.id
         add_perf_metadata(
             system_id=resolved_system_id,
             platform=service.system.truenas.platform,
