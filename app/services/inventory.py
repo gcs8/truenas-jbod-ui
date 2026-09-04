@@ -321,6 +321,7 @@ SMART_SUMMARY_VALUE_FIELDS = tuple(
 )
 OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
+QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES = 64
 SSH_CONNECTION_FAILURE_MARKERS = (
     "error reading ssh protocol banner",
     "no existing session",
@@ -5654,13 +5655,17 @@ class InventoryService:
             if system_id
         )
 
-        options: list[EnclosureOption] = []
+        system_rows_by_id: dict[str, dict[str, Any]] = {}
         for system_row in raw_data.systems:
             system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
             if not system_id:
                 continue
             if hardware_system_ids and system_id not in hardware_system_ids:
                 continue
+            system_rows_by_id.setdefault(system_id, system_row)
+
+        options: list[EnclosureOption] = []
+        for system_id, system_row in system_rows_by_id.items():
             label = normalize_text(
                 system_row.get("name")
                 or system_row.get("hostname")
@@ -5670,6 +5675,8 @@ class InventoryService:
             owned_enclosures = list(indexed_enclosure_rows_by_owner.get(system_id, {}).values())
             option_rows = owned_enclosures if len(owned_enclosures) > 1 else [None]
             for enclosure_row in option_rows:
+                if len(options) >= QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES:
+                    break
                 enclosure_id = self._quantastor_hw_enclosure_id(enclosure_row) if enclosure_row else None
                 enclosure_label = (
                     normalize_text(
@@ -5704,6 +5711,8 @@ class InventoryService:
                         slot_layout=slot_layout,
                     )
                 )
+            if len(options) >= QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES:
+                break
         return self._finalize_enclosure_options(options)
 
     @staticmethod
@@ -5912,7 +5921,7 @@ class InventoryService:
             disk_enclosure_id = normalize_text(
                 str(disk_enclosure_value) if disk_enclosure_value is not None else None
             )
-            if selected_enclosure_id and disk_enclosure_id != selected_enclosure_id:
+            if selected_enclosure_id and disk_enclosure_id and disk_enclosure_id != selected_enclosure_id:
                 continue
             cli_hint = next((cli_disk_hints[key] for key in lookup_keys if key in cli_disk_hints), None)
             pool_hint = next((pool_slot_hints[key] for key in lookup_keys if key in pool_slot_hints), None)
