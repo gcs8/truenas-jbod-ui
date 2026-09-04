@@ -43,6 +43,31 @@ CORE_DMIDECODE_SUDO_COMMANDS = (
 CORE_MESSAGES_SUDO_COMMANDS = (
     "/usr/bin/tail -n 4000 /var/log/messages",
 )
+# Device-specific probes the generic-Linux collection path builds at run time from
+# discovered devices. They never appear in an operator's saved command list, so the
+# bootstrap has to grant them in both the seeded and the supplemental flow (#332).
+LINUX_SG_SES_SUDO_COMMANDS = (
+    "/usr/bin/sg_ses -p aes /dev/sg*",
+    "/usr/bin/sg_ses -p ec /dev/sg*",
+    "/usr/bin/sg_ses --join --filter /dev/sg*",
+    "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
+    "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
+)
+LINUX_SMARTCTL_SUDO_COMMANDS = (
+    "/usr/sbin/smartctl -x -j *",
+    "/usr/sbin/smartctl -x *",
+    "/usr/sbin/smartctl -d * -x -j *",
+    "/usr/sbin/smartctl -d * -x *",
+    "/usr/local/sbin/smartctl -x -j *",
+    "/usr/local/sbin/smartctl -x *",
+    "/usr/local/sbin/smartctl -d * -x -j *",
+    "/usr/local/sbin/smartctl -d * -x *",
+)
+LINUX_NVME_SUDO_COMMANDS = (
+    "/usr/sbin/nvme smart-log -o json /dev/nvme*",
+    "/usr/sbin/nvme id-ctrl -o json /dev/nvme*",
+    "/usr/sbin/nvme id-ns -o json /dev/nvme*",
+)
 CORE_MPRUTIL_SHOW_COMMANDS = {
     "adapter",
     "adapters",
@@ -81,13 +106,9 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     ),
     "linux": (
         "/usr/sbin/mdadm --detail --scan",
-        "/usr/bin/sg_ses -p aes /dev/sg*",
-        "/usr/bin/sg_ses -p ec /dev/sg*",
-        "/usr/bin/sg_ses --join --filter /dev/sg*",
-        "/usr/sbin/smartctl -x -j *",
-        "/usr/sbin/smartctl -x *",
-        "/usr/local/sbin/smartctl -x -j *",
-        "/usr/local/sbin/smartctl -x *",
+        *LINUX_SG_SES_SUDO_COMMANDS,
+        *LINUX_SMARTCTL_SUDO_COMMANDS,
+        *LINUX_NVME_SUDO_COMMANDS,
     ),
     "quantastor": (
         "/usr/bin/sg_ses -p aes /dev/sg*",
@@ -124,10 +145,9 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/local/sbin/smartctl -x *",
     ),
     "linux": (
-        "/usr/sbin/smartctl -x -j *",
-        "/usr/sbin/smartctl -x *",
-        "/usr/local/sbin/smartctl -x -j *",
-        "/usr/local/sbin/smartctl -x *",
+        *LINUX_SG_SES_SUDO_COMMANDS,
+        *LINUX_SMARTCTL_SUDO_COMMANDS,
+        *LINUX_NVME_SUDO_COMMANDS,
     ),
     "quantastor": (
         "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",

@@ -148,6 +148,10 @@ LINUX_NVME_LIST_SUBSYS_COMMAND = (
     "/usr/sbin/nvme list-subsys -o json 2>/dev/null || "
     "/usr/bin/nvme list-subsys -o json 2>/dev/null || true"
 )
+# smartctl device type the generic-Linux path forces for UniFi boot media, which
+# turns the sudo-run SMART probes into `smartctl -d <type> -x ...` forms. The
+# admin bootstrap has to grant those shapes too (issue #332).
+LINUX_BOOT_MEDIA_SMARTCTL_DEVICE_TYPE = "scsi"
 # Reads the kernel enclosure-driver slot bindings without sudo. Every line is
 # `<enclosure scsi id>|<sg name>|<slot attr>|<component name>|<block devices>`,
 # which parse_enclosure_sysfs_map turns into per-bay device hints that keep
@@ -8994,7 +8998,9 @@ class InventoryService:
                         "vendor_slot": vendor_slot,
                         "vendor_raw": vendor_entry,
                         "boot_media": is_boot_media,
-                        "smartctl_device_type": "scsi" if is_boot_media else None,
+                        "smartctl_device_type": (
+                            LINUX_BOOT_MEDIA_SMARTCTL_DEVICE_TYPE if is_boot_media else None
+                        ),
                     },
                     device_name=device_name,
                     path_device_name=device_name,
