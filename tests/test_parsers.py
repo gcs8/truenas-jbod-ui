@@ -1558,9 +1558,52 @@ ses0:
         self.assertEqual(enclosure.slots[3].device_names, [])
         self.assertEqual(enclosure.slots[4].device_names, ["sdd"])
         self.assertEqual(enclosure.slots[4].device_names_source, "enclosure_sysfs")
-        # Every dropped binding is counted once on the enclosure for the
-        # operator-facing warning; the placed one is not.
-        self.assertEqual(enclosure.unplaced_sysfs_bindings, 3)
+        # Every dropped binding is counted once for its SES path; the placed
+        # one is not.
+        self.assertEqual(enclosure.unplaced_sysfs_bindings_by_ses_device, {"/dev/sg4": 3})
+
+    def test_merged_ses_sysfs_warnings_keep_path_counts_and_secondary_placements(self) -> None:
+        enclosure = SESMapEnclosure(
+            ses_device="/dev/sg10",
+            ses_devices=["/dev/sg10", "/dev/sg2"],
+            slots={
+                0: SESMapSlot(slot_number=0, element_id=0, presence_source="sg_ses_ec"),
+                1: SESMapSlot(
+                    slot_number=1,
+                    element_id=1,
+                    slot_number_source="ses_device_slot_number",
+                ),
+            },
+        )
+
+        _apply_enclosure_sysfs_device_names(
+            [enclosure],
+            {
+                "sg10": {0: ["sda"], 1: ["sdb"]},
+                "sg2": {0: ["sdc"], 1: ["sdd"], 2: ["sde"]},
+            },
+        )
+        _, selected = build_slot_candidates_from_ses_enclosures(
+            [enclosure],
+            2,
+            None,
+            enclosures_are_merged=True,
+        )
+
+        self.assertEqual(enclosure.slots[1].device_names, ["sdb", "sdd"])
+        self.assertEqual(
+            enclosure.unplaced_sysfs_bindings_by_ses_device,
+            {"/dev/sg10": 1, "/dev/sg2": 2},
+        )
+        self.assertEqual(
+            [warning for warning in selected["warnings"] if "Kernel enclosure bindings" in warning],
+            [
+                "Kernel enclosure bindings for /dev/sg2 could not be placed: "
+                "SES reported no device slot numbers for 2 bound devices.",
+                "Kernel enclosure bindings for /dev/sg10 could not be placed: "
+                "SES reported no device slot numbers for 1 bound device.",
+            ],
+        )
 
     def test_candidate_map_keeps_stronger_empty_presence_in_any_merge_order(self) -> None:
         strong = {

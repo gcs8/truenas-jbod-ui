@@ -166,9 +166,9 @@ class SESMapEnclosure:
     slot_layout: list[list[int | None]] | None = None
     slots: dict[int, SESMapSlot] = field(default_factory=dict)
     unmapped_slots: list[SESMapSlot] = field(default_factory=list)
-    # Kernel enclosure-driver bindings for this sg device that found no bay
-    # keyed by a device slot number (reported once per enclosure, issue #276).
-    unplaced_sysfs_bindings: int = 0
+    # Kernel enclosure-driver bindings that found no bay keyed by a device slot
+    # number, counted by contributing SES path (issue #276).
+    unplaced_sysfs_bindings_by_ses_device: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -1940,8 +1940,8 @@ def _apply_enclosure_sysfs_device_names(
     attribute onto EC element indexes showed bay N holding bay N+k's disk and
     turned empty bays present). EC-only enclosures therefore get no device
     names from sysfs rather than a neighbour's; each binding dropped that way
-    is counted on the enclosure so the operator sees one warning for the merged
-    SES evidence.
+    is counted against its SES path so merged evidence retains warning
+    attribution.
     """
     for enclosure in enclosures:
         ses_devices = enclosure.ses_devices or ([enclosure.ses_device] if enclosure.ses_device else [])
@@ -1953,7 +1953,9 @@ def _apply_enclosure_sysfs_device_names(
             for slot_number, device_names in slot_hints.items():
                 slot = enclosure.slots.get(slot_number)
                 if slot is None or slot.slot_number_source not in SYSFS_JOINABLE_SLOT_NUMBER_SOURCES:
-                    enclosure.unplaced_sysfs_bindings += 1
+                    enclosure.unplaced_sysfs_bindings_by_ses_device[ses_device] = (
+                        enclosure.unplaced_sysfs_bindings_by_ses_device.get(ses_device, 0) + 1
+                    )
                     continue
                 _apply_ses_presence_evidence(slot, True, "enclosure_sysfs")
                 _apply_ses_device_name_evidence(slot, device_names, "enclosure_sysfs")
@@ -2312,11 +2314,15 @@ def build_slot_candidates_from_ses_enclosures(
                 "so SAS-address slot matching is disabled for those bays. Slot mapping uses "
                 "Linux enclosure-driver evidence when available."
             )
-        if enclosure.unplaced_sysfs_bindings:
+        for ses_device in sorted(
+            enclosure.unplaced_sysfs_bindings_by_ses_device,
+            key=_device_name_sort_key,
+        ):
+            unplaced_count = enclosure.unplaced_sysfs_bindings_by_ses_device[ses_device]
             unmapped_warnings.append(
-                f"Kernel enclosure bindings for {enclosure.ses_device or 'this SES device'} could not be placed: "
-                f"SES reported no device slot numbers for {enclosure.unplaced_sysfs_bindings} bound "
-                f"device{'s' if enclosure.unplaced_sysfs_bindings != 1 else ''}."
+                f"Kernel enclosure bindings for {ses_device} could not be placed: "
+                f"SES reported no device slot numbers for {unplaced_count} bound "
+                f"device{'s' if unplaced_count != 1 else ''}."
             )
         if slot_numbers:
             min_slot = slot_numbers[0]
