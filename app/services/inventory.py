@@ -4809,9 +4809,15 @@ class InventoryService:
         selected_profile = frame.selected_profile
         allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
         slot_count = frame.layout_slot_count
+        # The candidate builders drop every slot index at or above the bound
+        # they are given. A drawer sub-view (or any profile whose bay ids are
+        # not zero-based) renders fewer bays than its highest bay id, so bound
+        # the builders by the highest rendered id while the visible count
+        # keeps feeding the option label and layout_slot_count (issue #274).
+        candidate_slot_bound = max(frame.slot_positions) + 1 if frame.slot_positions else slot_count
         ssh_candidates, ssh_meta = build_slot_candidates_from_ses_enclosures(
             ssh_data.ses_enclosures,
-            slot_count,
+            candidate_slot_bound,
             self.system.truenas.enclosure_filter,
             self._base_enclosure_id(selected_option.id),
         )
@@ -4822,7 +4828,7 @@ class InventoryService:
         api_candidates, api_selected_meta = extract_enclosure_slot_candidates(
             raw_data.enclosures,
             self.system.truenas.enclosure_filter,
-            slot_count,
+            candidate_slot_bound,
             self.settings.layout.api_slot_number_base,
             self._base_enclosure_id(selected_option.id),
         )

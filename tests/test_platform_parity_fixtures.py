@@ -12,7 +12,12 @@ from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import SlotState
 from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, InventoryService
 from app.services.mapping_store import MappingStore
-from app.services.parsers import parse_sg_ses_join_filter, parse_ssh_outputs, parse_storcli_physical_drives
+from app.services.parsers import (
+    ParsedSSHData,
+    parse_sg_ses_join_filter,
+    parse_ssh_outputs,
+    parse_storcli_physical_drives,
+)
 from app.services.profile_registry import (
     ProfileRegistry,
     SCALE_SSG_FRONT_24_PROFILE_ID,
@@ -77,6 +82,75 @@ def build_inventory_service(
         ProfileRegistry(settings),
         SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
     )
+
+
+def build_md1280_capture_service(
+    temp_dir: str,
+) -> tuple[InventoryService, dict[str, str], dict[str, dict[int, str]]]:
+    """
+    Replay the pseudonymised MD1280 captures (issue #119) into a SCALE
+    service with the Linux SES overlay pre-loaded. Returns the service, the
+    SES logical id per sg device, and the independent slot -> device truth
+    per sg device.
+    """
+
+    probe_output = fixture_text("scale_md1280_sysfs.txt")
+    truth = assert_md1280_sysfs_matches_independent_truth(probe_output)
+
+    lsblk = fixture_json("scale_md1280_lsblk.json")["blockdevices"]
+    disks = []
+    for row in lsblk:
+        if row.get("type") not in (None, "disk"):
+            continue
+        wwn = row.get("wwn") or ""
+        disks.append(
+            {
+                "devname": row.get("name"),
+                "name": row.get("name"),
+                "serial": row.get("serial"),
+                "model": row.get("model") or "FIXTURE-DISK",
+                "lunid": wwn.removeprefix("0x") if wwn else None,
+            }
+        )
+
+    class DummyScaleClient:
+        async def fetch_all(self) -> TrueNASRawData:
+            return TrueNASRawData(
+                enclosures=[],
+                disks=disks,
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+    settings = Settings()
+    system = SystemConfig(
+        id="md1280-parity",
+        truenas=TrueNASConfig(platform="scale"),
+        ssh=SSHConfig(enabled=True, host="192.0.2.50", user="jbodmap", commands=[]),
+    )
+    service = build_inventory_service(settings, system, DummyScaleClient(), AsyncMock(), temp_dir)
+
+    overlay = ParsedSSHData()
+    logical_by_sg: dict[str, str] = {}
+    for dev in ("sg1", "sg76"):
+        aes_text = fixture_text(f"scale_md1280_{dev}_aes.txt")
+        logical_by_sg[dev] = aes_text.splitlines()[1].split(":", 1)[1].strip()
+        parsed = parse_ssh_outputs(
+            {
+                f"sudo -n /usr/bin/sg_ses -p aes /dev/{dev}": aes_text,
+                f"sudo -n /usr/bin/sg_ses -p ec /dev/{dev}": fixture_text(f"scale_md1280_{dev}_ec.txt"),
+                f"sudo -n /usr/bin/sg_ses --join --filter /dev/{dev}": fixture_text(f"scale_md1280_{dev}_join.txt"),
+                LINUX_ENCLOSURE_SYSFS_MAP_COMMAND: probe_output,
+            },
+            84,
+            None,
+            None,
+        )
+        overlay = service._merge_ses_overlay_data(overlay, parsed)
+    service._tag_ses_overlay(overlay, "192.0.2.50")
+    service._fetch_scale_ses_overlay = AsyncMock(return_value=(overlay, []))
+    return service, logical_by_sg, truth
 
 
 class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
@@ -461,66 +535,8 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
         must stay empty, and the shelf must keep its full 84-bay geometry.
         """
 
-        probe_output = fixture_text("scale_md1280_sysfs.txt")
-        truth = assert_md1280_sysfs_matches_independent_truth(probe_output)
-
-        lsblk = fixture_json("scale_md1280_lsblk.json")["blockdevices"]
-        disks = []
-        for row in lsblk:
-            if row.get("type") not in (None, "disk"):
-                continue
-            wwn = row.get("wwn") or ""
-            disks.append(
-                {
-                    "devname": row.get("name"),
-                    "name": row.get("name"),
-                    "serial": row.get("serial"),
-                    "model": row.get("model") or "FIXTURE-DISK",
-                    "lunid": wwn.removeprefix("0x") if wwn else None,
-                }
-            )
-
-        class DummyScaleClient:
-            async def fetch_all(self) -> TrueNASRawData:
-                return TrueNASRawData(
-                    enclosures=[],
-                    disks=disks,
-                    pools=[],
-                    disk_temperatures={},
-                    smart_test_results=[],
-                )
-
         with tempfile.TemporaryDirectory() as temp_dir:
-            settings = Settings()
-            system = SystemConfig(
-                id="md1280-parity",
-                truenas=TrueNASConfig(platform="scale"),
-                ssh=SSHConfig(enabled=True, host="192.0.2.50", user="jbodmap", commands=[]),
-            )
-            service = build_inventory_service(settings, system, DummyScaleClient(), AsyncMock(), temp_dir)
-
-            from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND
-            from app.services.parsers import ParsedSSHData
-
-            overlay = ParsedSSHData()
-            logical_by_sg: dict[str, str] = {}
-            for dev in ("sg1", "sg76"):
-                aes_text = fixture_text(f"scale_md1280_{dev}_aes.txt")
-                logical_by_sg[dev] = aes_text.splitlines()[1].split(":", 1)[1].strip()
-                parsed = parse_ssh_outputs(
-                    {
-                        f"sudo -n /usr/bin/sg_ses -p aes /dev/{dev}": aes_text,
-                        f"sudo -n /usr/bin/sg_ses -p ec /dev/{dev}": fixture_text(f"scale_md1280_{dev}_ec.txt"),
-                        f"sudo -n /usr/bin/sg_ses --join --filter /dev/{dev}": fixture_text(f"scale_md1280_{dev}_join.txt"),
-                        LINUX_ENCLOSURE_SYSFS_MAP_COMMAND: probe_output,
-                    },
-                    84,
-                    None,
-                    None,
-                )
-                overlay = service._merge_ses_overlay_data(overlay, parsed)
-            service._tag_ses_overlay(overlay, "192.0.2.50")
-            service._fetch_scale_ses_overlay = AsyncMock(return_value=(overlay, []))
+            service, logical_by_sg, truth = build_md1280_capture_service(temp_dir)
 
             for dev in ("sg1", "sg76"):
                 snap = await service.get_snapshot(selected_enclosure_id=logical_by_sg[dev])
@@ -558,6 +574,57 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
                     [w for w in snap.warnings if "shared SAS address" in w],
                     "per-phy unique addresses must not trip the shared-address guard",
                 )
+
+    async def test_scale_md1280_drawer_views_keep_ses_evidence_for_every_bay(self) -> None:
+        """
+        Issue #274: a drawer sub-view renders 42 bays whose ids run 0-41 (top)
+        or 42-83 (bottom). The SES/API candidate builders must be bounded by
+        the highest bay id the view renders, not by the visible count, or the
+        bottom drawer loses every candidate: no disks, no SES evidence, every
+        bay resolved as "unknown". Replays the same captures as the whole-shelf
+        test above and requires every populated bay in each drawer to resolve
+        through the enclosure driver with SES evidence attached.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, logical_by_sg, truth = build_md1280_capture_service(temp_dir)
+
+            for dev in ("sg1", "sg76"):
+                base = logical_by_sg[dev]
+                gt = truth[dev]
+                for profile_id, low, high in (
+                    ("dell-md1280-drawer-top-42", 0, 42),
+                    ("dell-md1280-drawer-bottom-42", 42, 84),
+                ):
+                    view_id = f"{base}::{profile_id}"
+                    snap = await service.get_snapshot(selected_enclosure_id=view_id)
+                    resolved = {slot.slot: slot for slot in snap.slots}
+                    self.assertEqual(sorted(resolved), list(range(low, high)), f"{dev} {profile_id}")
+                    self.assertEqual(snap.layout_slot_count, high - low, f"{dev} {profile_id}")
+
+                    expected = {slot: device for slot, device in gt.items() if low <= slot < high}
+                    self.assertTrue(expected, f"{dev} {profile_id}: capture truth has no populated bay in this drawer")
+                    for slot_number, device in sorted(expected.items()):
+                        view = resolved[slot_number]
+                        self.assertEqual(
+                            view.device_name,
+                            device,
+                            f"{dev} {profile_id} slot {slot_number} resolved {view.device_name!r}, expected {device!r}",
+                        )
+                        self.assertTrue(view.present, f"{dev} {profile_id} slot {slot_number} should be present")
+                        self.assertEqual(
+                            view.raw_status.get("mapping_resolution_source"),
+                            "enclosure-sysfs",
+                            f"{dev} {profile_id} slot {slot_number} lost its enclosure-driver evidence",
+                        )
+
+                    for view in resolved.values():
+                        self.assertTrue(
+                            view.raw_status.get("ses_device"),
+                            f"{dev} {profile_id} slot {view.slot} has no SES evidence",
+                        )
+                        if view.slot not in expected:
+                            self.assertFalse(view.present, f"{dev} {profile_id} empty slot {view.slot} phantom-present")
 
     def test_scale_md1280_transposed_sysfs_mapping_fails_independent_truth(self) -> None:
         lines = fixture_text("scale_md1280_sysfs.txt").splitlines()
