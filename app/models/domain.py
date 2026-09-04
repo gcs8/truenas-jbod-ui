@@ -192,8 +192,13 @@ class SmartSummaryView(BaseModel):
     message: str | None = None
 
 
+# Match the largest enclosure profile accepted by configuration while keeping
+# layout-unavailable requests bounded before route execution.
+SMART_BATCH_MAX_SLOTS = 4096
+
+
 class SmartBatchRequest(BaseModel):
-    slots: list[int] = Field(default_factory=list)
+    slots: list[int] = Field(default_factory=list, max_length=SMART_BATCH_MAX_SLOTS)
     max_concurrency: int | None = None
 
     @field_validator("slots")

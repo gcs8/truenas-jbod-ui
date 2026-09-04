@@ -9,6 +9,7 @@ import re
 import shlex
 import time
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Generic, Iterable, Literal, TypeVar
@@ -3177,6 +3178,8 @@ class InventoryService:
         self,
         slot: int,
         selected_enclosure_id: str | None = None,
+        *,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
     ) -> SmartSummaryView | None:
         """Return last-good SMART data without rebuilding inventory topology."""
 
@@ -3212,6 +3215,7 @@ class InventoryService:
                 self.system.id,
                 selected_enclosure_id,
                 slot,
+                loaded_entries=loaded_entries,
             )
             if entry is not None and entry.smart_fields:
                 try:

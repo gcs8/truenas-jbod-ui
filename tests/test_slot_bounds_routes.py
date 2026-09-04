@@ -9,10 +9,17 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, call, patch
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 from app import main as app_main
 from app.config import Settings, SystemConfig, TrueNASConfig
-from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView, utcnow
+from app.models.domain import (
+    SMART_BATCH_MAX_SLOTS,
+    InventorySnapshot,
+    SlotView,
+    SmartSummaryView,
+    utcnow,
+)
 from app.services.inventory import InventoryService
 from app.services.profile_registry import dell_md1280_bottom_drawer_slot_layout
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
@@ -35,6 +42,7 @@ def _service(
     service = Mock()
     service.system.id = "system-a"
     service.system.truenas.platform = "scale"
+    service.slot_detail_store = None
     if layout_slot_count is None:
         service.get_snapshot = AsyncMock(side_effect=RuntimeError("collector down"))
     else:
@@ -508,11 +516,28 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         self.assertEqual(
             self.service.get_cached_slot_smart_summary_without_layout.call_args_list,
             [
-                call(5, selected_enclosure_id="enc-a"),
-                call(6, selected_enclosure_id="enc-a"),
+                call(5, selected_enclosure_id="enc-a", loaded_entries=None),
+                call(6, selected_enclosure_id="enc-a", loaded_entries=None),
             ],
         )
         self.service.get_slot_smart_summaries.assert_not_awaited()
+
+    def test_smart_batch_rejects_requests_over_the_slot_cap_before_cache_fallback(self) -> None:
+        registry = Mock()
+        registry.get_service.return_value = self.service
+        self.service.get_cached_slot_smart_summary_without_layout = Mock(return_value=None)
+
+        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+            response = TestClient(app_main.app).post(
+                "/api/slots/smart-batch",
+                json={
+                    "slots": list(range(SMART_BATCH_MAX_SLOTS + 1)),
+                    "max_concurrency": 2,
+                },
+            )
+
+        self.assertEqual(response.status_code, 422)
+        registry.get_service.assert_not_called()
 
     def test_cached_smart_batch_bypasses_a_second_snapshot_lookup(self) -> None:
         route = _route("/api/slots/smart-batch", "POST")
@@ -545,6 +570,50 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         )
         self.assertEqual(response.layout_bounds, "unavailable")
         self.assertEqual(snapshot_lookup.await_count, 1)
+
+    def test_layout_unavailable_smart_batch_loads_persisted_entries_once(self) -> None:
+        route = _route("/api/slots/smart-batch", "POST")
+        service, _snapshot_lookup = _service_with_cached_smart({})
+        registry = Mock()
+        registry.get_service.return_value = service
+        payload = Mock(slots=[5, 6, 5], max_concurrency=2)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SlotDetailStore(str(Path(temp_dir) / "slot-details.json"))
+            store.save_entries(
+                [
+                    SlotDetailCacheEntry(
+                        system_id="system-a",
+                        enclosure_id="enc-a",
+                        slot=slot,
+                        identifiers=[f"serial-{slot}"],
+                        smart_fields={"available": True, "temperature_c": temperature},
+                    )
+                    for slot, temperature in ((5, 33), (6, 34))
+                ]
+            )
+            store.load_all = Mock(wraps=store.load_all)
+            service.slot_detail_store = store
+
+            with (
+                patch.object(app_main, "get_inventory_registry", return_value=registry),
+                patch.object(app_main, "add_perf_metadata"),
+            ):
+                response = asyncio.run(
+                    route.endpoint(
+                        payload=payload,
+                        system_id="system-a",
+                        enclosure_id="enc-a",
+                        fresh=False,
+                    )
+                )
+
+        self.assertEqual([item.slot for item in response.summaries], [5, 6])
+        self.assertEqual(
+            [item.summary.temperature_c for item in response.summaries],
+            [33, 34],
+        )
+        store.load_all.assert_called_once_with()
 
     def test_fresh_smart_batch_keeps_strict_layout_bounds(self) -> None:
         route = _route("/api/slots/smart-batch", "POST")

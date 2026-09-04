@@ -612,6 +612,11 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             if layout_bounds == "unavailable":
                 summaries = []
                 seen_slots: set[int] = set()
+                loaded_entries = (
+                    service.slot_detail_store.load_all()
+                    if payload.slots and service.slot_detail_store is not None
+                    else None
+                )
                 for slot in payload.slots:
                     if slot in seen_slots:
                         continue
@@ -619,6 +624,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                     summary = service.get_cached_slot_smart_summary_without_layout(
                         slot,
                         selected_enclosure_id=enclosure_id,
+                        loaded_entries=loaded_entries,
                     ) or SmartSummaryView(
                         available=False,
                         message=(
