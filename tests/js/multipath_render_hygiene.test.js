@@ -147,7 +147,7 @@ test("live asset escapes the slot label in the live slot tile", () => {
   assert.match(html, /<span class="slot-number">01&quot;&gt;&lt;img src=x onerror=&quot;boom&quot;&gt;<\/span>/);
 });
 
-test("live asset bounds the topology pill state token and escapes its slot label", () => {
+test("live asset bounds the topology pill state token", () => {
   const renderTopologyContext = loadTopologyRenderer(LIVE_SOURCE);
   const selected = {
     slot: 1,
@@ -166,12 +166,37 @@ test("live asset bounds the topology pill state token and escapes its slot label
     vdev_class: "data",
     device_name: "sdb",
     state: 'present" data-unsafe="yes',
-    slot_label: '02"><img src=x onerror="boom">',
+    slot_label: "02",
   };
   const html = renderTopologyContext([selected, peer], selected);
 
   assert.doesNotMatch(html, /\sdata-unsafe=/);
-  assert.doesNotMatch(html, /<img/);
   assert.match(html, /class="topology-pill state-present-data-unsafe-yes"/);
+});
+
+test("live asset escapes the topology pill slot label", () => {
+  const renderTopologyContext = loadTopologyRenderer(LIVE_SOURCE);
+  const selected = {
+    slot: 1,
+    pool_name: "tank",
+    vdev_name: "mirror-0",
+    vdev_class: "data",
+    device_name: "sda",
+    state: "present",
+    slot_label: "01",
+    topology_label: "tank > mirror-0",
+  };
+  const peer = {
+    slot: 2,
+    pool_name: "tank",
+    vdev_name: "mirror-0",
+    vdev_class: "data",
+    device_name: "sdb",
+    state: "present",
+    slot_label: '02"><img src=x onerror="boom">',
+  };
+  const html = renderTopologyContext([selected, peer], selected);
+
+  assert.doesNotMatch(html, /<img/);
   assert.match(html, /<span>02&quot;&gt;&lt;img src=x onerror=&quot;boom&quot;&gt;<\/span>/);
 });
