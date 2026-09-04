@@ -92,6 +92,18 @@ class ReleaseStatusTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, unreleased)
 
+    def test_segment_permission_upgrade_note_uses_the_bounded_repair_procedure(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## v0.22.2", maxsplit=1)[0]
+        normalized = " ".join(unreleased.split())
+
+        self.assertNotIn("same preflight helper", unreleased)
+        self.assertIn("Do not run the generic ownership helper over an existing segmented-history tree", normalized)
+        self.assertIn("wiki/Backup-Restore-and-Debug-Bundles.md#optional-scheduled-state-backups", unreleased)
+        self.assertIn("`0750`", unreleased)
+        self.assertIn("`0640`", unreleased)
+
     def test_describe_release_status_reports_update_available_for_older_build(self) -> None:
         status, summary = describe_release_status("0.14.0", "v0.14.1")
 
