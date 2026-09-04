@@ -779,7 +779,8 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         snapshot = build_snapshot()
         snapshot.warnings = [
             f"API request to https://{hostnames['api']}:8443/api/v2 failed at 2026-09-02T00:01:00Z; "
-            f"unrelated {hostnames['api']}.example and prefix{hostnames['api']} stay literal.",
+            f"unrelated {hostnames['api']}.example collapses too; "
+            f"prefix{hostnames['api']} stays literal.",
             f"SSH warning from {hostnames['ssh']}.",
         ]
         snapshot.slots[0].raw_status = {
@@ -837,8 +838,9 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://host-01:8443/api/v2", rendered.html)
         self.assertIn("SSH warning from host-01.", rendered.html)
         self.assertIn("2026-09-02T00:01:00Z", rendered.html)
-        self.assertIn(f"{hostnames['api']}.example", rendered.html)
-        self.assertIn(f"prefix{hostnames['api']}", rendered.html)
+        self.assertNotIn(f"{hostnames['api']}.example", rendered.html)
+        self.assertIn("unrelated host-01 collapses too;", rendered.html)
+        self.assertIn(f"prefix{hostnames['api']} stays literal.", rendered.html)
         self.assertIn(f"x{hostnames['short']}", rendered.html)
         self.assertEqual(rendered.snapshot.slots[0].raw_status["sas_address_hint"], "0")
         self.assertIn("host-01", rendered.html)
@@ -1838,6 +1840,82 @@ class SnapshotRedactorIdentifierKeyTests(unittest.TestCase):
 
         self.assertEqual(redacted.slots[0].serial, "FI...0001")
         self.assertEqual(redacted.slots[0].raw_status["serial_hint"], "SE...0001")
+
+
+class SnapshotRedactorHostnameFormTests(unittest.TestCase):
+    @staticmethod
+    def _redactor_for(config_host: str) -> SnapshotRedactor:
+        return SnapshotRedactor(
+            build_snapshot(),
+            {},
+            {},
+            configured_hostnames=collect_configured_hostnames(
+                SystemConfig(
+                    id="archive-core",
+                    label="Archive CORE",
+                    truenas=TrueNASConfig(host=config_host),
+                ).model_dump(mode="json")
+            ),
+        )
+
+    def test_short_configured_hostname_also_redacts_its_fqdn(self) -> None:
+        redactor = self._redactor_for("https://nas206:8443")
+
+        self.assertEqual(
+            redactor.redact_object("SSH timed out for nas206.lab.invalid"),
+            "SSH timed out for host-01",
+        )
+        self.assertEqual(
+            redactor.redact_object("nas206-mgmt and xnas206 stay literal"),
+            "nas206-mgmt and xnas206 stay literal",
+        )
+
+    def test_fqdn_configured_hostname_also_redacts_its_short_name(self) -> None:
+        redactor = self._redactor_for("https://nas207.lab.invalid:8443/api/v2")
+
+        self.assertEqual(
+            redactor.redact_object("collector on nas207 failed"),
+            "collector on host-01 failed",
+        )
+        self.assertEqual(
+            redactor.redact_object("collector on nas207.lab.invalid failed"),
+            "collector on host-01 failed",
+        )
+
+    def test_configured_hostname_redaction_keeps_the_url_port_and_path(self) -> None:
+        redactor = self._redactor_for("https://nas208.lab.invalid")
+
+        self.assertEqual(
+            redactor.redact_object("see https://nas208.lab.invalid:8443/ui and nas208:22"),
+            "see https://host-01:8443/ui and host-01:22",
+        )
+
+    def test_unknown_system_id_in_history_rows_gets_a_freshly_minted_alias(self) -> None:
+        history_cache = {
+            "0": {"system_id": "other-box", "detail": "slot moved from other-box shelf"}
+        }
+        redactor = SnapshotRedactor(build_snapshot(), history_cache, {})
+
+        redacted = redactor.redact_history_cache(history_cache)
+        again = redactor.redact_history_cache(history_cache)
+        minted = redacted["0"]["system_id"]
+
+        self.assertNotIn("other-box", json.dumps(redacted))
+        self.assertRegex(minted, r"^host-\d{2}$")
+        self.assertNotEqual(minted, "host-01")
+        self.assertEqual(redacted["0"]["detail"], f"slot moved from {minted} shelf")
+        self.assertEqual(again["0"]["system_id"], minted)
+
+    def test_dotted_system_label_is_redacted_with_its_domain_suffix(self) -> None:
+        snapshot = build_snapshot()
+        snapshot.systems[0].label = "nas209.lab"
+        snapshot.selected_system_label = "nas209.lab"
+        snapshot.warnings = ["collector on nas209.lab.invalid failed"]
+        redactor = SnapshotRedactor(snapshot, {}, {})
+
+        redacted = redactor.redact_snapshot(snapshot)
+
+        self.assertEqual(redacted.warnings, ["collector on host-01 failed"])
 
 
 if __name__ == "__main__":

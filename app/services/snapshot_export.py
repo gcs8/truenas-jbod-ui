@@ -43,6 +43,9 @@ OFFLINE_IMAGE_ASSETS = {
 }
 IPV4_PATTERN = re.compile(r"(?<![\dA-Fa-f:])(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?![\dA-Fa-f:])")
 IPV6_PATTERN = re.compile(r"(?<![:\w])(?P<ip>(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4})(?![:\w])")
+# Trailing DNS labels appended to a hostname token, so a redacted host swallows
+# its own domain suffix instead of leaving it behind.
+FQDN_CONTINUATION_PATTERN = r"(?:\.[A-Za-z0-9-]+)*"
 SERIAL_PATH_KEYS = {"serial", "serial_hint"}
 PARTIAL_ID_PATH_KEYS = {
     "gptid",
@@ -215,6 +218,10 @@ class SnapshotRedactor:
             self.serial_values.append(normalized)
         elif bucket == "partial_id":
             self.partial_identifier_values.append(normalized)
+        elif bucket == "system":
+            self._alias_for_identifier(normalized, self.system_aliases, "host", value)
+        elif bucket == "enclosure":
+            self._alias_for_identifier(normalized, self.enclosure_aliases, "enc", value)
 
     def _classify_path(self, path: tuple[Any, ...]) -> str | None:
         if not path:
@@ -345,6 +352,30 @@ class SnapshotRedactor:
             selected_alias = next(iter(self.system_aliases.values()), "host-01")
         for hostname in self.configured_hostname_values:
             self.system_aliases[hostname] = selected_alias
+        # A host configured by FQDN is still written as its bare first label in
+        # collector warnings and raw fields (and the reverse), so register both
+        # forms against the same alias. The matching rule below then folds any
+        # domain suffix into whichever form it started from.
+        for short_form in self._configured_hostname_short_forms(self.configured_hostname_values):
+            self.system_aliases.setdefault(short_form, selected_alias)
+            if short_form not in self.configured_hostname_values:
+                self.configured_hostname_values.append(short_form)
+            self.configured_hostname_keys.add(short_form.casefold())
+
+    @staticmethod
+    def _configured_hostname_short_forms(hostnames: list[str]) -> list[str]:
+        short_forms: list[str] = []
+        seen: set[str] = set()
+        for hostname in hostnames:
+            short_form = hostname.split(".", 1)[0].strip()
+            if not short_form or short_form == hostname:
+                continue
+            folded = short_form.casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+            short_forms.append(short_form)
+        return short_forms
 
     @staticmethod
     def _build_group_aliases(groups: list[list[str]], prefix: str) -> dict[str, str]:
@@ -381,9 +412,9 @@ class SnapshotRedactor:
 
         bucket = self._classify_path(path)
         if bucket == "system":
-            return self.system_aliases.get(normalized, normalized)
+            return self._alias_for_identifier(normalized, self.system_aliases, "host", value)
         if bucket == "enclosure":
-            return self.enclosure_aliases.get(normalized, normalized)
+            return self._alias_for_identifier(normalized, self.enclosure_aliases, "enc", value)
         if bucket == "serial":
             if self._is_zero_identifier_sentinel(normalized):
                 return value
@@ -396,17 +427,55 @@ class SnapshotRedactor:
         redacted = value
         for original, replacement in self.token_replacements:
             if original.casefold() in self.configured_hostname_keys:
+                # Swallow any domain suffix so a short configured host also
+                # covers its FQDN. `-`/`_` continuations stay excluded because
+                # `nas01-mgmt` is a different host.
                 pattern = re.compile(
-                    rf"(?<![A-Za-z0-9_.-]){re.escape(original)}(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+                    rf"(?<![A-Za-z0-9_.-]){re.escape(original)}{FQDN_CONTINUATION_PATTERN}(?![A-Za-z0-9_-])",
                     re.IGNORECASE,
                 )
                 redacted = pattern.sub(lambda _match: replacement, redacted)
             elif original and original in redacted:
-                pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(original)}(?![A-Za-z0-9])")
+                # A dotted system label is a hostname too, so it takes the same
+                # domain-suffix rule; anything else keeps the plain boundary.
+                continuation = (
+                    FQDN_CONTINUATION_PATTERN
+                    if "." in original and original in self.system_aliases
+                    else ""
+                )
+                pattern = re.compile(
+                    rf"(?<![A-Za-z0-9]){re.escape(original)}{continuation}(?![A-Za-z0-9])"
+                )
                 redacted = pattern.sub(lambda _match: replacement, redacted)
         redacted = IPV4_PATTERN.sub(lambda match: self._mask_ipv4(match.group("ip")), redacted)
         redacted = IPV6_PATTERN.sub(lambda match: self._mask_ipv6(match.group("ip")), redacted)
         return redacted
+
+    def _alias_for_identifier(
+        self,
+        normalized: str,
+        aliases: dict[str, str],
+        prefix: str,
+        value: str,
+    ) -> str:
+        """Alias an identifier field, minting a new alias when it is unknown.
+
+        A history row can name a system or enclosure the snapshot no longer
+        lists. Returning it unchanged would ship the real identifier, so mint a
+        fresh alias and keep it for the life of this redactor.
+        """
+        existing = aliases.get(normalized)
+        if existing is not None:
+            return existing
+        if self._is_zero_identifier_sentinel(normalized):
+            return value
+        used = set(aliases.values())
+        index = len(used) + 1
+        while f"{prefix}-{index:02d}" in used:
+            index += 1
+        minted = f"{prefix}-{index:02d}"
+        aliases[normalized] = minted
+        return minted
 
     @staticmethod
     def _is_zero_identifier_sentinel(value: str) -> bool:
