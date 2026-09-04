@@ -536,6 +536,32 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("disk-backed scratch", backup_guide)
         self.assertIn("TMPDIR", backup_guide)
 
+    def test_shipped_admin_host_prep_staging_is_explicitly_disk_backed(self) -> None:
+        services = yaml.safe_load(
+            (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        )["services"]
+        host_prep_temp_dir = services["enclosure-admin"]["environment"].get(
+            "ADMIN_HOST_PREP_TEMP_DIR"
+        )
+
+        self.assertEqual(
+            host_prep_temp_dir,
+            "${ADMIN_HOST_PREP_TEMP_DIR:-/app/history/truenas-jbod-ui-host-prep}",
+        )
+        self.assertNotIn("/tmp", host_prep_temp_dir)
+
+    def test_env_example_documents_disk_backed_host_prep_staging(self) -> None:
+        env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "ADMIN_HOST_PREP_TEMP_DIR=/app/history/truenas-jbod-ui-host-prep",
+            env_example,
+        )
+        self.assertRegex(
+            env_example,
+            r"(?i)disk-backed[^\n]*host-prep|host-prep[^\n]*disk-backed",
+        )
+
     def test_default_nonroot_migration_is_documented_before_start(self) -> None:
         env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
         deployment_guide = (

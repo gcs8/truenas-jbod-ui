@@ -123,6 +123,8 @@ services:
       - .env
     environment:
       TMPDIR: /app/history
+      # Keep host-prep uploads on the disk-backed history mount, not the /tmp tmpfs.
+      ADMIN_HOST_PREP_TEMP_DIR: ${ADMIN_HOST_PREP_TEMP_DIR:-/app/history/truenas-jbod-ui-host-prep}
       HISTORY_SQLITE_PATH: /app/history/history.db
       HISTORY_SEGMENT_CATALOG_PATH: ${HISTORY_SEGMENT_CATALOG_PATH:-}
       HISTORY_BACKUP_DIR: ${HISTORY_BACKUP_DIR:-/app/history/backups}
