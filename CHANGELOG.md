@@ -158,6 +158,8 @@ rather than upgrading dependencies in place.
 - Corrected joined SES slot parsing so wrapped descriptor rows stay attached to
   their slots (#171, merged to `main` as
   `82e49a05f5e820d3360998d2590dfe33a1e5bad7`, and #252).
+- Selected, peer-highlighted and fabric-traced bay tiles no longer draw the dark
+  state chip over the slot number on any chassis face (#157).
 - Preflighted legacy history databases against the current schema contract
   before creating any segment, journal, or rollback artifact (#159).
 - Preserved StorCLI controller and RAID evidence across multiple ESXi
