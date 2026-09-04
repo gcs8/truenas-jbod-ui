@@ -486,6 +486,43 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertIn("1 manual mapping ", warnings[0])
             self.assertNotIn("2 manual", warnings[0])
 
+    def test_legacy_mapping_warning_checks_the_selected_drawer_slot_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
+            service.mapping_store._write({
+                "default:42": ManualMapping(slot=42, serial="SYNTH-LEGACY-42"),
+            })
+            bottom_layout: list[list[int | None]] = [
+                list(range(42, 56)),
+                list(range(56, 70)),
+                list(range(70, 84)),
+            ]
+            enclosures = [
+                EnclosureOption(
+                    id="enc-a::bottom",
+                    label="Bottom drawer",
+                    rows=3,
+                    columns=14,
+                    slot_count=42,
+                    slot_layout=bottom_layout,
+                ),
+                EnclosureOption(id="enc-b", label="Enclosure B", rows=2, columns=4, slot_count=8),
+            ]
+
+            warnings: list[str] = []
+            frame = service._resolve_layout_frame(
+                enclosures,
+                "enc-a::bottom",
+                warnings,
+                require_profile=False,
+            )
+
+            self.assertIsInstance(frame, inventory_module._LayoutFrame)
+            self.assertFalse(frame.allow_legacy_mapping_fallback)
+            self.assertEqual(set(frame.slot_positions), set(range(42, 84)))
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("1 manual mapping ", warnings[0])
+
     def test_storage_view_slot_label_honors_profile_slot_number_base(self) -> None:
         storage_view = StorageViewConfig.model_validate(
             {

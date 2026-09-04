@@ -4050,6 +4050,7 @@ class InventoryService:
             else fallback_slot_count
         )
         layout_slot_count = infer_slot_count_from_layout(layout_rows, layout_count_fallback)
+        slot_positions = layout_slot_positions(layout_rows)
         # #260 pins one mapping load per correlation pass, so the entries are
         # loaded here and read back off the frame by every caller.
         loaded_mappings = self.mapping_store.load_all()
@@ -4059,7 +4060,7 @@ class InventoryService:
                 # Drawer sub-views resolve mappings against the base shelf id,
                 # so the probe has to use the same key the correlator uses.
                 self._base_enclosure_id(resolved_meta.get("id")),
-                layout_slot_count,
+                slot_positions,
                 loaded_mappings,
             )
         return _LayoutFrame(
@@ -4070,7 +4071,7 @@ class InventoryService:
             layout_rows=layout_rows,
             layout_slot_count=layout_slot_count,
             layout_columns=layout_columns,
-            slot_positions=layout_slot_positions(layout_rows),
+            slot_positions=slot_positions,
             allow_legacy_mapping_fallback=allow_legacy_mapping_fallback,
             loaded_mappings=loaded_mappings,
         )
@@ -8458,15 +8459,15 @@ class InventoryService:
         self,
         warnings: list[str],
         enclosure_id: str | None,
-        slot_count: int,
+        slot_ids: Iterable[int],
         loaded_mappings: dict[str, ManualMapping],
     ) -> None:
         """Warn once per snapshot when legacy mapping rows cannot be applied."""
-        if slot_count <= 0 or not loaded_mappings:
+        if not loaded_mappings:
             return
         unapplied = sum(
             1
-            for slot in range(slot_count)
+            for slot in slot_ids
             if self.mapping_store.has_legacy_only_mapping(
                 self.system.id,
                 enclosure_id,
