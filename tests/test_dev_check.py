@@ -5,11 +5,13 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import dev_check
 
 
 ROOT = Path(__file__).resolve().parents[1]
+WINDOWS_NPM_SHIM = r"C:\Program Files\nodejs\npm.cmd"
 
 
 class DevCheckPlanTests(unittest.TestCase):
@@ -322,6 +324,88 @@ class DevCheckExecutionTests(unittest.TestCase):
             parser.parse_args(["--safe", "--full"])
         self.assertEqual(parser.parse_args(["--safe"]).mode, "safe")
         self.assertEqual(parser.parse_args(["--full"]).mode, "full")
+
+
+class DevCheckToolResolutionTests(unittest.TestCase):
+    def _named_check(self, plan: dev_check.Plan, name: str) -> dev_check.Check:
+        matches = [check for check in plan.checks if check.name == name]
+        self.assertEqual(len(matches), 1, f"expected exactly one {name!r} check")
+        return matches[0]
+
+    def test_npm_is_resolved_through_the_executable_finder(self) -> None:
+        plan = dev_check.build_plan(
+            "safe",
+            platform="win32",
+            root=ROOT,
+            python_executable="python.exe",
+            environment={},
+            find_executable=lambda name: WINDOWS_NPM_SHIM if name == "npm" else None,
+        )
+
+        check = self._named_check(plan, "JavaScript unit tests")
+        self.assertEqual(check.argv, (WINDOWS_NPM_SHIM, "run", "test:unit"))
+        self.assertIsNone(check.missing_tool)
+
+    def test_windows_falls_back_to_the_cmd_shim_when_the_bare_name_is_unresolvable(self) -> None:
+        plan = dev_check.build_plan(
+            "safe",
+            platform="win32",
+            root=ROOT,
+            python_executable="python.exe",
+            environment={},
+            find_executable=lambda name: WINDOWS_NPM_SHIM if name == "npm.cmd" else None,
+        )
+
+        check = self._named_check(plan, "JavaScript unit tests")
+        self.assertEqual(check.argv, (WINDOWS_NPM_SHIM, "run", "test:unit"))
+        self.assertIsNone(check.missing_tool)
+
+    def test_default_executable_finder_is_shutil_which(self) -> None:
+        with mock.patch.object(dev_check.shutil, "which", side_effect=lambda name: f"/resolved/{name}") as which:
+            plan = dev_check.build_plan(
+                "safe",
+                platform="linux",
+                root=ROOT,
+                python_executable="python",
+                environment={},
+            )
+
+        self.assertIn("npm", [call.args[0] for call in which.call_args_list])
+        self.assertEqual(
+            self._named_check(plan, "JavaScript unit tests").argv,
+            ("/resolved/npm", "run", "test:unit"),
+        )
+
+    def test_unresolvable_tool_becomes_a_named_failing_check_not_an_exception(self) -> None:
+        plan = dev_check.build_plan(
+            "safe",
+            platform="linux",
+            root=ROOT,
+            python_executable="python",
+            environment={},
+            find_executable=lambda _name: None,
+        )
+
+        check = self._named_check(plan, "JavaScript unit tests")
+        self.assertEqual(check.missing_tool, "npm")
+        self.assertEqual(check.argv, ("npm", "run", "test:unit"))
+
+        def runner(argv: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            raise AssertionError(f"unresolvable tool must not be dispatched: {argv}")
+
+        output = io.StringIO()
+        result = dev_check.run_plan(
+            dev_check.Plan(checks=(check,)),
+            root=ROOT,
+            runner=runner,
+            output=output,
+        )
+
+        summary = output.getvalue()
+        self.assertEqual(result, 1)
+        self.assertIn("FAIL  JavaScript unit tests: tool not found: npm", summary)
+        self.assertNotIn("Traceback", summary)
+        self.assertIn("FINAL: FAIL", summary)
 
 
 if __name__ == "__main__":

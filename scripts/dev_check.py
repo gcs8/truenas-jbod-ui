@@ -115,6 +115,7 @@ WINDOWS_EXCLUSIONS = (
 class Check:
     name: str
     argv: tuple[str, ...]
+    missing_tool: str | None = None
 
 
 @dataclass(frozen=True)
@@ -177,6 +178,34 @@ def _windows_test_check(root: Path, python_executable: str) -> tuple[Check, tupl
     return check, skips
 
 
+def _resolve_tool(tool: str, find_executable: ExecutableFinder, platform: str) -> str | None:
+    """Return the dispatchable path for ``tool``, or ``None`` when it is not installed.
+
+    ``subprocess.run(..., shell=False)`` on Windows only appends ``.exe`` when it resolves a
+    bare command name, so ``npm`` (shipped as ``npm.cmd``) raises ``FileNotFoundError``.
+    Resolving through ``shutil.which`` first, with an explicit ``.cmd`` fallback for the
+    Node tool shims, keeps the gate dispatchable on both platforms.
+    """
+    resolved = find_executable(tool)
+    if resolved is None and platform.startswith("win"):
+        resolved = find_executable(f"{tool}.cmd")
+    return resolved
+
+
+def _tool_check(
+    name: str,
+    tool: str,
+    args: tuple[str, ...],
+    *,
+    find_executable: ExecutableFinder,
+    platform: str,
+) -> Check:
+    resolved = _resolve_tool(tool, find_executable, platform)
+    if resolved is None:
+        return Check(name, (tool, *args), missing_tool=tool)
+    return Check(name, (resolved, *args))
+
+
 def _qa_spec_paths(root: Path) -> tuple[str, ...]:
     paths = tuple(
         path.relative_to(root).as_posix()
@@ -194,10 +223,13 @@ def build_plan(
     root: Path = ROOT,
     python_executable: str = sys.executable,
     environment: Mapping[str, str] = os.environ,
-    find_executable: ExecutableFinder = shutil.which,
+    find_executable: ExecutableFinder | None = None,
 ) -> Plan:
     if mode not in {"safe", "full"}:
         raise PlanError(f"Unsupported validation mode: {mode}")
+
+    if find_executable is None:
+        find_executable = shutil.which
 
     skips: list[Skip] = []
     if platform.startswith("win"):
@@ -252,13 +284,31 @@ def build_plan(
         ),
     ]
     checks.extend(
-        Check(f"JavaScript syntax: {path}", ("node", "--check", path))
+        _tool_check(
+            f"JavaScript syntax: {path}",
+            "node",
+            ("--check", path),
+            find_executable=find_executable,
+            platform=platform,
+        )
         for path in (*FIXED_JAVASCRIPT_PATHS, *_qa_spec_paths(root))
     )
     checks.extend(
         (
-            Check("Git diff hygiene", ("git", "diff", "--check")),
-            Check("JavaScript unit tests", ("npm", "run", "test:unit")),
+            _tool_check(
+                "Git diff hygiene",
+                "git",
+                ("diff", "--check"),
+                find_executable=find_executable,
+                platform=platform,
+            ),
+            _tool_check(
+                "JavaScript unit tests",
+                "npm",
+                ("run", "test:unit"),
+                find_executable=find_executable,
+                platform=platform,
+            ),
             Check(
                 "Performance baseline",
                 (python_executable, "scripts/build_perf_baseline.py", "--check"),
@@ -267,7 +317,7 @@ def build_plan(
     )
 
     requested_promtool = environment.get("PROMTOOL_BINARY", "promtool")
-    promtool = find_executable(requested_promtool)
+    promtool = _resolve_tool(requested_promtool, find_executable, platform)
     if promtool is None:
         skips.append(
             Skip(
@@ -300,6 +350,16 @@ def run_plan(
 ) -> int:
     results: list[tuple[str, str]] = []
     for check in plan.checks:
+        if check.missing_tool is not None:
+            print(f"MISS  {check.name}: {check.missing_tool} was not found", file=output, flush=True)
+            results.append(
+                (
+                    check.name,
+                    f"FAIL  {check.name}: tool not found: {check.missing_tool}; "
+                    "install it or add it to PATH",
+                )
+            )
+            continue
         print(f"RUN   {check.name}: {' '.join(check.argv)}", file=output, flush=True)
         try:
             completed = runner(check.argv, cwd=root, check=False, shell=False)
