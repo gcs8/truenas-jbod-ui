@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,16 @@ def _traceback_requested(record: logging.LogRecord) -> bool:
     return bool(getattr(record, INCLUDE_TRACEBACK_FIELD, False)) and bool(record.exc_info)
 
 
+def _format_traceback_without_exception_value(exc_info: Any) -> str:
+    exception_type, _exception_value, traceback_object = exc_info
+    rendered: list[str] = []
+    if traceback_object is not None:
+        rendered.append("Traceback (most recent call last):\n")
+        rendered.extend(traceback.format_tb(traceback_object))
+    rendered.append(exception_type.__name__ if exception_type is not None else "Exception")
+    return "".join(rendered)
+
+
 class JsonFormatter(logging.Formatter):
     def __init__(self, *, service_name: str | None = None) -> None:
         super().__init__()
@@ -55,7 +66,7 @@ class JsonFormatter(logging.Formatter):
         if record.exc_info and record.exc_info[0] is not None:
             payload["exception_class"] = record.exc_info[0].__name__
         if _traceback_requested(record):
-            payload["traceback"] = logging.Formatter.formatException(self, record.exc_info)
+            payload["traceback"] = _format_traceback_without_exception_value(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
 
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
@@ -90,7 +101,7 @@ class SafeTextFormatter(logging.Formatter):
             suffix = " ".join(f"{key}={value}" for key, value in fields.items())
             rendered = f"{rendered} {suffix}"
         if _traceback_requested(record):
-            traceback_text = logging.Formatter.formatException(self, record.exc_info)
+            traceback_text = _format_traceback_without_exception_value(record.exc_info)
             rendered = "\n".join((rendered, traceback_text))
         return rendered
 

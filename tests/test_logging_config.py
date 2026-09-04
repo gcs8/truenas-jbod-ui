@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from app.config import PathConfig, Settings
 from app.logging_config import (
+    INCLUDE_TRACEBACK_FIELD,
     JsonFormatter,
     SafeTextFormatter,
     configure_logging,
@@ -129,6 +130,40 @@ class LoggingConfigTests(unittest.TestCase):
             self.assertIn(expected, rendered)
         for forbidden in ("secret-token", "/private/history.db", "system-alpha", "Traceback"):
             self.assertNotIn(forbidden, rendered)
+
+    def test_opt_in_tracebacks_keep_frames_without_exception_values(self) -> None:
+        def raise_private_error(message: str) -> None:
+            raise RuntimeError(message)
+
+        private_message = "secret-token /private/history.db system-alpha"
+        exc_info = None
+        try:
+            raise_private_error(private_message)
+        except RuntimeError:
+            exc_info = sys.exc_info()
+        self.assertIsNotNone(exc_info)
+        record = logging.LogRecord(
+            name="app.observability",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="http_request_error",
+            args=(),
+            exc_info=exc_info,
+        )
+        setattr(record, INCLUDE_TRACEBACK_FIELD, True)
+
+        rendered_lines = (
+            JsonFormatter(service_name="enclosure-ui").format(record),
+            SafeTextFormatter(service_name="enclosure-ui").format(record),
+        )
+
+        for rendered in rendered_lines:
+            self.assertIn("Traceback", rendered)
+            self.assertIn("raise_private_error", rendered)
+            self.assertIn("RuntimeError", rendered)
+            for forbidden in ("secret-token", "/private/history.db", "system-alpha"):
+                self.assertNotIn(forbidden, rendered)
 
     def test_configure_logging_uses_json_stream_when_requested(self) -> None:
         settings = Settings(
