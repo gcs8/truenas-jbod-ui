@@ -1,0 +1,38 @@
+# Categories for GitHub's auto-generated release notes
+# (`gh release create --generate-notes`). A pull request lands in the first
+# category whose label it carries; `.github/workflows/pr-labels.yml` applies the
+# type labels from the conventional-commit title prefix. The Highlights and
+# Upgrade notes come from CHANGELOG.md via scripts/render_release_notes.py and
+# are passed with `--notes-file`; see CONTRIBUTING.md "Changelog And Release
+# Notes".
+changelog:
+  exclude:
+    labels:
+      - no-changelog
+  categories:
+    - title: Breaking changes
+      labels:
+        - breaking
+    - title: Security
+      labels:
+        - security
+    - title: Features
+      labels:
+        - enhancement
+    - title: Fixes
+      labels:
+        - bug
+    - title: Performance
+      labels:
+        - performance
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Internal
+      labels:
+        - internal
+        - tests
+        - ci
+    - title: Dependencies
+      labels:
+        - dependencies

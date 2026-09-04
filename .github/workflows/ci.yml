@@ -54,6 +54,39 @@ jobs:
             exit 1
           fi
 
+  changelog-entry:
+    name: Changelog entry
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a CHANGELOG entry for this pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Labels are read live so applying `no-changelog` and re-running the
+          # job takes effect without a new push. The gate script itself only
+          # runs git; it never talks to the network.
+          labels="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | join(",")')"
+          python3 scripts/check_changelog_entry.py \
+            --base "$PR_BASE_SHA" \
+            --head HEAD \
+            --pr "$PR_NUMBER" \
+            --labels "$labels"
+
   python-source:
     name: Python compile and unittest (${{ matrix.python-version }})
     runs-on: ubuntu-latest

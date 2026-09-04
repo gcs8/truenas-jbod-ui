@@ -159,7 +159,8 @@ class CIWorkflowContractTests(unittest.TestCase):
                 if match.group("version") is None:
                     uncommented.append(f"{workflow_path.name}: {action}")
 
-        self.assertEqual(action_count, 28)
+        # 28 pre-existing uses plus the changelog-entry job's checkout.
+        self.assertEqual(action_count, 29)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -267,6 +268,71 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertEqual(actions_entries[0]["directory"], "/")
         self.assertEqual(actions_entries[0]["schedule"]["interval"], "weekly")
 
+    def test_changelog_entry_gate_runs_only_for_pull_requests_without_pr_code_execution(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        job = workflow["jobs"]["changelog-entry"]
+
+        self.assertEqual(job["name"], "Changelog entry")
+        self.assertEqual(job["if"], "github.event_name == 'pull_request'")
+        self.assertEqual(job["permissions"], {"contents": "read", "pull-requests": "read"})
+        checkout = next(
+            step for step in job["steps"] if str(step.get("uses", "")).startswith("actions/checkout@")
+        )
+        self.assertEqual(checkout["with"]["fetch-depth"], 0)
+        gate_step = next(
+            step for step in job["steps"] if "check_changelog_entry.py" in str(step.get("run", ""))
+        )
+        self.assertEqual(gate_step["env"]["PR_BASE_SHA"], "${{ github.event.pull_request.base.sha }}")
+        self.assertEqual(gate_step["env"]["PR_NUMBER"], "${{ github.event.pull_request.number }}")
+        self.assertNotIn("${{", gate_step["run"])
+        self.assertIn('--labels "$labels"', gate_step["run"])
+
+    def test_pr_label_workflow_never_checks_out_or_runs_pull_request_code(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "pr-labels.yml"))
+        triggers = workflow.get("on", workflow.get(True, {}))
+
+        self.assertEqual(
+            triggers["pull_request_target"]["types"],
+            ["opened", "edited", "synchronize", "reopened"],
+        )
+        self.assertEqual(workflow["permissions"], {"pull-requests": "write"})
+        for job_name, job in workflow["jobs"].items():
+            for step in job["steps"]:
+                with self.subTest(job=job_name, step=step.get("name")):
+                    self.assertNotIn("uses", step)
+                    self.assertNotIn("${{", str(step.get("run", "")))
+        label_step = workflow["jobs"]["label"]["steps"][0]
+        self.assertEqual(label_step["env"]["PR_TITLE"], "${{ github.event.pull_request.title }}")
+        for mapping in (
+            "feat) want+=(enhancement)",
+            "fix) want+=(bug)",
+            "perf) want+=(performance)",
+            "docs) want+=(documentation)",
+            "test) want+=(tests)",
+            "ci) want+=(ci)",
+            "refactor|chore|build) want+=(internal)",
+            "security) want+=(security)",
+        ):
+            self.assertIn(mapping, label_step["run"])
+
+    def test_release_notes_categories_follow_the_documented_label_order(self) -> None:
+        config = yaml.safe_load(self.read(ROOT / ".github" / "release.yml"))
+
+        self.assertEqual(config["changelog"]["exclude"]["labels"], ["no-changelog"])
+        self.assertEqual(
+            [(category["title"], category["labels"]) for category in config["changelog"]["categories"]],
+            [
+                ("Breaking changes", ["breaking"]),
+                ("Security", ["security"]),
+                ("Features", ["enhancement"]),
+                ("Fixes", ["bug"]),
+                ("Performance", ["performance"]),
+                ("Documentation", ["documentation"]),
+                ("Internal", ["internal", "tests", "ci"]),
+                ("Dependencies", ["dependencies"]),
+            ],
+        )
+
     def test_contributing_documents_blocking_and_report_only_checks(self) -> None:
         contributing = self.read(ROOT / "CONTRIBUTING.md")
 
@@ -280,6 +346,7 @@ class CIWorkflowContractTests(unittest.TestCase):
             "JavaScript syntax and npm lock",
             "Checked-in public demo artifact",
             "Admin clean-room browser QA",
+            "Changelog entry",
         ):
             self.assertIn(required_check, contributing)
         self.assertIn("Coverage is report-only", contributing)
