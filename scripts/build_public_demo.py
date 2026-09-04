@@ -14,6 +14,7 @@ from app.services.public_demo_fixture import (  # noqa: E402
     PUBLIC_DEMO_GENERATED_AT,
     build_public_demo_html,
 )
+from scripts.public_demo_source_parity import add_source_parity_manifest  # noqa: E402
 
 
 DEFAULT_OUTPUT = ROOT / "public-demo" / "index.html"
@@ -66,10 +67,14 @@ async def run() -> int:
         output_path = ROOT / output_path
     try:
         html = normalize_artifact_html(await build_public_demo_html())
+        html = add_source_parity_manifest(html, source_root=ROOT)
     except RuntimeError as exc:
         print(f"Public demo generation failed: {exc}", file=sys.stderr)
         if "history/history.db" in str(exc):
             print(LOCAL_HISTORY_GUIDANCE, file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"Public demo source parity generation failed: {exc}", file=sys.stderr)
         return 1
 
     if args.check:

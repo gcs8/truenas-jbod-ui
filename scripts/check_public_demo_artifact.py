@@ -7,6 +7,14 @@ import re
 import sys
 
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app import __version__  # noqa: E402
+from scripts.public_demo_source_parity import check_source_parity_manifest  # noqa: E402
+
+
 DEFAULT_DEMO_DIR = Path("public-demo")
 DEFAULT_MAX_RAW_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_GZIP_BYTES = 1_835_008
@@ -42,6 +50,9 @@ REQUIRED_MARKERS: tuple[str, ...] = (
 FORBIDDEN_MARKERS: tuple[tuple[str, str], ...] = (
     ("snapshot Storage Fabric route action", 'id="sas-fabric-view-link"'),
 )
+ARTIFACT_VERSION_PATTERN = re.compile(
+    r"\bArtifact app v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)\b"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,6 +83,12 @@ def parse_args() -> argparse.Namespace:
             "Maximum allowed gzip-9 index.html size in bytes. "
             f"Defaults to {DEFAULT_MAX_GZIP_BYTES}; pass 0 to disable."
         ),
+    )
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=ROOT,
+        help="Repository root containing authoritative app assets and templates.",
     )
     return parser.parse_args()
 
@@ -107,9 +124,21 @@ def main() -> int:
         )
 
     html = raw_bytes.decode("utf-8")
+    errors.extend(check_source_parity_manifest(html, source_root=args.source_root))
     for marker in REQUIRED_MARKERS:
         if marker not in html:
             errors.append(f"missing required marker: {marker}")
+
+    artifact_versions = {
+        match.group("version") for match in ARTIFACT_VERSION_PATTERN.finditer(html)
+    }
+    if not artifact_versions:
+        errors.append("missing parseable artifact app version")
+    for artifact_version in sorted(artifact_versions):
+        if artifact_version != __version__:
+            errors.append(
+                f"artifact app version {artifact_version} does not match source {__version__}"
+            )
 
     for label, marker in FORBIDDEN_MARKERS:
         if marker in html:

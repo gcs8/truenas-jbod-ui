@@ -10,6 +10,7 @@ const APP_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8")
 const ADMIN_SOURCE = fs.readFileSync(path.join(ROOT, "admin_service/static/admin.js"), "utf8");
 const TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/index.html"), "utf8");
 const STYLE = fs.readFileSync(path.join(ROOT, "app/static/style.css"), "utf8");
+const PUBLIC_DEMO_ARTIFACT = fs.readFileSync(path.join(ROOT, "public-demo/index.html"), "utf8");
 
 function functionSource(source, name) {
   const patterns = [`async function ${name}(`, `function ${name}(`];
@@ -119,4 +120,14 @@ test("dead per-key cancellation stays absent while pagehide keeps cancel-all wir
     /window\.addEventListener\("pagehide", \(\) => cancelAllRuntimeActionPolling\(\)\)/,
     "pagehide must cancel every pending runtime action",
   );
+});
+
+test("public demo artifact contains no source-deleted UI paths", () => {
+  for (const symbol of [
+    "renderStorageViewsRuntime",
+    "initializeSystemSetupForm",
+    "handleSasFabricViewLinkClick",
+  ]) {
+    assertAbsent(PUBLIC_DEMO_ARTIFACT, new RegExp(`\\b${symbol}\\b`), `${symbol} must stay deleted from the artifact`);
+  }
 });

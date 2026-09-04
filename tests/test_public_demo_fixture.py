@@ -5,7 +5,9 @@ import asyncio
 import contextlib
 import hashlib
 import io
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,7 @@ from pathlib import Path
 import unittest
 from unittest import mock
 
+from app import __version__
 from app.services.public_demo_fixture import (
     PUBLIC_DEMO_GENERATED_AT,
     PUBLIC_DEMO_HISTORY_WINDOW_HOURS,
@@ -23,6 +26,11 @@ from app.services.snapshot_export import (
     EXPORT_HISTORY_CACHE,
     EXPORT_RENDER_CACHE,
     EXPORT_ZIP_CACHE,
+)
+from scripts.public_demo_source_parity import (
+    SOURCE_INPUT_PATHS,
+    SOURCE_PARITY_PREFIX,
+    check_source_parity_manifest,
 )
 
 
@@ -41,23 +49,47 @@ def clear_export_caches() -> None:
 
 
 class PublicDemoArtifactTests(unittest.TestCase):
-    def _write_minimal_demo_artifact(self, demo_dir: Path, *, padding: str = "") -> None:
+    def _copy_checked_demo_artifact(self, demo_dir: Path, *, padding: str = "") -> None:
         demo_dir.mkdir(parents=True, exist_ok=True)
-        marker_html = "\n".join(
-            (
-                "Frozen Sanitized Snapshot",
-                "Artifact app v0.0.0-test",
-                "Capture time",
-                "Live-derived CORE 60-bay sample",
-                "Scrambled IDs",
-                "4x NVMe Carrier Card",
-                "Boot SATADOMs",
-                "mirror-8",
-                padding,
-            )
-        )
-        (demo_dir / "index.html").write_text(marker_html, encoding="utf-8")
+        artifact_html = (ROOT / "public-demo" / "index.html").read_text(encoding="utf-8")
+        (demo_dir / "index.html").write_text(artifact_html + padding, encoding="utf-8")
         (demo_dir / ".nojekyll").write_text("", encoding="utf-8")
+
+    def _assert_source_change_rejects_checked_artifact(self, source_path: Path) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            source_root = temp_root / "source"
+            demo_dir = temp_root / "public-demo"
+            demo_dir.mkdir()
+            shutil.copy2(ROOT / "public-demo" / "index.html", demo_dir / "index.html")
+            (demo_dir / ".nojekyll").write_text("", encoding="utf-8")
+            source_paths = tuple(dict.fromkeys((*SOURCE_INPUT_PATHS, source_path)))
+            for relative_path in source_paths:
+                target = source_root / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative_path, target)
+
+            changed_source = source_root / source_path
+            changed_source.write_bytes(changed_source.read_bytes() + b"\nsource-parity-test-change\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/check_public_demo_artifact.py",
+                    str(demo_dir),
+                    "--source-root",
+                    str(source_root),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            artifact_html = (demo_dir / "index.html").read_text(encoding="utf-8")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"source fingerprint mismatch: {source_path.as_posix()}", result.stderr)
+        self.assertIn(f"Artifact app v{__version__}", artifact_html)
 
     def test_checked_in_public_demo_artifact_is_publishable(self) -> None:
         result = subprocess.run(
@@ -84,10 +116,100 @@ class PublicDemoArtifactTests(unittest.TestCase):
         self.assertIn("raw=", result.stdout)
         self.assertIn("gzip=", result.stdout)
 
+    def test_old_artifact_is_rejected_when_app_javascript_changes_without_version_bump(self) -> None:
+        self._assert_source_change_rejects_checked_artifact(Path("app/static/app.js"))
+
+    def test_old_artifact_is_rejected_when_app_stylesheet_changes_without_version_bump(self) -> None:
+        self._assert_source_change_rejects_checked_artifact(Path("app/static/style.css"))
+
+    def test_old_artifact_is_rejected_when_base_template_changes_without_version_bump(self) -> None:
+        self._assert_source_change_rejects_checked_artifact(Path("app/templates/base.html"))
+
+    def test_old_artifact_is_rejected_when_index_template_changes_without_version_bump(self) -> None:
+        self._assert_source_change_rejects_checked_artifact(Path("app/templates/index.html"))
+
+    def test_generator_source_manifest_includes_fixture_builder_and_snapshot_renderer(self) -> None:
+        source_paths = {path.as_posix() for path in SOURCE_INPUT_PATHS}
+
+        self.assertIn("app/services/public_demo_fixture.py", source_paths)
+        self.assertIn("app/services/snapshot_export.py", source_paths)
+
+    def test_old_artifact_is_rejected_when_fixture_builder_changes_without_version_bump(self) -> None:
+        self._assert_source_change_rejects_checked_artifact(
+            Path("app/services/public_demo_fixture.py")
+        )
+
+    def test_old_artifact_is_rejected_when_snapshot_renderer_changes_without_version_bump(self) -> None:
+        self._assert_source_change_rejects_checked_artifact(
+            Path("app/services/snapshot_export.py")
+        )
+
+    def test_public_demo_without_source_parity_manifest_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            demo_dir.mkdir(parents=True)
+            (demo_dir / "index.html").write_text(
+                "\n".join(
+                    (
+                        "Frozen Sanitized Snapshot",
+                        f"Artifact app v{__version__}",
+                        "Capture time",
+                        "Live-derived CORE 60-bay sample",
+                        "Scrambled IDs",
+                        "4x NVMe Carrier Card",
+                        "Boot SATADOMs",
+                        "mirror-8",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            (demo_dir / ".nojekyll").write_text("", encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing public demo source parity manifest", result.stderr)
+
+    def test_source_fingerprints_are_bound_to_embedded_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            self._copy_checked_demo_artifact(demo_dir)
+            artifact_path = demo_dir / "index.html"
+            manifest_line, artifact_html = artifact_path.read_text(encoding="utf-8").split("\n", 1)
+            manifest = json.loads(manifest_line.removeprefix(SOURCE_PARITY_PREFIX).removesuffix(" -->"))
+            artifact_html = artifact_html.replace(
+                "Frozen Sanitized Snapshot",
+                "Frozen Sanitized Snapshot ",
+                1,
+            )
+            manifest["artifact_sha256"] = hashlib.sha256(artifact_html.encode("utf-8")).hexdigest()
+            artifact_path.write_text(
+                f"{SOURCE_PARITY_PREFIX}{json.dumps(manifest, sort_keys=True, separators=(',', ':'))} -->\n"
+                f"{artifact_html}",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("source/output parity fingerprint mismatch", result.stderr)
+
     def test_public_demo_without_storage_fabric_route_action_is_publishable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             demo_dir = Path(temp_dir) / "public-demo"
-            self._write_minimal_demo_artifact(demo_dir)
+            self._copy_checked_demo_artifact(demo_dir)
 
             result = subprocess.run(
                 [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir)],
@@ -99,10 +221,59 @@ class PublicDemoArtifactTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_public_demo_artifact_version_must_match_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            self._copy_checked_demo_artifact(demo_dir)
+            artifact_path = demo_dir / "index.html"
+            artifact_path.write_text(
+                artifact_path.read_text(encoding="utf-8").replace(
+                    f"Artifact app v{__version__}",
+                    "Artifact app v0.0.0-stale",
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("artifact app version 0.0.0-stale does not match source", result.stderr)
+        self.assertIn(__version__, result.stderr)
+
+    def test_public_demo_artifact_version_must_be_parseable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            self._copy_checked_demo_artifact(demo_dir)
+            artifact_path = demo_dir / "index.html"
+            artifact_path.write_text(
+                artifact_path.read_text(encoding="utf-8").replace(
+                    f"Artifact app v{__version__}",
+                    "Artifact app v",
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing parseable artifact app version", result.stderr)
+
     def test_public_demo_storage_fabric_route_action_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             demo_dir = Path(temp_dir) / "public-demo"
-            self._write_minimal_demo_artifact(demo_dir)
+            self._copy_checked_demo_artifact(demo_dir)
             with (demo_dir / "index.html").open("a", encoding="utf-8") as artifact:
                 artifact.write('\n<a id="sas-fabric-view-link" href="#sas-fabric-panel">Storage Fabric</a>\n')
 
@@ -120,7 +291,7 @@ class PublicDemoArtifactTests(unittest.TestCase):
     def test_checked_in_public_demo_artifact_enforces_raw_size_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             demo_dir = Path(temp_dir) / "public-demo"
-            self._write_minimal_demo_artifact(demo_dir, padding="x" * 128)
+            self._copy_checked_demo_artifact(demo_dir, padding="x" * 128)
 
             result = subprocess.run(
                 [
@@ -143,7 +314,7 @@ class PublicDemoArtifactTests(unittest.TestCase):
     def test_checked_in_public_demo_artifact_enforces_gzip_size_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             demo_dir = Path(temp_dir) / "public-demo"
-            self._write_minimal_demo_artifact(demo_dir, padding="x" * 128)
+            self._copy_checked_demo_artifact(demo_dir, padding="x" * 128)
 
             result = subprocess.run(
                 [
@@ -170,7 +341,7 @@ class PublicDemoArtifactTests(unittest.TestCase):
 
         for marker in (
             "Frozen Sanitized Snapshot",
-            "Artifact app v0.21.0-dev",
+            f"Artifact app v{__version__}",
             "Capture time",
             PUBLIC_DEMO_GENERATED_AT.isoformat(),
             "Live-derived CORE 60-bay sample",
@@ -185,6 +356,33 @@ class PublicDemoArtifactTests(unittest.TestCase):
 
 
 class PublicDemoBuildScriptTests(unittest.TestCase):
+    def test_publish_workflow_watches_source_parity_generators(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "publish-public-demo.yml").read_text(encoding="utf-8")
+
+        self.assertIn('- "scripts/build_public_demo.py"', workflow)
+        self.assertIn('- "scripts/public_demo_source_parity.py"', workflow)
+
+    def test_build_script_embeds_source_and_output_fingerprints(self) -> None:
+        from scripts import build_public_demo as build_script
+
+        checked_artifact = (ROOT / "public-demo" / "index.html").read_text(encoding="utf-8")
+        generated_html = checked_artifact.split("\n", 1)[1]
+        async_build = mock.AsyncMock(return_value=generated_html)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "index.html"
+            args = argparse.Namespace(output=output_path, check=False)
+            with (
+                mock.patch.object(build_script, "build_public_demo_html", new=async_build),
+                mock.patch.object(build_script, "parse_args", return_value=args),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = asyncio.run(build_script.run())
+            artifact_html = output_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result, 0)
+        self.assertTrue(artifact_html.startswith(SOURCE_PARITY_PREFIX))
+        self.assertEqual(check_source_parity_manifest(artifact_html, source_root=ROOT), [])
+
     def test_current_source_browser_fixture_requires_explicit_output(self) -> None:
         result = subprocess.run(
             [sys.executable, "scripts/build_current_source_browser_fixture.py"],
@@ -317,6 +515,26 @@ class PublicDemoBuildScriptTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("history/history.db", stderr.getvalue())
         self.assertIn("Clean CI validates", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_build_script_reports_source_parity_errors_without_traceback(self) -> None:
+        from scripts import build_public_demo as build_script
+
+        async_build = mock.AsyncMock(return_value="<!DOCTYPE html><html></html>\n")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = argparse.Namespace(output=Path(temp_dir) / "index.html", check=False)
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(build_script, "build_public_demo_html", new=async_build),
+                mock.patch.object(build_script, "parse_args", return_value=args),
+                contextlib.redirect_stderr(stderr),
+                contextlib.redirect_stdout(stdout),
+            ):
+                result = asyncio.run(build_script.run())
+
+        self.assertEqual(result, 1)
+        self.assertIn("source parity", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
 
