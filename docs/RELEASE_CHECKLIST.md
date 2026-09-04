@@ -173,6 +173,11 @@ the final release-wrap validator:
     UI-bearing mode. Keep this full matrix
     off hosted CI. This synthetic gate does not use appliance or private data; a
     production-derived restore is a separate private QA gate
+  - The separate production-derived restore gate is
+    `scripts/run_private_qa_restore.py`. Its host requirements, approval token,
+    egress boundary, and evidence expectations are documented in
+    [`docs/PRIVATE_QA_RESTORE.md`](./PRIVATE_QA_RESTORE.md). Run it only on a
+    disposable Docker host, never on hosted CI
   - Before the local matrix, require at least 3,072 MiB of available memory,
     5 GiB of free scratch space, no existing containers with the reserved JBOD
     UI names, and three unused loopback ports. Choose the ports from live state;

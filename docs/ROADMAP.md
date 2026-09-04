@@ -36,10 +36,25 @@ validation, and PR #121 merged as
 after crash-safe later-generation segment rotation landed in #162. These items
 are completed post-`v0.22.2` work, not open `v0.22.3` prerequisites.
 
+Work merged after that reconciliation (#257 through #271) is also completed
+post-`v0.22.2` work: the remaining public platform and setup documents were
+scrubbed of lab identifiers behind an allowlist scanner (#257), the performance
+baseline moved from whole-artifact equality to structural invariants with hard
+ceilings (#258), `scripts/dev_check.py` became the platform-aware Tier 1 source
+gate (#259), the slot-detail store and profile validation gained fail-soft
+degradation plus an unknown-profile-ID warning (#260), the browser fixtures and
+publish workflows were hardened (#261), the remaining frontend heat-map,
+selector, grid-navigation, and snapshot-route gaps closed (#262 and #271), SES
+slot evidence parsing was hardened (#265), segment sealing stopped reacting to
+source access time (#264), and five structural refactors extracted the
+inventory, fabric, route, and parser seams without behavior change (#266
+through #270).
+
 - runtime deployment can be pinned to an immutable GHCR digest with a private
   receipt, convergence checks, and rollback evidence
-- non-root runtime support remains opt-in, with bounded ownership and permission
-  controls for persistent paths
+- the default Compose runtime now runs the UI and history services non-root with
+  read-only image filesystems and a required ownership preflight, with bounded
+  ownership and permission controls for persistent paths
 - deterministic 60-slot and 347-slot budgets cover inventory, history, export,
   cache, and query paths
 - browser history and export caches are bounded by age, entry count, and bytes
