@@ -583,6 +583,9 @@ labels plus that file. The rules:
   that is invisible to operators (tests-only, CI-only, tooling). It needs no
   entry and is excluded from the generated release notes. Re-run the
   `Changelog entry` job after applying the label; it reads labels live.
+  The `dependencies` label (Dependabot) skips the entry gate the same way,
+  but those pull requests still appear in the release body under
+  Dependencies.
 
 Two scripts enforce this:
 

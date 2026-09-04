@@ -15,7 +15,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   changes or Upgrade notes that names the variable, file, or action an
   operator must handle, ending with `(#N)`.
 - A pull request labelled `no-changelog` needs no entry (tests-only, CI-only,
-  or otherwise invisible to operators).
+  or otherwise invisible to operators). A `dependencies` (Dependabot) pull
+  request needs no entry either; it reaches the release body through its
+  label.
 - CI enforces the per-PR line with scripts/check_changelog_entry.py; the
   release gate scripts/check_release_changelog_coverage.py checks that every
   pull request merged since the previous tag is named in the release section.

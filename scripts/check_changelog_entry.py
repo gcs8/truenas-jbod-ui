@@ -3,8 +3,9 @@
 The gate reads the ``base...head`` diff of one pull request with ``git`` only.
 It never talks to the network. When the diff touches a path that operators can
 notice (application code, service code, scripts, Compose files, config
-examples, docs, or the wiki) and the pull request does not carry the
-``no-changelog`` label, the diff must add at least one bullet under
+examples, docs, or the wiki) and the pull request carries neither the
+``no-changelog`` nor the ``dependencies`` label, the diff must add at least
+one bullet under
 ``## Unreleased`` in one of the allowed ``### `` subsections whose trailing
 parenthetical names the pull request as ``(#N)``. A pull request labelled
 ``breaking`` must add that bullet under ``### Breaking changes`` or
@@ -33,6 +34,9 @@ from pathlib import Path
 CHANGELOG_PATH = "CHANGELOG.md"
 UNRELEASED_HEADING = "## Unreleased"
 NO_CHANGELOG_LABEL = "no-changelog"
+# Dependabot pull requests cannot add a changelog line; they still reach the
+# release body under "Dependencies" through .github/release.yml.
+SKIP_LABELS = (NO_CHANGELOG_LABEL, "dependencies")
 BREAKING_LABEL = "breaking"
 
 ALLOWED_SUBSECTIONS = (
@@ -214,10 +218,11 @@ def evaluate(
     paths = changed_paths(repo, base, head)
     relevant = sorted(path for path in paths if is_relevant_path(path))
 
-    if NO_CHANGELOG_LABEL in labels:
+    skipping = [label for label in SKIP_LABELS if label in labels]
+    if skipping:
         return GateResult(
             True,
-            [f"{NO_CHANGELOG_LABEL} label present; CHANGELOG entry not required for #{pr_number}."],
+            [f"{skipping[0]} label present; CHANGELOG entry not required for #{pr_number}."],
         )
     if not relevant:
         return GateResult(
