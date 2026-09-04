@@ -10,7 +10,11 @@ from pathlib import Path
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
-from admin_service.services.account_bootstrap import ServiceAccountBootstrapService
+from admin_service.services.account_bootstrap import (
+    ServiceAccountBootstrapService,
+    saved_sudo_commands_for_system,
+)
+from app.config import Settings, SSHConfig, SystemConfig
 from app.models.domain import SystemSetupBootstrapRequest
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.ssh_probe import SSHCommandResult
@@ -243,6 +247,59 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
         self.assertIn("/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*", content)
         self.assertIn("/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*", content)
         self.assertIn("/usr/sbin/smartctl -x -j *", content)
+        self.assertNotIn("sudo -n", content)
+
+    def test_saved_sudo_commands_for_system_returns_only_saved_sudo_lines(self) -> None:
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="saved-scale",
+                    ssh=SSHConfig(
+                        enabled=True,
+                        host="saved.example.test",
+                        user="jbodmap",
+                        commands=[
+                            "/usr/sbin/zpool status -gP",
+                            "  sudo -n /usr/sbin/smartctl -a /dev/sda  ",
+                            "sudo -n /usr/bin/sg_ses -p ec /dev/sg1",
+                        ],
+                    ),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            saved_sudo_commands_for_system(settings, "saved-scale"),
+            [
+                "sudo -n /usr/sbin/smartctl -a /dev/sda",
+                "sudo -n /usr/bin/sg_ses -p ec /dev/sg1",
+            ],
+        )
+        self.assertEqual(saved_sudo_commands_for_system(settings, None), [])
+        self.assertEqual(saved_sudo_commands_for_system(settings, "   "), [])
+        with self.assertRaisesRegex(ValueError, "saved SSH command list is unavailable"):
+            saved_sudo_commands_for_system(settings, "removed-system")
+
+    def test_saved_sudo_commands_feed_the_same_normalizer_as_the_request_list(self) -> None:
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="saved-scale",
+                    ssh=SSHConfig(
+                        enabled=True,
+                        host="saved.example.test",
+                        user="jbodmap",
+                        commands=["sudo -n /usr/sbin/smartctl -a /dev/sda"],
+                    ),
+                )
+            ]
+        )
+        saved = saved_sudo_commands_for_system(settings, "saved-scale")
+
+        content = ServiceAccountBootstrapService._build_sudoers_content("jbodmap", "scale", saved)
+
+        self.assertIn("/usr/sbin/smartctl -a /dev/sda", content)
+        self.assertNotIn("/usr/bin/sg_ses -p aes /dev/sg*", content)
         self.assertNotIn("sudo -n", content)
 
 

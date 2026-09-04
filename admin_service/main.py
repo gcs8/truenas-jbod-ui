@@ -24,7 +24,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from admin_service.config import AdminSettings, get_admin_settings
-from admin_service.services.account_bootstrap import ServiceAccountBootstrapService
+from admin_service.services.account_bootstrap import (
+    ServiceAccountBootstrapService,
+    saved_sudo_commands_for_system,
+)
 from admin_service.services.esxi_host_prep import ESXiHostPrepService
 from admin_service.services.esxi_host_prep import MAX_UPLOAD_BYTES as MAX_ESXI_HOST_PREP_UPLOAD_BYTES
 from admin_service.services.maintenance import AdminMaintenanceService

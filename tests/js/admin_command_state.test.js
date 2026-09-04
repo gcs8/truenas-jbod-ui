@@ -28,8 +28,8 @@ function functionSource(name) {
   assert.fail(`unterminated ${name}`);
 }
 
-function loadFunctions(names) {
-  const context = vm.createContext({});
+function loadFunctions(names, bindings = {}) {
+  const context = vm.createContext({ ...bindings });
   vm.runInContext(
     `${names.map(functionSource).join("\n")}\nglobalThis.__tested = { ${names.join(", ")} };`,
     context,
@@ -149,4 +149,70 @@ test("probe and host-prep request bodies omit command preservation controls", ()
     const source = functionSource(name);
     assert.doesNotMatch(source, /ssh_commands_(?:action|source_system_id)/);
   }
+});
+
+test("bootstrap and sudoers preview payloads carry the saved-command handle while placeholders are unchanged", () => {
+  const field = { value: "", dataset: {} };
+  const elements = {
+    setupSshCommands: field,
+    setupPlatform: { value: "scale" },
+    setupSshUser: { value: "jbodmap" },
+    setupBootstrapInstallSudo: { checked: true },
+  };
+  const {
+    loadSshCommandState,
+    collectBootstrapSudoCommandPayload,
+    collectSudoersPreviewPayload,
+  } = loadFunctions(
+    [
+      "normalizeCommandText",
+      "loadSshCommandState",
+      "unchangedRedactedSshCommands",
+      "collectSetupCommands",
+      "collectBootstrapSudoCommands",
+      "collectBootstrapSudoCommandPayload",
+      "collectSudoersPreviewPayload",
+    ],
+    {
+      elements,
+      bootstrapEnabledForSession: () => true,
+      recommendedSshUserForPlatform: () => "jbodmap",
+    }
+  );
+
+  loadSshCommandState(field, {
+    id: "source-system",
+    ssh_commands: ["Saved command 1 (hidden)", "Saved command 2 (hidden)"],
+    ssh_commands_redacted: true,
+  });
+
+  assert.deepEqual(plain(collectBootstrapSudoCommandPayload()), {
+    sudo_commands: [],
+    ssh_commands_source_system_id: "source-system",
+  });
+  assert.deepEqual(plain(collectSudoersPreviewPayload()), {
+    platform: "scale",
+    service_user: "jbodmap",
+    install_sudo_rules: true,
+    sudo_commands: [],
+    ssh_commands_source_system_id: "source-system",
+  });
+
+  field.value = "sudo -n /usr/sbin/smartctl -a /dev/sda\n/usr/sbin/zpool status -gP";
+  assert.deepEqual(plain(collectBootstrapSudoCommandPayload()), {
+    sudo_commands: ["sudo -n /usr/sbin/smartctl -a /dev/sda"],
+    ssh_commands_source_system_id: null,
+  });
+
+  field.value = "";
+  assert.deepEqual(plain(collectBootstrapSudoCommandPayload()), {
+    sudo_commands: [],
+    ssh_commands_source_system_id: null,
+  });
+});
+
+test("the one-time bootstrap request body uses the shared sudo command payload", () => {
+  const bootstrapSource = functionSource("collectBootstrapPayload");
+  assert.match(bootstrapSource, /\.\.\.collectBootstrapSudoCommandPayload\(\)/);
+  assert.doesNotMatch(bootstrapSource, /sudo_commands: collectBootstrapSudoCommands\(\)/);
 });

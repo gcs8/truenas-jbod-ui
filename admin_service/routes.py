@@ -777,6 +777,15 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         settings = reload_app_settings()
         bootstrap_service = ServiceAccountBootstrapService(settings.config_file)
         try:
+            if not payload.sudo_commands and payload.ssh_commands_source_system_id:
+                payload = payload.model_copy(
+                    update={
+                        "sudo_commands": saved_sudo_commands_for_system(
+                            settings,
+                            payload.ssh_commands_source_system_id,
+                        )
+                    }
+                )
             result = await asyncio.to_thread(bootstrap_service.bootstrap_service_account, payload)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -785,12 +794,18 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
     @router.post("/api/admin/system-setup/sudoers-preview")
     async def preview_sudoers_file(payload: SystemSetupSudoPreviewRequest) -> JSONResponse:
         try:
+            requested_commands = list(payload.sudo_commands)
+            if not requested_commands and payload.ssh_commands_source_system_id:
+                requested_commands = saved_sudo_commands_for_system(
+                    reload_app_settings(),
+                    payload.ssh_commands_source_system_id,
+                )
             result = await asyncio.to_thread(
                 ServiceAccountBootstrapService.build_sudoers_preview,
                 payload.service_user,
                 payload.platform,
                 install_sudo_rules=payload.install_sudo_rules,
-                requested_commands=payload.sudo_commands,
+                requested_commands=requested_commands,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
