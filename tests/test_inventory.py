@@ -6396,13 +6396,125 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsNone(returned)
 
+    async def test_run_ssh_commands_rejects_unapproved_caller_destination_before_transport(self) -> None:
+        observed_transport_hosts: list[str] = []
+
+        async def record_transport(probe: SSHProbe, commands, *, stdin_data=None):
+            observed_transport_hosts.append(probe.config.host)
+            return [
+                SSHCommandResult(command=command, ok=True, stdout="synthetic", exit_code=0)
+                for command in commands
+            ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="synthetic-quantastor",
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="approved-node.example.test",
+                    user="synthetic-operator",
+                    password="SYNTHETIC-SAVED-SSH-PASSWORD-362",
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                SSHProbe(system.ssh),
+                temp_dir,
+            )
+
+            with patch.object(SSHProbe, "run_commands", new=record_transport):
+                results = await service._run_ssh_commands(
+                    ["synthetic-read-only-command"],
+                    "replacement-node.example.test",
+                )
+
+        self.assertEqual(observed_transport_hosts, [])
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].ok)
+        self.assertIn("not an operator-approved destination", results[0].stderr)
+
+    async def test_quantastor_cli_does_not_send_credentials_to_appliance_discovered_host(self) -> None:
+        observed_transport_hosts: list[str] = []
+
+        async def record_transport(probe: SSHProbe, commands, *, stdin_data=None):
+            observed_transport_hosts.append(probe.config.host)
+            return [
+                SSHCommandResult(command=command, ok=True, stdout="synthetic", exit_code=0)
+                for command in commands
+            ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="synthetic-quantastor",
+                truenas=TrueNASConfig(
+                    host="https://saved-api.example.test",
+                    platform="quantastor",
+                    api_user="synthetic-api-operator",
+                    api_password="SYNTHETIC-SAVED-API-PASSWORD-362",
+                ),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="saved-api.example.test",
+                    ha_enabled=True,
+                    user="synthetic-ssh-operator",
+                    password="SYNTHETIC-SAVED-SSH-PASSWORD-362",
+                ),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                SSHProbe(system.ssh),
+                temp_dir,
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[
+                    {
+                        "id": "node-from-appliance",
+                        "name": "Synthetic appliance node",
+                        "mainIpAddress": "replacement-node.example.test",
+                        "storageSystemClusterId": "synthetic-cluster",
+                    }
+                ],
+                disks=[],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[
+                    {"id": "synthetic-enclosure", "storageSystemId": "node-from-appliance"}
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            with patch.object(SSHProbe, "run_commands", new=record_transport):
+                _overlay, failures = await service._fetch_quantastor_cli_overlay(raw_data)
+
+        self.assertEqual(observed_transport_hosts, [])
+        self.assertTrue(failures)
+        self.assertTrue(
+            all("not an operator-approved destination" in failure for failure in failures)
+        )
+
     async def test_ssh_batches_for_different_hosts_are_not_globally_serialized(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
             system = SystemConfig(
                 id="multi-host",
                 truenas=TrueNASConfig(platform="quantastor"),
-                ssh=SSHConfig(enabled=True, host="192.0.2.10", user="operator"),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="192.0.2.10",
+                    extra_hosts=["192.0.2.11"],
+                    user="operator",
+                ),
             )
             service = build_inventory_service(
                 settings,

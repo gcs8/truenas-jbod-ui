@@ -16,7 +16,6 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -62,9 +61,15 @@ from app.models.domain import (
     TLSCertificateInspectRequest,
     TLSRemoteCertificateTrustRequest,
 )
-from app.services.profile_builder import ProfileBuilderService, collect_profile_references
+from app.services.credential_authority import (
+    api_credential_authority,
+    credential_authorities_are_approved,
+    same_credential_authority,
+    ssh_credential_authorities,
+)
 from app.services.demo_system_factory import DemoSystemFactory
 from app.services.inventory import InventoryService
+from app.services.profile_builder import ProfileBuilderService, collect_profile_references
 from app.services.profile_registry import ProfileRegistry, build_profile_reference_warnings
 from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
 from app.services.quantastor_cli import build_quantastor_cli_invocation
@@ -305,39 +310,6 @@ def resolve_saved_secondary_secret(
         )
     existing = saved_value(system) if system is not None else None
     return resolve_preserved_secret(incoming, existing)
-
-
-def same_saved_endpoint(left: str | None, right: str | None) -> bool:
-    def endpoint_identity(value: str | None) -> tuple[Any, ...] | None:
-        normalized = normalize_text(value)
-        if not normalized:
-            return None
-        candidate = normalized if "://" in normalized else f"//{normalized}"
-        try:
-            parsed = urlsplit(candidate)
-            port = parsed.port
-        except ValueError:
-            return None
-        if parsed.hostname is None:
-            return None
-        return (
-            parsed.scheme.lower(),
-            parsed.username,
-            parsed.password,
-            parsed.hostname.lower(),
-            port,
-            parsed.path.rstrip("/"),
-            parsed.query,
-            parsed.fragment,
-        )
-
-    left_identity = endpoint_identity(left)
-    right_identity = endpoint_identity(right)
-    return left_identity is not None and right_identity is not None and left_identity == right_identity
-
-
-def same_saved_text(left: str | None, right: str | None) -> bool:
-    return (normalize_text(left) or "") == (normalize_text(right) or "")
 
 
 @lru_cache

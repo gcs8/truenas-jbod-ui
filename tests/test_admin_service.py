@@ -3656,6 +3656,69 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(discovery_payload.ssh_password, MARKER_BRAVO)
         self.assertEqual(discovery_payload.ssh_timeout_seconds, 45)
 
+    def test_quantastor_discovery_rejects_preserved_ssh_password_for_caller_supplied_ha_destination(self) -> None:
+        route = next(
+            route
+            for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/quantastor-nodes"
+        )
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="saved-quantastor",
+                    truenas=TrueNASConfig(
+                        host="https://saved-api.example.test",
+                        platform="quantastor",
+                        api_user="saved-api-operator",
+                        api_password="SYNTHETIC-SAVED-API-PASSWORD-362",
+                    ),
+                    ssh=SSHConfig(
+                        enabled=True,
+                        host="saved-node-a.example.test",
+                        ha_enabled=True,
+                        ha_nodes=[
+                            {"system_id": "node-a", "host": "saved-node-a.example.test"},
+                        ],
+                        user="saved-ssh-operator",
+                        password="SYNTHETIC-SAVED-SSH-PASSWORD-362",
+                    ),
+                )
+            ]
+        )
+        client = MagicMock()
+        client.fetch_all = AsyncMock(return_value=SimpleNamespace())
+        enrich = AsyncMock(return_value={"attempted": False, "ok": True})
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.main.QuantastorRESTClient", return_value=client) as client_factory:
+                with patch("admin_service.main.serialize_quantastor_nodes", return_value=[]):
+                    with patch("admin_service.main.enrich_quantastor_nodes_from_ssh", enrich):
+                        with self.assertRaises(HTTPException) as captured:
+                            asyncio.run(
+                                route.endpoint(
+                                    QuantastorNodeDiscoveryRequest(
+                                        system_id="saved-quantastor",
+                                        truenas_host="https://saved-api.example.test",
+                                        api_user="saved-api-operator",
+                                        api_password="SYNTHETIC-FRESH-API-PASSWORD-362",
+                                        ssh_enabled=True,
+                                        ssh_host="saved-node-a.example.test",
+                                        ssh_user="saved-ssh-operator",
+                                        ssh_password=PRESERVE_SECRET_SENTINEL,
+                                        ha_nodes=[
+                                            {
+                                                "system_id": "node-b",
+                                                "host": "replacement-node-b.example.test",
+                                            }
+                                        ],
+                                    )
+                                )
+                            )
+
+        self.assertEqual(captured.exception.status_code, 400)
+        client_factory.assert_not_called()
+        enrich.assert_not_awaited()
+
     def test_quantastor_discovery_rejects_saved_secrets_for_different_endpoint(self) -> None:
         route = next(
             route

@@ -4889,19 +4889,19 @@ class SystemSetupServiceTests(unittest.TestCase):
                 system_id="archive-core",
                 label="Archive CORE Revised",
                 platform="core",
-                truenas_host="https://archive-core-new.local",
+                truenas_host="https://archive-core.local",
                 api_key=PRESERVE_SECRET_SENTINEL,
                 api_user="root",
                 api_password=PRESERVE_SECRET_SENTINEL,
-                verify_ssl=False,
+                verify_ssl=True,
                 ssh_enabled=True,
-                ssh_host="archive-core-new.local",
+                ssh_host="archive-core.local",
                 ssh_user="jbodmap",
-                ssh_key_path="/run/ssh/id_truenas_new",
+                ssh_key_path="/run/ssh/id_truenas",
                 ssh_password=PRESERVE_SECRET_SENTINEL,
                 ssh_sudo_password=PRESERVE_SECRET_SENTINEL,
                 bmc_enabled=True,
-                bmc_host="192.0.2.201",
+                bmc_host="192.0.2.200",
                 bmc_username="ADMIN",
                 bmc_password=PRESERVE_SECRET_SENTINEL,
                 replace_existing=True,
@@ -4915,6 +4915,125 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(saved_system["ssh"]["password"], MARKER_CHARLIE)
         self.assertEqual(saved_system["ssh"]["sudo_password"], MARKER_DELTA)
         self.assertEqual(saved_system["bmc"]["password"], MARKER_ECHO)
+
+    def test_save_system_rejects_preserved_api_secrets_when_authority_changes(self) -> None:
+        cases = {
+            "platform": {"platform": "scale"},
+            "host": {"truenas_host": "https://replacement-api.example.test/Tenant"},
+            "username": {"api_user": "replacement-operator"},
+            "tls-verification": {"verify_ssl": False},
+            "tls-ca": {"tls_ca_bundle_path": "/synthetic/replacement-ca.pem"},
+            "tls-server-name": {"tls_server_name": "replacement-api.example.test"},
+        }
+        for label, update in cases.items():
+            with self.subTest(authority_field=label), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.yaml"
+                original: dict[str, object] = {
+                    "systems": [
+                        {
+                            "id": "synthetic-system",
+                            "truenas": {
+                                "host": "https://saved-api.example.test/Tenant",
+                                "api_key": "SYNTHETIC-SAVED-API-KEY-362",
+                                "api_user": "saved-operator",
+                                "api_password": "SYNTHETIC-SAVED-API-PASSWORD-362",
+                                "platform": "core",
+                                "verify_ssl": True,
+                                "tls_ca_bundle_path": "/synthetic/saved-ca.pem",
+                                "tls_server_name": "saved-api.example.test",
+                            },
+                        }
+                    ]
+                }
+                write_yaml(config_path, original)
+                request_values = {
+                    "system_id": "synthetic-system",
+                    "label": "Synthetic system",
+                    "platform": "core",
+                    "truenas_host": "https://saved-api.example.test/Tenant",
+                    "api_key": PRESERVE_SECRET_SENTINEL,
+                    "api_user": "saved-operator",
+                    "api_password": PRESERVE_SECRET_SENTINEL,
+                    "verify_ssl": True,
+                    "tls_ca_bundle_path": "/synthetic/saved-ca.pem",
+                    "tls_server_name": "saved-api.example.test",
+                    "replace_existing": True,
+                    **update,
+                }
+
+                with self.assertRaisesRegex(ValueError, "saved connection settings"):
+                    SystemSetupService(str(config_path)).save_system(SystemSetupRequest(**request_values))
+
+                self.assertEqual(yaml.safe_load(config_path.read_text(encoding="utf-8")), original)
+
+    def test_save_system_rejects_preserved_ssh_secrets_when_authority_changes(self) -> None:
+        cases = {
+            "platform": {"platform": "scale"},
+            "host": {"ssh_host": "replacement-ssh.example.test"},
+            "port": {"ssh_port": 2222},
+            "username": {"ssh_user": "replacement-operator"},
+            "host-key-policy": {"ssh_strict_host_key_checking": False},
+            "ha-destination": {
+                "ha_nodes": [
+                    {"system_id": "node-a", "host": "saved-node-a.example.test"},
+                    {"system_id": "node-b", "host": "replacement-node-b.example.test"},
+                ]
+            },
+        }
+        for label, update in cases.items():
+            with self.subTest(authority_field=label), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.yaml"
+                original: dict[str, object] = {
+                    "systems": [
+                        {
+                            "id": "synthetic-system",
+                            "truenas": {
+                                "host": "https://saved-api.example.test",
+                                "platform": "quantastor",
+                            },
+                            "ssh": {
+                                "enabled": True,
+                                "host": "saved-node-a.example.test",
+                                "ha_enabled": True,
+                                "ha_nodes": [
+                                    {"system_id": "node-a", "host": "saved-node-a.example.test"},
+                                    {"system_id": "node-b", "host": "saved-node-b.example.test"},
+                                ],
+                                "port": 22,
+                                "user": "saved-operator",
+                                "password": "SYNTHETIC-SAVED-SSH-PASSWORD-362",
+                                "sudo_password": "SYNTHETIC-SAVED-SUDO-PASSWORD-362",
+                                "strict_host_key_checking": True,
+                            },
+                        }
+                    ]
+                }
+                write_yaml(config_path, original)
+                request_values = {
+                    "system_id": "synthetic-system",
+                    "label": "Synthetic system",
+                    "platform": "quantastor",
+                    "truenas_host": "https://saved-api.example.test",
+                    "ssh_enabled": True,
+                    "ssh_host": "saved-node-a.example.test",
+                    "ssh_port": 22,
+                    "ssh_user": "saved-operator",
+                    "ssh_password": PRESERVE_SECRET_SENTINEL,
+                    "ssh_sudo_password": PRESERVE_SECRET_SENTINEL,
+                    "ssh_strict_host_key_checking": True,
+                    "ha_enabled": True,
+                    "ha_nodes": [
+                        {"system_id": "node-a", "host": "saved-node-a.example.test"},
+                        {"system_id": "node-b", "host": "saved-node-b.example.test"},
+                    ],
+                    "replace_existing": True,
+                    **update,
+                }
+
+                with self.assertRaisesRegex(ValueError, "saved connection settings"):
+                    SystemSetupService(str(config_path)).save_system(SystemSetupRequest(**request_values))
+
+                self.assertEqual(yaml.safe_load(config_path.read_text(encoding="utf-8")), original)
 
     def test_save_system_persists_explicit_storage_views(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

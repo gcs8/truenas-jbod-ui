@@ -324,13 +324,21 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                         payload.system_id,
                         payload.password,
                         lambda system: system.ssh.password,
-                        lambda system: (
-                            system.truenas.platform == "esxi"
-                            and same_saved_endpoint(payload.host, system.ssh.host)
-                            and payload.port == system.ssh.port
-                            and same_saved_text(payload.user, system.ssh.user)
-                            and payload.strict_host_key_checking
-                            == system.ssh.strict_host_key_checking
+                        lambda system: credential_authorities_are_approved(
+                            ssh_credential_authorities(
+                                platform="esxi",
+                                hosts=[payload.host],
+                                port=payload.port,
+                                username=payload.user,
+                                strict_host_key_checking=payload.strict_host_key_checking,
+                            ),
+                            ssh_credential_authorities(
+                                platform=system.truenas.platform,
+                                hosts=[system.ssh.host],
+                                port=system.ssh.port,
+                                username=system.ssh.user,
+                                strict_host_key_checking=system.ssh.strict_host_key_checking,
+                            ),
                         ),
                     )
                 }
@@ -440,25 +448,23 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                         payload.system_id,
                         payload.api_password,
                         lambda system: system.truenas.api_password,
-                        lambda system: (
-                            system.truenas.platform == "quantastor"
-                            and same_saved_endpoint(
-                                payload.truenas_host,
-                                system.truenas.host,
-                            )
-                            and same_saved_text(
-                                payload.api_user,
-                                system.truenas.api_user,
-                            )
-                            and payload.verify_ssl == system.truenas.verify_ssl
-                            and same_saved_text(
-                                payload.tls_ca_bundle_path,
-                                system.truenas.tls_ca_bundle_path,
-                            )
-                            and same_saved_text(
-                                payload.tls_server_name,
-                                system.truenas.tls_server_name,
-                            )
+                        lambda system: same_credential_authority(
+                            api_credential_authority(
+                                platform="quantastor",
+                                host=payload.truenas_host,
+                                username=payload.api_user,
+                                verify_tls=payload.verify_ssl,
+                                tls_ca_bundle_path=payload.tls_ca_bundle_path,
+                                tls_server_name=payload.tls_server_name,
+                            ),
+                            api_credential_authority(
+                                platform=system.truenas.platform,
+                                host=system.truenas.host,
+                                username=system.truenas.api_user,
+                                verify_tls=system.truenas.verify_ssl,
+                                tls_ca_bundle_path=system.truenas.tls_ca_bundle_path,
+                                tls_server_name=system.truenas.tls_server_name,
+                            ),
                         ),
                     ),
                     "ssh_password": resolve_saved_secondary_secret(
@@ -466,20 +472,29 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                         payload.system_id,
                         payload.ssh_password,
                         lambda system: system.ssh.password,
-                        lambda system: (
-                            system.truenas.platform == "quantastor"
-                            and system.ssh.enabled
-                            and same_saved_endpoint(
-                                payload.ssh_host,
-                                system.ssh.host,
-                            )
-                            and payload.ssh_port == system.ssh.port
-                            and same_saved_text(
-                                payload.ssh_user,
-                                system.ssh.user,
-                            )
-                            and payload.ssh_strict_host_key_checking
-                            == system.ssh.strict_host_key_checking
+                        lambda system: system.ssh.enabled
+                        and credential_authorities_are_approved(
+                            ssh_credential_authorities(
+                                platform="quantastor",
+                                hosts=[
+                                    payload.ssh_host,
+                                    *(node.host for node in payload.ha_nodes),
+                                ],
+                                port=payload.ssh_port,
+                                username=payload.ssh_user,
+                                strict_host_key_checking=payload.ssh_strict_host_key_checking,
+                            ),
+                            ssh_credential_authorities(
+                                platform=system.truenas.platform,
+                                hosts=[
+                                    system.ssh.host,
+                                    *system.ssh.extra_hosts,
+                                    *(node.host for node in system.ssh.ha_nodes),
+                                ],
+                                port=system.ssh.port,
+                                username=system.ssh.user,
+                                strict_host_key_checking=system.ssh.strict_host_key_checking,
+                            ),
                         ),
                     ),
                 }

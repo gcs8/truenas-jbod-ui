@@ -53,6 +53,10 @@ from app.metrics import (
     observe_smart_summary_request,
 )
 from app.perf import add_perf_metadata, perf_stage
+from app.services.credential_authority import (
+    credential_authorities_are_approved,
+    ssh_credential_authorities,
+)
 from app.services.mapping_store import MappingStore
 from app.services.profile_registry import (
     ENCLOSURE_SUB_VIEW_PROFILE_IDS,
@@ -11529,6 +11533,8 @@ class InventoryService:
             raise TrueNASAPIError("SSH LED action failed: " + detail)
 
     async def _run_ssh_command(self, command: str, host: str | None = None) -> Any:
+        if not self._ssh_destination_authority_approved(host):
+            return self._ssh_authority_failure_results([command])[0]
         if isinstance(self.ssh_probe, SSHProbe):
             async with self._ssh_session_lock_for_host(host):
                 target_host = normalize_text(host)
@@ -11539,6 +11545,42 @@ class InventoryService:
                 return await probe.run_command(command)
 
         return await self.ssh_probe.run_command(command)
+
+    def _ssh_destination_authority_approved(self, host: str | None = None) -> bool:
+        if host is None:
+            return True
+        target_host = normalize_text(host)
+        candidate = ssh_credential_authorities(
+            platform=self.system.truenas.platform,
+            hosts=[target_host],
+            port=self.system.ssh.port,
+            username=self.system.ssh.user,
+            strict_host_key_checking=self.system.ssh.strict_host_key_checking,
+        )
+        approved = ssh_credential_authorities(
+            platform=self.system.truenas.platform,
+            hosts=[
+                self.system.ssh.host,
+                *self.system.ssh.extra_hosts,
+                *(node.host for node in self.system.ssh.ha_nodes),
+            ],
+            port=self.system.ssh.port,
+            username=self.system.ssh.user,
+            strict_host_key_checking=self.system.ssh.strict_host_key_checking,
+        )
+        return credential_authorities_are_approved(candidate, approved)
+
+    @staticmethod
+    def _ssh_authority_failure_results(commands: Iterable[str]) -> list[SSHCommandResult]:
+        return [
+            SSHCommandResult(
+                command=command,
+                ok=False,
+                stderr="SSH target is not an operator-approved destination for this credential authority.",
+                exit_code=255,
+            )
+            for command in commands
+        ]
 
     def _optional_ssh_backoff_key(self, host: str | None = None) -> str:
         return normalize_text(host) or normalize_text(self.system.ssh.host) or "__default__"
@@ -11648,6 +11690,8 @@ class InventoryService:
         initial_list = list(initial_commands)
         if not initial_list:
             return []
+        if not self._ssh_destination_authority_approved(host):
+            return self._ssh_authority_failure_results(initial_list)
 
         backoff_results = self._optional_ssh_backoff_failure_results(initial_list, host)
         if backoff_results is not None:
@@ -11696,6 +11740,8 @@ class InventoryService:
         command_list = list(commands)
         if not command_list:
             return []
+        if not self._ssh_destination_authority_approved(host):
+            return self._ssh_authority_failure_results(command_list)
 
         backoff_results = self._optional_ssh_backoff_failure_results(command_list, host)
         if backoff_results is not None:
