@@ -8651,7 +8651,12 @@
     }
   }
 
-  function setSelectOptionsIfChanged(select, optionsHtml) {
+  function selectOptionGroupLabel(option) {
+    const parent = option?.parentNode;
+    return parent && parent.tagName === "OPTGROUP" ? (parent.label || "") : "";
+  }
+
+  function setSelectOptionsIfChanged(select, optionsHtml, intendedValue = null) {
     if (!select || select.innerHTML === optionsHtml) {
       return false;
     }
@@ -8661,19 +8666,33 @@
       comparisonSelect.innerHTML = optionsHtml;
       const currentOptions = Array.from(select.options);
       const desiredOptions = Array.from(comparisonSelect.options);
+      // `selected` is deliberately not compared. Option HTML for the
+      // enclosure/view selector carries no `selected` attribute, so the
+      // detached comparison select auto-selects its first option and would
+      // disagree with the live select on every render. The selection is
+      // carried by `intendedValue` instead.
       const optionsMatch = currentOptions.length === desiredOptions.length
         && currentOptions.every((option, index) => {
           const desired = desiredOptions[index];
           return option.value === desired.value
             && option.text === desired.text
-            && option.selected === desired.selected
-            && option.disabled === desired.disabled;
+            && option.disabled === desired.disabled
+            && selectOptionGroupLabel(option) === selectOptionGroupLabel(desired);
         });
       if (optionsMatch) {
         return false;
       }
     }
+    const previousValue = select.value;
     select.innerHTML = optionsHtml;
+    const preservedValue = typeof intendedValue === "string" && intendedValue
+      ? intendedValue
+      : previousValue;
+    if (preservedValue
+      && select.value !== preservedValue
+      && Array.from(select.options || []).some((option) => option.value === preservedValue)) {
+      select.value = preservedValue;
+    }
     return true;
   }
 
@@ -8816,7 +8835,7 @@
           return `<option value="${escapeHtml(system.id)}"${selected}>${escapeHtml(system.label)}</option>`;
         })
         .join("");
-      setSelectOptionsIfChanged(systemSelect, systemOptions);
+      setSelectOptionsIfChanged(systemSelect, systemOptions, state.selectedSystemId || "");
       if (state.selectedSystemId) {
         systemSelect.value = state.selectedSystemId;
       }
@@ -8845,10 +8864,10 @@
           virtualStorageViewOptions ? `<optgroup label="Virtual Storage Views">${virtualStorageViewOptions}</optgroup>` : "",
         ].filter(Boolean).join("");
       }
-      setSelectOptionsIfChanged(enclosureSelect, enclosureOptionsHtml);
       const selectedValue = state.selectedStorageViewRuntimeId
         ? `view:${state.selectedStorageViewRuntimeId}`
         : (currentLiveEnclosureId() ? `enclosure:${currentLiveEnclosureId()}` : "");
+      setSelectOptionsIfChanged(enclosureSelect, enclosureOptionsHtml, selectedValue);
       if (selectedValue) {
         enclosureSelect.value = selectedValue;
       } else if (!enclosureSelect.value && enclosureSelect.options.length) {
