@@ -159,6 +159,136 @@ class ReleaseChangelogCoverageTests(unittest.TestCase):
         self.assertIn(13, result.covered)
         self.assertNotIn(21, result.covered | result.missing)
 
+    def test_squashed_staging_branch_retains_inner_prs_without_unrelated_prs(self) -> None:
+        _git(self.repo, "checkout", "-q", "-b", "release-staging")
+        self._write("app/service.py", "VALUE = 4\n")
+        self._commit("fix: inner staged change whose merge title lost its number")
+        inner_oid = _git(self.repo, "rev-parse", "HEAD").strip()
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "--squash", "release-staging")
+        self._commit("fix: squash release staging (#14)")
+        outer_oid = _git(self.repo, "rev-parse", "HEAD").strip()
+
+        _git(self.repo, "checkout", "-q", "-b", "experimental", "v0.1.0")
+        self._write("app/service.py", "VALUE = 99\n")
+        self._commit("fix: unrelated branch change")
+        unrelated_oid = _git(self.repo, "rev-parse", "HEAD").strip()
+        _git(self.repo, "checkout", "-q", "main")
+
+        merged = self._json(
+            [
+                {
+                    "number": 13,
+                    "baseRefName": "release-staging",
+                    "headRefName": "inner-fix",
+                    "isCrossRepository": False,
+                    "mergedAt": "2099-01-02T00:00:00Z",
+                    "mergeCommit": {"oid": inner_oid},
+                },
+                {
+                    "number": 14,
+                    "baseRefName": "main",
+                    "headRefName": "release-staging",
+                    "isCrossRepository": False,
+                    "mergedAt": "2099-01-03T00:00:00Z",
+                    "mergeCommit": {"oid": outer_oid},
+                },
+                {
+                    "number": 21,
+                    "baseRefName": "experimental",
+                    "headRefName": "unrelated-fix",
+                    "isCrossRepository": False,
+                    "mergedAt": "2099-01-02T00:00:00Z",
+                    "mergeCommit": {"oid": unrelated_oid},
+                },
+            ]
+        )
+
+        result = coverage.evaluate(
+            self.repo,
+            previous_tag="v0.1.0",
+            section_header="## Unreleased",
+            merged_prs_json=merged,
+        )
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn(13, result.covered)
+        self.assertIn(14, result.covered)
+        self.assertNotIn(21, result.covered | result.missing)
+
+    def test_cross_repository_head_name_does_not_seed_branch_discovery(self) -> None:
+        self._write("app/service.py", "VALUE = 4\n")
+        self._commit("fix: outer fork change (#14)")
+        outer_oid = _git(self.repo, "rev-parse", "HEAD").strip()
+
+        _git(self.repo, "checkout", "-q", "-b", "unrelated", "v0.1.0")
+        self._write("app/service.py", "VALUE = 99\n")
+        self._commit("fix: unrelated same-named branch change")
+        unrelated_oid = _git(self.repo, "rev-parse", "HEAD").strip()
+        _git(self.repo, "checkout", "-q", "main")
+
+        merged = self._json(
+            [
+                {
+                    "number": 14,
+                    "baseRefName": "main",
+                    "headRefName": "release-staging",
+                    "isCrossRepository": True,
+                    "mergedAt": "2099-01-03T00:00:00Z",
+                    "mergeCommit": {"oid": outer_oid},
+                },
+                {
+                    "number": 21,
+                    "baseRefName": "release-staging",
+                    "headRefName": "unrelated-fix",
+                    "isCrossRepository": False,
+                    "mergedAt": "2099-01-02T00:00:00Z",
+                    "mergeCommit": {"oid": unrelated_oid},
+                },
+            ]
+        )
+
+        result = coverage.evaluate(
+            self.repo,
+            previous_tag="v0.1.0",
+            section_header="## Unreleased",
+            merged_prs_json=merged,
+        )
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn(14, result.covered)
+        self.assertNotIn(21, result.covered | result.missing)
+
+    def test_candidate_ancestry_precedes_merge_timestamp_filter(self) -> None:
+        _git(self.repo, "checkout", "-q", "-b", "release-staging")
+        self._write("app/service.py", "VALUE = 4\n")
+        self._commit("fix: old inner merge whose title lost its number")
+        inner_oid = _git(self.repo, "rev-parse", "HEAD").strip()
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "--no-ff", "release-staging", "-m", "Merge release staging")
+
+        merged = self._json(
+            [
+                {
+                    "number": 13,
+                    "baseRefName": "release-staging",
+                    "headRefName": "inner-fix",
+                    "mergedAt": "2000-01-01T00:00:00Z",
+                    "mergeCommit": {"oid": inner_oid},
+                }
+            ]
+        )
+
+        result = coverage.evaluate(
+            self.repo,
+            previous_tag="v0.1.0",
+            section_header="## Unreleased",
+            merged_prs_json=merged,
+        )
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn(13, result.covered)
+
     def test_merged_pr_json_entries_released_before_the_tag_are_ignored(self) -> None:
         tag_time = coverage.tag_commit_time(self.repo, "v0.1.0")
         merged = self._json([5, {"number": 6, "mergedAt": tag_time}, {"number": 10}])

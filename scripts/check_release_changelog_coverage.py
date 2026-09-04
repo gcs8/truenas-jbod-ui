@@ -11,18 +11,19 @@ union because neither is complete on its own:
 * ``git log <tag>..HEAD --format=%s`` -- squash subjects that end in ``(#N)``
   and merge commits whose subject starts ``Merge pull request #N``.
 * ``--merged-prs-json <file>`` -- the release operator produces it with
-  ``gh pr list -R <owner>/<repo> --state merged --search "merged:>=<tag date>"
-  --limit 1000 --json number,mergedAt,labels,mergeCommit`` (either a JSON list
-  of objects with a ``number`` field or a bare list of integers). Object entries
-  whose merge commit is outside ``<tag>..HEAD`` are ignored. This ancestry
-  filter includes pull requests that reached the candidate through an
-  intermediate branch without including unrelated branch merges. Squash
-  subjects lose the number when a contributor edits the merge title, so this
-  file is the safety net.
+  ``gh pr list -R <owner>/<repo> --state merged --limit 1000 --json
+  number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository``
+  (either a JSON list of objects with a ``number`` field or a bare list of
+  integers). Commit ancestry seeds a branch-scoped walk through same-repository
+  intermediate pull requests. That retains inner pull requests when an
+  intermediate branch is squash-merged, without including unrelated branch
+  merges. Squash subjects lose the number when a contributor edits the merge
+  title, so this file is the safety net.
 
-Numbers whose commit already sits at or below the tag are dropped, so a JSON
-list built from a same-day date filter does not fail the gate for pull requests
-that shipped in the previous release.
+Candidate and previous-tag ancestry seed separate branch walks. Merge timestamps
+bound each walk at the point an intermediate branch entered that candidate, so
+older inner pull requests are retained only when their branch had not already
+entered the previous release.
 
 Every collected number must appear as ``(#N)`` (alone or inside a longer
 parenthetical such as ``(#12, #13, and #14)``) somewhere in the target
@@ -69,6 +70,17 @@ class CoverageResult:
     messages: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class MergedPullRequest:
+    number: int
+    merged_at: str | None
+    merge_position: str
+    base_ref: str | None
+    head_ref: str | None
+    head_ref_is_local: bool
+    skipped: bool
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -112,12 +124,12 @@ def tag_commit_time(repo: Path, previous_tag: str) -> str:
     return _git(repo, "log", "-1", "--format=%cI", previous_tag).stdout.strip()
 
 
-def commit_is_in_range(repo: Path, commit: str, previous_tag: str, head: str) -> bool:
-    """Return whether ``commit`` exists in the candidate range ``tag..head``."""
+def commit_position(repo: Path, commit: str, previous_tag: str, head: str) -> str:
+    """Classify ``commit`` as candidate, released, unrelated, or missing."""
 
     exists = _git(repo, "cat-file", "-e", f"{commit}^{{commit}}", check=False)
     if exists.returncode != 0:
-        return False
+        return "missing"
 
     def is_ancestor(descendant: str) -> bool:
         completed = _git(repo, "merge-base", "--is-ancestor", commit, descendant, check=False)
@@ -127,7 +139,51 @@ def commit_is_in_range(repo: Path, commit: str, previous_tag: str, head: str) ->
             f"git merge-base --is-ancestor {commit} {descendant} failed: {completed.stderr.strip()}"
         )
 
-    return is_ancestor(head) and not is_ancestor(previous_tag)
+    if is_ancestor(previous_tag):
+        return "released"
+    if is_ancestor(head):
+        return "candidate"
+    return "unrelated"
+
+
+def _branch_scoped_indices(
+    records: list[MergedPullRequest],
+    seed_positions: set[str],
+) -> set[int]:
+    """Return PR rows entering branch tips seeded by commit ancestry."""
+
+    included = {
+        index for index, record in enumerate(records) if record.merge_position in seed_positions
+    }
+    branch_cutoffs: dict[str, str] = {}
+
+    def extend_branch(record: MergedPullRequest) -> bool:
+        if not record.head_ref_is_local or record.head_ref is None or record.merged_at is None:
+            return False
+        previous = branch_cutoffs.get(record.head_ref)
+        if previous is not None and previous >= record.merged_at:
+            return False
+        branch_cutoffs[record.head_ref] = record.merged_at
+        return True
+
+    for index in included:
+        extend_branch(records[index])
+
+    changed = True
+    while changed:
+        changed = False
+        for index, record in enumerate(records):
+            if record.base_ref is None or record.merged_at is None:
+                continue
+            cutoff = branch_cutoffs.get(record.base_ref)
+            if cutoff is None or record.merged_at > cutoff:
+                continue
+            if index not in included:
+                included.add(index)
+                changed = True
+            if extend_branch(record):
+                changed = True
+    return included
 
 
 def pr_number_sets_from_json(
@@ -143,6 +199,7 @@ def pr_number_sets_from_json(
         raise CoverageError(f"{path} must hold a JSON list")
     numbers: set[int] = set()
     excluded: set[int] = set()
+    records: list[MergedPullRequest] = []
     for item in payload:
         if isinstance(item, bool):
             raise CoverageError(f"{path} holds a boolean where a PR number was expected")
@@ -164,19 +221,52 @@ def pr_number_sets_from_json(
                 raise CoverageError(f"{path} entry labels must be strings or objects with a 'name' field")
         if label_names & CHANGELOG_SKIP_LABELS:
             excluded.add(int(item["number"]))
-            continue
         merged_at = item.get("mergedAt")
-        if not_after and isinstance(merged_at, str) and _iso_key(merged_at) <= _iso_key(not_after):
-            continue
+        merged_key = _iso_key(merged_at) if isinstance(merged_at, str) else None
         merge_commit = item.get("mergeCommit")
+        merge_position = "missing"
         if merge_commit is not None:
             if not isinstance(merge_commit, dict) or not isinstance(merge_commit.get("oid"), str):
                 raise CoverageError(f"{path} entry mergeCommit must be null or an object with an 'oid' field")
             if repo is None or previous_tag is None:
                 raise CoverageError("mergeCommit ancestry filtering requires a repository and previous tag")
-            if not commit_is_in_range(repo, merge_commit["oid"], previous_tag, head):
-                continue
-        numbers.add(int(item["number"]))
+            merge_position = commit_position(repo, merge_commit["oid"], previous_tag, head)
+        base_ref = item.get("baseRefName")
+        head_ref = item.get("headRefName")
+        for field_name, value in (("baseRefName", base_ref), ("headRefName", head_ref)):
+            if value is not None and not isinstance(value, str):
+                raise CoverageError(f"{path} entry {field_name} must be a string when present")
+        is_cross_repository = item.get("isCrossRepository")
+        if is_cross_repository is not None and not isinstance(is_cross_repository, bool):
+            raise CoverageError(f"{path} entry isCrossRepository must be a boolean when present")
+        records.append(
+            MergedPullRequest(
+                number=int(item["number"]),
+                merged_at=merged_key,
+                merge_position=merge_position,
+                base_ref=base_ref,
+                head_ref=head_ref,
+                head_ref_is_local=is_cross_repository is False,
+                skipped=bool(label_names & CHANGELOG_SKIP_LABELS),
+            )
+        )
+
+    candidate_rows = _branch_scoped_indices(records, {"candidate"})
+    released_rows = _branch_scoped_indices(records, {"released"})
+    for index, record in enumerate(records):
+        if index in candidate_rows and index not in released_rows:
+            if not record.skipped:
+                numbers.add(record.number)
+            continue
+        has_branch_metadata = all(
+            value is not None for value in (record.base_ref, record.head_ref, record.merged_at)
+        )
+        if record.merge_position != "missing" or has_branch_metadata:
+            continue
+        if not_after and record.merged_at is not None and record.merged_at <= _iso_key(not_after):
+            continue
+        if not record.skipped:
+            numbers.add(record.number)
     return numbers, excluded
 
 
@@ -328,7 +418,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--merged-prs-json",
         type=Path,
-        help="JSON list from gh pr list --state merged ... --json number,mergedAt,labels,mergeCommit.",
+        help=(
+            "JSON list from gh pr list --state merged ... --json "
+            "number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository."
+        ),
     )
     parser.add_argument("--wiki-commit", help="Published GitHub wiki commit sha, required when wiki/ changed.")
     parser.add_argument(

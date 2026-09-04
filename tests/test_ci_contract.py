@@ -319,7 +319,7 @@ class CIWorkflowContractTests(unittest.TestCase):
             r"\*\)\s+echo \"Unknown conventional type.*\n\s+exit 0\n\s+;;",
         )
 
-    def test_release_checklist_collects_all_labels_and_publishes_wiki_before_validation(self) -> None:
+    def test_release_checklist_collects_bounded_branch_metadata_and_publishes_wiki_before_validation(self) -> None:
         checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")
         contributing = self.read(ROOT / "CONTRIBUTING.md")
 
@@ -327,10 +327,14 @@ class CIWorkflowContractTests(unittest.TestCase):
             line for line in checklist.splitlines() if "gh pr list -R gcs8/truenas-jbod-ui" in line
         )
         self.assertIn("--limit 1000", merged_pr_command)
-        self.assertNotIn("--base", merged_pr_command)
-        self.assertIn("--json number,mergedAt,labels,mergeCommit", merged_pr_command)
+        self.assertNotIn("merged:", merged_pr_command)
         self.assertIn(
-            "--limit 1000 --json number,mergedAt,labels,mergeCommit",
+            "--json number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository",
+            merged_pr_command,
+        )
+        self.assertIn(
+            "--limit 1000 --json "
+            "number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository",
             " ".join(contributing.split()),
         )
         checklist_text = " ".join(checklist.split())
