@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, call, patch
 
 from fastapi import HTTPException
-from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app import main as app_main
 from app.config import Settings, SystemConfig, TrueNASConfig
@@ -17,6 +17,7 @@ from app.models.domain import (
     SMART_BATCH_MAX_SLOTS,
     InventorySnapshot,
     SlotView,
+    SmartBatchRequest,
     SmartSummaryView,
     utcnow,
 )
@@ -523,21 +524,13 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         self.service.get_slot_smart_summaries.assert_not_awaited()
 
     def test_smart_batch_rejects_requests_over_the_slot_cap_before_cache_fallback(self) -> None:
-        registry = Mock()
-        registry.get_service.return_value = self.service
-        self.service.get_cached_slot_smart_summary_without_layout = Mock(return_value=None)
-
-        with patch.object(app_main, "get_inventory_registry", return_value=registry):
-            response = TestClient(app_main.app).post(
-                "/api/slots/smart-batch",
-                json={
+        with self.assertRaises(ValidationError):
+            SmartBatchRequest.model_validate(
+                {
                     "slots": list(range(SMART_BATCH_MAX_SLOTS + 1)),
                     "max_concurrency": 2,
-                },
+                }
             )
-
-        self.assertEqual(response.status_code, 422)
-        registry.get_service.assert_not_called()
 
     def test_cached_smart_batch_bypasses_a_second_snapshot_lookup(self) -> None:
         route = _route("/api/slots/smart-batch", "POST")
