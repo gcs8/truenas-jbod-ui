@@ -1,8 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
+
+if __package__:
+    from scripts.verify_wiki_drift import (
+        WikiVerificationError,
+        WikiVerificationResult,
+        verify_wiki_drift,
+    )
+else:
+    from verify_wiki_drift import (  # type: ignore[no-redef]
+        WikiVerificationError,
+        WikiVerificationResult,
+        verify_wiki_drift,
+    )
 
 
 REQUIRED_GATES = (
@@ -24,12 +39,15 @@ REQUIRED_GATES = (
 )
 
 POST_PUBLISH_GATES = {
+    "docs/wiki/public-demo gate",
     "ghcr publish verification",
     "deployment refresh/sniff tests",
     "post-release reopen",
 }
 
 VALID_RESULTS = {"pass", "blocked", "n/a"}
+WIKI_DRIFT_REQUIRED_FROM = (0, 22, 3)
+VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?")
 
 
 @dataclass(frozen=True)
@@ -84,6 +102,8 @@ def validate_release_wrap_text(
     *,
     allow_blocked: bool = False,
     phase: str = "final",
+    require_wiki_verification: bool = False,
+    wiki_verification: WikiVerificationResult | None = None,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     normalized_phase = phase.lower()
@@ -124,6 +144,37 @@ def validate_release_wrap_text(
         if normalized_result == "n/a" and reason.lower() in {"", "-", "n/a", "none", "reason"}:
             issues.append(ValidationIssue(f"{gate}: N/A requires a concrete reason"))
 
+    wiki_row = rows.get("docs/wiki/public-demo gate")
+    wiki_is_deferred = bool(
+        wiki_row
+        and normalized_phase == "pre-tag"
+        and wiki_row[3].lower() == "blocked"
+    )
+    if require_wiki_verification and not wiki_is_deferred:
+        if wiki_row is not None and wiki_row[3].lower() != "pass":
+            issues.append(
+                ValidationIssue(
+                    "Docs/wiki/public-demo gate: Result must be Pass after wiki publication"
+                )
+            )
+        if wiki_verification is None:
+            issues.append(
+                ValidationIssue("Docs/wiki/public-demo gate: wiki drift verification was not run")
+            )
+        elif not wiki_verification.matches:
+            issues.append(
+                ValidationIssue(
+                    "Docs/wiki/public-demo gate: external wiki differs from repository wiki/"
+                )
+            )
+        elif wiki_row is not None and wiki_verification.release_evidence() not in wiki_row[2]:
+            issues.append(
+                ValidationIssue(
+                    "Docs/wiki/public-demo gate: evidence does not contain the exact wiki "
+                    "verification receipt"
+                )
+            )
+
     return issues
 
 
@@ -132,6 +183,8 @@ def validate_release_wrap_path(
     *,
     allow_blocked: bool = False,
     phase: str = "final",
+    require_wiki_verification: bool = False,
+    wiki_verification: WikiVerificationResult | None = None,
 ) -> list[ValidationIssue]:
     if not path.exists():
         return [ValidationIssue(f"release wrap not found: {path}")]
@@ -139,12 +192,25 @@ def validate_release_wrap_path(
         path.read_text(encoding="utf-8"),
         allow_blocked=allow_blocked,
         phase=phase,
+        require_wiki_verification=require_wiki_verification,
+        wiki_verification=wiki_verification,
     )
 
 
-def main() -> int:
+def wiki_drift_required(version: str) -> bool:
+    match = VERSION_RE.fullmatch(version)
+    if match is None:
+        raise ValueError("version must use semantic version form X.Y.Z")
+    return tuple(int(part) for part in match.groups()) >= WIKI_DRIFT_REQUIRED_FROM
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Validate release-wrap checklist evidence.")
     parser.add_argument("version", help="Release version, for example 0.20.2 or v0.20.2.")
+    parser.add_argument("--repository", type=Path, default=Path("."))
+    parser.add_argument("--repository-commit")
+    parser.add_argument("--wiki-source")
+    parser.add_argument("--external-wiki-commit")
     parser.add_argument(
         "--allow-blocked",
         action="store_true",
@@ -159,11 +225,56 @@ def main() -> int:
             "Use final after GHCR, deployment sniff tests, and reopen work are recorded."
         ),
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     version = args.version.removeprefix("v")
-    path = Path("docs") / f"RELEASE_WRAP_{version}.md"
-    issues = validate_release_wrap_path(path, allow_blocked=args.allow_blocked, phase=args.phase)
+    try:
+        require_wiki_verification = wiki_drift_required(version)
+    except ValueError as exc:
+        print(f"- {exc}")
+        return 1
+    path = args.repository / "docs" / f"RELEASE_WRAP_{version}.md"
+    wiki_verification = None
+    rows = {}
+    if path.exists():
+        rows = parse_checklist_evidence_table(path.read_text(encoding="utf-8"))
+    wiki_row = rows.get("docs/wiki/public-demo gate")
+    wiki_is_deferred = bool(
+        wiki_row
+        and args.phase == "pre-tag"
+        and wiki_row[3].lower() == "blocked"
+    )
+    if require_wiki_verification and not wiki_is_deferred:
+        required_arguments = {
+            "--repository-commit": args.repository_commit,
+            "--wiki-source": args.wiki_source,
+            "--external-wiki-commit": args.external_wiki_commit,
+        }
+        missing_arguments = [name for name, value in required_arguments.items() if not value]
+        if missing_arguments:
+            print(f"- wiki verification requires {', '.join(missing_arguments)}")
+            return 1
+        try:
+            wiki_verification = verify_wiki_drift(
+                repository=args.repository,
+                repository_commit=args.repository_commit,
+                wiki_source=args.wiki_source,
+                external_wiki_commit=args.external_wiki_commit,
+            )
+        except (OSError, UnicodeError, WikiVerificationError) as exc:
+            print(f"- Docs/wiki/public-demo gate: wiki verification failed: {exc}")
+            return 1
+    issues = validate_release_wrap_path(
+        path,
+        allow_blocked=args.allow_blocked,
+        phase=args.phase,
+        require_wiki_verification=require_wiki_verification,
+        wiki_verification=wiki_verification,
+    )
     if issues:
         for issue in issues:
             print(f"- {issue.message}")
