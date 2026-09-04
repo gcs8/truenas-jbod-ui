@@ -598,12 +598,16 @@ Two scripts enforce this:
   header>"` runs during release prep. It collects merged pull request numbers
   from `git log <tag>..HEAD` squash and merge subjects and from
   `--merged-prs-json <file>`, produced with
-  `gh pr list --state merged --search "merged:>=<tag date>" --limit 1000 --json number,mergedAt,labels,mergeCommit`
+  `gh pr list --state merged --limit 1000 --json number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository`
   (squash subjects lose the number when the merge title is edited). It removes
-  pull requests labelled `no-changelog` or `dependencies`, filters merge commits
-  to the candidate's `<tag>..HEAD` ancestry instead of filtering by target
-  branch, then fails when any remaining number is missing from the target
-  section. When `wiki/` changed
+  pull requests labelled `no-changelog` or `dependencies`, uses candidate and
+  previous-tag ancestry to seed a timestamp-bounded walk through the pull
+  request base/head branch graph, then fails when any remaining number is
+  missing from the target section. The branch walk follows only
+  same-repository head branches, retains inner pull requests when an
+  intermediate branch is squash-merged, including inner merges older than the
+  tag timestamp, and does not admit unrelated or same-named fork branches. When
+  `wiki/` changed
   since the tag it also requires `--wiki-commit <sha>` and verifies with
   `git ls-remote` that the sha is a branch tip of the GitHub wiki repository.
   Its `Changelog coverage: pass (<N> PRs)` and online-verified `External wiki

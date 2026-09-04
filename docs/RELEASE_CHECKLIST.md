@@ -394,11 +394,13 @@ on <remote>)` line. `--offline` output cannot satisfy this release evidence.
 ## Release Notes And Docs
 
 - bump `app/__init__.py` to the release version
-- build the repository-wide merged pull request list for the coverage gate; do
-  not add `--base`, because pull requests can reach the candidate through an
-  intermediate branch. The gate filters `mergeCommit.oid` by ancestry in the
-  release candidate range:
-  `gh pr list -R gcs8/truenas-jbod-ui --state merged --search "merged:>=<previous tag date>" --limit 1000 --json number,mergedAt,labels,mergeCommit > merged-prs.json`
+- build the bounded repository-wide merged pull request list for the coverage
+  gate. Do not date-filter it: a pull request can merge into an intermediate
+  branch before the previous tag and enter the candidate later. Base/head
+  branch and repository metadata lets the gate follow only same-repository
+  intermediate branches that enter the candidate, including through an outer
+  squash, while excluding unrelated and same-named fork branches:
+  `gh pr list -R gcs8/truenas-jbod-ui --state merged --limit 1000 --json number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository > merged-prs.json`
 - run the changelog coverage gate against the previous tag and the section
   that will become the release section, and fix every missing number before
   going on:
