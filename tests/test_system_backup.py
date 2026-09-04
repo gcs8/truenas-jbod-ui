@@ -461,7 +461,7 @@ class SystemBackupServiceTests(unittest.TestCase):
         self.assertEqual(target_catalog.stat().st_mode & 0o7777, 0o620)
         self.assertEqual(target_segment.stat().st_mode & 0o7777, 0o604)
 
-    def test_segmented_staging_preserves_existing_mode_zero_directory(self) -> None:
+    def test_segmented_staging_keeps_mode_zero_directory_writable(self) -> None:
         target_dir = self.temp_dir / "mode-zero-segments"
         target_dir.mkdir()
         target_dir.chmod(0o0000)
@@ -470,18 +470,15 @@ class SystemBackupServiceTests(unittest.TestCase):
 
         try:
             entry = transaction._record_target(target_dir)
-            with (
-                patch.object(transaction, "_fsync_tree"),
-                patch.object(transaction, "_fsync_directory"),
-            ):
-                transaction._stage_segmented_directory(
-                    staged_dir,
-                    target_dir=target_dir,
-                    entry=entry,
-                    members=[],
-                )
+            final_modes = transaction._stage_segmented_directory(
+                staged_dir,
+                target_dir=target_dir,
+                entry=entry,
+                members=[],
+            )
 
-            self.assertEqual(staged_dir.stat().st_mode & 0o7777, 0o0000)
+            self.assertEqual(staged_dir.stat().st_mode & 0o700, 0o700)
+            self.assertEqual(final_modes, ((Path(), 0o0000, True),))
         finally:
             target_dir.chmod(0o700)
             if staged_dir.exists():
@@ -489,7 +486,7 @@ class SystemBackupServiceTests(unittest.TestCase):
                 shutil.rmtree(staged_dir)
             shutil.rmtree(transaction.root, ignore_errors=True)
 
-    def test_segmented_staging_preserves_existing_mode_zero_file(self) -> None:
+    def test_segmented_staging_keeps_mode_zero_file_readable_and_writable(self) -> None:
         target_dir = self.temp_dir / "mode-zero-segment-file"
         target_dir.mkdir()
         target_file = target_dir / "catalog.json"
@@ -500,21 +497,19 @@ class SystemBackupServiceTests(unittest.TestCase):
 
         try:
             entry = transaction._record_target(target_dir)
-            with (
-                patch.object(transaction, "_fsync_tree"),
-                patch.object(transaction, "_fsync_directory"),
-            ):
-                transaction._stage_segmented_directory(
-                    staged_dir,
-                    target_dir=target_dir,
-                    entry=entry,
-                    members=[("catalog", Path("catalog.json"))],
-                )
+            final_modes = transaction._stage_segmented_directory(
+                staged_dir,
+                target_dir=target_dir,
+                entry=entry,
+                members=[("catalog", Path("catalog.json"))],
+            )
 
             self.assertEqual(
-                (staged_dir / "catalog.json").stat().st_mode & 0o7777,
-                0o0000,
+                (staged_dir / "catalog.json").stat().st_mode & 0o600,
+                0o600,
             )
+            self.assertEqual((staged_dir / "catalog.json").read_bytes(), b"IMPORTED")
+            self.assertIn((Path("catalog.json"), 0o0000, False), final_modes)
         finally:
             target_file.chmod(0o600)
             if staged_dir.exists():
