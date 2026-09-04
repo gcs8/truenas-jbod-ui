@@ -399,6 +399,10 @@ the final release-wrap validator:
   - `.\.venv\Scripts\python.exe scripts\check_public_demo_artifact.py public-demo`
   - `set PUBLIC_DEMO_ARTIFACT=public-demo/index.html`
   - `npx playwright test qa/public-demo.spec.js`
+- treat every push to `main` that changes `public-demo/**` as a GitHub Pages
+  publication: `.github/workflows/publish-public-demo.yml` deploys that directory
+  after verification, so release and PR notes must not claim that such a push has
+  no Pages deployment
 
 ## Config And Examples
 

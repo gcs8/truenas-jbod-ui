@@ -13,6 +13,7 @@ from pathlib import Path
 import unittest
 from unittest import mock
 
+from app import __version__
 from app.services.public_demo_fixture import (
     PUBLIC_DEMO_GENERATED_AT,
     PUBLIC_DEMO_HISTORY_WINDOW_HOURS,
@@ -46,7 +47,7 @@ class PublicDemoArtifactTests(unittest.TestCase):
         marker_html = "\n".join(
             (
                 "Frozen Sanitized Snapshot",
-                "Artifact app v0.0.0-test",
+                f"Artifact app v{__version__}",
                 "Capture time",
                 "Live-derived CORE 60-bay sample",
                 "Scrambled IDs",
@@ -98,6 +99,55 @@ class PublicDemoArtifactTests(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_public_demo_artifact_version_must_match_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            self._write_minimal_demo_artifact(demo_dir)
+            artifact_path = demo_dir / "index.html"
+            artifact_path.write_text(
+                artifact_path.read_text(encoding="utf-8").replace(
+                    f"Artifact app v{__version__}",
+                    "Artifact app v0.0.0-stale",
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("artifact app version 0.0.0-stale does not match source", result.stderr)
+        self.assertIn(__version__, result.stderr)
+
+    def test_public_demo_artifact_version_must_be_parseable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            self._write_minimal_demo_artifact(demo_dir)
+            artifact_path = demo_dir / "index.html"
+            artifact_path.write_text(
+                artifact_path.read_text(encoding="utf-8").replace(
+                    f"Artifact app v{__version__}",
+                    "Artifact app v",
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing parseable artifact app version", result.stderr)
 
     def test_public_demo_storage_fabric_route_action_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -170,7 +220,7 @@ class PublicDemoArtifactTests(unittest.TestCase):
 
         for marker in (
             "Frozen Sanitized Snapshot",
-            "Artifact app v0.21.0-dev",
+            f"Artifact app v{__version__}",
             "Capture time",
             PUBLIC_DEMO_GENERATED_AT.isoformat(),
             "Live-derived CORE 60-bay sample",

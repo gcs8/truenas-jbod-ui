@@ -7,6 +7,13 @@ import re
 import sys
 
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app import __version__  # noqa: E402
+
+
 DEFAULT_DEMO_DIR = Path("public-demo")
 DEFAULT_MAX_RAW_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_GZIP_BYTES = 1_835_008
@@ -41,6 +48,9 @@ REQUIRED_MARKERS: tuple[str, ...] = (
 
 FORBIDDEN_MARKERS: tuple[tuple[str, str], ...] = (
     ("snapshot Storage Fabric route action", 'id="sas-fabric-view-link"'),
+)
+ARTIFACT_VERSION_PATTERN = re.compile(
+    r"\bArtifact app v(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]*)\b"
 )
 
 
@@ -110,6 +120,17 @@ def main() -> int:
     for marker in REQUIRED_MARKERS:
         if marker not in html:
             errors.append(f"missing required marker: {marker}")
+
+    artifact_versions = {
+        match.group("version") for match in ARTIFACT_VERSION_PATTERN.finditer(html)
+    }
+    if not artifact_versions:
+        errors.append("missing parseable artifact app version")
+    for artifact_version in sorted(artifact_versions):
+        if artifact_version != __version__:
+            errors.append(
+                f"artifact app version {artifact_version} does not match source {__version__}"
+            )
 
     for label, marker in FORBIDDEN_MARKERS:
         if marker in html:
