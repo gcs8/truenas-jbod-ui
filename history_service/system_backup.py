@@ -59,6 +59,7 @@ from history_service.segment_catalog import (
 )
 from history_service.migration_lock import history_write_lock
 from history_service.segment_reader import SegmentedHistoryReader
+from history_service.segment_sealer import SEGMENT_DIRECTORY_MODE, SEGMENT_FILE_MODE
 from history_service.segmented_restore import (
     file_matches as restore_file_matches,
     record_file as record_restore_file,
@@ -603,7 +604,7 @@ class _ImportActivationTransaction:
         entry: _ImportRollbackEntry,
         members: list[tuple[str, Path]],
     ) -> None:
-        staged_dir.mkdir(mode=self._MISSING_DIRECTORY_MODE)
+        staged_dir.mkdir(mode=SEGMENT_DIRECTORY_MODE)
         self._sibling_artifacts.add(staged_dir)
         existing_directory = target_dir if entry.kind == "directory" else None
         root_owner = self._existing_owner(
@@ -613,7 +614,7 @@ class _ImportActivationTransaction:
         self._apply_owner(staged_dir, root_owner)
         staged_dir.chmod(
             self._existing_mode(existing_directory, directory=True)
-            or self._MISSING_DIRECTORY_MODE
+            or SEGMENT_DIRECTORY_MODE
         )
         seen: set[Path] = set()
         for member_key, relative_path in members:
@@ -646,7 +647,7 @@ class _ImportActivationTransaction:
                 self._apply_owner(staged_parent, parent_owner)
                 staged_parent.chmod(
                     self._existing_mode(existing_parent, directory=True)
-                    or self._MISSING_DIRECTORY_MODE
+                    or SEGMENT_DIRECTORY_MODE
                 )
             shutil.copyfile(self._staged_member(member_key), staged_target)
             existing_target = (
@@ -663,7 +664,7 @@ class _ImportActivationTransaction:
             self._apply_owner(staged_target, target_owner)
             staged_target.chmod(
                 self._existing_mode(existing_target, directory=False)
-                or self._MISSING_FILE_MODE
+                or SEGMENT_FILE_MODE
             )
         self._fsync_tree(staged_dir)
         self._fsync_directory(staged_dir.parent)
