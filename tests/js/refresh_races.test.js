@@ -521,6 +521,47 @@ test("virtual slot mapping save and clear handlers fail closed before any reques
   assert.ok(statuses.every((message) => !/\b(?:slot|bay)\b/i.test(message)));
 });
 
+test("mapping import is disabled with a reason for the active virtual inventory", async () => {
+  const reasonView = { textContent: "", classList: { toggle(_name, hidden) { this.hidden = hidden; } } };
+  const button = { disabled: false, title: "" };
+  const selected = { id: "virtual-system:system-a", kind: "virtual" };
+  const { fn: mappingImportUnavailableReason } = loadFunction(APP_SOURCE, "mappingImportUnavailableReason", {
+    state: { snapshotMode: false },
+    getSelectedEnclosureOption: () => selected,
+  });
+  const reason = mappingImportUnavailableReason();
+  const { fn: renderMappingImportControl } = loadFunction(APP_SOURCE, "renderMappingImportControl", {
+    importMappingsButton: button,
+    mappingImportUnavailable: reasonView,
+    mappingImportUnavailableReason: () => reason,
+  });
+
+  renderMappingImportControl();
+
+  assert.match(reason, /no identified physical enclosure/i);
+  assert.equal(button.disabled, true);
+  assert.equal(button.title, reason);
+  assert.equal(reasonView.textContent, reason);
+  assert.equal(reasonView.classList.hidden, false);
+
+  let requests = 0;
+  const statuses = [];
+  const mappingImportFile = { value: "selected-file" };
+  const { fn: importMappingsFromFile } = loadFunction(APP_SOURCE, "importMappingsFromFile", {
+    state: { snapshotMode: false },
+    mappingImportFile,
+    mappingImportUnavailableReason: () => reason,
+    setStatus(message) { statuses.push(message); },
+    async sendScopedRequest() { requests += 1; },
+  });
+
+  await importMappingsFromFile({ name: "mappings.json", async text() { return "{}"; } });
+
+  assert.equal(requests, 0);
+  assert.deepEqual(statuses, [reason]);
+  assert.equal(mappingImportFile.value, "");
+});
+
 test("virtual detail and aria location copy says disk while physical copy says slot", () => {
   const { fn: slotLocationLabel } = loadFunction(APP_SOURCE, "slotLocationLabel", {});
 
@@ -576,6 +617,7 @@ test("mapping import previews and confirms the exact diff before rendering impor
     setStatus() {},
     writeBlockedByPolicy: () => false,
     handleWriteRejection: () => false,
+    mappingImportUnavailableReason: () => null,
     mappingImportPreviewMessage(preview) {
       return `Add ${preview.additions.length}; update ${preview.updates.length}; remove ${preview.removals.length}; unchanged ${preview.unchanged.length}`;
     },
@@ -635,6 +677,7 @@ test("canceling a mapping import preview performs no write and clears the file i
     state,
     mappingImportFile,
     window: { confirm: () => false },
+    mappingImportUnavailableReason: () => null,
     mappingImportPreviewMessage: () => "preview",
     setStatus(message) { statuses.push(message); },
     writeBlockedByPolicy: () => false,

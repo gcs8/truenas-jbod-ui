@@ -410,7 +410,11 @@ class InventoryHelpersTests(unittest.TestCase):
 
     def test_zero_enclosure_disks_use_system_virtual_inventory_without_legacy_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            system = SystemConfig(id="system-a", truenas=TrueNASConfig(platform="core"))
+            system = SystemConfig(
+                id="system-a",
+                default_profile_id="supermicro-cse-946-top-60",
+                truenas=TrueNASConfig(platform="core"),
+            )
             settings = Settings(systems=[system])
             settings.layout.rows = 2
             settings.layout.columns = 4
@@ -513,6 +517,9 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertEqual(snapshot.summary.enclosure_count, 0)
             self.assertEqual(snapshot.summary.mapped_slot_count, 0)
             self.assertEqual(snapshot.capabilities["physical_slots"].status, "unavailable")
+            self.assertIsNone(snapshot.selected_profile)
+            self.assertEqual(snapshot.layout_rows, [[0, 1]])
+            self.assertEqual(snapshot.layout_slot_count, 2)
 
     def test_multi_enclosure_snapshot_warns_once_about_unapplied_legacy_mappings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -11195,6 +11202,59 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(result["revision"], preview["revision"])
             self.assertEqual(service.get_snapshot.await_count, 0)
             self.assertIn("__default__", service._cache)
+
+    async def test_preview_mapping_bundle_rejects_virtual_inventory_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(mappings=[ManualMapping(slot=0, serial="UNSTABLE")])
+            before = service.mapping_store.load_all()
+
+            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+                await service.preview_mapping_bundle(
+                    bundle,
+                    selected_enclosure_id="virtual-system:default",
+                )
+
+            self.assertEqual(service.mapping_store.load_all(), before)
+
+    async def test_import_mapping_bundle_rejects_virtual_inventory_scope_without_persisting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            virtual_enclosure_id = "virtual-system:default"
+            bundle = MappingBundle(mappings=[ManualMapping(slot=0, serial="UNSTABLE")])
+            rewritten = service._rewrite_mapping_bundle(bundle, virtual_enclosure_id)
+            preview = service.mapping_store.preview_replace_mappings(
+                system.id,
+                virtual_enclosure_id,
+                rewritten,
+            )
+            before = service.mapping_store.load_all()
+
+            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+                await service.import_mapping_bundle(
+                    bundle,
+                    selected_enclosure_id=virtual_enclosure_id,
+                    expected_revision=preview["revision"],
+                    import_digest=preview["import_digest"],
+                )
+
+            self.assertEqual(service.mapping_store.load_all(), before)
 
     async def test_import_mapping_bundle_rejects_stale_preview_without_invalidating_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

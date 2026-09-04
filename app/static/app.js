@@ -288,6 +288,7 @@
   const exportMappingsButton = document.getElementById("export-mappings-button");
   const importMappingsButton = document.getElementById("import-mappings-button");
   const mappingImportFile = document.getElementById("mapping-import-file");
+  const mappingImportUnavailable = document.getElementById("mapping-import-unavailable");
   const mappingEmpty = document.getElementById("mapping-empty");
   const exportSnapshotButton = document.getElementById("export-snapshot-button");
   const exportSnapshotDialog = document.getElementById("export-snapshot-dialog");
@@ -1131,6 +1132,22 @@
     const enclosure = getSelectedEnclosureOption();
     const enclosureLabel = enclosure?.label || currentLiveEnclosureLabel() || "Enclosure";
     const systemLabel = system?.label || state.snapshot.selected_system_label || "TrueNAS JBOD Enclosure UI";
+    if (!selectedStorageView && enclosure?.kind === "virtual") {
+      return {
+        profileId: null,
+        profileLabel: null,
+        eyebrow: `${systemLabel} / Virtual inventory`,
+        summary: "System-scoped disk inventory; no physical enclosure orientation or stable slot identity is claimed.",
+        enclosureTitle: enclosureLabel,
+        edgeLabel: "System-scoped disks",
+        faceStyle: "generic",
+        latchEdge: "bottom",
+        baySize: null,
+        rowGroups: [],
+        slotLayout: activeLayoutRows(),
+        slotCount: Number(state.snapshot.layout_slot_count) || countLayoutSlots(activeLayoutRows()),
+      };
+    }
     if (selectedStorageView) {
       const baseSummary =
         selectedStorageView.kind === "nvme_carrier"
@@ -1203,7 +1220,14 @@
   }
 
   function enclosureAliasEditorAvailable() {
-    return !state.snapshotMode && !state.selectedStorageViewRuntimeId && Boolean(getSelectedEnclosureOption());
+    const enclosure = getSelectedEnclosureOption();
+    return Boolean(
+      !state.snapshotMode
+      && !state.selectedStorageViewRuntimeId
+      && enclosure
+      && enclosure.kind !== "virtual"
+      && !String(enclosure.id || "").startsWith("virtual-system:")
+    );
   }
 
   function renderEnclosureAliasEditor() {
@@ -7636,6 +7660,26 @@
     setMappingFormEnabled(mappingSupported && !state.snapshotMode);
   }
 
+  function mappingImportUnavailableReason() {
+    const enclosure = getSelectedEnclosureOption();
+    if (enclosure?.kind !== "virtual" && !String(enclosure?.id || "").startsWith("virtual-system:")) {
+      return null;
+    }
+    return "Mapping import is unavailable because this system disk inventory has no identified physical enclosure or stable physical slot identities.";
+  }
+
+  function renderMappingImportControl() {
+    const reason = mappingImportUnavailableReason();
+    if (importMappingsButton) {
+      importMappingsButton.disabled = Boolean(reason);
+      importMappingsButton.title = reason || "";
+    }
+    if (mappingImportUnavailable) {
+      mappingImportUnavailable.textContent = reason || "";
+      mappingImportUnavailable.classList.toggle("hidden", !reason);
+    }
+  }
+
   function renderLiveSlotDetail(slot, options = {}) {
     const detailTitle = options.detailTitle || slotLocationLabel(slot);
     const smartEntry = options.smartEntry || getSmartSummaryEntry(slot);
@@ -8818,6 +8862,7 @@
     renderSummary();
     renderRefreshControls();
     renderSelectors();
+    renderMappingImportControl();
   }
 
   function selectSlot(slotNumber) {
@@ -9256,6 +9301,14 @@
     }
     if (!file) return;
     if (writeBlockedByPolicy()) {
+      if (mappingImportFile) {
+        mappingImportFile.value = "";
+      }
+      return;
+    }
+    const unavailableReason = mappingImportUnavailableReason();
+    if (unavailableReason) {
+      setStatus(unavailableReason, "error");
       if (mappingImportFile) {
         mappingImportFile.value = "";
       }

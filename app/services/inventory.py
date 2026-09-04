@@ -124,6 +124,10 @@ CacheValueT = TypeVar("CacheValueT")
 # horizon are evicted to keep the cache bounded.
 SMART_CACHE_STALE_RETENTION_TTL_MULTIPLIER = 12
 SMART_CACHE_STALE_RETENTION_FLOOR_SECONDS = 3600
+VIRTUAL_MAPPING_UNAVAILABLE_REASON = (
+    "Mapping import is unavailable because this system disk inventory has no identified "
+    "physical enclosure or stable physical slot identities."
+)
 
 logger = logging.getLogger(__name__)
 METRICS_SERVICE_NAME = "enclosure-ui"
@@ -350,7 +354,7 @@ def finalize_enclosure_option_labels(
     for option in options:
         raw_label = option.raw_label or option.label
         base_id, separator, _ = option.id.partition("::")
-        alias = enclosure_aliases.get(base_id)
+        alias = enclosure_aliases.get(base_id) if option.kind == "physical" else None
         label = raw_label
         if alias:
             if separator:
@@ -882,6 +886,8 @@ class InventoryService:
         scope_name = str(scope or "auto").strip().lower()
         enclosure_scoped_kinds = {"bay", "backplane", "ses-enclosure", "mpr-enclosure", "expander"}
         if kind_name == "enclosure":
+            if object_text.startswith("virtual-system:"):
+                raise ValueError("Friendly enclosure names are available only for identified physical enclosures.")
             object_text = self._base_enclosure_id(object_text) or object_text
             enclosure_id = None
         else:
@@ -3474,11 +3480,17 @@ class InventoryService:
             )
         return rewritten
 
+    @staticmethod
+    def _require_physical_mapping_scope(selected_enclosure_id: str | None) -> None:
+        if (normalize_text(selected_enclosure_id) or "").startswith("virtual-system:"):
+            raise TrueNASAPIError(VIRTUAL_MAPPING_UNAVAILABLE_REASON)
+
     async def preview_mapping_bundle(
         self,
         bundle: MappingBundle,
         selected_enclosure_id: str | None = None,
     ) -> dict[str, Any]:
+        self._require_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
         preview = self.mapping_store.preview_replace_mappings(
             self.system.id,
@@ -3500,6 +3512,7 @@ class InventoryService:
         import_digest: str,
         invalidate_snapshot: bool = True,
     ) -> dict[str, Any]:
+        self._require_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
         result = self.mapping_store.apply_mapping_import(
             self.system.id,
@@ -3594,15 +3607,17 @@ class InventoryService:
 
         selected_option = option_by_id.get(resolved_enclosure_id) if resolved_enclosure_id else None
         with perf_stage("inventory.resolve_profile"):
-            selected_profile = self.profile_registry.resolve_for_enclosure(
-                self.system,
-                selected_option,
-                fallback_label=selected_option.label if selected_option else selected_meta.get("label"),
-                fallback_rows=len(layout_rows) if layout_rows else None,
-                fallback_columns=layout_columns or None,
-                fallback_slot_count=layout_slot_count or None,
-                fallback_slot_layout=layout_rows or None,
-            )
+            selected_profile = None
+            if selected_option is None or selected_option.kind == "physical":
+                selected_profile = self.profile_registry.resolve_for_enclosure(
+                    self.system,
+                    selected_option,
+                    fallback_label=selected_option.label if selected_option else selected_meta.get("label"),
+                    fallback_rows=len(layout_rows) if layout_rows else None,
+                    fallback_columns=layout_columns or None,
+                    fallback_slot_count=layout_slot_count or None,
+                    fallback_slot_layout=layout_rows or None,
+                )
         selected_slot = None
         if resolved_enclosure_id:
             selected_slot = next((slot for slot in slots if slot.enclosure_id == resolved_enclosure_id), None)

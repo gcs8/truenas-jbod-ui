@@ -313,6 +313,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             )
         except MappingRevisionConflict as exc:
             return mapping_revision_conflict_response(exc)
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         led_warning = None
         led_changed = False
@@ -367,6 +369,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             )
         except MappingRevisionConflict as exc:
             return mapping_revision_conflict_response(exc)
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if cleared:
             service.invalidate_physical_enclosure_snapshot_cache(
                 reason="route.clear_mapping",
@@ -397,6 +401,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 payload,
                 selected_enclosure_id=enclosure_id,
             )
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError:
             return JSONResponse(status_code=422, content={"detail": INVALID_MAPPING_BUNDLE_DETAIL})
         return JSONResponse(preview)
@@ -433,6 +439,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                     "current_import_digest": exc.current_import_digest,
                 },
             )
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError:
             return JSONResponse(status_code=422, content={"detail": INVALID_MAPPING_BUNDLE_DETAIL})
         service.invalidate_snapshot_cache(reason="route.import_mappings")

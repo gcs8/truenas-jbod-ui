@@ -103,6 +103,19 @@ test("alias editor availability excludes snapshots and saved storage views", () 
   assert.equal(enclosureAliasEditorAvailable(), false);
 });
 
+test("alias editor availability excludes virtual enclosures", () => {
+  const state = { snapshotMode: false, selectedStorageViewRuntimeId: "" };
+  const { enclosureAliasEditorAvailable } = loadFunctions(["enclosureAliasEditorAvailable"], {
+    state,
+    getSelectedEnclosureOption: () => ({
+      id: "virtual-system:system-a",
+      kind: "virtual",
+    }),
+  });
+
+  assert.equal(enclosureAliasEditorAvailable(), false);
+});
+
 test("opening and canceling the editor preserves raw context and restores focus", () => {
   let inputFocused = 0;
   let inputSelected = 0;
@@ -372,6 +385,49 @@ test("multi-enclosure live title prefers the selected option label", () => {
   });
 
   assert.equal(buildViewProfile().enclosureTitle, "Archive East");
+});
+
+test("virtual inventory uses system-scoped disk copy without physical profile orientation", () => {
+  const state = {
+    snapshot: {
+      selected_system_label: "System A",
+      enclosures: [{ id: "virtual-system:system-a", label: "System disk inventory (virtual)", kind: "virtual" }],
+      layout_slot_count: 2,
+    },
+  };
+  const { buildViewProfile } = loadFunctions(["buildViewProfile"], {
+    state,
+    getSelectedStorageViewRuntime: () => null,
+    getSelectedProfile: () => ({
+      id: "supermicro-cse-946-top-60",
+      label: "Supermicro 60 Bay",
+      summary: "Physical top-loading chassis",
+      panel_title: "60-Bay Chassis",
+      edge_label: "System front",
+      face_style: "top-loader",
+      latch_edge: "top",
+      slot_layout: [Array.from({ length: 60 }, (_, index) => index)],
+    }),
+    getSelectedSystemOption: () => ({ label: "System A" }),
+    getSelectedEnclosureOption: () => state.snapshot.enclosures[0],
+    currentLiveEnclosureLabel: () => "System disk inventory (virtual)",
+    activeLayoutRows: () => [[0, 1]],
+    countLayoutSlots: () => 2,
+  });
+
+  const profile = buildViewProfile();
+
+  assert.equal(profile.profileId, null);
+  assert.equal(profile.profileLabel, null);
+  assert.equal(profile.eyebrow, "System A / Virtual inventory");
+  assert.match(profile.summary, /system-scoped disk inventory/i);
+  assert.match(profile.summary, /no physical enclosure orientation/i);
+  assert.equal(profile.enclosureTitle, "System disk inventory (virtual)");
+  assert.equal(profile.edgeLabel, "System-scoped disks");
+  assert.equal(profile.faceStyle, "generic");
+  assert.equal(profile.latchEdge, "bottom");
+  assert.deepEqual(profile.slotLayout, [[0, 1]]);
+  assert.equal(profile.slotCount, 2);
 });
 
 test("template and stylesheet expose an accessible inline alias editor", () => {
