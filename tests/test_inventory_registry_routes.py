@@ -1,18 +1,24 @@
 from __future__ import annotations
 
-import base64
+import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from fastapi.testclient import TestClient
-from pydantic import SecretStr
+from fastapi import Request
+from fastapi.routing import APIRoute
 
 from admin_service import main as admin_main
-from admin_service.config import AdminSettings
 from app import main as app_main
 from app.config import Settings, SystemConfig
-from app.models.domain import InventorySnapshot, StorageViewRuntimePayload, SystemLocatorStatusView, SystemOption
+from app.models.domain import (
+    InventorySnapshot,
+    StorageViewRuntimePayload,
+    SystemLocatorRequest,
+    SystemLocatorStatusView,
+    SystemOption,
+)
 from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
 
 
@@ -54,12 +60,33 @@ def _default_service() -> Mock:
     return service
 
 
-def _authorized_mutation_headers() -> dict[str, str]:
-    credentials = base64.b64encode(b"operator:test-password").decode("ascii")
-    return {
-        "Authorization": f"Basic {credentials}",
-        "Origin": "http://testserver",
-    }
+def _route(application, path: str, method: str = "GET") -> APIRoute:
+    return next(
+        route
+        for route in application.routes
+        if isinstance(route, APIRoute)
+        and getattr(route, "path", None) == path
+        and method in (getattr(route, "methods", None) or set())
+    )
+
+
+def _request(path: str = "/") -> Request:
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": [],
+            "client": ("testclient", 123),
+            "server": ("testserver", 80),
+            "root_path": "",
+            "app": app_main.app,
+        }
+    )
 
 
 class InventoryRegistrySelectionTests(unittest.TestCase):
@@ -93,45 +120,57 @@ class InventoryRegistrySelectionTests(unittest.TestCase):
 
 
 class UnknownSystemRouteTests(unittest.TestCase):
+    def assert_unknown_system(self, callback) -> None:
+        with self.assertRaisesRegex(
+            SystemNotConfiguredError,
+            "^System 'retired-nas' is not configured\\.$",
+        ):
+            asyncio.run(callback())
+
+    def test_registered_handlers_map_unknown_system_errors_to_404(self) -> None:
+        error = SystemNotConfiguredError(UNKNOWN_SYSTEM_ID)
+        for application, handler in (
+            (app_main.app, app_main.system_not_configured_exception_handler),
+            (admin_main.app, admin_main.system_not_configured_exception_handler),
+        ):
+            with self.subTest(application=application.title):
+                self.assertIs(application.exception_handlers[SystemNotConfiguredError], handler)
+                response = asyncio.run(handler(Mock(), error))
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(
+                    json.loads(bytes(response.body)),
+                    {"ok": False, "detail": UNKNOWN_SYSTEM_DETAIL},
+                )
+
     def test_explicit_unknown_inventory_read_returns_404_without_calling_default_service(self) -> None:
         default_service = _default_service()
         registry = _registry_with_default_service(default_service)
+        route = _route(app_main.app, "/api/inventory")
 
         with patch.object(app_main, "get_inventory_registry", return_value=registry):
-            response = TestClient(app_main.app).get(
-                "/api/inventory",
-                params={"system_id": UNKNOWN_SYSTEM_ID},
+            self.assert_unknown_system(
+                lambda: route.endpoint(
+                    force=False,
+                    system_id=UNKNOWN_SYSTEM_ID,
+                    enclosure_id=None,
+                )
             )
 
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json(), {"ok": False, "detail": UNKNOWN_SYSTEM_DETAIL})
         default_service.get_snapshot.assert_not_awaited()
 
     def test_explicit_unknown_locator_mutation_returns_404_without_calling_default_service(self) -> None:
         default_service = _default_service()
         registry = _registry_with_default_service(default_service)
-        original_auth_settings = app_main.app.state.operator_auth_settings
-        original_public_origin = app_main.app.state.read_ui_public_origin
-        app_main.app.state.operator_auth_settings = AdminSettings(
-            auth_mode="basic",
-            auth_username="operator",
-            auth_password=SecretStr("test-password"),
-        )
-        app_main.app.state.read_ui_public_origin = "http://testserver"
-        try:
-            with patch.object(app_main, "get_inventory_registry", return_value=registry):
-                response = TestClient(app_main.app).post(
-                    "/api/system-locator",
-                    params={"system_id": UNKNOWN_SYSTEM_ID},
-                    json={"active": True},
-                    headers=_authorized_mutation_headers(),
-                )
-        finally:
-            app_main.app.state.operator_auth_settings = original_auth_settings
-            app_main.app.state.read_ui_public_origin = original_public_origin
+        route = _route(app_main.app, "/api/system-locator", "POST")
 
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json(), {"ok": False, "detail": UNKNOWN_SYSTEM_DETAIL})
+        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+            self.assert_unknown_system(
+                lambda: route.endpoint(
+                    payload=SystemLocatorRequest(active=True),
+                    system_id=UNKNOWN_SYSTEM_ID,
+                )
+            )
+
         default_service.set_system_locator.assert_not_awaited()
 
     def test_explicit_unknown_slot_history_returns_404_without_calling_default_or_history_backend(self) -> None:
@@ -139,18 +178,21 @@ class UnknownSystemRouteTests(unittest.TestCase):
         registry = _registry_with_default_service(default_service)
         history_backend = Mock()
         history_backend.get_slot_history = AsyncMock(return_value={"available": True})
+        route = _route(app_main.app, "/api/slots/{slot}/history")
 
         with (
             patch.object(app_main, "get_inventory_registry", return_value=registry),
             patch.object(app_main, "get_history_backend", return_value=history_backend) as backend_getter,
         ):
-            response = TestClient(app_main.app).get(
-                "/api/slots/5/history",
-                params={"system_id": UNKNOWN_SYSTEM_ID, "enclosure_id": "enc-a"},
+            self.assert_unknown_system(
+                lambda: route.endpoint(
+                    slot=5,
+                    system_id=UNKNOWN_SYSTEM_ID,
+                    enclosure_id="enc-a",
+                    window_hours=None,
+                )
             )
 
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json(), {"ok": False, "detail": UNKNOWN_SYSTEM_DETAIL})
         default_service.get_snapshot.assert_not_awaited()
         backend_getter.assert_not_called()
         history_backend.get_slot_history.assert_not_awaited()
@@ -160,36 +202,43 @@ class UnknownSystemRouteTests(unittest.TestCase):
         registry = _registry_with_default_service(default_service)
         history_backend = Mock()
         history_backend.get_scope_history = AsyncMock(return_value={})
+        route = _route(app_main.app, "/api/history/scope")
 
         with (
             patch.object(app_main, "get_inventory_registry", return_value=registry),
             patch.object(app_main, "get_history_backend", return_value=history_backend) as backend_getter,
         ):
-            response = TestClient(app_main.app).get(
-                "/api/history/scope",
-                params={"system_id": UNKNOWN_SYSTEM_ID},
+            self.assert_unknown_system(
+                lambda: route.endpoint(
+                    system_id=UNKNOWN_SYSTEM_ID,
+                    enclosure_id=None,
+                    slots=None,
+                    window_hours=None,
+                    metrics=None,
+                    event_limit=12,
+                )
             )
 
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json(), {"ok": False, "detail": UNKNOWN_SYSTEM_DETAIL})
         backend_getter.assert_not_called()
         history_backend.get_scope_history.assert_not_awaited()
 
     def test_admin_inventory_route_maps_explicit_unknown_system_to_404(self) -> None:
         default_service = _default_service()
         registry = _registry_with_default_service(default_service)
+        route = _route(admin_main.app, "/api/admin/storage-views/candidates")
 
         with (
             patch.object(admin_main, "reload_app_settings", return_value=registry.settings),
             patch.object(admin_main, "InventoryRegistry", return_value=registry),
         ):
-            response = TestClient(admin_main.app).get(
-                "/api/admin/storage-views/candidates",
-                params={"system_id": UNKNOWN_SYSTEM_ID},
+            self.assert_unknown_system(
+                lambda: route.endpoint(
+                    system_id=UNKNOWN_SYSTEM_ID,
+                    target_system_id=None,
+                    force=False,
+                )
             )
 
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json(), {"ok": False, "detail": UNKNOWN_SYSTEM_DETAIL})
         default_service.get_storage_view_candidates.assert_not_awaited()
 
     def test_index_with_unknown_system_explicitly_selects_and_renders_default(self) -> None:
@@ -202,21 +251,27 @@ class UnknownSystemRouteTests(unittest.TestCase):
         registry.get_service.return_value = service
         release_service = Mock()
         release_service.snapshot.return_value = {}
+        route = _route(app_main.app, "/")
 
         with (
             patch.object(app_main, "get_settings", return_value=settings),
             patch.object(app_main, "get_inventory_registry", return_value=registry),
             patch.object(app_main, "get_release_status_service", return_value=release_service),
+            patch.object(app_main, "resolve_admin_launch_url", return_value=None),
         ):
-            response = TestClient(app_main.app).get(
-                "/",
-                params={"system_id": UNKNOWN_SYSTEM_ID},
+            response = asyncio.run(
+                route.endpoint(
+                    request=_request(),
+                    system_id=UNKNOWN_SYSTEM_ID,
+                    enclosure_id=None,
+                )
             )
 
         self.assertEqual(response.status_code, 200)
         registry.get_service.assert_called_once_with("system-a")
-        self.assertIn('value="system-a" selected', response.text)
-        self.assertNotIn(UNKNOWN_SYSTEM_ID, response.text)
+        response_text = response.body.decode("utf-8")
+        self.assertIn('value="system-a" selected', response_text)
+        self.assertNotIn(UNKNOWN_SYSTEM_ID, response_text)
 
 
 if __name__ == "__main__":
