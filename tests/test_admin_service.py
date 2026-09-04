@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
 import shlex
 import stat
 import tempfile
@@ -16,15 +15,13 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-# admin_service.main builds the module-level app at import time and refuses to
-# start without a browser origin; give the test process a synthetic one.
-os.environ.setdefault("ADMIN_PUBLIC_ORIGIN", "http://admin.example.test")
-
 from fastapi import HTTPException
 from fastapi import Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from app import __version__
+# Must precede admin_service.main, which builds its app at import time.
+import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
 from admin_service.config import AdminSettings
 from admin_service.services.esxi_host_prep import MAX_UPLOAD_BYTES
 from admin_service.services.runtime_control import DockerRuntimeService

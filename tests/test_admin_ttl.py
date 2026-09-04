@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import unittest
 from unittest.mock import patch
 
-# admin_service.main builds the module-level app at import time and refuses to
-# start without a browser origin; give the test process a synthetic one.
-os.environ.setdefault("ADMIN_PUBLIC_ORIGIN", "http://admin.example.test")
-
 from pydantic import ValidationError
 
+# Must precede admin_service.main, which builds its app at import time.
+from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings, get_admin_settings
 from admin_service.main import compute_expires_at, create_app
 
@@ -49,7 +46,7 @@ class AdminAutoStopContractTests(unittest.TestCase):
         get_admin_settings.cache_clear()
 
     def test_positive_auto_stop_keeps_expiry_and_shutdown_task(self) -> None:
-        settings = AdminSettings(auto_stop_seconds=17, public_origin="http://admin.example.test")
+        settings = AdminSettings(auto_stop_seconds=17, public_origin=ADMIN_TEST_PUBLIC_ORIGIN)
         self.assertIsNotNone(compute_expires_at(settings))
 
         async def exercise() -> list[int]:
@@ -72,7 +69,7 @@ class AdminAutoStopContractTests(unittest.TestCase):
         self.assertEqual(asyncio.run(exercise()), [17])
 
     def test_disabled_auto_stop_creates_no_shutdown_task(self) -> None:
-        settings = AdminSettings(auto_stop_seconds=0, public_origin="http://admin.example.test")
+        settings = AdminSettings(auto_stop_seconds=0, public_origin=ADMIN_TEST_PUBLIC_ORIGIN)
 
         async def exercise() -> list[int]:
             calls: list[int] = []

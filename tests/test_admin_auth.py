@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import os
 import re
 import tempfile
 import unittest
@@ -10,14 +9,12 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-# admin_service.main builds the module-level app at import time and refuses to
-# start without a browser origin; give the test process a synthetic one.
-os.environ.setdefault("ADMIN_PUBLIC_ORIGIN", "http://admin.example.test")
-
 from pydantic import SecretStr, ValidationError
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
 
+# Must precede admin_service.main, which builds its app at import time.
+from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings, get_admin_settings
 from admin_service.main import (
     _basic_auth_matches,
@@ -198,7 +195,7 @@ class AdminAuthenticationTests(unittest.TestCase):
             auth_mode="basic",
             auth_username="operator",
             auth_password=SecretStr(MARKER_ALPHA),
-            public_origin="http://admin.example.test",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
@@ -227,7 +224,7 @@ class AdminAuthenticationTests(unittest.TestCase):
             auth_mode="basic",
             auth_username="operator",
             auth_password=SecretStr(MARKER_ALPHA),
-            public_origin="http://admin.example.test",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
@@ -261,7 +258,7 @@ class AdminAuthenticationTests(unittest.TestCase):
     def test_origin_gate_wraps_every_admin_router_mutation(self) -> None:
         settings = AdminSettings(
             auth_mode="network",
-            public_origin="http://admin.example.test",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
@@ -295,7 +292,7 @@ class AdminAuthenticationTests(unittest.TestCase):
     def test_network_boundary_mode_preserves_remote_unauthenticated_contract(self) -> None:
         settings = AdminSettings(
             auth_mode="network",
-            public_origin="http://admin.example.test",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
@@ -329,7 +326,7 @@ class AdminAuthenticationTests(unittest.TestCase):
     def test_configured_public_origin_gates_browser_mutations_on_a_real_route(self) -> None:
         settings = AdminSettings(
             auth_mode="network",
-            public_origin="http://admin.example.test",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
@@ -362,7 +359,7 @@ class AdminAuthenticationTests(unittest.TestCase):
             (
                 AdminSettings(
                     auth_mode="network",
-                    public_origin="http://admin.example.test",
+                    public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
                     auto_stop_seconds=0,
                 ),
                 None,
@@ -372,7 +369,7 @@ class AdminAuthenticationTests(unittest.TestCase):
                     auth_mode="basic",
                     auth_username="operator",
                     auth_password=SecretStr(MARKER_ALPHA),
-                    public_origin="http://admin.example.test",
+                    public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
                     auto_stop_seconds=0,
                 ),
                 basic_header("operator", MARKER_ALPHA),
@@ -470,7 +467,7 @@ class AdminAuthenticationTests(unittest.TestCase):
             auth_mode="basic",
             auth_username="operator",
             auth_password=SecretStr(MARKER_ALPHA),
-            public_origin="http://admin.example.test",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with (
@@ -485,7 +482,7 @@ class AdminAuthenticationTests(unittest.TestCase):
             auth_mode="basic",
             auth_username="operator",
             auth_password=SecretStr(MARKER_ALPHA),
-            public_origin="http://admin.example.test",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with (
@@ -518,7 +515,7 @@ class AdminAuthenticationTests(unittest.TestCase):
         )
 
     def test_export_routes_enforce_plaintext_policy_before_maintenance(self) -> None:
-        settings = AdminSettings(auto_stop_seconds=0, public_origin="http://admin.example.test")
+        settings = AdminSettings(auto_stop_seconds=0, public_origin=ADMIN_TEST_PUBLIC_ORIGIN)
         with patch("admin_service.main.get_admin_settings", return_value=settings):
             app = create_app()
         backup_route = next(

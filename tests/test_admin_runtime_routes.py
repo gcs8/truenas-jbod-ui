@@ -3,18 +3,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
 import unittest
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-# admin_service.main builds the module-level app at import time and refuses to
-# start without a browser origin; give the test process a synthetic one.
-os.environ.setdefault("ADMIN_PUBLIC_ORIGIN", "http://admin.example.test")
-
 from pydantic import SecretStr
 
+# Must precede admin_service.main, which builds its app at import time.
+from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings
 from admin_service.main import create_app
 
@@ -110,7 +107,7 @@ class AdminRuntimeRouteTests(unittest.TestCase):
     def test_runtime_get_route_returns_a_narrow_fresh_runtime_payload(self) -> None:
         settings = AdminSettings(
             auth_mode="network",
-            public_origin="http://admin.example.test",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         runtime_service = self._runtime_service()
@@ -172,7 +169,7 @@ class AdminRuntimeRouteTests(unittest.TestCase):
             auth_mode="basic",
             auth_username="operator",
             auth_password=SecretStr("runtime-passphrase"),
-            public_origin="http://admin.example.test",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         runtime_service = self._runtime_service()
@@ -203,7 +200,7 @@ class AdminRuntimeRouteTests(unittest.TestCase):
     def test_runtime_get_route_replaces_unavailable_runtime_detail(self) -> None:
         settings = AdminSettings(
             auth_mode="network",
-            public_origin="http://admin.example.test",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         runtime_service = MagicMock()

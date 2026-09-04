@@ -12,14 +12,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-# admin_service.main builds the module-level app at import time and refuses to
-# start without a browser origin; give the test process a synthetic one.
-os.environ.setdefault("ADMIN_PUBLIC_ORIGIN", "http://admin.example.test")
-
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from prometheus_client.parser import text_string_to_metric_families
 
+# Must precede admin_service.main, which builds its app at import time.
+from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from app.config import Settings, SystemConfig, TrueNASConfig
 from app.logging_config import JsonFormatter
 from app.metrics import (
@@ -227,7 +225,7 @@ class MetricsRouteTests(unittest.TestCase):
                 auth_mode="basic",
                 auth_username="synthetic-user",
                 auth_password="synthetic-password",
-                public_origin="http://admin.example.test",
+                public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             ),
         ):
             basic_admin_app = create_admin_app()
