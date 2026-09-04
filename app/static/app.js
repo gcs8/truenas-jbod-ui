@@ -466,8 +466,12 @@
     return [...views].sort((left, right) => (Number(left.order) || 0) - (Number(right.order) || 0));
   }
 
+  function isMainUiStorageViewRuntimeOption(view) {
+    return Boolean(view) && view.enabled !== false && view.render?.show_in_main_ui !== false;
+  }
+
   function getMainUiStorageViewRuntimeOptions() {
-    return storageViewRuntimeViews().filter((view) => view.enabled !== false && view.render?.show_in_main_ui !== false);
+    return storageViewRuntimeViews().filter(isMainUiStorageViewRuntimeOption);
   }
 
   function getStorageViewRuntimeById(viewId) {
@@ -482,7 +486,9 @@
       ? bootstrapData.storageViewsRuntime.views
       : [];
     const storageViewId = isSnapshotMode
-      ? (availableViews.some((view) => view.id === requestedStorageViewId) ? requestedStorageViewId : "")
+      ? (availableViews.some((view) => view.id === requestedStorageViewId && isMainUiStorageViewRuntimeOption(view))
+        ? requestedStorageViewId
+        : "")
       : (new URLSearchParams(locationSearch).get("storage_view_id") || "");
     const unresolvedSnapshotView = Boolean(
       isSnapshotMode && requestedStorageViewId && !storageViewId
@@ -493,11 +499,20 @@
     return { selectedSlot, storageViewId };
   }
 
+  function dropStorageViewRuntimeSelection() {
+    // A storage-view slot index means nothing without its view: leaving it in
+    // state would highlight an unrelated physical bay on the live grid.
+    if (state.selectedStorageViewRuntimeId) {
+      state.selectedSlot = null;
+    }
+    state.selectedStorageViewRuntimeId = "";
+  }
+
   function ensureStorageViewRuntimeSelection(preferVisible = false) {
     const views = storageViewRuntimeViews();
     const mainUiViews = getMainUiStorageViewRuntimeOptions();
     if (!views.length) {
-      state.selectedStorageViewRuntimeId = "";
+      dropStorageViewRuntimeSelection();
       return null;
     }
     if (state.selectedStorageViewRuntimeId && mainUiViews.some((view) => view.id === state.selectedStorageViewRuntimeId)) {
@@ -505,10 +520,11 @@
     }
     if (preferVisible) {
       const preferredVisible = mainUiViews[0] || null;
+      dropStorageViewRuntimeSelection();
       state.selectedStorageViewRuntimeId = preferredVisible?.id || "";
       return preferredVisible || null;
     }
-    state.selectedStorageViewRuntimeId = "";
+    dropStorageViewRuntimeSelection();
     return null;
   }
 
