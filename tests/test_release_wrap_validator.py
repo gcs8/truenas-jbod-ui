@@ -3,14 +3,24 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from scripts.validate_release_wrap import REQUIRED_GATES, validate_release_wrap_text
+from scripts.validate_release_wrap import (
+    REQUIRED_GATES,
+    changelog_coverage_required,
+    validate_release_wrap_text,
+)
 
 
-def _wrap_with_rows(rows: dict[str, tuple[str, str, str, str]]) -> str:
+def _wrap_with_rows(
+    rows: dict[str, tuple[str, str, str, str]],
+    *,
+    coverage_line: str = "Changelog coverage: pass (12 PRs)",
+) -> str:
     lines = [
         "# Release Wrap - v0.20.2",
         "",
         "Validated against `docs/RELEASE_CHECKLIST.md`.",
+        "",
+        coverage_line,
         "",
         "| Gate | Required | Evidence | Result | N/A Reason |",
         "| --- | --- | --- | --- | --- |",
@@ -26,7 +36,9 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
         repository = Path(__file__).resolve().parents[1]
         text = (repository / "docs" / "RELEASE_WRAP_0.22.2.md").read_text(encoding="utf-8")
 
-        self.assertEqual(validate_release_wrap_text(text), [])
+        # v0.22.2 predates the changelog coverage gate; main() grandfathers it.
+        self.assertFalse(changelog_coverage_required("0.22.2"))
+        self.assertEqual(validate_release_wrap_text(text, require_changelog_coverage=False), [])
         for marker in (
             "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2",
             "https://github.com/gcs8/truenas-jbod-ui/actions/runs/33505635256",
@@ -64,6 +76,38 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
         issues = validate_release_wrap_text(_wrap_with_rows({}))
 
         self.assertEqual(issues, [])
+
+    def test_requires_changelog_coverage_evidence_line(self) -> None:
+        text = _wrap_with_rows({}, coverage_line="")
+
+        issues = validate_release_wrap_text(text)
+
+        self.assertIn(
+            "release wrap must record the changelog coverage gate as "
+            "'Changelog coverage: pass (<N> PRs)' from scripts/check_release_changelog_coverage.py",
+            [issue.message for issue in issues],
+        )
+        self.assertEqual(validate_release_wrap_text(text, require_changelog_coverage=False), [])
+
+    def test_changelog_coverage_requirement_starts_at_v0223(self) -> None:
+        self.assertFalse(changelog_coverage_required("v0.22.2"))
+        self.assertTrue(changelog_coverage_required("0.22.3"))
+        self.assertTrue(changelog_coverage_required("v0.23.0"))
+        self.assertTrue(changelog_coverage_required("1.0.0"))
+
+    def test_wiki_change_requires_external_wiki_commit_line(self) -> None:
+        text = _wrap_with_rows({})
+
+        issues = validate_release_wrap_text(text, wiki_changed=True)
+
+        self.assertIn(
+            "wiki/ changed since the previous tag; release wrap must record "
+            "'External wiki commit: <sha>' for the published GitHub wiki",
+            [issue.message for issue in issues],
+        )
+        self.assertEqual(validate_release_wrap_text(text, wiki_changed=False), [])
+        recorded = text + "\nExternal wiki commit: 0123456789abcdef0123456789abcdef01234567\n"
+        self.assertEqual(validate_release_wrap_text(recorded, wiki_changed=True), [])
 
     def test_requires_all_global_checklist_rows(self) -> None:
         text = _wrap_with_rows({}).replace(

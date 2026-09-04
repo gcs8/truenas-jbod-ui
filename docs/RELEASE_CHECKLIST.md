@@ -47,7 +47,7 @@ using this shape:
 | Linux QA restore gate | yes | target, counts, health, smoke evidence | Pass/Blocked/N/A | reason |
 | Restored Linux QA perf harnesses | yes | artifact path and summary | Pass/Blocked/N/A | reason |
 | Snapshot/export/offline artifact gate | yes | command and browser smoke | Pass/Blocked/N/A | reason |
-| Docs/wiki/public-demo gate | yes | changed files, URLs, workflow runs | Pass/Blocked/N/A | reason |
+| Docs/wiki/public-demo gate | yes | changed files, URLs, workflow runs, and `External wiki commit: <sha>` whenever `wiki/` changed since the previous tag | Pass/Blocked/N/A | reason |
 | GHCR publish verification | yes | workflow URL, full `name@sha256` image reference, and exact source revision | Pass/Blocked/N/A | reason |
 | Deployment refresh/sniff tests | yes | validated private deployment receipt, exact Compose project/file/profile/service contract, pre-update rollback digest, running container image IDs, health/restart evidence, and rollback result | Pass/Blocked/N/A | reason |
 | Post-release reopen | yes | branch, commit, version | Pass/Blocked/N/A | reason |
@@ -57,18 +57,23 @@ release URL when published, full `name@sha256` image reference and exact source
 revision when published, pre-update rollback digest, running container image IDs,
 validated private deployment-receipt result, exact Compose project/file/profile/service
 contract, health and restart evidence, rollback result, public demo workflow or Pages URL
-when applicable, external wiki commit when applicable, and any known deviations
+when applicable, the `Changelog coverage: pass (<N> PRs)` line from
+`scripts/check_release_changelog_coverage.py`, the `External wiki commit: <sha>`
+line whenever `wiki/` changed since the previous tag, and any known deviations
 from the checklist.
 
 Before tagging, run the pre-tag release-wrap validator against the target
 version:
 
-- `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --phase pre-tag`
+- `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --phase pre-tag --previous-tag <previous tag>`
 
 After GHCR publish, deployment sniff tests, and reopen work are recorded, run
 the final release-wrap validator:
 
-- `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version>`
+- `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --previous-tag <previous tag>`
+
+`--previous-tag` lets the validator see whether `wiki/` changed; when it did,
+the wrap must carry the `External wiki commit: <sha>` line.
 
 ## Release Gate Order
 
@@ -76,7 +81,9 @@ the final release-wrap validator:
    local handoff before doing release work.
 2. Confirm scope, release branch, version, and whether the release is a normal
    feature release, patch, hotfix, docs-only correction, or process correction.
-3. Draft or update the release notes and release wrap before tagging.
+3. Run the changelog coverage gate, finish the `CHANGELOG.md` release
+   section (Highlights and Upgrade notes included), and update the release
+   wrap before tagging.
 4. Run local unit, syntax, hygiene, Docker health, optional-sidecar, browser,
    feature-specific, public-demo, and perf gates.
 5. Run the Linux QA Docker restore gate and restored-stack perf/browser gates.
@@ -87,7 +94,10 @@ the final release-wrap validator:
 8. Refresh and sniff-test local, Linux, and production deployments after GHCR
    is available.
 9. Sync the external wiki and public demo deployment when those artifacts
-   changed, and record workflow URLs or commit hashes.
+   changed, and record workflow URLs or commit hashes. When `wiki/` changed
+   since the previous tag, the wrap must carry `External wiki commit: <sha>`
+   for the published GitHub wiki commit, and the wiki gate row cannot pass
+   without it.
 10. Reopen the next development branch only after post-publish deployment
     evidence is recorded, then rerun the final release-wrap validator.
 
@@ -383,10 +393,22 @@ the final release-wrap validator:
 ## Release Notes And Docs
 
 - bump `app/__init__.py` to the release version
-- add the release section to `CHANGELOG.md`
-- refresh any checked-in draft release-notes file if the repo is using one
+- build the merged pull request list for the coverage gate:
+  `gh pr list -R gcs8/truenas-jbod-ui --state merged --search "merged:>=<previous tag date>" --json number,mergedAt > merged-prs.json`
+- run the changelog coverage gate against the previous tag and the section
+  that will become the release section, and fix every missing number before
+  going on:
+  `python scripts/check_release_changelog_coverage.py <previous tag> "## Unreleased" --merged-prs-json merged-prs.json`
+  (add `--wiki-commit <sha>` once the wiki is published; see Publish)
+- rename `## Unreleased` to `## vX.Y.Z - YYYY-MM-DD`, write three to five
+  `### Highlights` bullets, and read the `### Upgrade notes` bullets as an
+  operator would; rerun the coverage gate with the final header
+- render the release body head and keep the file for the publish step:
+  `python scripts/render_release_notes.py "## vX.Y.Z - YYYY-MM-DD" > release-notes.md`
+- record the gate's `Changelog coverage: pass (<N> PRs)` line in the release
+  wrap
 - refresh the checked-in release notes file for the target tag, for example
-  `docs/RELEASE_NOTES_0.15.0.md`
+  `docs/RELEASE_NOTES_0.15.0.md`, from the rendered head plus the per-PR lines
 - review `README.md` for stale version or milestone wording
 - review `docs/ROADMAP.md` for stale "current direction" text
 - review profile/config docs for dead or outdated comments, especially builder
@@ -432,9 +454,17 @@ the final release-wrap validator:
   publish action
 - push `main`
 - push the release tag
-- publish the repo `wiki/` pages if they changed
-- create the GitHub release notes from the final changelog section
-- publish the GitHub release page so the `Publish GHCR Image` workflow runs
+- publish the repo `wiki/` pages if they changed, then rerun the coverage
+  gate with `--wiki-commit <sha>` so it verifies the published commit against
+  the wiki repository, and record its `External wiki commit: <sha>` line in the
+  release wrap
+- create the GitHub release with generated notes:
+  `gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes --notes-file release-notes.md`
+- open the release page and confirm every pull request sits in the expected
+  category (Breaking changes, Security, Features, Fixes, Performance,
+  Documentation, Internal, Dependencies); fix labels and regenerate rather than
+  editing the body by hand
+- publishing the GitHub release page runs the `Publish GHCR Image` workflow
 - wait for the `Publish GHCR Image` Actions run to finish successfully
 - confirm GHCR has the expected release tags:
   - `ghcr.io/gcs8/truenas-jbod-ui:vX.Y.Z`
@@ -454,7 +484,8 @@ the final release-wrap validator:
 
 - confirm the pushed tag matches the intended commit
 - confirm the GitHub README renders the new screenshots correctly
-- confirm the wiki publish completed if applicable
+- confirm the wiki publish completed if applicable and that the release wrap
+  records the published `External wiki commit: <sha>`
 - next-cycle source work may begin before production deployment only in a
   separate clean worktree after the tag and immutable image are published. Keep
   the production release lane frozen, and do not mark `Post-release reopen` as
