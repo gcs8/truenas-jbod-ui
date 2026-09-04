@@ -550,6 +550,14 @@ class BootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
                     if Path(tokens[0]).name == "smartctl":
                         self.assertIn(tuple(tokens[1:]), allowed_argument_shapes)
 
+    def test_quantastor_bootstrap_does_not_grant_unbounded_root_cli_access(self) -> None:
+        self.assertFalse(
+            any(
+                grant.startswith("/usr/bin/qs")
+                for grant in SUDO_COMMANDS_BY_PLATFORM["quantastor"]
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

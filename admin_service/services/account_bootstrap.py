@@ -125,7 +125,6 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
         *SMARTCTL_SUDO_COMMANDS,
-        "/usr/bin/qs *",
     ),
     "esxi": (),
 }
@@ -154,7 +153,6 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
         *SMARTCTL_SUDO_COMMANDS,
-        "/usr/bin/qs *",
     ),
     "esxi": (),
 }
