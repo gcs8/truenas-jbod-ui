@@ -63,14 +63,32 @@ repository commit and external wiki commit, and any known deviations from the
 checklist.
 
 Before tagging, run the pre-tag release-wrap validator against the target
-version:
+version. This binds the wiki source to the pre-tag `HEAD`:
 
-- `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --phase pre-tag`
+```bash
+version="<version>"
+repo_commit="$(git rev-parse HEAD)"
+wiki_commit="<full 40-character external wiki commit>"
+python scripts/validate_release_wrap.py "$version" --phase pre-tag \
+  --repository . \
+  --repository-commit "$repo_commit" \
+  --wiki-source https://github.com/gcs8/truenas-jbod-ui.wiki.git \
+  --external-wiki-commit "$wiki_commit"
+```
 
 After GHCR publish, deployment sniff tests, and reopen work are recorded, run
-the final release-wrap validator:
+the final release-wrap validator against the immutable release tag:
 
-- `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version>`
+```bash
+version="<version>"
+repo_commit="$(git rev-parse "v${version#v}^{commit}")"
+wiki_commit="<full 40-character external wiki commit>"
+python scripts/validate_release_wrap.py "$version" \
+  --repository . \
+  --repository-commit "$repo_commit" \
+  --wiki-source https://github.com/gcs8/truenas-jbod-ui.wiki.git \
+  --external-wiki-commit "$wiki_commit"
+```
 
 ## Release Gate Order
 
@@ -129,8 +147,8 @@ the final release-wrap validator:
   app/test packages; raw reference:
   - `python -m compileall app admin_service history_service scripts tests`
 - validate the target release wrap before tagging:
-  - `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --phase pre-tag`
-    (run the no-flag final validator after post-publish evidence exists)
+  - run the complete pre-tag command under `Required Release Wrap Evidence`
+    above (use the final command there after post-publish evidence exists)
 - use the wrapper's dynamic JavaScript syntax gates for app, admin, history,
   every `qa/*.spec.js`, and changed JS files; raw reference:
   - `node --check app/static/app.js`
@@ -416,16 +434,10 @@ the final release-wrap validator:
   Copy the four values into the `Docs/wiki/public-demo gate` evidence cell on
   one line, separated by semicolons. A missing, extra, or changed page or image
   keeps that row `Blocked`. The verifier does not publish anything.
-- for every release after v0.22.2, pass the same source and exact commits to the
-  final release-wrap validator:
-
-  ```bash
-  python scripts/validate_release_wrap.py <version> \
-    --repository . \
-    --repository-commit "$repo_commit" \
-    --wiki-source https://github.com/gcs8/truenas-jbod-ui.wiki.git \
-    --external-wiki-commit "$wiki_commit"
-  ```
+- for every release after v0.22.2, run the complete final release-wrap
+  validator command under `Required Release Wrap Evidence`. It resolves the
+  repository commit from the immutable version tag; the validator rejects a
+  supplied commit that does not match that tag
 
   During the pre-tag phase, the row may remain `Blocked` while it waits for the
   owner-approved publication. A `Pass` row always requires the live comparison

@@ -89,6 +89,26 @@ def _resolve_commit(repository: Path, commit: str, *, label: str) -> str:
     return resolved
 
 
+def _require_repository_authority(
+    repository: Path,
+    repository_commit: str,
+    *,
+    authority: str,
+    authority_label: str,
+) -> None:
+    authority_commit = _git(
+        repository,
+        "rev-parse",
+        "--verify",
+        f"{authority}^{{commit}}",
+        error_prefix=f"{authority_label} is unavailable",
+    ).decode("ascii", errors="strict").strip()
+    if repository_commit != authority_commit:
+        raise WikiVerificationError(
+            f"repository commit does not match {authority_label} {authority_commit}"
+        )
+
+
 def _scoped_path(path: bytes, *, repository_tree: bool) -> bytes | None:
     if repository_tree:
         if path.startswith(b"wiki/images/"):
@@ -189,11 +209,19 @@ def verify_wiki_drift(
     repository_commit: str,
     wiki_source: str,
     external_wiki_commit: str,
+    repository_authority: str = "HEAD",
+    repository_authority_label: str = "repository source HEAD",
 ) -> WikiVerificationResult:
     resolved_repository_commit = _resolve_commit(
         repository,
         repository_commit,
         label="repository",
+    )
+    _require_repository_authority(
+        repository,
+        resolved_repository_commit,
+        authority=repository_authority,
+        authority_label=repository_authority_label,
     )
     repository_files = _read_scoped_tree(
         repository,

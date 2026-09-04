@@ -26,6 +26,11 @@ class WikiDriftVerifierTests(unittest.TestCase):
         self._write(self.repository / "wiki" / "Home.md", b"# Home\n")
         self._write(self.repository / "wiki" / "images" / "overview.png", b"\x89PNG\r\nrepo-image\x00")
         self.repository_commit = self._commit(self.repository, "repository wiki")
+        subprocess.run(
+            ["git", "tag", "v0.22.3", self.repository_commit],
+            cwd=self.repository,
+            check=True,
+        )
 
         self._write(self.external / "Home.md", b"# Home\n")
         self._write(self.external / "images" / "overview.png", b"\x89PNG\r\nrepo-image\x00")
@@ -83,9 +88,16 @@ class WikiDriftVerifierTests(unittest.TestCase):
             text=True,
         )
 
-    def _write_release_wrap(self, evidence: str) -> None:
+    def _write_release_wrap(
+        self,
+        evidence: str,
+        *,
+        release_commit: str | None = None,
+    ) -> None:
         lines = [
             "# Release Wrap - v0.22.3",
+            "",
+            f"Release commit: `{release_commit or self.repository_commit}`.",
             "",
             "Validated against `docs/RELEASE_CHECKLIST.md`.",
             "",
@@ -157,6 +169,20 @@ class WikiDriftVerifierTests(unittest.TestCase):
                 "Compared files: 2",
             ],
         )
+
+    def test_repository_commit_must_match_source_head(self) -> None:
+        stale_commit = self.repository_commit
+        self._write(self.repository / "wiki" / "Home.md", b"# Release wiki\n")
+        release_commit = self._commit(self.repository, "release wiki update")
+
+        completed = self._run(repository_commit=stale_commit)
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(
+            f"repository commit does not match repository source HEAD {release_commit}",
+            completed.stderr,
+        )
+        self.assertNotIn("PASS", completed.stdout + completed.stderr)
 
     def test_external_git_url_is_fetched_without_credentials(self) -> None:
         completed = self._run(wiki_source=self.external.as_uri())
@@ -293,6 +319,35 @@ class WikiDriftVerifierTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertIn("checklist evidence is complete", completed.stdout)
 
+    def test_final_validator_rejects_stale_ancestor_of_release_tag(self) -> None:
+        stale_commit = self.repository_commit
+        self._write(self.repository / "wiki" / "Home.md", b"# Release wiki\n")
+        release_commit = self._commit(self.repository, "release wiki update")
+        subprocess.run(
+            ["git", "tag", "-f", "v0.22.3", release_commit],
+            cwd=self.repository,
+            check=True,
+            capture_output=True,
+        )
+        evidence = "; ".join(
+            (
+                "Wiki drift verification: PASS",
+                f"Repository commit: {stale_commit}",
+                f"External wiki commit: {self.external_commit}",
+                "Compared files: 2",
+            )
+        )
+        self._write_release_wrap(evidence, release_commit=release_commit)
+
+        completed = self._run_release_validator()
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            f"repository commit does not match release tag v0.22.3 {release_commit}",
+            completed.stdout,
+        )
+        self.assertNotIn("checklist evidence is complete", completed.stdout)
+
     def test_release_validator_rejects_tree_drift_even_with_matching_commit_tokens(self) -> None:
         changed_commit = self._external_revision(writes={"Home.md": b"changed\n"})
         evidence = "; ".join(
@@ -330,6 +385,32 @@ class WikiDriftVerifierTests(unittest.TestCase):
         self.assertIn("External wiki commit: <sha>", checklist)
         self.assertIn("after v0.22.2", checklist)
         self.assertNotIn("starting with v0.22.3", checklist)
+
+    def test_release_checklist_keeps_canonical_validator_commands_runnable(self) -> None:
+        checklist = (REPOSITORY / "docs" / "RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
+        pre_tag_command = """```bash
+version="<version>"
+repo_commit="$(git rev-parse HEAD)"
+wiki_commit="<full 40-character external wiki commit>"
+python scripts/validate_release_wrap.py "$version" --phase pre-tag \\
+  --repository . \\
+  --repository-commit "$repo_commit" \\
+  --wiki-source https://github.com/gcs8/truenas-jbod-ui.wiki.git \\
+  --external-wiki-commit "$wiki_commit"
+```"""
+        final_command = """```bash
+version="<version>"
+repo_commit="$(git rev-parse "v${version#v}^{commit}")"
+wiki_commit="<full 40-character external wiki commit>"
+python scripts/validate_release_wrap.py "$version" \\
+  --repository . \\
+  --repository-commit "$repo_commit" \\
+  --wiki-source https://github.com/gcs8/truenas-jbod-ui.wiki.git \\
+  --external-wiki-commit "$wiki_commit"
+```"""
+
+        self.assertIn(pre_tag_command, checklist)
+        self.assertIn(final_command, checklist)
 
 
 if __name__ == "__main__":

@@ -258,12 +258,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         if missing_arguments:
             print(f"- wiki verification requires {', '.join(missing_arguments)}")
             return 1
+        repository_authority = "HEAD"
+        repository_authority_label = "repository source HEAD"
+        if args.phase == "final":
+            repository_authority = f"refs/tags/v{version}"
+            repository_authority_label = f"release tag v{version}"
         try:
             wiki_verification = verify_wiki_drift(
                 repository=args.repository,
                 repository_commit=args.repository_commit,
                 wiki_source=args.wiki_source,
                 external_wiki_commit=args.external_wiki_commit,
+                repository_authority=repository_authority,
+                repository_authority_label=repository_authority_label,
             )
         except (OSError, UnicodeError, WikiVerificationError) as exc:
             print(f"- Docs/wiki/public-demo gate: wiki verification failed: {exc}")
