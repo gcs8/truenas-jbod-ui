@@ -5207,6 +5207,123 @@ ses2:
             self.assertEqual(record.lookup_keys, baseline.lookup_keys)
             self.assertEqual(record.smart_devices, baseline.smart_devices)
 
+    def test_build_disk_records_folds_api_named_provider_with_unsynced_peer_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_core_multipath_service(temp_dir)
+            ssh_data = ParsedSSHData(
+                glabel=parse_glabel_status(self.CORE_GLABEL_STATUS_FIXTURE),
+                multipath_info=parse_gmultipath_list(self.CORE_GMULTIPATH_LIST_FIXTURE),
+            )
+            api_named = dict(
+                self.CORE_API_NAMED_MULTIPATH_API_DISK,
+                status="ONLINE",
+                pool_name="authoritative-pool",
+                api_named_marker="authoritative",
+            )
+            unsynced_peer = {
+                "name": "da31",
+                "devname": "da31",
+                "multipath_name": "",
+                "multipath_member": "",
+                "serial": "SYNTH0000000050",
+                "identifier": "{serial_lunid}SYNTH0000000050_5000c500a0000050",
+                "lunid": "5000c500a0000050",
+                "zfs_guid": "peer-only-guid",
+                "peer_marker": "unsynced",
+            }
+
+            forward = service._build_disk_records([api_named, unsynced_peer], ssh_data, {}, {})
+            reverse = service._build_disk_records([unsynced_peer, api_named], ssh_data, {}, {})
+
+            self.assertEqual(len(forward), 1)
+            self.assertEqual(len(reverse), 1)
+            self.assertEqual(forward[0], reverse[0])
+            record = forward[0]
+            self.assertEqual(record.device_name, "multipath/disk50")
+            self.assertEqual(record.path_device_name, "da70")
+            self.assertEqual(record.multipath_name, "disk50")
+            self.assertEqual(record.multipath_member, "da31")
+            self.assertEqual(record.serial, "SYNTH0000000050")
+            self.assertEqual(record.pool_name, "authoritative-pool")
+            self.assertEqual(record.raw["api_named_marker"], "authoritative")
+            self.assertEqual(record.raw["peer_marker"], "unsynced")
+            self.assertNotIn("multipath_source", record.raw)
+            self.assertIn("peer-only-guid", record.lookup_keys)
+            self.assertIn("da31", record.lookup_keys)
+            self.assertIn("da70", record.lookup_keys)
+            self.assertEqual(record.smart_devices, ["da70", "da31", "multipath/disk50"])
+
+    def test_build_disk_records_refuses_ambiguous_direct_consumer_despite_unique_peer(self) -> None:
+        ambiguous_multipath_output = """
+Geom name: disk60
+Providers:
+1. Name: multipath/disk60
+Consumers:
+1. Name: da10
+   State: ACTIVE
+2. Name: da11
+   State: PASSIVE
+Geom name: disk61
+Providers:
+1. Name: multipath/disk61
+Consumers:
+1. Name: da10
+   State: ACTIVE
+2. Name: da12
+   State: PASSIVE
+""".strip()
+        ssh_data = ParsedSSHData(
+            multipath_info=parse_gmultipath_list(ambiguous_multipath_output),
+            camcontrol_peer_devices={"da10": ["da11"]},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_core_multipath_service(temp_dir)
+
+            record = service._build_disk_records(
+                [{"name": "da10", "devname": "da10", "serial": "AMBIGUOUS-CONSUMER"}],
+                ssh_data,
+                {},
+                {},
+            )[0]
+
+        self.assertEqual(record.device_name, "da10")
+        self.assertEqual(record.path_device_name, "da10")
+        self.assertIsNone(record.multipath_name)
+        self.assertIsNone(record.multipath_member)
+        self.assertNotIn("multipath_source", record.raw)
+
+    def test_build_disk_records_limits_gmultipath_inference_to_core(self) -> None:
+        ssh_data = ParsedSSHData(
+            glabel=parse_glabel_status(self.CORE_GLABEL_STATUS_FIXTURE),
+            multipath_info=parse_gmultipath_list(self.CORE_GMULTIPATH_LIST_FIXTURE),
+        )
+        for platform in ("scale", "linux", "quantastor", "esxi", "ipmi"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp_dir:
+                service = build_inventory_service(
+                    Settings(),
+                    SystemConfig(
+                        id=f"non-core-{platform}",
+                        truenas=TrueNASConfig(platform=platform),
+                        ssh=SSHConfig(enabled=True),
+                    ),
+                    AsyncMock(),
+                    AsyncMock(),
+                    temp_dir,
+                )
+
+                record = service._build_disk_records(
+                    [dict(self.CORE_UNSYNCED_MULTIPATH_API_DISK)],
+                    ssh_data,
+                    {},
+                    {},
+                )[0]
+
+                self.assertEqual(record.device_name, "da84")
+                self.assertEqual(record.path_device_name, "da84")
+                self.assertIsNone(record.multipath_name)
+                self.assertIsNone(record.multipath_member)
+                self.assertNotIn("multipath_source", record.raw)
+
     def test_core_correlate_resolves_unsynced_multipath_spare_alongside_api_named_spare(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._build_core_multipath_service(temp_dir)

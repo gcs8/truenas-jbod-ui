@@ -10156,8 +10156,15 @@ class InventoryService:
         records: list[DiskRecord] = []
         linux_block_index = self._index_linux_blockdevices(ssh_data)
         linux_scsi_index = self._index_linux_scsi_devices(ssh_data)
-        multipath_consumer_index = self._index_multipath_consumers(ssh_data)
-        backfilled_multipath_groups: dict[str, tuple[int, MultipathInfo, list[DiskRecord]]] = {}
+        multipath_consumer_index = (
+            self._index_multipath_consumers(ssh_data)
+            if self.system.truenas.platform == "core"
+            else {}
+        )
+        multipath_groups: dict[
+            str,
+            tuple[int, MultipathInfo, list[tuple[DiskRecord, bool]]],
+        ] = {}
         for disk in disks:
             device_name = normalize_device_name(
                 disk.get("devname") or disk.get("name") or disk.get("device") or disk.get("disk")
@@ -10166,7 +10173,17 @@ class InventoryService:
             multipath_name = normalize_text(disk.get("multipath_name"))
             multipath_member = normalize_device_name(disk.get("multipath_member"))
             multipath_source: str | None = None
-            backfilled_multipath: tuple[str, MultipathInfo] | None = None
+            grouped_multipath: tuple[str, MultipathInfo, bool] | None = None
+            if multipath_name and self.system.truenas.platform == "core":
+                parsed_multipath = ssh_data.multipath_info.get(
+                    (device_name or f"multipath/{multipath_name}").lower()
+                ) or ssh_data.multipath_info.get(f"multipath/{multipath_name}".lower())
+                if parsed_multipath is not None:
+                    grouped_multipath = (
+                        parsed_multipath.name.lower(),
+                        parsed_multipath,
+                        True,
+                    )
             if not multipath_name and multipath_consumer_index:
                 # Issue #355: the API disk record can lag gmultipath (a hot-added
                 # spare whose disk table row is not yet synced) and the passive
@@ -10195,7 +10212,7 @@ class InventoryService:
                     path_device_name = api_device_name
                     device_name = parsed_multipath.device_name
                     multipath_source = "gmultipath list"
-                    backfilled_multipath = (geom_key, parsed_multipath)
+                    grouped_multipath = (geom_key, parsed_multipath, False)
             serial = normalize_text(disk.get("serial") or disk.get("serial_lunid") or disk.get("lunid"))
             model = normalize_text(disk.get("model"))
             size_bytes = disk.get("size") if isinstance(disk.get("size"), int) else None
@@ -10341,19 +10358,23 @@ class InventoryService:
                 smart_devices=smart_devices,
                 lookup_keys=lookup_keys,
             )
-            if backfilled_multipath is None:
+            if grouped_multipath is None:
                 records.append(record)
                 continue
 
-            geom_key, parsed_multipath = backfilled_multipath
-            group = backfilled_multipath_groups.get(geom_key)
+            geom_key, parsed_multipath, authoritative = grouped_multipath
+            group = multipath_groups.get(geom_key)
             if group is None:
-                backfilled_multipath_groups[geom_key] = (len(records), parsed_multipath, [record])
+                multipath_groups[geom_key] = (
+                    len(records),
+                    parsed_multipath,
+                    [(record, authoritative)],
+                )
                 records.append(record)
             else:
-                group[2].append(record)
+                group[2].append((record, authoritative))
 
-        for record_index, parsed_multipath, group_records in backfilled_multipath_groups.values():
+        for record_index, parsed_multipath, group_records in multipath_groups.values():
             if len(group_records) > 1:
                 records[record_index] = self._merge_backfilled_multipath_records(
                     group_records,
@@ -10363,7 +10384,7 @@ class InventoryService:
 
     @staticmethod
     def _merge_backfilled_multipath_records(
-        records: list[DiskRecord],
+        grouped_records: list[tuple[DiskRecord, bool]],
         multipath: MultipathInfo,
     ) -> DiskRecord:
         """Fold API rows for one proven geom without discarding member evidence."""
@@ -10374,12 +10395,18 @@ class InventoryService:
         }
         state_priority = {"ACTIVE": 0, "PASSIVE": 1, "FAIL": 3}
 
-        def record_rank(record: DiskRecord) -> tuple[int, str]:
+        def record_rank(item: tuple[DiskRecord, bool]) -> tuple[int, int, str]:
+            record, authoritative = item
             path_device = normalize_device_name(record.path_device_name)
             state = consumer_states.get((path_device or "").lower())
-            return state_priority.get((state or "").upper(), 2), (path_device or "").lower()
+            return (
+                0 if authoritative else 1,
+                state_priority.get((state or "").upper(), 2),
+                (path_device or "").lower(),
+            )
 
-        ordered = sorted(records, key=record_rank)
+        ordered_items = sorted(grouped_records, key=record_rank)
+        ordered = [record for record, _authoritative in ordered_items]
         primary = ordered[0]
         for field_name in (
             "serial",
@@ -10431,6 +10458,8 @@ class InventoryService:
                     not useful_raw_value(merged_raw[key]) and useful_raw_value(value)
                 ):
                     merged_raw[key] = value
+        if any(authoritative for _record, authoritative in ordered_items):
+            merged_raw.pop("multipath_source", None)
         merged_raw["multipath_member_api_rows"] = raw_rows
         primary.raw = merged_raw
 
@@ -10476,7 +10505,9 @@ class InventoryService:
         return primary
 
     @staticmethod
-    def _index_multipath_consumers(ssh_data: ParsedSSHData) -> dict[str, MultipathInfo]:
+    def _index_multipath_consumers(
+        ssh_data: ParsedSSHData,
+    ) -> dict[str, MultipathInfo | None]:
         """Map each gmultipath consumer (member path) to the one geom that claims it.
 
         `parse_gmultipath_list` stores every geom under both `multipath/<name>` and
@@ -10492,24 +10523,22 @@ class InventoryService:
             seen.add(id(info))
             geoms.append(info)
 
-        index: dict[str, MultipathInfo] = {}
-        ambiguous: set[str] = set()
+        index: dict[str, MultipathInfo | None] = {}
         for info in geoms:
             for consumer in info.consumers:
                 key = normalize_device_name(consumer.device_name)
                 if not key:
                     continue
                 key = key.lower()
-                if key in index and index[key] is not info:
-                    ambiguous.add(key)
-                index[key] = info
-        for key in ambiguous:
-            index.pop(key, None)
+                if key not in index:
+                    index[key] = info
+                elif index[key] is not info:
+                    index[key] = None
         return index
 
     @staticmethod
     def _match_multipath_consumer(
-        index: dict[str, MultipathInfo],
+        index: dict[str, MultipathInfo | None],
         ssh_data: ParsedSSHData,
         *device_names: str | None,
     ) -> MultipathInfo | None:
@@ -10520,9 +10549,12 @@ class InventoryService:
 
         matched: MultipathInfo | None = None
         for name in dict.fromkeys(candidates):
-            info = index.get(name.lower())
-            if info is None:
+            key = name.lower()
+            if key not in index:
                 continue
+            info = index[key]
+            if info is None:
+                return None
             if matched is not None and info is not matched:
                 return None
             matched = info
