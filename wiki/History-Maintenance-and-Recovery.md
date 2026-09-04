@@ -21,6 +21,28 @@ That gives you:
 
 If you are not sure whether to purge or adopt, export first.
 
+## Leftover staging artifact
+
+Segmented rotation recovery names unexpected
+`.<hot-name>.segmented-*.sqlite3` and `.rotation-catalog-*.json` files in its
+unauthenticated staging error. Do not assume rotation owns a file because its
+name matches one of these patterns.
+
+1. Stop or otherwise quiesce the history service and every history writer or
+   maintenance job.
+2. Record the exact path and metadata for each reported file before changing
+   anything.
+3. Inspect the pending activation journal and active `catalog.json`. Prove that
+   each reported file is not journal-referenced and not catalog-selected.
+4. After that proof, remove only the named path. Leave every other hot, catalog,
+   staging, rollback, journal, and segment file untouched.
+5. Rerun dry-run recovery without `--apply`. Review its proposed action before
+   applying recovery.
+
+Never use wildcard deletion in the history directory. If journal or catalog
+membership is unclear, keep the file and stop. Filename, age, or parseable
+contents do not establish ownership.
+
 ## Delete System Vs Delete + Purge History
 
 The `Existing Systems` panel gives you two different delete behaviors:

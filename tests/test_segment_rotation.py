@@ -1235,17 +1235,46 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
 
                 marker_path = activation_pending_path(source)
                 self.assertTrue(marker_path.is_file())
-                with self.assertRaisesRegex(ValueError, "unauthenticated staging"):
+                generated_unexpected_paths = (
+                    list(root.glob(".history.db.segmented-*.sqlite3"))
+                    if missing_record == "staged_hot"
+                    else list(segments_directory.glob(".rotation-catalog-*.json"))
+                )
+                self.assertEqual(len(generated_unexpected_paths), 1)
+                extra_unexpected_paths = [
+                    root / ".history.db.segmented-z-extra.sqlite3",
+                    segments_directory / ".rotation-catalog-a-extra.json",
+                ]
+                for index, path in enumerate(extra_unexpected_paths):
+                    path.write_bytes(f"unexpected-{index}".encode())
+                unexpected_paths = sorted(
+                    [*generated_unexpected_paths, *extra_unexpected_paths],
+                    key=str,
+                )
+                staging_paths = [
+                    *root.glob(".history.db.segmented-*.sqlite3"),
+                    *segments_directory.glob(".rotation-catalog-*.json"),
+                ]
+                artifact_bytes = {path: path.read_bytes() for path in staging_paths}
+                journal_bytes = marker_path.read_bytes()
+
+                with self.assertRaises(ValueError) as raised:
                     rotation.recover_pending_rotation(
                         source=source,
                         segments_directory=segments_directory,
                         apply=True,
                     )
-                self.assertTrue(marker_path.is_file())
-                if missing_record == "staged_hot":
-                    self.assertEqual(len(list(root.glob(".history.db.segmented-*.sqlite3"))), 1)
-                else:
-                    self.assertEqual(len(list(segments_directory.glob(".rotation-catalog-*.json"))), 1)
+                self.assertEqual(
+                    str(raised.exception),
+                    "Segment rotation found unauthenticated staging artifacts: "
+                    + ", ".join(str(path) for path in unexpected_paths)
+                    + ".",
+                )
+                self.assertEqual(marker_path.read_bytes(), journal_bytes)
+                self.assertEqual(
+                    {path: path.read_bytes() for path in staging_paths},
+                    artifact_bytes,
+                )
 
     def test_rotation_file_record_rejects_path_replacement_during_hashing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

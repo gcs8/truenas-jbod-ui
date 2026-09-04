@@ -326,6 +326,30 @@ class ContainerResourceContractTests(unittest.TestCase):
             r"(?i)after reviewing[^.]+result[^.]+remove[^.]+fixed staging directory",
         )
 
+    def test_history_recovery_runbooks_bound_leftover_staging_cleanup(self) -> None:
+        for relative_path in (
+            "docs/SEGMENTED_HISTORY_V2.md",
+            "wiki/History-Maintenance-and-Recovery.md",
+        ):
+            runbook = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            match = re.search(
+                r"(?ims)^##+ Leftover staging artifact\s*$\n(.*?)(?=^##+ |\Z)",
+                runbook,
+            )
+            with self.subTest(runbook=relative_path):
+                self.assertIsNotNone(match)
+                section = match.group(1).lower() if match is not None else ""
+                for required_text in (
+                    "stop or otherwise quiesce",
+                    "record the exact path and metadata",
+                    "not journal-referenced",
+                    "not catalog-selected",
+                    "remove only the named path",
+                    "dry-run recovery",
+                    "never use wildcard deletion",
+                ):
+                    self.assertIn(required_text, section)
+
     def test_history_reads_scheduled_backup_status_for_segmented_retention(self) -> None:
         for compose_name in COMPOSE_FILES:
             services = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))[
