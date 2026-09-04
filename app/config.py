@@ -506,7 +506,6 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_KEY_PATH": ("ssh", "key_path"),
     "SSH_PASSWORD": ("ssh", "password"),
     "SSH_SUDO_PASSWORD": ("ssh", "sudo_password"),
-    "SSH_KNOWN_HOSTS_PATH": ("ssh", "known_hosts_path"),
     "SSH_STRICT_HOST_KEY_CHECKING": ("ssh", "strict_host_key_checking"),
     "SSH_TIMEOUT": ("ssh", "timeout_seconds"),
     "SSH_COMMANDS_JSON": ("ssh", "commands"),
