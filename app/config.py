@@ -101,6 +101,8 @@ class AppConfig(BaseModel):
     smart_prefetch_chunk_size: int = 24
     smart_prefetch_batch_concurrency: int = 2
     export_history_concurrency: int = 12
+    disk_inventory_sync_timeout_seconds: int = 180
+    disk_inventory_sync_poll_interval_seconds: float = 2.0
     export_cache_ttl_seconds: int = 60
     export_cache_max_entries: int = 8
     export_cache_max_bytes: int = 32 * 1024 * 1024
@@ -473,6 +475,8 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "APP_SMART_PREFETCH_CHUNK_SIZE": ("app", "smart_prefetch_chunk_size"),
     "APP_SMART_PREFETCH_BATCH_CONCURRENCY": ("app", "smart_prefetch_batch_concurrency"),
     "APP_EXPORT_HISTORY_CONCURRENCY": ("app", "export_history_concurrency"),
+    "APP_DISK_INVENTORY_SYNC_TIMEOUT_SECONDS": ("app", "disk_inventory_sync_timeout_seconds"),
+    "APP_DISK_INVENTORY_SYNC_POLL_INTERVAL_SECONDS": ("app", "disk_inventory_sync_poll_interval_seconds"),
     "APP_EXPORT_CACHE_TTL_SECONDS": ("app", "export_cache_ttl_seconds"),
     "APP_EXPORT_CACHE_MAX_ENTRIES": ("app", "export_cache_max_entries"),
     "APP_EXPORT_CACHE_MAX_BYTES": ("app", "export_cache_max_bytes"),

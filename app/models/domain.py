@@ -429,6 +429,26 @@ class LedRequest(BaseModel):
     action: LedAction
 
 
+class DiskInventorySyncMode(str, Enum):
+    multipath = "multipath"
+    full = "full"
+
+
+class DiskInventorySyncRequest(BaseModel):
+    mode: DiskInventorySyncMode
+    confirm: bool = False
+
+
+class DiskInventorySyncResult(BaseModel):
+    mode: DiskInventorySyncMode
+    state: str
+    job_id: int | None = None
+    elapsed_seconds: float = 0.0
+    timed_out: bool = False
+    error: str | None = None
+    message: str
+
+
 class SystemLocatorRequest(BaseModel):
     active: bool
 

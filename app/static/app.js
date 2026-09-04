@@ -99,6 +99,7 @@
     timerDelayMs: 0,
     timingTickId: null,
     identifyVerifyTimerId: null,
+    diskInventorySync: { armedMode: null, armTimerId: null, inFlight: false },
     refreshesInFlight: 0,
     latestRefreshToken: 0,
     storageViewsRuntimeRequestToken: 0,
@@ -246,6 +247,8 @@
   const detailContent = document.getElementById("detail-content");
   const detailSecondary = document.getElementById("detail-secondary");
   const detailLedControls = document.getElementById("detail-led-controls");
+  const diskInventorySyncControls = document.getElementById("disk-inventory-sync-controls");
+  const diskInventorySyncHint = document.getElementById("disk-inventory-sync-hint");
   const detailSlotTitle = document.getElementById("detail-slot-title");
   const detailStatePill = document.getElementById("detail-state-pill");
   const detailKvGrid = document.getElementById("detail-kv-grid");
@@ -329,6 +332,7 @@
   const uiPerfSummary = document.getElementById("ui-perf-summary");
   const uiPerfRecent = document.getElementById("ui-perf-recent");
   const ledButtons = Array.from(document.querySelectorAll("[data-led-action]"));
+  const diskInventorySyncButtons = Array.from(document.querySelectorAll("[data-disk-inventory-sync-mode]"));
 
   function getSlotById(slotNumber) {
     return state.snapshot.slots.find((slot) => slot.slot === slotNumber) || null;
@@ -8859,6 +8863,7 @@
     renderDetail();
     renderWarnings();
     renderStatus();
+    renderDiskInventorySyncControls();
     renderSummary();
     renderRefreshControls();
     renderSelectors();
@@ -9138,6 +9143,188 @@
     } catch (error) {
       handleWriteRejection(error);
       setStatus(`LED action failed: ${error.message || error}`, "error");
+    }
+  }
+
+  // TrueNAS disk inventory sync (#357): per-system action group in the enclosure
+  // header. Two-step confirm; runs behind the same write gate as the LED route.
+  function diskInventorySyncPlatformSupported(platform) {
+    return platform === "core" || platform === "scale";
+  }
+
+  function diskInventorySyncModeSpec(mode) {
+    switch (mode) {
+      case "multipath":
+        return {
+          label: "Sync multipath table",
+          progressLabel: "multipath table",
+          explanation: "Runs TrueNAS disk.multipath_sync so the middleware rebuilds its multipath table from the kernel's gmultipath geoms. Pools and data are not touched.",
+        };
+      case "full":
+        return {
+          label: "Full disk sync",
+          progressLabel: "disk inventory",
+          explanation: "Runs TrueNAS disk.sync_all so the middleware re-reads every disk into its inventory. Pools and data are not touched.",
+        };
+      default:
+        return null;
+    }
+  }
+
+  function diskInventorySyncModeAvailability(mode) {
+    const platform = currentPlatform();
+    if (!diskInventorySyncPlatformSupported(platform)) {
+      return {
+        available: false,
+        reason: "TrueNAS disk inventory sync is unsupported on this platform because it needs the TrueNAS middleware.",
+      };
+    }
+    if (mode === "multipath" && platform !== "core") {
+      return { available: false, reason: "Multipath table sync is only available on TrueNAS CORE." };
+    }
+    const ssh = state.snapshot?.sources?.ssh;
+    if (!ssh || ssh.enabled === false) {
+      return {
+        available: false,
+        reason: "SSH is disabled for this system, so the app cannot ask the TrueNAS middleware to re-read its disks.",
+      };
+    }
+    if (state.diskInventorySync.inFlight) {
+      return { available: false, reason: "A TrueNAS disk inventory sync is already running for this system." };
+    }
+    return { available: true, reason: "" };
+  }
+
+  function renderDiskInventorySyncControls() {
+    if (!diskInventorySyncControls) {
+      return;
+    }
+    const platform = currentPlatform();
+    const showGroup = !state.snapshotMode && diskInventorySyncPlatformSupported(platform);
+    diskInventorySyncControls.classList.toggle("hidden", !showGroup);
+    if (!showGroup) {
+      if (state.diskInventorySync.armedMode) {
+        disarmDiskInventorySync();
+      }
+      return;
+    }
+    const armedMode = state.diskInventorySync.armedMode;
+    diskInventorySyncButtons.forEach((button) => {
+      const mode = button.dataset.diskInventorySyncMode;
+      const spec = diskInventorySyncModeSpec(mode);
+      if (!spec) {
+        return;
+      }
+      button.classList.toggle("hidden", mode === "multipath" && platform !== "core");
+      const availability = diskInventorySyncModeAvailability(mode);
+      const armed = armedMode === mode;
+      button.disabled = !availability.available;
+      button.title = availability.available ? spec.explanation : availability.reason;
+      button.textContent = armed ? "Confirm sync" : spec.label;
+      button.dataset.armed = armed ? "true" : "false";
+    });
+    if (diskInventorySyncHint) {
+      const spec = armedMode ? diskInventorySyncModeSpec(armedMode) : null;
+      diskInventorySyncHint.textContent = spec
+        ? `${spec.explanation} Click Confirm sync within a few seconds to run it.`
+        : "";
+      diskInventorySyncHint.classList.toggle("hidden", !spec);
+    }
+  }
+
+  function disarmDiskInventorySync() {
+    if (state.diskInventorySync.armTimerId) {
+      window.clearTimeout(state.diskInventorySync.armTimerId);
+      state.diskInventorySync.armTimerId = null;
+    }
+    if (!state.diskInventorySync.armedMode) {
+      return;
+    }
+    state.diskInventorySync.armedMode = null;
+    renderDiskInventorySyncControls();
+  }
+
+  function armDiskInventorySync(mode) {
+    if (state.diskInventorySync.armTimerId) {
+      window.clearTimeout(state.diskInventorySync.armTimerId);
+    }
+    state.diskInventorySync.armedMode = mode;
+    // Confirm window: the second click has to land within 6 s or the button disarms.
+    state.diskInventorySync.armTimerId = window.setTimeout(() => {
+      state.diskInventorySync.armTimerId = null;
+      disarmDiskInventorySync();
+    }, 6000);
+    renderDiskInventorySyncControls();
+  }
+
+  function handleDiskInventorySyncClick(mode) {
+    if (state.snapshotMode) {
+      setStatus("TrueNAS disk inventory sync is disabled in an offline snapshot export.", "error");
+      return;
+    }
+    const availability = diskInventorySyncModeAvailability(mode);
+    if (!availability.available) {
+      disarmDiskInventorySync();
+      setStatus(availability.reason, "error");
+      return;
+    }
+    if (state.diskInventorySync.armedMode === mode) {
+      disarmDiskInventorySync();
+      void runDiskInventorySync(mode);
+      return;
+    }
+    armDiskInventorySync(mode);
+  }
+
+  function formatDiskInventorySyncResult(result) {
+    const parts = [];
+    if (result?.state) {
+      parts.push(`state ${result.state}`);
+    }
+    if (Number.isInteger(result?.job_id)) {
+      parts.push(`job ${result.job_id}`);
+    }
+    if (Number.isFinite(result?.elapsed_seconds)) {
+      parts.push(`${Math.round(result.elapsed_seconds)} s`);
+    }
+    const summary = parts.length ? ` (${parts.join(", ")})` : "";
+    const error = typeof result?.error === "string" && result.error ? ` ${result.error}` : "";
+    return `${result?.message || "TrueNAS disk inventory sync finished."}${summary}${error}`;
+  }
+
+  async function runDiskInventorySync(mode) {
+    const spec = diskInventorySyncModeSpec(mode);
+    const systemId = state.selectedSystemId || state.snapshot?.selected_system_id;
+    if (!spec || !systemId) {
+      setStatus("Select a system before syncing its TrueNAS disk inventory.", "error");
+      return;
+    }
+    state.diskInventorySync.inFlight = true;
+    renderDiskInventorySyncControls();
+    const startedAt = Date.now();
+    const showProgress = () => {
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      setStatus(`Syncing TrueNAS ${spec.progressLabel}... ${elapsed} s`);
+    };
+    showProgress();
+    const progressTimerId = window.setInterval(showProgress, 1000);
+    try {
+      const result = await fetchJson(`/api/systems/${encodeURIComponent(systemId)}/disk-inventory-sync`, {
+        method: "POST",
+        body: JSON.stringify({ mode, confirm: true }),
+      });
+      window.clearInterval(progressTimerId);
+      const succeeded = result?.state === "SUCCESS" && !result?.timed_out;
+      if (succeeded) {
+        await refreshSnapshot(true, "manual-refresh");
+      }
+      setStatus(formatDiskInventorySyncResult(result), succeeded ? "info" : "error");
+    } catch (error) {
+      window.clearInterval(progressTimerId);
+      setStatus(`TrueNAS disk inventory sync failed: ${error.message || error}`, "error");
+    } finally {
+      state.diskInventorySync.inFlight = false;
+      renderDiskInventorySyncControls();
     }
   }
 
@@ -10026,6 +10213,19 @@
 
   document.querySelectorAll("[data-led-action]").forEach((button) => {
     button.addEventListener("click", () => sendLedAction(button.dataset.ledAction));
+  });
+
+  diskInventorySyncButtons.forEach((button) => {
+    button.addEventListener("click", () => handleDiskInventorySyncClick(button.dataset.diskInventorySyncMode));
+  });
+  document.addEventListener("click", (event) => {
+    if (!state.diskInventorySync.armedMode) {
+      return;
+    }
+    if (diskInventorySyncControls && diskInventorySyncControls.contains(event.target)) {
+      return;
+    }
+    disarmDiskInventorySync();
   });
 
   rememberReusableSnapshot(state.snapshot);

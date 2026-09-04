@@ -14,6 +14,10 @@ complete release-note draft.
   journal, authenticated rollback artifacts, and fail-closed recovery (#162).
 - Added enclosure aliases across platform builders (#236), request correlation,
   and backup metrics (#248).
+- Added TrueNAS disk inventory sync actions (`disk.multipath_sync` on CORE,
+  `disk.sync_all` on CORE and SCALE) to the enclosure header behind the main-UI
+  write gate, with exact-argument sudo grants and a CORE multipath disk
+  replacement runbook (#357).
 
 ### Changed
 

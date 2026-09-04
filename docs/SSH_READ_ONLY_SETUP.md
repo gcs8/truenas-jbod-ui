@@ -271,7 +271,7 @@ If you want the full current web UI feature set on this CORE box, use this
 combined allow-list:
 
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/usr/local/sbin/smartctl -x -j *","/usr/local/sbin/smartctl -x *","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil -u * show adapter","/usr/sbin/mprutil -u * show all","/usr/sbin/mprutil -u * show devices","/usr/sbin/mprutil -u * show enclosures","/usr/sbin/mprutil -u * show expanders","/usr/sbin/mprutil -u * show iocfacts","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/usr/local/sbin/smartctl -x -j *","/usr/local/sbin/smartctl -x *","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil -u * show adapter","/usr/sbin/mprutil -u * show all","/usr/sbin/mprutil -u * show devices","/usr/sbin/mprutil -u * show enclosures","/usr/sbin/mprutil -u * show expanders","/usr/sbin/mprutil -u * show iocfacts","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages","/usr/local/bin/midclt call disk.multipath_sync","/usr/local/bin/midclt call disk.sync_all","/usr/local/bin/midclt call core.get_jobs *"]}'
 ```
 
 That enables:
@@ -279,6 +279,9 @@ That enables:
 - SSH slot mapping through `sesutil map`
 - SSH slot metadata overlay through `sesutil show`
 - SSH identify LED control through `sesutil locate`
+- the TrueNAS disk inventory sync actions in the enclosure header
+  (`midclt call disk.multipath_sync` and `disk.sync_all`, with `core.get_jobs`
+  for job polling); see "Disk Inventory Sync Grants" below
 - multipath controller labels such as `mpr0` and `mpr1` through
   `camcontrol devlist -v`
 - on-demand per-slot SMART detail through `smartctl`
@@ -569,12 +572,16 @@ If your SCALE build accepts wildcard command arguments in sudo rules, a
 narrower exact-command shape would look like:
 
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/bin/sg_ses -p aes /dev/sg26","/usr/bin/sg_ses -p aes /dev/sg37","/usr/bin/sg_ses -p ec /dev/sg26","/usr/bin/sg_ses -p ec /dev/sg37","/usr/bin/sg_ses --join --filter /dev/sg26","/usr/bin/sg_ses --join --filter /dev/sg37","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg26","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg26","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg37","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg37"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":false,"sudo_commands":["/usr/bin/sg_ses -p aes /dev/sg26","/usr/bin/sg_ses -p aes /dev/sg37","/usr/bin/sg_ses -p ec /dev/sg26","/usr/bin/sg_ses -p ec /dev/sg37","/usr/bin/sg_ses --join --filter /dev/sg26","/usr/bin/sg_ses --join --filter /dev/sg37","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg26","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg26","/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg37","/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg37","/usr/bin/midclt call disk.sync_all","/usr/bin/midclt call core.get_jobs *"]}'
 ```
 
 The tested web UI path on this box was broader: add `/usr/bin/sg_ses` to both
 `Allowed sudo commands` and `Allowed Sudo Commands (No Password)`. That works,
 but it grants a wider surface area than the exact-command list above.
+
+The two `/usr/bin/midclt` entries are only needed if you want the **Full disk
+sync** action from the enclosure header on SCALE; see "Disk Inventory Sync
+Grants" below.
 
 ### Example SCALE SSH Commands
 
@@ -637,6 +644,34 @@ empty output on hosts without `nvme-cli` or NVMe media. The privileged `nvme`
 commands above are only needed for on-demand controller-native enrichment such
 as firmware revision, protocol version, namespace GUIDs, and warning/critical
 temperature thresholds.
+
+## Disk Inventory Sync Grants
+
+The enclosure header's **TrueNAS disk inventory** actions (issue #357) ask the
+TrueNAS middleware to re-read its disk table over the same SSH channel used for
+`sesutil` and `sg_ses`. They need these exact-argument sudo entries; the admin
+bootstrap seeds them for CORE and SCALE:
+
+```text
+# CORE
+/usr/local/bin/midclt call disk.multipath_sync
+/usr/local/bin/midclt call disk.sync_all
+/usr/local/bin/midclt call core.get_jobs *
+
+# SCALE
+/usr/bin/midclt call disk.sync_all
+/usr/bin/midclt call core.get_jobs *
+```
+
+- `disk.multipath_sync` is CORE only. It rebuilds the middleware multipath
+  table from the kernel's `gmultipath` geoms and returns immediately.
+- `disk.sync_all` re-reads every disk into the middleware inventory as a job.
+  The app then polls `core.get_jobs '[["id","=",<job id>]]'` until the job is
+  terminal or `APP_DISK_INVENTORY_SYNC_TIMEOUT_SECONDS` (default 180) passes.
+  The `*` in the `core.get_jobs` grant only admits that filter argument; no
+  other `midclt` method is granted.
+- Neither call touches pools or data. The runbook is
+  `docs/DISK_REPLACEMENT_CORE_MULTIPATH.md`.
 
 ## Quantastor HA SES Notes
 

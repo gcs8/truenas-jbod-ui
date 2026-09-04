@@ -173,6 +173,7 @@ the wiki:
 - [Backup, Restore, and Debug Bundles](wiki/Backup-Restore-and-Debug-Bundles.md)
 - [Operations, Logging, and Metrics](wiki/Operations-Logging-and-Metrics.md)
 - [SSH Setup and Sudo](wiki/SSH-Setup-and-Sudo.md)
+- [Disk Replacement on CORE with SAS Multipath](docs/DISK_REPLACEMENT_CORE_MULTIPATH.md)
 - [Live Enclosures and Storage Views](wiki/Live-Enclosures-and-Storage-Views.md)
 - [Inventory Evidence Precedence](docs/INVENTORY_EVIDENCE_PRECEDENCE.md)
 - [Hardware Report Fixture Intake](docs/HARDWARE_REPORT_FIXTURE_INTAKE.md)

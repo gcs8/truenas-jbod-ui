@@ -78,6 +78,18 @@ CORE_MPRUTIL_SHOW_COMMANDS = {
     "iocfacts",
 }
 CORE_MPRUTIL_UNIT_SHOW_COMMANDS = CORE_MPRUTIL_SHOW_COMMANDS - {"adapters"}
+# TrueNAS middleware calls behind the main UI's disk inventory sync action (#357).
+# Exact-argument entries: the app never runs any other midclt method, and the
+# core.get_jobs wildcard only admits the job filter argument the poll loop builds.
+CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS = (
+    "/usr/local/bin/midclt call disk.multipath_sync",
+    "/usr/local/bin/midclt call disk.sync_all",
+    "/usr/local/bin/midclt call core.get_jobs *",
+)
+SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS = (
+    "/usr/bin/midclt call disk.sync_all",
+    "/usr/bin/midclt call core.get_jobs *",
+)
 SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     "core": (
         "/usr/sbin/sesutil map",
@@ -92,6 +104,7 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         *CORE_MPRUTIL_SUDO_COMMANDS,
         *CORE_DMIDECODE_SUDO_COMMANDS,
         *CORE_MESSAGES_SUDO_COMMANDS,
+        *CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
     "scale": (
         "/usr/bin/sg_ses -p aes /dev/sg*",
@@ -103,6 +116,7 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/sbin/smartctl -x *",
         "/usr/local/sbin/smartctl -x -j *",
         "/usr/local/sbin/smartctl -x *",
+        *SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
     "linux": (
         "/usr/sbin/mdadm --detail --scan",
@@ -135,6 +149,7 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         *CORE_MPRUTIL_SUDO_COMMANDS,
         *CORE_DMIDECODE_SUDO_COMMANDS,
         *CORE_MESSAGES_SUDO_COMMANDS,
+        *CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
     "scale": (
         "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
@@ -143,6 +158,7 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/sbin/smartctl -x *",
         "/usr/local/sbin/smartctl -x -j *",
         "/usr/local/sbin/smartctl -x *",
+        *SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
     "linux": (
         *LINUX_SG_SES_SUDO_COMMANDS,

@@ -258,6 +258,28 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": True, "snapshot": snapshot.model_dump(mode="json")})
 
+    @router.post(
+        "/api/systems/{system_id}/disk-inventory-sync",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
+    async def sync_disk_inventory(
+        system_id: str,
+        payload: DiskInventorySyncRequest,
+    ) -> JSONResponse:
+        service = route_service(system_id, disk_inventory_sync=payload.mode.value)
+        if not payload.confirm:
+            raise HTTPException(
+                status_code=400,
+                detail="Confirm the TrueNAS disk inventory sync before running it.",
+            )
+        try:
+            result = await service.sync_disk_inventory(payload.mode)
+        except DiskInventorySyncBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(result.model_dump(mode="json"))
+
     @router.get("/api/system-locator", response_model=SystemLocatorStatusView)
     async def get_system_locator(
         system_id: str | None = None,
