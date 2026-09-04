@@ -5,11 +5,16 @@ import asyncio
 import importlib.util
 import inspect
 import json
+import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
+
+# admin_service.main builds the module-level app at import time and refuses to
+# start without a browser origin; give the test process a synthetic one.
+os.environ.setdefault("ADMIN_PUBLIC_ORIGIN", "http://admin.example.test")
 
 from fastapi.routing import APIRoute
 

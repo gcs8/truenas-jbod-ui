@@ -3,10 +3,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import unittest
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
+
+# admin_service.main builds the module-level app at import time and refuses to
+# start without a browser origin; give the test process a synthetic one.
+os.environ.setdefault("ADMIN_PUBLIC_ORIGIN", "http://admin.example.test")
 
 from pydantic import SecretStr
 
@@ -103,7 +108,11 @@ class AdminRuntimeRouteTests(unittest.TestCase):
         return service
 
     def test_runtime_get_route_returns_a_narrow_fresh_runtime_payload(self) -> None:
-        settings = AdminSettings(auth_mode="network", auto_stop_seconds=0)
+        settings = AdminSettings(
+            auth_mode="network",
+            public_origin="http://admin.example.test",
+            auto_stop_seconds=0,
+        )
         runtime_service = self._runtime_service()
         release_service = SimpleNamespace(
             snapshot=lambda: {"latest_tag": "v0.22.0", "latest_version": "0.22.0"}
@@ -163,6 +172,7 @@ class AdminRuntimeRouteTests(unittest.TestCase):
             auth_mode="basic",
             auth_username="operator",
             auth_password=SecretStr("runtime-passphrase"),
+            public_origin="http://admin.example.test",
             auto_stop_seconds=0,
         )
         runtime_service = self._runtime_service()
@@ -191,7 +201,11 @@ class AdminRuntimeRouteTests(unittest.TestCase):
         runtime_service.status_payload.assert_called_once_with()
 
     def test_runtime_get_route_replaces_unavailable_runtime_detail(self) -> None:
-        settings = AdminSettings(auth_mode="network", auto_stop_seconds=0)
+        settings = AdminSettings(
+            auth_mode="network",
+            public_origin="http://admin.example.test",
+            auto_stop_seconds=0,
+        )
         runtime_service = MagicMock()
         runtime_service.status_payload.return_value = {
             "available": False,

@@ -40,7 +40,7 @@ from app.config import (
     save_runtime_behavior_overrides,
 )
 from app.logging_config import configure_service_logging
-from app.http_auth import basic_auth_matches, request_origin_allowed
+from app.http_auth import basic_auth_matches, configured_origin_identity, request_origin_allowed
 from app.metrics import install_metrics, metrics_path, observe_backup_operation
 from app.script_json import register_script_json_filters
 from app.models.domain import (
@@ -394,6 +394,12 @@ def format_history_system_summary(summary: dict[str, Any]) -> str:
 
 def create_app() -> FastAPI:
     admin_settings = get_admin_settings()
+    if configured_origin_identity(admin_settings.public_origin) is None:
+        raise ValueError(
+            "ADMIN_PUBLIC_ORIGIN must be an absolute HTTP(S) origin that matches the address "
+            "shown in the browser for the admin UI, for example http://jbod-admin.example.test:8082. "
+            "Browser-initiated admin changes are rejected without it, so the admin service refuses to start."
+        )
     admin_metrics_path = metrics_path()
     if (
         admin_metrics_path in {"/", "/livez", "/healthz", "/openapi.json"}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import shlex
 import stat
 import tempfile
@@ -14,6 +15,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+
+# admin_service.main builds the module-level app at import time and refuses to
+# start without a browser origin; give the test process a synthetic one.
+os.environ.setdefault("ADMIN_PUBLIC_ORIGIN", "http://admin.example.test")
 
 from fastapi import HTTPException
 from fastapi import Request
