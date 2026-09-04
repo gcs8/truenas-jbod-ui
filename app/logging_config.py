@@ -57,6 +57,12 @@ def _format_traceback_without_exception_value(exc_info: Any) -> str:
             rendered.append("Traceback (most recent call last):\n")
             rendered.extend(traceback.format_tb(current_traceback))
         rendered.append(type(value).__name__)
+        if isinstance(value, BaseExceptionGroup):
+            for member in value.exceptions:
+                member_rendered = render_exception(member, member.__traceback__, seen)
+                if member_rendered:
+                    rendered.append("\n")
+                    rendered.extend(member_rendered)
         return rendered
 
     if isinstance(exception_value, BaseException):

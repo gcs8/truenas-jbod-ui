@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -206,6 +207,138 @@ class LoggingConfigTests(unittest.TestCase):
             self.assertIn("RuntimeError", rendered)
             for forbidden in (inner_message, outer_message, "inner-secret", "outer-secret"):
                 self.assertNotIn(forbidden, rendered)
+
+    def test_opt_in_tracebacks_traverse_base_exception_group_members_in_stable_order(self) -> None:
+        def raise_first_member(message: str) -> None:
+            raise ValueError(message)
+
+        def raise_second_member(message: str) -> None:
+            raise KeyboardInterrupt(message)
+
+        first_member_secret = "first-member-secret"
+        second_member_secret = "second-member-secret"
+        outer_group_secret = "outer-group-secret"
+        member_exceptions: list[BaseException] = []
+        for raiser, message in (
+            (raise_first_member, first_member_secret),
+            (raise_second_member, second_member_secret),
+        ):
+            try:
+                raiser(message)
+            except BaseException as exc:
+                member_exceptions.append(exc)
+
+        try:
+            raise BaseExceptionGroup(outer_group_secret, member_exceptions)
+        except BaseExceptionGroup:
+            exc_info = sys.exc_info()
+
+        record = logging.LogRecord(
+            name="app.observability",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="http_request_error",
+            args=(),
+            exc_info=exc_info,
+        )
+        setattr(record, INCLUDE_TRACEBACK_FIELD, True)
+
+        json_traceback = json.loads(
+            JsonFormatter(service_name="enclosure-ui").format(record)
+        )["traceback"]
+        text_line = SafeTextFormatter(service_name="enclosure-ui").format(record)
+
+        self.assertIn(json_traceback, text_line)
+        expected_in_order = (
+            "BaseExceptionGroup",
+            "raise_first_member",
+            "ValueError",
+            "raise_second_member",
+            "KeyboardInterrupt",
+        )
+        for expected in expected_in_order:
+            self.assertIn(expected, json_traceback)
+        positions = [json_traceback.index(expected) for expected in expected_in_order]
+        self.assertEqual(positions, sorted(positions))
+        for forbidden in (
+            outer_group_secret,
+            first_member_secret,
+            second_member_secret,
+        ):
+            self.assertNotIn(forbidden, json_traceback)
+            self.assertNotIn(forbidden, text_line)
+
+    def test_opt_in_tracebacks_traverse_nested_groups_and_chained_causes_cycle_safely(self) -> None:
+        def raise_root_cause(message: str) -> None:
+            raise KeyError(message)
+
+        def raise_chained_member(root_message: str, member_message: str) -> None:
+            try:
+                raise_root_cause(root_message)
+            except KeyError as exc:
+                raise RuntimeError(member_message) from exc
+
+        root_cause_secret = "root-cause-secret"
+        chained_member_secret = "chained-member-secret"
+        inner_group_secret = "inner-group-secret"
+        outer_group_secret = "outer-group-secret"
+        chained_member: RuntimeError | None = None
+        try:
+            raise_chained_member(root_cause_secret, chained_member_secret)
+        except RuntimeError as exc:
+            chained_member = exc
+        self.assertIsNotNone(chained_member)
+        if chained_member is None:
+            self.fail("chained member was not captured")
+
+        inner_group = ExceptionGroup(inner_group_secret, [chained_member])
+        outer_group = ExceptionGroup(outer_group_secret, [inner_group])
+        root_cause = chained_member.__cause__
+        self.assertIsNotNone(root_cause)
+        if root_cause is None:
+            self.fail("root cause was not captured")
+        root_cause.__context__ = outer_group
+
+        try:
+            raise outer_group
+        except ExceptionGroup:
+            exc_info = sys.exc_info()
+
+        record = logging.LogRecord(
+            name="app.observability",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="http_request_error",
+            args=(),
+            exc_info=exc_info,
+        )
+        setattr(record, INCLUDE_TRACEBACK_FIELD, True)
+
+        json_traceback = json.loads(
+            JsonFormatter(service_name="enclosure-ui").format(record)
+        )["traceback"]
+        text_line = SafeTextFormatter(service_name="enclosure-ui").format(record)
+
+        self.assertIn(json_traceback, text_line)
+        for expected in (
+            "ExceptionGroup",
+            "raise_root_cause",
+            "KeyError",
+            "raise_chained_member",
+            "RuntimeError",
+        ):
+            self.assertIn(expected, json_traceback)
+        self.assertLess(json_traceback.index("KeyError"), json_traceback.index("RuntimeError"))
+        for forbidden in (
+            root_cause_secret,
+            chained_member_secret,
+            inner_group_secret,
+            outer_group_secret,
+        ):
+            self.assertNotIn(forbidden, json_traceback)
+            self.assertNotIn(forbidden, text_line)
 
     def test_configure_logging_uses_json_stream_when_requested(self) -> None:
         settings = Settings(
