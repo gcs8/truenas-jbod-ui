@@ -1400,6 +1400,13 @@ class HistoryStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "history.db"
             marker_path = activation_pending_path(database_path)
+            HistoryStore(str(database_path), recover_unreadable_database=False)
+            store = HistoryStore(
+                str(database_path),
+                recover_unreadable_database=False,
+                initialize=False,
+            )
+            store._journal_mode_identity = None
 
             @contextmanager
             def lifecycle_lock_that_creates_a_pending_marker(*args: Any, **kwargs: Any):
@@ -1413,7 +1420,8 @@ class HistoryStoreTests(unittest.TestCase):
                     lifecycle_lock_that_creates_a_pending_marker,
                 ):
                     with self.assertRaisesRegex(sqlite3.OperationalError, "activation is pending"):
-                        HistoryStore(str(database_path), recover_unreadable_database=False)
+                        connection = store._connect()
+                        connection.close()
             finally:
                 marker_path.unlink(missing_ok=True)
 

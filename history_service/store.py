@@ -701,6 +701,7 @@ class HistoryStore:
             if identity is not None and identity == self._journal_mode_identity:
                 return
         with history_write_lock(self.file_path, blocking=False):
+            self._require_no_pending_lifecycle_markers()
             self._ensure_journal_mode_locked(connection)
 
     def _ensure_journal_mode_locked(self, connection: sqlite3.Connection) -> None:
