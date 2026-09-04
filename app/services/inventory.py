@@ -84,6 +84,7 @@ from app.services.quantastor_api import QuantastorRESTClient
 from app.services.parsers import (
     ParsedSSHData,
     ZpoolMember,
+    _extract_slot_number,
     _merge_ses_enclosures,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
@@ -129,6 +130,10 @@ METRICS_SERVICE_NAME = "enclosure-ui"
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
 BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
 SERIAL_LUNID_IDENTIFIER_REGEX = re.compile(r"^\{\$?serial_lunid\}\$?(?P<identifier>.+)$", re.IGNORECASE)
+_CACHED_ENCLOSURE_RUNTIME_EVIDENCE_KEYS = frozenset(
+    {"dev", "device", "original", "status", "value", "value_raw"}
+)
+_ENCLOSURE_SLOT_NUMBER_KEYS = frozenset({"slot", "slot_number", "slotNumber", "index", "number"})
 SCALE_CONFIGURED_SG_SES_FAILURE_REGEX = re.compile(
     r"^SSH command failed: .*\bsg_ses\b\s+-p\s+(?:aes|ec)\s+/dev/sg\d+\s+\(exit\s+\d+\)$"
 )
@@ -137,6 +142,27 @@ QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
     r"Skipping optional SSH command batch after a recent connection startup failure; "
     r"retry after (?P<retry_at>\S+)"
 )
+
+
+def _structural_enclosure_topology(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_structural_enclosure_topology(item) for item in value]
+    if not isinstance(value, dict):
+        return copy.deepcopy(value)
+
+    raw_slot = _extract_slot_number(value)
+    structural: dict[str, Any] = {}
+    for key, child in value.items():
+        if key in _CACHED_ENCLOSURE_RUNTIME_EVIDENCE_KEYS:
+            if isinstance(child, (dict, list)):
+                nested = _structural_enclosure_topology(child)
+                if nested:
+                    structural[key] = nested
+            continue
+        structural[key] = _structural_enclosure_topology(child)
+    if raw_slot is not None and not _ENCLOSURE_SLOT_NUMBER_KEYS.intersection(structural):
+        structural["slot"] = raw_slot
+    return structural
 UNIFI_GPIO_LED_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
@@ -1695,7 +1721,9 @@ class InventoryService:
             if bundle.raw_data.enclosure_query_failed and previous_bundle is not None:
                 previous_api = previous_bundle.sources.get("api")
                 if previous_api is not None and previous_api.enabled and previous_bundle.raw_data.enclosures:
-                    bundle.raw_data.enclosures = copy.deepcopy(previous_bundle.raw_data.enclosures)
+                    bundle.raw_data.enclosures = _structural_enclosure_topology(
+                        previous_bundle.raw_data.enclosures
+                    )
                     bundle.warnings.append(
                         "TrueNAS API enclosure discovery failed; using the last trusted enclosure topology."
                     )

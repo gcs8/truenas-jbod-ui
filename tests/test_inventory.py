@@ -61,6 +61,7 @@ from app.services.parsers import (
     ZpoolMember,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
+    extract_enclosure_slot_candidates,
     merge_slot_candidate_maps,
     parse_ssh_outputs,
 )
@@ -9625,7 +9626,23 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(),
                 temp_dir,
             )
-            trusted_enclosures = [{"id": "enc-1", "name": "Synthetic Shelf"}]
+            trusted_enclosures = [
+                {
+                    "id": "enc-1",
+                    "name": "Synthetic Shelf",
+                    "label": "Shelf A",
+                    "elements": [
+                        {
+                            "descriptor": "Slot 1",
+                            "dev": "da0",
+                            "status": "OK",
+                            "value": "/dev/da0",
+                            "value_raw": "0x01",
+                            "original": "da0",
+                        }
+                    ],
+                }
+            ]
             service._source_bundle = InventorySourceBundle(
                 raw_data=TrueNASRawData(
                     enclosures=trusted_enclosures,
@@ -9647,7 +9664,32 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             returned = await service._get_inventory_source_bundle(force_refresh=True)
 
-            self.assertEqual(returned.raw_data.enclosures, trusted_enclosures)
+            self.assertEqual(
+                returned.raw_data.enclosures,
+                [
+                    {
+                        "id": "enc-1",
+                        "name": "Synthetic Shelf",
+                        "label": "Shelf A",
+                        "elements": [{"descriptor": "Slot 1", "slot": 1}],
+                    }
+                ],
+            )
+            cached_candidates, _cached_meta = extract_enclosure_slot_candidates(
+                returned.raw_data.enclosures,
+                enclosure_filter=None,
+                slot_count=24,
+                api_slot_number_base=0,
+            )
+            self.assertEqual(
+                {
+                    "status": cached_candidates[1]["status"],
+                    "value": cached_candidates[1]["value"],
+                    "value_raw": cached_candidates[1]["value_raw"],
+                    "device_hint": cached_candidates[1]["device_hint"],
+                },
+                {"status": None, "value": None, "value_raw": None, "device_hint": None},
+            )
             self.assertEqual(returned.raw_data.disks, [{"name": "da1", "serial": "FRESH-DISK"}])
             self.assertEqual(returned.raw_data.pools, [{"name": "fresh-pool"}])
             self.assertEqual(returned.raw_data.disk_temperatures, {"da1": 31})
