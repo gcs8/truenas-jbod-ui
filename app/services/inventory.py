@@ -531,6 +531,10 @@ class _LayoutFrame:
             return sorted(self.slot_positions)
         return list(range(self.layout_slot_count))
 
+    def candidate_slot_limit(self) -> int:
+        slot_ids = self.slot_ids()
+        return max(slot_ids, default=-1) + 1
+
     def result(
         self,
         slot_views: list[SlotView],
@@ -4731,15 +4735,15 @@ class InventoryService:
         empty_ssh = ParsedSSHData()
         loaded_mappings = self.mapping_store.load_all()
         slot_views: list[SlotView] = []
-        for slot in frame.slot_ids():
+        for ordinal, slot in enumerate(frame.slot_ids()):
             row_index, column_index = _slot_grid_position(
                 slot,
                 frame.slot_positions,
                 frame.layout_columns,
             )
             mapped_bmc_slot = bmc_slot_hints.get(slot)
-            if mapped_bmc_slot is None and slot < len(discovered_slot_numbers):
-                mapped_bmc_slot = discovered_slot_numbers[slot]
+            if mapped_bmc_slot is None and ordinal < len(discovered_slot_numbers):
+                mapped_bmc_slot = discovered_slot_numbers[ordinal]
             slot_hint = f"bmc-slot:{mapped_bmc_slot}" if isinstance(mapped_bmc_slot, int) else None
             raw_slot_status: dict[str, Any] = {
                 "device_names": [slot_hint] if slot_hint else [],
@@ -4817,9 +4821,10 @@ class InventoryService:
         selected_profile = frame.selected_profile
         allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
         slot_count = frame.layout_slot_count
+        candidate_slot_limit = frame.candidate_slot_limit()
         ssh_candidates, ssh_meta = build_slot_candidates_from_ses_enclosures(
             ssh_data.ses_enclosures,
-            slot_count,
+            candidate_slot_limit,
             self.system.truenas.enclosure_filter,
             self._base_enclosure_id(selected_option.id),
         )
@@ -4830,7 +4835,7 @@ class InventoryService:
         api_candidates, api_selected_meta = extract_enclosure_slot_candidates(
             raw_data.enclosures,
             self.system.truenas.enclosure_filter,
-            slot_count,
+            candidate_slot_limit,
             self.settings.layout.api_slot_number_base,
             self._base_enclosure_id(selected_option.id),
         )
@@ -4970,7 +4975,7 @@ class InventoryService:
             raw_data,
             selected_option.id,
             quantastor_ses_data,
-            frame.layout_slot_count,
+            frame.candidate_slot_limit(),
             selected_profile.id,
         )
         loaded_mappings = self.mapping_store.load_all()

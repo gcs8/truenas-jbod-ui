@@ -11568,6 +11568,167 @@ class ReviewRegressionTests(unittest.TestCase):
                 self.assertEqual(positions[20], (1, 0))
                 self.assertEqual(positions[31], (1, 11))
 
+    def test_gapped_bmc_profile_maps_discovered_slots_by_rendered_ordinal(self) -> None:
+        profile = EnclosureProfileConfig(
+            id="gapped-bmc",
+            label="Gapped BMC",
+            rows=1,
+            columns=2,
+            slot_layout=[[0, 20]],
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(profiles=[profile])
+            system = SystemConfig(
+                id="gapped-bmc",
+                default_profile_id=profile.id,
+                truenas=TrueNASConfig(platform="ipmi"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            inventory = BMCInventory(
+                system_model="SYNTH-CHASSIS",
+                drives=[
+                    BMCDriveRecord(
+                        controller_id=0,
+                        physical_index=0,
+                        slot_number=100,
+                        serial="SERIAL-FIRST",
+                        health="ONLINE",
+                    ),
+                    BMCDriveRecord(
+                        controller_id=0,
+                        physical_index=1,
+                        slot_number=101,
+                        serial="SERIAL-SECOND",
+                        health="ONLINE",
+                    ),
+                ],
+            )
+
+            slots, *_rest = service._correlate_bmc_host([], None, inventory)
+
+            self.assertEqual([slot.slot for slot in slots], [0, 20])
+            self.assertEqual([slot.serial for slot in slots], ["SERIAL-FIRST", "SERIAL-SECOND"])
+
+    def test_gapped_scale_and_quantastor_profiles_keep_high_id_ses_evidence(self) -> None:
+        profile = EnclosureProfileConfig(
+            id="gapped-ses",
+            label="Gapped SES",
+            rows=1,
+            columns=2,
+            slot_layout=[[0, 20]],
+        )
+        ses_enclosure = SESMapEnclosure(
+            ses_device="/dev/sg20",
+            enclosure_id="enc-a",
+            profile_id=profile.id,
+            slots={
+                0: SESMapSlot(
+                    slot_number=0,
+                    element_id=0,
+                    ses_device="/dev/sg20",
+                    description="First rendered bay",
+                    present=False,
+                ),
+                20: SESMapSlot(
+                    slot_number=20,
+                    element_id=20,
+                    ses_device="/dev/sg20",
+                    description="High rendered bay",
+                    device_names=["sdz"],
+                    present=True,
+                )
+            },
+        )
+        ses_data = ParsedSSHData(ses_enclosures=[ses_enclosure])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(profiles=[profile])
+            scale_system = SystemConfig(
+                id="gapped-scale",
+                default_profile_id=profile.id,
+                truenas=TrueNASConfig(platform="scale"),
+            )
+            scale_service = build_inventory_service(
+                settings,
+                scale_system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            scale_option = EnclosureOption(
+                id="enc-a",
+                label="Gapped shelf",
+                profile_id=profile.id,
+                rows=1,
+                columns=2,
+                slot_count=2,
+                slot_layout=[[0, 20]],
+            )
+            scale_service._build_scale_linux_enclosure_options = MagicMock(
+                return_value=[scale_option]
+            )
+            empty_raw = TrueNASRawData(
+                enclosures=[],
+                disks=[],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            scale_slots, *_rest = scale_service._correlate_scale_linux(
+                empty_raw,
+                ses_data,
+                [],
+                selected_enclosure_id="enc-a",
+            )
+
+            scale_high = next(slot for slot in scale_slots if slot.slot == 20)
+            self.assertTrue(scale_high.present)
+            self.assertEqual(scale_high.ssh_ses_element_id, 20)
+            self.assertEqual(scale_high.raw_status["descriptor"], "High rendered bay")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(profiles=[profile])
+            quantastor_system = SystemConfig(
+                id="gapped-quantastor",
+                default_profile_id=profile.id,
+                truenas=TrueNASConfig(platform="quantastor"),
+            )
+            quantastor_service = build_inventory_service(
+                settings,
+                quantastor_system,
+                MagicMock(),
+                MagicMock(),
+                temp_dir,
+            )
+            quantastor_raw = TrueNASRawData(
+                systems=[{"id": "node-a", "name": "Node A"}],
+                hw_enclosures=[{"id": "enc-a", "storageSystemId": "node-a"}],
+                enclosures=[],
+                disks=[],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            quantastor_slots, *_rest = quantastor_service._correlate_quantastor(
+                quantastor_raw,
+                [],
+                "node-a",
+                ses_data,
+            )
+
+            quantastor_high = next(slot for slot in quantastor_slots if slot.slot == 20)
+            self.assertTrue(quantastor_high.present)
+            self.assertEqual(quantastor_high.ssh_ses_element_id, 20)
+            self.assertEqual(quantastor_high.raw_status["descriptor"], "High rendered bay")
+
     def test_scale_linux_does_not_overlay_first_api_enclosure_on_selected_ses_enclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
