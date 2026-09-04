@@ -153,10 +153,34 @@ class SnapshotRedactor:
         self.serial_values: list[str] = []
         self.partial_identifier_values: list[str] = []
         alias_snapshots = [snapshot, *(extra_snapshots or [])]
-        self.system_aliases = self._build_system_aliases(alias_snapshots)
-        self.enclosure_aliases = self._build_enclosure_aliases(alias_snapshots)
         self.configured_hostname_values = list(dict.fromkeys(configured_hostnames or []))
         self.configured_hostname_keys = {hostname.casefold() for hostname in self.configured_hostname_values}
+        self.identifier_alias_reserved_values: dict[str, set[str]] = {
+            "host": {
+                value.casefold()
+                for value in (
+                    *self.configured_hostname_values,
+                    *self._configured_hostname_short_forms(self.configured_hostname_values),
+                )
+            },
+            "enc": set(),
+        }
+        payloads = [
+            *(candidate.model_dump(mode="json") for candidate in alias_snapshots),
+            history_cache,
+            smart_summary_cache,
+            *(extra_payloads or []),
+        ]
+        for payload in payloads:
+            self._collect_identifier_reservations(payload)
+        self.system_aliases = self._build_system_aliases(
+            alias_snapshots,
+            self.identifier_alias_reserved_values["host"],
+        )
+        self.enclosure_aliases = self._build_enclosure_aliases(
+            alias_snapshots,
+            self.identifier_alias_reserved_values["enc"],
+        )
         self._add_configured_hostname_aliases(snapshot)
         self._collect_known_values(snapshot.model_dump(mode="json"))
         for extra_snapshot in extra_snapshots or []:
@@ -225,6 +249,34 @@ class SnapshotRedactor:
         elif bucket == "partial_id":
             self.partial_identifier_values.append(normalized)
 
+    def _collect_identifier_reservations(self, value: Any, path: tuple[Any, ...] = ()) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                next_path = path + (key,)
+                if key == "details_json" and isinstance(item, str):
+                    try:
+                        parsed = json.loads(item)
+                    except json.JSONDecodeError:
+                        parsed = None
+                    if parsed is not None:
+                        self._collect_identifier_reservations(parsed, next_path + ("parsed",))
+                self._collect_identifier_reservations(item, next_path)
+            return
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                self._collect_identifier_reservations(item, path + (index,))
+            return
+        if not isinstance(value, str):
+            return
+        normalized = value.strip()
+        if not normalized or self._is_zero_identifier_sentinel(normalized):
+            return
+        bucket = self._classify_path(path)
+        if bucket == "system":
+            self.identifier_alias_reserved_values["host"].add(normalized.casefold())
+        elif bucket == "enclosure":
+            self.identifier_alias_reserved_values["enc"].add(normalized.casefold())
+
     def _classify_path(self, path: tuple[Any, ...]) -> str | None:
         if not path:
             return None
@@ -260,17 +312,25 @@ class SnapshotRedactor:
         return aliases
 
     @classmethod
-    def _build_system_aliases(cls, snapshots: list[InventorySnapshot]) -> dict[str, str]:
+    def _build_system_aliases(
+        cls,
+        snapshots: list[InventorySnapshot],
+        reserved_alias_values: set[str],
+    ) -> dict[str, str]:
         groups: list[list[str]] = []
         for snapshot in snapshots:
             for system in snapshot.systems:
                 groups.append([system.id, system.label])
             if snapshot.selected_system_id or snapshot.selected_system_label:
                 groups.append([snapshot.selected_system_id or "", snapshot.selected_system_label or ""])
-        return cls._build_group_aliases(groups, "host")
+        return cls._build_group_aliases(groups, "host", reserved_alias_values)
 
     @classmethod
-    def _build_enclosure_aliases(cls, snapshots: list[InventorySnapshot]) -> dict[str, str]:
+    def _build_enclosure_aliases(
+        cls,
+        snapshots: list[InventorySnapshot],
+        reserved_alias_values: set[str],
+    ) -> dict[str, str]:
         groups: list[list[str]] = []
         for snapshot in snapshots:
             for enclosure in snapshot.enclosures:
@@ -293,7 +353,7 @@ class SnapshotRedactor:
                 )
             for slot in snapshot.slots:
                 groups.append([slot.enclosure_id or "", slot.enclosure_label or "", slot.enclosure_name or ""])
-        return cls._build_group_aliases(groups, "enc")
+        return cls._build_group_aliases(groups, "enc", reserved_alias_values)
 
     @classmethod
     def _collect_configured_hostnames(cls, source_config: dict[str, Any] | None) -> list[str]:
@@ -351,7 +411,10 @@ class SnapshotRedactor:
             None,
         )
         if selected_alias is None:
-            selected_alias = next(iter(self.system_aliases.values()), "host-01")
+            selected_alias = next(
+                iter(self.system_aliases.values()),
+                self._next_identifier_alias(self.system_aliases, "host"),
+            )
         for hostname in self.configured_hostname_values:
             self.system_aliases[hostname] = selected_alias
         # A host configured by FQDN is still written as its bare first label in
@@ -380,7 +443,11 @@ class SnapshotRedactor:
         return short_forms
 
     @staticmethod
-    def _build_group_aliases(groups: list[list[str]], prefix: str) -> dict[str, str]:
+    def _build_group_aliases(
+        groups: list[list[str]],
+        prefix: str,
+        reserved_alias_values: set[str],
+    ) -> dict[str, str]:
         aliases: dict[str, str] = {}
         alias_index = 0
         for group in groups:
@@ -389,8 +456,11 @@ class SnapshotRedactor:
                 continue
             existing_alias = next((aliases[token] for token in tokens if token in aliases), None)
             if existing_alias is None:
-                alias_index += 1
-                existing_alias = f"{prefix}-{alias_index:02d}"
+                while True:
+                    alias_index += 1
+                    existing_alias = f"{prefix}-{alias_index:02d}"
+                    if existing_alias.casefold() not in reserved_alias_values:
+                        break
             for token in tokens:
                 aliases[token] = existing_alias
         return aliases
@@ -471,13 +541,20 @@ class SnapshotRedactor:
             return existing
         if self._is_zero_identifier_sentinel(normalized):
             return value
-        used = set(aliases.values())
-        index = len(used) + 1
-        while f"{prefix}-{index:02d}" in used:
-            index += 1
-        minted = f"{prefix}-{index:02d}"
+        self.identifier_alias_reserved_values[prefix].add(normalized.casefold())
+        minted = self._next_identifier_alias(aliases, prefix)
         aliases[normalized] = minted
         return minted
+
+    def _next_identifier_alias(self, aliases: dict[str, str], prefix: str) -> str:
+        used = {alias.casefold() for alias in aliases.values()}
+        reserved = self.identifier_alias_reserved_values[prefix]
+        index = 1
+        while True:
+            candidate = f"{prefix}-{index:02d}"
+            if candidate.casefold() not in used and candidate.casefold() not in reserved:
+                return candidate
+            index += 1
 
     @staticmethod
     def _is_zero_identifier_sentinel(value: str) -> bool:

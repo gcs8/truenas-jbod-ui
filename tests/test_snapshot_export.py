@@ -1760,6 +1760,51 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SnapshotRedactorIdentifierKeyTests(unittest.TestCase):
+    def test_partial_redaction_never_reuses_alias_shaped_system_or_enclosure_ids(self) -> None:
+        snapshot = build_snapshot()
+        snapshot.selected_system_id = "host-01"
+        snapshot.selected_system_label = "host-01"
+        snapshot.systems = [
+            SystemOption(id="host-01", label="host-01"),
+            SystemOption(id="host-02", label="host-02"),
+        ]
+        snapshot.selected_enclosure_id = "enc-01"
+        snapshot.selected_enclosure_label = "enc-01"
+        snapshot.enclosures = [
+            EnclosureOption(id="enc-01", label="enc-01"),
+            EnclosureOption(id="enc-02", label="enc-02"),
+        ]
+        snapshot.slots[0].enclosure_id = "enc-01"
+        snapshot.slots[0].enclosure_label = "enc-01"
+
+        redacted = SnapshotRedactor(snapshot, {}, {}).redact_snapshot(snapshot)
+
+        system_aliases = {system.id for system in redacted.systems}
+        enclosure_aliases = {enclosure.id for enclosure in redacted.enclosures}
+        self.assertTrue(system_aliases.isdisjoint({"host-01", "host-02"}))
+        self.assertTrue(enclosure_aliases.isdisjoint({"enc-01", "enc-02"}))
+        self.assertEqual(len(system_aliases), 2)
+        self.assertEqual(len(enclosure_aliases), 2)
+
+    def test_partial_redaction_reserves_alias_shaped_ids_from_extra_payloads(self) -> None:
+        snapshot = build_snapshot()
+        extra_payload = {
+            "system_id": "host-01",
+            "enclosure_id": "enc-01",
+            "detail": "moved from host-01 through enc-01",
+        }
+
+        redactor = SnapshotRedactor(snapshot, {}, {}, extra_payloads=[extra_payload])
+        redacted_snapshot = redactor.redact_snapshot(snapshot)
+        redacted_extra = redactor.redact_object(extra_payload)
+
+        self.assertNotEqual(redacted_snapshot.selected_system_id, "host-01")
+        self.assertNotEqual(redacted_snapshot.selected_enclosure_id, "enc-01")
+        self.assertNotEqual(redacted_extra["system_id"], "host-01")
+        self.assertNotEqual(redacted_extra["enclosure_id"], "enc-01")
+        self.assertNotIn("host-01", redacted_extra["detail"])
+        self.assertNotIn("enc-01", redacted_extra["detail"])
+
     def test_partial_redaction_does_not_replace_identifier_substrings(self) -> None:
         snapshot = build_snapshot()
         matching_timestamp = datetime(2026, 9, 2, 0, 1, tzinfo=timezone.utc)
