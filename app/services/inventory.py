@@ -4184,6 +4184,7 @@ class InventoryService:
                 ssh_data=ssh_data,
                 api_topology_members=api_topology_members,
                 api_enclosure_ids=api_enclosure_ids,
+                api_enclosure_query_failed=raw_data.enclosure_query_failed,
             )
             _warn_unmatched_mapping(warnings, mapping, disk, slot, "disk")
             slot_views.append(slot_view)
@@ -4963,6 +4964,7 @@ class InventoryService:
                 ssh_data=ssh_data,
                 api_topology_members=api_topology_members,
                 api_enclosure_ids=api_enclosure_ids,
+                api_enclosure_query_failed=raw_data.enclosure_query_failed,
             )
             _warn_unmatched_mapping(warnings, mapping, disk, slot, "disk")
             slot_views.append(slot_view)
@@ -9757,6 +9759,7 @@ class InventoryService:
         ssh_data: ParsedSSHData,
         api_topology_members: dict[str, Any],
         api_enclosure_ids: set[str],
+        api_enclosure_query_failed: bool = False,
         resolution_source: str | None = None,
         stale_manual_mapping: bool = False,
     ) -> SlotView:
@@ -9900,7 +9903,11 @@ class InventoryService:
                 }
             )
 
-        api_led_supported = bool(enclosure_id and enclosure_id in api_enclosure_ids)
+        api_led_supported = bool(
+            not api_enclosure_query_failed
+            and enclosure_id
+            and enclosure_id in api_enclosure_ids
+        )
         scale_linux_ses_targets = bool(
             self.system.truenas.platform == "scale"
             and any(
@@ -9961,12 +9968,6 @@ class InventoryService:
             led_supported = True
             led_backend = "api"
             led_reason = None
-        elif core_ses_target_invalid:
-            led_supported = False
-            led_backend = None
-            led_reason = (
-                f"Slot {slot:02d} must resolve to exactly one authentic SES element before CORE identify control can run."
-            )
         elif scale_linux_ses_targets and self.system.ssh.enabled:
             led_supported = True
             led_backend = "scale_sg_ses"
@@ -9979,6 +9980,16 @@ class InventoryService:
             led_supported = True
             led_backend = "ssh"
             led_reason = None
+        elif api_enclosure_query_failed:
+            led_supported = False
+            led_backend = None
+            led_reason = "API LED control is unavailable because enclosure discovery failed for this refresh."
+        elif core_ses_target_invalid:
+            led_supported = False
+            led_backend = None
+            led_reason = (
+                f"Slot {slot:02d} must resolve to exactly one authentic SES element before CORE identify control can run."
+            )
         elif not enclosure_id and not ses_device:
             led_supported = False
             led_backend = None
