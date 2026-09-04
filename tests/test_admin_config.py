@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from admin_service.config import get_admin_settings
@@ -23,7 +24,7 @@ class AdminSettingsHostPrepTempDirTests(unittest.TestCase):
 
         self.assertEqual(
             settings.host_prep_temp_dir,
-            "/app/history/truenas-jbod-ui-host-prep",
+            str(Path("/app/history") / "truenas-jbod-ui-host-prep"),
         )
 
     def test_explicit_host_prep_temp_dir_overrides_tmpdir_default(self) -> None:
