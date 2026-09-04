@@ -496,13 +496,20 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     ) -> SmartSummaryView:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        await ensure_slot_bounds(slot, service, enclosure_id)
+        if fresh:
+            await ensure_slot_bounds(slot, service, enclosure_id)
+            layout_bounds = "verified"
+        else:
+            layout_bounds = await ensure_read_slot_bounds(slot, service, enclosure_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         try:
-            return await service.get_slot_smart_summary(
+            summary = await service.get_slot_smart_summary(
                 slot,
                 selected_enclosure_id=enclosure_id,
                 allow_stale_cache=not fresh,
+            )
+            return SmartSummaryView.model_validate(summary).model_copy(
+                update={"layout_bounds": layout_bounds}
             )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -572,9 +579,16 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     ) -> SmartBatchResponse:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        layout_slots = await resolve_layout_slots(service, enclosure_id)
+        if fresh:
+            layout_slots = await resolve_layout_slots(service, enclosure_id)
+            layout_bounds = "verified"
+        else:
+            layout_slots, layout_bounds = await resolve_read_layout_slots(service, enclosure_id)
         for slot in payload.slots:
-            check_slot_bounds(slot, layout_slots)
+            if slot < 0:
+                check_slot_bounds(slot, ())
+            if layout_slots is not None:
+                check_slot_bounds(slot, layout_slots)
         add_perf_metadata(
             system_id=service.system.id,
             platform=service.system.truenas.platform,
@@ -591,7 +605,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return SmartBatchResponse(summaries=summaries)
+        return SmartBatchResponse(summaries=summaries, layout_bounds=layout_bounds)
 
     @router.get("/api/history/status")
     async def get_history_status() -> JSONResponse:
@@ -607,7 +621,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     ) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        await ensure_slot_bounds(slot, service, enclosure_id)
+        layout_bounds = await ensure_read_slot_bounds(slot, service, enclosure_id)
         resolved_system_id = service.system.id
         add_perf_metadata(
             system_id=resolved_system_id,
@@ -623,7 +637,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             enclosure_id,
             window_hours=window_hours,
         )
-        return JSONResponse(payload)
+        return JSONResponse({**payload, "layout_bounds": layout_bounds})
 
     @router.get("/api/history/scope")
     async def get_history_scope(
@@ -637,10 +651,14 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         normalized_slots = sorted({int(slot) for slot in (slots or [])})
+        layout_bounds = "verified"
         if normalized_slots:
-            layout_slots = await resolve_layout_slots(service, enclosure_id)
+            layout_slots, layout_bounds = await resolve_read_layout_slots(service, enclosure_id)
             for slot in normalized_slots:
-                check_slot_bounds(slot, layout_slots)
+                if slot < 0:
+                    check_slot_bounds(slot, ())
+                if layout_slots is not None:
+                    check_slot_bounds(slot, layout_slots)
         add_perf_metadata(
             system_id=service.system.id,
             platform=service.system.truenas.platform,
@@ -662,6 +680,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 "configured": history_backend.configured,
                 "system_id": service.system.id,
                 "enclosure_id": enclosure_id,
+                "layout_bounds": layout_bounds,
                 "histories": {str(slot): history for slot, history in payload.items()},
             }
         )

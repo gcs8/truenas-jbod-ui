@@ -138,6 +138,7 @@ class MultipathView(BaseModel):
 
 class SmartSummaryView(BaseModel):
     available: bool = False
+    layout_bounds: Literal["verified", "unavailable"] | None = None
     temperature_c: int | None = None
     warning_temperature_c: int | None = None
     critical_temperature_c: int | None = None
@@ -215,6 +216,7 @@ class SmartBatchItem(BaseModel):
 
 class SmartBatchResponse(BaseModel):
     summaries: list[SmartBatchItem] = Field(default_factory=list)
+    layout_bounds: Literal["verified", "unavailable"] | None = None
 
 
 class SlotView(BaseModel):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -8,7 +9,7 @@ from fastapi import HTTPException
 
 from app import main as app_main
 from app.config import Settings
-from app.models.domain import InventorySnapshot, SlotView
+from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView
 from app.services.profile_registry import dell_md1280_bottom_drawer_slot_layout
 
 
@@ -309,6 +310,167 @@ class SlotBoundsFollowRenderedSlotsTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 404)
         self.assertIn("Slot 41", raised.exception.detail)
         self.assertEqual(service.get_snapshot.await_count, 2)
+
+
+class DegradedReadSlotBoundsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.service = _service(layout_slot_count=None)
+        self.registry = Mock()
+        self.registry.get_service.return_value = self.service
+
+    def test_slot_history_uses_sidecar_when_layout_is_unavailable(self) -> None:
+        route = _route("/api/slots/{slot}/history", "GET")
+        history_backend = Mock()
+        history_backend.get_slot_history = AsyncMock(
+            return_value={"configured": True, "available": True, "slot": 5, "metrics": {}}
+        )
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_main, "get_history_backend", return_value=history_backend),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            response = asyncio.run(
+                route.endpoint(slot=5, system_id="system-a", enclosure_id="enc-a", window_hours=24)
+            )
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["layout_bounds"], "unavailable")
+        history_backend.get_slot_history.assert_awaited_once_with(
+            5,
+            "system-a",
+            "enc-a",
+            window_hours=24,
+        )
+
+    def test_history_scope_uses_sidecar_when_layout_is_unavailable(self) -> None:
+        route = _route("/api/history/scope", "GET")
+        history_backend = Mock()
+        history_backend.configured = True
+        history_backend.get_scope_history = AsyncMock(return_value={5: {"metrics": {}}})
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_main, "get_history_backend", return_value=history_backend),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            response = asyncio.run(
+                route.endpoint(
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    slots=[5],
+                    window_hours=24,
+                    metrics=None,
+                    event_limit=12,
+                )
+            )
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["layout_bounds"], "unavailable")
+        self.assertEqual(payload["histories"], {"5": {"metrics": {}}})
+
+    def test_cached_smart_read_continues_when_layout_is_unavailable(self) -> None:
+        route = _route("/api/slots/{slot}/smart", "GET")
+        self.service.get_slot_smart_summary = AsyncMock(return_value=SmartSummaryView(available=True))
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            summary = asyncio.run(
+                route.endpoint(slot=5, system_id="system-a", enclosure_id="enc-a", fresh=False)
+            )
+
+        self.assertTrue(summary.available)
+        self.assertEqual(summary.layout_bounds, "unavailable")
+        self.service.get_slot_smart_summary.assert_awaited_once_with(
+            5,
+            selected_enclosure_id="enc-a",
+            allow_stale_cache=True,
+        )
+
+    def test_fresh_smart_read_keeps_strict_layout_bounds(self) -> None:
+        route = _route("/api/slots/{slot}/smart", "GET")
+        self.service.get_slot_smart_summary = AsyncMock(return_value=SmartSummaryView(available=True))
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(
+                    route.endpoint(slot=5, system_id="system-a", enclosure_id="enc-a", fresh=True)
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.service.get_slot_smart_summary.assert_not_awaited()
+
+    def test_cached_smart_batch_continues_when_layout_is_unavailable(self) -> None:
+        route = _route("/api/slots/smart-batch", "POST")
+        self.service.get_slot_smart_summaries = AsyncMock(return_value=[])
+        payload = Mock(slots=[5, 6], max_concurrency=2)
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            response = asyncio.run(
+                route.endpoint(
+                    payload=payload,
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    fresh=False,
+                )
+            )
+
+        self.assertEqual(response.layout_bounds, "unavailable")
+        self.service.get_slot_smart_summaries.assert_awaited_once_with(
+            [5, 6],
+            selected_enclosure_id="enc-a",
+            max_concurrency=2,
+            allow_stale_cache=True,
+        )
+
+    def test_fresh_smart_batch_keeps_strict_layout_bounds(self) -> None:
+        route = _route("/api/slots/smart-batch", "POST")
+        self.service.get_slot_smart_summaries = AsyncMock(return_value=[])
+        payload = Mock(slots=[5, 6], max_concurrency=2)
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(
+                    route.endpoint(
+                        payload=payload,
+                        system_id="system-a",
+                        enclosure_id="enc-a",
+                        fresh=True,
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.service.get_slot_smart_summaries.assert_not_awaited()
+
+    def test_mutation_keeps_strict_layout_bounds_when_layout_is_unavailable(self) -> None:
+        route = _route("/api/slots/{slot}/led", "POST")
+        self.service.set_slot_led = AsyncMock()
+        payload = Mock(action="on")
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(
+                    route.endpoint(slot=5, payload=payload, system_id="system-a", enclosure_id="enc-a")
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.service.set_slot_led.assert_not_awaited()
 
 
 if __name__ == "__main__":
