@@ -1177,6 +1177,28 @@ ses0:
         self.assertEqual(slot.presence_source, "sesutil_map")
         self.assertFalse(slot.presence_conflict)
 
+    def test_parse_sesutil_map_duplicate_slot_uses_each_descriptors_device_names(self) -> None:
+        parsed = parse_sesutil_map(
+            """
+ses0:
+  Enclosure Name: ExampleCo GenericShelf
+  Enclosure ID: 5000000000000007
+  Element 0, Type: Array Device Slot
+    Status: OK
+    Description: Slot00
+    Device Names: da0, pass0
+  Element 24, Type: Array Device Slot
+    Status: Not installed
+    Description: Slot00
+    Device Names:
+""".strip()
+        )
+
+        slot = parsed[0].slots[0]
+        self.assertIs(slot.present, True)
+        self.assertEqual(slot.presence_source, "sesutil_map")
+        self.assertTrue(slot.presence_conflict)
+
     def test_parse_sg_ses_aes_preserves_slot_without_device_slot_number(self) -> None:
         output = """
   ExampleCo  GenericShelf  0001

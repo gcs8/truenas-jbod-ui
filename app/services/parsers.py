@@ -1172,12 +1172,15 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
 
         if stripped.startswith("Device Names:"):
             names = [item.strip() for item in stripped.split(":", 1)[1].split(",")]
+            descriptor_device_names = [
+                item for item in names if item and not item.startswith("pass")
+            ]
             _apply_ses_device_name_evidence(
                 current_slot,
-                [item for item in names if item and not item.startswith("pass")],
+                descriptor_device_names,
                 "sesutil_map",
             )
-            if current_slot.device_names:
+            if descriptor_device_names:
                 descriptor_presence_evidence.append(True)
             continue
 
