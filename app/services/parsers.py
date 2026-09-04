@@ -44,6 +44,11 @@ SES_EVIDENCE_SOURCE_STRENGTH = {
     "sg_ses_join": 40,
     "enclosure_sysfs": 50,
 }
+# Profiles support at most 4096 bays, and SES may report two descriptors for a
+# dual-path bay. Reject the entire untrusted page rather than return partial
+# geometry when either bounded parser input is exceeded.
+MAX_SES_AES_DESCRIPTORS = 2 * 4096
+MAX_SES_AES_OUTPUT_CHARS = 4 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -994,6 +999,7 @@ def _finalize_ses_invalid_descriptor_evidence(
         if slot.reported_slot_number is not None and slot.element_id is not None
     }
     translated_slots: dict[int, int] = {}
+    translated_slot_numbers: set[int] = set()
     if len(offsets) == 1:
         offset = next(iter(offsets))
         occupied_slots = {
@@ -1009,11 +1015,12 @@ def _finalize_ses_invalid_descriptor_evidence(
             if (
                 translated_slot < 0
                 or translated_slot in occupied_slots
-                or translated_slot in translated_slots.values()
+                or translated_slot in translated_slot_numbers
             ):
                 translated_slots.clear()
                 break
             translated_slots[slot.element_id] = translated_slot
+            translated_slot_numbers.add(translated_slot)
 
     translation_is_valid = len(translated_slots) == len(invalid_descriptors)
     for slot in invalid_descriptors:
@@ -1364,6 +1371,9 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     prettier enclosure APIs available.
     """
 
+    if len(output) > MAX_SES_AES_OUTPUT_CHARS:
+        return None
+
     ses_device = _extract_sg_ses_device(command)
     enclosure = SESMapEnclosure(
         ses_device=ses_device,
@@ -1371,6 +1381,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     )
     current_slot: SESMapSlot | None = None
     in_array_slots = False
+    descriptor_count = 0
     device_slot_evidence: list[SESMapSlot] = []
     descriptor_presence_evidence: list[bool] = []
     invalid_descriptor_evidence: list[SESMapSlot] = []
@@ -1413,6 +1424,9 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
                 descriptor_presence_evidence,
                 "sg_ses_aes",
             )
+            descriptor_count += 1
+            if descriptor_count > MAX_SES_AES_DESCRIPTORS:
+                return None
             _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
             descriptor_presence_evidence = []
             raw_element_id = int(element_match.group("element"))

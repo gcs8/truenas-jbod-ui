@@ -2755,6 +2755,23 @@ Additional element status diagnostic page:
           SAS address: 0x5eeeeeee00000084
 """.strip()
 
+    @staticmethod
+    def _build_bounded_aes_output(descriptor_count: int, *, dual_path: bool = False) -> str:
+        lines = [
+            "EXAMPLE  BOUNDEDAES  0100",
+            "Additional element status diagnostic page:",
+            "  additional element status descriptor list",
+            "    Element type: Array device slot, subenclosure id: 0 [ti=0]",
+        ]
+        for element_id in range(descriptor_count):
+            lines.append(f"      Element index: {element_id}  eiioe=0")
+            if dual_path or element_id == 0:
+                slot_number = element_id // 2 if dual_path else 0
+                lines.append(f"        device slot number: {slot_number}")
+            else:
+                lines.append("        flagged as invalid (no further information)")
+        return "\n".join(lines)
+
     def test_canonicalize_enclosure_sysfs_map_command(self) -> None:
         command = (
             "for c in /sys/class/enclosure/*/*; do "
@@ -2976,6 +2993,75 @@ Additional element status diagnostic page:
             [{"ses_device": "/dev/sg8", "ses_element_id": 2, "ses_slot_number": None}],
         )
         self.assertIn("no consistent element-to-device-slot offset", unmapped.slot_number_warning or "")
+
+    def test_aes_descriptor_cap_accepts_two_paths_for_every_supported_slot(self) -> None:
+        descriptor_cap = 2 * 4096
+
+        parsed = parse_sg_ses_aes(
+            self._build_bounded_aes_output(descriptor_cap, dual_path=True),
+            "sg_ses aes /dev/sg8",
+        )
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(list(parsed.slots), list(range(4096)))
+
+    def test_aes_descriptor_cap_rejects_the_whole_oversized_page(self) -> None:
+        descriptor_cap = 2 * 4096
+
+        parsed = parse_sg_ses_aes(
+            self._build_bounded_aes_output(descriptor_cap + 1),
+            "sg_ses aes /dev/sg8",
+        )
+
+        self.assertIsNone(parsed)
+
+    def test_aes_output_cap_accepts_the_exact_boundary(self) -> None:
+        output_cap = 4 * 1024 * 1024
+        output = self._build_bounded_aes_output(1)
+        output = output.ljust(output_cap)
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg8")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(list(parsed.slots), [0])
+
+    def test_aes_output_cap_rejects_the_whole_oversized_page(self) -> None:
+        output_cap = 4 * 1024 * 1024
+        output = self._build_bounded_aes_output(1)
+        output = output.ljust(output_cap + 1)
+
+        self.assertIsNone(parse_sg_ses_aes(output, "sg_ses aes /dev/sg8"))
+
+    def test_aes_invalid_descriptor_translation_has_linear_membership_work(self) -> None:
+        class ComparisonCountingInt(int):
+            comparisons = 0
+            __hash__ = int.__hash__
+
+            def __eq__(self, other: object) -> bool:
+                type(self).comparisons += 1
+                return super().__eq__(other)
+
+            def __add__(self, other: int) -> "ComparisonCountingInt":
+                return type(self)(int(self) + other)
+
+        descriptor_count = 128
+        invalid_descriptors = [
+            SESMapSlot(slot_number=-1, element_id=ComparisonCountingInt(element_id))
+            for element_id in range(1, descriptor_count + 1)
+        ]
+        enclosure = SESMapEnclosure(ses_device="/dev/sg8")
+
+        parsers._finalize_ses_invalid_descriptor_evidence(
+            enclosure,
+            invalid_descriptors,
+            [SESMapSlot(slot_number=0, element_id=0, reported_slot_number=0)],
+        )
+
+        comparisons = ComparisonCountingInt.comparisons
+        self.assertLessEqual(comparisons, descriptor_count * 4)
+        self.assertEqual(list(enclosure.slots), list(range(1, descriptor_count + 1)))
 
 
 class ParserConsolidationTests(unittest.TestCase):
