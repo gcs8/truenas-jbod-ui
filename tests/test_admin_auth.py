@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
+import os
 import re
 import tempfile
 import unittest
@@ -300,6 +302,26 @@ class AdminAuthenticationTests(unittest.TestCase):
 
         status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing"))
         self.assertEqual(status, 404)
+
+    def test_admin_test_env_replaces_a_blank_or_malformed_inherited_origin(self) -> None:
+        # A shell that sourced .env inherits the shipped empty `ADMIN_PUBLIC_ORIGIN=` line as a
+        # present-but-blank variable; the helper must still supply the synthetic origin.
+        import tests.admin_test_env as admin_test_env
+
+        try:
+            for inherited in ("", "   ", "not-an-origin", "https://admin.example.test/path"):
+                with self.subTest(inherited=inherited):
+                    with patch.dict("os.environ", {"ADMIN_PUBLIC_ORIGIN": inherited}):
+                        importlib.reload(admin_test_env)
+                        self.assertEqual(os.environ["ADMIN_PUBLIC_ORIGIN"], ADMIN_TEST_PUBLIC_ORIGIN)
+                        self.assertEqual(get_admin_settings().public_origin, ADMIN_TEST_PUBLIC_ORIGIN)
+            with patch.dict("os.environ", {"ADMIN_PUBLIC_ORIGIN": "https://inherited.example.test"}):
+                importlib.reload(admin_test_env)
+                self.assertEqual(os.environ["ADMIN_PUBLIC_ORIGIN"], "https://inherited.example.test")
+                self.assertEqual(get_admin_settings().public_origin, "https://inherited.example.test")
+        finally:
+            importlib.reload(admin_test_env)
+            get_admin_settings.cache_clear()
 
     def test_create_app_refuses_to_start_without_a_valid_public_origin(self) -> None:
         for public_origin in (
