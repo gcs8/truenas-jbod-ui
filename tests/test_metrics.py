@@ -19,7 +19,7 @@ from prometheus_client.parser import text_string_to_metric_families
 # Must precede admin_service.main, which builds its app at import time.
 from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from app.config import Settings, SystemConfig, TrueNASConfig
-from app.logging_config import JsonFormatter
+from app.logging_config import JsonFormatter, SafeTextFormatter
 from app.metrics import (
     ScheduledBackupStatusCollector,
     install_metrics,
@@ -54,6 +54,7 @@ async def invoke_asgi(
     path: str,
     *,
     headers: list[tuple[bytes, bytes]] | None = None,
+    method: str = "GET",
 ) -> list[dict[str, object]]:
     messages: list[dict[str, object]] = []
 
@@ -68,7 +69,7 @@ async def invoke_asgi(
             "type": "http",
             "asgi": {"version": "3.0"},
             "http_version": "1.1",
-            "method": "GET",
+            "method": method,
             "scheme": "http",
             "path": path,
             "raw_path": path.encode("ascii"),
@@ -275,6 +276,71 @@ class MetricsRouteTests(unittest.TestCase):
         serialized = json.dumps(payload)
         for forbidden in ("system-alpha", "secret-token", "/private/"):
             self.assertNotIn(forbidden, serialized)
+
+    def test_unhandled_route_error_logs_one_traceback_record_carrying_the_request_id(self) -> None:
+        app = FastAPI()
+        with patch.dict("os.environ", {"METRICS_ENABLED": "false"}, clear=False):
+            install_metrics(app, service_name="test-traceback-log", version="0.0.0-test")
+
+        @app.get("/boom")
+        async def boom() -> JSONResponse:
+            raise RuntimeError("synthetic middleware failure")
+
+        with self.assertLogs("app.observability", level="ERROR") as captured:
+            messages = asyncio.run(invoke_asgi(app, "/boom"))
+
+        request_id = response_headers(messages)["x-request-id"]
+        traceback_records = [record for record in captured.records if record.exc_info]
+        self.assertEqual(len(traceback_records), 1)
+        self.assertEqual(getattr(traceback_records[0], "request_id", None), request_id)
+        self.assertIsNone(captured.records[-1].exc_info)
+
+        json_line = JsonFormatter(service_name="test-traceback-log").format(traceback_records[0])
+        text_line = SafeTextFormatter(service_name="test-traceback-log").format(traceback_records[0])
+        for rendered in (json_line, text_line):
+            self.assertIn("Traceback", rendered)
+            self.assertIn("boom", rendered)
+
+        self.assertEqual(
+            next(message["status"] for message in messages if message.get("type") == "http.response.start"),
+            500,
+        )
+        self.assertEqual(
+            json.loads(response_body(messages)),
+            {
+                "ok": False,
+                "detail": "Unhandled application error; see application logs.",
+                "request_id": request_id,
+            },
+        )
+
+    def test_http_method_label_is_restricted_to_known_methods(self) -> None:
+        app = FastAPI()
+        service_name = "test-method-label"
+        with patch.dict("os.environ", {"METRICS_ENABLED": "true", "METRICS_PATH": "/metrics"}, clear=False):
+            install_metrics(app, service_name=service_name, version="0.0.0-test")
+
+        @app.get("/method-probe")
+        async def method_probe() -> JSONResponse:
+            return JSONResponse({"ok": True})
+
+        with self.assertLogs("app.observability", level="INFO") as captured:
+            asyncio.run(invoke_asgi(app, "/method-probe", method="PROPFIND"))
+            asyncio.run(invoke_asgi(app, "/method-probe", method="GET"))
+
+        metrics_text = response_body(asyncio.run(invoke_asgi(app, "/metrics")))
+
+        self.assertNotIn("PROPFIND", metrics_text)
+        self.assertIn(f'method="other",route="/method-probe",service="{service_name}"', metrics_text)
+        self.assertIn(f'method="GET",route="/method-probe",service="{service_name}"', metrics_text)
+        self.assertEqual(
+            [
+                getattr(record, "method", None)
+                for record in captured.records
+                if getattr(record, "component", None) == service_name
+            ],
+            ["other", "GET"],
+        )
 
     def test_json_observability_record_excludes_exception_text_and_unknown_fields(self) -> None:
         formatter = JsonFormatter(service_name="enclosure-admin")

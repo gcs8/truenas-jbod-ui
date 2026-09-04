@@ -24,6 +24,15 @@ OBSERVABILITY_FIELDS = (
     "exception_class",
 )
 
+# Formatters suppress stack traces by default so the bounded observability
+# records stay free of them. A record that sets this attribute is opting in to
+# full traceback rendering; only the unhandled-error diagnostic record does.
+INCLUDE_TRACEBACK_FIELD = "include_traceback"
+
+
+def _traceback_requested(record: logging.LogRecord) -> bool:
+    return bool(getattr(record, INCLUDE_TRACEBACK_FIELD, False)) and bool(record.exc_info)
+
 
 class JsonFormatter(logging.Formatter):
     def __init__(self, *, service_name: str | None = None) -> None:
@@ -45,6 +54,8 @@ class JsonFormatter(logging.Formatter):
                 payload[field_name] = value
         if record.exc_info and record.exc_info[0] is not None:
             payload["exception_class"] = record.exc_info[0].__name__
+        if _traceback_requested(record):
+            payload["traceback"] = logging.Formatter.formatException(self, record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
 
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
@@ -75,10 +86,13 @@ class SafeTextFormatter(logging.Formatter):
                 fields[field_name] = value
         if record.exc_info and record.exc_info[0] is not None:
             fields["exception_class"] = record.exc_info[0].__name__
-        if not fields:
-            return rendered
-        suffix = " ".join(f"{key}={value}" for key, value in fields.items())
-        return f"{rendered} {suffix}"
+        if fields:
+            suffix = " ".join(f"{key}={value}" for key, value in fields.items())
+            rendered = f"{rendered} {suffix}"
+        if _traceback_requested(record):
+            traceback_text = logging.Formatter.formatException(self, record.exc_info)
+            rendered = "\n".join((rendered, traceback_text))
+        return rendered
 
     def formatException(self, ei) -> str:
         exception_type = ei[0]

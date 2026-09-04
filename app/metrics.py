@@ -11,6 +11,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, Counter, Gauge, His
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from starlette.responses import JSONResponse, Response
 
+from app.logging_config import INCLUDE_TRACEBACK_FIELD
 from app.request_context import (
     REQUEST_ID_HEADER,
     generate_request_id,
@@ -366,6 +367,23 @@ def install_metrics(app: FastAPI, *, service_name: str, version: str) -> None:
             except Exception as exc:
                 exception_class = type(exc).__name__
                 status_code = 500
+                # The completion record below stays free of stack traces (see
+                # wiki/Operations-Logging-and-Metrics.md). Emit the diagnostic
+                # traceback as its own record so the "see application logs"
+                # response body actually points at something.
+                logger.error(
+                    "http_request_error",
+                    exc_info=exc,
+                    extra={
+                        "event": "http_request_error",
+                        "component": service_name,
+                        "release": version,
+                        "request_id": request_id,
+                        "route": _route_label(request),
+                        "exception_class": exception_class,
+                        INCLUDE_TRACEBACK_FIELD: True,
+                    },
+                )
                 response = JSONResponse(
                     {
                         "ok": False,
@@ -379,17 +397,18 @@ def install_metrics(app: FastAPI, *, service_name: str, version: str) -> None:
             finally:
                 if instrument_request:
                     route_label = _route_label(request)
+                    method_label = _method_label(request)
                     elapsed = max(0.0, time.perf_counter() - started)
                     if enabled:
                         HTTP_REQUESTS_TOTAL.labels(
                             service=service_name,
-                            method=request.method,
+                            method=method_label,
                             route=route_label,
                             status_code=str(status_code),
                         ).inc()
                         HTTP_REQUEST_DURATION_SECONDS.labels(
                             service=service_name,
-                            method=request.method,
+                            method=method_label,
                             route=route_label,
                         ).observe(elapsed)
                         HTTP_REQUESTS_IN_PROGRESS.labels(**labels).dec()
@@ -398,7 +417,7 @@ def install_metrics(app: FastAPI, *, service_name: str, version: str) -> None:
                         "component": service_name,
                         "release": version,
                         "request_id": request_id,
-                        "method": request.method,
+                        "method": method_label,
                         "route": route_label,
                         "status_code": status_code,
                         "duration_ms": round(elapsed * 1000, 3),
@@ -844,6 +863,18 @@ def _route_label(request: Request) -> str:
     if isinstance(route_path, str) and route_path:
         return route_path
     return "unmatched"
+
+
+KNOWN_HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+OTHER_HTTP_METHOD_LABEL = "other"
+
+
+def _method_label(request: Request) -> str:
+    """Bound the method label to a fixed set so unrouted requests cannot mint series."""
+    method = request.scope.get("method")
+    if isinstance(method, str) and method in KNOWN_HTTP_METHODS:
+        return method
+    return OTHER_HTTP_METHOD_LABEL
 
 
 SCHEDULED_BACKUP_STATUS_COLLECTOR = ScheduledBackupStatusCollector()
