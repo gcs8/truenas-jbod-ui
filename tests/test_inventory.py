@@ -12703,6 +12703,144 @@ class ReviewRegressionTests(unittest.TestCase):
 
             self.assertEqual([option.id for option in options], ["node-a"])
 
+    def test_quantastor_same_owner_shelves_do_not_share_duplicate_slot_fallbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="duplicate-slot-quantastor",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(platform="quantastor"),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[{"id": "node-a", "name": "Node A"}],
+                disks=[
+                    {
+                        "id": "disk-a",
+                        "storageSystemId": "node-a",
+                        "devicePath": "/dev/sda",
+                        "serialNumber": "SHELF-A-DISK",
+                    },
+                    {
+                        "id": "disk-b",
+                        "storageSystemId": "node-a",
+                        "devicePath": "/dev/sdb",
+                        "serialNumber": "SHELF-B-DISK",
+                    },
+                ],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[
+                    {
+                        "id": "hw-a",
+                        "physicalDiskId": "disk-a",
+                        "storageSystemId": "node-a",
+                        "enclosureId": "enc-a",
+                        "slot": "01",
+                        "serialNum": "SHELF-A-DISK",
+                    },
+                    {
+                        "id": "hw-b",
+                        "physicalDiskId": "disk-b",
+                        "storageSystemId": "node-a",
+                        "enclosureId": "enc-b",
+                        "slot": "01",
+                        "serialNum": "SHELF-B-DISK",
+                    },
+                ],
+                hw_enclosures=[
+                    {"id": "enc-a", "name": "Shelf A", "storageSystemId": "node-a"},
+                    {"id": "enc-b", "name": "Shelf B", "storageSystemId": "node-a"},
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            rendered_devices = {}
+            for enclosure_id in ("enc-a", "enc-b"):
+                slots, _options, _meta, _rows, _slot_count, _columns = service._correlate_quantastor(
+                    raw_data,
+                    [],
+                    enclosure_id,
+                    ParsedSSHData(),
+                )
+                rendered_devices[enclosure_id] = slots[0].device_name
+
+            self.assertEqual(rendered_devices, {"enc-a": "sda", "enc-b": "sdb"})
+
+    def test_quantastor_default_selection_indexes_many_malformed_shelf_owners_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="bounded-quantastor", truenas=TrueNASConfig(platform="quantastor"))
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            valid_rows = [
+                {"id": f"enc-{index}", "storageSystemId": f"node-{index}"}
+                for index in range(64)
+            ]
+            malformed_rows = [
+                {"id": f"unowned-{index}", "storageSystemId": None}
+                for index in range(256)
+            ]
+            enclosure_rows = [*malformed_rows, *valid_rows]
+            service._quantastor_hw_enclosure_rows = MagicMock(return_value=enclosure_rows)  # type: ignore[method-assign]
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[],
+                disks=[],
+                pools=[{"id": "pool", "activeStorageSystemId": "node-63"}],
+                pool_devices=[],
+                ha_groups=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+            options = [
+                EnclosureOption(id=f"enc-{index}", label=f"Shelf {index}")
+                for index in range(64)
+            ]
+
+            selected_id = service._select_quantastor_default_enclosure_id(raw_data, options)
+
+            self.assertEqual(selected_id, "enc-63")
+            service._quantastor_hw_enclosure_rows.assert_called_once_with(raw_data)
+
+    def test_quantastor_storage_view_candidates_resolve_selected_shelf_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="candidate-quantastor", truenas=TrueNASConfig(platform="quantastor"))
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[{"id": "node-a", "name": "Node A"}],
+                disks=[
+                    {
+                        "id": "internal-disk",
+                        "storageSystemId": "node-a",
+                        "devicePath": "/dev/nvme0n1",
+                        "serialNumber": "INTERNAL-DISK",
+                    }
+                ],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[
+                    {"id": "enc-a", "storageSystemId": "node-a"},
+                    {"id": "enc-b", "storageSystemId": "node-a"},
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            records = service._build_storage_view_candidate_records(
+                raw_data,
+                ParsedSSHData(),
+                "enc-a",
+            )
+
+            self.assertEqual([record.device_name for record in records], ["nvme0n1"])
+
     def test_parse_size_to_bytes_binary_suffixes_use_1024(self) -> None:
         self.assertEqual(parse_size_to_bytes("1 GiB"), 1024**3)
         self.assertEqual(parse_size_to_bytes("1 GB"), 1000**3)
@@ -12760,6 +12898,77 @@ class ReviewRegressionTests(unittest.TestCase):
 
             with patch("app.services.mapping_store.Path.open", side_effect=OSError("synthetic read failure")):
                 self.assertEqual(store.load_all(), {})
+
+
+class QuantastorMultiShelfSnapshotRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_selected_shelf_uses_owner_for_platform_context_and_slot_annotation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="owner-context-quantastor",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(platform="quantastor"),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            systems = [
+                {
+                    "id": "node-a",
+                    "name": "Node A",
+                    "storageSystemClusterId": "cluster-a",
+                    "isMaster": True,
+                }
+            ]
+            raw_data = TrueNASRawData(
+                enclosures=systems,
+                systems=systems,
+                disks=[
+                    {
+                        "id": "disk-a",
+                        "storageSystemId": "node-a",
+                        "storagePoolId": "pool-a",
+                        "devicePath": "/dev/sda",
+                        "serialNumber": "OWNER-CONTEXT-DISK",
+                    }
+                ],
+                pools=[{"id": "pool-a", "name": "pool-a", "activeStorageSystemId": "node-a"}],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[
+                    {
+                        "id": "hw-a",
+                        "physicalDiskId": "disk-a",
+                        "storageSystemId": "node-a",
+                        "enclosureId": "enc-a",
+                        "slot": "01",
+                        "serialNum": "OWNER-CONTEXT-DISK",
+                    }
+                ],
+                hw_enclosures=[
+                    {"id": "enc-a", "name": "Shelf A", "storageSystemId": "node-a"},
+                    {"id": "enc-b", "name": "Shelf B", "storageSystemId": "node-a"},
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=raw_data,
+                    ssh_outputs={},
+                    ssh_collected=False,
+                    warnings=[],
+                    sources={},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+
+            snapshot = await service.get_snapshot(selected_enclosure_id="enc-a", force_refresh=True)
+
+            self.assertEqual(snapshot.selected_enclosure_id, "enc-a")
+            self.assertEqual(snapshot.platform_context["selected_view_id"], "node-a")
+            self.assertEqual(snapshot.platform_context["selected_view_label"], "Node A")
+            self.assertEqual(snapshot.slots[0].operator_context["selected_view_label"], "Node A")
+            self.assertTrue(snapshot.slots[0].operator_context["selected_view_is_pool_owner"])
 
 
 if __name__ == "__main__":

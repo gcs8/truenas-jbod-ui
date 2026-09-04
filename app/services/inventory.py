@@ -4007,7 +4007,10 @@ class InventoryService:
 
         platform_context: dict[str, Any] = {}
         if self.system.truenas.platform == "quantastor":
-            selected_system_id = selected_option.id if selected_option else resolved_enclosure_id
+            selected_option_id = selected_option.id if selected_option else resolved_enclosure_id
+            selected_system_id = normalize_text(selected_meta.get("storage_system_id"))
+            if selected_system_id is None and selected_option_id:
+                selected_system_id = self._quantastor_option_owner_id(raw_data, selected_option_id)
             with perf_stage("inventory.quantastor.build_platform_context"):
                 platform_context = self._build_quantastor_platform_context(raw_data, selected_system_id)
                 self._annotate_quantastor_slot_context(slots, raw_data, selected_system_id, platform_context)
@@ -4695,7 +4698,12 @@ class InventoryService:
         if self.system.truenas.platform == "ipmi":
             return self._build_bmc_disk_records(bmc_inventory)
         if self.system.truenas.platform == "quantastor":
-            return self._build_quantastor_disk_records(raw_data, selected_enclosure_id)
+            selected_system_id = (
+                self._quantastor_option_owner_id(raw_data, selected_enclosure_id)
+                if selected_enclosure_id
+                else None
+            )
+            return self._build_quantastor_disk_records(raw_data, selected_system_id)
         return self._build_disk_records(
             raw_data.disks,
             ssh_data,
@@ -5467,10 +5475,15 @@ class InventoryService:
         quantastor_ses_data: ParsedSSHData,
         bmc_inventory: BMCInventory | None = None,
     ) -> tuple[list[SlotView], list[EnclosureOption], dict[str, str | None], list[list[int | None]], int, int]:
-        available_enclosures = self._build_quantastor_enclosure_options(raw_data)
+        enclosure_owner_ids, enclosure_rows_by_owner = self._index_quantastor_hw_enclosures(raw_data)
+        available_enclosures = self._build_quantastor_enclosure_options(
+            raw_data,
+            enclosure_rows_by_owner=enclosure_rows_by_owner,
+        )
         preferred_enclosure_id = selected_enclosure_id or self._select_quantastor_default_enclosure_id(
             raw_data,
             available_enclosures,
+            enclosure_owner_ids=enclosure_owner_ids,
         )
         frame = self._resolve_layout_frame(
             available_enclosures,
@@ -5487,19 +5500,30 @@ class InventoryService:
             return frame.result([])
         allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
 
-        selected_system_id = self._quantastor_option_owner_id(raw_data, selected_option.id)
+        selected_system_id = self._quantastor_option_owner_id(
+            raw_data,
+            selected_option.id,
+            enclosure_owner_ids=enclosure_owner_ids,
+        )
         selected_hw_enclosure_id = selected_option.id if selected_option.id != selected_system_id else None
         warnings.extend(self._build_quantastor_cluster_warnings(raw_data, selected_system_id))
 
-        disk_records = self._build_quantastor_disk_records(raw_data, selected_system_id)
+        disk_records = self._build_quantastor_disk_records(
+            raw_data,
+            selected_system_id,
+            selected_hw_enclosure_id,
+        )
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
         for disk in disk_records:
             for key in disk.lookup_keys:
                 disks_by_key[key] = disk
             if disk.slot is not None:
-                disks_by_slot[(selected_option.id, disk.slot)] = disk
-                disks_by_slot[(None, disk.slot)] = disk
+                if disk.enclosure_id:
+                    disks_by_slot[(disk.enclosure_id, disk.slot)] = disk
+                if selected_hw_enclosure_id is None:
+                    disks_by_slot[(selected_option.id, disk.slot)] = disk
+                    disks_by_slot[(None, disk.slot)] = disk
         disks_by_sas = index_disks_by_sas(
             (disk, *self._disk_sas_alias_tiers(disk)) for disk in disk_records
         )
@@ -5507,6 +5531,7 @@ class InventoryService:
 
         api_topology_members = self._build_quantastor_topology_members(raw_data, disk_records)
         selected_meta = frame.selected_meta
+        selected_meta["storage_system_id"] = selected_system_id
         empty_ssh = ParsedSSHData()
         quantastor_ses_candidates = self._select_quantastor_ses_candidates(
             raw_data,
@@ -5592,7 +5617,12 @@ class InventoryService:
 
         return frame.result(slot_views)
 
-    def _build_quantastor_enclosure_options(self, raw_data: TrueNASRawData) -> list[EnclosureOption]:
+    def _build_quantastor_enclosure_options(
+        self,
+        raw_data: TrueNASRawData,
+        *,
+        enclosure_rows_by_owner: dict[str, dict[str, dict[str, Any]]] | None = None,
+    ) -> list[EnclosureOption]:
         profile = self.profile_registry.resolve_for_enclosure(
             self.system,
             None,
@@ -5606,15 +5636,23 @@ class InventoryService:
         columns = profile.columns if profile else None
         slot_count = infer_slot_count_from_layout(slot_layout or [], 24 if profile else None)
         hw_disks = self._quantastor_hw_disk_rows(raw_data)
-        hw_enclosures = self._quantastor_hw_enclosure_rows(raw_data)
-        hardware_system_ids = {
+        if enclosure_rows_by_owner is None:
+            hw_enclosures = self._quantastor_hw_enclosure_rows(raw_data)
+            _enclosure_owner_ids, indexed_enclosure_rows_by_owner = self._index_quantastor_hw_enclosures(
+                raw_data,
+                rows=hw_enclosures,
+            )
+        else:
+            indexed_enclosure_rows_by_owner = enclosure_rows_by_owner
+        hardware_system_ids = set(indexed_enclosure_rows_by_owner)
+        hardware_system_ids.update(
             system_id
             for system_id in (
                 normalize_text(str(item.get("storageSystemId")) if item.get("storageSystemId") is not None else None)
-                for item in [*hw_disks, *hw_enclosures]
+                for item in hw_disks
             )
             if system_id
-        }
+        )
 
         options: list[EnclosureOption] = []
         for system_row in raw_data.systems:
@@ -5629,15 +5667,7 @@ class InventoryService:
                 or system_row.get("description")
                 or system_id
             )
-            owned_enclosures_by_id: dict[str, dict[str, Any]] = {}
-            for row in hw_enclosures:
-                owner_id = normalize_text(
-                    str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None
-                )
-                enclosure_id = self._quantastor_hw_enclosure_id(row)
-                if owner_id == system_id and enclosure_id:
-                    owned_enclosures_by_id.setdefault(enclosure_id, row)
-            owned_enclosures = list(owned_enclosures_by_id.values())
+            owned_enclosures = list(indexed_enclosure_rows_by_owner.get(system_id, {}).values())
             option_rows = owned_enclosures if len(owned_enclosures) > 1 else [None]
             for enclosure_row in option_rows:
                 enclosure_id = self._quantastor_hw_enclosure_id(enclosure_row) if enclosure_row else None
@@ -5689,16 +5719,38 @@ class InventoryService:
             None,
         )
 
-    def _quantastor_option_owner_id(self, raw_data: TrueNASRawData, option_id: str) -> str:
-        for row in self._quantastor_hw_enclosure_rows(raw_data):
-            if self._quantastor_hw_enclosure_id(row) != option_id:
-                continue
+    def _index_quantastor_hw_enclosures(
+        self,
+        raw_data: TrueNASRawData,
+        *,
+        rows: Iterable[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, str], dict[str, dict[str, dict[str, Any]]]]:
+        enclosure_owner_ids: dict[str, str] = {}
+        enclosure_rows_by_owner: dict[str, dict[str, dict[str, Any]]] = {}
+        enclosure_rows = self._quantastor_hw_enclosure_rows(raw_data) if rows is None else rows
+        for row in enclosure_rows:
+            enclosure_id = self._quantastor_hw_enclosure_id(row)
             owner_id = normalize_text(
                 str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None
             )
-            if owner_id:
-                return owner_id
-        return option_id
+            if not enclosure_id or not owner_id:
+                continue
+            recorded_owner_id = enclosure_owner_ids.setdefault(enclosure_id, owner_id)
+            if recorded_owner_id != owner_id:
+                continue
+            enclosure_rows_by_owner.setdefault(owner_id, {}).setdefault(enclosure_id, row)
+        return enclosure_owner_ids, enclosure_rows_by_owner
+
+    def _quantastor_option_owner_id(
+        self,
+        raw_data: TrueNASRawData,
+        option_id: str,
+        *,
+        enclosure_owner_ids: dict[str, str] | None = None,
+    ) -> str:
+        if enclosure_owner_ids is None:
+            enclosure_owner_ids, _enclosure_rows_by_owner = self._index_quantastor_hw_enclosures(raw_data)
+        return enclosure_owner_ids.get(option_id, option_id)
 
     def _select_quantastor_ses_candidates(
         self,
@@ -5763,8 +5815,17 @@ class InventoryService:
         )
         return candidates
 
-    def _build_quantastor_disk_records(self, raw_data: TrueNASRawData, selected_system_id: str | None) -> list[DiskRecord]:
-        hw_slot_hints = self._build_quantastor_hw_slot_hints(raw_data, selected_system_id)
+    def _build_quantastor_disk_records(
+        self,
+        raw_data: TrueNASRawData,
+        selected_system_id: str | None,
+        selected_enclosure_id: str | None = None,
+    ) -> list[DiskRecord]:
+        hw_slot_hints = self._build_quantastor_hw_slot_hints(
+            raw_data,
+            selected_system_id,
+            selected_enclosure_id,
+        )
         cli_disk_hints = self._build_quantastor_cli_disk_hints(raw_data.cli_disks, selected_system_id)
         pool_slot_hints = self._build_quantastor_pool_slot_hints(raw_data, selected_system_id)
         pool_names = {
@@ -5843,6 +5904,16 @@ class InventoryService:
             ):
                 lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
             hint = next((hw_slot_hints[key] for key in lookup_keys if key in hw_slot_hints), None)
+            disk_enclosure_value = (
+                hint.get("enclosure_id")
+                if hint and hint.get("enclosure_id") is not None
+                else disk.get("enclosureId") or disk.get("enclosure_id")
+            )
+            disk_enclosure_id = normalize_text(
+                str(disk_enclosure_value) if disk_enclosure_value is not None else None
+            )
+            if selected_enclosure_id and disk_enclosure_id != selected_enclosure_id:
+                continue
             cli_hint = next((cli_disk_hints[key] for key in lookup_keys if key in cli_disk_hints), None)
             pool_hint = next((pool_slot_hints[key] for key in lookup_keys if key in pool_slot_hints), None)
             merged_raw = dict(disk)
@@ -5907,7 +5978,7 @@ class InventoryService:
                     last_smart_test_lifetime_hours=None,
                     logical_block_size=self._extract_quantastor_int(disk, "logicalBlockSize", "sectorSize", "logSectorSize"),
                     physical_block_size=self._extract_quantastor_int(disk, "physicalBlockSize", "phySectorSize"),
-                    enclosure_id=normalize_text(str(hint.get("enclosure_id")) if hint and hint.get("enclosure_id") is not None else None) or selected_system_id,
+                    enclosure_id=disk_enclosure_id or selected_system_id,
                     slot=slot,
                     smart_devices=smart_devices,
                     lookup_keys=lookup_keys,
@@ -5919,14 +5990,18 @@ class InventoryService:
         self,
         raw_data: TrueNASRawData,
         options: list[EnclosureOption],
+        *,
+        enclosure_owner_ids: dict[str, str] | None = None,
     ) -> str | None:
         option_ids = [option.id for option in options if option.id]
         if not option_ids:
             return None
 
+        if enclosure_owner_ids is None:
+            enclosure_owner_ids, _enclosure_rows_by_owner = self._index_quantastor_hw_enclosures(raw_data)
         option_rank = {option_id: index for index, option_id in enumerate(option_ids)}
         option_owner_ids = {
-            option_id: self._quantastor_option_owner_id(raw_data, option_id)
+            option_id: enclosure_owner_ids.get(option_id, option_id)
             for option_id in option_ids
         }
         owner_option_ids: dict[str, list[str]] = {}
@@ -6026,10 +6101,18 @@ class InventoryService:
         self,
         raw_data: TrueNASRawData,
         selected_system_id: str | None,
+        selected_enclosure_id: str | None = None,
     ) -> dict[str, dict[str, Any]]:
         grouped_rows: dict[str, list[dict[str, Any]]] = {}
         row_source = "cli" if raw_data.cli_hw_disks else "api"
         for row in self._quantastor_hw_disk_rows(raw_data):
+            enclosure_id = normalize_text(
+                str(row.get("enclosureId") or row.get("enclosure_id"))
+                if (row.get("enclosureId") or row.get("enclosure_id")) is not None
+                else None
+            )
+            if selected_enclosure_id and enclosure_id != selected_enclosure_id:
+                continue
             slot = self._extract_quantastor_slot(row)
             if slot is None:
                 continue
