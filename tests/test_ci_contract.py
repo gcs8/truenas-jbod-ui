@@ -327,13 +327,23 @@ class CIWorkflowContractTests(unittest.TestCase):
             line for line in checklist.splitlines() if "gh pr list -R gcs8/truenas-jbod-ui" in line
         )
         self.assertIn("--limit 1000", merged_pr_command)
-        self.assertIn("--json number,mergedAt,labels", merged_pr_command)
-        self.assertIn("--limit 1000 --json number,mergedAt,labels", " ".join(contributing.split()))
+        self.assertNotIn("--base", merged_pr_command)
+        self.assertIn("--json number,mergedAt,labels,mergeCommit", merged_pr_command)
+        self.assertIn(
+            "--limit 1000 --json number,mergedAt,labels,mergeCommit",
+            " ".join(contributing.split()),
+        )
         checklist_text = " ".join(checklist.split())
         self.assertLess(
             checklist_text.index("publish the repo `wiki/` pages"),
             checklist_text.index("pass the pre-tag validator"),
         )
+
+    def test_dependencies_category_precedes_internal_for_mixed_label_prs(self) -> None:
+        config = yaml.safe_load(self.read(ROOT / ".github" / "release.yml"))
+        titles = [category["title"] for category in config["changelog"]["categories"]]
+
+        self.assertLess(titles.index("Dependencies"), titles.index("Internal"))
 
     def test_release_notes_categories_follow_the_documented_label_order(self) -> None:
         config = yaml.safe_load(self.read(ROOT / ".github" / "release.yml"))
@@ -348,8 +358,8 @@ class CIWorkflowContractTests(unittest.TestCase):
                 ("Fixes", ["bug"]),
                 ("Performance", ["performance"]),
                 ("Documentation", ["documentation"]),
-                ("Internal", ["internal", "tests", "ci"]),
                 ("Dependencies", ["dependencies"]),
+                ("Internal", ["internal", "tests", "ci"]),
             ],
         )
 
