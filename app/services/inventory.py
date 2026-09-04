@@ -85,6 +85,7 @@ from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.quantastor_cli import build_quantastor_cli_invocation
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.parsers import (
+    MultipathInfo,
     ParsedSSHData,
     ZpoolMember,
     _extract_slot_number,
@@ -10155,6 +10156,8 @@ class InventoryService:
         records: list[DiskRecord] = []
         linux_block_index = self._index_linux_blockdevices(ssh_data)
         linux_scsi_index = self._index_linux_scsi_devices(ssh_data)
+        multipath_consumer_index = self._index_multipath_consumers(ssh_data)
+        backfilled_multipath_records: dict[str, int] = {}
         for disk in disks:
             device_name = normalize_device_name(
                 disk.get("devname") or disk.get("name") or disk.get("device") or disk.get("disk")
@@ -10162,6 +10165,48 @@ class InventoryService:
             path_device_name = normalize_device_name(disk.get("name"))
             multipath_name = normalize_text(disk.get("multipath_name"))
             multipath_member = normalize_device_name(disk.get("multipath_member"))
+            multipath_source: str | None = None
+            if not multipath_name and multipath_consumer_index:
+                # Issue #355: the API disk record can lag gmultipath (a hot-added
+                # spare whose disk table row is not yet synced) and the passive
+                # member may be absent from the API list entirely. The parsed
+                # `gmultipath list` consumers are then the only evidence tying
+                # this bare member to its geom; use them so the provider's GPT
+                # label and pool membership can join.
+                api_device_name = path_device_name or device_name
+                parsed_multipath = self._match_multipath_consumer(
+                    multipath_consumer_index,
+                    ssh_data,
+                    api_device_name,
+                    device_name,
+                )
+                if parsed_multipath is not None:
+                    geom_key = parsed_multipath.name.lower()
+                    earlier_index = backfilled_multipath_records.get(geom_key)
+                    if earlier_index is not None:
+                        # Both members reached the API list without the multipath
+                        # fields: keep the first record and fold this one in as
+                        # its member rather than emitting a second disk.
+                        earlier = records[earlier_index]
+                        for value in (api_device_name, device_name, disk.get("name"), disk.get("devname")):
+                            earlier.lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
+                        for candidate in dict.fromkeys(filter(None, [api_device_name, device_name])):
+                            if candidate not in earlier.smart_devices:
+                                earlier.smart_devices.append(candidate)
+                        continue
+                    multipath_name = parsed_multipath.name
+                    multipath_member = next(
+                        (
+                            consumer.device_name
+                            for consumer in parsed_multipath.consumers
+                            if not api_device_name or consumer.device_name.lower() != api_device_name.lower()
+                        ),
+                        None,
+                    )
+                    path_device_name = api_device_name
+                    device_name = parsed_multipath.device_name
+                    multipath_source = "gmultipath list"
+                    backfilled_multipath_records[geom_key] = len(records)
             serial = normalize_text(disk.get("serial") or disk.get("serial_lunid") or disk.get("lunid"))
             model = normalize_text(disk.get("model"))
             size_bytes = disk.get("size") if isinstance(disk.get("size"), int) else None
@@ -10239,6 +10284,8 @@ class InventoryService:
             linux_block_summary = self._linux_blockdevice_summary(linux_blockdevice)
             linux_scsi_summary = self._linux_scsi_device_summary(linux_scsi_device)
             disk_raw = dict(disk)
+            if multipath_source:
+                disk_raw["multipath_source"] = multipath_source
             if linux_block_summary:
                 disk_raw["linux_blockdevice"] = linux_block_summary
             if linux_scsi_summary:
@@ -10308,6 +10355,59 @@ class InventoryService:
                 )
             )
         return records
+
+    @staticmethod
+    def _index_multipath_consumers(ssh_data: ParsedSSHData) -> dict[str, MultipathInfo]:
+        """Map each gmultipath consumer (member path) to the one geom that claims it.
+
+        `parse_gmultipath_list` stores every geom under both `multipath/<name>` and
+        its provider name, so geoms are deduplicated by identity first. A consumer
+        claimed by more than one geom is dropped: that evidence is ambiguous and
+        must not backfill anything.
+        """
+        geoms: list[MultipathInfo] = []
+        seen: set[int] = set()
+        for info in ssh_data.multipath_info.values():
+            if id(info) in seen:
+                continue
+            seen.add(id(info))
+            geoms.append(info)
+
+        index: dict[str, MultipathInfo] = {}
+        ambiguous: set[str] = set()
+        for info in geoms:
+            for consumer in info.consumers:
+                key = normalize_device_name(consumer.device_name)
+                if not key:
+                    continue
+                key = key.lower()
+                if key in index and index[key] is not info:
+                    ambiguous.add(key)
+                index[key] = info
+        for key in ambiguous:
+            index.pop(key, None)
+        return index
+
+    @staticmethod
+    def _match_multipath_consumer(
+        index: dict[str, MultipathInfo],
+        ssh_data: ParsedSSHData,
+        *device_names: str | None,
+    ) -> MultipathInfo | None:
+        """Return the one geom whose consumers include a given name or a camcontrol peer of it."""
+        candidates = list(dict.fromkeys(filter(None, device_names)))
+        for name in list(candidates):
+            candidates.extend(ssh_data.camcontrol_peer_devices.get(name.lower(), []))
+
+        matched: MultipathInfo | None = None
+        for name in dict.fromkeys(candidates):
+            info = index.get(name.lower())
+            if info is None:
+                continue
+            if matched is not None and info is not matched:
+                return None
+            matched = info
+        return matched
 
     def _extract_pool_name(self, disk: dict[str, Any]) -> str | None:
         pool = disk.get("pool")
