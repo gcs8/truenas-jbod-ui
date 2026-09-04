@@ -52,6 +52,7 @@ class ESXiHostPrepService:
         stale_ttl_seconds: int = 24 * 60 * 60,
         probe_factory: Callable[[SSHConfig], SSHProbe] = SSHProbe,
     ) -> None:
+        self._service_uid = os.geteuid()
         self.staging_root = Path(staging_root)
         self.staging_root.mkdir(parents=True, exist_ok=True)
         self.stale_ttl_seconds = stale_ttl_seconds
@@ -126,9 +127,8 @@ class ESXiHostPrepService:
                 os.close(root_fd)
         return summary
 
-    @classmethod
     def _load_owned_package_for_cleanup(
-        cls,
+        self,
         root_fd: int,
         root_stat: os.stat_result,
         token: str,
@@ -139,7 +139,7 @@ class ESXiHostPrepService:
         if (
             not stat.S_ISDIR(directory_lstat.st_mode)
             or directory_lstat.st_dev != root_stat.st_dev
-            or directory_lstat.st_uid != root_stat.st_uid
+            or directory_lstat.st_uid != self._service_uid
         ):
             return None
 
@@ -174,7 +174,7 @@ class ESXiHostPrepService:
             if (
                 not stat.S_ISREG(metadata_lstat.st_mode)
                 or metadata_lstat.st_dev != root_stat.st_dev
-                or metadata_lstat.st_uid != root_stat.st_uid
+                or metadata_lstat.st_uid != self._service_uid
                 or metadata_lstat.st_nlink != 1
                 or metadata_lstat.st_size > MAX_METADATA_BYTES
             ):
@@ -217,7 +217,7 @@ class ESXiHostPrepService:
             if not isinstance(filename, str):
                 return None
             try:
-                if cls._sanitize_filename(filename) != filename:
+                if self._sanitize_filename(filename) != filename:
                     return None
             except ValueError:
                 return None
@@ -240,7 +240,7 @@ class ESXiHostPrepService:
             if (
                 not stat.S_ISREG(package_lstat.st_mode)
                 or package_lstat.st_dev != root_stat.st_dev
-                or package_lstat.st_uid != root_stat.st_uid
+                or package_lstat.st_uid != self._service_uid
                 or package_lstat.st_nlink != 1
                 or package_lstat.st_size != metadata["size_bytes"]
             ):
@@ -358,16 +358,16 @@ class ESXiHostPrepService:
     def _active_package(self, token: str) -> Iterator[None]:
         cleaned_token = str(token or "").strip()
         with self._activity_lock:
-            self._active_tokens[cleaned_token] = self._active_tokens.get(cleaned_token, 0) + 1
+            if self._active_tokens.get(cleaned_token, 0) > 0:
+                raise ValueError(
+                    "The selected staged ESXi package is already being installed."
+                )
+            self._active_tokens[cleaned_token] = 1
         try:
             yield
         finally:
             with self._activity_lock:
-                remaining = self._active_tokens.get(cleaned_token, 1) - 1
-                if remaining > 0:
-                    self._active_tokens[cleaned_token] = remaining
-                else:
-                    self._active_tokens.pop(cleaned_token, None)
+                self._active_tokens.pop(cleaned_token, None)
 
     def list_staged_packages(self) -> list[dict[str, Any]]:
         packages: list[dict[str, Any]] = []
@@ -451,6 +451,7 @@ class ESXiHostPrepService:
         remote_name = self._build_remote_filename(str(package["token"]), str(package["filename"]))
         remote_path = f"/tmp/{remote_name}"
 
+        cleanup_result: SSHCommandResult | None = None
         try:
             with probe.open_client() as client:
                 pre_upload_cleanup = self._run_remote_command(
@@ -468,23 +469,39 @@ class ESXiHostPrepService:
                         f"Unable to clear the previous ESXi temp file at {remote_path} before upload: "
                         f"{cleanup_detail}"
                     )
+                remote_uploaded = False
                 try:
-                    with client.open_sftp() as sftp:
-                        sftp.put(str(local_path), remote_path)
-                except Exception as exc:
-                    raise ValueError(
-                        f"Unable to upload {filename} to {remote_path} on the ESXi host. "
-                        "The admin flow clears any previous temp file at that path before upload, "
-                        f"so this was not a simple existing-file conflict. Remote upload error: {exc}"
-                    ) from exc
-                install_command = self._build_install_command(remote_path, str(package["extension"]))
-                install_result = self._run_remote_command(client, install_command, payload.timeout_seconds)
-                verification = self._run_verification_commands(client, payload.timeout_seconds)
-                cleanup_result = self._run_remote_command(
-                    client,
-                    f"rm -f {shlex.quote(remote_path)}",
-                    payload.timeout_seconds,
-                )
+                    try:
+                        with client.open_sftp() as sftp:
+                            sftp.put(str(local_path), remote_path)
+                    except Exception as exc:
+                        raise ValueError(
+                            f"Unable to upload {filename} to {remote_path} on the ESXi host. "
+                            "The admin flow clears any previous temp file at that path before upload, "
+                            f"so this was not a simple existing-file conflict. Remote upload error: {exc}"
+                        ) from exc
+                    remote_uploaded = True
+                    install_command = self._build_install_command(remote_path, str(package["extension"]))
+                    install_result = self._run_remote_command(client, install_command, payload.timeout_seconds)
+                    verification = self._run_verification_commands(client, payload.timeout_seconds)
+                finally:
+                    if remote_uploaded:
+                        try:
+                            cleanup_result = self._run_remote_command(
+                                client,
+                                f"rm -f {shlex.quote(remote_path)}",
+                                payload.timeout_seconds,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Host-prep remote cleanup did not complete outcome=exception"
+                            )
+                        else:
+                            if not cleanup_result.ok:
+                                logger.warning(
+                                    "Host-prep remote cleanup did not complete "
+                                    "outcome=command_failed"
+                                )
         except TimeoutError as exc:
             raise ValueError(
                 f"Timed out while installing or verifying {filename} on ESXi host {payload.host} "
@@ -492,6 +509,14 @@ class ESXiHostPrepService:
                 "verification can take longer on some hosts; retry with a larger host-prep timeout."
             ) from exc
 
+        if cleanup_result is None:
+            cleanup_result = SSHCommandResult(
+                command="remote package cleanup",
+                ok=False,
+                stdout="",
+                stderr="",
+                exit_code=-1,
+            )
         detail = self._build_install_detail(package, install_result, verification)
         return {
             "ok": install_result.ok,

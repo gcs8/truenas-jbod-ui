@@ -5217,14 +5217,17 @@
       syncEsxiHostPrepFields();
       setBanner(result.detail || "ESXi host prep finished.", result.install_ok ? "success" : "error");
     } catch (error) {
+      try {
+        await refreshState({ quiet: true });
+      } catch {
+        // Keep the install error primary when the follow-up state refresh also fails.
+      }
       if (elements.setupEsxiHostPrepResult) {
         elements.setupEsxiHostPrepResult.textContent = `ESXi host prep failed: ${error.message || error}`;
       }
       setBanner(`ESXi host prep failed: ${error.message || error}`, "error");
     } finally {
-      if (elements.setupEsxiHostPrepInstallButton) {
-        elements.setupEsxiHostPrepInstallButton.disabled = false;
-      }
+      syncEsxiHostPrepFields();
     }
   }
 
