@@ -77,9 +77,12 @@ Sealed history segments are now group-readable (#216). The segment directory is
 published as `0750` and each immutable segment and `catalog.json` as `0640`,
 owned by the history identity and shared with the backup group, so the backup
 service can read them without write access. The publisher must own the hot
-history database. Deployments that changed these paths by hand should confirm
-the ownership and modes with the same preflight helper before starting the
-history sidecar.
+history database. Do not run the generic ownership helper over an existing
+segmented-history tree. It applies shared-write `0770` and `0660` modes
+recursively, which would make sealed segments and private recovery artifacts
+writable by the backup group. Follow the bounded, quiesced repair procedure in
+[Backup, Restore, and Debug Bundles](wiki/Backup-Restore-and-Debug-Bundles.md#optional-scheduled-state-backups)
+before starting the history sidecar.
 
 An enclosure-query failure now fails the whole API fetch (#218). The TrueNAS
 websocket client used to swallow an enclosure-query error and return what
