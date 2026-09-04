@@ -2692,6 +2692,24 @@ Additional element status diagnostic page:
             any("shared SAS address" in warning for warning in parsed.ses_selected_meta.get("warnings") or [])
         )
 
+    def test_parse_ssh_outputs_keeps_sysfs_bindings_from_every_merged_ses_path(self) -> None:
+        parsed = parse_ssh_outputs(
+            {
+                "sudo -n /usr/bin/sg_ses -p aes /dev/sg84": self.SHARED_ADDRESS_AES,
+                "sudo -n /usr/bin/sg_ses -p aes /dev/sg85": self.SHARED_ADDRESS_AES,
+                "for c in /sys/class/enclosure/*/*; do printf x; done": (
+                    "13:0:0:0|sg85 |1|1|sdz"
+                ),
+            },
+            4,
+            None,
+            None,
+        )
+
+        self.assertEqual(len(parsed.ses_enclosures), 1)
+        self.assertEqual(parsed.ses_slot_candidates[1]["device_names"], ["sdz"])
+        self.assertEqual(parsed.ses_slot_to_device[1], "sdz")
+
     def test_parse_ssh_outputs_keeps_unique_aes_addresses_unflagged(self) -> None:
         output = """
   EXAMPLE  SASJBOD           0100

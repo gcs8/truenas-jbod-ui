@@ -156,6 +156,7 @@ class SESMapSlot:
 @dataclass(slots=True)
 class SESMapEnclosure:
     ses_device: str | None = None
+    ses_devices: list[str] = field(default_factory=list)
     enclosure_id: str | None = None
     enclosure_name: str | None = None
     enclosure_label: str | None = None
@@ -1788,8 +1789,12 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
                     break
         if key is None:
             key = enclosure.enclosure_id or enclosure.ses_device or enclosure.enclosure_name or f"unknown-{len(merged)}"
+            ses_devices = list(enclosure.ses_devices)
+            if enclosure.ses_device and enclosure.ses_device not in ses_devices:
+                ses_devices.append(enclosure.ses_device)
             merged[key] = SESMapEnclosure(
                 ses_device=enclosure.ses_device,
+                ses_devices=ses_devices,
                 enclosure_id=enclosure.enclosure_id,
                 enclosure_name=enclosure.enclosure_name,
                 enclosure_label=enclosure.enclosure_label,
@@ -1804,6 +1809,9 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
         target.enclosure_id = target.enclosure_id or enclosure.enclosure_id
         target.enclosure_name = target.enclosure_name or enclosure.enclosure_name
         target.ses_device = target.ses_device or enclosure.ses_device
+        for ses_device in [*enclosure.ses_devices, enclosure.ses_device]:
+            if ses_device and ses_device not in target.ses_devices:
+                target.ses_devices.append(ses_device)
         target.enclosure_label = target.enclosure_label or enclosure.enclosure_label
         target.profile_id = target.profile_id or enclosure.profile_id
         target.layout_rows = target.layout_rows or enclosure.layout_rows
@@ -1932,20 +1940,23 @@ def _apply_enclosure_sysfs_device_names(
     attribute onto EC element indexes showed bay N holding bay N+k's disk and
     turned empty bays present). EC-only enclosures therefore get no device
     names from sysfs rather than a neighbour's; each binding dropped that way
-    is counted on the enclosure so the operator sees one warning per sg device.
+    is counted on the enclosure so the operator sees one warning for the merged
+    SES evidence.
     """
     for enclosure in enclosures:
-        sg_name = (enclosure.ses_device or "").rsplit("/", 1)[-1]
-        slot_hints = sysfs_slots.get(sg_name)
-        if not slot_hints:
-            continue
-        for slot_number, device_names in slot_hints.items():
-            slot = enclosure.slots.get(slot_number)
-            if slot is None or slot.slot_number_source not in SYSFS_JOINABLE_SLOT_NUMBER_SOURCES:
-                enclosure.unplaced_sysfs_bindings += 1
+        ses_devices = enclosure.ses_devices or ([enclosure.ses_device] if enclosure.ses_device else [])
+        for ses_device in ses_devices:
+            sg_name = ses_device.rsplit("/", 1)[-1]
+            slot_hints = sysfs_slots.get(sg_name)
+            if not slot_hints:
                 continue
-            _apply_ses_presence_evidence(slot, True, "enclosure_sysfs")
-            _apply_ses_device_name_evidence(slot, device_names, "enclosure_sysfs")
+            for slot_number, device_names in slot_hints.items():
+                slot = enclosure.slots.get(slot_number)
+                if slot is None or slot.slot_number_source not in SYSFS_JOINABLE_SLOT_NUMBER_SOURCES:
+                    enclosure.unplaced_sysfs_bindings += 1
+                    continue
+                _apply_ses_presence_evidence(slot, True, "enclosure_sysfs")
+                _apply_ses_device_name_evidence(slot, device_names, "enclosure_sysfs")
 
 
 def _flag_degraded_ses_sas_addresses(enclosure: SESMapEnclosure) -> None:
