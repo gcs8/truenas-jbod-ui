@@ -225,7 +225,7 @@ def _raise_for_unreferenced_segment_temporaries(
     noun = "artifact" if len(paths) == 1 else "artifacts"
     raise ValueError(
         f"{label} found unreferenced segment temporary {noun}: "
-        + ", ".join(str(path) for path in paths)
+        + ", ".join(json.dumps(str(path)) for path in paths)
         + "."
     )
 

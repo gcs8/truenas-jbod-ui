@@ -1246,7 +1246,9 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
 
             self.assertEqual(
                 str(raised.exception),
-                f"Segment rotation found unreferenced segment temporary artifact: {orphan_path}.",
+                "Segment rotation found unreferenced segment temporary artifact: "
+                + json.dumps(str(orphan_path))
+                + ".",
             )
             self.assertEqual(marker_path.read_bytes(), marker_bytes)
             self.assertEqual(orphan_path.read_bytes(), orphan_bytes)

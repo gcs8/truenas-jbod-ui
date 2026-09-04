@@ -707,8 +707,43 @@ class SegmentedHistoryMigrationCliTests(unittest.TestCase):
 
             self.assertEqual(
                 str(raised.exception),
-                f"Segmented history recovery found unreferenced segment temporary artifact: {orphan_path}.",
+                "Segmented history recovery found unreferenced segment temporary artifact: "
+                + json.dumps(str(orphan_path))
+                + ".",
             )
+            self.assertEqual(orphan_path.read_bytes(), orphan_bytes)
+            self.assertTrue(rollback_path.is_file())
+
+    def test_recovery_json_escapes_hostile_segment_temp_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            rollback_path = segments_directory / ".v1-rollback.sqlite3"
+            orphan_path = segments_directory / ".segment-hostile\nname\x1b[31m.sqlite3"
+            orphan_bytes = b"unauthenticated-segment"
+            self._create_source_database(source)
+            segments_directory.mkdir()
+            rollback_path.write_bytes(source.read_bytes())
+            rollback_path.chmod(0o600)
+            orphan_path.write_bytes(orphan_bytes)
+
+            with self.assertRaises(ValueError) as raised:
+                segment_migration.recover_pending_migration(
+                    source=source,
+                    segments_directory=segments_directory,
+                    apply=True,
+                )
+
+            message = str(raised.exception)
+            self.assertEqual(
+                message,
+                "Segmented history recovery found unreferenced segment temporary artifact: "
+                + json.dumps(str(orphan_path))
+                + ".",
+            )
+            self.assertNotIn("\n", message)
+            self.assertNotIn("\x1b", message)
             self.assertEqual(orphan_path.read_bytes(), orphan_bytes)
             self.assertTrue(rollback_path.is_file())
 
