@@ -297,6 +297,26 @@ class CIWorkflowContractTests(unittest.TestCase):
             "security) want+=(security)",
         ):
             self.assertIn(mapping, label_step["run"])
+        self.assertRegex(
+            label_step["run"],
+            r"\*\)\s+echo \"Unknown conventional type.*\n\s+exit 0\n\s+;;",
+        )
+
+    def test_release_checklist_collects_all_labels_and_publishes_wiki_before_validation(self) -> None:
+        checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")
+        contributing = self.read(ROOT / "CONTRIBUTING.md")
+
+        merged_pr_command = next(
+            line for line in checklist.splitlines() if "gh pr list -R gcs8/truenas-jbod-ui" in line
+        )
+        self.assertIn("--limit 1000", merged_pr_command)
+        self.assertIn("--json number,mergedAt,labels", merged_pr_command)
+        self.assertIn("--limit 1000 --json number,mergedAt,labels", " ".join(contributing.split()))
+        checklist_text = " ".join(checklist.split())
+        self.assertLess(
+            checklist_text.index("publish the repo `wiki/` pages"),
+            checklist_text.index("pass the pre-tag validator"),
+        )
 
     def test_release_notes_categories_follow_the_documented_label_order(self) -> None:
         config = yaml.safe_load(self.read(ROOT / ".github" / "release.yml"))

@@ -87,18 +87,18 @@ the wrap must carry the `External wiki commit: <sha>` line.
 4. Run local unit, syntax, hygiene, Docker health, optional-sidecar, browser,
    feature-specific, public-demo, and perf gates.
 5. Run the Linux QA Docker restore gate and restored-stack perf/browser gates.
-6. Fill in the release wrap checklist evidence table and pass the pre-tag
+6. If `wiki/` changed, obtain explicit maintainer approval, publish the repo
+   `wiki/` pages, verify the external commit, and record it in the release wrap.
+7. Fill in the release wrap checklist evidence table and pass the pre-tag
    validator.
-7. Only after the pre-tag table is complete, merge/cut the release commit, tag
+8. Only after the pre-tag table is complete, merge/cut the release commit, tag
    it, push it, publish the GitHub release, and verify GHCR digest convergence.
-8. Refresh and sniff-test local, Linux, and production deployments after GHCR
+9. Refresh and sniff-test local, Linux, and production deployments after GHCR
    is available.
-9. Sync the external wiki and public demo deployment when those artifacts
-   changed, and record workflow URLs or commit hashes. When `wiki/` changed
-   since the previous tag, the wrap must carry `External wiki commit: <sha>`
-   for the published GitHub wiki commit, and the wiki gate row cannot pass
-   without it.
-10. Reopen the next development branch only after post-publish deployment
+10. Publish the public demo when it changed and record the workflow URL. Verify
+    that the external wiki commit recorded before tagging is still the published
+    branch tip.
+11. Reopen the next development branch only after post-publish deployment
     evidence is recorded, then rerun the final release-wrap validator.
 
 ## Scope
@@ -394,7 +394,7 @@ the wrap must carry the `External wiki commit: <sha>` line.
 
 - bump `app/__init__.py` to the release version
 - build the merged pull request list for the coverage gate:
-  `gh pr list -R gcs8/truenas-jbod-ui --state merged --search "merged:>=<previous tag date>" --json number,mergedAt > merged-prs.json`
+  `gh pr list -R gcs8/truenas-jbod-ui --state merged --search "merged:>=<previous tag date>" --limit 1000 --json number,mergedAt,labels > merged-prs.json`
 - run the changelog coverage gate against the previous tag and the section
   that will become the release section, and fix every missing number before
   going on:
@@ -414,6 +414,10 @@ the wrap must carry the `External wiki commit: <sha>` line.
 - review profile/config docs for dead or outdated comments, especially builder
   mode and custom-profile authoring guidance
 - review the repo `wiki/` pages for stale setup or release wording
+- if `wiki/` changed, obtain explicit maintainer approval, publish the repo
+  `wiki/` pages before pre-tag validation, and rerun the coverage gate with
+  `--wiki-commit <sha>` so the release wrap can record the verified external
+  commit
 - add the completed checklist evidence table to the release wrap before the
   tag is cut
 - if the release changes public-demo behavior or data, regenerate and verify
@@ -454,10 +458,8 @@ the wrap must carry the `External wiki commit: <sha>` line.
   publish action
 - push `main`
 - push the release tag
-- publish the repo `wiki/` pages if they changed, then rerun the coverage
-  gate with `--wiki-commit <sha>` so it verifies the published commit against
-  the wiki repository, and record its `External wiki commit: <sha>` line in the
-  release wrap
+- verify that the external wiki commit recorded before tagging is still a
+  published branch tip; stop rather than silently republishing changed pages
 - create the GitHub release with generated notes:
   `gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes --notes-file release-notes.md`
 - open the release page and confirm every pull request sits in the expected
