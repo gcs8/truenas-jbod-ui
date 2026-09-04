@@ -1805,6 +1805,93 @@ class SnapshotRedactorIdentifierKeyTests(unittest.TestCase):
         self.assertNotIn("host-01", redacted_extra["detail"])
         self.assertNotIn("enc-01", redacted_extra["detail"])
 
+    def test_partial_redaction_reserves_raw_ids_across_alias_namespaces(self) -> None:
+        snapshot = build_snapshot()
+        snapshot.selected_system_id = "enc-01"
+        snapshot.selected_system_label = "System One"
+        snapshot.systems = [SystemOption(id="enc-01", label="System One")]
+        snapshot.selected_enclosure_id = "host-01"
+        snapshot.selected_enclosure_label = "Enclosure One"
+        snapshot.enclosures = [EnclosureOption(id="host-01", label="Enclosure One")]
+        snapshot.slots[0].enclosure_id = "host-01"
+        snapshot.slots[0].enclosure_label = "Enclosure One"
+
+        redacted = SnapshotRedactor(snapshot, {}, {}).redact_snapshot(snapshot)
+
+        self.assertEqual(redacted.selected_system_id, "host-02")
+        self.assertEqual(redacted.selected_enclosure_id, "enc-02")
+
+    def test_partial_redaction_reserves_cross_namespace_ids_case_insensitively(self) -> None:
+        snapshot = build_snapshot()
+        snapshot.selected_system_id = "ENC-01"
+        snapshot.selected_system_label = "System One"
+        snapshot.systems = [SystemOption(id="ENC-01", label="System One")]
+        snapshot.selected_enclosure_id = "HOST-01"
+        snapshot.selected_enclosure_label = "Enclosure One"
+        snapshot.enclosures = [EnclosureOption(id="HOST-01", label="Enclosure One")]
+        snapshot.slots[0].enclosure_id = "HOST-01"
+        snapshot.slots[0].enclosure_label = "Enclosure One"
+
+        redacted = SnapshotRedactor(snapshot, {}, {}).redact_snapshot(snapshot)
+
+        self.assertEqual(redacted.selected_system_id, "host-02")
+        self.assertEqual(redacted.selected_enclosure_id, "enc-02")
+
+    def test_partial_redaction_dynamic_aliases_share_raw_id_reservations(self) -> None:
+        enclosure_first = SnapshotRedactor(build_snapshot(), {}, {})
+        enclosure_first.redact_object({"enclosure_id": "HOST-02"})
+        redacted_system = enclosure_first.redact_object({"system_id": "late-system"})
+
+        system_first = SnapshotRedactor(build_snapshot(), {}, {})
+        system_first.redact_object({"system_id": "ENC-02"})
+        redacted_enclosure = system_first.redact_object({"enclosure_id": "late-enclosure"})
+
+        self.assertEqual(redacted_system["system_id"], "host-03")
+        self.assertEqual(redacted_enclosure["enclosure_id"], "enc-03")
+
+    def test_alias_shaped_zero_suffix_ids_are_redacted_in_fields_and_free_text(self) -> None:
+        history_cache = {
+            "0": {
+                "system_id": "host-00",
+                "enclosure_id": "enc-00",
+                "detail": "moved from host-00 through enc-00",
+            }
+        }
+        redactor = SnapshotRedactor(build_snapshot(), history_cache, {})
+
+        redacted = redactor.redact_history_cache(history_cache)
+        system_alias = redacted["0"]["system_id"]
+        enclosure_alias = redacted["0"]["enclosure_id"]
+
+        self.assertNotEqual(system_alias, "host-00")
+        self.assertNotEqual(enclosure_alias, "enc-00")
+        self.assertEqual(
+            redacted["0"]["detail"],
+            f"moved from {system_alias} through {enclosure_alias}",
+        )
+
+    def test_actual_numeric_and_address_zero_sentinels_are_preserved(self) -> None:
+        zero_forms = (
+            "0",
+            "0000",
+            "0x0000000000000000",
+            "00:00:00:00:00:00",
+            "00-00-00-00-00-00",
+            "0.0.0.0",
+            "::",
+        )
+        redactor = SnapshotRedactor(build_snapshot(), {}, {})
+
+        for zero_form in zero_forms:
+            with self.subTest(zero_form=zero_form):
+                payload = {
+                    "system_id": zero_form,
+                    "enclosure_id": zero_form,
+                    "serial": zero_form,
+                    "sas_address": zero_form,
+                }
+                self.assertEqual(redactor.redact_object(payload), payload)
+
     def test_partial_redaction_does_not_replace_identifier_substrings(self) -> None:
         snapshot = build_snapshot()
         matching_timestamp = datetime(2026, 9, 2, 0, 1, tzinfo=timezone.utc)

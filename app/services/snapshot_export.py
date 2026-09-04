@@ -155,15 +155,12 @@ class SnapshotRedactor:
         alias_snapshots = [snapshot, *(extra_snapshots or [])]
         self.configured_hostname_values = list(dict.fromkeys(configured_hostnames or []))
         self.configured_hostname_keys = {hostname.casefold() for hostname in self.configured_hostname_values}
-        self.identifier_alias_reserved_values: dict[str, set[str]] = {
-            "host": {
-                value.casefold()
-                for value in (
-                    *self.configured_hostname_values,
-                    *self._configured_hostname_short_forms(self.configured_hostname_values),
-                )
-            },
-            "enc": set(),
+        self.raw_identifier_reservations = {
+            value.casefold()
+            for value in (
+                *self.configured_hostname_values,
+                *self._configured_hostname_short_forms(self.configured_hostname_values),
+            )
         }
         payloads = [
             *(candidate.model_dump(mode="json") for candidate in alias_snapshots),
@@ -175,11 +172,11 @@ class SnapshotRedactor:
             self._collect_identifier_reservations(payload)
         self.system_aliases = self._build_system_aliases(
             alias_snapshots,
-            self.identifier_alias_reserved_values["host"],
+            self.raw_identifier_reservations,
         )
         self.enclosure_aliases = self._build_enclosure_aliases(
             alias_snapshots,
-            self.identifier_alias_reserved_values["enc"],
+            self.raw_identifier_reservations,
         )
         self._add_configured_hostname_aliases(snapshot)
         self._collect_known_values(snapshot.model_dump(mode="json"))
@@ -272,10 +269,8 @@ class SnapshotRedactor:
         if not normalized or self._is_zero_identifier_sentinel(normalized):
             return
         bucket = self._classify_path(path)
-        if bucket == "system":
-            self.identifier_alias_reserved_values["host"].add(normalized.casefold())
-        elif bucket == "enclosure":
-            self.identifier_alias_reserved_values["enc"].add(normalized.casefold())
+        if bucket in {"system", "enclosure"}:
+            self.raw_identifier_reservations.add(normalized.casefold())
 
     def _classify_path(self, path: tuple[Any, ...]) -> str | None:
         if not path:
@@ -541,14 +536,14 @@ class SnapshotRedactor:
             return existing
         if self._is_zero_identifier_sentinel(normalized):
             return value
-        self.identifier_alias_reserved_values[prefix].add(normalized.casefold())
+        self.raw_identifier_reservations.add(normalized.casefold())
         minted = self._next_identifier_alias(aliases, prefix)
         aliases[normalized] = minted
         return minted
 
     def _next_identifier_alias(self, aliases: dict[str, str], prefix: str) -> str:
         used = {alias.casefold() for alias in aliases.values()}
-        reserved = self.identifier_alias_reserved_values[prefix]
+        reserved = self.raw_identifier_reservations
         index = 1
         while True:
             candidate = f"{prefix}-{index:02d}"
@@ -558,8 +553,18 @@ class SnapshotRedactor:
 
     @staticmethod
     def _is_zero_identifier_sentinel(value: str) -> bool:
-        compact = re.sub(r"[^0-9A-Fa-f]", "", value.strip().removeprefix("0x").removeprefix("0X"))
-        return bool(compact) and set(compact) == {"0"}
+        normalized = value.strip()
+        if re.fullmatch(r"(?:0[xX])?0+", normalized):
+            return True
+        try:
+            return int(ip_address(normalized)) == 0
+        except ValueError:
+            return bool(
+                re.fullmatch(
+                    r"0+(?P<separator>[:-])0+(?:(?P=separator)0+)*",
+                    normalized,
+                )
+            )
 
     @staticmethod
     def _serial_suffix(value: str) -> str:
