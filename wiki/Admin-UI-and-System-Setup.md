@@ -40,9 +40,12 @@ publication or `https://jbod-admin.example.test` behind a reverse proxy.
 Browser-initiated admin changes (POST, PUT, PATCH, DELETE) are accepted only
 when their `Origin` or `Referer` header matches this value; any other browser
 request is rejected with `403 Cross-origin admin mutation rejected.` The
-published Compose file passes the variable through empty, and the admin service
-refuses to start while it is empty or not an origin, so set it first. It is
-required in both `network` and `basic` mode.
+published Compose file passes the variable through empty. `v0.22.2` and current
+`main` still start when the value is empty or malformed, but browser mutations
+are rejected at request time with `403 Cross-origin admin mutation rejected.`
+Set it before using the admin UI. It is required in both `network` and `basic`
+mode. Startup refusal for an empty or invalid value is proposed in PR #321; it
+is not part of `v0.22.2` or current `main`.
 
 ```dotenv
 ADMIN_PUBLIC_ORIGIN=http://jbod-admin.example.test:8082

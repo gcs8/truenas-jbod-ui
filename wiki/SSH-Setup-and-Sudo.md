@@ -57,9 +57,53 @@ ssh:
   password: "your-esxi-root-password"
 ```
 
-With that default, the first successful SSH connection pins the observed host
-key into `/app/data/known_hosts`, and later connections must match it unless
-you intentionally clear the saved entry.
+Host-key behavior differs by version. With `strict_host_key_checking: true`,
+current `main` uses Paramiko `RejectPolicy` and rejects an unknown key. Before
+enabling strict mode, obtain the key through a trusted management path, verify
+every host-key fingerprint out of band, and preload the matching OpenSSH entries
+into `./data/known_hosts`. A strict first connection cannot create the pin.
+
+For example, collect a candidate on the Docker host while strict mode is still
+off. Replace the example host and port. `ssh-keyscan` only retrieves the key; it
+does not authenticate the key.
+
+```bash
+set -euo pipefail
+test ! -L data
+mkdir -p data
+test -d data
+known_hosts_candidate="$(mktemp)"
+known_hosts_merged="$(mktemp)"
+trap 'rm -f "$known_hosts_candidate" "$known_hosts_merged"' EXIT
+ssh-keyscan -T 5 -p 22 storage.example.test > "$known_hosts_candidate"
+test -s "$known_hosts_candidate"
+ssh-keygen -lf "$known_hosts_candidate"
+```
+
+Compare every displayed fingerprint with a value obtained through a separate
+trusted channel, such as the appliance console or an authenticated management
+interface. Do not continue on a mismatch. After every fingerprint matches,
+merge the verified entries without following an existing `known_hosts` symlink:
+
+```bash
+test ! -L data/known_hosts
+test ! -e data/known_hosts || test -f data/known_hosts
+{ test ! -f data/known_hosts || cat data/known_hosts; cat "$known_hosts_candidate"; } \
+  | sort -u > "$known_hosts_merged"
+install -m 0600 "$known_hosts_merged" data/known_hosts
+rm -f "$known_hosts_candidate" "$known_hosts_merged"
+trap - EXIT
+```
+
+Then enable `strict_host_key_checking: true` and restart the UI. Repeat the
+collection and out-of-band verification for every configured host or HA node.
+
+`v0.22.2` instead uses trust on first use when a known-hosts path is configured,
+even when `strict_host_key_checking` is `true`. It accepts and saves an unknown
+key without prior fingerprint verification. Do not treat that flag as strict
+verification on `v0.22.2`; connect only on a trusted network, verify the saved
+fingerprint immediately, and upgrade to a release with the current-main
+`RejectPolicy` behavior when one is available.
 
 ## CORE Command Ideas
 

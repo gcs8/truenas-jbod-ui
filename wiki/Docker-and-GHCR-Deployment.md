@@ -75,9 +75,14 @@ Open:
 http://your-docker-host:8080
 ```
 
-The default `ADMIN_AUTH_MODE=network` keeps this dashboard readable but disables
-mapping, alias, import, locator, and LED mutations. To enable operator controls,
-set shared Basic credentials and the exact main-UI origin:
+`v0.22.2` does not enforce `ADMIN_AUTH_MODE` on main-UI writes. Its mapping,
+alias, import, locator, and LED routes remain writable, so do not treat network
+mode as read-only. Restrict port `8080` to trusted clients.
+
+Current `main` rejects these writes unless `ADMIN_AUTH_MODE=basic`, valid shared
+credentials are supplied, and `APP_PUBLIC_ORIGIN` matches the exact main-UI
+origin. This server-side policy is not in the published `v0.22.2` image. For a
+source-built current-main image, configure:
 
 ```dotenv
 ADMIN_AUTH_MODE=basic
@@ -86,13 +91,13 @@ ADMIN_AUTH_PASSWORD=replace-with-a-long-random-secret
 APP_PUBLIC_ORIGIN=https://storage-ui.example.local
 ```
 
-In network mode the main UI renders the write controls disabled with that
-reason before any click; a write the server still rejects with 401 or 403
-disables them again and shows the server's detail.
+Current `main` leaves the controls enabled and reports a rejected request
+through the existing error path. The pre-click and post-401/403 disabling
+behavior proposed in PR #322 is not in `v0.22.2` or current `main`.
 
-Basic mode protects persistent and hardware-changing main-UI writes while reads
-remain anonymous. Use HTTPS through a reverse proxy or an encrypted private
-network; Basic credentials are not encrypted by HTTP itself.
+On current `main`, Basic mode protects persistent and hardware-changing main-UI
+writes while reads remain anonymous. Use HTTPS through a reverse proxy or an
+encrypted private network; Basic credentials are not encrypted by HTTP itself.
 
 ## Default non-root runtime
 
@@ -496,9 +501,12 @@ publication or `https://jbod-admin.example.test` behind a reverse proxy.
 Browser-initiated admin changes (POST, PUT, PATCH, DELETE) are accepted only
 when their `Origin` or `Referer` header matches this value; any other browser
 request is rejected with `403 Cross-origin admin mutation rejected.` The
-published Compose file passes the variable through empty, and the admin service
-refuses to start while it is empty or not an origin, so set it first. It is
-required in both `network` and `basic` mode.
+published Compose file passes the variable through empty. `v0.22.2` and current
+`main` still start when the value is empty or malformed, but browser mutations
+are rejected at request time with `403 Cross-origin admin mutation rejected.`
+Set it before using the admin UI. It is required in both `network` and `basic`
+mode. Startup refusal for an empty or invalid value is proposed in PR #321; it
+is not part of `v0.22.2` or current `main`.
 
 ```dotenv
 ADMIN_PUBLIC_ORIGIN=http://jbod-admin.example.test:8082

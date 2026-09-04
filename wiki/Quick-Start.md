@@ -180,9 +180,12 @@ publication or `https://jbod-admin.example.test` behind a reverse proxy.
 Browser-initiated admin changes (POST, PUT, PATCH, DELETE) are accepted only
 when their `Origin` or `Referer` header matches this value; any other browser
 request is rejected with `403 Cross-origin admin mutation rejected.` The
-published Compose file passes the variable through empty, and the admin service
-refuses to start while it is empty or not an origin, so set it first. It is
-required in both `network` and `basic` mode.
+published Compose file passes the variable through empty. `v0.22.2` and current
+`main` still start when the value is empty or malformed, but browser mutations
+are rejected at request time with `403 Cross-origin admin mutation rejected.`
+Set it before using the admin UI. It is required in both `network` and `basic`
+mode. Startup refusal for an empty or invalid value is proposed in PR #321; it
+is not part of `v0.22.2` or current `main`.
 
 ```dotenv
 ADMIN_PUBLIC_ORIGIN=http://jbod-admin.example.test:8082
@@ -199,14 +202,15 @@ Open:
 http://your-docker-host:8082
 ```
 
-The same operator-auth settings control main-UI writes. The compatibility
-default, `ADMIN_AUTH_MODE=network`, keeps inventory and history views available
-without a login but rejects mapping, alias, import, locator, and LED mutations.
-In network mode the main UI renders those write controls disabled with that
-reason before any click; a write the server still rejects with 401 or 403
-disables them again and shows the server's detail. To enable the controls, set
-`ADMIN_AUTH_MODE=basic`, configure the shared username/password, and set
-`APP_PUBLIC_ORIGIN` to the exact main-UI origin.
+The release boundary matters here. `v0.22.2` does not enforce
+`ADMIN_AUTH_MODE` on main-UI writes. Do not treat its network mode as read-only;
+restrict port `8080` to trusted clients. Current `main` rejects these writes
+unless `ADMIN_AUTH_MODE=basic`, valid shared credentials are supplied, and
+`APP_PUBLIC_ORIGIN` matches the exact main-UI origin. That server-side policy is
+not in the published `v0.22.2` image. Also, current `main` leaves the controls
+enabled and reports a rejected request through the existing error path. The
+pre-click and post-401/403 disabling behavior proposed in PR #322 is not in
+`v0.22.2` or current `main`.
 
 Use [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for the walkthrough.
 

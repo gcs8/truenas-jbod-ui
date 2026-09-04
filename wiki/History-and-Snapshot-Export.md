@@ -67,7 +67,11 @@ history, scope history, counts, and summaries across databases. They do not use
 SQLite `ATTACH`. A query selects at most 32 segments and 5,000 rows; broader
 requests fail rather than silently omitting older history.
 
-Inside the published image the four segmented-history tools are
+The four segmented-history tools are packaged in images built from current
+`main`, but they are not present in the published `v0.22.2` image. Use these
+paths only with a source-built current-main image or a later release that
+contains them:
+
 `/app/scripts/migrate_segmented_history.py`,
 `/app/scripts/rotate_segmented_history.py`,
 `/app/scripts/query_segmented_history.py`, and

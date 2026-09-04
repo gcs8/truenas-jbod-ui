@@ -654,6 +654,97 @@ class ContainerResourceContractTests(unittest.TestCase):
                 self.assertIn("Docker socket", guide)
                 self.assertIn("Auto-stop limits exposure; it is not authentication", guide)
 
+    def test_main_ui_write_authorization_is_version_gated_in_published_guides(self) -> None:
+        for relative_path in (
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+            "wiki/Troubleshooting.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            guide_text = " ".join(guide.split())
+            with self.subTest(guide=relative_path):
+                self.assertIn(
+                    "`v0.22.2` does not enforce `ADMIN_AUTH_MODE` on main-UI writes",
+                    guide_text,
+                )
+                self.assertIn(
+                    "Current `main` rejects these writes unless `ADMIN_AUTH_MODE=basic`",
+                    guide_text,
+                )
+
+    def test_main_ui_write_control_state_matches_current_main(self) -> None:
+        for relative_path in (
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+            "wiki/Troubleshooting.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            guide_text = " ".join(guide.split()).lower()
+            with self.subTest(guide=relative_path):
+                self.assertIn("current `main` leaves the controls enabled", guide_text)
+                self.assertNotIn("renders those write controls disabled", guide_text)
+                self.assertNotIn("renders the write controls disabled", guide_text)
+                self.assertNotIn("disables them again", guide_text)
+
+    def test_admin_origin_startup_behavior_is_not_overstated(self) -> None:
+        for relative_path in (
+            "wiki/Quick-Start.md",
+            "wiki/Docker-and-GHCR-Deployment.md",
+            "wiki/Admin-UI-and-System-Setup.md",
+            "wiki/Troubleshooting.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            guide_text = " ".join(guide.split())
+            with self.subTest(guide=relative_path):
+                self.assertIn("`v0.22.2` and current `main` still start", guide_text)
+                self.assertIn("rejected at request time with `403", guide_text)
+                self.assertNotIn("refuses to start while", guide_text)
+
+    def test_segmented_history_tools_are_version_gated(self) -> None:
+        for relative_path in (
+            "wiki/Backup-Restore-and-Debug-Bundles.md",
+            "wiki/History-and-Snapshot-Export.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            guide_text = " ".join(guide.split())
+            with self.subTest(guide=relative_path):
+                self.assertIn("packaged in images built from current `main`", guide_text)
+                self.assertIn("not present in the published `v0.22.2` image", guide_text)
+
+    def test_strict_host_key_guides_require_verified_preloading(self) -> None:
+        for relative_path in (
+            "wiki/SSH-Setup-and-Sudo.md",
+            "wiki/Quantastor-Setup.md",
+        ):
+            guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            guide_text = " ".join(guide.split())
+            with self.subTest(guide=relative_path):
+                self.assertIn("current `main` uses Paramiko `RejectPolicy`", guide_text)
+                self.assertIn("verify every host-key fingerprint", guide_text)
+                self.assertIn("preload", guide_text)
+                self.assertIn("`v0.22.2` instead uses trust on first use", guide_text)
+                self.assertNotIn("first successful SSH connection pins", guide_text)
+
+        ssh_guide = (REPO_ROOT / "wiki/SSH-Setup-and-Sudo.md").read_text(encoding="utf-8")
+        self.assertIn("ssh-keyscan -T 5 -p 22 storage.example.test", ssh_guide)
+        self.assertIn('ssh-keygen -lf "$known_hosts_candidate"', ssh_guide)
+        self.assertIn("does not authenticate the key", ssh_guide)
+
+    def test_scheduled_backup_archive_format_follows_scope(self) -> None:
+        guide = (REPO_ROOT / "wiki/Backup-Restore-and-Debug-Bundles.md").read_text(
+            encoding="utf-8"
+        )
+        guide_text = " ".join(guide.split())
+
+        self.assertIn("Scopes that include `history_db` produce encrypted `.7z` archives", guide_text)
+        self.assertIn(
+            "Scopes without `history_db` produce encrypted `.tar.zst.enc` archives",
+            guide_text,
+        )
+        self.assertIn("Both paths validate the finished archive", guide_text)
+        self.assertNotIn("Legacy `.tar.zst.enc`", guide_text)
+        self.assertNotIn("Both scheduled archive formats support schema 2", guide_text)
+
     def test_secret_overlay_grants_only_required_service_scoped_files(self) -> None:
         overlay_path = REPO_ROOT / "docker-compose.secrets.yml"
         self.assertTrue(overlay_path.is_file())

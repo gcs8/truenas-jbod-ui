@@ -154,10 +154,17 @@ Notes:
   prefer the active pool-owner node for pool-related SMART/CLI follow-up
 - `ssh.commands` usually stays blank for Quantastor unless you have a custom
   reason to override the platform-owned defaults
-- keep `strict_host_key_checking: true`. The first successful connection to each
-  HA node pins that node's key into `./data/known_hosts`; connect to every node
-  once from a trusted network, or pre-load its key into that file, before
-  relying on the pins
+- host-key behavior differs by version. With `strict_host_key_checking: true`,
+  current `main` uses Paramiko `RejectPolicy` and rejects every unknown HA-node
+  key. Obtain each key through a trusted management path, verify every host-key
+  fingerprint out of band, and preload every node's matching OpenSSH entry into
+  `./data/known_hosts` before enabling strict mode. A strict first connection
+  cannot create the pin
+- `v0.22.2` instead uses trust on first use when a known-hosts path is
+  configured, even when `strict_host_key_checking` is `true`. Do not treat that
+  flag as strict verification on `v0.22.2`; use a trusted network, verify each
+  saved fingerprint immediately, and upgrade when a release with the
+  current-main `RejectPolicy` behavior is available
 - `binding.target_system_id` is what pins a storage view to one HA node
 
 ## Prepare The SSH User
