@@ -59,6 +59,7 @@ from history_service.segment_catalog import (
 )
 from history_service.migration_lock import history_write_lock
 from history_service.segment_reader import SegmentedHistoryReader
+from history_service.segment_sealer import SEGMENT_DIRECTORY_MODE, SEGMENT_FILE_MODE
 from history_service.segmented_restore import (
     file_matches as restore_file_matches,
     record_file as record_restore_file,
@@ -329,6 +330,8 @@ class _PreparedSegmentedRestore:
     staged_segments_path: Path
     previous_hot_path: Path
     previous_segments_path: Path
+    hot_mode: int
+    segment_modes: tuple[tuple[Path, int, bool], ...]
     journal_payload: dict[str, Any]
 
 
@@ -514,13 +517,13 @@ class _ImportActivationTransaction:
             if self._path_exists(path):
                 raise ValueError("Segmented history restore artifact already exists.")
 
-        self._stage_segmented_hot(
+        hot_mode = self._stage_segmented_hot(
             staged_hot_path,
             source_path=self._staged_member(hot_member_key),
             target_path=store.file_path,
             entry=hot_entry,
         )
-        self._stage_segmented_directory(
+        segment_modes = self._stage_segmented_directory(
             staged_segments_path,
             target_dir=catalog_path.parent,
             entry=segments_entry,
@@ -557,6 +560,8 @@ class _ImportActivationTransaction:
             staged_segments_path=staged_segments_path,
             previous_hot_path=previous_hot_path,
             previous_segments_path=previous_segments_path,
+            hot_mode=hot_mode,
+            segment_modes=segment_modes,
             journal_payload=journal_payload,
         )
         return journal_payload
@@ -568,7 +573,7 @@ class _ImportActivationTransaction:
         source_path: Path,
         target_path: Path,
         entry: _ImportRollbackEntry,
-    ) -> None:
+    ) -> int:
         descriptor = os.open(
             staged_path,
             os.O_WRONLY
@@ -591,9 +596,10 @@ class _ImportActivationTransaction:
             else self._MISSING_FILE_MODE
         )
         self._apply_owner(staged_path, owner)
-        staged_path.chmod(mode)
+        staged_path.chmod(mode | 0o600)
         self._fsync_file(staged_path)
         self._fsync_directory(staged_path.parent)
+        return mode
 
     def _stage_segmented_directory(
         self,
@@ -602,19 +608,22 @@ class _ImportActivationTransaction:
         target_dir: Path,
         entry: _ImportRollbackEntry,
         members: list[tuple[str, Path]],
-    ) -> None:
-        staged_dir.mkdir(mode=self._MISSING_DIRECTORY_MODE)
+    ) -> tuple[tuple[Path, int, bool], ...]:
+        staged_dir.mkdir(mode=SEGMENT_DIRECTORY_MODE)
         self._sibling_artifacts.add(staged_dir)
         existing_directory = target_dir if entry.kind == "directory" else None
         root_owner = self._existing_owner(
             existing_directory or target_dir.parent,
             directory=True,
         )
-        self._apply_owner(staged_dir, root_owner)
-        staged_dir.chmod(
-            self._existing_mode(existing_directory, directory=True)
-            or self._MISSING_DIRECTORY_MODE
+        root_mode = self._existing_mode_or_default(
+            existing_directory,
+            directory=True,
+            default=SEGMENT_DIRECTORY_MODE,
         )
+        self._apply_owner(staged_dir, root_owner)
+        staged_dir.chmod(root_mode | 0o700)
+        final_modes: list[tuple[Path, int, bool]] = [(Path(), root_mode, True)]
         seen: set[Path] = set()
         for member_key, relative_path in members:
             if (
@@ -643,11 +652,16 @@ class _ImportActivationTransaction:
                         staged_parent.parent,
                         directory=True,
                     )
-                self._apply_owner(staged_parent, parent_owner)
-                staged_parent.chmod(
-                    self._existing_mode(existing_parent, directory=True)
-                    or self._MISSING_DIRECTORY_MODE
+                parent_mode = self._existing_mode_or_default(
+                    existing_parent,
+                    directory=True,
+                    default=SEGMENT_DIRECTORY_MODE,
                 )
+                self._apply_owner(staged_parent, parent_owner)
+                staged_parent.chmod(parent_mode | 0o700)
+                mode_entry = (current_relative, parent_mode, True)
+                if mode_entry not in final_modes:
+                    final_modes.append(mode_entry)
             shutil.copyfile(self._staged_member(member_key), staged_target)
             existing_target = (
                 existing_directory / relative_path
@@ -660,13 +674,17 @@ class _ImportActivationTransaction:
                     staged_target.parent,
                     directory=True,
                 )
-            self._apply_owner(staged_target, target_owner)
-            staged_target.chmod(
-                self._existing_mode(existing_target, directory=False)
-                or self._MISSING_FILE_MODE
+            target_mode = self._existing_mode_or_default(
+                existing_target,
+                directory=False,
+                default=SEGMENT_FILE_MODE,
             )
+            self._apply_owner(staged_target, target_owner)
+            staged_target.chmod(target_mode | 0o600)
+            final_modes.append((relative_path, target_mode, False))
         self._fsync_tree(staged_dir)
         self._fsync_directory(staged_dir.parent)
+        return tuple(final_modes)
 
     def _activate_prepared_target(
         self,
@@ -797,9 +815,14 @@ class _ImportActivationTransaction:
             existing_directory or target_dir.parent,
             directory=True,
         )
-        root_mode = self._existing_mode(existing_directory, directory=True)
         self._apply_owner(staged_dir, root_owner)
-        staged_dir.chmod(root_mode or self._MISSING_DIRECTORY_MODE)
+        staged_dir.chmod(
+            self._existing_mode_or_default(
+                existing_directory,
+                directory=True,
+                default=self._MISSING_DIRECTORY_MODE,
+            )
+        )
         try:
             for member_key, relative_path in members:
                 staged_target = staged_dir / relative_path
@@ -822,8 +845,11 @@ class _ImportActivationTransaction:
                         )
                     self._apply_owner(staged_parent, parent_owner)
                     staged_parent.chmod(
-                        self._existing_mode(existing_parent, directory=True)
-                        or self._MISSING_DIRECTORY_MODE
+                        self._existing_mode_or_default(
+                            existing_parent,
+                            directory=True,
+                            default=self._MISSING_DIRECTORY_MODE,
+                        )
                     )
                 shutil.copyfile(self._staged_member(member_key), staged_target)
                 existing_target = (
@@ -839,8 +865,11 @@ class _ImportActivationTransaction:
                     )
                 self._apply_owner(staged_target, target_owner)
                 staged_target.chmod(
-                    self._existing_mode(existing_target, directory=False)
-                    or self._MISSING_FILE_MODE
+                    self._existing_mode_or_default(
+                        existing_target,
+                        directory=False,
+                        default=self._MISSING_FILE_MODE,
+                    )
                 )
             self._fsync_tree(staged_dir)
             self._park_original(entry)
@@ -1100,6 +1129,7 @@ class _ImportActivationTransaction:
                 segments["prior"],
             ):
                 raise ValueError("Segmented history restore prior segment tree integrity failed.")
+            self._apply_segmented_final_modes(prepared)
             if hot["prior"].get("kind") != "missing":
                 remove_recorded_restore_file(
                     prepared.previous_hot_path,
@@ -1148,6 +1178,42 @@ class _ImportActivationTransaction:
             self._fsync_directory(directory)
         self._fsync_directory(root)
 
+    def _apply_segmented_final_modes(self, prepared: _PreparedSegmentedRestore) -> None:
+        segment_root = prepared.segments_entry.target_path
+        files = [entry for entry in prepared.segment_modes if not entry[2]]
+        directories = sorted(
+            (entry for entry in prepared.segment_modes if entry[2]),
+            key=lambda entry: len(entry[0].parts),
+            reverse=True,
+        )
+        for relative_path, mode, directory in (*files, *directories):
+            self._apply_final_mode(segment_root / relative_path, mode, directory=directory)
+        self._apply_final_mode(
+            prepared.hot_entry.target_path,
+            prepared.hot_mode,
+            directory=False,
+        )
+
+    @staticmethod
+    def _apply_final_mode(path: Path, mode: int, *, directory: bool) -> None:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | (getattr(os, "O_DIRECTORY", 0) if directory else 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if directory != stat.S_ISDIR(metadata.st_mode):
+                raise ValueError("Segmented history restore mode target changed type.")
+            os.fchmod(descriptor, mode)
+            os.fsync(descriptor)
+            if stat.S_IMODE(os.fstat(descriptor).st_mode) != mode:
+                raise ValueError("Segmented history restore mode was not applied.")
+        finally:
+            os.close(descriptor)
+
     @staticmethod
     def _existing_mode(path: Path | None, *, directory: bool) -> int | None:
         if path is None or path.is_symlink():
@@ -1157,6 +1223,17 @@ class _ImportActivationTransaction:
         if not directory and not path.is_file():
             return None
         return path.stat(follow_symlinks=False).st_mode & 0o7777
+
+    @classmethod
+    def _existing_mode_or_default(
+        cls,
+        path: Path | None,
+        *,
+        directory: bool,
+        default: int,
+    ) -> int:
+        existing_mode = cls._existing_mode(path, directory=directory)
+        return default if existing_mode is None else existing_mode
 
     @staticmethod
     def _existing_owner(path: Path | None, *, directory: bool) -> tuple[int, int] | None:

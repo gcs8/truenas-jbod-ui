@@ -39,6 +39,7 @@ from history_service.config import HistorySettings
 from history_service import segment_migration, system_backup as system_backup_module
 from history_service.domain import MetricSample, SlotStateRecord
 from history_service.migration_lock import history_write_lock
+from history_service.segment_sealer import SEGMENT_DIRECTORY_MODE, SEGMENT_FILE_MODE
 from history_service.store import SCHEMA, HistoryStore
 from history_service.system_backup import (
     BACKUP_GROUP_METADATA,
@@ -378,6 +379,142 @@ class SystemBackupServiceTests(unittest.TestCase):
             ),
         )
         return service, catalog_path, segments_directory / "segment-0001.sqlite3"
+
+    def _build_segmented_restore_target(
+        self,
+        name: str,
+    ) -> tuple[SystemBackupService, Path]:
+        target_root = self.temp_dir / name
+        target_root.mkdir()
+        target_source = target_root / "history.db"
+        with sqlite3.connect(target_source) as connection:
+            connection.executescript(SCHEMA)
+        target_catalog = target_root / "segments" / "catalog.json"
+        target_settings = HistorySettings(
+            sqlite_path=str(target_source),
+            segment_catalog_path=str(target_catalog),
+            backup_dir=str(target_root / "backups"),
+            startup_grace_seconds=0,
+        )
+        target_store = HistoryStore(
+            str(target_source),
+            recover_unreadable_database=False,
+            segment_catalog_path=target_catalog,
+        )
+        return SystemBackupService(target_settings, target_store), target_catalog
+
+    def test_schema_v2_restore_uses_shared_modes_and_parent_group_for_missing_segments(
+        self,
+    ) -> None:
+        source_service, _source_catalog, _source_segment = (
+            self._build_segmented_debug_service()
+        )
+        artifact = source_service.export_bundle_to_file(
+            encrypt=False,
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        target_service, target_catalog = self._build_segmented_restore_target(
+            "missing-segment-target"
+        )
+        target_segment = target_catalog.parent / "segment-0001.sqlite3"
+        expected_group = target_catalog.parent.parent.stat().st_gid
+
+        try:
+            result = target_service.import_bundle_from_file(artifact.path)
+        finally:
+            artifact.cleanup()
+
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(target_catalog.parent.stat().st_mode & 0o7777, SEGMENT_DIRECTORY_MODE)
+        self.assertEqual(target_catalog.stat().st_mode & 0o7777, SEGMENT_FILE_MODE)
+        self.assertEqual(target_segment.stat().st_mode & 0o7777, SEGMENT_FILE_MODE)
+        self.assertEqual(target_catalog.parent.stat().st_gid, expected_group)
+        self.assertEqual(target_catalog.stat().st_gid, expected_group)
+        self.assertEqual(target_segment.stat().st_gid, expected_group)
+
+    def test_schema_v2_restore_preserves_existing_custom_segment_modes(self) -> None:
+        source_service, _source_catalog, _source_segment = (
+            self._build_segmented_debug_service()
+        )
+        artifact = source_service.export_bundle_to_file(
+            encrypt=False,
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        target_service, target_catalog = self._build_segmented_restore_target(
+            "existing-segment-target"
+        )
+        target_segment = target_catalog.parent / "segment-0001.sqlite3"
+
+        try:
+            target_service.import_bundle_from_file(artifact.path)
+            target_catalog.parent.chmod(0o2710)
+            target_catalog.chmod(0o620)
+            target_segment.chmod(0o604)
+
+            target_service.import_bundle_from_file(artifact.path)
+        finally:
+            artifact.cleanup()
+
+        self.assertEqual(target_catalog.parent.stat().st_mode & 0o7777, 0o2710)
+        self.assertEqual(target_catalog.stat().st_mode & 0o7777, 0o620)
+        self.assertEqual(target_segment.stat().st_mode & 0o7777, 0o604)
+
+    def test_segmented_staging_keeps_mode_zero_directory_writable(self) -> None:
+        target_dir = self.temp_dir / "mode-zero-segments"
+        target_dir.mkdir()
+        target_dir.chmod(0o0000)
+        staged_dir = self.temp_dir / ".mode-zero-segments.restore-test"
+        transaction = _ImportActivationTransaction({})
+
+        try:
+            entry = transaction._record_target(target_dir)
+            final_modes = transaction._stage_segmented_directory(
+                staged_dir,
+                target_dir=target_dir,
+                entry=entry,
+                members=[],
+            )
+
+            self.assertEqual(staged_dir.stat().st_mode & 0o700, 0o700)
+            self.assertEqual(final_modes, ((Path(), 0o0000, True),))
+        finally:
+            target_dir.chmod(0o700)
+            if staged_dir.exists():
+                staged_dir.chmod(0o700)
+                shutil.rmtree(staged_dir)
+            shutil.rmtree(transaction.root, ignore_errors=True)
+
+    def test_segmented_staging_keeps_mode_zero_file_readable_and_writable(self) -> None:
+        target_dir = self.temp_dir / "mode-zero-segment-file"
+        target_dir.mkdir()
+        target_file = target_dir / "catalog.json"
+        target_file.write_bytes(b"ORIGINAL")
+        target_file.chmod(0o0000)
+        staged_dir = self.temp_dir / ".mode-zero-segment-file.restore-test"
+        transaction = _ImportActivationTransaction({"catalog": b"IMPORTED"})
+
+        try:
+            entry = transaction._record_target(target_dir)
+            final_modes = transaction._stage_segmented_directory(
+                staged_dir,
+                target_dir=target_dir,
+                entry=entry,
+                members=[("catalog", Path("catalog.json"))],
+            )
+
+            self.assertEqual(
+                (staged_dir / "catalog.json").stat().st_mode & 0o600,
+                0o600,
+            )
+            self.assertEqual((staged_dir / "catalog.json").read_bytes(), b"IMPORTED")
+            self.assertIn((Path("catalog.json"), 0o0000, False), final_modes)
+        finally:
+            target_file.chmod(0o600)
+            if staged_dir.exists():
+                shutil.rmtree(staged_dir)
+            shutil.rmtree(transaction.root, ignore_errors=True)
 
     def test_segmented_file_inspection_aggregates_hot_and_segment_counts(self) -> None:
         service, _catalog_path, _segment_path = self._build_segmented_debug_service()
