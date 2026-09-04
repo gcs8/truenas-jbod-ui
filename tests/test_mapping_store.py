@@ -190,14 +190,17 @@ class MappingStoreImportTests(unittest.TestCase):
             self.assertNotEqual(enc_a, enc_b)
             self.assertNotEqual(enc_a, other_system)
 
-    def test_single_mapping_save_and_clear_require_current_scope_revision(self) -> None:
+    def test_single_mapping_save_and_clear_require_current_revisions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            empty_revision = store.preview_replace_mappings("system-a", "enc-a", [])["revision"]
-            self.assertEqual(store.scope_revision("system-a", "enc-a"), empty_revision)
+            empty_scope_revision = store.preview_replace_mappings("system-a", "enc-a", [])["revision"]
+            self.assertEqual(store.scope_revision("system-a", "enc-a"), empty_scope_revision)
+            save_revision = store.save_revision("system-a", "enc-a", 0)
+            stale_save_revision = store.save_revision("system-a", "enc-a", 1)
+            stale_clear_revision = store.clear_revision("system-a", "enc-a", 0)
             saved = store.save_mapping(
                 ManualMapping(system_id="system-a", enclosure_id="enc-a", slot=0, serial="FIRST"),
-                expected_revision=empty_revision,
+                expected_revision=save_revision,
             )
             current_revision = store.preview_replace_mappings("system-a", "enc-a", [saved])["revision"]
             self.assertEqual(store.scope_revision("system-a", "enc-a"), current_revision)
@@ -206,14 +209,14 @@ class MappingStoreImportTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "revision"):
                 store.save_mapping(
                     ManualMapping(system_id="system-a", enclosure_id="enc-a", slot=1, serial="STALE"),
-                    expected_revision=empty_revision,
+                    expected_revision=stale_save_revision,
                 )
             with self.assertRaisesRegex(RuntimeError, "revision"):
                 store.clear_mapping(
                     "system-a",
                     "enc-a",
                     0,
-                    expected_revision=empty_revision,
+                    expected_revision=stale_clear_revision,
                 )
 
             self.assertEqual(store.get_mapping("system-a", "enc-a", 0).serial, "FIRST")
@@ -464,7 +467,7 @@ class MappingStoreImportTests(unittest.TestCase):
                         serial="LEGACY",
                     )
                 })
-                revision = store.scope_revision("system-a", enclosure_id)
+                revision = store.save_revision("system-a", enclosure_id, 0)
 
                 store.save_mapping(
                     ManualMapping(
@@ -547,7 +550,7 @@ class MappingStoreImportTests(unittest.TestCase):
                     serial="LEGACY",
                 )
             })
-            stale_revision = store.scope_revision("default", "enc-a")
+            stale_revision = store.save_revision("default", "enc-a", 0)
             store.save_mapping(
                 ManualMapping(
                     system_id="default",
@@ -650,6 +653,72 @@ class MappingStoreImportTests(unittest.TestCase):
                 )
             )
             self.assertEqual(store.load_all(), {})
+
+    def test_save_revision_rejects_newer_scoped_enclosureless_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            exact_key = store._slot_key("system-a", "enc-a", 5)
+            fallback_key = store._slot_key("system-a", None, 5)
+            exact = ManualMapping(
+                system_id="system-a",
+                enclosure_id="enc-a",
+                slot=5,
+                serial="EXACT-OLD",
+            )
+            fallback = ManualMapping(
+                system_id="system-a",
+                enclosure_id=None,
+                slot=5,
+                serial="FALLBACK-OLD",
+            )
+            store._write({exact_key: exact, fallback_key: fallback})
+            revision = store.save_revision("system-a", "enc-a", 5)
+            newer_fallback = fallback.model_copy(update={"serial": "FALLBACK-NEW"})
+            store._write({exact_key: exact, fallback_key: newer_fallback})
+
+            with self.assertRaisesRegex(RuntimeError, "revision"):
+                store.save_mapping(
+                    exact.model_copy(update={"serial": "EXACT-NEW"}),
+                    expected_revision=revision,
+                )
+
+            current = store.load_all()
+            self.assertEqual(current[exact_key].serial, "EXACT-OLD")
+            self.assertEqual(current[fallback_key].serial, "FALLBACK-NEW")
+
+    def test_clear_revision_rejects_newer_shadowed_fallback_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            exact_key = store._slot_key("system-a", "enc-a", 5)
+            fallback_key = store._slot_key("system-a", None, 5)
+            exact = ManualMapping(
+                system_id="system-a",
+                enclosure_id="enc-a",
+                slot=5,
+                serial="EXACT",
+            )
+            fallback = ManualMapping(
+                system_id="system-a",
+                enclosure_id=None,
+                slot=5,
+                serial="FALLBACK-OLD",
+            )
+            store._write({exact_key: exact, fallback_key: fallback})
+            revision = store.clear_revision("system-a", "enc-a", 5)
+            newer_fallback = fallback.model_copy(update={"serial": "FALLBACK-NEW"})
+            store._write({exact_key: exact, fallback_key: newer_fallback})
+
+            with self.assertRaisesRegex(RuntimeError, "revision"):
+                store.clear_mapping(
+                    "system-a",
+                    "enc-a",
+                    5,
+                    expected_revision=revision,
+                )
+
+            current = store.load_all()
+            self.assertEqual(current[exact_key].serial, "EXACT")
+            self.assertEqual(current[fallback_key].serial, "FALLBACK-NEW")
 
     def test_default_system_clear_keeps_other_system_canonical_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

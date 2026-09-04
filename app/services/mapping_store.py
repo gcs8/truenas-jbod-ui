@@ -136,8 +136,11 @@ class MappingStore:
         with self._lock:
             current = self.load_all()
             if expected_revision is not None:
-                current_revision = self._scope_revision_from_current(
-                    current, mapping.system_id, mapping.enclosure_id
+                current_revision = self._save_revision_from_current(
+                    current,
+                    mapping.system_id,
+                    mapping.enclosure_id,
+                    mapping.slot,
                 )
                 if current_revision != expected_revision:
                     raise MappingRevisionConflict(current_revision)
@@ -457,6 +460,40 @@ class MappingStore:
             current = self.load_all()
             return self._clear_revision_from_current(current, system_id, enclosure_id, slot)
 
+    def save_revision(
+        self,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slot: int,
+    ) -> str:
+        with self._lock:
+            current = self.load_all()
+            return self._save_revision_from_current(current, system_id, enclosure_id, slot)
+
+    def save_revisions(
+        self,
+        system_id: str | None,
+        targets: list[tuple[str | None, int]],
+    ) -> dict[tuple[str | None, int], str]:
+        with self._lock:
+            current = self.load_all()
+            scope_revisions = {
+                enclosure_id: self._scope_revision_from_current(
+                    current, system_id, enclosure_id
+                )
+                for enclosure_id in {target[0] for target in targets}
+            }
+            return {
+                target: self._save_revision_from_current(
+                    current,
+                    system_id,
+                    target[0],
+                    target[1],
+                    scope_revision=scope_revisions[target[0]],
+                )
+                for target in targets
+            }
+
     def clear_revisions(
         self,
         system_id: str | None,
@@ -486,6 +523,57 @@ class MappingStore:
         )
         return preview["revision"]
 
+    def _resolvable_revision_from_current(
+        self,
+        current: dict[str, ManualMapping],
+        system_id: str | None,
+        enclosure_id: str | None,
+        slot: int,
+    ) -> str:
+        entries = []
+        for key in dict.fromkeys(self._resolvable_keys(system_id, enclosure_id, slot)):
+            mapping = current.get(key)
+            if mapping is None:
+                continue
+            entries.append({
+                "key": key,
+                "stored_system_id": mapping.system_id,
+                "mapping": self._semantic_mapping(mapping),
+            })
+        return self._digest(
+            {
+                "system_id": system_id,
+                "enclosure_id": enclosure_id,
+                "slot": slot,
+                "mappings": entries,
+            }
+        )
+
+    def _save_revision_from_current(
+        self,
+        current: dict[str, ManualMapping],
+        system_id: str | None,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        scope_revision: str | None = None,
+    ) -> str:
+        if scope_revision is None:
+            scope_revision = self._scope_revision_from_current(
+                current, system_id, enclosure_id
+            )
+        return self._digest(
+            {
+                "system_id": system_id,
+                "enclosure_id": enclosure_id,
+                "slot": slot,
+                "scope_revision": scope_revision,
+                "resolvable_revision": self._resolvable_revision_from_current(
+                    current, system_id, enclosure_id, slot
+                ),
+            }
+        )
+
     def _clear_revision_from_current(
         self,
         current: dict[str, ManualMapping],
@@ -514,6 +602,9 @@ class MappingStore:
             "effective_scope": effective_scope,
             "effective_revision": self._scope_revision_from_current(
                 current, system_id, effective_scope
+            ),
+            "resolvable_revision": self._resolvable_revision_from_current(
+                current, system_id, enclosure_id, slot
             ),
         }
         return self._digest(payload)

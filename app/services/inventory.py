@@ -3649,19 +3649,16 @@ class InventoryService:
         )
 
     def _attach_mapping_revisions(self, slots: list[SlotView]) -> list[SlotView]:
-        scopes = {slot.enclosure_id for slot in slots}
-        revisions = {
-            scope: self.mapping_store.scope_revision(self.system.id, scope)
-            for scope in scopes
-        }
+        targets = list({(slot.enclosure_id, slot.slot) for slot in slots})
+        save_revisions = self.mapping_store.save_revisions(self.system.id, targets)
         clear_revisions = self.mapping_store.clear_revisions(
             self.system.id,
-            list({(slot.enclosure_id, slot.slot) for slot in slots}),
+            targets,
         )
         return [
             slot.model_copy(
                 update={
-                    "mapping_revision": revisions[slot.enclosure_id],
+                    "mapping_revision": save_revisions[(slot.enclosure_id, slot.slot)],
                     "mapping_clear_revision": clear_revisions[(slot.enclosure_id, slot.slot)],
                 }
             )
