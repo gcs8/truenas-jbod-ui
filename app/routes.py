@@ -503,11 +503,23 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             layout_bounds = await ensure_read_slot_bounds(slot, service, enclosure_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         try:
-            summary = await service.get_slot_smart_summary(
-                slot,
-                selected_enclosure_id=enclosure_id,
-                allow_stale_cache=not fresh,
-            )
+            if layout_bounds == "unavailable":
+                summary = service.get_cached_slot_smart_summary_without_layout(
+                    slot,
+                    selected_enclosure_id=enclosure_id,
+                ) or SmartSummaryView(
+                    available=False,
+                    message=(
+                        "Cached SMART data is unavailable while the inventory "
+                        "layout cannot be resolved."
+                    ),
+                )
+            else:
+                summary = await service.get_slot_smart_summary(
+                    slot,
+                    selected_enclosure_id=enclosure_id,
+                    allow_stale_cache=not fresh,
+                )
             return SmartSummaryView.model_validate(summary).model_copy(
                 update={"layout_bounds": layout_bounds}
             )
@@ -597,12 +609,31 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             smart_batch_max_concurrency=payload.max_concurrency,
         )
         try:
-            summaries = await service.get_slot_smart_summaries(
-                payload.slots,
-                selected_enclosure_id=enclosure_id,
-                max_concurrency=payload.max_concurrency,
-                allow_stale_cache=not fresh,
-            )
+            if layout_bounds == "unavailable":
+                summaries = []
+                seen_slots: set[int] = set()
+                for slot in payload.slots:
+                    if slot in seen_slots:
+                        continue
+                    seen_slots.add(slot)
+                    summary = service.get_cached_slot_smart_summary_without_layout(
+                        slot,
+                        selected_enclosure_id=enclosure_id,
+                    ) or SmartSummaryView(
+                        available=False,
+                        message=(
+                            "Cached SMART data is unavailable while the inventory "
+                            "layout cannot be resolved."
+                        ),
+                    )
+                    summaries.append(SmartBatchItem(slot=slot, summary=summary))
+            else:
+                summaries = await service.get_slot_smart_summaries(
+                    payload.slots,
+                    selected_enclosure_id=enclosure_id,
+                    max_concurrency=payload.max_concurrency,
+                    allow_stale_cache=not fresh,
+                )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return SmartBatchResponse(summaries=summaries, layout_bounds=layout_bounds)

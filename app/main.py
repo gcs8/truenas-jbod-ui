@@ -42,6 +42,7 @@ from app.models.domain import (
     MappingRequest,
     SasFabricAliasRequest,
     SnapshotExportRequest,
+    SmartBatchItem,
     SmartBatchRequest,
     SmartBatchResponse,
     SasFabricSnapshot,

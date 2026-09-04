@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from datetime import timedelta
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, call, patch
 
 from fastapi import HTTPException
 
 from app import main as app_main
-from app.config import Settings
-from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView
+from app.config import Settings, SystemConfig, TrueNASConfig
+from app.models.domain import InventorySnapshot, SlotView, SmartSummaryView, utcnow
+from app.services.inventory import InventoryService
 from app.services.profile_registry import dell_md1280_bottom_drawer_slot_layout
+from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 
 
 def _route(path: str, method: str):
@@ -44,6 +49,31 @@ def _service(
         )
     service.get_slot_smart_summary = AsyncMock(return_value={"slot": 78})
     return service
+
+
+def _service_with_cached_smart(
+    summaries: dict[int, SmartSummaryView],
+) -> tuple[InventoryService, AsyncMock]:
+    service = object.__new__(InventoryService)
+    service.settings = Settings()
+    service.system = SystemConfig(
+        id="system-a",
+        truenas=TrueNASConfig(platform="scale"),
+    )
+    service.slot_detail_store = None
+    service._smart_cache = {}
+    service._smart_cache_until = {}
+    service._smart_cache_global_generation = 0
+    service._smart_cache_enclosure_generations = {}
+    service._observe_inventory_cache_metrics = Mock()
+    service._observe_smart_summary_request = Mock()
+    for slot, summary in summaries.items():
+        key = ("system-a", "scale", "enc-a", slot, (f"/dev/sd{slot}",))
+        service._smart_cache[key] = summary
+        service._smart_cache_until[key] = utcnow() + timedelta(minutes=5)
+    snapshot_lookup = AsyncMock(side_effect=RuntimeError("collector down"))
+    setattr(service, "get_snapshot", snapshot_lookup)
+    return service, snapshot_lookup
 
 
 BOTTOM_DRAWER_ID = "50050cc11ac013fc::dell-md1280-drawer-bottom-42"
@@ -373,7 +403,9 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
 
     def test_cached_smart_read_continues_when_layout_is_unavailable(self) -> None:
         route = _route("/api/slots/{slot}/smart", "GET")
-        self.service.get_slot_smart_summary = AsyncMock(return_value=SmartSummaryView(available=True))
+        self.service.get_cached_slot_smart_summary_without_layout = Mock(
+            return_value=SmartSummaryView(available=True)
+        )
 
         with (
             patch.object(app_main, "get_inventory_registry", return_value=self.registry),
@@ -385,11 +417,55 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
 
         self.assertTrue(summary.available)
         self.assertEqual(summary.layout_bounds, "unavailable")
-        self.service.get_slot_smart_summary.assert_awaited_once_with(
+        self.service.get_cached_slot_smart_summary_without_layout.assert_called_once_with(
             5,
             selected_enclosure_id="enc-a",
-            allow_stale_cache=True,
         )
+        self.service.get_slot_smart_summary.assert_not_awaited()
+
+    def test_cached_smart_read_bypasses_a_second_snapshot_lookup(self) -> None:
+        route = _route("/api/slots/{slot}/smart", "GET")
+        service, snapshot_lookup = _service_with_cached_smart(
+            {5: SmartSummaryView(available=True, temperature_c=31)}
+        )
+        registry = Mock()
+        registry.get_service.return_value = service
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            summary = asyncio.run(
+                route.endpoint(slot=5, system_id="system-a", enclosure_id="enc-a", fresh=False)
+            )
+
+        self.assertEqual(summary.temperature_c, 31)
+        self.assertEqual(summary.layout_bounds, "unavailable")
+        self.assertEqual(snapshot_lookup.await_count, 1)
+
+    def test_layout_unavailable_smart_read_uses_persisted_last_good_data(self) -> None:
+        service, _snapshot_lookup = _service_with_cached_smart({})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SlotDetailStore(str(Path(temp_dir) / "slot-details.json"))
+            store.save_entries(
+                [
+                    SlotDetailCacheEntry(
+                        system_id="system-a",
+                        enclosure_id="enc-a",
+                        slot=5,
+                        identifiers=["serial-a"],
+                        smart_fields={"available": True, "temperature_c": 33},
+                    )
+                ]
+            )
+            service.slot_detail_store = store
+
+            summary = service.get_cached_slot_smart_summary_without_layout(5, "enc-a")
+
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertTrue(summary.available)
+        self.assertEqual(summary.temperature_c, 33)
 
     def test_fresh_smart_read_keeps_strict_layout_bounds(self) -> None:
         route = _route("/api/slots/{slot}/smart", "GET")
@@ -409,6 +485,7 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
 
     def test_cached_smart_batch_continues_when_layout_is_unavailable(self) -> None:
         route = _route("/api/slots/smart-batch", "POST")
+        self.service.get_cached_slot_smart_summary_without_layout = Mock(return_value=None)
         self.service.get_slot_smart_summaries = AsyncMock(return_value=[])
         payload = Mock(slots=[5, 6], max_concurrency=2)
 
@@ -426,12 +503,48 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
             )
 
         self.assertEqual(response.layout_bounds, "unavailable")
-        self.service.get_slot_smart_summaries.assert_awaited_once_with(
-            [5, 6],
-            selected_enclosure_id="enc-a",
-            max_concurrency=2,
-            allow_stale_cache=True,
+        self.assertEqual([item.slot for item in response.summaries], [5, 6])
+        self.assertTrue(all(not item.summary.available for item in response.summaries))
+        self.assertEqual(
+            self.service.get_cached_slot_smart_summary_without_layout.call_args_list,
+            [
+                call(5, selected_enclosure_id="enc-a"),
+                call(6, selected_enclosure_id="enc-a"),
+            ],
         )
+        self.service.get_slot_smart_summaries.assert_not_awaited()
+
+    def test_cached_smart_batch_bypasses_a_second_snapshot_lookup(self) -> None:
+        route = _route("/api/slots/smart-batch", "POST")
+        service, snapshot_lookup = _service_with_cached_smart(
+            {
+                5: SmartSummaryView(available=True, temperature_c=31),
+                6: SmartSummaryView(available=True, temperature_c=32),
+            }
+        )
+        registry = Mock()
+        registry.get_service.return_value = service
+        payload = Mock(slots=[5, 6], max_concurrency=2)
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            response = asyncio.run(
+                route.endpoint(
+                    payload=payload,
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    fresh=False,
+                )
+            )
+
+        self.assertEqual(
+            [item.summary.temperature_c for item in response.summaries],
+            [31, 32],
+        )
+        self.assertEqual(response.layout_bounds, "unavailable")
+        self.assertEqual(snapshot_lookup.await_count, 1)
 
     def test_fresh_smart_batch_keeps_strict_layout_bounds(self) -> None:
         route = _route("/api/slots/smart-batch", "POST")

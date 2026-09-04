@@ -3173,6 +3173,62 @@ class InventoryService:
             )
         return cleared
 
+    def get_cached_slot_smart_summary_without_layout(
+        self,
+        slot: int,
+        selected_enclosure_id: str | None = None,
+    ) -> SmartSummaryView | None:
+        """Return last-good SMART data without rebuilding inventory topology."""
+
+        self._evict_expired_smart_cache_entries()
+        enclosure_key = normalize_text(selected_enclosure_id) or "__default__"
+        matching_keys = [
+            cache_key
+            for cache_key in self._smart_cache
+            if cache_key[:4]
+            == (
+                self.system.id,
+                self.system.truenas.platform,
+                enclosure_key,
+                slot,
+            )
+        ]
+        if matching_keys:
+            cache_key = max(
+                matching_keys,
+                key=lambda candidate: self._smart_cache_until.get(
+                    candidate,
+                    datetime.min.replace(tzinfo=timezone.utc),
+                ),
+            )
+            cached = self._smart_cache.get(cache_key)
+            if cached is not None:
+                add_perf_metadata(smart_cache="layout-unavailable-hit")
+                self._observe_smart_summary_request("layout-unavailable-hit")
+                return cached
+
+        if self.slot_detail_store is not None:
+            entry = self.slot_detail_store.get_entry(
+                self.system.id,
+                selected_enclosure_id,
+                slot,
+            )
+            if entry is not None and entry.smart_fields:
+                try:
+                    persisted = SmartSummaryView.model_validate(entry.smart_fields)
+                except (TypeError, ValueError):
+                    persisted = None
+                if persisted is not None:
+                    add_perf_metadata(smart_cache="layout-unavailable-persistent-hit")
+                    self._observe_smart_summary_request(
+                        "layout-unavailable-persistent-hit"
+                    )
+                    return persisted
+
+        add_perf_metadata(smart_cache="layout-unavailable-miss")
+        self._observe_smart_summary_request("layout-unavailable-miss")
+        return None
+
     async def get_slot_smart_summary(
         self,
         slot: int,
