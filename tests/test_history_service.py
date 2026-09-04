@@ -1396,6 +1396,70 @@ class HistoryStoreTests(unittest.TestCase):
             # Without a marker the same store adopts the replaced hot normally.
             self.assertEqual(store.get_slot_states("synthetic-system", None), {})
 
+    def test_ordinary_read_waits_for_ordinary_write_instead_of_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = HistoryStore(str(Path(temp_dir) / "history.db"))
+            writer_entered = threading.Event()
+            release_writer = threading.Event()
+            reader_lock_attempted = threading.Event()
+            reader_done = threading.Event()
+            writer_errors: list[BaseException] = []
+            reader_errors: list[BaseException] = []
+            reader_results: list[dict[int, SlotStateRecord]] = []
+
+            def hold_ordinary_write(connection: sqlite3.Connection) -> None:
+                connection.execute(
+                    "UPDATE history_table_counts SET row_count = row_count WHERE table_name = 'slot_events'"
+                )
+                writer_entered.set()
+                if not release_writer.wait(5):
+                    raise TimeoutError("ordinary writer was not released")
+
+            def run_writer() -> None:
+                try:
+                    store._execute_write(hold_ordinary_write)
+                except BaseException as exc:
+                    writer_errors.append(exc)
+
+            def run_reader() -> None:
+                try:
+                    reader_results.append(store.get_slot_states("synthetic-system", None))
+                except BaseException as exc:
+                    reader_errors.append(exc)
+                finally:
+                    reader_done.set()
+
+            reader_thread = threading.Thread(target=run_reader, name="ordinary-history-reader")
+
+            @contextmanager
+            def tracking_history_write_lock(*args: Any, **kwargs: Any):
+                if threading.current_thread() is reader_thread:
+                    reader_lock_attempted.set()
+                with history_write_lock(*args, **kwargs):
+                    yield
+
+            writer_thread = threading.Thread(target=run_writer, name="ordinary-history-writer")
+            with patch("history_service.store.history_write_lock", tracking_history_write_lock):
+                writer_thread.start()
+                self.assertTrue(writer_entered.wait(2), "ordinary writer did not acquire the lifecycle lock")
+                reader_thread.start()
+                self.assertTrue(reader_lock_attempted.wait(2), "ordinary reader did not attempt connection setup")
+                try:
+                    self.assertFalse(
+                        reader_done.wait(0.2),
+                        f"ordinary reader failed instead of waiting: {reader_errors!r}",
+                    )
+                finally:
+                    release_writer.set()
+                    writer_thread.join(5)
+                    reader_thread.join(5)
+
+            self.assertFalse(writer_thread.is_alive(), "ordinary writer did not finish")
+            self.assertFalse(reader_thread.is_alive(), "ordinary reader did not finish")
+            self.assertEqual(writer_errors, [])
+            self.assertEqual(reader_errors, [])
+            self.assertEqual(reader_results, [{}])
+
     def test_store_rechecks_lifecycle_markers_after_acquiring_the_history_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "history.db"
@@ -1657,18 +1721,50 @@ class HistoryStoreTests(unittest.TestCase):
 
             self.assertEqual(store.file_path.read_bytes(), original_bytes)
 
-    def test_journal_mode_setup_rejects_while_migration_owns_shared_lock(self) -> None:
+    def test_journal_mode_setup_waits_while_lifecycle_lock_is_owned(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = HistoryStore(
                 str(Path(temp_dir) / "history.db"),
                 recover_unreadable_database=False,
             )
             store._journal_mode_identity = None
+            lock_attempted = threading.Event()
+            setup_done = threading.Event()
+            setup_errors: list[BaseException] = []
 
-            with history_write_lock(store.file_path, blocking=False):
-                with self.assertRaisesRegex(sqlite3.OperationalError, "migration"):
+            def run_setup() -> None:
+                try:
                     connection = store._connect()
                     connection.close()
+                except BaseException as exc:
+                    setup_errors.append(exc)
+                finally:
+                    setup_done.set()
+
+            setup_thread = threading.Thread(target=run_setup, name="history-journal-setup")
+
+            @contextmanager
+            def tracking_history_write_lock(*args: Any, **kwargs: Any):
+                if threading.current_thread() is setup_thread:
+                    lock_attempted.set()
+                with history_write_lock(*args, **kwargs):
+                    yield
+
+            real_connect = sqlite3.connect
+            with (
+                patch("history_service.store.history_write_lock", tracking_history_write_lock),
+                patch("history_service.store.sqlite3.connect", wraps=real_connect) as connect,
+            ):
+                with history_write_lock(store.file_path, blocking=False):
+                    setup_thread.start()
+                    self.assertTrue(lock_attempted.wait(2), "journal setup did not attempt the lifecycle lock")
+                    self.assertFalse(setup_done.wait(0.2), "journal setup did not wait for lifecycle exclusivity")
+                    connect.assert_not_called()
+                setup_thread.join(5)
+
+            self.assertFalse(setup_thread.is_alive(), "journal setup did not finish")
+            self.assertEqual(setup_errors, [])
+            self.assertIsNotNone(store._journal_mode_identity)
 
     def test_new_store_publishes_fresh_database_and_live_sidecars_with_shared_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

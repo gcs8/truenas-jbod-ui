@@ -671,7 +671,7 @@ class HistoryStore:
         lock_context = (
             nullcontext()
             if migration_lock_held
-            else history_write_lock(self.file_path, blocking=False)
+            else history_write_lock(self.file_path, blocking=True)
         )
         with lock_context:
             return self._connect_locked()
