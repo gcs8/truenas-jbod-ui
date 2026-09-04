@@ -699,6 +699,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/static/images/hyper-m2-gen3-card.png", rendered.html)
         self.assertIn("data:image/png;base64", rendered.html)
         self.assertNotIn("Export Snapshot", rendered.html)
+        self.assertNotIn('id="sas-fabric-view-link"', rendered.html)
 
     async def test_service_redacts_sensitive_values_with_stable_aliases(self) -> None:
         snapshot = build_snapshot()

@@ -324,7 +324,7 @@ class SnapshotExportBootstrapTests(unittest.IsolatedAsyncioTestCase):
         bootstrap = extract_bootstrap_object(rendered.html, "window.APP_BOOTSTRAP =")
         self.assertTrue(bootstrap["snapshotMode"])
         self.assertEqual(bootstrap["sasFabricViewUrl"], "#sas-fabric-panel")
-        self.assertIn('id="sas-fabric-view-link" href="#sas-fabric-panel"', rendered.html)
+        self.assertNotIn('id="sas-fabric-view-link"', rendered.html)
         self.assertEqual(bootstrap["snapshot"]["selected_system_label"], HOSTILE_TEXT)
         self.assertEqual(bootstrap["snapshot"]["slots"][0]["model"], HOSTILE_TEXT)
         self.assertEqual(bootstrap["preloadedSmartSummariesBySlot"]["0"]["model"], HOSTILE_TEXT)

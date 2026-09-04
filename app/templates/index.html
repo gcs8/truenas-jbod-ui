@@ -300,9 +300,11 @@
             <button class="button secondary small" id="sas-fabric-toggle-button" type="button" aria-expanded="false">
               Topology
             </button>
+            {% if not snapshot_mode %}
             <a class="button secondary small" id="sas-fabric-view-link" href="{{ sas_fabric_view_url }}">
               Storage Fabric
             </a>
+            {% endif %}
             <div id="heatmap-controls" class="heatmap-controls hidden">
               <label class="field heatmap-control-field heatmap-metric-field" id="heatmap-metric-field">
                 <span>Metric</span>

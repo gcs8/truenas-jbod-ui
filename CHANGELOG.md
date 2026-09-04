@@ -36,6 +36,8 @@ complete release-note draft.
 - Tightened post-release inventory identity, route selection, backup state,
   export redaction, and mapping-error boundaries across the subsequent
   maintenance fixes through #251.
+- Hid the dedicated Storage Fabric route action from offline snapshots, which
+  do not contain a Fabric payload, while keeping the in-page availability notice.
 
 ## v0.22.2 - 2026-09-01
 

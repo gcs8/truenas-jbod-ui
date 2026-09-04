@@ -48,8 +48,6 @@ class PublicDemoArtifactTests(unittest.TestCase):
                 "Frozen Sanitized Snapshot",
                 "Artifact app v0.0.0-test",
                 "Capture time",
-                'id="sas-fabric-view-link" href="#sas-fabric-panel"',
-                'sasFabricViewUrl: "#sas-fabric-panel"',
                 "Live-derived CORE 60-bay sample",
                 "Scrambled IDs",
                 "4x NVMe Carrier Card",
@@ -85,6 +83,39 @@ class PublicDemoArtifactTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("raw=", result.stdout)
         self.assertIn("gzip=", result.stdout)
+
+    def test_public_demo_without_storage_fabric_route_action_is_publishable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            self._write_minimal_demo_artifact(demo_dir)
+
+            result = subprocess.run(
+                [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_public_demo_storage_fabric_route_action_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            demo_dir = Path(temp_dir) / "public-demo"
+            self._write_minimal_demo_artifact(demo_dir)
+            with (demo_dir / "index.html").open("a", encoding="utf-8") as artifact:
+                artifact.write('\n<a id="sas-fabric-view-link" href="#sas-fabric-panel">Storage Fabric</a>\n')
+
+            result = subprocess.run(
+                [sys.executable, "scripts/check_public_demo_artifact.py", str(demo_dir)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("snapshot Storage Fabric route action", result.stderr)
 
     def test_checked_in_public_demo_artifact_enforces_raw_size_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -142,7 +173,6 @@ class PublicDemoArtifactTests(unittest.TestCase):
             "Artifact app v0.21.0-dev",
             "Capture time",
             PUBLIC_DEMO_GENERATED_AT.isoformat(),
-            'id="sas-fabric-view-link" href="#sas-fabric-panel"',
             "Live-derived CORE 60-bay sample",
             "Scrambled IDs",
             "4x NVMe Carrier Card",
@@ -151,6 +181,7 @@ class PublicDemoArtifactTests(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, html)
+        self.assertNotIn('id="sas-fabric-view-link"', html)
 
 
 class PublicDemoBuildScriptTests(unittest.TestCase):
@@ -325,7 +356,7 @@ class PublicDemoFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Frozen Sanitized Snapshot", first_html)
         self.assertIn("Artifact app v", first_html)
         self.assertIn("Capture time", first_html)
-        self.assertIn('id="sas-fabric-view-link" href="#sas-fabric-panel"', first_html)
+        self.assertNotIn('id="sas-fabric-view-link"', first_html)
         self.assertNotIn('src="/static/app.js"', first_html)
         self.assertNotIn('href="/static/style.css"', first_html)
         self.assertNotIn("/static/images/hyper-m2-gen3-card.png", first_html)

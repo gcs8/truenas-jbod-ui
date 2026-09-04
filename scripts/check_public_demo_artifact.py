@@ -32,13 +32,15 @@ REQUIRED_MARKERS: tuple[str, ...] = (
     "Frozen Sanitized Snapshot",
     "Artifact app v",
     "Capture time",
-    'id="sas-fabric-view-link" href="#sas-fabric-panel"',
-    'sasFabricViewUrl: "#sas-fabric-panel"',
     "Live-derived CORE 60-bay sample",
     "Scrambled IDs",
     "4x NVMe Carrier Card",
     "Boot SATADOMs",
     "mirror-8",
+)
+
+FORBIDDEN_MARKERS: tuple[tuple[str, str], ...] = (
+    ("snapshot Storage Fabric route action", 'id="sas-fabric-view-link"'),
 )
 
 
@@ -108,6 +110,10 @@ def main() -> int:
     for marker in REQUIRED_MARKERS:
         if marker not in html:
             errors.append(f"missing required marker: {marker}")
+
+    for label, marker in FORBIDDEN_MARKERS:
+        if marker in html:
+            errors.append(f"found forbidden {label}")
 
     for label, pattern in SENSITIVE_PATTERNS:
         match = pattern.search(html)
