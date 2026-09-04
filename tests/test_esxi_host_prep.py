@@ -58,6 +58,7 @@ class FakeClient:
         self,
         command_results: dict[str, tuple[int, str, str]],
         *,
+        open_sftp_error: Exception | None = None,
         put_error: Exception | None = None,
         command_errors: dict[str, Exception] | None = None,
         block_command: str | None = None,
@@ -67,12 +68,15 @@ class FakeClient:
         self.command_results = command_results
         self.commands: list[str] = []
         self.sftp = FakeSFTP(put_error=put_error)
+        self.open_sftp_error = open_sftp_error
         self.command_errors = dict(command_errors or {})
         self.block_command = block_command
         self.block_entered = block_entered
         self.block_release = block_release
 
     def open_sftp(self) -> FakeSFTP:
+        if self.open_sftp_error is not None:
+            raise self.open_sftp_error
         return self.sftp
 
     def exec_command(self, command: str, timeout: int):
@@ -587,6 +591,50 @@ class ESXiHostPrepServiceTests(unittest.TestCase):
                         upload_token=staged["token"],
                     )
                 )
+            self.assertFalse(package_dir.exists())
+
+    def test_open_sftp_failure_does_not_repeat_pre_upload_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ESXiHostPrepService(temp_dir, probe_factory=FakeProbe)
+            staged = service.stage_package("BCM-vmware-storcli64.zip", b"payload")
+            package_dir = Path(str(staged["staged_path"])).parent
+            remote_path = f"/tmp/truenas-jbod-ui-{staged['token'][:12]}-BCM-vmware-storcli64.zip"
+            payload = ESXiHostPrepInstallRequest(
+                host="192.0.2.47",
+                user="root",
+                password="synthetic",
+                timeout_seconds=15,
+                upload_token=staged["token"],
+            )
+            FakeProbe.next_client = FakeClient(
+                {},
+                open_sftp_error=OSError("unable to start sftp subsystem"),
+            )
+            pre_upload_cleanup = SSHCommandResult(
+                command="bounded pre-upload cleanup",
+                ok=True,
+                stdout="",
+                stderr="",
+                exit_code=0,
+            )
+
+            with patch.object(
+                service,
+                "_run_remote_command",
+                return_value=pre_upload_cleanup,
+            ) as run_remote_command:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"Remote upload error: unable to start sftp subsystem$",
+                ):
+                    service.install_package(payload)
+
+            self.assertEqual(run_remote_command.call_count, 1)
+            self.assertEqual(
+                run_remote_command.call_args.args,
+                (FakeProbe.next_client, f"rm -f {remote_path}", payload.timeout_seconds),
+            )
+            self.assertEqual(FakeProbe.next_client.sftp.uploads, [])
             self.assertFalse(package_dir.exists())
 
     def test_partial_sftp_upload_failure_is_cleaned_without_masking_upload_error(self) -> None:

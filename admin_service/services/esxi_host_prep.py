@@ -469,10 +469,11 @@ class ESXiHostPrepService:
                         f"Unable to clear the previous ESXi temp file at {remote_path} before upload: "
                         f"{cleanup_detail}"
                     )
-                remote_cleanup_required = True
+                remote_cleanup_required = False
                 try:
                     try:
                         with client.open_sftp() as sftp:
+                            remote_cleanup_required = True
                             sftp.put(str(local_path), remote_path)
                     except Exception as exc:
                         raise ValueError(
