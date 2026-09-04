@@ -2894,6 +2894,11 @@ class InventoryService:
     ) -> ManualMapping:
         snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
+        if slot_view is not None and not slot_view.mapping_supported:
+            raise TrueNASAPIError(
+                slot_view.mapping_reason
+                or "Manual mapping is unavailable because this disk has no stable physical location."
+            )
         enclosure_id = slot_view.enclosure_id if slot_view else None
         mapping = ManualMapping(
             system_id=self.system.id,
@@ -2919,6 +2924,11 @@ class InventoryService:
     ) -> bool:
         snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
+        if slot_view is not None and not slot_view.mapping_supported:
+            raise TrueNASAPIError(
+                slot_view.mapping_reason
+                or "Manual mapping is unavailable because this disk has no stable physical location."
+            )
         enclosure_id = slot_view.enclosure_id if slot_view else None
         cleared = self.mapping_store.clear_mapping(
             self.system.id,
@@ -4286,7 +4296,13 @@ class InventoryService:
                         "led_reason": (
                             "Identify unavailable because no physical enclosure or slot location was identified."
                         ),
+                        "physical_location_known": False,
                         "mapping_source": "system-inventory",
+                        "mapping_supported": False,
+                        "mapping_reason": (
+                            "Manual mapping is unavailable because this system disk has no identified physical "
+                            "enclosure or stable physical location."
+                        ),
                     }
                 )
             )

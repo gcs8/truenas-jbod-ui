@@ -2870,6 +2870,13 @@
     return (slot.state || "unknown").replace("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
   }
 
+  function slotLocationLabel(slot) {
+    if (slot?.physical_location_known === false) {
+      return slot.slot_label || "System disk";
+    }
+    return `Slot ${slot.slot_label}`;
+  }
+
   function isPlaceholderHintLabel(value) {
     return typeof value === "string" && /^\d+:\d+:\d+:\d+$/.test(value.trim());
   }
@@ -5335,7 +5342,7 @@
     const poolLabel = currentPlatform() === "linux" ? "Mount" : "Pool";
     const vdevLabel = currentPlatform() === "linux" ? "Array" : "Vdev";
     const lines = [
-      `Slot ${slot.slot_label}${slot.device_name ? ` - ${slot.device_name}` : ""}`,
+      `${slotLocationLabel(slot)}${slot.device_name ? ` - ${slot.device_name}` : ""}`,
       slot.serial ? `Serial: ${slot.serial}` : "Serial: n/a",
       persistentIdText,
       slot.pool_name ? `${poolLabel}: ${slot.pool_name}` : `${poolLabel}: n/a`,
@@ -7616,8 +7623,21 @@
     }
   }
 
+  function renderMappingEditorForSlot(slot) {
+    const mappingSupported = slot?.mapping_supported !== false;
+    if (mappingEmpty) {
+      mappingEmpty.textContent = mappingSupported
+        ? "Select a slot to save or restore calibration details for that bay."
+        : (slot.mapping_reason
+          || "Manual mapping is unavailable because this disk has no stable physical location.");
+      mappingEmpty.classList.toggle("hidden", mappingSupported);
+    }
+    mappingForm.classList.toggle("hidden", !mappingSupported);
+    setMappingFormEnabled(mappingSupported && !state.snapshotMode);
+  }
+
   function renderLiveSlotDetail(slot, options = {}) {
-    const detailTitle = options.detailTitle || `Slot ${slot.slot_label}`;
+    const detailTitle = options.detailTitle || slotLocationLabel(slot);
     const smartEntry = options.smartEntry || getSmartSummaryEntry(slot);
     const showSasTransportFields = shouldShowSasTransportFields(slot, smartEntry);
     const showLinkRate = showSasTransportFields || formatLinkRateValue(smartEntry) !== "n/a";
@@ -7628,10 +7648,7 @@
     detailContent.classList.remove("hidden");
     detailSecondary.classList.remove("hidden");
     detailLedControls.classList.toggle("hidden", !showLedControls);
-    if (mappingEmpty) {
-      mappingEmpty.classList.add("hidden");
-    }
-    mappingForm.classList.remove("hidden");
+    renderMappingEditorForSlot(slot);
     detailSlotTitle.textContent = detailTitle;
     detailStatePill.textContent = stateLabel(slot);
     detailStatePill.className = `state-pill state-${slot.state}`;
@@ -7712,7 +7729,6 @@
     renderMultipathContext(slot);
 
     syncMappingFormForSlot(slot);
-    setMappingFormEnabled(!state.snapshotMode);
     ledButtons.forEach((button) => {
       button.disabled = state.snapshotMode || !slot.led_supported;
     });
@@ -9091,6 +9107,14 @@
     }
     const slot = getSlotById(state.selectedSlot);
     if (!slot) return;
+    if (slot.mapping_supported === false) {
+      setStatus(
+        slot.mapping_reason
+          || "Manual mapping is unavailable because this disk has no stable physical location.",
+        "error",
+      );
+      return;
+    }
     if (!slot.mapping_revision) {
       setStatus("Mapping revision is unavailable. Refresh inventory before saving.", "error");
       return;
@@ -9133,6 +9157,14 @@
     }
     const slot = getSlotById(state.selectedSlot);
     if (!slot) return;
+    if (slot.mapping_supported === false) {
+      setStatus(
+        slot.mapping_reason
+          || "Manual mapping is unavailable because this disk has no stable physical location.",
+        "error",
+      );
+      return;
+    }
     if (!slot.mapping_clear_revision) {
       setStatus("Mapping revision is unavailable. Refresh inventory before clearing.", "error");
       return;
@@ -9270,6 +9302,14 @@
   function prefillMapping() {
     const slot = getSlotById(state.selectedSlot);
     if (!slot) return;
+    if (slot.mapping_supported === false) {
+      setStatus(
+        slot.mapping_reason
+          || "Manual mapping is unavailable because this disk has no stable physical location.",
+        "error",
+      );
+      return;
+    }
     mappingForm.serial.value = slot.serial || "";
     mappingForm.device_name.value = slot.device_name || "";
     mappingForm.gptid.value = slot.gptid || "";

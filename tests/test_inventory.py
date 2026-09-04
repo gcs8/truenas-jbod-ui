@@ -471,7 +471,10 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertTrue(all(slot.mapping_source == "system-inventory" for slot in slots))
             self.assertTrue(all(slot.raw_status.get("virtual_enclosure") is True for slot in slots))
             self.assertTrue(all(slot.raw_status.get("physical_location_known") is False for slot in slots))
+            self.assertTrue(all(slot.physical_location_known is False for slot in slots))
             self.assertTrue(all(slot.led_supported is False for slot in slots))
+            self.assertTrue(all(slot.mapping_supported is False for slot in slots))
+            self.assertTrue(all("physical enclosure" in slot.mapping_reason for slot in slots))
             self.assertEqual(len(warnings), 1)
             self.assertIn("1 manual mapping", warnings[0])
             self.assertIn("no identified physical enclosure", warnings[0])
@@ -10999,6 +11002,92 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("__default__", service._cache)
             self.assertNotIn("enc-1", service._cache)
             self.assertIn("enc-2", service._cache)
+
+    async def test_save_mapping_rejects_virtual_slot_without_mutating_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            virtual_enclosure_id = "virtual-system:default"
+            slot = SlotView(
+                slot=0,
+                slot_label="Disk 1",
+                row_index=0,
+                column_index=0,
+                enclosure_id=virtual_enclosure_id,
+                physical_location_known=False,
+                mapping_supported=False,
+                mapping_reason=(
+                    "Manual mapping is unavailable because this system disk has no identified physical enclosure "
+                    "or stable physical location."
+                ),
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
+            )
+            service.mapping_store.save_mapping(
+                ManualMapping(
+                    system_id=system.id,
+                    enclosure_id=virtual_enclosure_id,
+                    slot=0,
+                    serial="ORIGINAL",
+                )
+            )
+            before = service.mapping_store.load_all()
+
+            with self.assertRaisesRegex(TrueNASAPIError, "identified physical enclosure"):
+                await service.save_mapping(0, {"serial": "REPLACEMENT"})
+
+            self.assertEqual(service.mapping_store.load_all(), before)
+
+    async def test_clear_mapping_rejects_virtual_slot_without_mutating_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            virtual_enclosure_id = "virtual-system:default"
+            slot = SlotView(
+                slot=0,
+                slot_label="Disk 1",
+                row_index=0,
+                column_index=0,
+                enclosure_id=virtual_enclosure_id,
+                physical_location_known=False,
+                mapping_supported=False,
+                mapping_reason=(
+                    "Manual mapping is unavailable because this system disk has no identified physical enclosure "
+                    "or stable physical location."
+                ),
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
+            )
+            service.mapping_store.save_mapping(
+                ManualMapping(
+                    system_id=system.id,
+                    enclosure_id=virtual_enclosure_id,
+                    slot=0,
+                    serial="ORIGINAL",
+                )
+            )
+            before = service.mapping_store.load_all()
+
+            with self.assertRaisesRegex(TrueNASAPIError, "identified physical enclosure"):
+                await service.clear_mapping(0)
+
+            self.assertEqual(service.mapping_store.load_all(), before)
 
     async def test_save_mapping_invalidates_cache_without_second_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

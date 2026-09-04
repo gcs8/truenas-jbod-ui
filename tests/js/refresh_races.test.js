@@ -432,6 +432,110 @@ test("mapping mutations without a scope revision fail closed before any request"
   assert.ok(statuses.every((message) => message.includes("Refresh inventory")));
 });
 
+test("virtual slot mapping editor is hidden with a truthful reason", () => {
+  const reason = "Manual mapping is unavailable because this system disk has no identified physical enclosure or stable physical location.";
+  const classes = new Set();
+  const mappingForm = {
+    classList: {
+      toggle(name, force) {
+        if (force) classes.add(name);
+        else classes.delete(name);
+      },
+    },
+  };
+  const emptyClasses = new Set(["hidden"]);
+  const mappingEmpty = {
+    textContent: "",
+    classList: {
+      toggle(name, force) {
+        if (force) emptyClasses.add(name);
+        else emptyClasses.delete(name);
+      },
+    },
+  };
+  const enabledStates = [];
+  const { fn: renderMappingEditorForSlot } = loadFunction(APP_SOURCE, "renderMappingEditorForSlot", {
+    state: { snapshotMode: false },
+    mappingForm,
+    mappingEmpty,
+    setMappingFormEnabled(enabled) { enabledStates.push(enabled); },
+  });
+
+  renderMappingEditorForSlot({ mapping_supported: false, mapping_reason: reason });
+
+  assert.equal(classes.has("hidden"), true);
+  assert.equal(emptyClasses.has("hidden"), false);
+  assert.equal(mappingEmpty.textContent, reason);
+  assert.deepEqual(enabledStates, [false]);
+
+  renderMappingEditorForSlot({ mapping_supported: true });
+
+  assert.equal(classes.has("hidden"), false);
+  assert.equal(emptyClasses.has("hidden"), true);
+  assert.deepEqual(enabledStates, [false, true]);
+});
+
+test("virtual slot mapping save and clear handlers fail closed before any request", async () => {
+  const reason = "Manual mapping is unavailable because this system disk has no identified physical enclosure or stable physical location.";
+  const state = { snapshotMode: false, selectedSlot: 0 };
+  const statuses = [];
+  let requestCount = 0;
+  let confirmCount = 0;
+  let prevented = false;
+  class FakeFormData {
+    get() { return "untrusted"; }
+  }
+  const context = {
+    state,
+    FormData: FakeFormData,
+    mappingForm: {},
+    window: { confirm() { confirmCount += 1; return true; } },
+    getSlotById() {
+      return {
+        slot: 0,
+        slot_label: "Disk 1",
+        physical_location_known: false,
+        mapping_supported: false,
+        mapping_reason: reason,
+        mapping_revision: "a".repeat(64),
+        mapping_clear_revision: "b".repeat(64),
+      };
+    },
+    setStatus(message) { statuses.push(message); },
+    async sendScopedRequest() { requestCount += 1; return { snapshot: {} }; },
+    applySnapshot() {},
+    invalidateHistoryCaches() {},
+    renderAll() {},
+    scheduleSmartPrefetch() {},
+  };
+  const { fn: saveMapping } = loadFunction(APP_SOURCE, "saveMapping", context);
+  const { fn: clearMapping } = loadFunction(APP_SOURCE, "clearMapping", context);
+
+  await saveMapping({ preventDefault() { prevented = true; } });
+  await clearMapping();
+
+  assert.equal(prevented, true);
+  assert.equal(requestCount, 0);
+  assert.equal(confirmCount, 0);
+  assert.deepEqual(statuses, [reason, reason]);
+  assert.ok(statuses.every((message) => !/\b(?:slot|bay)\b/i.test(message)));
+});
+
+test("virtual detail and aria location copy says disk while physical copy says slot", () => {
+  const { fn: slotLocationLabel } = loadFunction(APP_SOURCE, "slotLocationLabel", {});
+
+  assert.equal(
+    slotLocationLabel({ slot_label: "Disk 1", physical_location_known: false }),
+    "Disk 1",
+  );
+  assert.equal(
+    slotLocationLabel({ slot_label: "07", physical_location_known: true }),
+    "Slot 07",
+  );
+  assert.match(functionSource(APP_SOURCE, "renderLiveSlotDetail"), /slotLocationLabel\(slot\)/);
+  assert.match(functionSource(APP_SOURCE, "buildTooltipLines"), /slotLocationLabel\(slot\)/);
+});
+
 test("mapping import preview lists every exact scope and slot classification", () => {
   const { fn: mappingImportPreviewMessage } = loadFunction(APP_SOURCE, "mappingImportPreviewMessage", {});
   const message = mappingImportPreviewMessage({

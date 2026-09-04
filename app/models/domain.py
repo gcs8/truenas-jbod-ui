@@ -258,6 +258,7 @@ class SlotView(BaseModel):
     phy_identifier: str | None = None
     target_port_protocol: str | None = None
     enclosure_identifier: str | None = None
+    physical_location_known: bool = True
     led_supported: bool = False
     led_backend: str | None = None
     led_reason: str | None = None
@@ -265,6 +266,8 @@ class SlotView(BaseModel):
     ssh_ses_element_id: int | None = None
     ssh_ses_targets: list[dict[str, Any]] = Field(default_factory=list)
     mapping_source: str = "unknown"
+    mapping_supported: bool = True
+    mapping_reason: str | None = None
     mapping_revision: str | None = None
     mapping_clear_revision: str | None = None
     notes: str | None = None
