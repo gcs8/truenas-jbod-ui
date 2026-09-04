@@ -112,6 +112,7 @@ class TrueNASRawData:
     pools: list[dict[str, Any]]
     disk_temperatures: dict[str, int]
     smart_test_results: list[dict[str, Any]]
+    enclosure_query_failed: bool = False
     systems: list[dict[str, Any]] = field(default_factory=list)
     pool_devices: list[dict[str, Any]] = field(default_factory=list)
     ha_groups: list[dict[str, Any]] = field(default_factory=list)
@@ -138,15 +139,25 @@ class TrueNASWebsocketClient:
     async def fetch_all(self) -> TrueNASRawData:
         async with self._session() as ws:
             dispatcher = _MiddlewareCallDispatcher(ws)
+
+            async def fetch_enclosures() -> tuple[list[dict[str, Any]], bool]:
+                try:
+                    return await self._fetch_enclosures(dispatcher.call), False
+                except TrueNASAPIError:
+                    logger.warning(
+                        "TrueNAS enclosure methods failed; retaining the other API payloads with degraded topology."
+                    )
+                    return [], True
+
             fetch_tasks = [
-                asyncio.create_task(self._fetch_enclosures(dispatcher.call)),
+                asyncio.create_task(fetch_enclosures()),
                 asyncio.create_task(self._fetch_disks(dispatcher.call)),
                 asyncio.create_task(self._fetch_pools(dispatcher.call)),
                 asyncio.create_task(self._fetch_disk_temperatures(dispatcher.call)),
                 asyncio.create_task(self._fetch_smart_test_results(dispatcher.call)),
             ]
             try:
-                enclosures, disks, pools, disk_temperatures, smart_test_results = await asyncio.gather(*fetch_tasks)
+                enclosure_result, disks, pools, disk_temperatures, smart_test_results = await asyncio.gather(*fetch_tasks)
             except BaseException:
                 # gather() propagates the first failure but leaves its siblings running.
                 # Their futures live in the dispatcher, whose reader is about to be
@@ -158,12 +169,14 @@ class TrueNASWebsocketClient:
                 raise
             finally:
                 await dispatcher.close()
+            enclosures, enclosure_query_failed = enclosure_result
             return TrueNASRawData(
                 enclosures=self._ensure_list(enclosures),
                 disks=self._ensure_list(disks),
                 pools=self._ensure_list(pools),
                 disk_temperatures=disk_temperatures,
                 smart_test_results=smart_test_results,
+                enclosure_query_failed=enclosure_query_failed,
             )
 
     async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import ipaddress
 import json
 import logging
@@ -1689,7 +1690,15 @@ class InventoryService:
                 platform=self.system.truenas.platform,
             )
             build_started = time.perf_counter()
+            previous_bundle = self._source_bundle
             bundle = await self._collect_inventory_source_bundle()
+            if bundle.raw_data.enclosure_query_failed and previous_bundle is not None:
+                previous_api = previous_bundle.sources.get("api")
+                if previous_api is not None and previous_api.enabled and previous_bundle.raw_data.enclosures:
+                    bundle.raw_data.enclosures = copy.deepcopy(previous_bundle.raw_data.enclosures)
+                    bundle.warnings.append(
+                        "TrueNAS API enclosure discovery failed; using the last trusted enclosure topology."
+                    )
             self._source_bundle = bundle
             self._source_bundle_until = utcnow() + timedelta(
                 seconds=max(0, int(self.settings.app.source_bundle_cache_ttl_seconds))
@@ -2337,7 +2346,17 @@ class InventoryService:
             else:
                 if api_result is not None:
                     raw_data = api_result
-                sources["api"] = SourceStatus(enabled=True, ok=True, message=f"{api_label} reachable.")
+                if raw_data.enclosure_query_failed:
+                    sources["api"] = SourceStatus(
+                        enabled=True,
+                        ok=False,
+                        message=f"{api_label} reachable with degraded enclosure data.",
+                    )
+                    warnings.append(
+                        f"{api_label} enclosure discovery failed; fresh disk, pool, temperature, and SMART data are retained."
+                    )
+                else:
+                    sources["api"] = SourceStatus(enabled=True, ok=True, message=f"{api_label} reachable.")
 
         if ssh_task is not None:
             try:
