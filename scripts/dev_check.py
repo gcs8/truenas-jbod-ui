@@ -21,6 +21,7 @@ FIXED_JAVASCRIPT_PATHS = (
 )
 WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_admin_command_state",
+    "tests.test_admin_config",
     "tests.test_admin_maintenance",
     "tests.test_admin_secret_models",
     "tests.test_ci_contract",
