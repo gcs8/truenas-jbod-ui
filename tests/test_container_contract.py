@@ -338,8 +338,14 @@ class ContainerResourceContractTests(unittest.TestCase):
             )
             with self.subTest(runbook=relative_path):
                 self.assertIsNotNone(match)
-                section = match.group(1).lower() if match is not None else ""
+                section = (
+                    " ".join(match.group(1).lower().split())
+                    if match is not None
+                    else ""
+                )
                 for required_text in (
+                    ".segment-*.sqlite3",
+                    "unreferenced `.segment-*.sqlite3` temporary artifact",
                     "stop or otherwise quiesce",
                     "record the exact path and metadata",
                     "not journal-referenced",

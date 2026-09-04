@@ -25,7 +25,9 @@ If you are not sure whether to purge or adopt, export first.
 
 Segmented rotation recovery names unexpected
 `.<hot-name>.segmented-*.sqlite3` and `.rotation-catalog-*.json` files in its
-unauthenticated staging error. Do not assume rotation owns a file because its
+unauthenticated staging error. Migration recovery and later-generation
+`--recover` also name every path for an unreferenced `.segment-*.sqlite3`
+temporary artifact. Do not assume migration or rotation owns a file because its
 name matches one of these patterns.
 
 1. Stop or otherwise quiesce the history service and every history writer or
