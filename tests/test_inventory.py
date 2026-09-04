@@ -12558,6 +12558,151 @@ class ReviewRegressionTests(unittest.TestCase):
                 ["/dev/sg10"],
             )
 
+    def test_quantastor_two_same_owner_ses_shelves_are_separate_selectable_options(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="same-owner-quantastor",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(platform="quantastor"),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[{"id": "node-a", "name": "Node A"}],
+                disks=[],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[
+                    {"id": "enc-a", "name": "Shelf A", "storageSystemId": "node-a"},
+                    {"id": "enc-b", "name": "Shelf B", "storageSystemId": "node-a"},
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            def build_shelf(enclosure_id: str, ses_device: str) -> SESMapEnclosure:
+                return SESMapEnclosure(
+                    ses_device=ses_device,
+                    enclosure_id=enclosure_id,
+                    enclosure_label=enclosure_id,
+                    slots={
+                        slot: SESMapSlot(
+                            slot_number=slot,
+                            element_id=slot,
+                            ses_device=ses_device,
+                            control_targets=[
+                                {
+                                    "ses_device": ses_device,
+                                    "ses_element_id": slot,
+                                    "ses_slot_number": slot,
+                                }
+                            ],
+                            status="OK",
+                            description=f"{enclosure_id} bay {slot}",
+                            present=True,
+                        )
+                        for slot in range(24)
+                    },
+                )
+
+            ses_data = ParsedSSHData(
+                ses_enclosures=[
+                    build_shelf("enc-a", "/dev/sg10"),
+                    build_shelf("enc-b", "/dev/sg11"),
+                ]
+            )
+
+            rendered: dict[str, list[SlotView]] = {}
+            available_enclosures: list[EnclosureOption] = []
+            for enclosure_id in ("enc-a", "enc-b"):
+                slots, available_enclosures, selected_meta, _rows, slot_count, _columns = (
+                    service._correlate_quantastor(
+                        raw_data,
+                        [],
+                        enclosure_id,
+                        ses_data,
+                    )
+                )
+                self.assertEqual(selected_meta["id"], enclosure_id)
+                self.assertEqual(slot_count, 24)
+                self.assertEqual(len(slots), 24)
+                rendered[enclosure_id] = slots
+
+            self.assertEqual([option.id for option in available_enclosures], ["enc-a", "enc-b"])
+            self.assertEqual(
+                {target["ses_device"] for slot in rendered["enc-a"] for target in slot.ssh_ses_targets},
+                {"/dev/sg10"},
+            )
+            self.assertEqual(
+                {target["ses_device"] for slot in rendered["enc-b"] for target in slot.ssh_ses_targets},
+                {"/dev/sg11"},
+            )
+
+    def test_quantastor_multi_shelf_default_stays_on_active_pool_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="same-owner-quantastor",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(platform="quantastor"),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[
+                    {"id": "node-b", "name": "Node B"},
+                    {"id": "node-a", "name": "Node A"},
+                ],
+                disks=[],
+                pools=[{"id": "pool-a", "activeStorageSystemId": "node-a"}],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[
+                    {"id": "enc-b0", "storageSystemId": "node-b"},
+                    {"id": "enc-a0", "storageSystemId": "node-a"},
+                    {"id": "enc-a1", "storageSystemId": "node-a"},
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            options = service._build_quantastor_enclosure_options(raw_data)
+
+            self.assertEqual(service._select_quantastor_default_enclosure_id(raw_data, options), "enc-a0")
+
+    def test_quantastor_duplicate_hw_rows_keep_one_single_shelf_option(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="duplicate-row-quantastor",
+                default_profile_id="supermicro-ssg-2028r-shared-front-24",
+                truenas=TrueNASConfig(platform="quantastor"),
+            )
+            service = build_inventory_service(settings, system, MagicMock(), MagicMock(), temp_dir)
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                systems=[{"id": "node-a", "name": "Node A"}],
+                disks=[],
+                pools=[],
+                pool_devices=[],
+                ha_groups=[],
+                hw_disks=[],
+                hw_enclosures=[
+                    {"id": "enc-a", "storageSystemId": "node-a"},
+                    {"id": "enc-a", "storageSystemId": "node-a"},
+                ],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            options = service._build_quantastor_enclosure_options(raw_data)
+
+            self.assertEqual([option.id for option in options], ["node-a"])
+
     def test_parse_size_to_bytes_binary_suffixes_use_1024(self) -> None:
         self.assertEqual(parse_size_to_bytes("1 GiB"), 1024**3)
         self.assertEqual(parse_size_to_bytes("1 GB"), 1000**3)

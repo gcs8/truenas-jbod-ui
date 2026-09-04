@@ -5487,9 +5487,11 @@ class InventoryService:
             return frame.result([])
         allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
 
-        warnings.extend(self._build_quantastor_cluster_warnings(raw_data, selected_option.id))
+        selected_system_id = self._quantastor_option_owner_id(raw_data, selected_option.id)
+        selected_hw_enclosure_id = selected_option.id if selected_option.id != selected_system_id else None
+        warnings.extend(self._build_quantastor_cluster_warnings(raw_data, selected_system_id))
 
-        disk_records = self._build_quantastor_disk_records(raw_data, selected_option.id)
+        disk_records = self._build_quantastor_disk_records(raw_data, selected_system_id)
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
         for disk in disk_records:
@@ -5508,10 +5510,11 @@ class InventoryService:
         empty_ssh = ParsedSSHData()
         quantastor_ses_candidates = self._select_quantastor_ses_candidates(
             raw_data,
-            selected_option.id,
+            selected_system_id,
             quantastor_ses_data,
             frame.layout_slot_count,
             selected_profile.id,
+            selected_hw_enclosure_id,
         )
         loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
@@ -5626,22 +5629,76 @@ class InventoryService:
                 or system_row.get("description")
                 or system_id
             )
-            options.append(
-                EnclosureOption(
-                    id=system_id,
-                    label=label or system_id,
-                    name=normalize_text(
-                        str(system_row.get("description") or system_row.get("nodeId") or label)
-                        if (system_row.get("description") or system_row.get("nodeId") or label) is not None
-                        else None
-                    ),
-                    rows=rows,
-                    columns=columns,
-                    slot_count=slot_count,
-                    slot_layout=slot_layout,
+            owned_enclosures_by_id: dict[str, dict[str, Any]] = {}
+            for row in hw_enclosures:
+                owner_id = normalize_text(
+                    str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None
                 )
-            )
+                enclosure_id = self._quantastor_hw_enclosure_id(row)
+                if owner_id == system_id and enclosure_id:
+                    owned_enclosures_by_id.setdefault(enclosure_id, row)
+            owned_enclosures = list(owned_enclosures_by_id.values())
+            option_rows = owned_enclosures if len(owned_enclosures) > 1 else [None]
+            for enclosure_row in option_rows:
+                enclosure_id = self._quantastor_hw_enclosure_id(enclosure_row) if enclosure_row else None
+                enclosure_label = (
+                    normalize_text(
+                        str(
+                            enclosure_row.get("name")
+                            or enclosure_row.get("label")
+                            or enclosure_row.get("description")
+                            or enclosure_id
+                        )
+                    )
+                    if enclosure_row
+                    else None
+                )
+                option_label = (
+                    f"{label or system_id} · {enclosure_label}"
+                    if enclosure_label
+                    else label or system_id
+                )
+                options.append(
+                    EnclosureOption(
+                        id=enclosure_id or system_id,
+                        label=option_label,
+                        name=enclosure_label
+                        or normalize_text(
+                            str(system_row.get("description") or system_row.get("nodeId") or label)
+                            if (system_row.get("description") or system_row.get("nodeId") or label) is not None
+                            else None
+                        ),
+                        rows=rows,
+                        columns=columns,
+                        slot_count=slot_count,
+                        slot_layout=slot_layout,
+                    )
+                )
         return self._finalize_enclosure_options(options)
+
+    @staticmethod
+    def _quantastor_hw_enclosure_id(row: dict[str, Any] | None) -> str | None:
+        if not row:
+            return None
+        return next(
+            (
+                value
+                for key in ("id", "enclosureId", "enclosure_id", "sasAddress", "sas_address", "wwn", "wwid")
+                if (value := normalize_text(str(row.get(key)) if row.get(key) is not None else None))
+            ),
+            None,
+        )
+
+    def _quantastor_option_owner_id(self, raw_data: TrueNASRawData, option_id: str) -> str:
+        for row in self._quantastor_hw_enclosure_rows(raw_data):
+            if self._quantastor_hw_enclosure_id(row) != option_id:
+                continue
+            owner_id = normalize_text(
+                str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None
+            )
+            if owner_id:
+                return owner_id
+        return option_id
 
     def _select_quantastor_ses_candidates(
         self,
@@ -5650,6 +5707,7 @@ class InventoryService:
         ses_data: ParsedSSHData,
         slot_count: int,
         selected_profile_id: str,
+        selected_enclosure_id: str | None = None,
     ) -> dict[int, dict[str, Any]]:
         if not ses_data.ses_enclosures:
             return ses_data.ses_slot_candidates
@@ -5660,6 +5718,9 @@ class InventoryService:
                 str(row.get("storageSystemId")) if row.get("storageSystemId") is not None else None
             )
             if owner_id != selected_system_id:
+                continue
+            row_id = self._quantastor_hw_enclosure_id(row)
+            if selected_enclosure_id and row_id != selected_enclosure_id:
                 continue
             for key in ("id", "enclosureId", "enclosure_id", "sasAddress", "sas_address", "wwn", "wwid"):
                 value = normalize_text(str(row.get(key)) if row.get(key) is not None else None)
@@ -5680,7 +5741,7 @@ class InventoryService:
             if aliases & selected_enclosure_aliases:
                 selected_enclosures.append(enclosure)
 
-        if not selected_enclosures:
+        if not selected_enclosures and selected_enclosure_id is None:
             profile_matches = [
                 enclosure
                 for enclosure in ses_data.ses_enclosures
@@ -5691,14 +5752,14 @@ class InventoryService:
             elif len(ses_data.ses_enclosures) == 1:
                 selected_enclosures = list(ses_data.ses_enclosures)
 
-        if not selected_enclosures:
+        if len(selected_enclosures) != 1:
             return {}
 
         candidates, _meta = build_slot_candidates_from_ses_enclosures(
             selected_enclosures,
             slot_count,
             None,
-            enclosures_are_merged=True,
+            enclosures_are_merged=False,
         )
         return candidates
 
@@ -5864,13 +5925,24 @@ class InventoryService:
             return None
 
         option_rank = {option_id: index for index, option_id in enumerate(option_ids)}
+        option_owner_ids = {
+            option_id: self._quantastor_option_owner_id(raw_data, option_id)
+            for option_id in option_ids
+        }
+        owner_option_ids: dict[str, list[str]] = {}
+        for option_id in option_ids:
+            owner_option_ids.setdefault(option_owner_ids[option_id], []).append(option_id)
+        owner_rank = {
+            owner_id: min(option_rank[option_id] for option_id in owned_option_ids)
+            for owner_id, owned_option_ids in owner_option_ids.items()
+        }
         owner_counts: dict[str, int] = {}
         for pool in raw_data.pools:
             owner_id = next(
                 (
                     normalize_text(str(pool.get(key)) if pool.get(key) is not None else None)
                     for key in ("activeStorageSystemId", "primaryStorageSystemId", "storageSystemId")
-                    if normalize_text(str(pool.get(key)) if pool.get(key) is not None else None) in option_rank
+                    if normalize_text(str(pool.get(key)) if pool.get(key) is not None else None) in owner_rank
                 ),
                 None,
             )
@@ -5878,14 +5950,18 @@ class InventoryService:
                 owner_counts[owner_id] = owner_counts.get(owner_id, 0) + 1
 
         if owner_counts:
-            return min(owner_counts, key=lambda owner_id: (-owner_counts[owner_id], option_rank[owner_id]))
+            selected_owner_id = min(
+                owner_counts,
+                key=lambda owner_id: (-owner_counts[owner_id], owner_rank[owner_id]),
+            )
+            return owner_option_ids[selected_owner_id][0]
 
         for system_row in raw_data.systems:
             if not self._quantastor_bool(system_row.get("isMaster")):
                 continue
             system_id = normalize_text(str(system_row.get("id")) if system_row.get("id") is not None else None)
-            if system_id in option_rank:
-                return system_id
+            if system_id in owner_option_ids:
+                return owner_option_ids[system_id][0]
 
         return option_ids[0]
 
