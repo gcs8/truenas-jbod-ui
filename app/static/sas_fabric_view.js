@@ -713,12 +713,18 @@
       payload = await response.json();
     } catch (error) {
       if (!response.ok) {
-        throw new Error(`Request failed with ${response.status}`);
+        const failure = new Error(`Request failed with ${response.status}`);
+        failure.status = response.status;
+        failure.detail = null;
+        throw failure;
       }
       throw error;
     }
     if (!response.ok || payload?.ok === false) {
-      throw new Error(payload?.detail || `Request failed with ${response.status}`);
+      const failure = new Error(payload?.detail || `Request failed with ${response.status}`);
+      failure.status = response.status;
+      failure.detail = payload?.detail ?? null;
+      throw failure;
     }
     return payload;
   }

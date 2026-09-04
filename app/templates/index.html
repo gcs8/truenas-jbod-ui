@@ -202,6 +202,7 @@
     <div class="cache-timing-chips" id="cache-timing-chips" aria-label="Cache timing"></div>
     <div class="status-text" id="status-text" role="status" aria-live="polite">Ready.</div>
   </section>
+  <p class="status-text write-policy-notice hidden" id="write-policy-notice" role="note" data-tone="error"></p>
 
   <section id="ui-perf-panel" class="panel ui-perf-panel hidden">
     <div class="panel-header compact">
@@ -660,6 +661,7 @@
     initialHistoryTimeframeHours: {{ initial_history_timeframe_hours_json | script_json_text }},
     initialHistoryPanelOpen: {{ initial_history_panel_open_json | script_json_text }},
     initialHistoryIoChartMode: {{ initial_history_io_chart_mode_json | script_json_text }},
+    writePolicy: {{ write_policy_json | default("null") | script_json_text }},
   };
 </script>
 {% endblock %}

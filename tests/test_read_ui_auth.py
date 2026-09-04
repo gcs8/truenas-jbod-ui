@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import unittest
 from pathlib import Path
 from typing import Any, Literal
@@ -9,10 +10,17 @@ from unittest.mock import patch
 
 import yaml
 from pydantic import SecretStr
+from starlette.requests import Request
 
 from admin_service.config import AdminSettings
 from app import main as app_main
 from app.config import AppConfig, Settings
+from app.models.domain import (
+    EnclosureOption,
+    EnclosureProfileView,
+    InventorySnapshot,
+    StorageViewRuntimePayload,
+)
 
 
 MUTATION_ROUTES = (
@@ -109,6 +117,47 @@ async def invoke_asgi(
     return int(start["status"]), response_headers, response_body
 
 
+def build_app(
+    *,
+    auth_mode: Literal["network", "basic"],
+    public_origin: str | None = None,
+):
+    settings = Settings(app=AppConfig(public_origin=public_origin))
+    auth_settings = AdminSettings(
+        auth_mode=auth_mode,
+        auth_username="operator" if auth_mode == "basic" else None,
+        auth_password=SecretStr("synthetic-passphrase") if auth_mode == "basic" else None,
+        auto_stop_seconds=0,
+    )
+    with patch.object(app_main, "get_settings", return_value=settings):
+        with patch.object(
+            app_main,
+            "get_admin_settings",
+            return_value=auth_settings,
+            create=True,
+        ):
+            return app_main.create_app()
+
+
+def index_request(app) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/",
+            "raw_path": b"/",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("ui.example.test", 8080),
+            "app": app,
+        }
+    )
+
+
 class ReadUIAuthorizationTests(unittest.TestCase):
     def make_app(
         self,
@@ -116,21 +165,7 @@ class ReadUIAuthorizationTests(unittest.TestCase):
         auth_mode: Literal["network", "basic"],
         public_origin: str | None = None,
     ):
-        settings = Settings(app=AppConfig(public_origin=public_origin))
-        auth_settings = AdminSettings(
-            auth_mode=auth_mode,
-            auth_username="operator" if auth_mode == "basic" else None,
-            auth_password=SecretStr("synthetic-passphrase") if auth_mode == "basic" else None,
-            auto_stop_seconds=0,
-        )
-        with patch.object(app_main, "get_settings", return_value=settings):
-            with patch.object(
-                app_main,
-                "get_admin_settings",
-                return_value=auth_settings,
-                create=True,
-            ):
-                return app_main.create_app()
+        return build_app(auth_mode=auth_mode, public_origin=public_origin)
 
     def test_network_mode_keeps_reads_available_but_denies_every_mutation(self) -> None:
         app = self.make_app(auth_mode="network")
@@ -288,6 +323,78 @@ class ReadUIAuthorizationTests(unittest.TestCase):
         self.assertIn("main UI mutations are disabled", env_example)
         self.assertIn("main UI reads remain anonymous", env_example)
         self.assertNotIn("protects the full main UI", env_example)
+
+
+class ReadUIWritePolicyBootstrapTests(unittest.TestCase):
+    """The main UI bootstrap must carry the effective write policy (#273).
+
+    The mutation guard denies every main-UI write in network mode; the page has to know
+    that before a click so the controls can be disabled with a reason instead of failing
+    on submit.
+    """
+
+    def _context(self, *, auth_mode: Literal["network", "basic"]) -> dict[str, object]:
+        app = build_app(
+            auth_mode=auth_mode,
+            public_origin="http://ui.example.test:8080" if auth_mode == "basic" else None,
+        )
+        snapshot = InventorySnapshot(
+            slots=[],
+            refresh_interval_seconds=30,
+            selected_system_id="system-a",
+            selected_system_label="System A",
+            selected_enclosure_id="enc-a",
+            selected_enclosure_label="Shelf A",
+            selected_profile=EnclosureProfileView(
+                id="profile-a",
+                label="Profile A",
+                panel_title="Profile A",
+                rows=1,
+                columns=1,
+                slot_layout=[[0]],
+            ),
+            enclosures=[EnclosureOption(id="enc-a", label="Shelf A", raw_label="Shelf A")],
+        )
+        return app_main.build_index_context(
+            request=index_request(app),
+            snapshot=snapshot,
+            storage_view_runtime=StorageViewRuntimePayload(system_id="system-a", views=[]),
+            settings=Settings(),
+            history_configured=False,
+        )
+
+    def test_network_mode_context_disables_writes_with_operator_reason(self) -> None:
+        context = self._context(auth_mode="network")
+
+        policy = context["write_policy"]
+        self.assertEqual(policy["enabled"], False)
+        self.assertEqual(policy["mode"], "network")
+        self.assertIn("ADMIN_AUTH_MODE=basic", policy["reason"])
+        self.assertEqual(json.loads(context["write_policy_json"]), policy)
+
+        html = app_main.templates.get_template("index.html").render(context)
+        self.assertIn(f"writePolicy: {context['write_policy_json']}", html)
+
+    def test_basic_mode_context_enables_writes(self) -> None:
+        context = self._context(auth_mode="basic")
+
+        policy = context["write_policy"]
+        self.assertEqual(policy["enabled"], True)
+        self.assertEqual(policy["mode"], "basic")
+        self.assertEqual(policy["reason"], "")
+        self.assertEqual(json.loads(context["write_policy_json"]), policy)
+
+    def test_snapshot_export_context_without_policy_renders_null(self) -> None:
+        # Offline snapshot exports build their own template context and never carry a
+        # write policy; the client treats a missing policy as "enabled" so the existing
+        # snapshot-mode affordances stay in charge.
+        context = self._context(auth_mode="network")
+        context.pop("write_policy")
+        context.pop("write_policy_json")
+        context["snapshot_mode"] = True
+
+        html = app_main.templates.get_template("index.html").render(context)
+        self.assertIn("writePolicy: null,", html)
 
 
 if __name__ == "__main__":

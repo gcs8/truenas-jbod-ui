@@ -74,6 +74,7 @@
   const initialStorageViewId = initialSelection.storageViewId;
   const state = {
     snapshotMode,
+    writePolicy: normalizeWritePolicy(bootstrap.writePolicy),
     snapshotExportMeta: bootstrap.snapshotExportMeta || null,
     snapshot: bootstrap.snapshot || { slots: [], systems: [], enclosures: [] },
     storageViewsRuntime: bootstrap.storageViewsRuntime || { system_id: bootstrap.snapshot?.selected_system_id || null, views: [] },
@@ -272,6 +273,7 @@
   const historyStatusChip = document.getElementById("history-status-chip");
   const cacheTimingChips = document.getElementById("cache-timing-chips");
   const statusText = document.getElementById("status-text");
+  const writePolicyNotice = document.getElementById("write-policy-notice");
   const summaryDiskCount = document.getElementById("summary-disk-count");
   const summaryPoolCount = document.getElementById("summary-pool-count");
   const summaryEnclosureCount = document.getElementById("summary-enclosure-count");
@@ -1261,6 +1263,9 @@
 
   async function submitEnclosureAlias(event) {
     event?.preventDefault();
+    if (writeBlockedByPolicy()) {
+      return;
+    }
     const enclosure = getSelectedEnclosureOption();
     if (!enclosure || !enclosureAliasInput) {
       return;
@@ -1291,6 +1296,7 @@
       setStatus(label ? "Enclosure name saved." : "Enclosure name cleared.");
       await refreshSnapshot(true, "enclosure-alias");
     } catch (error) {
+      handleWriteRejection(error);
       setStatus(error?.message || "Enclosure name could not be saved.", "error");
       enclosureAliasInput.focus();
     }
@@ -2406,6 +2412,99 @@
   function setStatus(message, tone = "info") {
     statusText.textContent = message;
     statusText.dataset.tone = tone;
+  }
+
+  // Effective write policy for the main UI (#273). The server publishes it in the
+  // bootstrap payload; a missing value means "enabled" so offline snapshot artifacts keep
+  // their own read-only affordances. Once disabled it never re-enables on its own.
+  function normalizeWritePolicy(raw) {
+    if (!raw || typeof raw !== "object") {
+      return { enabled: true, mode: "", reason: "" };
+    }
+    return {
+      enabled: raw.enabled !== false,
+      mode: typeof raw.mode === "string" ? raw.mode : "",
+      reason: typeof raw.reason === "string" ? raw.reason : "",
+    };
+  }
+
+  function writePolicyAllowsWrites() {
+    return state.writePolicy?.enabled !== false;
+  }
+
+  function writePolicyReason() {
+    return state.writePolicy?.reason || "Writes are disabled for this deployment.";
+  }
+
+  function writePolicyControls() {
+    const controls = [
+      ...ledButtons,
+      clearMappingButton,
+      importMappingsButton,
+      enclosureAliasEditButton,
+      enclosureAliasClear,
+    ];
+    if (mappingForm && typeof mappingForm.querySelector === "function") {
+      controls.push(mappingForm.querySelector('button[type="submit"]'));
+    }
+    if (enclosureAliasForm && typeof enclosureAliasForm.querySelector === "function") {
+      controls.push(enclosureAliasForm.querySelector('button[type="submit"]'));
+    }
+    return controls.filter(Boolean);
+  }
+
+  function syncWritePolicyControls() {
+    if (writePolicyAllowsWrites()) {
+      return;
+    }
+    const reason = writePolicyReason();
+    writePolicyControls().forEach((control) => {
+      control.disabled = true;
+      control.title = reason;
+      control.setAttribute("aria-describedby", "write-policy-notice");
+    });
+  }
+
+  function renderWritePolicyNotice() {
+    if (!writePolicyNotice) {
+      return;
+    }
+    if (writePolicyAllowsWrites()) {
+      writePolicyNotice.textContent = "";
+      writePolicyNotice.classList.add("hidden");
+      return;
+    }
+    writePolicyNotice.textContent = writePolicyReason();
+    writePolicyNotice.classList.remove("hidden");
+  }
+
+  function applyWritePolicy(policy) {
+    state.writePolicy = normalizeWritePolicy(policy);
+    renderWritePolicyNotice();
+    syncWritePolicyControls();
+  }
+
+  function writeBlockedByPolicy() {
+    if (writePolicyAllowsWrites()) {
+      return false;
+    }
+    setStatus(writePolicyReason(), "error");
+    return true;
+  }
+
+  function handleWriteRejection(error) {
+    const status = Number(error?.status);
+    if (status !== 401 && status !== 403) {
+      return false;
+    }
+    applyWritePolicy({
+      enabled: false,
+      mode: state.writePolicy?.mode || "",
+      reason: typeof error?.detail === "string" && error.detail
+        ? error.detail
+        : error?.message || `Request failed with ${status}`,
+    });
+    return true;
   }
 
   function uiPerfNow() {
@@ -7617,6 +7716,7 @@
     ledButtons.forEach((button) => {
       button.disabled = state.snapshotMode || !slot.led_supported;
     });
+    syncWritePolicyControls();
     renderHistoryPanel();
     if (state.history.panelOpen && isHistoryAvailable()) {
       void loadHistoryForSelectedSlot(false);
@@ -8740,12 +8840,18 @@
       payload = await response.json();
     } catch (error) {
       if (!response.ok) {
-        throw new Error(`Request failed with ${response.status}`);
+        const failure = new Error(`Request failed with ${response.status}`);
+        failure.status = response.status;
+        failure.detail = null;
+        throw failure;
       }
       throw error;
     }
     if (!response.ok || payload?.ok === false) {
-      throw new Error(payload?.detail || `Request failed with ${response.status}`);
+      const failure = new Error(payload?.detail || `Request failed with ${response.status}`);
+      failure.status = response.status;
+      failure.detail = payload?.detail ?? null;
+      throw failure;
     }
     return payload;
   }
@@ -8949,6 +9055,9 @@
       setStatus("LED actions are disabled in an offline snapshot export.", "error");
       return;
     }
+    if (writeBlockedByPolicy()) {
+      return;
+    }
     const slot = getSlotById(state.selectedSlot);
     if (!slot) return;
     if (!slot.led_supported) {
@@ -8966,6 +9075,7 @@
       scheduleSmartPrefetch();
       setStatus(`Slot ${slot.slot_label} LED action ${action} completed via ${ledBackendLabel(slot)}.`);
     } catch (error) {
+      handleWriteRejection(error);
       setStatus(`LED action failed: ${error.message || error}`, "error");
     }
   }
@@ -8976,6 +9086,9 @@
       return;
     }
     event.preventDefault();
+    if (writeBlockedByPolicy()) {
+      return;
+    }
     const slot = getSlotById(state.selectedSlot);
     if (!slot) return;
     if (!slot.mapping_revision) {
@@ -9005,6 +9118,7 @@
       scheduleSmartPrefetch();
       setStatus(result.warning || `Saved mapping for slot ${slot.slot_label}.`);
     } catch (error) {
+      handleWriteRejection(error);
       setStatus(`Save mapping failed: ${error.message || error}`, "error");
     }
   }
@@ -9012,6 +9126,9 @@
   async function clearMapping() {
     if (state.snapshotMode) {
       setStatus("Mapping changes are disabled in an offline snapshot export.", "error");
+      return;
+    }
+    if (writeBlockedByPolicy()) {
       return;
     }
     const slot = getSlotById(state.selectedSlot);
@@ -9038,6 +9155,7 @@
       scheduleSmartPrefetch();
       setStatus(`Cleared mapping for slot ${slot.slot_label}.`);
     } catch (error) {
+      handleWriteRejection(error);
       setStatus(`Clear mapping failed: ${error.message || error}`, "error");
     }
   }
@@ -9105,6 +9223,12 @@
       return;
     }
     if (!file) return;
+    if (writeBlockedByPolicy()) {
+      if (mappingImportFile) {
+        mappingImportFile.value = "";
+      }
+      return;
+    }
     try {
       setStatus(`Previewing mappings from ${file.name}...`);
       const rawText = await file.text();
@@ -9134,6 +9258,7 @@
       scheduleSmartPrefetch();
       setStatus(`Imported ${result.imported} mappings into the active scope.`);
     } catch (error) {
+      handleWriteRejection(error);
       setStatus(`Import failed: ${error.message || error}`, "error");
     } finally {
       if (mappingImportFile) {
@@ -9169,6 +9294,7 @@
       element.disabled = !enabled;
     });
     prefillMappingButton.disabled = !enabled;
+    syncWritePolicyControls();
   }
 
   async function ensureSmartSummary(slot) {
@@ -9811,6 +9937,8 @@
 
   rememberReusableSnapshot(state.snapshot);
   renderAll();
+  renderWritePolicyNotice();
+  syncWritePolicyControls();
   renderHeatmapControls();
   ensureHeatmapData();
   renderUiPerfPanel();

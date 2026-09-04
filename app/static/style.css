@@ -863,6 +863,11 @@ textarea {
   color: var(--muted);
 }
 
+.write-policy-notice {
+  margin: -8px 0 18px;
+  padding: 0 16px;
+}
+
 .content-grid {
   display: grid;
   grid-template-columns: minmax(0, 2.05fr) minmax(380px, 470px);
