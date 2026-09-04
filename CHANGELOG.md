@@ -44,7 +44,7 @@ an entry below.
 - The default Compose stack runs the UI and history services as non-root on a
   read-only image filesystem after a one-time ownership preflight (#246).
 - Every merged pull request now carries a changelog line that CI enforces, and
-  GitHub release bodies are generated from labels plus this file (#314).
+  GitHub release bodies are generated from labels plus this file (#314, #338).
 
 ### Breaking changes
 
@@ -303,6 +303,9 @@ them before starting the new images.
 - Backfilled the `Unreleased` changelog with a line for every pull request
   merged since `v0.22.2`, wrote the upgrade notes for the operator-visible
   changes, and refreshed the roadmap snapshot and release checklist (#314).
+- Adopted a per-PR changelog entry standard with a CI gate, label-driven
+  GitHub release categories, a release-time coverage gate that pins the
+  published wiki commit, and the matching release checklist steps (#338).
 
 ### Internal
 
