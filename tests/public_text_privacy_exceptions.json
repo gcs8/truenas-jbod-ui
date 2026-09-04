@@ -1,546 +1,776 @@
 {
   ".env.example": {
     "findings": {
-      "internal_hostname": 5
+      "internal_hostname": {
+        "sha256:1e332482d9b982a8e1f9601e5df7d6a2c63eaf154d2a8d44518a55a63c7e3854": 5
+      }
     },
     "reason": "Reviewed public configuration example; exact detector counts are pinned."
   },
   ".github/workflows/ci.yml": {
     "findings": {
-      "sas_wwn_identifier": 5
+      "sas_wwn_identifier": {
+        "sha256:b282751bce848f0c29564021be6917e95aec009f2bd66abbb7ce68aaa67ff770": 5
+      }
     },
     "reason": "Capability masks match the broad 16-hex identifier detector."
   },
   "admin_service/config.py": {
     "findings": {
-      "internal_hostname": 1
+      "internal_hostname": {
+        "sha256:4fa25391e6ffa97d947a379c74b6f7f5bf502da1638911d3635b59675de1ca47": 1
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "admin_service/services/account_bootstrap.py": {
     "findings": {
-      "private_posix_host_path": 1
+      "private_posix_host_path": {
+        "sha256:9a9332694ce509a7b52cb6cc29ddd16b7780d5d6629701a3f4b8211812e0a614": 1
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "admin_service/services/tls_trust.py": {
     "findings": {
-      "internal_hostname": 5
+      "internal_hostname": {
+        "sha256:b8a5a184c202a328c1fce60017aac8095cd07d1dcd2ced9f76c1a792b7b3f3e1": 5
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "admin_service/static/admin.js": {
     "findings": {
-      "internal_hostname": 7
+      "internal_hostname": {
+        "sha256:31e99ef42fb8a90a93ae240d7087a51f2441ddb46cf1ecccd4a498215bd8b80c": 7
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "admin_service/templates/index.html": {
     "findings": {
-      "internal_hostname": 3
+      "internal_hostname": {
+        "sha256:498dc35957eacb17c980a86fe8a902db9318e952a58cfbf927916145b1fa18aa": 3
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "app/config.py": {
     "findings": {
-      "internal_hostname": 6
+      "internal_hostname": {
+        "sha256:887a316eff930e2f900b70272df8eb85f82c96e2e347994534fcead46aa1f73f": 6
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "app/models/domain.py": {
     "findings": {
-      "internal_hostname": 6
+      "internal_hostname": {
+        "sha256:620804213bcf0d0c1b11b2c2f48a62bbab95bc99e35e721f354f45545d487603": 6
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "app/services/inventory.py": {
     "findings": {
-      "internal_hostname": 5
+      "internal_hostname": {
+        "sha256:f4fdb5b05d3055c2a80f5b84d55774380136d0d81f773c886f8012be10b56f15": 5
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "app/services/public_demo_fixture.py": {
     "findings": {
-      "sas_wwn_identifier": 1
+      "sas_wwn_identifier": {
+        "sha256:7b89c41ea9648df787ca2ce4f52648372f0fb3b1e58a0c72394e585c11c2cb22": 1
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "app/static/sas_fabric_view.js": {
     "findings": {
-      "internal_hostname": 5
+      "internal_hostname": {
+        "sha256:f164b56d535df3aedb8108009168b93db878915dc2c0417503ecd7f0ba2202f6": 5
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "config/config.example.yaml": {
     "findings": {
-      "internal_hostname": 15,
-      "rfc1918_ipv4": 3,
-      "sas_wwn_identifier": 3
+      "internal_hostname": {
+        "sha256:06117e57d3c71582d604d499c66153bc32bf9ce26c8ab16595f99946de060a50": 15
+      },
+      "rfc1918_ipv4": {
+        "sha256:6b8ef42a074f65ccd8a058fd2aaeddbe92ca7b631b789b3e9aa525d274383237": 3
+      },
+      "sas_wwn_identifier": {
+        "sha256:fae4aa3b4381531a9c75898321456a2fe55d193ac2dc23a7ab36d9c921ef92b7": 3
+      }
     },
     "reason": "Reviewed public configuration example; exact detector counts are pinned."
   },
   "docs/ADMIN_TRUST_BOUNDARY.md": {
     "findings": {
-      "internal_hostname": 1
+      "internal_hostname": {
+        "sha256:da0ebffc9bc0d33883db00fa26bab2c33603ca42fa29dfd0a95f99db73e53bb6": 1
+      }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
   "docs/PROFILE_AUTHORING.md": {
     "findings": {
-      "sas_wwn_identifier": 2
+      "sas_wwn_identifier": {
+        "sha256:6d8288a378ab08c9df50235706954b3b087e49ba26f33e480a0c8270f1742716": 2
+      }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
   "docs/RELEASE_NOTES_0.12.0.md": {
     "findings": {
-      "rfc1918_ipv4": 1
+      "rfc1918_ipv4": {
+        "sha256:2317060e1568573e65166f383b510ba0c5fa127c1c193bae67fa5ac0f5b55be2": 1
+      }
     },
     "reason": "Historical public release evidence; exact detector counts are pinned."
   },
   "docs/RELEASE_NOTES_0.17.0.md": {
     "findings": {
-      "rfc1918_ipv4": 2
+      "rfc1918_ipv4": {
+        "sha256:0a9e6688d9a7d985c0b78e850bf40593facd313ed5f6e89d3a329c7dae1072b7": 2
+      }
     },
     "reason": "Historical public release evidence; exact detector counts are pinned."
   },
   "docs/RELEASE_NOTES_0.20.1.md": {
     "findings": {
-      "sas_wwn_identifier": 1
+      "sas_wwn_identifier": {
+        "sha256:47dcffccecc527984675bb4c11ad47a4492c2b315fd108446e022b9d1aaea755": 1
+      }
     },
     "reason": "Historical public release evidence; exact detector counts are pinned."
   },
   "docs/RELEASE_WRAP_0.17.0.md": {
     "findings": {
-      "rfc1918_ipv4": 1
+      "rfc1918_ipv4": {
+        "sha256:2317060e1568573e65166f383b510ba0c5fa127c1c193bae67fa5ac0f5b55be2": 1
+      }
     },
     "reason": "Historical public release evidence; exact detector counts are pinned."
   },
   "docs/RELEASE_WRAP_0.20.0.md": {
     "findings": {
-      "rfc1918_ipv4": 1
+      "rfc1918_ipv4": {
+        "sha256:2317060e1568573e65166f383b510ba0c5fa127c1c193bae67fa5ac0f5b55be2": 1
+      }
     },
     "reason": "Historical public release evidence; exact detector counts are pinned."
   },
   "docs/RELEASE_WRAP_0.20.2.md": {
     "findings": {
-      "rfc1918_ipv4": 2
+      "rfc1918_ipv4": {
+        "sha256:f32214e7bedc2dcbe43f12e491af15a300266943fbd46a6de7f7ed30f4ea422c": 2
+      }
     },
     "reason": "Historical public release evidence; exact detector counts are pinned."
   },
   "docs/RELEASE_WRAP_0.21.0.md": {
     "findings": {
-      "rfc1918_ipv4": 11
+      "rfc1918_ipv4": {
+        "sha256:44b9b52abf75a0602230602f090b13d575092acb7c72493ccb263883c0b127e7": 11
+      }
     },
     "reason": "Historical public release evidence; exact detector counts are pinned."
   },
   "docs/RELEASE_WRAP_0.21.1.md": {
     "findings": {
-      "rfc1918_ipv4": 3
+      "rfc1918_ipv4": {
+        "sha256:60edeb3ba73ae3fa4363b372a1cbfe74dee8d98a7d73003fd05242b93d0fef61": 3
+      }
     },
     "reason": "Historical public release evidence; exact detector counts are pinned."
   },
   "docs/RELEASE_WRAP_0.21.2.md": {
     "findings": {
-      "rfc1918_ipv4": 9
+      "rfc1918_ipv4": {
+        "sha256:551c00040b924f8811eae1441c56becd1f63adb09c7804873bcfbdbb3bc7a86d": 9
+      }
     },
     "reason": "Historical public release evidence; exact detector counts are pinned."
   },
   "docs/RELEASE_WRAP_0.22.0.md": {
     "findings": {
-      "compact_lab_host_id": 1
+      "compact_lab_host_id": {
+        "sha256:2aad1662600d1dadc9b7eecccdaa1e4f6a9ecb82a47fa4442b3e9ba8142ecaa2": 1
+      }
     },
     "reason": "Historical public release evidence; exact detector counts are pinned."
   },
   "docs/SAS_DIAGNOSTIC_DECODER_SOURCES.md": {
     "findings": {
-      "compact_lab_host_id": 5,
-      "local_windows_drive_path": 2
+      "compact_lab_host_id": {
+        "sha256:ae0d07c6a43fdd10b7fdc15191c1006bb713fbac6831568bbc6bfae8b4726988": 5
+      },
+      "local_windows_drive_path": {
+        "sha256:7a05f5c96196287ba6c88a625edc3559db28bdf51295f9b947ebe038c7b0e254": 2
+      }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
   "docs/SSH_READ_ONLY_SETUP.md": {
     "findings": {
-      "internal_hostname": 1
+      "internal_hostname": {
+        "sha256:d7a7d53fca74148c85df8ac218d69e03814e7ba618e3dbb45a6713024a337023": 1
+      }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
   "docs/STORAGE_VIEW_CONFIG_SKETCH.md": {
     "findings": {
-      "internal_hostname": 2,
-      "realistic_serial_example": 4,
-      "rfc1918_ipv4": 2,
-      "sas_wwn_identifier": 1
+      "internal_hostname": {
+        "sha256:8651e716e2e5a1e65984c718ab296b6f5935b082238f1a72d0dbc06f7ad3a822": 2
+      },
+      "realistic_serial_example": {
+        "sha256:356dd221e9c2c1faeb0eb97650e64276050ac2d3aa9c5f8e4ecc409b25654b3f": 4
+      },
+      "rfc1918_ipv4": {
+        "sha256:8af795bbd88a16011c8719477bf18ba19888f88653ffe91ee32c7a99f74d892d": 2
+      },
+      "sas_wwn_identifier": {
+        "sha256:6a14d3e9357bc3ad09490b292d315eea40e4ce7a33b7330b9ec577328d34cbad": 1
+      }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
   "docs/STORAGE_VIEW_NOTES.md": {
     "findings": {
-      "local_windows_drive_path": 1
+      "local_windows_drive_path": {
+        "sha256:db48f10d2e9456c9da54ec5c9cdc6658a257392946f9bb10b62ae404515ea387": 1
+      }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
   "docs/STORAGE_VIEW_PLAN.md": {
     "findings": {
-      "local_windows_drive_path": 1
+      "local_windows_drive_path": {
+        "sha256:db48f10d2e9456c9da54ec5c9cdc6658a257392946f9bb10b62ae404515ea387": 1
+      }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
   "docs/UNVR_NOTES.md": {
     "findings": {
-      "private_posix_host_path": 1,
-      "rfc1918_ipv4": 2
+      "private_posix_host_path": {
+        "sha256:589860de91990ee77f5b6b71462509db391c54ba74a5fa094b4e03358525ed28": 1
+      },
+      "rfc1918_ipv4": {
+        "sha256:d068e92614c805add869337565ef8f225248552c088640baaa2ab0b427742b70": 2
+      }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
   "docs/V0_20_SAS_FABRIC_PLAN.md": {
     "findings": {
-      "compact_lab_host_id": 2,
-      "rfc1918_ipv4": 1
+      "compact_lab_host_id": {
+        "sha256:6827e135b9d9d07835934f36afdda7ca4f9f8c6d83d0671f8783d2319e9dc21e": 2
+      },
+      "rfc1918_ipv4": {
+        "sha256:86222564ab45953d14259e5136d4af5b7b722ee0fd3a3e241a977af973dd1a9f": 1
+      }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
   "docs/V0_9_0_PLAN.md": {
     "findings": {
-      "local_windows_drive_path": 2
+      "local_windows_drive_path": {
+        "sha256:2ff8e3b4c2b6bb61f35cda6199124efcd284fbed228cd7a901562ca807b6cac5": 2
+      }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
   },
   "history_service/config.py": {
     "findings": {
-      "internal_hostname": 1
+      "internal_hostname": {
+        "sha256:4fa25391e6ffa97d947a379c74b6f7f5bf502da1638911d3635b59675de1ca47": 1
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "history_service/segment_migration.py": {
     "findings": {
-      "sas_wwn_identifier": 1
+      "sas_wwn_identifier": {
+        "sha256:177c6558d1f427f30d865da7602dcf3c040fb7895def02e82f885ec38808483b": 1
+      }
     },
     "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
   },
   "public-demo/index.html": {
     "findings": {
-      "compact_lab_host_id": 3,
-      "sas_wwn_identifier": 683
+      "compact_lab_host_id": {
+        "sha256:53a13e21199cb549462704b9d319d0eef5ff654df15691a558e71f213f73b0aa": 3
+      },
+      "sas_wwn_identifier": {
+        "sha256:d6aeb1462173590f2a894f4cc5b68868ae5cfcbcb50dd09c9e469039c98e5d24": 683
+      }
     },
     "reason": "Generated sanitized demo; the dedicated artifact privacy checker also applies."
   },
   "qa/fixtures/admin-cleanroom-config.yaml": {
     "findings": {
-      "internal_hostname": 1
+      "internal_hostname": {
+        "sha256:88902ce067180f5aeed0a7b915d8b6f4d2fa40a140384a5b1f3ef889ae87eff2": 1
+      }
     },
     "reason": "Deterministic clean-room QA fixture; exact detector counts are pinned."
   },
   "scripts/capture_readme_screenshots.py": {
     "findings": {
-      "sas_wwn_identifier": 3
+      "sas_wwn_identifier": {
+        "sha256:14d804e199a8dc6ef9135c3ba57ebdb1b09863e54f376dfcaf76f489e7da40e7": 3
+      }
     },
     "reason": "Reviewed source literal for sanitized capture or QA tooling."
   },
   "scripts/capture_release_workflow_screenshots.py": {
     "findings": {
-      "sas_wwn_identifier": 1
+      "sas_wwn_identifier": {
+        "sha256:1db7e953a8d3c1f608849c82baea4a3dd644eddda8fcfb6549a9309fdc6ce3af": 1
+      }
     },
     "reason": "Reviewed source literal for sanitized capture or QA tooling."
   },
   "scripts/capture_visual_tour_screenshots.py": {
     "findings": {
-      "sas_wwn_identifier": 2
+      "sas_wwn_identifier": {
+        "sha256:d668a8016f0fedbc2b575fd354893af98db8f827928584dedf3439b8ac719581": 2
+      }
     },
     "reason": "Reviewed source literal for sanitized capture or QA tooling."
   },
   "scripts/run_private_qa_restore.py": {
     "findings": {
-      "sas_wwn_identifier": 3
+      "sas_wwn_identifier": {
+        "sha256:479fe06a1501613678ecaf5e941298396c5f0db1a2ad0cdcb0cca2365b6759f4": 3
+      }
     },
     "reason": "Reviewed source literal for sanitized capture or QA tooling."
   },
   "tests/fixtures/ci-smoke-config.yaml": {
     "findings": {
-      "internal_hostname": 1
+      "internal_hostname": {
+        "sha256:88902ce067180f5aeed0a7b915d8b6f4d2fa40a140384a5b1f3ef889ae87eff2": 1
+      }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
   "tests/fixtures/platform_parity/scale_md1280_lsblk.json": {
     "findings": {
-      "sas_wwn_identifier": 102
+      "sas_wwn_identifier": {
+        "sha256:3ccbe5112efbec731d0e27842368be46254b8f210ce527a6d47f0bedf6f1c16d": 102
+      }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
   "tests/fixtures/platform_parity/scale_md1280_sg1_aes.txt": {
     "findings": {
-      "sas_wwn_identifier": 146
+      "sas_wwn_identifier": {
+        "sha256:9d24c7e0b98bfe3813b0369b8b2fdf7433a4508e45c64fbc0651263dc76a4e9a": 146
+      }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
   "tests/fixtures/platform_parity/scale_md1280_sg1_join.txt": {
     "findings": {
-      "sas_wwn_identifier": 169
+      "sas_wwn_identifier": {
+        "sha256:aeb3c7a73e98ea72f73532947568a463ca976e277bc165de6bc84b536b822289": 169
+      }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
   "tests/fixtures/platform_parity/scale_md1280_sg76_aes.txt": {
     "findings": {
-      "sas_wwn_identifier": 48
+      "sas_wwn_identifier": {
+        "sha256:b6e262728046cf7f7630f4796bb290b2d399f7c1ff18dc2dcb8b50cfef5c5ba0": 48
+      }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
   "tests/fixtures/platform_parity/scale_md1280_sg76_join.txt": {
     "findings": {
-      "sas_wwn_identifier": 71
+      "sas_wwn_identifier": {
+        "sha256:1424e3897e17c3dc3f59feba9f7db617cd1a6fab9371ae3e925c7a41b29b43de": 71
+      }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
   "tests/fixtures/platform_parity/scale_sg26_aes.txt": {
     "findings": {
-      "sas_wwn_identifier": 5
+      "sas_wwn_identifier": {
+        "sha256:7bf51d3acaa6db57688e0bba288d05ee49f53c7907908f00c1b611838dfd862c": 5
+      }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
   "tests/fixtures/platform_parity/scale_sg26_ec.txt": {
     "findings": {
-      "sas_wwn_identifier": 1
+      "sas_wwn_identifier": {
+        "sha256:c9e028f36e6f2fa3b882dde7ad00146233c3a85427efae01819fae81f937f7a7": 1
+      }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
   "tests/fixtures/platform_parity/scale_sg37_aes.txt": {
     "findings": {
-      "sas_wwn_identifier": 5
+      "sas_wwn_identifier": {
+        "sha256:009ede6a0ee10ba45d47dbb7a12411d7d4e40069ba5ebbf27d50d3c42c718012": 5
+      }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
   "tests/fixtures/platform_parity/scale_sg37_ec.txt": {
     "findings": {
-      "sas_wwn_identifier": 1
+      "sas_wwn_identifier": {
+        "sha256:fb0895aff56a9b41abd3c9a769e3911be438e0f7238b78b9aafe04e0844937af": 1
+      }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
   "tests/fixtures/platform_parity/scale_shared_sata_aes.txt": {
     "findings": {
-      "sas_wwn_identifier": 12
+      "sas_wwn_identifier": {
+        "sha256:662081eed48ef45ce224fa85e21dfa5113c2fa73b2f1a45ee47076549515c6ed": 12
+      }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
   "tests/js/mapping_health_accessibility.test.js": {
     "findings": {
-      "local_windows_drive_path": 3
+      "local_windows_drive_path": {
+        "sha256:0cea7f689a7d8ac2c8aafa4f725289719c93896f78ac0269723d243721e52975": 3
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_account_bootstrap.py": {
     "findings": {
-      "internal_hostname": 2,
-      "private_posix_host_path": 2,
-      "rfc1918_ipv4": 1
+      "internal_hostname": {
+        "sha256:cb345dd95355b12b3628a9305b73277c0689a0b7dc4920453b607fc8ac81cda6": 2
+      },
+      "private_posix_host_path": {
+        "sha256:989baf8b8d6cd45c0744bd9a210f537a81a26e6e7c9ff4ee5354e978a7211d4c": 2
+      },
+      "rfc1918_ipv4": {
+        "sha256:6afee82c6c0baca5a6edbeda9126ae22eea7e9e672bf99a1fe15e1b3410c23f3": 1
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_admin_runtime_routes.py": {
     "findings": {
-      "internal_hostname": 2
+      "internal_hostname": {
+        "sha256:fc454cd9cc883b7d091a802353a389b5112e0973eaf40f9b55f1ecf08689ce59": 2
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_admin_service.py": {
     "findings": {
-      "internal_hostname": 15,
-      "local_windows_drive_path": 40,
-      "rfc1918_ipv4": 10,
-      "sas_wwn_identifier": 2
+      "internal_hostname": {
+        "sha256:e65220bb602f725a06bfcbbbe8bf34468eb6de7f9ca72a22d44aef5859595c44": 15
+      },
+      "local_windows_drive_path": {
+        "sha256:7f6282e3cefc483276f2e92b51ae0aba800789df402b8e3185e3969ea3628138": 40
+      },
+      "rfc1918_ipv4": {
+        "sha256:d5363628e881b66d6825605a543b014632618b3b9bd14cc2cc8bac61f17222ec": 10
+      },
+      "sas_wwn_identifier": {
+        "sha256:7d33aabd5f337ddf08d57b26bb11daaf32f48f1a28a849f646e9bdf16565d00e": 2
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_container_contract.py": {
     "findings": {
-      "sas_wwn_identifier": 1
+      "sas_wwn_identifier": {
+        "sha256:572dee6fa33b24eaf17e44d8dc6212019c5b3fb15e70c6e8fe6068aa90cb014a": 1
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_enclosure_option_labels.py": {
     "findings": {
-      "sas_wwn_identifier": 43
+      "sas_wwn_identifier": {
+        "sha256:90dbae0f1fb794df9da9e764bc90693b6af781ecaf488a6e886266de7df53e61": 43
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_esxi_host_prep.py": {
     "findings": {
-      "compact_lab_host_id": 1,
-      "rfc1918_ipv4": 5
+      "compact_lab_host_id": {
+        "sha256:98e2036972c8a7b8aab309e0340808b7499a8815247f266cfb61b170f421a2c6": 1
+      },
+      "rfc1918_ipv4": {
+        "sha256:b24a5590a87e1464303bbeeb4f749247b8aa5db2c7d8d60693e27c1a2a23b706": 5
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_history_service.py": {
     "findings": {
-      "sas_wwn_identifier": 87
+      "sas_wwn_identifier": {
+        "sha256:0c10903c0b9341a6962bb8367ed1cfd2c3617e9b24bee4e1ec589058e23f744b": 87
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_inventory.py": {
     "findings": {
-      "internal_hostname": 11,
-      "private_posix_host_path": 3,
-      "rfc1918_ipv4": 116,
-      "sas_wwn_identifier": 183
+      "internal_hostname": {
+        "sha256:ff095ec093fecb52a418c3ca29f090428f7b016f764d9d66863e839da04bd09f": 11
+      },
+      "private_posix_host_path": {
+        "sha256:2c4bad5b735e2092c0fe4941ec6ec0cce684ba68e202180166d25e5fec72f9fe": 3
+      },
+      "rfc1918_ipv4": {
+        "sha256:12c01b41995df68196d0f7811b34603c9222d1e26c3448ee6dd9d001b9fdde2a": 116
+      },
+      "sas_wwn_identifier": {
+        "sha256:daa4365d1b04d53645964349d0b5e841ac4b31dad5eaa081bdcddf5a65a8540a": 183
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_parsers.py": {
     "findings": {
-      "private_posix_host_path": 1,
-      "sas_wwn_identifier": 132
+      "private_posix_host_path": {
+        "sha256:39de09fc25e538bb2bb7ccf330b7ffbdfaf157185f2e123cf78e2ddb148909e8": 1
+      },
+      "sas_wwn_identifier": {
+        "sha256:01dfe62297a5d49e72e11f31ebbb4c902a934a4e574934c4ecdd6a64d054b856": 132
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_perf.py": {
     "findings": {
-      "local_windows_drive_path": 2
+      "local_windows_drive_path": {
+        "sha256:029efe121573436cdf726448d03f8d3e7c58ede9e17b19f56ff0304fdfdc66ed": 2
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_perf_budgets.py": {
     "findings": {
-      "local_windows_drive_path": 1
+      "local_windows_drive_path": {
+        "sha256:c3c036524a45fd986635d22ea3ca616775fe9a3b2f8cbbc057b75e9c9540a54a": 1
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_platform_parity_fixtures.py": {
     "findings": {
-      "rfc1918_ipv4": 4,
-      "sas_wwn_identifier": 11
+      "rfc1918_ipv4": {
+        "sha256:b839bb1e7548e77823ba8072adcd5a810b99c17f7425a704ac6e0c2ed244dcc4": 4
+      },
+      "sas_wwn_identifier": {
+        "sha256:fcf42bed0124b37bc713ac15d8a0a9ec63952cae6b886fb01c61651f36d35bb3": 11
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_private_qa_restore.py": {
     "findings": {
-      "rfc1918_ipv4": 3
+      "rfc1918_ipv4": {
+        "sha256:c68326e1093cc4427ce971259cb6da0f0dfe7a1c08c6779a23cf508097f4d0aa": 3
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_public_demo_fixture.py": {
     "findings": {
-      "sas_wwn_identifier": 4
+      "sas_wwn_identifier": {
+        "sha256:3b83745e02f361c09757b5666c6f2bf194e5fec71c55bee53b4fbe7a884b07a6": 4
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_public_doc_privacy.py": {
     "findings": {
-      "rfc1918_ipv4": 4
+      "rfc1918_ipv4": {
+        "sha256:69bf0609807131bf1283e77de0c657a455a49364096c8dd41706228b205e7611": 6
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_quantastor_api.py": {
     "findings": {
-      "rfc1918_ipv4": 1
+      "rfc1918_ipv4": {
+        "sha256:dededa22d6e593f0768490b5740c55e59d3d2a4a64c740b491398accae896238": 1
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_sas_fabric.py": {
     "findings": {
-      "private_posix_host_path": 2,
-      "sas_wwn_identifier": 45
+      "private_posix_host_path": {
+        "sha256:bd75f1c570c55f6c27e66b877dcd71e9ae3631f51974e5efa245a1cc6df86bdd": 2
+      },
+      "sas_wwn_identifier": {
+        "sha256:6d741a20543668acf583bcbd189cbf3a51e1cd4c478b7b3b9d8fb416686125b5": 45
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_slot_bounds_routes.py": {
     "findings": {
-      "sas_wwn_identifier": 9
+      "sas_wwn_identifier": {
+        "sha256:1a3d2f5b66455dc3466bfe150d760f198aa2fd50408f39ab9b89752c2595a4b4": 9
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_snapshot_export.py": {
     "findings": {
-      "compact_lab_host_id": 1,
-      "rfc1918_ipv4": 6,
-      "sas_wwn_identifier": 11
+      "compact_lab_host_id": {
+        "sha256:fa6401a9ffe2e315c3b60f36a6453ab8a4bd4e5a8bf44e8974813bd43a5ff9c1": 1
+      },
+      "rfc1918_ipv4": {
+        "sha256:6cb8593861b5a374425ec6c3b1fd75ccb83715cba8df9695ac9bcfa8396bae02": 6
+      },
+      "sas_wwn_identifier": {
+        "sha256:3af69c52ab86b0ca7caec431df623cf7bea31b0a72383df0e9987c51d6569da4": 11
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_ssh_probe.py": {
     "findings": {
-      "rfc1918_ipv4": 4
+      "rfc1918_ipv4": {
+        "sha256:0dcec5eabe26c04c47b36ef831a1343a773b69481576468fdb8773c948cb5181": 4
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_system_backup.py": {
     "findings": {
-      "internal_hostname": 25,
-      "local_windows_drive_path": 4,
-      "rfc1918_ipv4": 25
+      "internal_hostname": {
+        "sha256:018fdf69639e1ed1eb3d11a726b467615371e847aa590a74af06d2ca1fcf5c17": 25
+      },
+      "local_windows_drive_path": {
+        "sha256:72d1da1cfc961bc4d5ff3e9f983bd667555607f98a33e14e6e771a4445ccc49f": 4
+      },
+      "rfc1918_ipv4": {
+        "sha256:11c701a784d32ac22922225b968a0c79c4ace0c77fe68c4679e1ea8b17048e12": 25
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_tls_trust.py": {
     "findings": {
-      "internal_hostname": 25,
-      "rfc1918_ipv4": 6
+      "internal_hostname": {
+        "sha256:ccac22412e166043a753e965c5a1266766799e1739cda8dbcb9e76a0210856fd": 25
+      },
+      "rfc1918_ipv4": {
+        "sha256:1813f298dc7fefe34f88cd24b72c2468fe9a50456db28ceae1e60761363122ca": 6
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/test_truenas_ws.py": {
     "findings": {
-      "rfc1918_ipv4": 1
+      "rfc1918_ipv4": {
+        "sha256:dededa22d6e593f0768490b5740c55e59d3d2a4a64c740b491398accae896238": 1
+      }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "wiki/Advanced-Configuration.md": {
     "findings": {
-      "internal_hostname": 8,
-      "sas_wwn_identifier": 2
+      "internal_hostname": {
+        "sha256:f1a4835c7b9ed897099c6a48ff9bb1837d8674161a0852fd0068886f1b2f3a07": 8
+      },
+      "sas_wwn_identifier": {
+        "sha256:6d8288a378ab08c9df50235706954b3b087e49ba26f33e480a0c8270f1742716": 2
+      }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
   "wiki/Docker-and-GHCR-Deployment.md": {
     "findings": {
-      "internal_hostname": 2
+      "internal_hostname": {
+        "sha256:71e4e6da9ad58267d63588348e897aa392a0a9057a18e1c51c9beb928632802a": 2
+      }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
   "wiki/Generic-Linux-Setup.md": {
     "findings": {
-      "internal_hostname": 8,
-      "private_posix_host_path": 4
+      "internal_hostname": {
+        "sha256:dbaeb2f106765ab2d0f73f2caeb7a2e3e33e3af4b115aa5fdd75e1cf77afc4fd": 8
+      },
+      "private_posix_host_path": {
+        "sha256:8b7a943008359470753be2be6d288e6cce3b3fcd25c8e709b8a031eb7f28b6bc": 4
+      }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
   "wiki/Operations-Logging-and-Metrics.md": {
     "findings": {
-      "internal_hostname": 1
+      "internal_hostname": {
+        "sha256:b0fb2f1da71ca3e8b4d5897c2f4b596761970e25bddf3ba8a47d67e28917e96f": 1
+      }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
   "wiki/Profiles-and-Custom-Layouts.md": {
     "findings": {
-      "sas_wwn_identifier": 2
+      "sas_wwn_identifier": {
+        "sha256:6d8288a378ab08c9df50235706954b3b087e49ba26f33e480a0c8270f1742716": 2
+      }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
   "wiki/Quick-Start.md": {
     "findings": {
-      "internal_hostname": 1
+      "internal_hostname": {
+        "sha256:e40435f697458ad404e9301264359a6d8bebab0e64e4d679fd25601ae62a95bc": 1
+      }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
   "wiki/SSH-Setup-and-Sudo.md": {
     "findings": {
-      "internal_hostname": 4
+      "internal_hostname": {
+        "sha256:9571ab60f5bbef2ef59f1953417ebb2f5c779a8d1af796172833fbdf07dbceb7": 4
+      }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
   "wiki/Troubleshooting.md": {
     "findings": {
-      "sas_wwn_identifier": 2
+      "sas_wwn_identifier": {
+        "sha256:6d8288a378ab08c9df50235706954b3b087e49ba26f33e480a0c8270f1742716": 2
+      }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
   "wiki/TrueNAS-CORE-Setup.md": {
     "findings": {
-      "internal_hostname": 7
+      "internal_hostname": {
+        "sha256:03562184a597ec6c60d29e1453486282c4242fb41a6632526bd6902865f8962f": 7
+      }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   },
   "wiki/TrueNAS-SCALE-Setup.md": {
     "findings": {
-      "internal_hostname": 7,
-      "sas_wwn_identifier": 2
+      "internal_hostname": {
+        "sha256:daa0423f875f805d966aa6ee513b440bc48942eba9c28967635fd3ec96fa9cfa": 7
+      },
+      "sas_wwn_identifier": {
+        "sha256:6d8288a378ab08c9df50235706954b3b087e49ba26f33e480a0c8270f1742716": 2
+      }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
   }

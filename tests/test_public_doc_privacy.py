@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -14,12 +15,14 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 EXCEPTIONS_PATH = REPOSITORY_ROOT / "tests" / "public_text_privacy_exceptions.json"
 
 
-def load_reviewed_exceptions(path: Path) -> dict[str, tuple[str, dict[str, int]]]:
+def load_reviewed_exceptions(
+    path: Path,
+) -> dict[str, tuple[str, dict[str, dict[str, int]]]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("reviewed privacy exceptions must be a JSON object")
 
-    reviewed: dict[str, tuple[str, dict[str, int]]] = {}
+    reviewed: dict[str, tuple[str, dict[str, dict[str, int]]]] = {}
     for relative_path, entry in payload.items():
         if not isinstance(relative_path, str) or not relative_path:
             raise ValueError("reviewed privacy exception paths must be non-empty strings")
@@ -31,15 +34,18 @@ def load_reviewed_exceptions(path: Path) -> dict[str, tuple[str, dict[str, int]]
         findings = entry.get("findings")
         if not isinstance(findings, dict) or not findings:
             raise ValueError(f"reviewed privacy exception for {relative_path} needs findings")
-        if any(
-            not isinstance(category, str)
-            or not category
-            or isinstance(count, bool)
-            or not isinstance(count, int)
-            or count <= 0
-            for category, count in findings.items()
-        ):
-            raise ValueError(f"reviewed privacy exception for {relative_path} has invalid findings")
+        for category, fingerprints in findings.items():
+            if not isinstance(category, str) or not category or not isinstance(fingerprints, dict) or not fingerprints:
+                raise ValueError(f"reviewed privacy exception for {relative_path} has invalid findings")
+            for fingerprint, count in fingerprints.items():
+                if (
+                    not isinstance(fingerprint, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint) is None
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count <= 0
+                ):
+                    raise ValueError(f"reviewed privacy exception for {relative_path} has invalid findings")
         reviewed[relative_path] = (reason, findings)
     return reviewed
 
@@ -116,16 +122,34 @@ def _is_safe_documentation_host(value: str) -> bool:
     return not any(address in network for network in RFC1918_NETWORKS)
 
 
-def _scan_text(text: str) -> Counter[str]:
-    findings: Counter[str] = Counter()
-    findings["rfc1918_ipv4"] += sum(
-        _is_rfc1918(match.group()) for match in IPV4_CANDIDATE.finditer(text)
+def _finding_fingerprint(category: str, values: Counter[str]) -> str:
+    serialized = json.dumps(
+        sorted(values.items()),
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
-    findings["private_posix_host_path"] += len(PRIVATE_POSIX_PATH.findall(text))
-    findings["local_windows_drive_path"] += len(LOCAL_WINDOWS_PATH.findall(text))
-    findings["internal_hostname"] += len(INTERNAL_HOST_SUFFIX.findall(text))
-    findings["compact_lab_host_id"] += len(COMPACT_LAB_HOST_ID.findall(text))
-    findings["sas_wwn_identifier"] += len(SAS_WWN_IDENTIFIER.findall(text))
+    digest = hashlib.sha256(f"{category}\0{serialized}".encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _scan_text(text: str) -> Counter[tuple[str, str]]:
+    values_by_category: dict[str, Counter[str]] = {}
+
+    def add(category: str, value: str) -> None:
+        values_by_category.setdefault(category, Counter())[value] += 1
+
+    for match in IPV4_CANDIDATE.finditer(text):
+        if _is_rfc1918(match.group()):
+            add("rfc1918_ipv4", match.group())
+    for category, pattern in (
+        ("private_posix_host_path", PRIVATE_POSIX_PATH),
+        ("local_windows_drive_path", LOCAL_WINDOWS_PATH),
+        ("internal_hostname", INTERNAL_HOST_SUFFIX),
+        ("compact_lab_host_id", COMPACT_LAB_HOST_ID),
+        ("sas_wwn_identifier", SAS_WWN_IDENTIFIER),
+    ):
+        for match in pattern.finditer(text):
+            add(category, match.group())
 
     serial_list_indent: int | None = None
     for line in text.splitlines():
@@ -133,14 +157,14 @@ def _scan_text(text: str) -> Counter[str]:
         yaml_host = YAML_HOST_FIELD.match(line)
         if yaml_host:
             host_matches.append(yaml_host.group(1))
-        findings["internal_hostname"] += sum(
-            not _is_safe_documentation_host(value) for value in host_matches
-        )
+        for value in host_matches:
+            if not _is_safe_documentation_host(value):
+                add("internal_hostname", value)
 
-        findings["realistic_serial_example"] += sum(
-            not match.group(1).upper().startswith("SANITIZED-")
-            for match in INLINE_SERIAL.finditer(line)
-        )
+        for match in INLINE_SERIAL.finditer(line):
+            value = match.group(1)
+            if not value.upper().startswith("SANITIZED-"):
+                add("realistic_serial_example", value)
 
         serial_list = SERIAL_LIST_START.match(line)
         if serial_list:
@@ -153,18 +177,23 @@ def _scan_text(text: str) -> Counter[str]:
             continue
         serial_value = SERIAL_LIST_VALUE.match(line)
         if serial_value and not serial_value.group(1).upper().startswith("SANITIZED-"):
-            findings["realistic_serial_example"] += 1
-    return +findings
+            add("realistic_serial_example", serial_value.group(1))
+    return Counter(
+        {
+            (category, _finding_fingerprint(category, values)): sum(values.values())
+            for category, values in values_by_category.items()
+        }
+    )
 
 
 def scan_tracked_public_text(
     root: Path = REPOSITORY_ROOT,
-) -> Counter[tuple[str, str]]:
-    findings: Counter[tuple[str, str]] = Counter()
+) -> Counter[tuple[str, str, str]]:
+    findings: Counter[tuple[str, str, str]] = Counter()
     for relative_path in discover_tracked_public_text(root):
         text = (root / relative_path).read_text(encoding="utf-8")
-        for category, count in _scan_text(text).items():
-            findings[(relative_path, category)] = count
+        for (category, fingerprint), count in _scan_text(text).items():
+            findings[(relative_path, category, fingerprint)] = count
     return findings
 
 
@@ -204,8 +233,15 @@ class PublicDocPrivacyTests(unittest.TestCase):
 
             findings = scan_tracked_public_text(root)
 
-        self.assertEqual(findings[("new-script.py", "rfc1918_ipv4")], 1)
-        self.assertFalse(any(path == "asset.png" for path, _category in findings))
+        self.assertEqual(
+            sum(
+                count
+                for (path, category, _fingerprint), count in findings.items()
+                if path == "new-script.py" and category == "rfc1918_ipv4"
+            ),
+            1,
+        )
+        self.assertFalse(any(path == "asset.png" for path, _category, _fingerprint in findings))
 
     def test_reviewed_exception_config_fails_closed_without_a_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -225,12 +261,19 @@ class PublicDocPrivacyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "non-empty reason"):
                 load_reviewed_exceptions(path)
 
+    def test_privacy_findings_pin_values_instead_of_only_category_counts(self) -> None:
+        first = _scan_text("host: 10.23.45.67\n")
+        replacement = _scan_text("host: 10.23.45.68\n")
+
+        self.assertNotEqual(first, replacement)
+
     def test_tracked_public_text_contains_no_unreviewed_private_lab_identifiers(self) -> None:
-        expected: Counter[tuple[str, str]] = Counter()
-        for path, (reason, category_counts) in REVIEWED_FINDING_EXCEPTIONS.items():
+        expected: Counter[tuple[str, str, str]] = Counter()
+        for path, (reason, categories) in REVIEWED_FINDING_EXCEPTIONS.items():
             self.assertTrue(reason.strip(), path)
-            for category, count in category_counts.items():
-                expected[(path, category)] = count
+            for category, fingerprints in categories.items():
+                for fingerprint, count in fingerprints.items():
+                    expected[(path, category, fingerprint)] = count
 
         findings = scan_tracked_public_text()
 
@@ -239,7 +282,7 @@ class PublicDocPrivacyTests(unittest.TestCase):
             expected,
             msg=(
                 "tracked public text privacy findings differ from reviewed exceptions: "
-                f"{json.dumps({f'{path}:{category}': count for (path, category), count in findings.items()}, sort_keys=True)}"
+                f"{json.dumps({f'{path}:{category}:{fingerprint}': count for (path, category, fingerprint), count in findings.items()}, sort_keys=True)}"
             ),
         )
 
