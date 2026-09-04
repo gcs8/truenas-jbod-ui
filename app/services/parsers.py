@@ -1812,6 +1812,10 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
         for ses_device in [*enclosure.ses_devices, enclosure.ses_device]:
             if ses_device and ses_device not in target.ses_devices:
                 target.ses_devices.append(ses_device)
+        for ses_device, count in enclosure.unplaced_sysfs_bindings_by_ses_device.items():
+            target.unplaced_sysfs_bindings_by_ses_device[ses_device] = (
+                target.unplaced_sysfs_bindings_by_ses_device.get(ses_device, 0) + count
+            )
         target.enclosure_label = target.enclosure_label or enclosure.enclosure_label
         target.profile_id = target.profile_id or enclosure.profile_id
         target.layout_rows = target.layout_rows or enclosure.layout_rows
