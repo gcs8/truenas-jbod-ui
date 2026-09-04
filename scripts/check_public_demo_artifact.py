@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import __version__  # noqa: E402
+from scripts.public_demo_source_parity import check_source_parity_manifest  # noqa: E402
 
 
 DEFAULT_DEMO_DIR = Path("public-demo")
@@ -83,6 +84,12 @@ def parse_args() -> argparse.Namespace:
             f"Defaults to {DEFAULT_MAX_GZIP_BYTES}; pass 0 to disable."
         ),
     )
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=ROOT,
+        help="Repository root containing authoritative app assets and templates.",
+    )
     return parser.parse_args()
 
 
@@ -117,6 +124,7 @@ def main() -> int:
         )
 
     html = raw_bytes.decode("utf-8")
+    errors.extend(check_source_parity_manifest(html, source_root=args.source_root))
     for marker in REQUIRED_MARKERS:
         if marker not in html:
             errors.append(f"missing required marker: {marker}")
