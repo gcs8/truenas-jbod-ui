@@ -4966,6 +4966,99 @@ class SystemSetupServiceTests(unittest.TestCase):
 
                 self.assertEqual(yaml.safe_load(config_path.read_text(encoding="utf-8")), original)
 
+    def test_save_system_rejects_preserved_bmc_secret_when_authority_changes(self) -> None:
+        cases = {
+            "platform": {"platform": "scale"},
+            "host": {"bmc_host": "replacement-bmc.example.test"},
+            "username": {"bmc_username": "replacement-operator"},
+            "tls-verification": {"bmc_verify_ssl": False},
+        }
+        for label, update in cases.items():
+            with self.subTest(authority_field=label), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.yaml"
+                original: dict[str, object] = {
+                    "systems": [
+                        {
+                            "id": "synthetic-system",
+                            "truenas": {
+                                "host": "https://saved-api.example.test",
+                                "platform": "core",
+                            },
+                            "bmc": {
+                                "enabled": True,
+                                "host": "saved-bmc.example.test",
+                                "username": "saved-operator",
+                                "password": "SYNTHETIC-SAVED-BMC-PASSWORD-362",
+                                "verify_ssl": True,
+                            },
+                        }
+                    ]
+                }
+                write_yaml(config_path, original)
+                original_bytes = config_path.read_bytes()
+                request_values = {
+                    "system_id": "synthetic-system",
+                    "label": "Synthetic system",
+                    "platform": "core",
+                    "truenas_host": "https://saved-api.example.test",
+                    "bmc_enabled": True,
+                    "bmc_host": "saved-bmc.example.test",
+                    "bmc_username": "saved-operator",
+                    "bmc_password": PRESERVE_SECRET_SENTINEL,
+                    "bmc_verify_ssl": True,
+                    "replace_existing": True,
+                    **update,
+                }
+
+                with self.assertRaisesRegex(ValueError, "saved connection settings"):
+                    SystemSetupService(str(config_path)).save_system(SystemSetupRequest(**request_values))
+
+                self.assertEqual(config_path.read_bytes(), original_bytes)
+
+    def test_save_system_preserves_bmc_secret_for_unchanged_effective_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            original: dict[str, object] = {
+                "systems": [
+                    {
+                        "id": "synthetic-system",
+                        "truenas": {
+                            "host": "https://saved-api.example.test",
+                            "platform": "core",
+                        },
+                        "bmc": {
+                            "enabled": True,
+                            "host": "saved-bmc.example.test",
+                            "username": "saved-operator",
+                            "password": "SYNTHETIC-SAVED-BMC-PASSWORD-362",
+                            "verify_ssl": True,
+                        },
+                    }
+                ]
+            }
+            write_yaml(config_path, original)
+
+            SystemSetupService(str(config_path)).save_system(
+                SystemSetupRequest(
+                    system_id="synthetic-system",
+                    label="Synthetic system revised",
+                    platform="core",
+                    truenas_host="https://saved-api.example.test",
+                    bmc_enabled=True,
+                    bmc_host="https://SAVED-BMC.EXAMPLE.TEST/",
+                    bmc_username="saved-operator",
+                    bmc_password=PRESERVE_SECRET_SENTINEL,
+                    bmc_verify_ssl=True,
+                    replace_existing=True,
+                )
+            )
+
+            saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                saved["systems"][0]["bmc"]["password"],
+                "SYNTHETIC-SAVED-BMC-PASSWORD-362",
+            )
+
     def test_save_system_rejects_preserved_ssh_secrets_when_authority_changes(self) -> None:
         cases = {
             "platform": {"platform": "scale"},

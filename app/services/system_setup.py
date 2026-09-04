@@ -23,6 +23,7 @@ from app.config import (
 from app.models.domain import SystemSetupRequest
 from app.services.credential_authority import (
     api_credential_authority,
+    bmc_credential_authority,
     same_credential_authorities,
     same_credential_authority,
     ssh_credential_authorities,
@@ -374,6 +375,28 @@ class SystemSetupService:
                     strict_host_key_checking=payload.ssh_strict_host_key_checking,
                 )
                 if not same_credential_authorities(requested_authorities, saved_authorities):
+                    raise ValueError(
+                        "A saved secret can only be reused with its saved connection settings."
+                    )
+
+            if payload.bmc_password == PRESERVE_SECRET_SENTINEL:
+                saved_authority = (
+                    bmc_credential_authority(
+                        platform=existing_system.truenas.platform,
+                        host=existing_system.bmc.host,
+                        username=existing_system.bmc.username,
+                        verify_tls=existing_system.bmc.verify_ssl,
+                    )
+                    if existing_system is not None
+                    else None
+                )
+                requested_authority = bmc_credential_authority(
+                    platform=payload.platform,
+                    host=payload.bmc_host,
+                    username=payload.bmc_username,
+                    verify_tls=payload.bmc_verify_ssl,
+                )
+                if not same_credential_authority(requested_authority, saved_authority):
                     raise ValueError(
                         "A saved secret can only be reused with its saved connection settings."
                     )

@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 @dataclass(frozen=True)
 class CredentialAuthority:
     platform: str
-    transport: Literal["api", "ssh"]
+    transport: Literal["api", "bmc", "ssh"]
     endpoint: tuple[object, ...]
     port: int | None
     username: str
@@ -38,6 +38,28 @@ def api_credential_authority(
         verify_tls=bool(verify_tls),
         tls_ca_bundle_path=_text(tls_ca_bundle_path),
         tls_server_name=_text(tls_server_name),
+    )
+
+
+def bmc_credential_authority(
+    *,
+    platform: str, host: str | None,
+    username: str | None,
+    verify_tls: bool,
+) -> CredentialAuthority | None:
+    normalized_host = _text(host)
+    if normalized_host and "://" not in normalized_host:
+        normalized_host = f"https://{normalized_host}"
+    endpoint = _endpoint_identity(normalized_host, include_resource=True)
+    if endpoint is None:
+        return None
+    return CredentialAuthority(
+        platform=_text(platform).lower(),
+        transport="bmc",
+        endpoint=endpoint,
+        port=None,
+        username=_text(username),
+        verify_tls=bool(verify_tls),
     )
 
 
