@@ -121,6 +121,16 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIn("no-changelog", result.messages[0])
 
+    def test_dependencies_label_passes_without_entry(self) -> None:
+        self._write("requirements.txt", "fastapi==0.999.0" + chr(10))
+        self._write("Dockerfile", "FROM python:3.12-slim" + chr(10))
+        self._commit("chore(deps): bump fastapi")
+
+        result = self._evaluate(labels={"dependencies", "python"})
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn("dependencies", result.messages[0])
+
     def test_change_outside_operator_visible_paths_passes(self) -> None:
         self._write("tests/test_service.py", "def test_more() -> None:\n    pass\n")
         self._write("README.md", "# readme\n")

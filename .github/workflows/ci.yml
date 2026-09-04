@@ -80,8 +80,10 @@ jobs:
         run: |
           set -euo pipefail
           # Labels are read live so applying `no-changelog` and re-running the
-          # job takes effect without a new push. The gate script itself only
-          # runs git; it never talks to the network.
+          # job takes effect without a new push. `dependencies` (Dependabot)
+          # skips the gate the same way; release.yml still lists those PRs
+          # under Dependencies. The gate script itself only runs git; it
+          # never talks to the network.
           labels="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | join(",")')"
           python3 scripts/check_changelog_entry.py \
             --base "$PR_BASE_SHA" \
