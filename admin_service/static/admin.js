@@ -4313,6 +4313,27 @@
     return { allowed: true, guidance: null };
   }
 
+  // Full backup export always sends scrub_secrets=false, so the server's export policy
+  // (validate_admin_export_policy) can only accept it encrypted unless plaintext export is
+  // explicitly allowed. Preflight the same rule here so the button says so before the click (#284).
+  function getBackupExportPolicy() {
+    const encrypt = Boolean(elements.backupEncryptToggle?.checked);
+    const passphrase = readOptionalSecretValue(elements.backupExportPassphrase);
+    if (encrypt && !passphrase) {
+      return {
+        allowed: false,
+        guidance: "Enter a passphrase before exporting an encrypted backup.",
+      };
+    }
+    if (!encrypt && !Boolean(state.backupDefaults?.allow_plaintext_backup_export)) {
+      return {
+        allowed: false,
+        guidance: "Enable encryption before exporting a full backup. Plaintext backup export is disabled unless ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true.",
+      };
+    }
+    return { allowed: true, guidance: null };
+  }
+
   function syncBackupControls() {
     let rerenderPaths = false;
     if (elements.debugScrubSecretsToggle?.checked) {
@@ -4344,8 +4365,18 @@
       manualEncryptKey: "debugManualEncrypt",
     });
     const debugPolicy = getDebugExportPolicy();
+    const backupPolicy = getBackupExportPolicy();
     if (elements.backupExportButton) {
-      elements.backupExportButton.disabled = !state.selectedBackupPaths.length;
+      elements.backupExportButton.disabled = !state.selectedBackupPaths.length || !backupPolicy.allowed;
+    }
+    if (elements.backupExportResult) {
+      if (!backupPolicy.allowed) {
+        elements.backupExportResult.textContent = backupPolicy.guidance;
+        state.backupExportPolicyGuidanceActive = true;
+      } else if (state.backupExportPolicyGuidanceActive) {
+        elements.backupExportResult.textContent = "Exports can stay live, or you can pause the read surfaces first for a cleaner point-in-time bundle.";
+        state.backupExportPolicyGuidanceActive = false;
+      }
     }
     if (elements.backupExportRestartToggle) {
       const stopEnabled = Boolean(elements.backupExportStopToggle?.checked);
@@ -5661,8 +5692,10 @@
     const encrypt = Boolean(elements.backupEncryptToggle?.checked);
     const passphrase = readOptionalSecretValue(elements.backupExportPassphrase);
     const packaging = elements.backupPackaging?.value || "tar.zst";
-    if (encrypt && !passphrase) {
-      setBanner("Enter a passphrase before exporting an encrypted backup.", "error");
+    const policy = getBackupExportPolicy();
+    if (!policy.allowed) {
+      setBanner(policy.guidance, "error");
+      syncBackupControls();
       return;
     }
     if (elements.backupExportButton) {
@@ -5722,9 +5755,7 @@
       }
       setBanner(`Full backup export failed: ${error.message || error}`, "error");
     } finally {
-      if (elements.backupExportButton) {
-        elements.backupExportButton.disabled = false;
-      }
+      syncBackupControls();
     }
   }
 
@@ -6524,6 +6555,7 @@
       state.backupManualEncrypt = Boolean(elements.backupEncryptToggle?.checked);
       syncBackupControls();
     });
+    elements.backupExportPassphrase?.addEventListener("input", syncBackupControls);
     elements.backupPackaging?.addEventListener("change", () => {
       if (!bundleHasLockedSelection("backup") && elements.backupPackaging?.value && elements.backupPackaging.value !== "7z") {
         state.backupLastPlainPackaging = elements.backupPackaging.value;
