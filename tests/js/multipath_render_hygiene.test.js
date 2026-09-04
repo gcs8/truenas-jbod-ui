@@ -91,3 +91,87 @@ for (const [label, source] of SOURCES) {
     assert.match(html, /<small>ACTIVE&quot; DATA-UNSAFE=&quot;YES \/ Controller A<\/small>/);
   });
 }
+
+const LIVE_SOURCE = SOURCES[0][1];
+
+function loadLiveSlotTileRenderer(source) {
+  const sandbox = vm.createContext({});
+  const script = [
+    "function isPlaceholderHintLabel() { return false; }",
+    functionSource(source, "escapeHtml"),
+    functionSource(source, "stateLabel"),
+    functionSource(source, "slotPrimaryLabel"),
+    functionSource(source, "buildLiveSlotTileMarkup"),
+    "this.__buildLiveSlotTileMarkup = buildLiveSlotTileMarkup;",
+  ].join("\n");
+  vm.runInContext(script, sandbox, { filename: "live-slot-tile-hygiene.behavior.js" });
+  return sandbox.__buildLiveSlotTileMarkup;
+}
+
+function loadTopologyRenderer(source) {
+  const target = { innerHTML: "", querySelectorAll: () => [] };
+  const sandbox = vm.createContext({ __topologyTarget: target });
+  const script = [
+    "const topologyContext = __topologyTarget;",
+    "const state = { snapshot: { slots: [] } };",
+    "function currentPlatform() { return 'truenas'; }",
+    "function selectSlot() {}",
+    functionSource(source, "escapeHtml"),
+    functionSource(source, "sasFabricClassToken"),
+    functionSource(source, "hasStoragePeerGroup"),
+    functionSource(source, "sameStoragePeerGroup"),
+    functionSource(source, "renderTopologyContext"),
+    [
+      "this.__renderTopologyContext = (slots, slot) => {",
+      "  state.snapshot.slots = slots;",
+      "  renderTopologyContext(slot);",
+      "  return topologyContext.innerHTML;",
+      "};",
+    ].join("\n"),
+  ].join("\n");
+  vm.runInContext(script, sandbox, { filename: "topology-render-hygiene.behavior.js" });
+  return sandbox.__renderTopologyContext;
+}
+
+test("live asset escapes the slot label in the live slot tile", () => {
+  const buildLiveSlotTileMarkup = loadLiveSlotTileRenderer(LIVE_SOURCE);
+  const html = buildLiveSlotTileMarkup({
+    slot_label: '01"><img src=x onerror="boom">',
+    state: "present",
+    present: true,
+    device_name: "sda",
+    pool_name: "tank",
+  });
+
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /<span class="slot-number">01&quot;&gt;&lt;img src=x onerror=&quot;boom&quot;&gt;<\/span>/);
+});
+
+test("live asset bounds the topology pill state token and escapes its slot label", () => {
+  const renderTopologyContext = loadTopologyRenderer(LIVE_SOURCE);
+  const selected = {
+    slot: 1,
+    pool_name: "tank",
+    vdev_name: "mirror-0",
+    vdev_class: "data",
+    device_name: "sda",
+    state: "present",
+    slot_label: "01",
+    topology_label: "tank > mirror-0",
+  };
+  const peer = {
+    slot: 2,
+    pool_name: "tank",
+    vdev_name: "mirror-0",
+    vdev_class: "data",
+    device_name: "sdb",
+    state: 'present" data-unsafe="yes',
+    slot_label: '02"><img src=x onerror="boom">',
+  };
+  const html = renderTopologyContext([selected, peer], selected);
+
+  assert.doesNotMatch(html, /\sdata-unsafe=/);
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /class="topology-pill state-present-data-unsafe-yes"/);
+  assert.match(html, /<span>02&quot;&gt;&lt;img src=x onerror=&quot;boom&quot;&gt;<\/span>/);
+});

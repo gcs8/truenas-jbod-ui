@@ -2789,7 +2789,7 @@
   function buildLiveSlotTileMarkup(slot) {
     return `
       <span class="slot-status-led" aria-hidden="true"></span>
-      <span class="slot-number">${slot.slot_label}</span>
+      <span class="slot-number">${escapeHtml(slot.slot_label)}</span>
       <span class="slot-device">${escapeHtml(slotPrimaryLabel(slot))}</span>
       <span class="slot-pool">${escapeHtml(slot.pool_name || stateLabel(slot))}</span>
       <span class="slot-latch" aria-hidden="true"></span>
@@ -7803,8 +7803,8 @@
       .map((member) => {
         const selected = member.slot === slot.slot ? " selected" : "";
         return `
-          <button type="button" class="topology-pill state-${member.state}${selected}" data-topology-slot="${member.slot}">
-            <span>${member.slot_label}</span>
+          <button type="button" class="topology-pill state-${sasFabricClassToken(member.state)}${selected}" data-topology-slot="${member.slot}">
+            <span>${escapeHtml(member.slot_label)}</span>
             <small>${escapeHtml(member.device_name || member.serial || member.state)}</small>
           </button>
         `;

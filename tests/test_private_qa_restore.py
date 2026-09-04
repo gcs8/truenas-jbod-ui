@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import socket
 import stat
@@ -1051,6 +1053,55 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, text)
+
+    def test_offline_runtime_override_follows_the_offline_network_constant(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            runtime = root / "runtime"
+            with patch.object(
+                self.module,
+                "OFFLINE_NETWORK",
+                {"internal": True, "attachable": False},
+            ):
+                self.module._write_runtime_files(
+                    ROOT,
+                    runtime,
+                    "sha256:" + "a" * 64,
+                    (28080, 28081, 28082),
+                    "qa-user",
+                    "qa-password",
+                    live_read_only=False,
+                )
+            override = runtime / "qa-restore.override.yml"
+            self.assertEqual(
+                yaml.safe_load(override.read_text(encoding="utf-8")),
+                {"networks": {"default": {"internal": True, "attachable": False}}},
+            )
+
+    def test_cleanup_failure_raises_when_it_is_the_first_failure(self) -> None:
+        def failing_cleanup() -> None:
+            raise RuntimeError("synthetic cleanup failure")
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic cleanup failure"):
+            self.module._cleanup_after_run(failing_cleanup, "synthetic cleanup")
+
+    def test_cleanup_failure_is_reported_and_suppressed_while_another_error_propagates(self) -> None:
+        class BodyFailure(RuntimeError):
+            pass
+
+        def failing_cleanup() -> None:
+            raise RuntimeError("synthetic cleanup failure")
+
+        stderr = io.StringIO()
+        with self.assertRaises(BodyFailure), contextlib.redirect_stderr(stderr):
+            try:
+                raise BodyFailure("original failure")
+            finally:
+                self.module._cleanup_after_run(failing_cleanup, "synthetic cleanup")
+
+        report = stderr.getvalue()
+        self.assertIn("synthetic cleanup", report)
+        self.assertIn("synthetic cleanup failure", report)
 
 
 if __name__ == "__main__":
