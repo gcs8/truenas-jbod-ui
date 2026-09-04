@@ -314,6 +314,37 @@ class MetricsRouteTests(unittest.TestCase):
             },
         )
 
+    def test_unhandled_route_traceback_omits_source_line_literals(self) -> None:
+        app = FastAPI()
+        with patch.dict("os.environ", {"METRICS_ENABLED": "false"}, clear=False):
+            install_metrics(app, service_name="test-source-line-redaction", version="0.0.0-test")
+
+        @app.get("/source-line-boom")
+        async def source_line_boom() -> JSONResponse:
+            raise RuntimeError("synthetic middleware failure")  # TRACE_SOURCE_TOKEN /private/synthetic-source-line.db
+
+        with self.assertLogs("app.observability", level="ERROR") as captured:
+            asyncio.run(invoke_asgi(app, "/source-line-boom"))
+
+        traceback_records = [record for record in captured.records if record.exc_info]
+        self.assertEqual(len(traceback_records), 1)
+        json_traceback = json.loads(
+            JsonFormatter(service_name="test-source-line-redaction").format(traceback_records[0])
+        )["traceback"]
+        text_line = SafeTextFormatter(service_name="test-source-line-redaction").format(
+            traceback_records[0]
+        )
+
+        self.assertIn(json_traceback, text_line)
+        for source_literal in ("TRACE_SOURCE_TOKEN", "/private/synthetic-source-line.db"):
+            self.assertNotIn(source_literal, json_traceback)
+            self.assertNotIn(source_literal, text_line)
+        self.assertRegex(
+            json_traceback,
+            r'  File "test_metrics\.py", line \d+, in source_line_boom\n',
+        )
+        self.assertIn("RuntimeError", json_traceback)
+
     def test_http_method_label_is_restricted_to_known_methods(self) -> None:
         app = FastAPI()
         service_name = "test-method-label"

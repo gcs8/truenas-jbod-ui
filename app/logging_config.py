@@ -29,10 +29,24 @@ OBSERVABILITY_FIELDS = (
 # records stay free of them. A record that sets this attribute is opting in to
 # full traceback rendering; only the unhandled-error diagnostic record does.
 INCLUDE_TRACEBACK_FIELD = "include_traceback"
+TRACEBACK_FILENAME_MAX_LENGTH = 160
 
 
 def _traceback_requested(record: logging.LogRecord) -> bool:
     return bool(getattr(record, INCLUDE_TRACEBACK_FIELD, False)) and bool(record.exc_info)
+
+
+def _format_traceback_frames(traceback_object: Any) -> list[str]:
+    rendered: list[str] = []
+    for frame, line_number in traceback.walk_tb(traceback_object):
+        filename = Path(frame.f_code.co_filename).name or "<unknown>"
+        if len(filename) > TRACEBACK_FILENAME_MAX_LENGTH:
+            filename = f"...{filename[-(TRACEBACK_FILENAME_MAX_LENGTH - 3):]}"
+        rendered.append(
+            f'  File {json.dumps(filename, ensure_ascii=False)}, line {line_number}, '
+            f'in {frame.f_code.co_name}\n'
+        )
+    return rendered
 
 
 def _format_traceback_without_exception_value(exc_info: Any) -> str:
@@ -55,7 +69,7 @@ def _format_traceback_without_exception_value(exc_info: Any) -> str:
             rendered.append("\nDuring handling of the above exception, another exception occurred:\n\n")
         if current_traceback is not None:
             rendered.append("Traceback (most recent call last):\n")
-            rendered.extend(traceback.format_tb(current_traceback))
+            rendered.extend(_format_traceback_frames(current_traceback))
         rendered.append(type(value).__name__)
         if isinstance(value, BaseExceptionGroup):
             for member in value.exceptions:
@@ -71,7 +85,7 @@ def _format_traceback_without_exception_value(exc_info: Any) -> str:
     rendered = []
     if traceback_object is not None:
         rendered.append("Traceback (most recent call last):\n")
-        rendered.extend(traceback.format_tb(traceback_object))
+        rendered.extend(_format_traceback_frames(traceback_object))
     rendered.append(exception_type.__name__ if exception_type is not None else "Exception")
     return "".join(rendered)
 
@@ -118,6 +132,10 @@ class SafeTextFormatter(logging.Formatter):
         self.service_name = service_name
 
     def format(self, record: logging.LogRecord) -> str:
+        # Another handler may have cached an unsafe default rendering on the
+        # shared record. Rebuild it through this formatter's redacted path.
+        if record.exc_info:
+            record.exc_text = None
         rendered = super().format(record)
         fields: dict[str, str | int | float | bool] = {}
         if self.service_name:
