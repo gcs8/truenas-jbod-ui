@@ -522,7 +522,9 @@ class ContainerResourceContractTests(unittest.TestCase):
 
         self.assertIn("default non-root UI and history services", env_example)
         self.assertIn("Default non-root runtime", deployment_guide)
-        self.assertRegex(deployment_guide, r"before\s+the first v0\.22\.3 start")
+        self.assertRegex(deployment_guide, r"before\s+the first start on the non-root Compose file")
+        self.assertNotIn("v0.22.3", deployment_guide)
+        self.assertNotIn("v0.22.3", quick_start)
         self.assertIn("prepare_nonroot_bind_mounts.py", readme)
         self.assertIn("prepare_nonroot_bind_mounts.py", quick_start)
         self.assertIn("--apply", quick_start)
@@ -642,7 +644,12 @@ class ContainerResourceContractTests(unittest.TestCase):
         ):
             guide = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
             with self.subTest(guide=relative_path):
-                self.assertIn("../docs/ADMIN_TRUST_BOUNDARY.md", guide)
+                self.assertIn(
+                    "https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md",
+                    guide,
+                )
+                self.assertNotIn("../docs/", guide)
+                self.assertIn("ADMIN_PUBLIC_ORIGIN", guide)
                 self.assertIn("trusted operator", guide)
                 self.assertIn("Docker socket", guide)
                 self.assertIn("Auto-stop limits exposure; it is not authentication", guide)
