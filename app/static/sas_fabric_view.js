@@ -55,6 +55,8 @@
     smartRequests: {},
     aliasEditObjectId: null,
     writePolicy: normalizeFabricWritePolicy(bootstrap.writePolicy),
+    writeAuthorization: null,
+    writeAuthPending: false,
     mode: modeIds.has(initialMode) ? initialMode : "lanes",
     loading: false,
     error: null,
@@ -70,6 +72,13 @@
     apiChip: document.getElementById("fabric-api-chip"),
     statusText: document.getElementById("fabric-status-text"),
     writePolicyNotice: document.getElementById("fabric-write-policy-notice"),
+    authPanel: document.getElementById("fabric-read-ui-auth-panel"),
+    authForm: document.getElementById("fabric-read-ui-auth-form"),
+    authUsername: document.getElementById("fabric-read-ui-auth-username"),
+    authPassword: document.getElementById("fabric-read-ui-auth-password"),
+    authSubmit: document.getElementById("fabric-read-ui-auth-submit"),
+    authSignOut: document.getElementById("fabric-read-ui-auth-sign-out"),
+    authStatus: document.getElementById("fabric-read-ui-auth-status"),
     lastUpdated: document.getElementById("fabric-last-updated"),
     backLinks: Array.from(document.querySelectorAll("[data-fabric-back-link]")),
     summaryControllers: document.getElementById("fabric-summary-controllers"),
@@ -111,6 +120,110 @@
     return state.writePolicy?.reason || "Writes are disabled for this deployment.";
   }
 
+  function encodeFabricBasicAuthorization(username, password) {
+    const bytes = new TextEncoder().encode(`${username}:${password}`);
+    let binary = "";
+    bytes.forEach((byte) => {
+      binary += String.fromCharCode(byte);
+    });
+    return `Basic ${btoa(binary)}`;
+  }
+
+  function readUiAuthenticatedHeaders(url, headers = {}) {
+    if (!state.writeAuthorization) {
+      const failure = new Error("Sign in to enable this write.");
+      failure.status = 401;
+      throw failure;
+    }
+    const target = new URL(url, window.location.href);
+    if (target.origin !== window.location.origin) {
+      const failure = new Error("Write credentials can only be sent to a same-origin endpoint.");
+      failure.status = 403;
+      throw failure;
+    }
+    return { ...headers, Authorization: state.writeAuthorization };
+  }
+
+  function clearFabricAuthorization() {
+    state.writeAuthorization = null;
+    if (elements.authUsername) {
+      elements.authUsername.value = "";
+    }
+    if (elements.authPassword) {
+      elements.authPassword.value = "";
+    }
+  }
+
+  function renderFabricReadUiAuth() {
+    if (!elements.authPanel) {
+      return;
+    }
+    const available = state.writePolicy?.mode === "basic";
+    elements.authPanel.classList.toggle("hidden", !available);
+    if (!available) {
+      return;
+    }
+    const signedIn = Boolean(state.writeAuthorization);
+    elements.authForm?.classList.toggle("hidden", signedIn);
+    elements.authSignOut?.classList.toggle("hidden", !signedIn);
+    if (elements.authUsername) elements.authUsername.disabled = state.writeAuthPending;
+    if (elements.authPassword) elements.authPassword.disabled = state.writeAuthPending;
+    if (elements.authSubmit) elements.authSubmit.disabled = state.writeAuthPending;
+    if (elements.authStatus) {
+      if (state.writeAuthPending) {
+        elements.authStatus.textContent = "Checking credentials...";
+      } else if (signedIn && fabricWritePolicyAllowsWrites()) {
+        elements.authStatus.textContent = "Signed in for writes. Credentials clear on reload or sign-out.";
+      } else if (signedIn) {
+        elements.authStatus.textContent = `Signed in, but writes are blocked. ${fabricWritePolicyReason()}`;
+      } else {
+        elements.authStatus.textContent = "Reads remain anonymous. Credentials stay in this page only.";
+      }
+    }
+  }
+
+  async function submitFabricReadUiSignIn(event) {
+    event?.preventDefault();
+    if (state.writePolicy?.mode !== "basic" || state.writeAuthPending) {
+      return;
+    }
+    const username = elements.authUsername?.value || "";
+    const password = elements.authPassword?.value || "";
+    if (!username || !password) {
+      state.error = "Enter both the write username and password.";
+      render();
+      return;
+    }
+    state.writeAuthorization = encodeFabricBasicAuthorization(username, password);
+    if (elements.authPassword) elements.authPassword.value = "";
+    state.writeAuthPending = true;
+    renderFabricReadUiAuth();
+    try {
+      await fetchJson("/api/read-ui/auth/verify", { readUiAuth: true });
+      state.writePolicy = { enabled: true, mode: "basic", reason: "" };
+      state.error = null;
+    } catch (error) {
+      clearFabricAuthorization();
+      const reason = error?.message || "Write sign-in failed.";
+      state.writePolicy = { enabled: false, mode: "basic", reason };
+      state.error = reason;
+    } finally {
+      state.writeAuthPending = false;
+      render();
+    }
+  }
+
+  function signOutFabricReadUi() {
+    clearFabricAuthorization();
+    state.writePolicy = {
+      enabled: false,
+      mode: "basic",
+      reason: "Sign in to enable mapping, LED, and alias changes.",
+    };
+    state.error = null;
+    render();
+  }
+
   function fabricAliasWriteAttributes() {
     if (fabricWritePolicyAllowsWrites()) {
       return "";
@@ -129,6 +242,9 @@
   function handleFabricWriteRejection(error) {
     if (!error || ![401, 403].includes(Number(error.status))) {
       return false;
+    }
+    if (Number(error.status) === 401) {
+      clearFabricAuthorization();
     }
     const reason = error.detail || error.message || "Write access was rejected.";
     state.writePolicy = {
@@ -767,9 +883,12 @@
   }
 
   async function fetchJson(url, options = {}) {
+    const { readUiAuth = false, ...requestOptions } = options;
+    const headers = { "Content-Type": "application/json", ...(requestOptions.headers || {}) };
+    const requestHeaders = readUiAuth ? readUiAuthenticatedHeaders(url, headers) : headers;
     const response = await fetch(url, {
-      ...options,
-      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      ...requestOptions,
+      headers: requestHeaders,
     });
     let payload;
     try {
@@ -3153,6 +3272,7 @@
     try {
       await fetchJson(scopedUrl("/api/sas-fabric/aliases"), {
         method: "POST",
+        readUiAuth: true,
         body: JSON.stringify(payload),
       });
       state.aliasEditObjectId = null;
@@ -3529,6 +3649,7 @@
     renderWarnings();
     renderModeChrome();
     renderFabricWritePolicyNotice();
+    renderFabricReadUiAuth();
     renderMap();
     ensureSelectedSmartSummary();
     syncLocation();
@@ -3750,6 +3871,15 @@
     const target = event.target instanceof Element ? event.target : event.target?.parentElement;
     handleFabricActivation(target);
   });
+
+  if (elements.authForm) {
+    elements.authForm.addEventListener("submit", (event) => {
+      void submitFabricReadUiSignIn(event);
+    });
+  }
+  if (elements.authSignOut) {
+    elements.authSignOut.addEventListener("click", signOutFabricReadUi);
+  }
 
   document.addEventListener("submit", (event) => {
     const form = event.target instanceof HTMLFormElement ? event.target : null;

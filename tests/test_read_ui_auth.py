@@ -255,6 +255,51 @@ class ReadUIAuthorizationTests(unittest.TestCase):
         self.assertEqual(conflicting_referer_mutation, 403)
         self.assertEqual(duplicate_origin_mutation, 403)
 
+    def test_basic_mode_exposes_a_non_mutating_credential_verification_endpoint(self) -> None:
+        basic_app = self.make_app(
+            auth_mode="basic",
+            public_origin="http://ui.example.test:8080",
+        )
+        network_app = self.make_app(auth_mode="network")
+
+        anonymous_status, anonymous_headers, anonymous_body = asyncio.run(
+            invoke_asgi(basic_app, "/api/read-ui/auth/verify")
+        )
+        invalid_status, _invalid_headers, invalid_body = asyncio.run(
+            invoke_asgi(
+                basic_app,
+                "/api/read-ui/auth/verify",
+                authorization=basic_header("operator", "wrong-passphrase"),
+            )
+        )
+        valid_status, valid_headers, valid_body = asyncio.run(
+            invoke_asgi(
+                basic_app,
+                "/api/read-ui/auth/verify",
+                authorization=basic_header("operator", "synthetic-passphrase"),
+            )
+        )
+        unavailable_status, _unavailable_headers, unavailable_body = asyncio.run(
+            invoke_asgi(network_app, "/api/read-ui/auth/verify")
+        )
+
+        self.assertEqual(anonymous_status, 401)
+        self.assertEqual(
+            anonymous_headers.get("www-authenticate"),
+            'Basic realm="truenas-jbod-ui"',
+        )
+        self.assertEqual(json.loads(anonymous_body), {"ok": False, "detail": "Read UI authentication required."})
+        self.assertEqual(invalid_status, 401)
+        self.assertEqual(json.loads(invalid_body), {"ok": False, "detail": "Read UI authentication required."})
+        self.assertEqual(valid_status, 200)
+        self.assertEqual(json.loads(valid_body), {"ok": True})
+        self.assertEqual(valid_headers.get("cache-control"), "no-store")
+        self.assertEqual(unavailable_status, 403)
+        self.assertEqual(
+            json.loads(unavailable_body),
+            {"ok": False, "detail": "Read UI sign-in requires ADMIN_AUTH_MODE=basic."},
+        )
+
     def test_basic_mode_requires_explicit_main_ui_public_origin(self) -> None:
         for public_origin in (
             None,
@@ -377,13 +422,13 @@ class ReadUIWritePolicyBootstrapTests(unittest.TestCase):
         html = app_main.templates.get_template("index.html").render(context)
         self.assertIn(f"writePolicy: {context['write_policy_json']}", html)
 
-    def test_basic_mode_context_enables_writes(self) -> None:
+    def test_basic_mode_context_requires_in_page_sign_in_before_enabling_writes(self) -> None:
         context = self._context(auth_mode="basic")
 
         policy = context["write_policy"]
-        self.assertEqual(policy["enabled"], True)
+        self.assertEqual(policy["enabled"], False)
         self.assertEqual(policy["mode"], "basic")
-        self.assertEqual(policy["reason"], "")
+        self.assertEqual(policy["reason"], "Sign in to enable mapping, LED, and alias changes.")
         self.assertEqual(json.loads(context["write_policy_json"]), policy)
 
     def test_snapshot_export_context_without_policy_renders_null(self) -> None:
@@ -397,6 +442,22 @@ class ReadUIWritePolicyBootstrapTests(unittest.TestCase):
 
         html = app_main.templates.get_template("index.html").render(context)
         self.assertIn("writePolicy: null,", html)
+
+    def test_operator_docs_explain_in_page_sign_in_and_credential_lifetime(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        documents = (
+            root / "README.md",
+            root / "docs" / "ADMIN_TRUST_BOUNDARY.md",
+            root / "wiki" / "Docker-and-GHCR-Deployment.md",
+        )
+
+        for document in documents:
+            text = document.read_text(encoding="utf-8")
+            normalized = " ".join(text.split())
+            with self.subTest(document=document.name):
+                self.assertIn("in-page sign-in", normalized)
+                self.assertIn("page memory", normalized)
+                self.assertIn("reload or sign-out", normalized)
 
 
 if __name__ == "__main__":

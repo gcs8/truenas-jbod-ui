@@ -64,6 +64,21 @@
     <div class="status-chip" id="fabric-api-chip">STORAGE</div>
     <div class="status-text" id="fabric-status-text" role="status" aria-live="polite">Ready.</div>
   </section>
+  <section class="read-ui-auth-panel hidden" id="fabric-read-ui-auth-panel" aria-label="Write access sign-in">
+    <form class="read-ui-auth-form" id="fabric-read-ui-auth-form" autocomplete="off">
+      <label>
+        <span>Username</span>
+        <input id="fabric-read-ui-auth-username" autocomplete="off" type="text" required>
+      </label>
+      <label>
+        <span>Password</span>
+        <input id="fabric-read-ui-auth-password" type="password" autocomplete="off" required>
+      </label>
+      <button class="button small" id="fabric-read-ui-auth-submit" type="submit">Sign in for writes</button>
+    </form>
+    <button class="button secondary small hidden" id="fabric-read-ui-auth-sign-out" type="button">Sign out</button>
+    <span class="subtle" id="fabric-read-ui-auth-status" role="status" aria-live="polite"></span>
+  </section>
   <p
     class="status-text write-policy-notice hidden"
     id="fabric-write-policy-notice"

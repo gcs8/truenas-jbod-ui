@@ -176,6 +176,13 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             allow_stale_cache=not force,
         )
 
+    @router.get(
+        "/api/read-ui/auth/verify",
+        dependencies=[Depends(require_read_ui_basic_credentials)],
+    )
+    async def verify_read_ui_credentials() -> JSONResponse:
+        return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+
     @router.get("/api/sas-fabric", response_model=SasFabricSnapshot)
     async def get_sas_fabric(
         force: bool = False,

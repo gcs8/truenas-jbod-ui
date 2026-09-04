@@ -202,6 +202,23 @@
     <div class="cache-timing-chips" id="cache-timing-chips" aria-label="Cache timing"></div>
     <div class="status-text" id="status-text" role="status" aria-live="polite">Ready.</div>
   </section>
+  {% if not snapshot_mode %}
+  <section class="read-ui-auth-panel hidden" id="read-ui-auth-panel" aria-label="Write access sign-in">
+    <form class="read-ui-auth-form" id="read-ui-auth-form" autocomplete="off">
+      <label>
+        <span>Username</span>
+        <input id="read-ui-auth-username" autocomplete="off" type="text" required>
+      </label>
+      <label>
+        <span>Password</span>
+        <input id="read-ui-auth-password" type="password" autocomplete="off" required>
+      </label>
+      <button class="button small" id="read-ui-auth-submit" type="submit">Sign in for writes</button>
+    </form>
+    <button class="button secondary small hidden" id="read-ui-auth-sign-out" type="button">Sign out</button>
+    <span class="subtle" id="read-ui-auth-status" role="status" aria-live="polite"></span>
+  </section>
+  {% endif %}
   <p class="status-text write-policy-notice hidden" id="write-policy-notice" role="note" data-tone="error"></p>
 
   <section id="ui-perf-panel" class="panel ui-perf-panel hidden">
