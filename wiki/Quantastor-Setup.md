@@ -56,7 +56,7 @@ runtime service rather than a dev-only helper.
 3. In SSH enrichment:
    - enable SSH if you want `qs`, `smartctl`, or `sg_ses` detail
    - turn on the Quantastor HA cluster checkbox
-   - use `Load Nodes from Quantastor API` to populate the node ids, labels, and
+   - use `Load Nodes From Quantastor API` to populate the node ids, labels, and
      any API-advertised node hostnames/IPs
    - keep the shared API or grid-management VIP out of SSH targeting
    - the app auto-adds HA node SSH candidates from API `hostname`, main IP,
@@ -106,8 +106,7 @@ like this:
     port: 22
     user: jbodmap
     key_path: /run/ssh/id_jbodmap
-    known_hosts_path: /app/data/known_hosts
-    strict_host_key_checking: false
+    strict_host_key_checking: true
     timeout_seconds: 15
     commands: []
   storage_views:
@@ -155,6 +154,10 @@ Notes:
   prefer the active pool-owner node for pool-related SMART/CLI follow-up
 - `ssh.commands` usually stays blank for Quantastor unless you have a custom
   reason to override the platform-owned defaults
+- keep `strict_host_key_checking: true`. The first successful connection to each
+  HA node pins that node's key into `./data/known_hosts`; connect to every node
+  once from a trusted network, or pre-load its key into that file, before
+  relying on the pins
 - `binding.target_system_id` is what pins a storage view to one HA node
 
 ## Prepare The SSH User
@@ -183,30 +186,36 @@ Expected shape:
 The app does not need blanket root, but Quantastor is much more useful when the
 SSH user can run `smartctl` and `sg_ses` without a password.
 
+The two files below together equal the list the one-time bootstrap in the admin
+sidecar grants for Quantastor.
+
 SMART:
 
 ```bash
 sudo tee /etc/sudoers.d/jbodmap-smartctl >/dev/null <<'EOF'
 Defaults:jbodmap !requiretty
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/sd*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x /dev/sd*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/disk/by-id/scsi-*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x /dev/disk/by-id/scsi-*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x *
 EOF
 
 sudo chmod 440 /etc/sudoers.d/jbodmap-smartctl
 sudo visudo -cf /etc/sudoers.d/jbodmap-smartctl
 ```
 
-SES and identify LEDs:
+SES, identify LEDs, and the `qs` CLI (`--join --filter` is the probe that
+supplies slot names and fan/PSU state):
 
 ```bash
 sudo tee /etc/sudoers.d/jbodmap-sg_ses >/dev/null <<'EOF'
 Defaults:jbodmap !requiretty
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p aes /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p ec /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --join --filter /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/qs *
 EOF
 
 sudo chmod 440 /etc/sudoers.d/jbodmap-sg_ses

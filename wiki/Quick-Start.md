@@ -34,14 +34,19 @@ mkdir -p config/ssh data history/backups/long-term logs
 
 ## 2. Download the Compose file and ownership helper
 
+Download both from the release tag you are going to run, and pin
+`JBOD_UI_IMAGE` in `.env` to that same tag. The Compose file on `main` is for
+images built from `main`; do not pair it with a release image.
+
 ```bash
 mkdir -p scripts
+tag=v0.22.2
 curl -fsSL \
   -o compose.yaml \
-  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/docker-compose.yml
+  "https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/$tag/docker-compose.yml"
 curl -fsSL \
   -o scripts/prepare_nonroot_bind_mounts.py \
-  https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/main/scripts/prepare_nonroot_bind_mounts.py
+  "https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/$tag/scripts/prepare_nonroot_bind_mounts.py"
 ```
 
 That Compose file runs the public image from:
@@ -59,7 +64,7 @@ For a simple single-system TrueNAS CORE install:
 ```bash
 cat > .env <<'EOF'
 APP_PORT=8080
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:latest
+JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.22.2
 
 TRUENAS_HOST=https://truenas.example.local
 TRUENAS_API_KEY=replace_me
@@ -84,15 +89,18 @@ platform-specific setup pages so this first-run path stays focused.
 ## 4. Prepare, pull, and start
 
 ```bash
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 docker compose pull
 docker compose up -d
 ```
 
-The dry run must pass before `--apply`. The base Compose file runs UI and
-history as `10001:10001`, so these ownership steps are required for a fresh
-install and before the first v0.22.3 start of an older root-owned deployment.
+The dry run must pass before `--apply`. The non-root Compose file (unreleased,
+on `main`) runs UI and history as `10001:10001`, so these ownership steps are
+required for a fresh install on that file and before its first start on an
+older root-owned deployment. The `v0.22.2` Compose file still runs the services
+as root; the steps are harmless there and leave the folder ready for the next
+release.
 
 Open:
 
@@ -114,7 +122,8 @@ Expected shape:
 
 ## Updates
 
-If you use `latest`, updates are the normal Compose flow:
+To move to a new release, download `compose.yaml` and the ownership helper
+from the new tag as in step 2, set `JBOD_UI_IMAGE` in `.env` to that tag, then:
 
 ```bash
 cd /docker-local/truenas-jbod-ui
@@ -122,21 +131,12 @@ docker compose pull
 docker compose up -d
 ```
 
-When crossing from v0.22.2 or older to v0.22.3, stop the stack and run the
+When crossing from `v0.22.2` or older to the first release that ships the
+non-root Compose file (unreleased, on `main`), stop the stack and run the
 ownership helper's dry run and `--apply` commands above before recreating it.
 
-If you pin a version, edit `JBOD_UI_IMAGE` in `.env` first:
-
-```dotenv
-JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:v0.18.0
-```
-
-Then run:
-
-```bash
-docker compose pull
-docker compose up -d
-```
+`latest` tracks the newest published release. If you use it, still download the
+Compose file from the matching release tag rather than from `main`.
 
 ## Optional: History Sidecar
 
@@ -164,11 +164,29 @@ The admin UI is optional. Turn it on when you want guided setup, storage-view
 editing, backups/restores, runtime controls, or the profile builder.
 
 Before starting it, read the
-[Admin trust boundary](../docs/ADMIN_TRUST_BOUNDARY.md). The default network
+[Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md). The default network
 mode has no application login and treats every client that can reach port
 `8082` as a trusted operator. The mounted Docker socket gives the sidecar
 host-level container authority. Restrict network reachability to trusted
 operators. Auto-stop limits exposure; it is not authentication.
+
+### Admin browser origin
+
+Set `ADMIN_PUBLIC_ORIGIN` in `.env` before starting the admin profile. Use the
+exact origin the browser shows for the admin UI: scheme, host, and port, with no
+path, for example `http://jbod-admin.example.test:8082` for the default port
+publication or `https://jbod-admin.example.test` behind a reverse proxy.
+
+Browser-initiated admin changes (POST, PUT, PATCH, DELETE) are accepted only
+when their `Origin` or `Referer` header matches this value; any other browser
+request is rejected with `403 Cross-origin admin mutation rejected.` The
+published Compose file passes the variable through empty, and the admin service
+refuses to start while it is empty or not an origin, so set it first. It is
+required in both `network` and `basic` mode.
+
+```dotenv
+ADMIN_PUBLIC_ORIGIN=http://jbod-admin.example.test:8082
+```
 
 ```bash
 docker compose --profile admin pull
@@ -180,6 +198,15 @@ Open:
 ```text
 http://your-docker-host:8082
 ```
+
+The same operator-auth settings control main-UI writes. The compatibility
+default, `ADMIN_AUTH_MODE=network`, keeps inventory and history views available
+without a login but rejects mapping, alias, import, locator, and LED mutations.
+In network mode the main UI renders those write controls disabled with that
+reason before any click; a write the server still rejects with 401 or 403
+disables them again and shows the server's detail. To enable the controls, set
+`ADMIN_AUTH_MODE=basic`, configure the shared username/password, and set
+`APP_PUBLIC_ORIGIN` to the exact main-UI origin.
 
 Use [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for the walkthrough.
 
@@ -216,8 +243,8 @@ git clone https://github.com/gcs8/truenas-jbod-ui.git
 cd truenas-jbod-ui
 cp .env.example .env
 cp config/config.example.yaml config/config.yaml
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 ```
 
 Edit `.env` before the first start; values in `.env` override matching YAML settings.

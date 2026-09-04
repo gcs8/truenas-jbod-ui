@@ -40,7 +40,6 @@ ssh:
   user: jbodmap
   key_path: /run/ssh/id_truenas
   password: ""
-  known_hosts_path: /app/data/known_hosts
   strict_host_key_checking: true
 ```
 
@@ -52,7 +51,7 @@ For ESXi specifically, password-only auth is a normal supported case:
 ```yaml
 ssh:
   enabled: true
-  host: truenas-core-a.example.local
+  host: esxi-host.example.local
   user: root
   key_path: ""
   password: "your-esxi-root-password"
@@ -165,6 +164,10 @@ jbodmap ALL=(root) NOPASSWD: /usr/sbin/sesutil show
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/sesutil locate -u /dev/ses* * on
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/sesutil locate -u /dev/ses* * off
 jbodmap ALL=(root) NOPASSWD: /sbin/camcontrol devlist -v
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x *
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show adapter
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show adapters
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/mprutil show all
@@ -182,22 +185,39 @@ jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/dmidecode -t slot
 jbodmap ALL=(root) NOPASSWD: /usr/bin/tail -n 4000 /var/log/messages
 ```
 
-SCALE example:
+SCALE example (the list the one-time bootstrap grants; `--join --filter` is
+the probe that supplies slot names and fan/PSU state):
 
 ```text
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p aes /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p ec /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --join --filter /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x *
 ```
 
-Generic Linux NVMe example:
+Generic Linux example (the list the one-time bootstrap grants):
 
 ```text
-jbodmap ALL=(root) NOPASSWD: /usr/bin/lsblk -OJ
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail --scan
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j /dev/nvme*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p aes /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p ec /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --join --filter /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x *
+```
+
+The app runs `nvme smart-log`, `nvme id-ctrl`, and `nvme id-ns` under `sudo -n`
+for NVMe enrichment, but the one-time bootstrap does not grant them yet. Add
+them by hand only on hosts where you want that detail:
+
+```text
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*

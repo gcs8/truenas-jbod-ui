@@ -46,7 +46,6 @@ flowchart LR
     Admin --> HistDB
     UI --> Logs
     History --> Logs
-    Admin --> Logs
     Pages -. no live backend .-> Browser
 ```
 
@@ -72,7 +71,10 @@ Keep these beside the checkout or deployment bundle:
 | `./config/ssh` | SSH keys if you let the app manage or reuse them |
 | `./data` | slot mappings, detail cache, known host records |
 | `./history` | history sidecar SQLite DB and backups |
-| `./logs` | local app logs when configured |
+| `./logs` | local app logs when configured; the admin sidecar does not mount it |
+| `./backups` | scheduled backup archives written by the one-shot backup service |
+| `./backup-status` | scheduled backup status file, readable by the UI and history services |
+| `./config/backup-secrets` | scheduled backup passphrase file, mounted read-only |
 
 The published image does not remove the need for local config and persistent
 data. It only removes the need to build the container image yourself.

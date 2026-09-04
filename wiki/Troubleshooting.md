@@ -156,6 +156,68 @@ Then open:
 http://your-docker-host:8082
 ```
 
+## Every Save, Import, Or LED Action Returns 403
+
+In the default `ADMIN_AUTH_MODE=network`, the main UI is read-only: mapping,
+alias, import, locator, and LED writes are rejected with
+`Read UI mutations require ADMIN_AUTH_MODE=basic.` and the UI renders those
+controls disabled with that reason.
+
+To enable them, set in `.env`:
+
+```dotenv
+ADMIN_AUTH_MODE=basic
+ADMIN_AUTH_USERNAME=operator
+ADMIN_AUTH_PASSWORD=replace-with-a-long-random-secret
+APP_PUBLIC_ORIGIN=http://your-docker-host:8080
+```
+
+`APP_PUBLIC_ORIGIN` must be the exact origin your browser shows for the main
+UI. If it does not match, writes fail with
+`Cross-origin Read UI mutation rejected.` Recreate `enclosure-ui` after changing
+these values.
+
+## The Admin Page Rejects Every Change With 403
+
+`Cross-origin admin mutation rejected.` means `ADMIN_PUBLIC_ORIGIN` is unset or
+does not match the origin your browser shows for the admin UI. Set it to that
+exact origin, for example `http://your-docker-host:8082`, then recreate
+`enclosure-admin`:
+
+```bash
+docker compose --profile admin up -d --force-recreate enclosure-admin
+```
+
+The admin service refuses to start while the value is empty or not an origin.
+
+## Full Backup Export Fails With 400
+
+`Plaintext backup export is disabled.` means encryption was turned off for a
+Full Backup. Exports must be encrypted unless the admin service runs with
+`ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true`, which is meant only for a
+trusted-operator deployment where the archive itself is protected separately.
+Turn encryption back on, or set that variable and recreate `enclosure-admin`.
+
+## Permission Errors After Switching To The Non-Root Compose File
+
+The non-root Compose file (unreleased, on `main`) runs the UI and history
+services as `10001:10001`. On a folder created by an older root-owned
+deployment they cannot write `data/`, `history/`, or `logs/`, and the logs show
+`PermissionError` or read-only database failures.
+
+Stop the stack and run the ownership helper, dry run first:
+
+```bash
+docker compose down
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
+sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
+docker compose up -d
+docker compose exec enclosure-ui id
+```
+
+See the non-root runtime section in
+[[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]].
+
 ## The Browser Keeps Showing Old UI
 
 Try these in order:

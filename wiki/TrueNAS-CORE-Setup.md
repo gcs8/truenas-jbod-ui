@@ -59,7 +59,6 @@ ssh:
   port: 22
   user: jbodmap
   key_path: /run/ssh/id_truenas
-  known_hosts_path: /app/data/known_hosts
   strict_host_key_checking: true
   commands:
     - /sbin/glabel status
@@ -104,7 +103,6 @@ systems:
       user: jbodmap
       key_path: /run/ssh/id_truenas
       sudo_password: ""
-      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /sbin/glabel status
@@ -155,7 +153,7 @@ do not need a separate allow-list edit for each controller number.
 For TrueNAS CORE middleware, the topology-capable one-liner shape is:
 
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/usr/local/sbin/smartctl -x -j *","/usr/local/sbin/smartctl -x *","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil -u * show adapter","/usr/sbin/mprutil -u * show all","/usr/sbin/mprutil -u * show devices","/usr/sbin/mprutil -u * show enclosures","/usr/sbin/mprutil -u * show expanders","/usr/sbin/mprutil -u * show iocfacts","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil locate -u /dev/ses* * on","/usr/sbin/sesutil locate -u /dev/ses* * off","/usr/local/sbin/smartctl -x -j *","/usr/local/sbin/smartctl -x *","/usr/sbin/smartctl -x -j *","/usr/sbin/smartctl -x *","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil -u * show adapter","/usr/sbin/mprutil -u * show all","/usr/sbin/mprutil -u * show devices","/usr/sbin/mprutil -u * show enclosures","/usr/sbin/mprutil -u * show expanders","/usr/sbin/mprutil -u * show iocfacts","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages"]}'
 ```
 
 ## 6. Optional LED Control

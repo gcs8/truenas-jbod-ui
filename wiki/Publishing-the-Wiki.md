@@ -43,11 +43,15 @@ set before you copy `wiki/images/` into the GitHub wiki repo.
 From the repo root in PowerShell:
 
 ```powershell
-$env:SCREENSHOT_TAG='v0.18.0'
+$env:SCREENSHOT_TAG='vX.Y.Z'
 .\.venv\Scripts\python.exe scripts\capture_readme_screenshots.py
 .\.venv\Scripts\python.exe scripts\capture_history_export_screenshots.py
 .\.venv\Scripts\python.exe scripts\capture_release_workflow_screenshots.py
+.\.venv\Scripts\python.exe scripts\capture_visual_tour_screenshots.py
 ```
+
+Set `SCREENSHOT_TAG` to the release tag you are publishing, for example
+`v0.22.2`; it becomes the suffix of the refreshed image file names.
 
 That refreshes the repo screenshots under `docs/images/screenshots/` and the
 wiki-facing copies under `wiki/images/`.
@@ -61,4 +65,4 @@ wiki-facing copies under `wiki/images/`.
 
 For the full repo release flow, use:
 
-- [`docs/RELEASE_CHECKLIST.md`](../docs/RELEASE_CHECKLIST.md)
+- [`docs/RELEASE_CHECKLIST.md`](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/RELEASE_CHECKLIST.md)

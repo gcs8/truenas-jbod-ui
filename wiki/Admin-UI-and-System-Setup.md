@@ -24,11 +24,29 @@ Use the same folder you created in [[Quick Start|Quick-Start]], where
 `compose.yaml` and `.env` live.
 
 Before starting the sidecar, read the
-[Admin trust boundary](../docs/ADMIN_TRUST_BOUNDARY.md). The default network
+[Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md). The default network
 mode has no application login and treats every client that can reach port
 `8082` as a trusted operator. The mounted Docker socket gives the sidecar
 host-level container authority. Restrict network reachability to trusted
 operators. Auto-stop limits exposure; it is not authentication.
+
+### Admin browser origin
+
+Set `ADMIN_PUBLIC_ORIGIN` in `.env` before starting the admin profile. Use the
+exact origin the browser shows for the admin UI: scheme, host, and port, with no
+path, for example `http://jbod-admin.example.test:8082` for the default port
+publication or `https://jbod-admin.example.test` behind a reverse proxy.
+
+Browser-initiated admin changes (POST, PUT, PATCH, DELETE) are accepted only
+when their `Origin` or `Referer` header matches this value; any other browser
+request is rejected with `403 Cross-origin admin mutation rejected.` The
+published Compose file passes the variable through empty, and the admin service
+refuses to start while it is empty or not an origin, so set it first. It is
+required in both `network` and `basic` mode.
+
+```dotenv
+ADMIN_PUBLIC_ORIGIN=http://jbod-admin.example.test:8082
+```
 
 If the main UI is already running and you only want to add the admin sidecar:
 
@@ -61,15 +79,18 @@ http://your-docker-host:8082
 By default the admin sidecar:
 
 - listens on port `8082`
-- auto-stops after `3600` seconds unless you change
-  `ADMIN_AUTO_STOP_SECONDS`
+- stops itself after `3600` seconds when started from the published Compose
+  files, which set `ADMIN_AUTO_STOP_SECONDS` explicitly
 - stays separate from the main UI so the read path can remain standalone if
   you do not want the extra write-capable maintenance surface up all the time
 
-`ADMIN_AUTO_STOP_SECONDS=0` disables auto-stop. A positive integer is the
-number of seconds before shutdown; negative or malformed values are rejected.
-The published Compose files explicitly default to `3600`. If you change this
-environment value, recreate the admin container so the process receives it:
+The application default for `ADMIN_AUTO_STOP_SECONDS` is `0`, which never
+stops the sidecar. The published Compose files set `3600`, so a Compose-started
+sidecar stops itself after one hour unless you change the value in `.env`. Set
+it explicitly if you run the sidecar outside those files. A positive integer is
+the number of seconds before shutdown; negative or malformed values are
+rejected. If you change this environment value, recreate the admin container so
+the process receives it:
 
 ```bash
 docker compose --profile admin up -d --force-recreate enclosure-admin
@@ -162,6 +183,10 @@ Use the SSH section when you want to:
 - point at an existing key under `config/ssh`
 - generate a fresh Ed25519 keypair
 - review the recommended runtime command list for the target host
+
+Saved SSH command lists are not returned to the browser. When you load a saved
+system, the command field shows placeholders for the stored commands; leave it
+unchanged to keep them, or replace the text to save a new list.
 
 This is especially useful on CORE and SCALE systems where the app can stay
 read-only in the main UI but still use richer SSH detail, LED control, and

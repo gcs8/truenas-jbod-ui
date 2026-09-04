@@ -44,7 +44,6 @@ ssh:
   host: scale.example.local
   user: jbodmap
   key_path: /run/ssh/id_truenas
-  known_hosts_path: /app/data/known_hosts
   strict_host_key_checking: true
   commands:
     - /usr/sbin/zpool status -gP
@@ -77,9 +76,25 @@ The app has been validated with narrow rules for:
 
 - `sg_ses -p aes`
 - `sg_ses -p ec`
+- `sg_ses --join --filter`, the probe that supplies slot names and fan/PSU state
 - `sg_ses --dev-slot-num=... --set=ident`
 - `sg_ses --dev-slot-num=... --clear=ident`
-- `smartctl -x -j /dev/<disk>`
+- `smartctl -x -j` and `smartctl -x`
+
+The one-time bootstrap in the admin sidecar grants exactly this list; paste the
+same rules if you write sudoers by hand:
+
+```text
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p aes /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p ec /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --join --filter /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x *
+```
 
 ## 5. Example SCALE Multi-System Config
 
@@ -101,7 +116,6 @@ systems:
       host: scale.example.local
       user: jbodmap
       key_path: /run/ssh/id_truenas
-      known_hosts_path: /app/data/known_hosts
       strict_host_key_checking: true
       commands:
         - /usr/sbin/zpool status -gP
