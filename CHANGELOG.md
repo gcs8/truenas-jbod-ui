@@ -41,9 +41,10 @@ mutations are rejected. Set it before upgrading. This gap is tracked in #272.
 
 The default Compose runtime is hardened and needs a one-time ownership step
 (#246). The UI and history services now run as `${APP_UID}:${APP_GID}` instead
-of root and mount `./config` read-only, so operator configuration is edited on
-the host or through the admin sidecar rather than from inside the UI container.
-Every service now has a read-only image filesystem, a private `/tmp`, all
+of root. The UI service also mounts `./config` read-only, so operator
+configuration is edited on the host or through the admin sidecar rather than
+from inside the UI container; the history service does not mount `./config` at
+all. Every service now has a read-only image filesystem, a private `/tmp`, all
 capabilities dropped, and `no-new-privileges`. The admin service stays UID `0`
 for Docker control but runs as `0:${APP_GID}` with only `CHOWN` and `FOWNER`
 added back and without its app-log mount. Before the first start on the new
