@@ -246,7 +246,7 @@ class SegmentedHistoryReader:
                     if path_entry_exists(Path(f"{path}{suffix}")):
                         raise ValueError(
                             "Segmented history hot database has SQLite sidecar state; "
-                            "stop the history service or read it live."
+                            "pass --live to read beside a running service."
                         )
                 connection = sqlite3.connect(f"{path.as_uri()}?mode=ro&immutable=1", uri=True)
             else:

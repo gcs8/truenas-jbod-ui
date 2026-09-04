@@ -1374,6 +1374,9 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
 
             self.assertNotEqual(refused.returncode, 0)
             self.assertIn("sidecar", refused.stderr)
+            # The packaged CLI is operator-facing: a plain message, not a traceback.
+            self.assertNotIn("Traceback", refused.stderr)
+            self.assertIn("--live", refused.stderr)
             self.assertEqual(live.returncode, 0, live.stderr)
             self.assertEqual([event["id"] for event in json.loads(live.stdout)], [3])
 

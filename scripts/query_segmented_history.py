@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -37,6 +38,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    try:
+        payload = _query(args)
+    except ValueError as exc:
+        # Operator-facing CLI: a plain message, not a traceback.
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
+def _query(args: argparse.Namespace) -> Any:
     reader = (
         SegmentedHistoryReader.from_catalog(
             hot_path=args.hot,
@@ -77,8 +89,7 @@ def main() -> int:
             since=args.since,
         )
     )
-    print(json.dumps(payload, sort_keys=True))
-    return 0
+    return payload
 
 
 if __name__ == "__main__":
