@@ -386,6 +386,35 @@ class MappingStoreImportTests(unittest.TestCase):
             assert admitted is not None
             self.assertEqual(admitted.device_name, "sda")
 
+    def test_has_legacy_only_mapping_reports_rows_without_resolving_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            store._write({
+                "default:3": ManualMapping(slot=3, device_name="sda"),
+                store._slot_key("system-a", "enc-a", 4): ManualMapping(
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    slot=4,
+                    device_name="sdb",
+                ),
+            })
+
+            self.assertTrue(store.has_legacy_only_mapping("system-a", "enc-a", 3))
+            self.assertFalse(store.has_legacy_only_mapping("system-a", "enc-a", 4))
+            self.assertFalse(store.has_legacy_only_mapping("system-a", "enc-a", 5))
+
+            loaded_entries = store.load_all()
+            store.load_all = MagicMock(side_effect=AssertionError("preloaded lookup must not reload"))  # type: ignore[method-assign]
+            self.assertTrue(
+                store.has_legacy_only_mapping(
+                    "system-a",
+                    "enc-a",
+                    3,
+                    loaded_entries=loaded_entries,
+                )
+            )
+            store.load_all.assert_not_called()
+
     def test_enclosureless_mapping_requires_single_scope_admission(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)

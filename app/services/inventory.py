@@ -549,6 +549,7 @@ class _LayoutFrame:
     layout_columns: int
     slot_positions: dict[int, tuple[int, int]]
     allow_legacy_mapping_fallback: bool
+    loaded_mappings: dict[str, ManualMapping]
 
     def result(
         self,
@@ -4049,6 +4050,16 @@ class InventoryService:
             else fallback_slot_count
         )
         layout_slot_count = infer_slot_count_from_layout(layout_rows, layout_count_fallback)
+        # #260 pins one mapping load per correlation pass, so the entries are
+        # loaded here and read back off the frame by every caller.
+        loaded_mappings = self.mapping_store.load_all()
+        if not allow_legacy_mapping_fallback:
+            self._warn_unapplied_legacy_mappings(
+                warnings,
+                resolved_meta.get("id"),
+                layout_slot_count,
+                loaded_mappings,
+            )
         return _LayoutFrame(
             available_enclosures=available_enclosures,
             selected_option=selected_option,
@@ -4059,6 +4070,7 @@ class InventoryService:
             layout_columns=layout_columns,
             slot_positions=layout_slot_positions(layout_rows),
             allow_legacy_mapping_fallback=allow_legacy_mapping_fallback,
+            loaded_mappings=loaded_mappings,
         )
 
     def _correlate(
@@ -4138,7 +4150,7 @@ class InventoryService:
             self.system.truenas.platform,
         )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
 
         slot_views: list[SlotView] = []
 
@@ -4442,7 +4454,7 @@ class InventoryService:
                 disks_by_slot[(None, vendor_slot)] = disk
 
         linux_topology_members = self._build_linux_topology_members(disk_records)
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
         selected_meta = frame.selected_meta
         vendor_slot_candidates = self._build_linux_vendor_slot_candidates(ssh_data, selected_option)
@@ -4607,7 +4619,7 @@ class InventoryService:
             for disk in bmc_disk_records
             if isinstance(disk.slot, int)
         }
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
         for slot in range(frame.layout_slot_count):
             row_index, column_index = _slot_grid_position(
@@ -4773,7 +4785,7 @@ class InventoryService:
             )
 
         empty_ssh = ParsedSSHData()
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
         for slot in range(frame.layout_slot_count):
             row_index, column_index = _slot_grid_position(
@@ -4920,7 +4932,7 @@ class InventoryService:
         )
         if is_sub_view:
             slot_count = len(slots_to_render)
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
 
         for slot in slots_to_render:
@@ -5029,7 +5041,7 @@ class InventoryService:
             frame.layout_slot_count,
             selected_profile.id,
         )
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
 
         for slot in range(frame.layout_slot_count):
@@ -8440,6 +8452,42 @@ class InventoryService:
         )
         return finalize_enclosure_option_labels(options, aliases)
 
+    def _warn_unapplied_legacy_mappings(
+        self,
+        warnings: list[str],
+        enclosure_id: str | None,
+        slot_count: int,
+        loaded_mappings: dict[str, ManualMapping],
+    ) -> None:
+        """Warn once per snapshot when legacy mapping rows cannot be applied."""
+        if slot_count <= 0 or not loaded_mappings:
+            return
+        unapplied = sum(
+            1
+            for slot in range(slot_count)
+            if self.mapping_store.has_legacy_only_mapping(
+                self.system.id,
+                enclosure_id,
+                slot,
+                loaded_entries=loaded_mappings,
+            )
+        )
+        if not unapplied:
+            return
+        scope = (
+            "multi-system deployment"
+            if len(self.settings.systems) > 1
+            else "multi-enclosure system"
+        )
+        noun, verb, auxiliary = (
+            ("mapping", "uses", "was") if unapplied == 1 else ("mappings", "use", "were")
+        )
+        warnings.append(
+            f"{unapplied} manual {noun} {verb} the legacy unscoped format and "
+            f"{auxiliary} not applied on this {scope}. Re-save each affected "
+            "mapping to scope it."
+        )
+
     @staticmethod
     def _base_enclosure_id(option_id: str | None) -> str | None:
         if not option_id:
@@ -8456,7 +8504,9 @@ class InventoryService:
             if (base_id := self._base_enclosure_id(option.id))
         }
         configured_system_count = max(1, len(self.settings.systems))
-        return configured_system_count == 1 and len(base_enclosure_ids) == 1
+        # Zero detected enclosures (no API rows, no SES) leaves nothing to
+        # disambiguate on a single-system deployment, so legacy rows still apply.
+        return configured_system_count == 1 and len(base_enclosure_ids) <= 1
 
     @staticmethod
     def _enclosure_option_meta(option: EnclosureOption) -> dict[str, str | None]:

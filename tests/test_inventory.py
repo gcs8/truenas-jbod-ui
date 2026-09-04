@@ -258,6 +258,8 @@ class InventoryHelpersTests(unittest.TestCase):
         )
         service.profile_registry = MagicMock()
         service.profile_registry.resolve_for_enclosure.return_value = selected_profile
+        service.mapping_store = MagicMock()
+        service.mapping_store.load_all.return_value = {}
 
         warnings: list[str] = []
         frame = service._resolve_layout_frame(
@@ -362,6 +364,81 @@ class InventoryHelpersTests(unittest.TestCase):
                 EnclosureOption(id="enc-a::drawer-b", label="Drawer B"),
             ])
         )
+        self.assertTrue(service._legacy_mapping_fallback_allowed([]))
+
+    def _legacy_fallback_service(
+        self,
+        temp_dir: str,
+        systems: list[SystemConfig],
+    ) -> InventoryService:
+        service = object.__new__(InventoryService)
+        service.settings = Settings(systems=systems)
+        service.system = service.settings.systems[0]
+        service.mapping_store = MappingStore(str(Path(temp_dir) / "slot_mappings.json"))
+        service.profile_registry = MagicMock()
+        service.profile_registry.resolve_for_enclosure.return_value = None
+        return service
+
+    def test_single_system_without_detected_enclosures_still_resolves_legacy_mappings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
+            service.mapping_store._write({
+                "default:5": ManualMapping(slot=5, serial="SYNTH-LEGACY-5"),
+            })
+
+            warnings: list[str] = []
+            frame = service._resolve_layout_frame(
+                [],
+                None,
+                warnings,
+                require_selected_option=False,
+                require_profile=False,
+            )
+
+            self.assertIsInstance(frame, inventory_module._LayoutFrame)
+            self.assertTrue(frame.allow_legacy_mapping_fallback)
+            resolved = service.mapping_store.get_mapping(
+                "system-a",
+                None,
+                5,
+                allow_legacy_fallback=frame.allow_legacy_mapping_fallback,
+            )
+            self.assertIsNotNone(resolved)
+            self.assertEqual(resolved.serial, "SYNTH-LEGACY-5")
+            self.assertEqual(warnings, [])
+
+    def test_multi_enclosure_snapshot_warns_once_about_unapplied_legacy_mappings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
+            service.mapping_store._write({
+                "default:1": ManualMapping(slot=1, serial="SYNTH-LEGACY-1"),
+                "default:2": ManualMapping(slot=2, serial="SYNTH-LEGACY-2"),
+                service.mapping_store._slot_key("system-a", "enc-a", 3): ManualMapping(
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    slot=3,
+                    serial="SYNTH-SCOPED-3",
+                ),
+            })
+            enclosures = [
+                EnclosureOption(id="enc-a", label="Enclosure A", rows=2, columns=4, slot_count=8),
+                EnclosureOption(id="enc-b", label="Enclosure B", rows=2, columns=4, slot_count=8),
+            ]
+
+            warnings: list[str] = []
+            frame = service._resolve_layout_frame(
+                enclosures,
+                "enc-a",
+                warnings,
+                require_profile=False,
+            )
+
+            self.assertIsInstance(frame, inventory_module._LayoutFrame)
+            self.assertFalse(frame.allow_legacy_mapping_fallback)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("2 manual mappings", warnings[0])
+            self.assertNotIn("SYNTH", warnings[0])
+            self.assertNotIn("enc-a", warnings[0])
 
     def test_storage_view_slot_label_honors_profile_slot_number_base(self) -> None:
         storage_view = StorageViewConfig.model_validate(
