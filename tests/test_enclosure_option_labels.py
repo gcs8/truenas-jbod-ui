@@ -195,6 +195,59 @@ class EnclosureAliasOptionLabelTests(unittest.TestCase):
         self.assertEqual([option.label for option in resolved], ["Dell MD1280 84 Bay [13fc]", "Dell MD1280 84 Bay [1479]"])
         self.assertEqual([option.raw_label for option in resolved], ["Dell MD1280 84 Bay", "Dell MD1280 84 Bay"])
 
+    def test_core_api_slots_use_the_finalized_selector_alias(self) -> None:
+        settings = Settings()
+        system = SystemConfig(id="system-a", truenas=TrueNASConfig(platform="core"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            alias_store = SasFabricAliasStore(Path(temp_dir) / "sas_fabric_aliases.json")
+            alias_store.save_alias(self._alias("enc-a", "Archive East"))
+            service = InventoryService(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                None,
+                MappingStore(str(Path(temp_dir) / "slot_mappings.json")),
+                ProfileRegistry(settings),
+                SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
+                alias_store,
+            )
+            raw_data = TrueNASRawData(
+                enclosures=[
+                    {
+                        "id": "enc-a",
+                        "label": "Raw enclosure label",
+                        "elements": [{"slot": 1, "dev": "/dev/da0", "status": "OK"}],
+                    }
+                ],
+                disks=[
+                    {
+                        "name": "da0",
+                        "serial": "SERIAL-A",
+                        "model": "Synthetic disk",
+                        "size": 4_000_000_000_000,
+                        "status": "ONLINE",
+                        "enclosure": {"id": "enc-a", "slot": 1},
+                    }
+                ],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            )
+
+            slots, options, selected_meta, *_rest = service._correlate(
+                raw_data,
+                parse_ssh_outputs({}, settings.layout.slot_count, None),
+                [],
+                "enc-a",
+            )
+
+        option = next(item for item in options if item.id == "enc-a")
+        self.assertEqual(option.label, "Archive East")
+        self.assertEqual(selected_meta["label"], option.label)
+        self.assertTrue(slots)
+        self.assertTrue(all(slot.enclosure_label == option.label for slot in slots))
+
     def test_enclosure_alias_save_and_clear_invalidate_default_base_and_drawer_cache_keys(self) -> None:
         settings = Settings()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -360,6 +413,12 @@ class TwoIdenticalShelvesSelectorTests(unittest.IsolatedAsyncioTestCase):
         )
         # The page header follows the same label as the selector entry.
         self.assertEqual(snapshot.selected_enclosure_label, by_id[snapshot.selected_enclosure_id])
+        slot_enclosure_labels = {slot.enclosure_label for slot in snapshot.slots}
+        self.assertEqual(
+            slot_enclosure_labels,
+            {snapshot.selected_enclosure_label},
+            slot_enclosure_labels,
+        )
 
 
 if __name__ == "__main__":

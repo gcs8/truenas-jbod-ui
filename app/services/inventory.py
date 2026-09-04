@@ -4046,6 +4046,13 @@ class InventoryService:
         )
         selected_meta = self._merge_enclosure_meta(ssh_data.ses_selected_meta, api_selected_meta)
         available_enclosures = self._build_enclosure_options(raw_data, ssh_data, selected_meta)
+        selected_option = self._resolve_selected_enclosure_option(
+            available_enclosures,
+            selected_enclosure_id,
+            selected_meta,
+        )
+        if selected_option is not None:
+            selected_meta.update(self._enclosure_option_meta(selected_option))
         api_enclosure_ids = {
             enclosure_id
             for enclosure_id in (
@@ -9970,7 +9977,7 @@ class InventoryService:
             row_index=row_index,
             column_index=column_index,
             enclosure_id=enclosure_id,
-            enclosure_label=normalize_text(raw_slot_status.get("enclosure_label")) or enclosure_meta.get("label"),
+            enclosure_label=enclosure_meta.get("label") or normalize_text(raw_slot_status.get("enclosure_label")),
             enclosure_name=normalize_text(raw_slot_status.get("enclosure_name")) or enclosure_meta.get("name"),
             present=present,
             state=state,
