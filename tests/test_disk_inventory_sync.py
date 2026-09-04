@@ -230,6 +230,44 @@ class DiskInventorySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotEqual(service._cache, {}, "a timed-out sync must not claim the inventory changed")
 
+    async def test_timed_out_full_job_blocks_new_syncs_until_recheck_finds_it_terminal(self) -> None:
+        service = self.build_service(platform="core", timeout_seconds=1)
+        runner = RecordingSSHRunner(
+            [
+                ok("268071"),
+                ok(job_payload(268071, "RUNNING")),
+                ok(job_payload(268071, "RUNNING")),
+                ok(job_payload(268071, "RUNNING")),
+                ok(job_payload(268071, "SUCCESS")),
+                ok("268072"),
+                ok(job_payload(268072, "SUCCESS")),
+            ]
+        )
+        service._run_ssh_command = runner
+        clock = [0.0]
+
+        async def fake_sleep(seconds: float) -> None:
+            clock[0] += 2.0
+
+        service._disk_inventory_sync_clock = lambda: clock[0]
+        service._disk_inventory_sync_sleep = fake_sleep
+
+        timed_out = await service.sync_disk_inventory(DiskInventorySyncMode.full)
+        self.assertTrue(timed_out.timed_out)
+
+        with self.assertRaisesRegex(DiskInventorySyncBusy, "job 268071 is still running"):
+            await service.sync_disk_inventory(DiskInventorySyncMode.full)
+
+        completed = await service.sync_disk_inventory(DiskInventorySyncMode.full)
+
+        self.assertEqual(completed.state, "SUCCESS")
+        self.assertEqual(completed.job_id, 268072)
+        self.assertEqual(
+            sum(command.endswith("call disk.sync_all") for command in runner.commands),
+            2,
+            "the blocked request must not start another remote job",
+        )
+
     async def test_full_mode_reports_a_failed_job_with_its_middleware_error(self) -> None:
         service = self.build_service(platform="core")
         service._run_ssh_command = RecordingSSHRunner(
@@ -404,6 +442,43 @@ class DiskInventorySyncRouteTests(unittest.TestCase):
         self.assertEqual(body["mode"], "full")
         self.assertEqual(body["job_id"], 268071)
         self.assertEqual(body["state"], "SUCCESS")
+
+    def test_route_rejects_stale_and_mistyped_exact_system_ids_before_service_fallback(self) -> None:
+        for system_id in ("stale-system-id", "system-aa"):
+            with self.subTest(system_id=system_id):
+                service = self.build_service()
+                service.sync_disk_inventory = AsyncMock(
+                    return_value=DiskInventorySyncResult(
+                        mode=DiskInventorySyncMode.full,
+                        state="SUCCESS",
+                        elapsed_seconds=0.0,
+                        message="must not run",
+                    )
+                )
+                registry = Mock()
+                registry.has_system.return_value = False
+                registry.get_service.return_value = service
+
+                with (
+                    patch.object(app_main, "get_inventory_registry", return_value=registry),
+                    patch.object(app_main, "add_perf_metadata"),
+                    self.assertRaises(HTTPException) as caught,
+                ):
+                    asyncio.run(
+                        self.route().endpoint(
+                            system_id=system_id,
+                            payload=DiskInventorySyncRequest(
+                                mode=DiskInventorySyncMode.full,
+                                confirm=True,
+                            ),
+                        )
+                    )
+
+                self.assertEqual(caught.exception.status_code, 404)
+                self.assertEqual(caught.exception.detail, f"System {system_id!r} is not configured.")
+                registry.has_system.assert_called_once_with(system_id)
+                registry.get_service.assert_not_called()
+                service.sync_disk_inventory.assert_not_awaited()
 
     def test_request_model_rejects_unknown_modes(self) -> None:
         with self.assertRaises(ValueError):

@@ -13,8 +13,15 @@ from app.route_compat import MainModuleAPIRouter
 def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     router = MainModuleAPIRouter(main_module, globals())
 
-    def route_service(system_id: str | None, **perf_metadata: Any) -> Any:
+    def route_service(
+        system_id: str | None,
+        *,
+        exact_system_id: bool = False,
+        **perf_metadata: Any,
+    ) -> Any:
         registry = get_inventory_registry()
+        if exact_system_id and (system_id is None or not registry.has_system(system_id)):
+            raise HTTPException(status_code=404, detail=f"System {system_id!r} is not configured.")
         service = registry.get_service(system_id)
         add_perf_metadata(
             system_id=service.system.id,
@@ -105,6 +112,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 storage_view_runtime=storage_view_runtime,
                 settings=current_settings,
                 history_configured=bool(current_settings.history.service_url),
+                read_ui_mutation_auth_mode=request.app.state.operator_auth_settings.auth_mode,
                 admin_launch_url=admin_launch_url,
                 app_version=__version__,
                 release_status=get_release_status_service().snapshot(),
@@ -266,7 +274,11 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         system_id: str,
         payload: DiskInventorySyncRequest,
     ) -> JSONResponse:
-        service = route_service(system_id, disk_inventory_sync=payload.mode.value)
+        service = route_service(
+            system_id,
+            exact_system_id=True,
+            disk_inventory_sync=payload.mode.value,
+        )
         if not payload.confirm:
             raise HTTPException(
                 status_code=400,

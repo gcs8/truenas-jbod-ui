@@ -658,6 +658,7 @@
     uiPerfEnabled: {{ settings.perf.enabled | tojson }},
     slotCount: {{ snapshot.layout_slot_count or settings.layout.slot_count }},
     historyConfigured: {{ history_configured | tojson }},
+    readUiMutationAuthMode: {{ read_ui_mutation_auth_mode | default("network") | tojson }},
     snapshotMode: {{ snapshot_mode | tojson }},
     sasFabricViewUrl: {{ sas_fabric_view_url | tojson }},
     snapshotExportMeta: {{ snapshot_export_meta_json | script_json_text }},

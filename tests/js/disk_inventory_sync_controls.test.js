@@ -110,6 +110,7 @@ function harness({
   platform = "core",
   sshEnabled = true,
   snapshotMode = false,
+  authMode = "basic",
   writePolicyAllowed,
   writePolicyBlockReason = "Writes are disabled by policy.",
 } = {}) {
@@ -127,6 +128,7 @@ function harness({
   const controls = { classList: classList(["hidden"]) };
   const hint = { classList: classList(["hidden"]), textContent: "" };
   const context = {
+    bootstrap: { readUiMutationAuthMode: authMode },
     state,
     currentPlatform: () => platform,
     diskInventorySyncControls: controls,
@@ -293,6 +295,21 @@ test("optional write-policy hooks disable the controls and click handler with th
   const prePolicyMerge = harness({ platform: "core" });
   prePolicyMerge.fns.renderDiskInventorySyncControls();
   assert.equal(prePolicyMerge.buttons.full.disabled, false);
+});
+
+test("standalone network auth disables disk sync with the route's truthful reason", () => {
+  const h = harness({ platform: "core", authMode: "network" });
+
+  h.fns.renderDiskInventorySyncControls();
+
+  assert.equal(h.buttons.multipath.disabled, true);
+  assert.equal(h.buttons.full.disabled, true);
+  assert.match(h.buttons.full.title, /ADMIN_AUTH_MODE=basic/);
+
+  h.fns.handleDiskInventorySyncClick("full");
+  assert.deepEqual(h.runs, []);
+  assert.equal(h.state.diskInventorySync.armedMode, null);
+  assert.match(h.statuses.at(-1).message, /ADMIN_AUTH_MODE=basic/);
 });
 
 function diskInventorySyncRunHarness(selectedSystemId = "system-a") {

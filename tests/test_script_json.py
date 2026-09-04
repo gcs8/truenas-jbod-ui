@@ -220,6 +220,22 @@ class ScriptSafeJsonHelperTests(unittest.TestCase):
 
 
 class MainViewBootstrapTests(unittest.TestCase):
+    def test_index_bootstrap_exposes_the_read_ui_mutation_auth_mode(self) -> None:
+        snapshot = build_hostile_snapshot()
+        context = build_index_context(
+            request=build_request("/"),
+            snapshot=snapshot,
+            storage_view_runtime=StorageViewRuntimePayload(system_id="system-a", views=[]),
+            settings=Settings(),
+            history_configured=False,
+            read_ui_mutation_auth_mode="basic",
+        )
+
+        html = templates.get_template("index.html").render(context)
+        bootstrap = extract_bootstrap_object(html, "window.APP_BOOTSTRAP =")
+
+        self.assertEqual(bootstrap["readUiMutationAuthMode"], "basic")
+
     def test_index_bootstrap_survives_hostile_values(self) -> None:
         snapshot = build_hostile_snapshot()
         runtime = StorageViewRuntimePayload(system_id="system-a", system_label=HOSTILE_TEXT, views=[])
@@ -247,6 +263,7 @@ class MainViewBootstrapTests(unittest.TestCase):
         self.assertEqual(bootstrap["initialSelectedSlot"], 0)
         self.assertEqual(bootstrap["initialHistoryIoChartMode"], "total")
         self.assertEqual(bootstrap["preloadedHistorySummary"], {"counts": {}, "collector": {}})
+        self.assertEqual(bootstrap["readUiMutationAuthMode"], "network")
 
         script_body = inline_script_block(html, "window.APP_BOOTSTRAP =")
         self.assertNotIn("<", script_body)

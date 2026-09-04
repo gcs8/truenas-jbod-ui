@@ -9183,6 +9183,12 @@
         reason: "TrueNAS disk inventory sync is unsupported on this platform because it needs the TrueNAS middleware.",
       };
     }
+    if (bootstrap.readUiMutationAuthMode !== "basic") {
+      return {
+        available: false,
+        reason: "TrueNAS disk inventory sync requires ADMIN_AUTH_MODE=basic so the Read UI can authorize this write.",
+      };
+    }
     if (typeof writePolicyAllowsWrites === "function" && !writePolicyAllowsWrites()) {
       const reason = typeof writePolicyReason === "function"
         ? writePolicyReason()

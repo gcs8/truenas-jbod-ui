@@ -734,6 +734,7 @@ class InventoryService:
         self._source_bundle_lock = asyncio.Lock()
         self._ssh_session_locks: dict[str, asyncio.Lock] = {}
         self._disk_inventory_sync_lock = asyncio.Lock()
+        self._disk_inventory_sync_active_job_id: int | None = None
         # Injected so tests can drive the full-sync poll loop with a fake clock.
         self._disk_inventory_sync_clock = time.monotonic
         self._disk_inventory_sync_sleep = asyncio.sleep
@@ -2957,6 +2958,15 @@ class InventoryService:
             )
         async with self._disk_inventory_sync_lock:
             midclt = DISK_INVENTORY_SYNC_MIDCLT_BY_PLATFORM[self.system.truenas.platform]
+            active_job_id = self._disk_inventory_sync_active_job_id
+            if active_job_id is not None:
+                state, _error = await self._get_disk_inventory_sync_job_state(midclt, active_job_id)
+                if state not in DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES:
+                    raise DiskInventorySyncBusy(
+                        f"TrueNAS disk sync job {active_job_id} is still running for this system. "
+                        "Wait for it to finish before starting another."
+                    )
+                self._disk_inventory_sync_active_job_id = None
             started = self._disk_inventory_sync_clock()
             if mode == DiskInventorySyncMode.multipath:
                 # disk.multipath_sync is synchronous and returns null on success.
@@ -3005,17 +3015,14 @@ class InventoryService:
             raise TrueNASAPIError(
                 "TrueNAS did not return a job id for disk.sync_all, so the sync could not be tracked."
             )
+        self._disk_inventory_sync_active_job_id = job_id
         timeout_seconds = max(1, int(self.settings.app.disk_inventory_sync_timeout_seconds))
         poll_interval = max(0.0, float(self.settings.app.disk_inventory_sync_poll_interval_seconds))
-        job_filter = json.dumps([["id", "=", job_id]], separators=(",", ":"))
         while True:
-            poll_result = await self._run_disk_inventory_sync_command(
-                [midclt, "call", "core.get_jobs", job_filter],
-                failure_prefix=f"TrueNAS could not report disk sync job {job_id}",
-            )
-            state, error = _parse_disk_inventory_sync_job(poll_result.stdout, job_id)
+            state, error = await self._get_disk_inventory_sync_job_state(midclt, job_id)
             elapsed = self._disk_inventory_sync_elapsed(started)
             if state in DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES:
+                self._disk_inventory_sync_active_job_id = None
                 break
             if elapsed >= timeout_seconds:
                 return DiskInventorySyncResult(
@@ -3046,6 +3053,18 @@ class InventoryService:
             error=error,
             message=message,
         )
+
+    async def _get_disk_inventory_sync_job_state(
+        self,
+        midclt: str,
+        job_id: int,
+    ) -> tuple[str, str | None]:
+        job_filter = json.dumps([["id", "=", job_id]], separators=(",", ":"))
+        poll_result = await self._run_disk_inventory_sync_command(
+            [midclt, "call", "core.get_jobs", job_filter],
+            failure_prefix=f"TrueNAS could not report disk sync job {job_id}",
+        )
+        return _parse_disk_inventory_sync_job(poll_result.stdout, job_id)
 
     async def get_system_locator_status(self) -> SystemLocatorStatusView:
         if not self.system.bmc.enabled or self.bmc_service is None:
