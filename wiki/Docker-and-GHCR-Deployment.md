@@ -26,20 +26,15 @@ cd /docker-local/truenas-jbod-ui
 mkdir -p config/ssh data history/backups/long-term logs
 ```
 
-Download the release Compose file and ownership helper from the same source
-revision: the release tag you are going to run. Pin `JBOD_UI_IMAGE` in `.env`
-to that same tag. The Compose file on `main` is for
+Download the release Compose file from the release tag you are going to run.
+Pin `JBOD_UI_IMAGE` in `.env` to that same tag. The Compose file on `main` is for
 images built from `main`; do not pair it with a release image.
 
 ```bash
-mkdir -p scripts
 tag=v0.22.2
 curl -fsSL \
   -o compose.yaml \
   "https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/$tag/docker-compose.yml"
-curl -fsSL \
-  -o scripts/prepare_nonroot_bind_mounts.py \
-  "https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/$tag/scripts/prepare_nonroot_bind_mounts.py"
 ```
 
 Create a minimal `.env` for one TrueNAS system:
@@ -60,14 +55,18 @@ EOF
 chmod 600 .env
 ```
 
-Prepare the bind mounts, then pull and start:
+Pull and start:
 
 ```bash
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 docker compose pull
 docker compose up -d
 ```
+
+Do not run the current-main non-root ownership helper against a `v0.22.2`
+install. That release runs UI and history as root, while its backup service uses
+`1000:1000` without the supplemental `10001` group. Applying the current-main
+ownership migration can make the history backup paths unwritable by the
+`v0.22.2` backup service.
 
 Open:
 

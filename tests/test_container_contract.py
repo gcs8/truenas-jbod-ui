@@ -530,6 +530,26 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("--apply", quick_start)
         self.assertNotIn("The base Compose file keeps the existing root-compatible", deployment_guide)
 
+    def test_v0222_install_does_not_apply_current_nonroot_ownership(self) -> None:
+        quick_start = (REPO_ROOT / "wiki/Quick-Start.md").read_text(encoding="utf-8")
+        deployment_guide = (
+            REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md"
+        ).read_text(encoding="utf-8")
+        pinned_sections = {
+            "quick-start": quick_start.split("## Updates", maxsplit=1)[0],
+            "deployment-guide": deployment_guide.split("## Default non-root runtime", maxsplit=1)[0],
+        }
+
+        for guide_name, section in pinned_sections.items():
+            normalized = " ".join(section.split())
+            with self.subTest(guide=guide_name):
+                self.assertNotIn("prepare_nonroot_bind_mounts.py", section)
+                self.assertNotIn("--uid 10001", section)
+                self.assertNotIn("--gid 10001", section)
+                self.assertIn("Do not run the current-main non-root ownership helper", normalized)
+                self.assertIn("backup service", normalized)
+                self.assertIn("1000:1000", section)
+
     def test_nonroot_overlay_preserves_backup_identity_with_app_data_group(self) -> None:
         overlay = yaml.safe_load(
             (REPO_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8")

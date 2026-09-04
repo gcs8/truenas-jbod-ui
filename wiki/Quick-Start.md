@@ -32,21 +32,17 @@ cd /docker-local/truenas-jbod-ui
 mkdir -p config/ssh data history/backups/long-term logs
 ```
 
-## 2. Download the Compose file and ownership helper
+## 2. Download the Compose file
 
-Download both from the release tag you are going to run, and pin
+Download it from the release tag you are going to run, and pin
 `JBOD_UI_IMAGE` in `.env` to that same tag. The Compose file on `main` is for
 images built from `main`; do not pair it with a release image.
 
 ```bash
-mkdir -p scripts
 tag=v0.22.2
 curl -fsSL \
   -o compose.yaml \
   "https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/$tag/docker-compose.yml"
-curl -fsSL \
-  -o scripts/prepare_nonroot_bind_mounts.py \
-  "https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/$tag/scripts/prepare_nonroot_bind_mounts.py"
 ```
 
 That Compose file runs the public image from:
@@ -86,21 +82,18 @@ Edit the values before starting:
 Start with CORE or SCALE here. Less common adapters are covered on their
 platform-specific setup pages so this first-run path stays focused.
 
-## 4. Prepare, pull, and start
+## 4. Pull and start
 
 ```bash
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001
-sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001 --apply
 docker compose pull
 docker compose up -d
 ```
 
-The dry run must pass before `--apply`. The non-root Compose file (unreleased,
-on `main`) runs UI and history as `10001:10001`, so these ownership steps are
-required for a fresh install on that file and before its first start on an
-older root-owned deployment. The `v0.22.2` Compose file still runs the services
-as root; the steps are harmless there and leave the folder ready for the next
-release.
+Do not run the current-main non-root ownership helper against a `v0.22.2`
+install. That release runs UI and history as root, while its backup service uses
+`1000:1000` without the supplemental `10001` group. Applying the current-main
+ownership migration can make the history backup paths unwritable by the
+`v0.22.2` backup service.
 
 Open:
 
@@ -122,8 +115,8 @@ Expected shape:
 
 ## Updates
 
-To move to a new release, download `compose.yaml` and the ownership helper
-from the new tag as in step 2, set `JBOD_UI_IMAGE` in `.env` to that tag, then:
+To move to a new release, download `compose.yaml` from the new tag as in step 2,
+set `JBOD_UI_IMAGE` in `.env` to that tag, then:
 
 ```bash
 cd /docker-local/truenas-jbod-ui
@@ -132,8 +125,10 @@ docker compose up -d
 ```
 
 When crossing from `v0.22.2` or older to the first release that ships the
-non-root Compose file (unreleased, on `main`), stop the stack and run the
-ownership helper's dry run and `--apply` commands above before recreating it.
+non-root Compose file (unreleased, on `main`), download the ownership helper
+from that new release tag. Stop the stack and run the helper's dry run and
+`--apply` commands before recreating it, as described under
+[[Default non-root runtime|Docker-and-GHCR-Deployment#default-non-root-runtime]].
 
 `latest` tracks the newest published release. If you use it, still download the
 Compose file from the matching release tag rather than from `main`.
