@@ -1,11 +1,9 @@
 """Pull-request gate: require a CHANGELOG.md line for code-visible changes.
 
 The gate reads the ``base...head`` diff of one pull request with ``git`` only.
-It never talks to the network. When the diff touches a path that operators can
-notice (application code, service code, scripts, Compose files, config
-examples, docs, or the wiki) and the pull request carries neither the
-``no-changelog`` nor the ``dependencies`` label, the diff must add at least
-one bullet under
+It never talks to the network. A pull request must either carry the
+``no-changelog`` or ``dependencies`` escape label, or touch an operator-visible
+path and add at least one bullet under
 ``## Unreleased`` in one of the allowed ``### `` subsections whose trailing
 parenthetical names the pull request as ``(#N)``. A pull request labelled
 ``breaking`` must add that bullet under ``### Breaking changes`` or
@@ -226,8 +224,11 @@ def evaluate(
         )
     if not relevant:
         return GateResult(
-            True,
-            [f"No operator-visible paths changed; CHANGELOG entry not required for #{pr_number}."],
+            False,
+            [
+                f"No operator-visible paths changed for #{pr_number}; apply the "
+                f"'{NO_CHANGELOG_LABEL}' label and re-run the check."
+            ],
         )
 
     added = added_line_numbers(repo, base, head, CHANGELOG_PATH) if CHANGELOG_PATH in paths else set()

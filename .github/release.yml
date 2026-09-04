@@ -28,11 +28,11 @@ changelog:
     - title: Documentation
       labels:
         - documentation
+    - title: Dependencies
+      labels:
+        - dependencies
     - title: Internal
       labels:
         - internal
         - tests
         - ci
-    - title: Dependencies
-      labels:
-        - dependencies

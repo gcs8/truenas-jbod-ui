@@ -12,9 +12,13 @@ union because neither is complete on its own:
   and merge commits whose subject starts ``Merge pull request #N``.
 * ``--merged-prs-json <file>`` -- the release operator produces it with
   ``gh pr list -R <owner>/<repo> --state merged --search "merged:>=<tag date>"
-  --limit 1000 --json number,mergedAt,labels`` (either a JSON list of objects with a ``number``
-  field or a bare list of integers). Squash subjects lose the number when a
-  contributor edits the merge title, so this file is the safety net.
+  --limit 1000 --json number,mergedAt,labels,mergeCommit`` (either a JSON list
+  of objects with a ``number`` field or a bare list of integers). Object entries
+  whose merge commit is outside ``<tag>..HEAD`` are ignored. This ancestry
+  filter includes pull requests that reached the candidate through an
+  intermediate branch without including unrelated branch merges. Squash
+  subjects lose the number when a contributor edits the merge title, so this
+  file is the safety net.
 
 Numbers whose commit already sits at or below the tag are dropped, so a JSON
 list built from a same-day date filter does not fail the gate for pull requests
@@ -25,8 +29,9 @@ parenthetical such as ``(#12, #13, and #14)``) somewhere in the target
 ``CHANGELOG.md`` section. Missing numbers are printed and the gate exits 1.
 
 When ``wiki/`` changed since the tag, the gate also requires ``--wiki-commit
-<sha>`` and, unless ``--offline`` is given, confirms with ``git ls-remote`` that
-the sha is a branch tip of the GitHub wiki repository. Nothing is cloned.
+<sha>`` and confirms with ``git ls-remote`` that the sha is a branch tip of the
+GitHub wiki repository. ``--offline`` can inspect the candidate but cannot pass
+that release gate or emit publish evidence. Nothing is cloned.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ MERGE_SUBJECT = re.compile(r"^Merge pull request #(\d+) from ")
 PARENTHETICAL = re.compile(r"\(([^()]*)\)")
 PR_TOKEN = re.compile(r"(?<![\w#])#(\d+)(?!\d)")
 SHA_TOKEN = re.compile(r"^[0-9a-f]{7,40}$")
+CHANGELOG_SKIP_LABELS = {"no-changelog", "dependencies"}
 
 
 class CoverageError(Exception):
@@ -106,9 +112,30 @@ def tag_commit_time(repo: Path, previous_tag: str) -> str:
     return _git(repo, "log", "-1", "--format=%cI", previous_tag).stdout.strip()
 
 
+def commit_is_in_range(repo: Path, commit: str, previous_tag: str, head: str) -> bool:
+    """Return whether ``commit`` exists in the candidate range ``tag..head``."""
+
+    exists = _git(repo, "cat-file", "-e", f"{commit}^{{commit}}", check=False)
+    if exists.returncode != 0:
+        return False
+
+    def is_ancestor(descendant: str) -> bool:
+        completed = _git(repo, "merge-base", "--is-ancestor", commit, descendant, check=False)
+        if completed.returncode in {0, 1}:
+            return completed.returncode == 0
+        raise CoverageError(
+            f"git merge-base --is-ancestor {commit} {descendant} failed: {completed.stderr.strip()}"
+        )
+
+    return is_ancestor(head) and not is_ancestor(previous_tag)
+
+
 def pr_number_sets_from_json(
     path: Path,
     *,
+    repo: Path | None = None,
+    previous_tag: str | None = None,
+    head: str = "HEAD",
     not_after: str | None = None,
 ) -> tuple[set[int], set[int]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -135,12 +162,20 @@ def pr_number_sets_from_json(
                 label_names.add(label["name"])
             else:
                 raise CoverageError(f"{path} entry labels must be strings or objects with a 'name' field")
-        if "no-changelog" in label_names:
+        if label_names & CHANGELOG_SKIP_LABELS:
             excluded.add(int(item["number"]))
             continue
         merged_at = item.get("mergedAt")
         if not_after and isinstance(merged_at, str) and _iso_key(merged_at) <= _iso_key(not_after):
             continue
+        merge_commit = item.get("mergeCommit")
+        if merge_commit is not None:
+            if not isinstance(merge_commit, dict) or not isinstance(merge_commit.get("oid"), str):
+                raise CoverageError(f"{path} entry mergeCommit must be null or an object with an 'oid' field")
+            if repo is None or previous_tag is None:
+                raise CoverageError("mergeCommit ancestry filtering requires a repository and previous tag")
+            if not commit_is_in_range(repo, merge_commit["oid"], previous_tag, head):
+                continue
         numbers.add(int(item["number"]))
     return numbers, excluded
 
@@ -223,6 +258,9 @@ def evaluate(
     if merged_prs_json is not None:
         json_numbers, excluded = pr_number_sets_from_json(
             merged_prs_json,
+            repo=repo,
+            previous_tag=previous_tag,
+            head=head,
             not_after=tag_commit_time(repo, previous_tag),
         )
         expected |= json_numbers
@@ -241,7 +279,7 @@ def evaluate(
         )
         result.messages.append(
             f"Add one '- ... (#N)' line per missing pull request to {CHANGELOG_PATH} under "
-            f"{section_header!r}, or record why it is not operator-visible under '### Internal'."
+            f"{section_header!r}, or apply an approved changelog escape label before release."
         )
     else:
         result.messages.append(f"Changelog coverage: pass ({len(expected)} PRs)")
@@ -260,8 +298,8 @@ def evaluate(
         else:
             sha = wiki_commit.lower()
             if offline:
-                result.wiki_commit = sha
-                result.messages.append(f"External wiki commit: {sha} (not verified: --offline)")
+                result.ok = False
+                result.messages.append(f"External wiki commit candidate: {sha} (not verified: --offline)")
             else:
                 remote = wiki_remote or default_wiki_remote(repo)
                 if wiki_commit_is_published(repo, remote, sha):
@@ -290,10 +328,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--merged-prs-json",
         type=Path,
-        help="JSON list from gh pr list --state merged ... --json number,mergedAt,labels.",
+        help="JSON list from gh pr list --state merged ... --json number,mergedAt,labels,mergeCommit.",
     )
     parser.add_argument("--wiki-commit", help="Published GitHub wiki commit sha, required when wiki/ changed.")
-    parser.add_argument("--offline", action="store_true", help="Skip the git ls-remote wiki verification.")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Inspect without git ls-remote; cannot pass when wiki publication evidence is required.",
+    )
     parser.add_argument("--wiki-remote", help="Wiki repository URL (default: origin URL with .wiki.git).")
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="Repository root (default: cwd).")
     args = parser.parse_args(argv)

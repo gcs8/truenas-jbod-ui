@@ -102,12 +102,30 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
 
         self.assertIn(
             "wiki/ changed since the previous tag; release wrap must record "
-            "'External wiki commit: <sha>' for the published GitHub wiki",
+            "'External wiki commit: <sha> (branch tip on <remote>)' from online verification",
             [issue.message for issue in issues],
         )
         self.assertEqual(validate_release_wrap_text(text, wiki_changed=False), [])
-        recorded = text + "\nExternal wiki commit: 0123456789abcdef0123456789abcdef01234567\n"
+        recorded = (
+            text
+            + "\nExternal wiki commit: 0123456789abcdef0123456789abcdef01234567 "
+            "(branch tip on https://github.com/example/project.wiki.git)\n"
+        )
         self.assertEqual(validate_release_wrap_text(recorded, wiki_changed=True), [])
+
+    def test_wiki_change_rejects_offline_unverified_commit_evidence(self) -> None:
+        text = (
+            _wrap_with_rows({})
+            + "\nExternal wiki commit: abcdef1 (not verified: --offline)\n"
+        )
+
+        issues = validate_release_wrap_text(text, wiki_changed=True)
+
+        self.assertIn(
+            "wiki/ changed since the previous tag; release wrap must record "
+            "'External wiki commit: <sha> (branch tip on <remote>)' from online verification",
+            [issue.message for issue in issues],
+        )
 
     def test_requires_all_global_checklist_rows(self) -> None:
         text = _wrap_with_rows({}).replace(

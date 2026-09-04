@@ -37,7 +37,10 @@ VALID_RESULTS = {"pass", "blocked", "n/a"}
 # (scripts/check_release_changelog_coverage.py). Earlier wraps predate it.
 CHANGELOG_COVERAGE_REQUIRED_FROM = (0, 22, 3)
 CHANGELOG_COVERAGE_LINE = re.compile(r"Changelog coverage: pass \(\d+ PRs\)")
-EXTERNAL_WIKI_COMMIT_LINE = re.compile(r"External wiki commit: [0-9a-f]{7,40}\b")
+EXTERNAL_WIKI_COMMIT_LINE = re.compile(
+    r"^External wiki commit: [0-9a-f]{7,40} \(branch tip on \S+\)$",
+    re.MULTILINE,
+)
 
 
 @dataclass(frozen=True)
@@ -114,7 +117,7 @@ def validate_release_wrap_text(
         issues.append(
             ValidationIssue(
                 "wiki/ changed since the previous tag; release wrap must record "
-                "'External wiki commit: <sha>' for the published GitHub wiki"
+                "'External wiki commit: <sha> (branch tip on <remote>)' from online verification"
             )
         )
 
@@ -217,7 +220,7 @@ def main() -> int:
         "--previous-tag",
         help=(
             "Previous release tag. When wiki/ changed between it and HEAD, the wrap must "
-            "record 'External wiki commit: <sha>'."
+            "record online-verified 'External wiki commit: <sha> (branch tip on <remote>)' evidence."
         ),
     )
     parser.add_argument(

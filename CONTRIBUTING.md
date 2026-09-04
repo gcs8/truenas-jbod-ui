@@ -569,15 +569,18 @@ labels plus that file. The rules:
   `breaking`. Changing the title swaps the type label; `security` and
   `breaking` are only ever added automatically, so a hand-applied one stays.
   `.github/release.yml` maps those labels to the categories Breaking changes,
-  Security, Features, Fixes, Performance, Documentation, Internal, and
-  Dependencies.
+  Security, Features, Fixes, Performance, Documentation, Dependencies, and
+  Internal. Dependencies precedes Internal so a Dependabot pull request that
+  also carries `internal` remains categorized as a dependency.
 - **`no-changelog` escape.** Apply the `no-changelog` label to a pull request
   that is invisible to operators (tests-only, CI-only, tooling). It needs no
   entry and is excluded from the generated release notes. Re-run the
   `Changelog entry` job after applying the label; it reads labels live.
   The `dependencies` label (Dependabot) skips the entry gate the same way,
   but those pull requests still appear in the release body under
-  Dependencies.
+  Dependencies. Pull requests with no operator-visible paths must still carry
+  `no-changelog`; an unlabeled invisible pull request fails the entry gate so
+  release coverage cannot discover an implicit escape later.
 
 Two scripts enforce this:
 
@@ -595,14 +598,17 @@ Two scripts enforce this:
   header>"` runs during release prep. It collects merged pull request numbers
   from `git log <tag>..HEAD` squash and merge subjects and from
   `--merged-prs-json <file>`, produced with
-  `gh pr list --state merged --search "merged:>=<tag date>" --limit 1000 --json number,mergedAt,labels`
+  `gh pr list --state merged --search "merged:>=<tag date>" --limit 1000 --json number,mergedAt,labels,mergeCommit`
   (squash subjects lose the number when the merge title is edited). It removes
-  pull requests labelled `no-changelog`, then fails when any remaining number
-  is missing from the target section. When `wiki/` changed
+  pull requests labelled `no-changelog` or `dependencies`, filters merge commits
+  to the candidate's `<tag>..HEAD` ancestry instead of filtering by target
+  branch, then fails when any remaining number is missing from the target
+  section. When `wiki/` changed
   since the tag it also requires `--wiki-commit <sha>` and verifies with
   `git ls-remote` that the sha is a branch tip of the GitHub wiki repository.
-  Its `Changelog coverage: pass (<N> PRs)` and `External wiki commit: <sha>`
-  lines are the evidence the release wrap validator requires.
+  Its `Changelog coverage: pass (<N> PRs)` and online-verified `External wiki
+  commit: <sha> (branch tip on <remote>)` lines are the evidence the release
+  wrap validator requires. `--offline` cannot produce release evidence.
 
 Release body recipe, after the coverage gate passes and the release section
 header is final:

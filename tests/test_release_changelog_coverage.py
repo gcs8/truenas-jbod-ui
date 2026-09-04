@@ -119,6 +119,46 @@ class ReleaseChangelogCoverageTests(unittest.TestCase):
         self.assertEqual(result.missing, {21})
         self.assertIn(13, result.covered)
 
+    def test_merged_pr_json_uses_candidate_ancestry_not_target_branch(self) -> None:
+        _git(self.repo, "checkout", "-q", "-b", "release-staging")
+        self._write("app/service.py", "VALUE = 4\n")
+        self._commit("fix: staged change whose merge title lost its number")
+        included_oid = _git(self.repo, "rev-parse", "HEAD").strip()
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "--no-ff", "release-staging", "-m", "Merge release staging")
+
+        _git(self.repo, "checkout", "-q", "-b", "experimental", "v0.1.0")
+        self._write("app/service.py", "VALUE = 99\n")
+        self._commit("fix: unrelated branch change")
+        excluded_oid = _git(self.repo, "rev-parse", "HEAD").strip()
+        _git(self.repo, "checkout", "-q", "main")
+
+        merged = self._json(
+            [
+                {
+                    "number": 13,
+                    "baseRefName": "release-staging",
+                    "mergeCommit": {"oid": included_oid},
+                },
+                {
+                    "number": 21,
+                    "baseRefName": "experimental",
+                    "mergeCommit": {"oid": excluded_oid},
+                },
+            ]
+        )
+
+        result = coverage.evaluate(
+            self.repo,
+            previous_tag="v0.1.0",
+            section_header="## Unreleased",
+            merged_prs_json=merged,
+        )
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn(13, result.covered)
+        self.assertNotIn(21, result.covered | result.missing)
+
     def test_merged_pr_json_entries_released_before_the_tag_are_ignored(self) -> None:
         tag_time = coverage.tag_commit_time(self.repo, "v0.1.0")
         merged = self._json([5, {"number": 6, "mergedAt": tag_time}, {"number": 10}])
@@ -134,7 +174,7 @@ class ReleaseChangelogCoverageTests(unittest.TestCase):
         self.assertNotIn(5, result.missing | result.covered)
         self.assertNotIn(6, result.missing | result.covered)
 
-    def test_no_changelog_json_entries_are_excluded_from_release_coverage(self) -> None:
+    def test_entry_gate_escape_labels_are_excluded_from_release_coverage(self) -> None:
         self._write("app/service.py", "VALUE = 4\n")
         self._commit("chore: internal cleanup (#13)")
         merged = self._json(
@@ -153,7 +193,7 @@ class ReleaseChangelogCoverageTests(unittest.TestCase):
 
         self.assertTrue(result.ok, result.messages)
         self.assertNotIn(13, result.covered | result.missing)
-        self.assertIn(14, result.covered)
+        self.assertNotIn(14, result.covered | result.missing)
 
     def test_numbers_count_only_in_the_target_section(self) -> None:
         self._write("app/service.py", "VALUE = 4\n")
@@ -212,7 +252,7 @@ class ReleaseChangelogCoverageTests(unittest.TestCase):
         self.assertFalse(bad.ok)
         self.assertIn("not a branch tip", "\n".join(bad.messages))
 
-    def test_offline_accepts_wiki_commit_without_verification(self) -> None:
+    def test_offline_wiki_commit_cannot_be_release_evidence(self) -> None:
         self._write("wiki/Home.md", "# Home\n")
         self._commit("docs: wiki page (#13)")
 
@@ -224,8 +264,10 @@ class ReleaseChangelogCoverageTests(unittest.TestCase):
             offline=True,
         )
 
-        self.assertTrue(result.ok, result.messages)
-        self.assertIn("External wiki commit: abcdef1 (not verified: --offline)", result.messages)
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.wiki_commit)
+        self.assertIn("External wiki commit candidate: abcdef1 (not verified: --offline)", result.messages)
+        self.assertFalse(any(message.startswith("External wiki commit:") for message in result.messages))
 
     def test_malformed_wiki_commit_is_rejected(self) -> None:
         self._write("wiki/Home.md", "# Home\n")

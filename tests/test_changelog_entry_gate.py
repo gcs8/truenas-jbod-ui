@@ -131,7 +131,7 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertTrue(result.ok, result.messages)
         self.assertIn("dependencies", result.messages[0])
 
-    def test_change_outside_operator_visible_paths_passes(self) -> None:
+    def test_change_outside_operator_visible_paths_requires_escape_label(self) -> None:
         self._write("tests/test_service.py", "def test_more() -> None:\n    pass\n")
         self._write("README.md", "# readme\n")
         self._write("docs/RELEASE_WRAP_0.1.0.md", "wrap\n")
@@ -139,8 +139,17 @@ class ChangelogEntryGateTests(unittest.TestCase):
 
         result = self._evaluate()
 
-        self.assertTrue(result.ok)
-        self.assertIn("No operator-visible paths changed", result.messages[0])
+        self.assertFalse(result.ok)
+        self.assertIn("no-changelog", "\n".join(result.messages))
+
+    def test_change_outside_operator_visible_paths_with_escape_label_passes(self) -> None:
+        self._write("tests/test_service.py", "def test_more() -> None:\n    pass\n")
+        self._commit("test: add coverage")
+
+        result = self._evaluate(labels={"no-changelog"})
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn("no-changelog", result.messages[0])
 
     def test_breaking_label_requires_breaking_or_upgrade_note_entry(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")

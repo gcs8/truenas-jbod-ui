@@ -47,7 +47,7 @@ using this shape:
 | Linux QA restore gate | yes | target, counts, health, smoke evidence | Pass/Blocked/N/A | reason |
 | Restored Linux QA perf harnesses | yes | artifact path and summary | Pass/Blocked/N/A | reason |
 | Snapshot/export/offline artifact gate | yes | command and browser smoke | Pass/Blocked/N/A | reason |
-| Docs/wiki/public-demo gate | yes | changed files, URLs, workflow runs, and `External wiki commit: <sha>` whenever `wiki/` changed since the previous tag | Pass/Blocked/N/A | reason |
+| Docs/wiki/public-demo gate | yes | changed files, URLs, workflow runs, and `External wiki commit: <sha> (branch tip on <remote>)` whenever `wiki/` changed since the previous tag | Pass/Blocked/N/A | reason |
 | GHCR publish verification | yes | workflow URL, full `name@sha256` image reference, and exact source revision | Pass/Blocked/N/A | reason |
 | Deployment refresh/sniff tests | yes | validated private deployment receipt, exact Compose project/file/profile/service contract, pre-update rollback digest, running container image IDs, health/restart evidence, and rollback result | Pass/Blocked/N/A | reason |
 | Post-release reopen | yes | branch, commit, version | Pass/Blocked/N/A | reason |
@@ -58,9 +58,9 @@ revision when published, pre-update rollback digest, running container image IDs
 validated private deployment-receipt result, exact Compose project/file/profile/service
 contract, health and restart evidence, rollback result, public demo workflow or Pages URL
 when applicable, the `Changelog coverage: pass (<N> PRs)` line from
-`scripts/check_release_changelog_coverage.py`, the `External wiki commit: <sha>`
-line whenever `wiki/` changed since the previous tag, and any known deviations
-from the checklist.
+`scripts/check_release_changelog_coverage.py`, the online-verified `External wiki
+commit: <sha> (branch tip on <remote>)` line whenever `wiki/` changed since the
+previous tag, and any known deviations from the checklist.
 
 Before tagging, run the pre-tag release-wrap validator against the target
 version:
@@ -73,7 +73,8 @@ the final release-wrap validator:
 - `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --previous-tag <previous tag>`
 
 `--previous-tag` lets the validator see whether `wiki/` changed; when it did,
-the wrap must carry the `External wiki commit: <sha>` line.
+the wrap must carry the online-verified `External wiki commit: <sha> (branch tip
+on <remote>)` line. `--offline` output cannot satisfy this release evidence.
 
 ## Release Gate Order
 
@@ -393,8 +394,11 @@ the wrap must carry the `External wiki commit: <sha>` line.
 ## Release Notes And Docs
 
 - bump `app/__init__.py` to the release version
-- build the merged pull request list for the coverage gate:
-  `gh pr list -R gcs8/truenas-jbod-ui --state merged --search "merged:>=<previous tag date>" --limit 1000 --json number,mergedAt,labels > merged-prs.json`
+- build the repository-wide merged pull request list for the coverage gate; do
+  not add `--base`, because pull requests can reach the candidate through an
+  intermediate branch. The gate filters `mergeCommit.oid` by ancestry in the
+  release candidate range:
+  `gh pr list -R gcs8/truenas-jbod-ui --state merged --search "merged:>=<previous tag date>" --limit 1000 --json number,mergedAt,labels,mergeCommit > merged-prs.json`
 - run the changelog coverage gate against the previous tag and the section
   that will become the release section, and fix every missing number before
   going on:
@@ -464,7 +468,7 @@ the wrap must carry the `External wiki commit: <sha>` line.
   `gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes --notes-file release-notes.md`
 - open the release page and confirm every pull request sits in the expected
   category (Breaking changes, Security, Features, Fixes, Performance,
-  Documentation, Internal, Dependencies); fix labels and regenerate rather than
+  Documentation, Dependencies, Internal); fix labels and regenerate rather than
   editing the body by hand
 - publishing the GitHub release page runs the `Publish GHCR Image` workflow
 - wait for the `Publish GHCR Image` Actions run to finish successfully
@@ -487,7 +491,8 @@ the wrap must carry the `External wiki commit: <sha>` line.
 - confirm the pushed tag matches the intended commit
 - confirm the GitHub README renders the new screenshots correctly
 - confirm the wiki publish completed if applicable and that the release wrap
-  records the published `External wiki commit: <sha>`
+  records the online-verified `External wiki commit: <sha> (branch tip on
+  <remote>)`
 - next-cycle source work may begin before production deployment only in a
   separate clean worktree after the tag and immutable image are published. Keep
   the production release lane frozen, and do not mark `Post-release reopen` as
