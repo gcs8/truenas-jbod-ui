@@ -559,9 +559,12 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         await ensure_slot_bounds(slot, service, enclosure_id)
-        resolved_system_id = service.system.id if system_id is None else system_id
+        # Scope the query to the system the registry resolved, exactly like
+        # every sibling route; an unknown or retired ``system_id`` otherwise
+        # gets bounds-checked against the default system but queried as the
+        # raw string, so this panel and ``/api/history/scope`` disagree (#286).
         add_perf_metadata(
-            system_id=resolved_system_id,
+            system_id=service.system.id,
             platform=service.system.truenas.platform,
             slot=slot,
             enclosure_id=enclosure_id,
@@ -570,7 +573,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         history_backend = get_history_backend()
         payload = await history_backend.get_slot_history(
             slot,
-            resolved_system_id,
+            service.system.id,
             enclosure_id,
             window_hours=window_hours,
         )
