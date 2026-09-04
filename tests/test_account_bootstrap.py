@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import AsyncMock
 
 from cryptography.hazmat.primitives import serialization
@@ -30,6 +31,9 @@ from app.services.slot_detail_store import SlotDetailStore
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.ssh_probe import SSHCommandResult
 from app.services.system_setup import default_ssh_commands_for_platform
+
+
+Platform = Literal["core", "scale", "quantastor", "linux"]
 
 
 class FakeProbe:
@@ -347,25 +351,30 @@ def strip_sudo_prefix(command: str) -> str | None:
         remainder.pop(0)
     if not remainder:
         return None
+    for index, token in enumerate(remainder):
+        if token in {"&&", "||", ";"} or token.startswith((">", "2>")):
+            remainder = remainder[:index]
+            break
     return shlex.join(remainder)
 
 
-class LinuxBootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
-    """The Linux bootstrap grant list must cover every sudo-run Linux probe.
-
-    The expected set is derived by running the generic-Linux collection paths in
-    `app.services.inventory` against a recording SSH runner, so a new sudo-run
-    command fails this test until the bootstrap grants it (issue #332).
-    """
+class BootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
+    """Bootstrap grants must cover the sudo-run builders for every SSH platform."""
 
     maxDiff = None
+    platforms: tuple[Platform, ...] = ("core", "scale", "quantastor", "linux")
 
-    def build_linux_service(self, temp_dir: str) -> InventoryService:
+    def build_service(self, temp_dir: str, platform: Platform) -> InventoryService:
         system = SystemConfig(
-            id="linux-contract",
-            label="Generic Linux",
-            truenas=TrueNASConfig(platform="linux"),
-            ssh=SSHConfig(enabled=True, host="linux-host.invalid", user="jbodmap", commands=[]),
+            id=f"{platform}-contract",
+            label=f"{platform.title()} contract",
+            truenas=TrueNASConfig(platform=platform),
+            ssh=SSHConfig(
+                enabled=True,
+                host=f"{platform}-host.invalid",
+                user="jbodmap",
+                commands=[],
+            ),
         )
         return InventoryService(
             Settings(),
@@ -378,14 +387,21 @@ class LinuxBootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
             SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
         )
 
-    async def collect_linux_sudo_commands(self) -> set[str]:
+    async def collect_sudo_commands(self, platform: Platform) -> set[str]:
         recorded: list[str] = []
+        host = f"{platform}-host.invalid"
 
         async def record_many(commands, host=None, **_kwargs):
             command_list = list(commands)
             recorded.extend(command_list)
             return [
-                SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
+                SSHCommandResult(
+                    command=command,
+                    ok="smartctl" not in command,
+                    stdout="",
+                    stderr="command not found" if "smartctl" in command else "",
+                    exit_code=127 if "smartctl" in command else 0,
+                )
                 for command in command_list
             ]
 
@@ -394,43 +410,67 @@ class LinuxBootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
             return SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            service = self.build_linux_service(temp_dir)
+            service = self.build_service(temp_dir, platform)
             service._run_ssh_commands = record_many
             service._run_ssh_command = record_one
+            smartctl_binaries = service._smartctl_binary_candidates()
 
-            # Commands the setup wizard seeds for a generic Linux host.
-            recorded.extend(default_ssh_commands_for_platform("linux"))
+            # Commands seeded by the setup wizard for this platform.
+            recorded.extend(default_ssh_commands_for_platform(platform))
 
-            # SES page reads for a discovered generic SCSI enclosure.
-            await service._fetch_sg_ses_host_overlay(
-                "linux-host.invalid",
-                ["/dev/sg3"],
-                failure_prefix="SES",
-            )
+            # Dynamic CORE collection probes are built from discovered adapters.
+            if platform == "core":
+                seed_commands = service._core_mprutil_seed_probe_commands([])
+                recorded.extend(seed_commands)
+                recorded.extend(
+                    service._core_mprutil_unit_probe_commands(
+                        [
+                            SSHCommandResult(
+                                command=seed_commands[0],
+                                ok=True,
+                                stdout="/dev/mpr10 Synthetic adapter",
+                                stderr="",
+                                exit_code=0,
+                            )
+                        ]
+                    )
+                )
+                recorded.extend(service._core_mpr_dmesg_probe_commands([]))
+                recorded.extend(service._core_pci_slot_probe_commands([]))
 
-            # SMART reads, including the NVMe enrichment probes and the forced
-            # device type the UniFi boot-media path sets.
-            await service._fetch_smart_summary_over_ssh(["nvme0n1"])
+            # SES page reads for a discovered Linux-family SCSI enclosure.
+            if platform in {"scale", "quantastor", "linux"}:
+                await service._fetch_sg_ses_host_overlay(
+                    host,
+                    ["/dev/sg3"],
+                    failure_prefix="SES",
+                )
+
+            # SMART reads use the same builder on every SSH-capable platform.
+            if platform == "linux":
+                await service._fetch_smart_summary_over_ssh(["nvme0n1"])
             await service._fetch_smart_summary_over_ssh(["sda"])
             await service._fetch_smart_summary_over_ssh(
                 ["sda"],
+                hosts=[host] if platform == "quantastor" else None,
                 device_type=LINUX_BOOT_MEDIA_SMARTCTL_DEVICE_TYPE,
             )
 
-            # Identify LED control over the SES device discovered above.
+            # Identify control uses sesutil on CORE and sg_ses elsewhere.
+            ses_device = "/dev/ses3" if platform == "core" else "/dev/sg3"
             slot_view = SimpleNamespace(
                 slot=3,
                 slot_label="03",
                 led_reason=None,
                 ssh_ses_targets=[
                     {
-                        "ses_device": "/dev/sg3",
+                        "ses_device": ses_device,
                         "ses_element_id": 3,
                         "ses_slot_number": 3,
-                        "ssh_host": "linux-host.invalid",
+                        "ssh_host": host,
                     }
                 ],
-                ssh_ses_device="/dev/sg3",
+                ssh_ses_device=ses_device,
                 ssh_ses_element_id=3,
             )
             await service._set_slot_led_over_ssh(slot_view, LedAction.identify)
@@ -441,43 +481,74 @@ class LinuxBootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
             for command in recorded
             if (stripped := strip_sudo_prefix(command)) is not None
         }
-        self.assertTrue(sudo_commands, "no sudo-run Linux commands were captured")
+        self.assertTrue(sudo_commands, f"no sudo-run {platform} commands were captured")
+        for smartctl_binary in smartctl_binaries:
+            self.assertIn(
+                f"{smartctl_binary} -d scsi -x -j /dev/sda",
+                sudo_commands,
+                f"typed SMART JSON builder was not exercised for {platform}",
+            )
+            self.assertIn(
+                f"{smartctl_binary} -d scsi -x /dev/sda",
+                sudo_commands,
+                f"typed SMART text builder was not exercised for {platform}",
+            )
         return sudo_commands
 
-    async def test_linux_bootstrap_grants_cover_every_sudo_run_linux_command(self) -> None:
-        grants = SUDO_COMMANDS_BY_PLATFORM["linux"]
-        ungranted = sorted(
-            command
-            for command in await self.collect_linux_sudo_commands()
-            if not any(sudoers_grant_matches(grant, command) for grant in grants)
-        )
+    async def test_bootstrap_grants_cover_every_sudo_run_platform_command(self) -> None:
+        for platform in self.platforms:
+            with self.subTest(platform=platform):
+                grants = SUDO_COMMANDS_BY_PLATFORM[platform]
+                ungranted = sorted(
+                    command
+                    for command in await self.collect_sudo_commands(platform)
+                    if not any(sudoers_grant_matches(grant, command) for grant in grants)
+                )
+                self.assertEqual(
+                    ungranted,
+                    [],
+                    f"{platform} bootstrap sudo grants do not cover: " + ", ".join(ungranted),
+                )
 
-        self.assertEqual(
-            ungranted,
-            [],
-            "Linux bootstrap sudo grants do not cover these sudo-run commands: "
-            + ", ".join(ungranted),
-        )
-
-    async def test_linux_supplemental_grants_cover_device_specific_sudo_commands(self) -> None:
+    async def test_supplemental_grants_cover_device_specific_platform_commands(self) -> None:
         # Commands built per device never appear in an operator's saved command
         # list, so they have to survive the supplemental merge too.
-        grants = ServiceAccountBootstrapService._resolve_sudo_commands(
-            "linux",
-            ["sudo -n /usr/sbin/mdadm --detail --scan"],
-        )
-        ungranted = sorted(
-            command
-            for command in await self.collect_linux_sudo_commands()
-            if not any(sudoers_grant_matches(grant, command) for grant in grants)
-        )
+        for platform in self.platforms:
+            with self.subTest(platform=platform):
+                sudo_commands = await self.collect_sudo_commands(platform)
+                requested_commands = [
+                    f"sudo -n {command}"
+                    for command in sudo_commands
+                    if "smartctl -d " not in command
+                ]
+                grants = ServiceAccountBootstrapService._resolve_sudo_commands(
+                    platform,
+                    requested_commands,
+                )
+                ungranted = sorted(
+                    command
+                    for command in sudo_commands
+                    if not any(sudoers_grant_matches(grant, command) for grant in grants)
+                )
+                self.assertEqual(
+                    ungranted,
+                    [],
+                    f"{platform} supplemental sudo grants do not cover: " + ", ".join(ungranted),
+                )
 
-        self.assertEqual(
-            ungranted,
-            [],
-            "Linux supplemental sudo grants do not cover these sudo-run commands: "
-            + ", ".join(ungranted),
-        )
+    def test_smartctl_grants_only_allow_inventory_read_shapes(self) -> None:
+        allowed_argument_shapes = {
+            ("-x", "-j", "*"),
+            ("-x", "*"),
+            ("-d", "*", "-x", "-j", "*"),
+            ("-d", "*", "-x", "*"),
+        }
+        for platform in self.platforms:
+            with self.subTest(platform=platform):
+                for grant in SUDO_COMMANDS_BY_PLATFORM[platform]:
+                    tokens = shlex.split(grant)
+                    if Path(tokens[0]).name == "smartctl":
+                        self.assertIn(tuple(tokens[1:]), allowed_argument_shapes)
 
 
 if __name__ == "__main__":

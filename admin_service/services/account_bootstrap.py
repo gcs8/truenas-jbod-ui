@@ -43,9 +43,9 @@ CORE_DMIDECODE_SUDO_COMMANDS = (
 CORE_MESSAGES_SUDO_COMMANDS = (
     "/usr/bin/tail -n 4000 /var/log/messages",
 )
-# Device-specific probes the generic-Linux collection path builds at run time from
-# discovered devices. They never appear in an operator's saved command list, so the
-# bootstrap has to grant them in both the seeded and the supplemental flow (#332).
+# Device-specific probes the collection path builds at run time from discovered
+# devices. They never appear in an operator's saved command list, so the bootstrap
+# has to grant them in both the seeded and the supplemental flow (#332, #335).
 LINUX_SG_SES_SUDO_COMMANDS = (
     "/usr/bin/sg_ses -p aes /dev/sg*",
     "/usr/bin/sg_ses -p ec /dev/sg*",
@@ -53,7 +53,7 @@ LINUX_SG_SES_SUDO_COMMANDS = (
     "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
     "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
 )
-LINUX_SMARTCTL_SUDO_COMMANDS = (
+SMARTCTL_SUDO_COMMANDS = (
     "/usr/sbin/smartctl -x -j *",
     "/usr/sbin/smartctl -x *",
     "/usr/sbin/smartctl -d * -x -j *",
@@ -97,10 +97,7 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/sbin/sesutil locate -u /dev/ses* * on",
         "/usr/sbin/sesutil locate -u /dev/ses* * off",
         "/sbin/camcontrol devlist -v",
-        "/usr/local/sbin/smartctl -x -j *",
-        "/usr/local/sbin/smartctl -x *",
-        "/usr/sbin/smartctl -x -j *",
-        "/usr/sbin/smartctl -x *",
+        *SMARTCTL_SUDO_COMMANDS,
         *CORE_MPRUTIL_SUDO_COMMANDS,
         *CORE_DMIDECODE_SUDO_COMMANDS,
         *CORE_MESSAGES_SUDO_COMMANDS,
@@ -112,16 +109,13 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/bin/sg_ses --join --filter /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
-        "/usr/sbin/smartctl -x -j *",
-        "/usr/sbin/smartctl -x *",
-        "/usr/local/sbin/smartctl -x -j *",
-        "/usr/local/sbin/smartctl -x *",
+        *SMARTCTL_SUDO_COMMANDS,
         *SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
     "linux": (
         "/usr/sbin/mdadm --detail --scan",
         *LINUX_SG_SES_SUDO_COMMANDS,
-        *LINUX_SMARTCTL_SUDO_COMMANDS,
+        *SMARTCTL_SUDO_COMMANDS,
         *LINUX_NVME_SUDO_COMMANDS,
     ),
     "quantastor": (
@@ -130,10 +124,7 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         "/usr/bin/sg_ses --join --filter /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
-        "/usr/sbin/smartctl -x -j *",
-        "/usr/sbin/smartctl -x *",
-        "/usr/local/sbin/smartctl -x -j *",
-        "/usr/local/sbin/smartctl -x *",
+        *SMARTCTL_SUDO_COMMANDS,
         "/usr/bin/qs *",
     ),
     "esxi": (),
@@ -142,10 +133,7 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     "core": (
         "/usr/sbin/sesutil locate -u /dev/ses* * on",
         "/usr/sbin/sesutil locate -u /dev/ses* * off",
-        "/usr/local/sbin/smartctl -x -j *",
-        "/usr/local/sbin/smartctl -x *",
-        "/usr/sbin/smartctl -x -j *",
-        "/usr/sbin/smartctl -x *",
+        *SMARTCTL_SUDO_COMMANDS,
         *CORE_MPRUTIL_SUDO_COMMANDS,
         *CORE_DMIDECODE_SUDO_COMMANDS,
         *CORE_MESSAGES_SUDO_COMMANDS,
@@ -154,24 +142,18 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     "scale": (
         "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
-        "/usr/sbin/smartctl -x -j *",
-        "/usr/sbin/smartctl -x *",
-        "/usr/local/sbin/smartctl -x -j *",
-        "/usr/local/sbin/smartctl -x *",
+        *SMARTCTL_SUDO_COMMANDS,
         *SCALE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
     "linux": (
         *LINUX_SG_SES_SUDO_COMMANDS,
-        *LINUX_SMARTCTL_SUDO_COMMANDS,
+        *SMARTCTL_SUDO_COMMANDS,
         *LINUX_NVME_SUDO_COMMANDS,
     ),
     "quantastor": (
         "/usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*",
         "/usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*",
-        "/usr/sbin/smartctl -x -j *",
-        "/usr/sbin/smartctl -x *",
-        "/usr/local/sbin/smartctl -x -j *",
-        "/usr/local/sbin/smartctl -x *",
+        *SMARTCTL_SUDO_COMMANDS,
         "/usr/bin/qs *",
     ),
     "esxi": (),
