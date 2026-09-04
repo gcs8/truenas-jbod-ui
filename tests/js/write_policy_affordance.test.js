@@ -9,6 +9,9 @@ const vm = require("node:vm");
 const ROOT = path.resolve(__dirname, "../..");
 const APP_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8");
 const TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/index.html"), "utf8");
+const FABRIC_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/sas_fabric_view.js"), "utf8");
+const FABRIC_TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/sas_fabric.html"), "utf8");
+const ROUTES_SOURCE = fs.readFileSync(path.join(ROOT, "app/routes.py"), "utf8");
 
 const NETWORK_REASON =
   "Writes are disabled: this deployment runs the read UI in network auth mode. "
@@ -74,6 +77,14 @@ function loadFunctions(names, context = {}) {
   const source = names.map((name) => functionSource(APP_SOURCE, name)).join("\n");
   const exports = names.map((name) => `this.__${name} = ${name};`).join("\n");
   vm.runInContext(`${source}\n${exports}`, sandbox, { filename: "write-policy-affordance.behavior.js" });
+  return Object.fromEntries(names.map((name) => [name, sandbox[`__${name}`]]));
+}
+
+function loadFabricFunctions(names, context = {}) {
+  const sandbox = vm.createContext({ ...context });
+  const source = names.map((name) => functionSource(FABRIC_SOURCE, name)).join("\n");
+  const exports = names.map((name) => `this.__${name} = ${name};`).join("\n");
+  vm.runInContext(`${source}\n${exports}`, sandbox, { filename: "fabric-write-policy.behavior.js" });
   return Object.fromEntries(names.map((name) => [name, sandbox[`__${name}`]]));
 }
 
@@ -281,4 +292,51 @@ test("every guarded write handler checks the policy first and reports rejections
   assert.match(APP_SOURCE, /writePolicy: normalizeWritePolicy\(bootstrap\.writePolicy\)/);
   assert.match(TEMPLATE, /id="write-policy-notice"/);
   assert.match(TEMPLATE, /writePolicy: \{\{ write_policy_json \| default\("null"\) \| script_json_text \}\}/);
+});
+
+test("Storage Fabric bootstrap and alias markup carry the same write policy", () => {
+  assert.match(ROUTES_SOURCE, /"writePolicy": resolve_read_ui_write_policy\(request\)/);
+  assert.match(FABRIC_SOURCE, /writePolicy: normalizeFabricWritePolicy\(bootstrap\.writePolicy\)/);
+  assert.match(FABRIC_TEMPLATE, /id="fabric-write-policy-notice"/);
+
+  const renderAliasRow = functionSource(FABRIC_SOURCE, "renderAliasRow");
+  assert.match(renderAliasRow, /fabricAliasWriteAttributes\(\)/);
+  const saveAliasFromForm = functionSource(FABRIC_SOURCE, "saveAliasFromForm");
+  assert.match(saveAliasFromForm, /if \(fabricWriteBlockedByPolicy\(\)\) \{/);
+  assert.match(saveAliasFromForm, /handleFabricWriteRejection\(error\)/);
+  const handleFabricActivation = functionSource(FABRIC_SOURCE, "handleFabricActivation");
+  assert.match(handleFabricActivation, /if \(fabricWriteBlockedByPolicy\(\)\) \{/);
+});
+
+test("Storage Fabric rejects blocked alias writes and adopts 401/403 details", () => {
+  const state = {
+    writePolicy: { enabled: false, mode: "network", reason: NETWORK_REASON },
+    error: null,
+  };
+  const fns = loadFabricFunctions([
+    "normalizeFabricWritePolicy",
+    "fabricWritePolicyAllowsWrites",
+    "fabricWritePolicyReason",
+    "fabricAliasWriteAttributes",
+    "fabricWriteBlockedByPolicy",
+    "handleFabricWriteRejection",
+  ], { state });
+
+  assert.equal(fns.fabricWritePolicyAllowsWrites(), false);
+  assert.equal(
+    fns.fabricAliasWriteAttributes(),
+    ' disabled aria-describedby="fabric-write-policy-notice"',
+  );
+  assert.equal(fns.fabricWriteBlockedByPolicy(), true);
+  assert.equal(state.error, NETWORK_REASON);
+
+  state.writePolicy = fns.normalizeFabricWritePolicy({ enabled: true, mode: "basic", reason: "" });
+  const denied = new Error("Read UI authentication required.");
+  denied.status = 401;
+  denied.detail = "Read UI authentication required.";
+  assert.equal(fns.handleFabricWriteRejection(denied), true);
+  assert.equal(state.writePolicy.enabled, false);
+  assert.equal(state.writePolicy.mode, "basic");
+  assert.equal(state.writePolicy.reason, "Read UI authentication required.");
+  assert.equal(state.error, "Read UI authentication required.");
 });

@@ -54,6 +54,7 @@
     smartSummaries: {},
     smartRequests: {},
     aliasEditObjectId: null,
+    writePolicy: normalizeFabricWritePolicy(bootstrap.writePolicy),
     mode: modeIds.has(initialMode) ? initialMode : "lanes",
     loading: false,
     error: null,
@@ -68,6 +69,7 @@
     pageSummary: document.getElementById("fabric-page-summary"),
     apiChip: document.getElementById("fabric-api-chip"),
     statusText: document.getElementById("fabric-status-text"),
+    writePolicyNotice: document.getElementById("fabric-write-policy-notice"),
     lastUpdated: document.getElementById("fabric-last-updated"),
     backLinks: Array.from(document.querySelectorAll("[data-fabric-back-link]")),
     summaryControllers: document.getElementById("fabric-summary-controllers"),
@@ -88,6 +90,67 @@
 
   function list(value) {
     return Array.isArray(value) ? value : [];
+  }
+
+  function normalizeFabricWritePolicy(raw) {
+    if (!raw || typeof raw !== "object") {
+      return { enabled: true, mode: "", reason: "" };
+    }
+    return {
+      enabled: raw.enabled !== false,
+      mode: typeof raw.mode === "string" ? raw.mode : "",
+      reason: typeof raw.reason === "string" ? raw.reason : "",
+    };
+  }
+
+  function fabricWritePolicyAllowsWrites() {
+    return state.writePolicy?.enabled !== false;
+  }
+
+  function fabricWritePolicyReason() {
+    return state.writePolicy?.reason || "Writes are disabled for this deployment.";
+  }
+
+  function fabricAliasWriteAttributes() {
+    if (fabricWritePolicyAllowsWrites()) {
+      return "";
+    }
+    return ' disabled aria-describedby="fabric-write-policy-notice"';
+  }
+
+  function fabricWriteBlockedByPolicy() {
+    if (fabricWritePolicyAllowsWrites()) {
+      return false;
+    }
+    state.error = fabricWritePolicyReason();
+    return true;
+  }
+
+  function handleFabricWriteRejection(error) {
+    if (!error || ![401, 403].includes(Number(error.status))) {
+      return false;
+    }
+    const reason = error.detail || error.message || "Write access was rejected.";
+    state.writePolicy = {
+      enabled: false,
+      mode: state.writePolicy?.mode || "",
+      reason,
+    };
+    state.error = reason;
+    return true;
+  }
+
+  function renderFabricWritePolicyNotice() {
+    if (!elements.writePolicyNotice) {
+      return;
+    }
+    if (fabricWritePolicyAllowsWrites()) {
+      elements.writePolicyNotice.textContent = "";
+      elements.writePolicyNotice.classList.add("hidden");
+      return;
+    }
+    elements.writePolicyNotice.textContent = fabricWritePolicyReason();
+    elements.writePolicyNotice.classList.remove("hidden");
   }
 
   function setSelectOptionsIfChanged(select, optionsHtml) {
@@ -3015,6 +3078,11 @@
     const fallbackLabel = rawLabel(item) || objectId;
     const currentLabel = displayLabel(item) || fallbackLabel;
     const rawHint = currentLabel !== fallbackLabel ? `<small>Raw: ${escapeHtml(fallbackLabel)}</small>` : "";
+    const writeAttributes = fabricAliasWriteAttributes();
+    const writeTitle = fabricWritePolicyAllowsWrites()
+      ? ""
+      : ` title="${escapeHtml(fabricWritePolicyReason())}"`;
+    const clearAttributes = savedLabel ? writeAttributes : (writeAttributes || " disabled");
     if (state.aliasEditObjectId === objectId) {
       return `
         <form class="kv-row fabric-alias-row is-editing" data-fabric-alias-form>
@@ -3031,10 +3099,11 @@
               data-fabric-alias-object="${escapeHtml(objectId)}"
               data-fabric-alias-kind="${escapeHtml(objectKind || "")}"
               data-fabric-alias-scope="auto"
+              ${writeAttributes}${writeTitle}
             >
             <div class="fabric-alias-actions">
-              <button type="submit">Save</button>
-              <button type="button" data-fabric-alias-clear${savedLabel ? "" : " disabled"}>Clear</button>
+              <button type="submit"${writeAttributes}${writeTitle}>Save</button>
+              <button type="button" data-fabric-alias-clear${clearAttributes}${writeTitle}>Clear</button>
               <button type="button" data-fabric-alias-cancel>Cancel</button>
             </div>
             <small>${escapeHtml(aliasScopeLabel(objectKind))} name / raw: ${escapeHtml(fallbackLabel)}</small>
@@ -3052,15 +3121,20 @@
         <button
           type="button"
           class="fabric-alias-edit-button"
-          title="Edit friendly name"
+          title="${escapeHtml(fabricWritePolicyAllowsWrites() ? "Edit friendly name" : fabricWritePolicyReason())}"
           aria-label="Edit friendly name for ${escapeHtml(fallbackLabel)}"
           data-fabric-alias-edit="${escapeHtml(objectId)}"
+          ${writeAttributes}
         >&#9998;</button>
       </div>
     `;
   }
 
   async function saveAliasFromForm(form, { clear = false } = {}) {
+    if (fabricWriteBlockedByPolicy()) {
+      render();
+      return;
+    }
     const input = form.querySelector("[data-fabric-alias-input]");
     if (!(input instanceof HTMLInputElement)) {
       return;
@@ -3086,7 +3160,9 @@
       applyFabric(fabric);
       render();
     } catch (error) {
-      state.error = error.message || String(error);
+      if (!handleFabricWriteRejection(error)) {
+        state.error = error.message || String(error);
+      }
       render();
     } finally {
       form.classList.remove("is-saving");
@@ -3452,6 +3528,7 @@
     renderStatus();
     renderWarnings();
     renderModeChrome();
+    renderFabricWritePolicyNotice();
     renderMap();
     ensureSelectedSmartSummary();
     syncLocation();
@@ -3578,6 +3655,10 @@
     }
     const aliasEditButton = target.closest("[data-fabric-alias-edit]");
     if (aliasEditButton) {
+      if (fabricWriteBlockedByPolicy()) {
+        render();
+        return;
+      }
       state.aliasEditObjectId = aliasEditButton.dataset.fabricAliasEdit || null;
       render();
       window.requestAnimationFrame(() => {
