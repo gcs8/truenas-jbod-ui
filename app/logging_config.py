@@ -36,8 +36,33 @@ def _traceback_requested(record: logging.LogRecord) -> bool:
 
 
 def _format_traceback_without_exception_value(exc_info: Any) -> str:
-    exception_type, _exception_value, traceback_object = exc_info
-    rendered: list[str] = []
+    exception_type, exception_value, traceback_object = exc_info
+
+    def render_exception(
+        value: BaseException,
+        current_traceback: Any,
+        seen: set[int],
+    ) -> list[str]:
+        if id(value) in seen:
+            return []
+        seen.add(id(value))
+        rendered: list[str] = []
+        if value.__cause__ is not None:
+            rendered.extend(render_exception(value.__cause__, value.__cause__.__traceback__, seen))
+            rendered.append("\nThe above exception was the direct cause of the following exception:\n\n")
+        elif value.__context__ is not None and not value.__suppress_context__:
+            rendered.extend(render_exception(value.__context__, value.__context__.__traceback__, seen))
+            rendered.append("\nDuring handling of the above exception, another exception occurred:\n\n")
+        if current_traceback is not None:
+            rendered.append("Traceback (most recent call last):\n")
+            rendered.extend(traceback.format_tb(current_traceback))
+        rendered.append(type(value).__name__)
+        return rendered
+
+    if isinstance(exception_value, BaseException):
+        return "".join(render_exception(exception_value, traceback_object, set()))
+
+    rendered = []
     if traceback_object is not None:
         rendered.append("Traceback (most recent call last):\n")
         rendered.extend(traceback.format_tb(traceback_object))
