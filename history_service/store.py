@@ -668,11 +668,17 @@ class HistoryStore:
                 raise
 
     def _connect(self, *, migration_lock_held: bool = False) -> sqlite3.Connection:
-        # Every reader and writer opens the hot database here. Check the
-        # lifecycle markers before connecting: _ensure_journal_mode rewrites the
-        # header (PRAGMA journal_mode=WAL) whenever the hot inode changed, which
-        # is exactly the state a crashed rotation or restore leaves behind, so a
-        # plain read used to make the hot diverge from the journal (issue #279).
+        lock_context = (
+            nullcontext()
+            if migration_lock_held
+            else history_write_lock(self.file_path, blocking=False)
+        )
+        with lock_context:
+            return self._connect_locked()
+
+    def _connect_locked(self) -> sqlite3.Connection:
+        """Open and fully configure a connection while the lifecycle lock is held."""
+
         self._require_no_pending_lifecycle_markers()
         connection = sqlite3.connect(
             self.file_path,
@@ -682,19 +688,11 @@ class HistoryStore:
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
             connection.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_SIZE_KIB}")
-            self._ensure_journal_mode(connection, migration_lock_held=migration_lock_held)
-        except sqlite3.Error:
+            self._ensure_journal_mode_locked(connection)
+        except BaseException:
             connection.close()
             raise
         return connection
-
-    def _ensure_journal_mode(self, connection: sqlite3.Connection, *, migration_lock_held: bool = False) -> None:
-        if migration_lock_held:
-            self._ensure_journal_mode_locked(connection)
-            return
-        with history_write_lock(self.file_path, blocking=False):
-            self._require_no_pending_lifecycle_markers()
-            self._ensure_journal_mode_locked(connection)
 
     def _ensure_journal_mode_locked(self, connection: sqlite3.Connection) -> None:
         try:

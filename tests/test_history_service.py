@@ -1425,6 +1425,189 @@ class HistoryStoreTests(unittest.TestCase):
             finally:
                 marker_path.unlink(missing_ok=True)
 
+    def test_store_does_not_open_replacement_published_with_a_lifecycle_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            marker_path = activation_pending_path(database_path)
+            store = HistoryStore(str(database_path), recover_unreadable_database=False)
+            replacement_path = root / "replacement.db"
+            with sqlite3.connect(replacement_path) as connection:
+                connection.executescript(history_store.SCHEMA)
+                connection.execute("PRAGMA journal_mode=DELETE")
+                connection.commit()
+            replacement_bytes = replacement_path.read_bytes()
+            for suffix in ("-wal", "-shm"):
+                Path(f"{database_path}{suffix}").unlink(missing_ok=True)
+
+            @contextmanager
+            def lifecycle_lock_that_publishes_replacement(*args: Any, **kwargs: Any):
+                with history_write_lock(*args, **kwargs):
+                    os.replace(replacement_path, database_path)
+                    marker_path.write_text("{}", encoding="utf-8")
+                    yield
+
+            try:
+                with (
+                    patch(
+                        "history_service.store.history_write_lock",
+                        lifecycle_lock_that_publishes_replacement,
+                    ),
+                    patch(
+                        "history_service.store.sqlite3.connect",
+                        wraps=sqlite3.connect,
+                    ) as connect,
+                ):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "activation is pending"):
+                        connection = store._connect()
+                        connection.close()
+
+                connect.assert_not_called()
+                self.assertEqual(database_path.read_bytes(), replacement_bytes)
+                self.assertFalse(Path(f"{database_path}-wal").exists())
+            finally:
+                marker_path.unlink(missing_ok=True)
+
+    def test_connect_configures_connection_entirely_under_the_lifecycle_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "history.db"
+            store = HistoryStore(str(database_path), initialize=False)
+            real_connect = sqlite3.connect
+            lock_owned = False
+            configuration_events: list[tuple[str, bool]] = []
+
+            class TrackingConnection:
+                def __init__(self, connection: sqlite3.Connection) -> None:
+                    self.connection = connection
+
+                @property
+                def row_factory(self) -> object:
+                    return self.connection.row_factory
+
+                @row_factory.setter
+                def row_factory(self, value: object) -> None:
+                    configuration_events.append(("row_factory", lock_owned))
+                    self.connection.row_factory = value  # type: ignore[assignment]
+
+                def execute(self, statement: str, parameters: object = ()) -> sqlite3.Cursor:
+                    configuration_events.append((statement, lock_owned))
+                    return self.connection.execute(statement, parameters)  # type: ignore[arg-type]
+
+                def close(self) -> None:
+                    self.connection.close()
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(self.connection, name)
+
+            @contextmanager
+            def tracking_lifecycle_lock(*args: Any, **kwargs: Any):
+                nonlocal lock_owned
+                with history_write_lock(*args, **kwargs):
+                    self.assertFalse(lock_owned)
+                    lock_owned = True
+                    try:
+                        yield
+                        self.assertIsNotNone(store._journal_mode_identity)
+                    finally:
+                        lock_owned = False
+
+            def tracking_marker_check() -> None:
+                configuration_events.append(("marker_check", lock_owned))
+                store_marker_check()
+
+            def tracking_connect(*args: object, **kwargs: object) -> TrackingConnection:
+                configuration_events.append(("connect", lock_owned))
+                return TrackingConnection(real_connect(*args, **kwargs))  # type: ignore[arg-type]
+
+            store_marker_check = store._require_no_pending_lifecycle_markers
+            with (
+                patch("history_service.store.history_write_lock", tracking_lifecycle_lock),
+                patch.object(
+                    store,
+                    "_require_no_pending_lifecycle_markers",
+                    side_effect=tracking_marker_check,
+                ),
+                patch("history_service.store.sqlite3.connect", side_effect=tracking_connect),
+            ):
+                connection = store._connect()
+                connection.execute("SELECT 1").fetchone()
+                connection.close()
+
+            config_names = {
+                "marker_check",
+                "connect",
+                "row_factory",
+                f"PRAGMA temp_store={history_store.SQLITE_TEMP_STORE}",
+                f"PRAGMA cache_size=-{history_store.SQLITE_CACHE_SIZE_KIB}",
+                "PRAGMA journal_mode=WAL",
+            }
+            self.assertTrue(config_names.issubset({name for name, _owned in configuration_events}))
+            self.assertTrue(
+                all(owned for name, owned in configuration_events if name in config_names),
+                configuration_events,
+            )
+            self.assertIn(("SELECT 1", False), configuration_events)
+
+    def test_connect_with_caller_owned_lifecycle_lock_does_not_reacquire_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "history.db"
+            store = HistoryStore(str(database_path), initialize=False)
+
+            with history_write_lock(database_path, blocking=False):
+                with patch(
+                    "history_service.store.history_write_lock",
+                    side_effect=AssertionError("caller-owned lifecycle lock was reacquired"),
+                ):
+                    connection = store._connect(migration_lock_held=True)
+                    connection.close()
+
+            self.assertIsNotNone(store._journal_mode_identity)
+
+    def test_connect_closes_partial_connection_after_each_configuration_failure(self) -> None:
+        class FailingConfigurationConnection:
+            def __init__(self, failure_point: str) -> None:
+                self.failure_point = failure_point
+                self.close_count = 0
+                self._row_factory: object = None
+
+            @property
+            def row_factory(self) -> object:
+                return self._row_factory
+
+            @row_factory.setter
+            def row_factory(self, value: object) -> None:
+                if self.failure_point == "row_factory":
+                    raise RuntimeError("injected row factory failure")
+                self._row_factory = value
+
+            def execute(self, statement: str, _parameters: object = ()) -> MagicMock:
+                if self.failure_point == statement:
+                    raise RuntimeError(f"injected {statement} failure")
+                return MagicMock()
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        failure_points = (
+            "row_factory",
+            f"PRAGMA temp_store={history_store.SQLITE_TEMP_STORE}",
+            f"PRAGMA cache_size=-{history_store.SQLITE_CACHE_SIZE_KIB}",
+            "PRAGMA journal_mode=WAL",
+        )
+        for failure_point in failure_points:
+            with self.subTest(failure_point=failure_point):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    store = HistoryStore(str(Path(temp_dir) / "history.db"), initialize=False)
+                    connection = FailingConfigurationConnection(failure_point)
+                    with patch(
+                        "history_service.store.sqlite3.connect",
+                        return_value=connection,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "injected"):
+                            store._connect(migration_lock_held=True)
+
+                    self.assertEqual(connection.close_count, 1)
+
     def test_cached_journal_identity_still_rechecks_markers_under_the_history_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "history.db"
