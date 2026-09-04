@@ -3283,6 +3283,98 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertNotIn("/usr/sbin/zpool status -gP", remote_commands[0])
         self.assertNotIn("/usr/bin/sg_ses -p aes /dev/sg*", remote_commands[0])
 
+    def test_saved_sudo_commands_are_sanitized_like_request_supplied_commands(self) -> None:
+        # An over-long saved line must go through the same request-model validator (per-item
+        # 1024-character cap) as a command typed into the editor, so both paths render alike.
+        long_command = "sudo -n /usr/sbin/smartctl -a /dev/sda --marker-" + ("x" * 1200)
+        preview_route = next(
+            route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview"
+        )
+        bootstrap_route = next(
+            route for route in admin_app.routes if route.path == "/api/admin/system-setup/bootstrap"
+        )
+        settings = Settings(
+            config_file="C:/tmp/config/config.yaml",
+            systems=[
+                SystemConfig(
+                    id="saved-scale",
+                    truenas=TrueNASConfig(host="https://saved.example.test", platform="scale"),
+                    ssh=SSHConfig(enabled=True, host="saved.example.test", user="jbodmap", commands=[long_command]),
+                )
+            ],
+        )
+        expected_commands = SystemSetupBootstrapRequest(
+            platform="scale",
+            host="saved.example.test",
+            bootstrap_user="root",
+            bootstrap_password="one-time-secret",
+            service_public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyOnly saved-test",
+            sudo_commands=[long_command],
+        ).sudo_commands
+        self.assertEqual(len(expected_commands[0]), 1024)
+
+        with patch("admin_service.main.reload_app_settings", return_value=settings):
+            from_saved = asyncio.run(
+                preview_route.endpoint(
+                    SystemSetupSudoPreviewRequest(
+                        platform="scale",
+                        service_user="jbodmap",
+                        install_sudo_rules=True,
+                        sudo_commands=[],
+                        ssh_commands_source_system_id="saved-scale",
+                    )
+                )
+            )
+        from_request = asyncio.run(
+            preview_route.endpoint(
+                SystemSetupSudoPreviewRequest(
+                    platform="scale",
+                    service_user="jbodmap",
+                    install_sudo_rules=True,
+                    sudo_commands=[long_command],
+                )
+            )
+        )
+        self.assertEqual(
+            json.loads(from_saved.body.decode("utf-8"))["content"],
+            json.loads(from_request.body.decode("utf-8"))["content"],
+        )
+
+        received: list[SystemSetupBootstrapRequest] = []
+
+        class RecordingBootstrapService:
+            def __init__(self, config_path: str) -> None:
+                self.config_path = config_path
+
+            def bootstrap_service_account(self, payload: SystemSetupBootstrapRequest) -> dict[str, object]:
+                received.append(payload)
+                return {"ok": True}
+
+        with (
+            patch("admin_service.main.reload_app_settings", return_value=settings),
+            patch("admin_service.main.ServiceAccountBootstrapService", RecordingBootstrapService),
+        ):
+            response = asyncio.run(
+                bootstrap_route.endpoint(
+                    SystemSetupBootstrapRequest(
+                        platform="scale",
+                        host="saved.example.test",
+                        bootstrap_user="root",
+                        bootstrap_password="one-time-secret",
+                        service_user="jbodmap",
+                        service_public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyOnly saved-test",
+                        install_sudo_rules=True,
+                        sudo_commands=[],
+                        ssh_commands_source_system_id="saved-scale",
+                    )
+                )
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].sudo_commands, expected_commands)
+        self.assertEqual(received[0].bootstrap_password, "one-time-secret")
+
     def test_bootstrap_route_rejects_esxi_platform(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/bootstrap")
         settings = Settings(config_file="C:/tmp/config/config.yaml")
