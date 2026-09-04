@@ -28,8 +28,10 @@ from admin_service.services.runtime_control import DockerRuntimeService
 from admin_service.main import app as admin_app
 from admin_service.main import annotate_runtime_versions
 from admin_service.main import build_admin_state_payload
+from admin_service.main import create_app
 from admin_service.main import decode_optional_secret_header
 from admin_service.main import enrich_quantastor_nodes_from_ssh
+from admin_service.main import get_esxi_host_prep_service
 from admin_service.main import get_history_store
 from admin_service.main import observe_backup_route
 from admin_service.main import stream_limited_request_body_to_file
@@ -258,6 +260,98 @@ class MainAppBoundaryTests(unittest.TestCase):
             )
         finally:
             get_history_store.cache_clear()
+
+    def test_host_prep_service_receives_configured_stale_ttl(self) -> None:
+        get_esxi_host_prep_service.cache_clear()
+        settings = AdminSettings(
+            host_prep_temp_dir="/synthetic/host-prep",
+            host_prep_stale_ttl_seconds=1234,
+        )
+        service = object()
+        try:
+            with (
+                patch("admin_service.main.get_admin_settings", return_value=settings),
+                patch(
+                    "admin_service.main.ESXiHostPrepService",
+                    return_value=service,
+                ) as service_type,
+            ):
+                created = get_esxi_host_prep_service()
+
+            self.assertIs(created, service)
+            service_type.assert_called_once_with(
+                "/synthetic/host-prep",
+                stale_ttl_seconds=1234,
+            )
+        finally:
+            get_esxi_host_prep_service.cache_clear()
+
+    def test_admin_startup_prunes_stale_host_prep_packages(self) -> None:
+        settings = AdminSettings(auto_stop_seconds=0)
+        host_prep_service = MagicMock()
+        host_prep_service.prune_stale_packages.return_value = {
+            "removed": 2,
+            "skipped": 1,
+            "failed": 0,
+            "limited": False,
+        }
+        release_service = MagicMock()
+        release_service.run_periodic_refresh = AsyncMock(return_value=None)
+        with (
+            patch("admin_service.main.get_admin_settings", return_value=settings),
+            patch(
+                "admin_service.main.get_esxi_host_prep_service",
+                return_value=host_prep_service,
+            ),
+            patch(
+                "admin_service.main.get_release_status_service",
+                return_value=release_service,
+            ),
+        ):
+            application = create_app()
+
+            async def exercise_lifespan() -> None:
+                async with application.router.lifespan_context(application):
+                    pass
+
+            asyncio.run(exercise_lifespan())
+
+        host_prep_service.prune_stale_packages.assert_called_once_with()
+
+    def test_host_prep_cleanup_failure_is_sanitized_and_does_not_block_startup(self) -> None:
+        settings = AdminSettings(auto_stop_seconds=0)
+        host_prep_service = MagicMock()
+        host_prep_service.prune_stale_packages.side_effect = OSError(
+            f"{MARKER_ALPHA} /private/staging/vendor.vib"
+        )
+        release_service = MagicMock()
+        release_service.run_periodic_refresh = AsyncMock(return_value=None)
+        with (
+            patch("admin_service.main.get_admin_settings", return_value=settings),
+            patch(
+                "admin_service.main.get_esxi_host_prep_service",
+                return_value=host_prep_service,
+            ),
+            patch(
+                "admin_service.main.get_release_status_service",
+                return_value=release_service,
+            ),
+        ):
+            application = create_app()
+
+            async def exercise_lifespan() -> None:
+                async with application.router.lifespan_context(application):
+                    pass
+
+            with self.assertLogs("admin_service.main", level="WARNING") as captured:
+                asyncio.run(exercise_lifespan())
+
+        messages = "\n".join(captured.output)
+        self.assertIn("error_type=OSError", messages)
+        self.assertNotIn(MARKER_ALPHA, messages)
+        self.assertNotIn("/private/staging", messages)
+        self.assertNotIn("vendor.vib", messages)
+        release_service.run_periodic_refresh.assert_called_once_with()
 
     def test_main_app_does_not_expose_embedded_admin_routes(self) -> None:
         paths = {route.path for route in main_app.routes}

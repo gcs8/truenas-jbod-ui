@@ -43,6 +43,28 @@ class AdminSettingsHostPrepTempDirTests(unittest.TestCase):
 
         self.assertEqual(settings.host_prep_temp_dir, "/srv/host-prep")
 
+    def test_host_prep_stale_ttl_defaults_to_24_hours(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("admin_service.config.Path.mkdir"),
+        ):
+            settings = get_admin_settings()
+
+        self.assertEqual(settings.host_prep_stale_ttl_seconds, 24 * 60 * 60)
+
+    def test_host_prep_stale_ttl_accepts_zero_to_disable_pruning(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {"ADMIN_HOST_PREP_STALE_TTL_SECONDS": "0"},
+                clear=True,
+            ),
+            patch("admin_service.config.Path.mkdir"),
+        ):
+            settings = get_admin_settings()
+
+        self.assertEqual(settings.host_prep_stale_ttl_seconds, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

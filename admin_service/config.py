@@ -41,6 +41,7 @@ class AdminSettings(BaseModel):
         default_factory=lambda: ["ui", "history"]
     )
     host_prep_temp_dir: str = Field(default_factory=_default_host_prep_temp_dir)
+    host_prep_stale_ttl_seconds: StrictInt = Field(default=24 * 60 * 60, ge=0)
 
     @model_validator(mode="after")
     def validate_authentication(self) -> "AdminSettings":
@@ -77,6 +78,7 @@ ENV_OVERRIDES: dict[str, str] = {
     "ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT": "allow_plaintext_backup_export",
     "ADMIN_CLEAN_BACKUP_TARGETS_JSON": "clean_backup_targets",
     "ADMIN_HOST_PREP_TEMP_DIR": "host_prep_temp_dir",
+    "ADMIN_HOST_PREP_STALE_TTL_SECONDS": "host_prep_stale_ttl_seconds",
 }
 FILE_SECRET_ENV_OVERRIDES = frozenset({"ADMIN_AUTH_PASSWORD"})
 

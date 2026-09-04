@@ -207,8 +207,9 @@ Important guardrails:
 
 - the project does **not** bundle Broadcom or other vendor binaries
 - the temp area is just staging space, not long-term package management
-- stop the admin sidecar and remove its staged packages within 24 hours after
-  host-prep work; this is an operator recommendation, not an automatic TTL
+- on startup, the admin service prunes service-owned staging artifacts stale for 24 hours
+  by default; change `ADMIN_HOST_PREP_STALE_TTL_SECONDS` to choose a different
+  retention window, or set it to `0` to disable automatic pruning
 - this path is for one-time host prep / remediation, not ongoing RAID control
 - if a host only needs BMC-backed inventory, you can still use the `ipmi`
   platform and skip ESXi SSH entirely
