@@ -1049,20 +1049,32 @@ Enclosure status diagnostic page:
         self.assertIsNotNone(parsed)
         assert parsed is not None
         self.assertEqual(len(parsed.slots) + len(parsed.unmapped_slots), 84)
-        self.assertEqual(len(parsed.unmapped_slots), 70)
-        self.assertEqual(len({slot.element_id for slot in parsed.unmapped_slots}), 70)
-        self.assertTrue(all(slot.slot_number_degraded for slot in parsed.unmapped_slots))
-        self.assertTrue(all(slot.reported_slot_number == 0 for slot in parsed.unmapped_slots))
+        repeated_slots = [slot for slot in parsed.unmapped_slots if slot.slot_number_degraded]
+        invalid_slots = [slot for slot in parsed.unmapped_slots if not slot.slot_number_degraded]
+        self.assertEqual(len(repeated_slots), 70)
+        self.assertEqual(len({slot.element_id for slot in repeated_slots}), 70)
+        self.assertTrue(all(slot.reported_slot_number == 0 for slot in repeated_slots))
         self.assertTrue(
-            all("multiple distinct elements" in (slot.slot_number_warning or "") for slot in parsed.unmapped_slots)
+            all("multiple distinct elements" in (slot.slot_number_warning or "") for slot in repeated_slots)
+        )
+        # Invalid descriptors cannot use their raw element indexes as bay
+        # numbers when the remaining descriptors prove no consistent offset.
+        self.assertEqual(len(invalid_slots), 14)
+        self.assertTrue(all(slot.reported_slot_number is None for slot in invalid_slots))
+        self.assertTrue(
+            all("no consistent element-to-device-slot offset" in (slot.slot_number_warning or "") for slot in invalid_slots)
         )
         _, selected = build_slot_candidates_from_ses_enclosures([parsed], 84, None)
-        self.assertEqual(len(selected["unmapped_ses_elements"]), 70)
+        self.assertEqual(len(selected["unmapped_ses_elements"]), 84)
+        selected_repeated = [
+            item for item in selected["unmapped_ses_elements"] if item["slot_number_degraded"]
+        ]
+        self.assertEqual(len(selected_repeated), 70)
         self.assertTrue(
-            all(item["slot_number_degraded"] for item in selected["unmapped_ses_elements"])
+            all(item["slot_number_degraded"] for item in selected_repeated)
         )
         self.assertTrue(
-            all(item["reported_slot_number"] == 0 for item in selected["unmapped_ses_elements"])
+            all(item["reported_slot_number"] == 0 for item in selected_repeated)
         )
         self.assertTrue(any("multiple distinct elements" in warning for warning in selected["warnings"]))
 
@@ -2925,8 +2937,9 @@ Additional element status diagnostic page:
         self.assertIsNotNone(parsed)
         assert parsed is not None
         # Invalid descriptors (issue #119's empty bays) must not vanish from
-        # the shelf geometry: they fall back to the element index with
-        # low-strength provenance and read as empty.
+        # the shelf geometry: the valid descriptor proves a zero offset, so
+        # the empty elements safely retain matching bay numbers with
+        # low-strength provenance.
         self.assertEqual(sorted(parsed.slots), [0, 1, 2])
         self.assertIs(parsed.slots[1].present, False)
         self.assertEqual(parsed.slots[1].slot_number_source, "ses_element_index_invalid_descriptor")
@@ -2934,6 +2947,35 @@ Additional element status diagnostic page:
         # A stronger reported slot number must still win on merge.
         self.assertIs(parsed.slots[0].present, True)
         self.assertEqual(parsed.slots[0].slot_number_source, "ses_device_slot_number")
+
+    def test_aes_invalid_descriptor_stays_unmapped_without_consistent_offset(self) -> None:
+        output = """
+  EXAMPLE  AMBIGUOUSOFFSET    0100
+Additional element status diagnostic page:
+  additional element status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Element index: 0  eiioe=0
+        device slot number: 1
+      Element index: 1  eiioe=0
+        device slot number: 3
+      Element index: 2  eiioe=0
+        flagged as invalid (no further information)
+""".strip()
+
+        parsed = parse_sg_ses_aes(output, "sg_ses aes /dev/sg8")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(sorted(parsed.slots), [1, 3])
+        self.assertEqual(len(parsed.unmapped_slots), 1)
+        unmapped = parsed.unmapped_slots[0]
+        self.assertEqual(unmapped.element_id, 2)
+        self.assertFalse(unmapped.present)
+        self.assertEqual(
+            unmapped.control_targets,
+            [{"ses_device": "/dev/sg8", "ses_element_id": 2, "ses_slot_number": None}],
+        )
+        self.assertIn("no consistent element-to-device-slot offset", unmapped.slot_number_warning or "")
 
 
 class ParserConsolidationTests(unittest.TestCase):
