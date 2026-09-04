@@ -200,24 +200,25 @@ jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x -j *
 jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x *
 ```
 
-Generic Linux example (the list the one-time bootstrap grants):
+Generic Linux example (matches the list the one-time bootstrap grants as of
+#333, including the LED, `smartctl -d *`, and `nvme` probes the collection path
+builds at run time):
 
 ```text
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail --scan
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p aes /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p ec /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --join --filter /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j *
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -d * -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -d * -x *
 jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x -j *
 jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x *
-```
-
-The app runs `nvme smart-log`, `nvme id-ctrl`, and `nvme id-ns` under `sudo -n`
-for NVMe enrichment, but the one-time bootstrap does not grant them yet. Add
-them by hand only on hosts where you want that detail:
-
-```text
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -d * -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -d * -x *
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*

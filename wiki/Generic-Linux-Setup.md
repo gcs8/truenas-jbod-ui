@@ -52,9 +52,12 @@ sudo chmod 600 /home/jbodmap/.ssh/authorized_keys
 
 ## 3. Minimal Generic Linux Sudo
 
-This is the list the one-time bootstrap in the admin sidecar grants for Linux.
-The `sg_ses` rules matter only on hosts that expose SES devices, and
-`--join --filter` is the probe that supplies slot names and fan/PSU state:
+This block matches the list the one-time bootstrap in the admin sidecar grants
+for Linux as of #333. The `sg_ses` rules matter only on hosts that expose SES
+devices; `--join --filter` is the probe that supplies slot names and fan/PSU
+state, the `--set=ident`/`--clear=ident` rules are for identify LEDs, the
+`smartctl -d *` forms cover boot media that needs an explicit device type, and
+the `nvme` rules feed NVMe enrichment:
 
 ```bash
 sudo tee /etc/sudoers.d/jbodmap-storage > /dev/null <<'EOF'
@@ -63,29 +66,23 @@ jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail --scan
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p aes /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses -p ec /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --join --filter /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --set=ident /dev/sg*
+jbodmap ALL=(root) NOPASSWD: /usr/bin/sg_ses --dev-slot-num=* --clear=ident /dev/sg*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x -j *
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -x *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -d * -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl -d * -x *
 jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x -j *
 jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -x *
-EOF
-
-sudo chmod 440 /etc/sudoers.d/jbodmap-storage
-sudo visudo -cf /etc/sudoers.d/jbodmap-storage
-```
-
-The app runs `nvme smart-log`, `nvme id-ctrl`, and `nvme id-ns` under `sudo -n`
-for NVMe enrichment, but the one-time bootstrap does not grant them yet. Add
-them by hand only on hosts where you want that detail:
-
-```bash
-sudo tee /etc/sudoers.d/jbodmap-nvme > /dev/null <<'EOF'
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -d * -x -j *
+jbodmap ALL=(root) NOPASSWD: /usr/local/sbin/smartctl -d * -x *
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ctrl -o json /dev/nvme*
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme id-ns -o json /dev/nvme*
 EOF
 
-sudo chmod 440 /etc/sudoers.d/jbodmap-nvme
-sudo visudo -cf /etc/sudoers.d/jbodmap-nvme
+sudo chmod 440 /etc/sudoers.d/jbodmap-storage
+sudo visudo -cf /etc/sudoers.d/jbodmap-storage
 ```
 
 ## 4. Example Generic Linux System Config
