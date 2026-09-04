@@ -520,7 +520,7 @@ class ContainerResourceContractTests(unittest.TestCase):
     def test_large_temporary_workspaces_use_disk_backed_state_mounts(self) -> None:
         expected_temp_roots = {
             "enclosure-history": "/app/history",
-            "enclosure-admin": "/app/history",
+            "enclosure-admin": "/app/host-prep",
             "enclosure-backup": "/app/backups",
         }
         for compose_name in COMPOSE_FILES:
@@ -536,6 +536,15 @@ class ContainerResourceContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("disk-backed scratch", backup_guide)
         self.assertIn("TMPDIR", backup_guide)
+
+    def test_admin_host_prep_upload_spooling_never_uses_shared_history(self) -> None:
+        for compose_name in COMPOSE_FILES:
+            compose = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))
+            admin = compose["services"]["enclosure-admin"]
+
+            with self.subTest(compose=compose_name):
+                self.assertEqual(admin["environment"].get("TMPDIR"), "/app/host-prep")
+                self.assertNotEqual(admin["environment"].get("TMPDIR"), "/app/history")
 
     def test_admin_host_prep_staging_uses_a_dedicated_disk_backed_volume(self) -> None:
         for compose_name in COMPOSE_FILES:
@@ -598,7 +607,9 @@ class ContainerResourceContractTests(unittest.TestCase):
             env_example,
             r"(?i)disk-backed[^\n]*host-prep|host-prep[^\n]*disk-backed",
         )
+        self.assertRegex(env_example, r"(?i)TMPDIR[^\n]*not shared history|not shared history[^\n]*TMPDIR")
         self.assertIn("`/app/host-prep`", admin_guide)
+        self.assertRegex(admin_guide, r"(?i)incoming upload[^\n]*spool[^\n]*`/app/host-prep`")
 
     def test_host_prep_docs_recommend_removal_within_24_hours(self) -> None:
         admin_guide = (REPO_ROOT / "wiki/Admin-UI-and-System-Setup.md").read_text(

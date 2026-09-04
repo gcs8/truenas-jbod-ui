@@ -194,8 +194,9 @@ can enrich controller-backed disks properly.
 The current workflow is intentionally conservative:
 
 - choose a `.zip` offline bundle or `.vib` from your machine
-- stage it under `/app/host-prep` on the dedicated disk-backed
-  `host-prep-staging` Compose volume; no other shipped service mounts this volume
+- keep the incoming upload spool under `/app/host-prep`, then stage the package
+  there on the dedicated disk-backed `host-prep-staging` Compose volume; no
+  other shipped service mounts this volume
 - reuse the current saved ESXi SSH host, user, and password-or-key settings
   from the form
 - upload it to the host and run the matching `esxcli software component apply`

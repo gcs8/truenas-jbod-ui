@@ -134,8 +134,8 @@ services:
     env_file:
       - .env
     environment:
-      TMPDIR: /app/history
-      # Keep host-prep uploads on the dedicated disk-backed volume, not history or /tmp.
+      # Spool inbound uploads on the dedicated admin-only volume, not history or /tmp.
+      TMPDIR: /app/host-prep
       ADMIN_HOST_PREP_TEMP_DIR: ${ADMIN_HOST_PREP_TEMP_DIR:-/app/host-prep}
       HISTORY_SQLITE_PATH: /app/history/history.db
       HISTORY_SEGMENT_CATALOG_PATH: ${HISTORY_SEGMENT_CATALOG_PATH:-}
