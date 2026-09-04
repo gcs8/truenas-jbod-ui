@@ -288,6 +288,7 @@ class SystemOption(BaseModel):
 class EnclosureOption(BaseModel):
     id: str
     label: str
+    kind: Literal["physical", "virtual"] = "physical"
     raw_label: str | None = None
     alias: str | None = None
     name: str | None = None

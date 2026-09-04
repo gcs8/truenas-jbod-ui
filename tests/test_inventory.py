@@ -364,7 +364,7 @@ class InventoryHelpersTests(unittest.TestCase):
                 EnclosureOption(id="enc-a::drawer-b", label="Drawer B"),
             ])
         )
-        self.assertTrue(service._legacy_mapping_fallback_allowed([]))
+        self.assertFalse(service._legacy_mapping_fallback_allowed([]))
 
     def _legacy_fallback_service(
         self,
@@ -379,7 +379,7 @@ class InventoryHelpersTests(unittest.TestCase):
         service.profile_registry.resolve_for_enclosure.return_value = None
         return service
 
-    def test_single_system_without_detected_enclosures_still_resolves_legacy_mappings(self) -> None:
+    def test_single_system_without_detected_enclosures_denies_legacy_mappings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
             service.mapping_store._write({
@@ -396,16 +396,120 @@ class InventoryHelpersTests(unittest.TestCase):
             )
 
             self.assertIsInstance(frame, inventory_module._LayoutFrame)
-            self.assertTrue(frame.allow_legacy_mapping_fallback)
+            self.assertFalse(frame.allow_legacy_mapping_fallback)
             resolved = service.mapping_store.get_mapping(
                 "system-a",
                 None,
                 5,
                 allow_legacy_fallback=frame.allow_legacy_mapping_fallback,
             )
-            self.assertIsNotNone(resolved)
-            self.assertEqual(resolved.serial, "SYNTH-LEGACY-5")
-            self.assertEqual(warnings, [])
+            self.assertIsNone(resolved)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("no identified physical enclosure", warnings[0])
+            self.assertIn("Re-save", warnings[0])
+
+    def test_zero_enclosure_disks_use_system_virtual_inventory_without_legacy_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="system-a", truenas=TrueNASConfig(platform="core"))
+            settings = Settings(systems=[system])
+            settings.layout.rows = 2
+            settings.layout.columns = 4
+            settings.layout.slot_count = 8
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service.mapping_store._write({
+                "default:0": ManualMapping(slot=0, serial="SYNTH-DISK-B"),
+            })
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                disks=[
+                    {
+                        "name": "da0",
+                        "serial": "SYNTH-DISK-A",
+                        "model": "Synthetic A",
+                        "size": 1_000_000_000,
+                        "status": "ONLINE",
+                    },
+                    {
+                        "name": "da1",
+                        "serial": "SYNTH-DISK-B",
+                        "model": "Synthetic B",
+                        "size": 2_000_000_000,
+                        "status": "ONLINE",
+                    },
+                ],
+                pools=[],
+                disk_temperatures={"da0": 30, "da1": 31},
+                smart_test_results=[],
+            )
+            warnings: list[str] = []
+
+            slots, enclosures, selected_meta, rows, slot_count, columns = service._correlate(
+                raw_data,
+                ParsedSSHData(),
+                warnings,
+            )
+
+            self.assertEqual(len(enclosures), 1)
+            virtual_enclosure = enclosures[0]
+            self.assertEqual(virtual_enclosure.id, "virtual-system:system-a")
+            self.assertEqual(virtual_enclosure.label, "System disk inventory (virtual)")
+            self.assertEqual(virtual_enclosure.kind, "virtual")
+            self.assertEqual((virtual_enclosure.rows, virtual_enclosure.columns), (1, 2))
+            self.assertEqual(virtual_enclosure.slot_count, 2)
+            self.assertEqual(selected_meta["id"], virtual_enclosure.id)
+            self.assertEqual(rows, [[0, 1]])
+            self.assertEqual((slot_count, columns), (2, 2))
+            self.assertEqual([slot.device_name for slot in slots], ["da0", "da1"])
+            self.assertEqual([slot.slot_label for slot in slots], ["Disk 1", "Disk 2"])
+            self.assertTrue(all(slot.enclosure_id == virtual_enclosure.id for slot in slots))
+            self.assertTrue(all(slot.mapping_source == "system-inventory" for slot in slots))
+            self.assertTrue(all(slot.raw_status.get("virtual_enclosure") is True for slot in slots))
+            self.assertTrue(all(slot.raw_status.get("physical_location_known") is False for slot in slots))
+            self.assertTrue(all(slot.led_supported is False for slot in slots))
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("1 manual mapping", warnings[0])
+            self.assertIn("no identified physical enclosure", warnings[0])
+            self.assertIn("system-scoped virtual inventory", warnings[0])
+            self.assertIn("Re-save", warnings[0])
+            self.assertNotIn("SYNTH", warnings[0])
+            self.assertNotIn("system-a", warnings[0])
+
+            capabilities = service._build_platform_capabilities(
+                slots=slots,
+                available_enclosures=enclosures,
+                summary=InventorySummary(
+                    disk_count=2,
+                    enclosure_count=0,
+                    mapped_slot_count=0,
+                ),
+                sources={"api": SourceStatus(enabled=True, ok=True)},
+                platform_context={},
+            )
+            self.assertEqual(capabilities["inventory"].status, "available")
+            self.assertEqual(capabilities["physical_slots"].status, "unavailable")
+
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=raw_data,
+                    ssh_outputs={},
+                    ssh_collected=False,
+                    warnings=[],
+                    sources={"api": SourceStatus(enabled=True, ok=True)},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+            snapshot = asyncio.run(service._build_snapshot())
+            self.assertEqual(snapshot.summary.disk_count, 2)
+            self.assertEqual(snapshot.summary.enclosure_count, 0)
+            self.assertEqual(snapshot.summary.mapped_slot_count, 0)
+            self.assertEqual(snapshot.capabilities["physical_slots"].status, "unavailable")
 
     def test_multi_enclosure_snapshot_warns_once_about_unapplied_legacy_mappings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
