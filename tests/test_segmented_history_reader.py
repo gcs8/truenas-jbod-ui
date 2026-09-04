@@ -1321,6 +1321,99 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_quiesced_hot_reader_creates_no_sqlite_sidecars_on_a_service_wal_hot(self) -> None:
+        # The service leaves the hot database with a WAL header. A plain mode=ro
+        # open of that quiesced file creates -wal/-shm that survive close, and
+        # the next rotation or migration preflight refuses it (issue #278).
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            hot_path = Path(temporary_directory) / "hot.sqlite3"
+            self._create_service_wal_hot(hot_path, [(3, "2025-01-03T00:00:00+00:00")])
+
+            reader = SegmentedHistoryReader(hot_path=hot_path, quiesced_hot=True)
+            events = reader.list_slot_events("system-1", "enclosure-1", 1, limit=10)
+
+            self.assertEqual([event["id"] for event in events], [3])
+            self._assert_no_sqlite_sidecars(hot_path)
+
+    def test_quiesced_hot_reader_refuses_a_hot_that_has_sidecars(self) -> None:
+        # immutable=1 ignores an existing WAL, so a hot database that is still
+        # open elsewhere is refused instead of being read without its pending frames.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            hot_path = Path(temporary_directory) / "hot.sqlite3"
+            self._create_database(hot_path, [(3, "2025-01-03T00:00:00+00:00")])
+            Path(f"{hot_path}-wal").write_bytes(b"")
+            reader = SegmentedHistoryReader(hot_path=hot_path, quiesced_hot=True)
+
+            with self.assertRaisesRegex(ValueError, "sidecar"):
+                reader.list_slot_events("system-1", "enclosure-1", 1, limit=10)
+
+    def test_cli_query_of_a_service_wal_hot_creates_no_sqlite_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            hot_path = Path(temporary_directory) / "hot.sqlite3"
+            self._create_service_wal_hot(hot_path, [(3, "2025-01-03T00:00:00+00:00")])
+
+            result = self._run_query_cli(hot_path)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([event["id"] for event in json.loads(result.stdout)], [3])
+            self._assert_no_sqlite_sidecars(hot_path)
+
+    def test_cli_reads_a_hot_beside_a_running_service_only_with_live_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            hot_path = Path(temporary_directory) / "hot.sqlite3"
+            self._create_service_wal_hot(hot_path, [(3, "2025-01-03T00:00:00+00:00")])
+            service_connection = sqlite3.connect(hot_path)
+            try:
+                service_connection.execute("SELECT count(*) FROM slot_events").fetchone()
+                self.assertTrue(Path(f"{hot_path}-wal").exists())
+
+                refused = self._run_query_cli(hot_path)
+                live = self._run_query_cli(hot_path, "--live")
+            finally:
+                service_connection.close()
+
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("sidecar", refused.stderr)
+            self.assertEqual(live.returncode, 0, live.stderr)
+            self.assertEqual([event["id"] for event in json.loads(live.stdout)], [3])
+
+    @staticmethod
+    def _run_query_cli(hot_path: Path, *extra_arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "scripts/query_segmented_history.py",
+                "--hot",
+                str(hot_path),
+                "--system-id",
+                "system-1",
+                "--enclosure-id",
+                "enclosure-1",
+                "--slot",
+                "1",
+                *extra_arguments,
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+    def _create_service_wal_hot(self, path: Path, events: list[tuple[int, str]]) -> None:
+        """Build a hot database the way the service leaves it: WAL header, closed cleanly, no sidecars."""
+        self._create_database(path, events)
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+        finally:
+            connection.close()
+        self.assertEqual(path.read_bytes()[18:20], b"\x02\x02")
+        self._assert_no_sqlite_sidecars(path)
+
+    def _assert_no_sqlite_sidecars(self, path: Path) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            self.assertFalse(Path(f"{path}{suffix}").exists(), f"{path.name}{suffix} exists")
+
     @staticmethod
     def _create_database(
         path: Path,

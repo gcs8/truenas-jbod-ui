@@ -100,10 +100,15 @@ class SegmentedHistoryReader:
         segment_paths: Iterable[Path] = (),
         max_segments_per_query: int = MAX_SEGMENTS_PER_QUERY,
         activation_marker_path: Path | None = None,
+        quiesced_hot: bool = False,
     ) -> None:
         if type(max_segments_per_query) is not int or max_segments_per_query < 1:
             raise ValueError("Segmented history query segment limit is invalid.")
         self.hot_path = self._require_regular_file(Path(hot_path), label="hot history")
+        # Offline tools read a stopped service's hot database. Opening it
+        # immutable never creates -wal/-shm sidecars; the in-service reader keeps
+        # the default so it sees pending WAL frames.
+        self.quiesced_hot = bool(quiesced_hot)
         self.segment_paths = tuple(
             self._require_regular_file(Path(path), label="history segment") for path in segment_paths
         )
@@ -126,6 +131,7 @@ class SegmentedHistoryReader:
         max_segments_per_query: int = MAX_SEGMENTS_PER_QUERY,
         allow_pending_recovery: bool = False,
         allow_pending_activation: bool = False,
+        quiesced_hot: bool = False,
     ) -> "SegmentedHistoryReader":
         marker_path = activation_pending_path(hot_path)
         if not allow_pending_activation and path_entry_exists(marker_path):
@@ -202,6 +208,7 @@ class SegmentedHistoryReader:
             segment_paths=(),
             max_segments_per_query=max_segments_per_query,
             activation_marker_path=None if allow_pending_activation else marker_path,
+            quiesced_hot=quiesced_hot,
         )
         reader.segment_paths = tuple(segment.path for segment in catalog_segments)
         reader._catalog_segments = tuple(catalog_segments)
@@ -231,7 +238,19 @@ class SegmentedHistoryReader:
     ) -> Iterator[sqlite3.Connection]:
         self._require_activation_ready()
         if not immutable:
-            connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+            if path == self.hot_path and self.quiesced_hot:
+                # immutable=1 never creates -wal/-shm, but it also ignores an
+                # existing WAL, so a hot database that is still open elsewhere is
+                # refused instead of being read without its pending frames.
+                for suffix in ("-wal", "-shm", "-journal"):
+                    if path_entry_exists(Path(f"{path}{suffix}")):
+                        raise ValueError(
+                            "Segmented history hot database has SQLite sidecar state; "
+                            "stop the history service or read it live."
+                        )
+                connection = sqlite3.connect(f"{path.as_uri()}?mode=ro&immutable=1", uri=True)
+            else:
+                connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
             try:
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA query_only = ON")

@@ -170,7 +170,9 @@ def _prepare_output_directory(
 
 
 def _copy_and_prune(source: Path, destination: Path, cutoff: str) -> dict[str, int]:
-    source_uri = f"{source.resolve().as_uri()}?mode=ro"
+    # The source is quiesced and sidecar-free by contract. immutable=1 keeps a
+    # WAL-header hot from growing -wal/-shm that the next preflight would refuse.
+    source_uri = f"{source.resolve().as_uri()}?mode=ro&immutable=1"
     with sqlite3.connect(source_uri, uri=True) as source_connection:
         source_connection.execute("PRAGMA query_only = ON")
         with sqlite3.connect(destination) as destination_connection:

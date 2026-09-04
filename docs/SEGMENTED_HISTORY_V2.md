@@ -78,6 +78,11 @@ points under `/app/scripts`:
 - `scripts/query_segmented_history.py`
 - `scripts/seal_history_segment.py`
 
+Every offline read of a quiesced hot database (migration, rotation, sealing, and
+the query CLI) opens it immutable, so it never creates `-wal`/`-shm` sidecars
+beside a stopped service's database. The query CLI refuses a hot database that
+already has sidecars; pass `--live` to read beside a running history service.
+
 ## Offline migration
 
 Stop or otherwise quiesce the history service. Confirm the SQLite main file has

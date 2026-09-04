@@ -257,6 +257,57 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
             self.assertFalse(activation_pending_path(source).exists())
             self.assertFalse((segments_directory / "segment-0002.sqlite3").exists())
 
+    def test_row_count_read_of_a_service_wal_hot_creates_no_sqlite_sidecars(self) -> None:
+        # The history service initialises the hot database in WAL mode. A plain
+        # mode=ro open of that quiesced file creates -wal/-shm that outlive the
+        # connection, and the sealer's sidecar preflight then refused the
+        # rotation after its journal was already written (issue #278).
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source = Path(temporary_directory) / "history.db"
+            self._create_service_wal_hot(source)
+            rotation = self._rotation_module()
+
+            counts = rotation._history_row_counts(source)
+
+            self.assertEqual(counts["slot_events"], 1)
+            self._assert_no_sqlite_sidecars(source)
+            segment_sealer._require_regular_source(source)
+
+    def test_rotation_apply_completes_against_a_service_wal_hot(self) -> None:
+        # Every other apply fixture forces journal_mode=DELETE, which hid #278.
+        # Needs POSIX (segment ownership checks); CI is authoritative.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_generation_0001(source, segments_directory)
+            self._append_event(source, "generation-2-sealed", "2025-01-02T12:00:00+00:00", journal_mode="WAL")
+            self._append_event(source, "generation-2-hot", "2025-01-03T12:00:00+00:00", journal_mode="WAL")
+            self.assertEqual(source.read_bytes()[18:20], b"\x02\x02")
+            self._assert_no_sqlite_sidecars(source)
+            backup_directory, backup_status_path = self._create_full_backup_evidence(root)
+            rotation = self._rotation_module()
+
+            receipt = rotation.rotate_segmented_history(
+                source=source,
+                segments_directory=segments_directory,
+                cutoff="2025-01-03T00:00:00+00:00",
+                key_id="generation-key-2",
+                scheduled_backup_directory=backup_directory,
+                scheduled_backup_status_path=backup_status_path,
+                apply=True,
+            )
+
+            self.assertTrue(receipt["apply"])
+            self.assertEqual(receipt["generation_id"], "generation-0002")
+            self.assertFalse(activation_pending_path(source).exists())
+            self._assert_no_sqlite_sidecars(source)
+            self.assertEqual(
+                self._event_types(segments_directory / "segment-0002.sqlite3"),
+                ["generation-1-hot", "generation-2-sealed"],
+            )
+            self.assertEqual(self._event_types(source), ["generation-2-hot"])
+
     def test_rotation_rechecks_quiescence_after_preflight_before_journal_creation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1926,10 +1977,38 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
             apply=True,
         )
 
-    def _append_event(self, source: Path, event_type: str, observed_at: str) -> None:
-        with sqlite3.connect(source) as connection:
-            connection.execute("PRAGMA journal_mode=DELETE")
-            self._insert_event(connection, event_type, observed_at)
+    def _append_event(
+        self,
+        source: Path,
+        event_type: str,
+        observed_at: str,
+        *,
+        journal_mode: str = "DELETE",
+    ) -> None:
+        connection = sqlite3.connect(source)
+        try:
+            connection.execute(f"PRAGMA journal_mode={journal_mode}")
+            with connection:
+                self._insert_event(connection, event_type, observed_at)
+        finally:
+            connection.close()
+
+    def _create_service_wal_hot(self, source: Path) -> None:
+        """Build a hot database the way the service leaves it: WAL header, closed cleanly, no sidecars."""
+        connection = sqlite3.connect(source)
+        try:
+            connection.executescript(SCHEMA)
+            connection.execute("PRAGMA journal_mode=WAL")
+            with connection:
+                self._insert_event(connection, "generation-2-hot", "2025-01-03T12:00:00+00:00")
+        finally:
+            connection.close()
+        self.assertEqual(source.read_bytes()[18:20], b"\x02\x02")
+        self._assert_no_sqlite_sidecars(source)
+
+    def _assert_no_sqlite_sidecars(self, source: Path) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            self.assertFalse(Path(f"{source}{suffix}").exists(), f"{source.name}{suffix} exists")
 
     @staticmethod
     def _insert_event(connection: sqlite3.Connection, event_type: str, observed_at: str) -> None:
