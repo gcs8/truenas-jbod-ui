@@ -57,6 +57,7 @@
     writePolicy: normalizeFabricWritePolicy(bootstrap.writePolicy),
     writeAuthorization: null,
     writeAuthPending: false,
+    writeAuthRequestToken: 0,
     mode: modeIds.has(initialMode) ? initialMode : "lanes",
     loading: false,
     error: null,
@@ -145,6 +146,8 @@
   }
 
   function clearFabricAuthorization() {
+    state.writeAuthRequestToken = (state.writeAuthRequestToken || 0) + 1;
+    state.writeAuthPending = false;
     state.writeAuthorization = null;
     if (elements.authUsername) {
       elements.authUsername.value = "";
@@ -197,18 +200,28 @@
     state.writeAuthorization = encodeFabricBasicAuthorization(username, password);
     if (elements.authPassword) elements.authPassword.value = "";
     state.writeAuthPending = true;
+    const requestToken = (state.writeAuthRequestToken || 0) + 1;
+    state.writeAuthRequestToken = requestToken;
     renderFabricReadUiAuth();
     try {
       await fetchJson("/api/read-ui/auth/verify", { readUiAuth: true });
+      if (requestToken !== state.writeAuthRequestToken) {
+        return;
+      }
       state.writePolicy = { enabled: true, mode: "basic", reason: "" };
       state.error = null;
     } catch (error) {
+      if (requestToken !== state.writeAuthRequestToken) {
+        return;
+      }
       clearFabricAuthorization();
       const reason = error?.message || "Write sign-in failed.";
       state.writePolicy = { enabled: false, mode: "basic", reason };
       state.error = reason;
     } finally {
-      state.writeAuthPending = false;
+      if (requestToken === state.writeAuthRequestToken) {
+        state.writeAuthPending = false;
+      }
       render();
     }
   }

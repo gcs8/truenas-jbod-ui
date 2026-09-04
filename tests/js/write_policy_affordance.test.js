@@ -486,6 +486,77 @@ test("sign-out clears the in-memory header and both credential fields on both li
   assert.equal(fabricPassword.value, "");
 });
 
+test("late credential verification cannot re-enable writes after sign-out on either live page", async () => {
+  let resolveMainVerification;
+  const mainVerification = new Promise((resolve) => { resolveMainVerification = resolve; });
+  const mainState = {
+    snapshotMode: false,
+    writePolicy: { enabled: false, mode: "basic", reason: "Sign in." },
+    writeAuthorization: null,
+    writeAuthPending: false,
+    writeAuthRequestToken: 0,
+  };
+  const main = loadFunctions([
+    "clearReadUiAuthorization",
+    "submitReadUiSignIn",
+    "signOutReadUi",
+  ], {
+    state: mainState,
+    readUiAuthUsername: { value: "operator" },
+    readUiAuthPassword: { value: "synthetic-passphrase" },
+    encodeBasicAuthorization: () => "Basic synthetic",
+    renderReadUiAuth() {},
+    fetchJson: async () => mainVerification,
+    applyWritePolicy(policy) { mainState.writePolicy = policy; },
+    renderAll() {},
+    setStatus() {},
+  });
+
+  const mainPending = main.submitReadUiSignIn({ preventDefault() {} });
+  main.signOutReadUi();
+  resolveMainVerification({ ok: true });
+  await mainPending;
+
+  assert.equal(mainState.writeAuthorization, null);
+  assert.equal(mainState.writePolicy.enabled, false);
+  assert.equal(mainState.writeAuthPending, false);
+
+  let resolveFabricVerification;
+  const fabricVerification = new Promise((resolve) => { resolveFabricVerification = resolve; });
+  const fabricState = {
+    writePolicy: { enabled: false, mode: "basic", reason: "Sign in." },
+    writeAuthorization: null,
+    writeAuthPending: false,
+    writeAuthRequestToken: 0,
+    error: null,
+  };
+  const elements = {
+    authUsername: { value: "operator" },
+    authPassword: { value: "synthetic-passphrase" },
+  };
+  const fabric = loadFabricFunctions([
+    "clearFabricAuthorization",
+    "submitFabricReadUiSignIn",
+    "signOutFabricReadUi",
+  ], {
+    state: fabricState,
+    elements,
+    encodeFabricBasicAuthorization: () => "Basic synthetic",
+    renderFabricReadUiAuth() {},
+    fetchJson: async () => fabricVerification,
+    render() {},
+  });
+
+  const fabricPending = fabric.submitFabricReadUiSignIn({ preventDefault() {} });
+  fabric.signOutFabricReadUi();
+  resolveFabricVerification({ ok: true });
+  await fabricPending;
+
+  assert.equal(fabricState.writeAuthorization, null);
+  assert.equal(fabricState.writePolicy.enabled, false);
+  assert.equal(fabricState.writeAuthPending, false);
+});
+
 test("a signed-in 403 state reports that writes remain blocked on both live pages", () => {
   const node = () => ({
     disabled: false,

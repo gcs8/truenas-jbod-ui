@@ -77,6 +77,7 @@
     writePolicy: normalizeWritePolicy(bootstrap.writePolicy),
     writeAuthorization: null,
     writeAuthPending: false,
+    writeAuthRequestToken: 0,
     snapshotExportMeta: bootstrap.snapshotExportMeta || null,
     snapshot: bootstrap.snapshot || { slots: [], systems: [], enclosures: [] },
     storageViewsRuntime: bootstrap.storageViewsRuntime || { system_id: bootstrap.snapshot?.selected_system_id || null, views: [] },
@@ -2574,6 +2575,8 @@
   }
 
   function clearReadUiAuthorization() {
+    state.writeAuthRequestToken = (state.writeAuthRequestToken || 0) + 1;
+    state.writeAuthPending = false;
     state.writeAuthorization = null;
     if (readUiAuthUsername) {
       readUiAuthUsername.value = "";
@@ -2671,13 +2674,21 @@
     state.writeAuthorization = encodeBasicAuthorization(username, password);
     if (readUiAuthPassword) readUiAuthPassword.value = "";
     state.writeAuthPending = true;
+    const requestToken = (state.writeAuthRequestToken || 0) + 1;
+    state.writeAuthRequestToken = requestToken;
     renderReadUiAuth();
     try {
       await fetchJson("/api/read-ui/auth/verify", { readUiAuth: true });
+      if (requestToken !== state.writeAuthRequestToken) {
+        return;
+      }
       applyWritePolicy({ enabled: true, mode: "basic", reason: "" });
       renderAll();
       setStatus("Signed in. Write controls are available on this page.");
     } catch (error) {
+      if (requestToken !== state.writeAuthRequestToken) {
+        return;
+      }
       clearReadUiAuthorization();
       applyWritePolicy({
         enabled: false,
@@ -2686,7 +2697,9 @@
       });
       setStatus(error?.message || "Write sign-in failed.", "error");
     } finally {
-      state.writeAuthPending = false;
+      if (requestToken === state.writeAuthRequestToken) {
+        state.writeAuthPending = false;
+      }
       renderReadUiAuth();
     }
   }
