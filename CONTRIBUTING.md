@@ -371,6 +371,14 @@ Release/full validation includes, as applicable:
 Do not push a release tag until the release wrap evidence table has every
 pre-tag gate recorded as `Pass` or justified `N/A`.
 
+## Branch and CI policy
+
+CI runs on every branch push and on pull requests targeting `main`. The
+all-branch push contract keeps pre-PR validation independent of naming prefixes;
+contributors may use descriptive prefixes such as `feat/`, `fix/`, `refactor/`,
+`docs/`, `perf/`, `test/`, `ci/`, `codex/`, or `claude/` without creating a CI
+coverage gap. Tag pushes are not part of this preflight workflow.
+
 ## CI blocking policy
 
 The following pull-request checks are release-blocking and required for `main`:

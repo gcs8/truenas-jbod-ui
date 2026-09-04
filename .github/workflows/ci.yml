@@ -6,9 +6,7 @@ on:
       - main
   push:
     branches:
-      - main
-      - "codex/**"
-      - "ci/**"
+      - "**"
   workflow_dispatch:
 
 permissions:

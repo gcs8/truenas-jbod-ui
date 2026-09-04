@@ -1,0 +1,547 @@
+{
+  ".env.example": {
+    "findings": {
+      "internal_hostname": 5
+    },
+    "reason": "Reviewed public configuration example; exact detector counts are pinned."
+  },
+  ".github/workflows/ci.yml": {
+    "findings": {
+      "sas_wwn_identifier": 5
+    },
+    "reason": "Capability masks match the broad 16-hex identifier detector."
+  },
+  "admin_service/config.py": {
+    "findings": {
+      "internal_hostname": 1
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "admin_service/services/account_bootstrap.py": {
+    "findings": {
+      "private_posix_host_path": 1
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "admin_service/services/tls_trust.py": {
+    "findings": {
+      "internal_hostname": 5
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "admin_service/static/admin.js": {
+    "findings": {
+      "internal_hostname": 7
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "admin_service/templates/index.html": {
+    "findings": {
+      "internal_hostname": 3
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "app/config.py": {
+    "findings": {
+      "internal_hostname": 6
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "app/models/domain.py": {
+    "findings": {
+      "internal_hostname": 6
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "app/services/inventory.py": {
+    "findings": {
+      "internal_hostname": 5
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "app/services/public_demo_fixture.py": {
+    "findings": {
+      "sas_wwn_identifier": 1
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "app/static/sas_fabric_view.js": {
+    "findings": {
+      "internal_hostname": 5
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "config/config.example.yaml": {
+    "findings": {
+      "internal_hostname": 15,
+      "rfc1918_ipv4": 3,
+      "sas_wwn_identifier": 3
+    },
+    "reason": "Reviewed public configuration example; exact detector counts are pinned."
+  },
+  "docs/ADMIN_TRUST_BOUNDARY.md": {
+    "findings": {
+      "internal_hostname": 1
+    },
+    "reason": "Reviewed public documentation example; exact detector counts are pinned."
+  },
+  "docs/PROFILE_AUTHORING.md": {
+    "findings": {
+      "sas_wwn_identifier": 2
+    },
+    "reason": "Reviewed public documentation example; exact detector counts are pinned."
+  },
+  "docs/RELEASE_NOTES_0.12.0.md": {
+    "findings": {
+      "rfc1918_ipv4": 1
+    },
+    "reason": "Historical public release evidence; exact detector counts are pinned."
+  },
+  "docs/RELEASE_NOTES_0.17.0.md": {
+    "findings": {
+      "rfc1918_ipv4": 2
+    },
+    "reason": "Historical public release evidence; exact detector counts are pinned."
+  },
+  "docs/RELEASE_NOTES_0.20.1.md": {
+    "findings": {
+      "sas_wwn_identifier": 1
+    },
+    "reason": "Historical public release evidence; exact detector counts are pinned."
+  },
+  "docs/RELEASE_WRAP_0.17.0.md": {
+    "findings": {
+      "rfc1918_ipv4": 1
+    },
+    "reason": "Historical public release evidence; exact detector counts are pinned."
+  },
+  "docs/RELEASE_WRAP_0.20.0.md": {
+    "findings": {
+      "rfc1918_ipv4": 1
+    },
+    "reason": "Historical public release evidence; exact detector counts are pinned."
+  },
+  "docs/RELEASE_WRAP_0.20.2.md": {
+    "findings": {
+      "rfc1918_ipv4": 2
+    },
+    "reason": "Historical public release evidence; exact detector counts are pinned."
+  },
+  "docs/RELEASE_WRAP_0.21.0.md": {
+    "findings": {
+      "rfc1918_ipv4": 11
+    },
+    "reason": "Historical public release evidence; exact detector counts are pinned."
+  },
+  "docs/RELEASE_WRAP_0.21.1.md": {
+    "findings": {
+      "rfc1918_ipv4": 3
+    },
+    "reason": "Historical public release evidence; exact detector counts are pinned."
+  },
+  "docs/RELEASE_WRAP_0.21.2.md": {
+    "findings": {
+      "rfc1918_ipv4": 9
+    },
+    "reason": "Historical public release evidence; exact detector counts are pinned."
+  },
+  "docs/RELEASE_WRAP_0.22.0.md": {
+    "findings": {
+      "compact_lab_host_id": 1
+    },
+    "reason": "Historical public release evidence; exact detector counts are pinned."
+  },
+  "docs/SAS_DIAGNOSTIC_DECODER_SOURCES.md": {
+    "findings": {
+      "compact_lab_host_id": 5,
+      "local_windows_drive_path": 2
+    },
+    "reason": "Reviewed public documentation example; exact detector counts are pinned."
+  },
+  "docs/SSH_READ_ONLY_SETUP.md": {
+    "findings": {
+      "internal_hostname": 1
+    },
+    "reason": "Reviewed public documentation example; exact detector counts are pinned."
+  },
+  "docs/STORAGE_VIEW_CONFIG_SKETCH.md": {
+    "findings": {
+      "internal_hostname": 2,
+      "realistic_serial_example": 4,
+      "rfc1918_ipv4": 2,
+      "sas_wwn_identifier": 1
+    },
+    "reason": "Reviewed public documentation example; exact detector counts are pinned."
+  },
+  "docs/STORAGE_VIEW_NOTES.md": {
+    "findings": {
+      "local_windows_drive_path": 1
+    },
+    "reason": "Reviewed public documentation example; exact detector counts are pinned."
+  },
+  "docs/STORAGE_VIEW_PLAN.md": {
+    "findings": {
+      "local_windows_drive_path": 1
+    },
+    "reason": "Reviewed public documentation example; exact detector counts are pinned."
+  },
+  "docs/UNVR_NOTES.md": {
+    "findings": {
+      "private_posix_host_path": 1,
+      "rfc1918_ipv4": 2
+    },
+    "reason": "Reviewed public documentation example; exact detector counts are pinned."
+  },
+  "docs/V0_20_SAS_FABRIC_PLAN.md": {
+    "findings": {
+      "compact_lab_host_id": 2,
+      "rfc1918_ipv4": 1
+    },
+    "reason": "Reviewed public documentation example; exact detector counts are pinned."
+  },
+  "docs/V0_9_0_PLAN.md": {
+    "findings": {
+      "local_windows_drive_path": 2
+    },
+    "reason": "Reviewed public documentation example; exact detector counts are pinned."
+  },
+  "history_service/config.py": {
+    "findings": {
+      "internal_hostname": 1
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "history_service/segment_migration.py": {
+    "findings": {
+      "sas_wwn_identifier": 1
+    },
+    "reason": "Reviewed source literal or validation pattern; exact detector counts are pinned."
+  },
+  "public-demo/index.html": {
+    "findings": {
+      "compact_lab_host_id": 3,
+      "sas_wwn_identifier": 683
+    },
+    "reason": "Generated sanitized demo; the dedicated artifact privacy checker also applies."
+  },
+  "qa/fixtures/admin-cleanroom-config.yaml": {
+    "findings": {
+      "internal_hostname": 1
+    },
+    "reason": "Deterministic clean-room QA fixture; exact detector counts are pinned."
+  },
+  "scripts/capture_readme_screenshots.py": {
+    "findings": {
+      "sas_wwn_identifier": 3
+    },
+    "reason": "Reviewed source literal for sanitized capture or QA tooling."
+  },
+  "scripts/capture_release_workflow_screenshots.py": {
+    "findings": {
+      "sas_wwn_identifier": 1
+    },
+    "reason": "Reviewed source literal for sanitized capture or QA tooling."
+  },
+  "scripts/capture_visual_tour_screenshots.py": {
+    "findings": {
+      "sas_wwn_identifier": 2
+    },
+    "reason": "Reviewed source literal for sanitized capture or QA tooling."
+  },
+  "scripts/run_private_qa_restore.py": {
+    "findings": {
+      "sas_wwn_identifier": 3
+    },
+    "reason": "Reviewed source literal for sanitized capture or QA tooling."
+  },
+  "tests/fixtures/ci-smoke-config.yaml": {
+    "findings": {
+      "internal_hostname": 1
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/fixtures/platform_parity/scale_md1280_lsblk.json": {
+    "findings": {
+      "sas_wwn_identifier": 102
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/fixtures/platform_parity/scale_md1280_sg1_aes.txt": {
+    "findings": {
+      "sas_wwn_identifier": 146
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/fixtures/platform_parity/scale_md1280_sg1_join.txt": {
+    "findings": {
+      "sas_wwn_identifier": 169
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/fixtures/platform_parity/scale_md1280_sg76_aes.txt": {
+    "findings": {
+      "sas_wwn_identifier": 48
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/fixtures/platform_parity/scale_md1280_sg76_join.txt": {
+    "findings": {
+      "sas_wwn_identifier": 71
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/fixtures/platform_parity/scale_sg26_aes.txt": {
+    "findings": {
+      "sas_wwn_identifier": 5
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/fixtures/platform_parity/scale_sg26_ec.txt": {
+    "findings": {
+      "sas_wwn_identifier": 1
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/fixtures/platform_parity/scale_sg37_aes.txt": {
+    "findings": {
+      "sas_wwn_identifier": 5
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/fixtures/platform_parity/scale_sg37_ec.txt": {
+    "findings": {
+      "sas_wwn_identifier": 1
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/fixtures/platform_parity/scale_shared_sata_aes.txt": {
+    "findings": {
+      "sas_wwn_identifier": 12
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/js/mapping_health_accessibility.test.js": {
+    "findings": {
+      "local_windows_drive_path": 3
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_account_bootstrap.py": {
+    "findings": {
+      "internal_hostname": 2,
+      "private_posix_host_path": 2,
+      "rfc1918_ipv4": 1
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_admin_runtime_routes.py": {
+    "findings": {
+      "internal_hostname": 2
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_admin_service.py": {
+    "findings": {
+      "internal_hostname": 15,
+      "local_windows_drive_path": 40,
+      "rfc1918_ipv4": 10,
+      "sas_wwn_identifier": 2
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_container_contract.py": {
+    "findings": {
+      "sas_wwn_identifier": 1
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_enclosure_option_labels.py": {
+    "findings": {
+      "sas_wwn_identifier": 43
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_esxi_host_prep.py": {
+    "findings": {
+      "compact_lab_host_id": 1,
+      "rfc1918_ipv4": 5
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_history_service.py": {
+    "findings": {
+      "sas_wwn_identifier": 87
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_inventory.py": {
+    "findings": {
+      "internal_hostname": 11,
+      "private_posix_host_path": 3,
+      "rfc1918_ipv4": 116,
+      "sas_wwn_identifier": 183
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_parsers.py": {
+    "findings": {
+      "private_posix_host_path": 1,
+      "sas_wwn_identifier": 132
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_perf.py": {
+    "findings": {
+      "local_windows_drive_path": 2
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_perf_budgets.py": {
+    "findings": {
+      "local_windows_drive_path": 1
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_platform_parity_fixtures.py": {
+    "findings": {
+      "rfc1918_ipv4": 4,
+      "sas_wwn_identifier": 11
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_private_qa_restore.py": {
+    "findings": {
+      "rfc1918_ipv4": 3
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_public_demo_fixture.py": {
+    "findings": {
+      "sas_wwn_identifier": 4
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_public_doc_privacy.py": {
+    "findings": {
+      "rfc1918_ipv4": 4
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_quantastor_api.py": {
+    "findings": {
+      "rfc1918_ipv4": 1
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_sas_fabric.py": {
+    "findings": {
+      "private_posix_host_path": 2,
+      "sas_wwn_identifier": 45
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_slot_bounds_routes.py": {
+    "findings": {
+      "sas_wwn_identifier": 9
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_snapshot_export.py": {
+    "findings": {
+      "compact_lab_host_id": 1,
+      "rfc1918_ipv4": 6,
+      "sas_wwn_identifier": 11
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_ssh_probe.py": {
+    "findings": {
+      "rfc1918_ipv4": 4
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_system_backup.py": {
+    "findings": {
+      "internal_hostname": 25,
+      "local_windows_drive_path": 4,
+      "rfc1918_ipv4": 25
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_tls_trust.py": {
+    "findings": {
+      "internal_hostname": 25,
+      "rfc1918_ipv4": 6
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_truenas_ws.py": {
+    "findings": {
+      "rfc1918_ipv4": 1
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "wiki/Advanced-Configuration.md": {
+    "findings": {
+      "internal_hostname": 8,
+      "sas_wwn_identifier": 2
+    },
+    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
+  },
+  "wiki/Docker-and-GHCR-Deployment.md": {
+    "findings": {
+      "internal_hostname": 2
+    },
+    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
+  },
+  "wiki/Generic-Linux-Setup.md": {
+    "findings": {
+      "internal_hostname": 8,
+      "private_posix_host_path": 4
+    },
+    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
+  },
+  "wiki/Operations-Logging-and-Metrics.md": {
+    "findings": {
+      "internal_hostname": 1
+    },
+    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
+  },
+  "wiki/Profiles-and-Custom-Layouts.md": {
+    "findings": {
+      "sas_wwn_identifier": 2
+    },
+    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
+  },
+  "wiki/Quick-Start.md": {
+    "findings": {
+      "internal_hostname": 1
+    },
+    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
+  },
+  "wiki/SSH-Setup-and-Sudo.md": {
+    "findings": {
+      "internal_hostname": 4
+    },
+    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
+  },
+  "wiki/Troubleshooting.md": {
+    "findings": {
+      "sas_wwn_identifier": 2
+    },
+    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
+  },
+  "wiki/TrueNAS-CORE-Setup.md": {
+    "findings": {
+      "internal_hostname": 7
+    },
+    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
+  },
+  "wiki/TrueNAS-SCALE-Setup.md": {
+    "findings": {
+      "internal_hostname": 7,
+      "sas_wwn_identifier": 2
+    },
+    "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
+  }
+}
