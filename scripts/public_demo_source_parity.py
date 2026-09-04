@@ -11,6 +11,8 @@ SOURCE_PARITY_SCHEMA = 1
 SOURCE_PARITY_PREFIX = "<!-- public-demo-source-parity "
 SOURCE_PARITY_SUFFIX = " -->\n"
 SOURCE_INPUT_PATHS: tuple[Path, ...] = (
+    Path("app/services/public_demo_fixture.py"),
+    Path("app/services/snapshot_export.py"),
     Path("app/static/app.js"),
     Path("app/static/style.css"),
     Path("app/templates/base.html"),

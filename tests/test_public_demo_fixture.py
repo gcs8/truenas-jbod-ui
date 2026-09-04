@@ -63,7 +63,8 @@ class PublicDemoArtifactTests(unittest.TestCase):
             demo_dir.mkdir()
             shutil.copy2(ROOT / "public-demo" / "index.html", demo_dir / "index.html")
             (demo_dir / ".nojekyll").write_text("", encoding="utf-8")
-            for relative_path in SOURCE_INPUT_PATHS:
+            source_paths = tuple(dict.fromkeys((*SOURCE_INPUT_PATHS, source_path)))
+            for relative_path in source_paths:
                 target = source_root / relative_path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT / relative_path, target)
@@ -126,6 +127,22 @@ class PublicDemoArtifactTests(unittest.TestCase):
 
     def test_old_artifact_is_rejected_when_index_template_changes_without_version_bump(self) -> None:
         self._assert_source_change_rejects_checked_artifact(Path("app/templates/index.html"))
+
+    def test_generator_source_manifest_includes_fixture_builder_and_snapshot_renderer(self) -> None:
+        source_paths = {path.as_posix() for path in SOURCE_INPUT_PATHS}
+
+        self.assertIn("app/services/public_demo_fixture.py", source_paths)
+        self.assertIn("app/services/snapshot_export.py", source_paths)
+
+    def test_old_artifact_is_rejected_when_fixture_builder_changes_without_version_bump(self) -> None:
+        self._assert_source_change_rejects_checked_artifact(
+            Path("app/services/public_demo_fixture.py")
+        )
+
+    def test_old_artifact_is_rejected_when_snapshot_renderer_changes_without_version_bump(self) -> None:
+        self._assert_source_change_rejects_checked_artifact(
+            Path("app/services/snapshot_export.py")
+        )
 
     def test_public_demo_without_source_parity_manifest_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
