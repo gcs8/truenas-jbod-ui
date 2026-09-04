@@ -692,14 +692,6 @@ class HistoryStore:
         if migration_lock_held:
             self._ensure_journal_mode_locked(connection)
             return
-        try:
-            stat_result = self.file_path.stat()
-            identity = (int(stat_result.st_dev), int(stat_result.st_ino))
-        except FileNotFoundError:
-            identity = None
-        with self._journal_mode_lock:
-            if identity is not None and identity == self._journal_mode_identity:
-                return
         with history_write_lock(self.file_path, blocking=False):
             self._require_no_pending_lifecycle_markers()
             self._ensure_journal_mode_locked(connection)
