@@ -4056,7 +4056,9 @@ class InventoryService:
         if not allow_legacy_mapping_fallback:
             self._warn_unapplied_legacy_mappings(
                 warnings,
-                resolved_meta.get("id"),
+                # Drawer sub-views resolve mappings against the base shelf id,
+                # so the probe has to use the same key the correlator uses.
+                self._base_enclosure_id(resolved_meta.get("id")),
                 layout_slot_count,
                 loaded_mappings,
             )

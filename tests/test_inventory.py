@@ -440,6 +440,52 @@ class InventoryHelpersTests(unittest.TestCase):
             self.assertNotIn("SYNTH", warnings[0])
             self.assertNotIn("enc-a", warnings[0])
 
+    def test_legacy_mapping_warning_scopes_drawer_sub_views_to_the_base_enclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
+            service.mapping_store._write({
+                "default:1": ManualMapping(slot=1, serial="SYNTH-LEGACY-1"),
+                "default:2": ManualMapping(slot=2, serial="SYNTH-LEGACY-2"),
+                service.mapping_store._slot_key("system-a", "enc-a", 1): ManualMapping(
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    slot=1,
+                    serial="SYNTH-SCOPED-1",
+                ),
+            })
+            enclosures = [
+                EnclosureOption(
+                    id="enc-a::drawer-a",
+                    label="Drawer A",
+                    rows=2,
+                    columns=4,
+                    slot_count=8,
+                ),
+                EnclosureOption(
+                    id="enc-a::drawer-b",
+                    label="Drawer B",
+                    rows=2,
+                    columns=4,
+                    slot_count=8,
+                ),
+                EnclosureOption(id="enc-b", label="Enclosure B", rows=2, columns=4, slot_count=8),
+            ]
+
+            warnings: list[str] = []
+            frame = service._resolve_layout_frame(
+                enclosures,
+                "enc-a::drawer-b",
+                warnings,
+                require_profile=False,
+            )
+
+            self.assertIsInstance(frame, inventory_module._LayoutFrame)
+            self.assertFalse(frame.allow_legacy_mapping_fallback)
+            self.assertEqual(frame.selected_meta["id"], "enc-a::drawer-b")
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("1 manual mapping ", warnings[0])
+            self.assertNotIn("2 manual", warnings[0])
+
     def test_storage_view_slot_label_honors_profile_slot_number_base(self) -> None:
         storage_view = StorageViewConfig.model_validate(
             {
