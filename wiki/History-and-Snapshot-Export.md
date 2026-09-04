@@ -173,7 +173,7 @@ warnings.
 | serials (`serial`, `serial_hint`) | masked to the last four characters, for example `...1234`; a two-character prefix is kept when several serials share that suffix |
 | path and transport identifiers (`gptid`, `logical_unit_id`, `lunid`, `sas_address`, `attached_sas_address`, `sas_address_hint`, `transport_address`, `wwn`, `namespace_eui64`, `namespace_nguid`, `uuid`, `partuuid`, `enclosure_identifier`) | masked to the leading and trailing characters, for example `5003...043f` |
 | IPv4 addresses anywhere in text | `x.x.x.N`, keeping the last octet |
-| IPv6 addresses anywhere in text | `x:x:` plus the last two groups |
+| canonical eight-group IPv6 addresses in text | `x:x:` plus the last two groups; compressed IPv6 forms are not currently matched and require manual review |
 | everything else, for example slot numbers, models, capacities, pool names, SMART values, and timestamps | unchanged |
 
 A configured hostname is matched in the form you saved it. That rule is being

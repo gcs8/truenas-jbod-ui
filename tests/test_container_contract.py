@@ -711,6 +711,14 @@ class ContainerResourceContractTests(unittest.TestCase):
                 self.assertIn("packaged in images built from current `main`", guide_text)
                 self.assertIn("not present in the published `v0.22.2` image", guide_text)
 
+    def test_snapshot_export_guide_does_not_overpromise_ipv6_redaction(self) -> None:
+        guide = (REPO_ROOT / "wiki/History-and-Snapshot-Export.md").read_text(
+            encoding="utf-8"
+        )
+        guide_text = " ".join(guide.split())
+        self.assertIn("compressed IPv6 forms are not currently matched", guide_text)
+        self.assertNotIn("IPv6 addresses anywhere in text", guide_text)
+
     def test_strict_host_key_guides_require_verified_preloading(self) -> None:
         for relative_path in (
             "wiki/SSH-Setup-and-Sudo.md",
