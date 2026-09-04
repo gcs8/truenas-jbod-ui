@@ -3184,7 +3184,40 @@ class InventoryService:
         """Return last-good SMART data without rebuilding inventory topology."""
 
         self._evict_expired_smart_cache_entries()
-        enclosure_key = normalize_text(selected_enclosure_id) or "__default__"
+        loaded_slot_entries = loaded_entries
+        resolved_enclosure_id = normalize_text(selected_enclosure_id)
+        if resolved_enclosure_id is None:
+            default_snapshot = self._cache.get("__default__")
+            if default_snapshot is not None:
+                resolved_enclosure_id = normalize_text(default_snapshot.selected_enclosure_id)
+
+        if resolved_enclosure_id is None:
+            matching_enclosure_ids = {
+                cache_key[2]
+                for cache_key in self._smart_cache
+                if cache_key[0] == self.system.id
+                and cache_key[1] == self.system.truenas.platform
+                and cache_key[2] != "__default__"
+                and cache_key[3] == slot
+            }
+            if self.slot_detail_store is not None:
+                if loaded_slot_entries is None:
+                    loaded_slot_entries = self.slot_detail_store.load_all()
+                matching_enclosure_ids.update(
+                    enclosure_id
+                    for entry in loaded_slot_entries.values()
+                    if entry.system_id == self.system.id
+                    and entry.slot == slot
+                    and (enclosure_id := normalize_text(entry.enclosure_id)) is not None
+                )
+            if len(matching_enclosure_ids) == 1:
+                resolved_enclosure_id = next(iter(matching_enclosure_ids))
+            elif matching_enclosure_ids:
+                add_perf_metadata(smart_cache="layout-unavailable-miss")
+                self._observe_smart_summary_request("layout-unavailable-miss")
+                return None
+
+        enclosure_key = resolved_enclosure_id or "__default__"
         matching_keys = [
             cache_key
             for cache_key in self._smart_cache
@@ -3213,9 +3246,9 @@ class InventoryService:
         if self.slot_detail_store is not None:
             entry = self.slot_detail_store.get_entry(
                 self.system.id,
-                selected_enclosure_id,
+                resolved_enclosure_id,
                 slot,
-                loaded_entries=loaded_entries,
+                loaded_entries=loaded_slot_entries,
             )
             if entry is not None and entry.smart_fields:
                 try:
