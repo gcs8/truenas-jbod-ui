@@ -10157,7 +10157,7 @@ class InventoryService:
         linux_block_index = self._index_linux_blockdevices(ssh_data)
         linux_scsi_index = self._index_linux_scsi_devices(ssh_data)
         multipath_consumer_index = self._index_multipath_consumers(ssh_data)
-        backfilled_multipath_records: dict[str, int] = {}
+        backfilled_multipath_groups: dict[str, tuple[int, MultipathInfo, list[DiskRecord]]] = {}
         for disk in disks:
             device_name = normalize_device_name(
                 disk.get("devname") or disk.get("name") or disk.get("device") or disk.get("disk")
@@ -10166,6 +10166,7 @@ class InventoryService:
             multipath_name = normalize_text(disk.get("multipath_name"))
             multipath_member = normalize_device_name(disk.get("multipath_member"))
             multipath_source: str | None = None
+            backfilled_multipath: tuple[str, MultipathInfo] | None = None
             if not multipath_name and multipath_consumer_index:
                 # Issue #355: the API disk record can lag gmultipath (a hot-added
                 # spare whose disk table row is not yet synced) and the passive
@@ -10182,18 +10183,6 @@ class InventoryService:
                 )
                 if parsed_multipath is not None:
                     geom_key = parsed_multipath.name.lower()
-                    earlier_index = backfilled_multipath_records.get(geom_key)
-                    if earlier_index is not None:
-                        # Both members reached the API list without the multipath
-                        # fields: keep the first record and fold this one in as
-                        # its member rather than emitting a second disk.
-                        earlier = records[earlier_index]
-                        for value in (api_device_name, device_name, disk.get("name"), disk.get("devname")):
-                            earlier.lookup_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
-                        for candidate in dict.fromkeys(filter(None, [api_device_name, device_name])):
-                            if candidate not in earlier.smart_devices:
-                                earlier.smart_devices.append(candidate)
-                        continue
                     multipath_name = parsed_multipath.name
                     multipath_member = next(
                         (
@@ -10206,7 +10195,7 @@ class InventoryService:
                     path_device_name = api_device_name
                     device_name = parsed_multipath.device_name
                     multipath_source = "gmultipath list"
-                    backfilled_multipath_records[geom_key] = len(records)
+                    backfilled_multipath = (geom_key, parsed_multipath)
             serial = normalize_text(disk.get("serial") or disk.get("serial_lunid") or disk.get("lunid"))
             model = normalize_text(disk.get("model"))
             size_bytes = disk.get("size") if isinstance(disk.get("size"), int) else None
@@ -10327,34 +10316,164 @@ class InventoryService:
                 )
             ]
 
-            records.append(
-                DiskRecord(
-                    raw=disk_raw,
-                    device_name=device_name,
-                    path_device_name=path_device_name,
-                    multipath_name=multipath_name,
-                    multipath_member=multipath_member,
-                    serial=serial,
-                    model=model,
-                    size_bytes=size_bytes,
-                    identifier=identifier,
-                    health=health,
-                    pool_name=pool_name,
-                    lunid=normalize_text(disk.get("lunid")),
-                    bus=bus,
-                    temperature_c=temperature_c,
-                    last_smart_test_type=normalize_text(latest_test.get("description")) if latest_test else None,
-                    last_smart_test_status=normalize_text(latest_test.get("status_verbose") or latest_test.get("status")) if latest_test else None,
-                    last_smart_test_lifetime_hours=latest_test.get("lifetime") if latest_test else None,
-                    logical_block_size=logical_block_size,
-                    physical_block_size=physical_block_size,
-                    enclosure_id=enclosure_id,
-                    slot=slot,
-                    smart_devices=smart_devices,
-                    lookup_keys=lookup_keys,
-                )
+            record = DiskRecord(
+                raw=disk_raw,
+                device_name=device_name,
+                path_device_name=path_device_name,
+                multipath_name=multipath_name,
+                multipath_member=multipath_member,
+                serial=serial,
+                model=model,
+                size_bytes=size_bytes,
+                identifier=identifier,
+                health=health,
+                pool_name=pool_name,
+                lunid=normalize_text(disk.get("lunid")),
+                bus=bus,
+                temperature_c=temperature_c,
+                last_smart_test_type=normalize_text(latest_test.get("description")) if latest_test else None,
+                last_smart_test_status=normalize_text(latest_test.get("status_verbose") or latest_test.get("status")) if latest_test else None,
+                last_smart_test_lifetime_hours=latest_test.get("lifetime") if latest_test else None,
+                logical_block_size=logical_block_size,
+                physical_block_size=physical_block_size,
+                enclosure_id=enclosure_id,
+                slot=slot,
+                smart_devices=smart_devices,
+                lookup_keys=lookup_keys,
             )
+            if backfilled_multipath is None:
+                records.append(record)
+                continue
+
+            geom_key, parsed_multipath = backfilled_multipath
+            group = backfilled_multipath_groups.get(geom_key)
+            if group is None:
+                backfilled_multipath_groups[geom_key] = (len(records), parsed_multipath, [record])
+                records.append(record)
+            else:
+                group[2].append(record)
+
+        for record_index, parsed_multipath, group_records in backfilled_multipath_groups.values():
+            if len(group_records) > 1:
+                records[record_index] = self._merge_backfilled_multipath_records(
+                    group_records,
+                    parsed_multipath,
+                )
         return records
+
+    @staticmethod
+    def _merge_backfilled_multipath_records(
+        records: list[DiskRecord],
+        multipath: MultipathInfo,
+    ) -> DiskRecord:
+        """Fold API rows for one proven geom without discarding member evidence."""
+        consumer_states = {
+            consumer.device_name.lower(): normalize_text(consumer.state)
+            for consumer in multipath.consumers
+            if consumer.device_name
+        }
+        state_priority = {"ACTIVE": 0, "PASSIVE": 1, "FAIL": 3}
+
+        def record_rank(record: DiskRecord) -> tuple[int, str]:
+            path_device = normalize_device_name(record.path_device_name)
+            state = consumer_states.get((path_device or "").lower())
+            return state_priority.get((state or "").upper(), 2), (path_device or "").lower()
+
+        ordered = sorted(records, key=record_rank)
+        primary = ordered[0]
+        for field_name in (
+            "serial",
+            "model",
+            "size_bytes",
+            "identifier",
+            "health",
+            "pool_name",
+            "lunid",
+            "bus",
+            "temperature_c",
+            "last_smart_test_type",
+            "last_smart_test_status",
+            "last_smart_test_lifetime_hours",
+            "logical_block_size",
+            "physical_block_size",
+            "enclosure_id",
+            "slot",
+        ):
+            setattr(
+                primary,
+                field_name,
+                next(
+                    (
+                        getattr(record, field_name)
+                        for record in ordered
+                        if getattr(record, field_name) is not None
+                    ),
+                    None,
+                ),
+            )
+
+        raw_rows = [
+            {
+                key: value
+                for key, value in record.raw.items()
+                if key != "multipath_member_api_rows"
+            }
+            for record in ordered
+        ]
+
+        def useful_raw_value(value: Any) -> bool:
+            return value is not None and value != "" and value != [] and value != {}
+
+        merged_raw: dict[str, Any] = {}
+        for row in raw_rows:
+            for key, value in row.items():
+                if key not in merged_raw or (
+                    not useful_raw_value(merged_raw[key]) and useful_raw_value(value)
+                ):
+                    merged_raw[key] = value
+        merged_raw["multipath_member_api_rows"] = raw_rows
+        primary.raw = merged_raw
+
+        smart_devices: list[str] = []
+        seen_smart_devices: set[str] = set()
+        for record in ordered:
+            for candidate in record.smart_devices:
+                key = candidate.lower()
+                if key in seen_smart_devices:
+                    continue
+                seen_smart_devices.add(key)
+                smart_devices.append(candidate)
+        primary.smart_devices = smart_devices
+
+        identity_conflict = any(
+            len(
+                {
+                    value.casefold()
+                    for record in ordered
+                    if (value := normalize_text(getattr(record, field_name)))
+                }
+            )
+            > 1
+            for field_name in ("serial", "identifier", "lunid")
+        )
+        if identity_conflict:
+            # Conflicting API identity must not make the geom resolve through
+            # every claimed serial/identifier/LUN. Keep the preferred member's
+            # evidence and add only proven device aliases from its peer rows.
+            lookup_keys = set(primary.lookup_keys)
+            for record in ordered:
+                for value in (
+                    record.device_name,
+                    record.path_device_name,
+                    record.multipath_name,
+                    record.multipath_member,
+                    *record.smart_devices,
+                ):
+                    lookup_keys.update(normalize_lookup_keys(value))
+            primary.lookup_keys = lookup_keys
+        else:
+            primary.lookup_keys = set().union(*(record.lookup_keys for record in ordered))
+        return primary
 
     @staticmethod
     def _index_multipath_consumers(ssh_data: ParsedSSHData) -> dict[str, MultipathInfo]:

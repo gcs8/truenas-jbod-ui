@@ -5020,6 +5020,164 @@ ses2:
             self.assertIn("da69", record.lookup_keys)
             self.assertIn("da84", record.lookup_keys)
 
+    @staticmethod
+    def _core_unsynced_fold_rows() -> tuple[dict[str, object], dict[str, object]]:
+        active_member: dict[str, object] = {
+            "name": "da84",
+            "devname": "da84",
+            "multipath_name": "",
+            "multipath_member": "",
+            "active_only_raw": "active-path-evidence",
+        }
+        passive_member: dict[str, object] = {
+            "name": "da69",
+            "devname": "da69",
+            "multipath_name": "",
+            "multipath_member": "",
+            "serial": "SYNTH-FOLD-SERIAL",
+            "identifier": "{serial_lunid}SYNTH-FOLD-SERIAL_5000c500a0000049",
+            "lunid": "5000c500a0000049",
+            "model": "SYNTH FOLD MODEL",
+            "size": 409600,
+            "blocks": 100,
+            "sectorsize": 4096,
+            "status": "DEGRADED",
+            "pool_name": "foldpool",
+            "enclosure": {"id": "fold-enclosure", "slot": 7},
+            "zfs_guid": "second-only-guid",
+            "support_marker": {"source": "passive-api-row"},
+        }
+        return active_member, passive_member
+
+    def test_build_disk_records_fold_retains_metadata_from_second_unsynced_member(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_core_multipath_service(temp_dir)
+            ssh_data = ParsedSSHData(
+                glabel=parse_glabel_status(self.CORE_GLABEL_STATUS_FIXTURE),
+                multipath_info=parse_gmultipath_list(self.CORE_GMULTIPATH_LIST_FIXTURE),
+            )
+            active_member, passive_member = self._core_unsynced_fold_rows()
+
+            records = service._build_disk_records(
+                [active_member, passive_member],
+                ssh_data,
+                {"da69": 37},
+                {
+                    "da69": {
+                        "description": "LONG",
+                        "status": "FINISHED",
+                        "status_verbose": "SUCCESS",
+                        "lifetime": 123,
+                    }
+                },
+            )
+
+            self.assertEqual(len(records), 1)
+            record = records[0]
+            self.assertEqual(record.device_name, "multipath/disk49")
+            self.assertEqual(record.path_device_name, "da84")
+            self.assertEqual(record.multipath_member, "da69")
+            self.assertEqual(record.serial, "SYNTH-FOLD-SERIAL")
+            self.assertEqual(record.identifier, "{serial_lunid}SYNTH-FOLD-SERIAL_5000c500a0000049")
+            self.assertEqual(record.lunid, "5000c500a0000049")
+            self.assertEqual(record.model, "SYNTH FOLD MODEL")
+            self.assertEqual(record.size_bytes, 409600)
+            self.assertEqual(record.health, "DEGRADED")
+            self.assertEqual(record.pool_name, "foldpool")
+            self.assertEqual(record.temperature_c, 37)
+            self.assertEqual(record.last_smart_test_type, "LONG")
+            self.assertEqual(record.last_smart_test_status, "SUCCESS")
+            self.assertEqual(record.last_smart_test_lifetime_hours, 123)
+            self.assertEqual(record.logical_block_size, 4096)
+            self.assertEqual(record.physical_block_size, 4096)
+            self.assertEqual(record.enclosure_id, "fold-enclosure")
+            self.assertEqual(record.slot, 6)
+            self.assertEqual(record.raw["active_only_raw"], "active-path-evidence")
+            self.assertEqual(record.raw["support_marker"], {"source": "passive-api-row"})
+            self.assertIn("second-only-guid", record.lookup_keys)
+            self.assertEqual(record.smart_devices, ["da84", "da69", "multipath/disk49"])
+
+    def test_build_disk_records_fold_is_deterministic_under_api_row_reversal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_core_multipath_service(temp_dir)
+            ssh_data = ParsedSSHData(
+                glabel=parse_glabel_status(self.CORE_GLABEL_STATUS_FIXTURE),
+                multipath_info=parse_gmultipath_list(self.CORE_GMULTIPATH_LIST_FIXTURE),
+            )
+            active_member, passive_member = self._core_unsynced_fold_rows()
+            temperatures = {"da69": 37}
+            smart_tests = {
+                "da69": {
+                    "description": "LONG",
+                    "status": "FINISHED",
+                    "status_verbose": "SUCCESS",
+                    "lifetime": 123,
+                }
+            }
+
+            forward = service._build_disk_records(
+                [active_member, passive_member],
+                ssh_data,
+                temperatures,
+                smart_tests,
+            )
+            reverse = service._build_disk_records(
+                [passive_member, active_member],
+                ssh_data,
+                temperatures,
+                smart_tests,
+            )
+
+            self.assertEqual(len(forward), 1)
+            self.assertEqual(len(reverse), 1)
+            self.assertEqual(forward[0], reverse[0])
+
+    def test_build_disk_records_fold_does_not_union_conflicting_identity_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_core_multipath_service(temp_dir)
+            ssh_data = ParsedSSHData(
+                glabel=parse_glabel_status(self.CORE_GLABEL_STATUS_FIXTURE),
+                multipath_info=parse_gmultipath_list(self.CORE_GMULTIPATH_LIST_FIXTURE),
+            )
+            active_member = {
+                "name": "da84",
+                "devname": "da84",
+                "multipath_name": "",
+                "multipath_member": "",
+                "serial": "ACTIVE-SERIAL",
+                "identifier": "ACTIVE-IDENTIFIER",
+                "lunid": "5000c50000000084",
+            }
+            passive_member = {
+                "name": "da69",
+                "devname": "da69",
+                "multipath_name": "",
+                "multipath_member": "",
+                "serial": "PASSIVE-SERIAL",
+                "identifier": "PASSIVE-IDENTIFIER",
+                "lunid": "5000c50000000069",
+            }
+
+            forward = service._build_disk_records([active_member, passive_member], ssh_data, {}, {})
+            reverse = service._build_disk_records([passive_member, active_member], ssh_data, {}, {})
+
+            self.assertEqual(len(forward), 1)
+            self.assertEqual(len(reverse), 1)
+            self.assertEqual(forward[0], reverse[0])
+            record = forward[0]
+            self.assertEqual(record.serial, "ACTIVE-SERIAL")
+            self.assertEqual(record.identifier, "ACTIVE-IDENTIFIER")
+            self.assertEqual(record.lunid, "5000c50000000084")
+            self.assertIn("active-serial", record.lookup_keys)
+            self.assertIn("active-identifier", record.lookup_keys)
+            self.assertNotIn("passive-serial", record.lookup_keys)
+            self.assertNotIn("passive-identifier", record.lookup_keys)
+            self.assertEqual(record.smart_devices, ["da84", "da69", "multipath/disk49"])
+            self.assertEqual(
+                [row["serial"] for row in record.raw["multipath_member_api_rows"]],
+                ["ACTIVE-SERIAL", "PASSIVE-SERIAL"],
+            )
+
     def test_build_disk_records_keeps_api_named_multipath_over_gmultipath_backfill(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._build_core_multipath_service(temp_dir)
