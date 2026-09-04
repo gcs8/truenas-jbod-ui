@@ -212,16 +212,18 @@ class SnapshotRedactor:
         normalized = value.strip()
         if not normalized:
             return
-        if self._is_zero_identifier_sentinel(normalized) or len(normalized) < 5:
+        if self._is_zero_identifier_sentinel(normalized):
             return
-        if bucket == "serial":
-            self.serial_values.append(normalized)
-        elif bucket == "partial_id":
-            self.partial_identifier_values.append(normalized)
-        elif bucket == "system":
+        if bucket == "system":
             self._alias_for_identifier(normalized, self.system_aliases, "host", value)
         elif bucket == "enclosure":
             self._alias_for_identifier(normalized, self.enclosure_aliases, "enc", value)
+        elif len(normalized) < 5:
+            return
+        elif bucket == "serial":
+            self.serial_values.append(normalized)
+        elif bucket == "partial_id":
+            self.partial_identifier_values.append(normalized)
 
     def _classify_path(self, path: tuple[Any, ...]) -> str | None:
         if not path:

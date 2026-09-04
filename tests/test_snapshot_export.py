@@ -1841,6 +1841,29 @@ class SnapshotRedactorIdentifierKeyTests(unittest.TestCase):
         self.assertEqual(redacted.slots[0].serial, "FI...0001")
         self.assertEqual(redacted.slots[0].raw_status["serial_hint"], "SE...0001")
 
+    def test_short_unknown_system_and_enclosure_ids_are_removed_from_free_text(self) -> None:
+        history_cache = {
+            "0": {
+                "system_id": "unvr",
+                "enclosure_id": "252",
+                "detail": "moved from unvr enclosure 252",
+            }
+        }
+        redactor = SnapshotRedactor(build_snapshot(), history_cache, {})
+
+        redacted = redactor.redact_history_cache(history_cache)
+        system_alias = redacted["0"]["system_id"]
+        enclosure_alias = redacted["0"]["enclosure_id"]
+
+        self.assertRegex(system_alias, r"^host-\d{2}$")
+        self.assertRegex(enclosure_alias, r"^enc-\d{2}$")
+        self.assertEqual(
+            redacted["0"]["detail"],
+            f"moved from {system_alias} enclosure {enclosure_alias}",
+        )
+        self.assertNotIn("unvr", json.dumps(redacted))
+        self.assertNotIn('"252"', json.dumps(redacted))
+
 
 class SnapshotRedactorHostnameFormTests(unittest.TestCase):
     @staticmethod
