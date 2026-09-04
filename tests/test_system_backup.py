@@ -461,6 +461,66 @@ class SystemBackupServiceTests(unittest.TestCase):
         self.assertEqual(target_catalog.stat().st_mode & 0o7777, 0o620)
         self.assertEqual(target_segment.stat().st_mode & 0o7777, 0o604)
 
+    def test_segmented_staging_preserves_existing_mode_zero_directory(self) -> None:
+        target_dir = self.temp_dir / "mode-zero-segments"
+        target_dir.mkdir()
+        target_dir.chmod(0o0000)
+        staged_dir = self.temp_dir / ".mode-zero-segments.restore-test"
+        transaction = _ImportActivationTransaction({})
+
+        try:
+            entry = transaction._record_target(target_dir)
+            with (
+                patch.object(transaction, "_fsync_tree"),
+                patch.object(transaction, "_fsync_directory"),
+            ):
+                transaction._stage_segmented_directory(
+                    staged_dir,
+                    target_dir=target_dir,
+                    entry=entry,
+                    members=[],
+                )
+
+            self.assertEqual(staged_dir.stat().st_mode & 0o7777, 0o0000)
+        finally:
+            target_dir.chmod(0o700)
+            if staged_dir.exists():
+                staged_dir.chmod(0o700)
+                shutil.rmtree(staged_dir)
+            shutil.rmtree(transaction.root, ignore_errors=True)
+
+    def test_segmented_staging_preserves_existing_mode_zero_file(self) -> None:
+        target_dir = self.temp_dir / "mode-zero-segment-file"
+        target_dir.mkdir()
+        target_file = target_dir / "catalog.json"
+        target_file.write_bytes(b"ORIGINAL")
+        target_file.chmod(0o0000)
+        staged_dir = self.temp_dir / ".mode-zero-segment-file.restore-test"
+        transaction = _ImportActivationTransaction({"catalog": b"IMPORTED"})
+
+        try:
+            entry = transaction._record_target(target_dir)
+            with (
+                patch.object(transaction, "_fsync_tree"),
+                patch.object(transaction, "_fsync_directory"),
+            ):
+                transaction._stage_segmented_directory(
+                    staged_dir,
+                    target_dir=target_dir,
+                    entry=entry,
+                    members=[("catalog", Path("catalog.json"))],
+                )
+
+            self.assertEqual(
+                (staged_dir / "catalog.json").stat().st_mode & 0o7777,
+                0o0000,
+            )
+        finally:
+            target_file.chmod(0o600)
+            if staged_dir.exists():
+                shutil.rmtree(staged_dir)
+            shutil.rmtree(transaction.root, ignore_errors=True)
+
     def test_segmented_file_inspection_aggregates_hot_and_segment_counts(self) -> None:
         service, _catalog_path, _segment_path = self._build_segmented_debug_service()
         artifact = service.export_bundle_to_file(

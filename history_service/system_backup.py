@@ -613,8 +613,11 @@ class _ImportActivationTransaction:
         )
         self._apply_owner(staged_dir, root_owner)
         staged_dir.chmod(
-            self._existing_mode(existing_directory, directory=True)
-            or SEGMENT_DIRECTORY_MODE
+            self._existing_mode_or_default(
+                existing_directory,
+                directory=True,
+                default=SEGMENT_DIRECTORY_MODE,
+            )
         )
         seen: set[Path] = set()
         for member_key, relative_path in members:
@@ -646,8 +649,11 @@ class _ImportActivationTransaction:
                     )
                 self._apply_owner(staged_parent, parent_owner)
                 staged_parent.chmod(
-                    self._existing_mode(existing_parent, directory=True)
-                    or SEGMENT_DIRECTORY_MODE
+                    self._existing_mode_or_default(
+                        existing_parent,
+                        directory=True,
+                        default=SEGMENT_DIRECTORY_MODE,
+                    )
                 )
             shutil.copyfile(self._staged_member(member_key), staged_target)
             existing_target = (
@@ -663,8 +669,11 @@ class _ImportActivationTransaction:
                 )
             self._apply_owner(staged_target, target_owner)
             staged_target.chmod(
-                self._existing_mode(existing_target, directory=False)
-                or SEGMENT_FILE_MODE
+                self._existing_mode_or_default(
+                    existing_target,
+                    directory=False,
+                    default=SEGMENT_FILE_MODE,
+                )
             )
         self._fsync_tree(staged_dir)
         self._fsync_directory(staged_dir.parent)
@@ -798,9 +807,14 @@ class _ImportActivationTransaction:
             existing_directory or target_dir.parent,
             directory=True,
         )
-        root_mode = self._existing_mode(existing_directory, directory=True)
         self._apply_owner(staged_dir, root_owner)
-        staged_dir.chmod(root_mode or self._MISSING_DIRECTORY_MODE)
+        staged_dir.chmod(
+            self._existing_mode_or_default(
+                existing_directory,
+                directory=True,
+                default=self._MISSING_DIRECTORY_MODE,
+            )
+        )
         try:
             for member_key, relative_path in members:
                 staged_target = staged_dir / relative_path
@@ -823,8 +837,11 @@ class _ImportActivationTransaction:
                         )
                     self._apply_owner(staged_parent, parent_owner)
                     staged_parent.chmod(
-                        self._existing_mode(existing_parent, directory=True)
-                        or self._MISSING_DIRECTORY_MODE
+                        self._existing_mode_or_default(
+                            existing_parent,
+                            directory=True,
+                            default=self._MISSING_DIRECTORY_MODE,
+                        )
                     )
                 shutil.copyfile(self._staged_member(member_key), staged_target)
                 existing_target = (
@@ -840,8 +857,11 @@ class _ImportActivationTransaction:
                     )
                 self._apply_owner(staged_target, target_owner)
                 staged_target.chmod(
-                    self._existing_mode(existing_target, directory=False)
-                    or self._MISSING_FILE_MODE
+                    self._existing_mode_or_default(
+                        existing_target,
+                        directory=False,
+                        default=self._MISSING_FILE_MODE,
+                    )
                 )
             self._fsync_tree(staged_dir)
             self._park_original(entry)
@@ -1158,6 +1178,17 @@ class _ImportActivationTransaction:
         if not directory and not path.is_file():
             return None
         return path.stat(follow_symlinks=False).st_mode & 0o7777
+
+    @classmethod
+    def _existing_mode_or_default(
+        cls,
+        path: Path | None,
+        *,
+        directory: bool,
+        default: int,
+    ) -> int:
+        existing_mode = cls._existing_mode(path, directory=directory)
+        return default if existing_mode is None else existing_mode
 
     @staticmethod
     def _existing_owner(path: Path | None, *, directory: bool) -> tuple[int, int] | None:
