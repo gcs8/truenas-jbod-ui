@@ -41,6 +41,21 @@ class MappingStore:
     def _slot_key(self, system_id: str | None, enclosure_id: str | None, slot: int) -> str:
         return f"{system_id or 'default_system'}:{enclosure_id or 'default'}:{slot}"
 
+    def _resolvable_keys(
+        self,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slot: int,
+    ) -> tuple[str, ...]:
+        """Keys that can resolve for this bay: canonical, scoped enclosure-less
+        sibling, then the two unscoped legacy aliases (see ``get_mapping``)."""
+        return (
+            self._slot_key(system_id, enclosure_id, slot),
+            self._slot_key(system_id, None, slot),
+            f"{enclosure_id or 'default'}:{slot}",
+            f"default:{slot}",
+        )
+
     def load_all(self) -> dict[str, ManualMapping]:
         if not self.file_path.exists():
             return {}
@@ -73,13 +88,8 @@ class MappingStore:
         loaded_entries: Mapping[str, ManualMapping] | None = None,
     ) -> ManualMapping | None:
         current = self.load_all() if loaded_entries is None else loaded_entries
-        keys = [self._slot_key(system_id, enclosure_id, slot)]
-        if allow_legacy_fallback:
-            keys.extend((
-                self._slot_key(system_id, None, slot),
-                f"{enclosure_id or 'default'}:{slot}",
-                f"default:{slot}",
-            ))
+        resolvable = self._resolvable_keys(system_id, enclosure_id, slot)
+        keys = list(resolvable) if allow_legacy_fallback else [resolvable[0]]
         for key in keys:
             candidate = current.get(key)
             if candidate is None:
@@ -134,8 +144,10 @@ class MappingStore:
             saved = mapping.model_copy(
                 update={"updated_at": datetime.now(timezone.utc)}
             )
-            current.pop(f"{mapping.enclosure_id or 'default'}:{mapping.slot}", None)
-            current.pop(f"default:{mapping.slot}", None)
+            for stale_key in self._resolvable_keys(
+                mapping.system_id, mapping.enclosure_id, mapping.slot
+            ):
+                current.pop(stale_key, None)
             current[self._slot_key(mapping.system_id, mapping.enclosure_id, mapping.slot)] = saved
             self._write(current)
         return saved
@@ -157,12 +169,8 @@ class MappingStore:
                 if current_revision != expected_revision:
                     raise MappingRevisionConflict(current_revision)
             effective = None
-            for key in (
-                self._slot_key(system_id, enclosure_id, slot),
-                self._slot_key(system_id, None, slot),
-                f"{enclosure_id or 'default'}:{slot}",
-                f"default:{slot}",
-            ):
+            resolvable_keys = self._resolvable_keys(system_id, enclosure_id, slot)
+            for key in resolvable_keys:
                 candidate = current.get(key)
                 if candidate is None:
                     continue
@@ -177,7 +185,10 @@ class MappingStore:
                 key
                 for key, mapping in current.items()
                 if self._mapping_matches_clear_system(key, mapping, system_id)
-                and self._scope_identity(mapping) == effective_identity
+                and (
+                    self._scope_identity(mapping) == effective_identity
+                    or key in resolvable_keys
+                )
             ]
             for key in keys_to_remove:
                 current.pop(key, None)

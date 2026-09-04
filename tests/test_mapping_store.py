@@ -596,6 +596,61 @@ class MappingStoreImportTests(unittest.TestCase):
             self.assertIsNone(store.get_mapping("default", "enc-a", 0))
             self.assertEqual(store.load_all(), {})
 
+    def test_canonical_save_removes_scoped_enclosureless_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            store._write({
+                store._slot_key("system-a", None, 5): ManualMapping(
+                    system_id="system-a",
+                    enclosure_id=None,
+                    slot=5,
+                    serial="SYNTH-OLD-A",
+                )
+            })
+
+            store.save_mapping(
+                ManualMapping(
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    slot=5,
+                    serial="SYNTH-NEW-B",
+                )
+            )
+
+            current = store.load_all()
+            self.assertNotIn(store._slot_key("system-a", None, 5), current)
+            self.assertEqual(list(current), [store._slot_key("system-a", "enc-a", 5)])
+
+    def test_clear_removes_scoped_enclosureless_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            store._write({
+                store._slot_key("system-a", None, 5): ManualMapping(
+                    system_id="system-a",
+                    enclosure_id=None,
+                    slot=5,
+                    serial="SYNTH-OLD-A",
+                ),
+                store._slot_key("system-a", "enc-a", 5): ManualMapping(
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    slot=5,
+                    serial="SYNTH-NEW-B",
+                ),
+            })
+
+            self.assertTrue(store.clear_mapping("system-a", "enc-a", 5))
+
+            self.assertIsNone(
+                store.get_mapping(
+                    "system-a",
+                    "enc-a",
+                    5,
+                    allow_legacy_fallback=True,
+                )
+            )
+            self.assertEqual(store.load_all(), {})
+
     def test_default_system_clear_keeps_other_system_canonical_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
