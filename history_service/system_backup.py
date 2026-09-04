@@ -312,10 +312,18 @@ class _SegmentedExportSnapshot:
 @dataclass(slots=True)
 class _ImportRollbackEntry:
     target_path: Path
-    kind: Literal["missing", "file", "directory", "symlink", "history"]
+    kind: Literal["missing", "file", "directory", "history"]
+    expected_kind: Literal["file", "directory"]
     backup_path: Path | None = None
     history_store: HistoryStore | None = None
     mutated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ImportRestoreDestination:
+    group_key: str
+    target_path: Path
+    expected_kind: Literal["file", "directory"]
 
 
 @dataclass(slots=True)
@@ -351,7 +359,7 @@ class _ImportActivationTransaction:
         self._journal: dict[str, _ImportRollbackEntry] = {}
         self._journal_order: list[str] = []
         self._created_parents: list[Path] = []
-        self._sibling_artifacts: set[Path] = set()
+        self._sibling_artifacts: dict[Path, Literal["file", "directory"]] = {}
         self._protected_history_key = (
             self._journal_key(history_store.file_path)
             if history_store is not None
@@ -435,7 +443,11 @@ class _ImportActivationTransaction:
         *,
         allow_history: bool,
     ) -> None:
-        entry = self._record_target(target_path, allow_history=allow_history)
+        entry = self._record_target(
+            target_path,
+            expected_kind="file",
+            allow_history=allow_history,
+        )
         staged_path = self._staged_member(member_key)
         self._ensure_parent_hierarchy(target_path.parent)
         file_descriptor, temp_name = tempfile.mkstemp(
@@ -443,7 +455,7 @@ class _ImportActivationTransaction:
             dir=target_path.parent,
         )
         temp_path = Path(temp_name)
-        self._sibling_artifacts.add(temp_path)
+        self._sibling_artifacts[temp_path] = "file"
         try:
             os.close(file_descriptor)
             shutil.copyfile(staged_path, temp_path)
@@ -461,7 +473,7 @@ class _ImportActivationTransaction:
             self._fsync_file(temp_path)
             self._park_original(entry)
             os.replace(temp_path, target_path)
-            self._sibling_artifacts.discard(temp_path)
+            self._sibling_artifacts.pop(temp_path, None)
             entry.mutated = True
             self._fsync_directory(target_path.parent)
         finally:
@@ -483,8 +495,15 @@ class _ImportActivationTransaction:
         store._segment_reader_cache = None
         store._segment_reader_identity = None
         self._checkpoint_hot_database(store.file_path)
-        hot_entry = self._record_target(store.file_path, allow_history=True)
-        segments_entry = self._record_target(catalog_path.parent)
+        hot_entry = self._record_target(
+            store.file_path,
+            expected_kind="file",
+            allow_history=True,
+        )
+        segments_entry = self._record_target(
+            catalog_path.parent,
+            expected_kind="directory",
+        )
         if hot_entry.kind not in {"file", "missing"}:
             raise ValueError("Live segmented history hot target is invalid.")
         if segments_entry.kind not in {"directory", "missing"}:
@@ -579,7 +598,7 @@ class _ImportActivationTransaction:
             self._MISSING_FILE_MODE,
         )
         os.close(descriptor)
-        self._sibling_artifacts.add(staged_path)
+        self._sibling_artifacts[staged_path] = "file"
         shutil.copyfile(source_path, staged_path)
         owner = self._existing_owner(
             target_path if entry.kind == "file" else target_path.parent,
@@ -604,7 +623,7 @@ class _ImportActivationTransaction:
         members: list[tuple[str, Path]],
     ) -> None:
         staged_dir.mkdir(mode=self._MISSING_DIRECTORY_MODE)
-        self._sibling_artifacts.add(staged_dir)
+        self._sibling_artifacts[staged_dir] = "directory"
         existing_directory = target_dir if entry.kind == "directory" else None
         root_owner = self._existing_owner(
             existing_directory or target_dir.parent,
@@ -692,13 +711,13 @@ class _ImportActivationTransaction:
             os.replace(entry.target_path, previous_path)
             entry.backup_path = previous_path
             entry.mutated = True
-            self._sibling_artifacts.add(previous_path)
+            self._sibling_artifacts[previous_path] = entry.expected_kind
             self._fsync_directory(entry.target_path.parent)
             if not matcher(previous_path, prior_record):
                 self._preserve_segmented_evidence = True
                 raise ValueError("Segmented history restore parked prior integrity failed.")
         os.replace(staged_path, entry.target_path)
-        self._sibling_artifacts.discard(staged_path)
+        self._sibling_artifacts.pop(staged_path, None)
         entry.mutated = True
         self._fsync_directory(entry.target_path.parent)
         if not matcher(entry.target_path, candidate_record):
@@ -783,7 +802,7 @@ class _ImportActivationTransaction:
         target_dir: Path,
         members: list[tuple[str, Path]],
     ) -> None:
-        entry = self._record_target(target_dir)
+        entry = self._record_target(target_dir, expected_kind="directory")
         existing_directory = target_dir if entry.kind == "directory" else None
         self._ensure_parent_hierarchy(target_dir.parent)
         staged_dir = Path(
@@ -792,7 +811,7 @@ class _ImportActivationTransaction:
                 dir=target_dir.parent,
             )
         )
-        self._sibling_artifacts.add(staged_dir)
+        self._sibling_artifacts[staged_dir] = "directory"
         root_owner = self._existing_owner(
             existing_directory or target_dir.parent,
             directory=True,
@@ -845,7 +864,7 @@ class _ImportActivationTransaction:
             self._fsync_tree(staged_dir)
             self._park_original(entry)
             os.replace(staged_dir, target_dir)
-            self._sibling_artifacts.discard(staged_dir)
+            self._sibling_artifacts.pop(staged_dir, None)
             entry.mutated = True
             self._fsync_directory(target_dir.parent)
         finally:
@@ -884,10 +903,56 @@ class _ImportActivationTransaction:
             raise ValueError(f"Backup bundle is missing staged member {member_key!r}.")
         return staged_path
 
+    @staticmethod
+    def _target_path_kind(
+        target_path: Path,
+    ) -> Literal["missing", "file", "directory", "symlink", "other"]:
+        try:
+            metadata = os.lstat(target_path)
+        except FileNotFoundError:
+            return "missing"
+        if stat.S_ISLNK(metadata.st_mode):
+            return "symlink"
+        if stat.S_ISREG(metadata.st_mode):
+            return "file"
+        if stat.S_ISDIR(metadata.st_mode):
+            return "directory"
+        return "other"
+
+    @classmethod
+    def _validate_target_path(
+        cls,
+        target_path: Path,
+        *,
+        expected_kind: Literal["file", "directory"],
+    ) -> Literal["missing", "file", "directory"]:
+        cursor = target_path.parent
+        while True:
+            kind = cls._target_path_kind(cursor)
+            if kind == "symlink":
+                raise ValueError("Import target parent hierarchy must not contain symlinks.")
+            if kind not in {"missing", "directory"}:
+                raise ValueError("Import target parent hierarchy must contain only directories.")
+            if cursor == cursor.parent:
+                break
+            cursor = cursor.parent
+
+        kind = cls._target_path_kind(target_path)
+        if kind == "symlink":
+            raise ValueError(f"Live restore target {target_path} must not be a symlink.")
+        if kind == "missing":
+            return "missing"
+        if kind == expected_kind:
+            return "file" if kind == "file" else "directory"
+        if expected_kind == "file":
+            raise ValueError(f"Live restore target {target_path} must be a regular file or missing.")
+        raise ValueError(f"Live restore target {target_path} must be a directory or missing.")
+
     def _record_target(
         self,
         target_path: Path,
         *,
+        expected_kind: Literal["file", "directory"],
         allow_history: bool = False,
     ) -> _ImportRollbackEntry:
         journal_key = self._journal_key(target_path)
@@ -903,32 +968,26 @@ class _ImportActivationTransaction:
                 raise ValueError(
                     f"Live restore target {target_path} collides with another restore target."
                 )
-        if target_path.is_symlink():
-            entry = _ImportRollbackEntry(target_path=target_path, kind="symlink")
-        elif target_path.is_dir():
-            entry = _ImportRollbackEntry(target_path=target_path, kind="directory")
-        elif target_path.is_file():
-            entry = _ImportRollbackEntry(target_path=target_path, kind="file")
-        elif target_path.exists():
-            raise ValueError(f"Live restore target {target_path} is not a regular file or directory.")
-        else:
-            entry = _ImportRollbackEntry(target_path=target_path, kind="missing")
+        kind = self._validate_target_path(target_path, expected_kind=expected_kind)
+        entry = _ImportRollbackEntry(
+            target_path=target_path,
+            kind=kind,
+            expected_kind=expected_kind,
+        )
         self._journal[journal_key] = entry
         self._journal_order.append(journal_key)
         return entry
 
     def _record_history(self, store: HistoryStore) -> _ImportRollbackEntry:
         target_path = store.file_path
-        self._reject_symlinked_history_target(target_path)
+        target_kind = self._validate_target_path(target_path, expected_kind="file")
         journal_key = self._journal_key(target_path)
         for existing_key in self._journal:
             if self._journal_paths_overlap(journal_key, existing_key):
                 raise ValueError(
                     f"Live restore target {target_path} collides with the history database."
                 )
-        if target_path.exists() and not target_path.is_file():
-            raise ValueError(f"Live history restore target {target_path} is not a regular file.")
-        if target_path.exists():
+        if target_kind == "file":
             backup_dir = self.rollback_root / f"history-{len(self._journal_order):04d}"
             backup_path = store.create_backup(
                 backup_dir,
@@ -946,6 +1005,7 @@ class _ImportActivationTransaction:
             entry = _ImportRollbackEntry(
                 target_path=target_path,
                 kind="history",
+                expected_kind="file",
                 backup_path=backup_path,
                 history_store=store,
             )
@@ -953,6 +1013,7 @@ class _ImportActivationTransaction:
             entry = _ImportRollbackEntry(
                 target_path=target_path,
                 kind="history",
+                expected_kind="file",
                 history_store=store,
             )
         self._journal[journal_key] = entry
@@ -964,17 +1025,25 @@ class _ImportActivationTransaction:
             return
         displaced_path: Path | None = None
         if self._path_exists(entry.target_path):
+            self._validate_target_path(
+                entry.target_path,
+                expected_kind=entry.expected_kind,
+            )
             displaced_path = self._new_sibling_path(entry.target_path, "restore")
             os.replace(entry.target_path, displaced_path)
-            self._sibling_artifacts.add(displaced_path)
+            self._sibling_artifacts[displaced_path] = entry.expected_kind
             self._fsync_directory(entry.target_path.parent)
 
         try:
             if entry.kind != "missing":
                 if entry.backup_path is None or not self._path_exists(entry.backup_path):
                     raise RuntimeError(f"Rollback material is missing for {entry.target_path}.")
+                self._validate_target_path(
+                    entry.backup_path,
+                    expected_kind=entry.expected_kind,
+                )
                 os.replace(entry.backup_path, entry.target_path)
-                self._sibling_artifacts.discard(entry.backup_path)
+                self._sibling_artifacts.pop(entry.backup_path, None)
                 entry.backup_path = None
                 self._fsync_directory(entry.target_path.parent)
         except Exception as restore_error:
@@ -986,7 +1055,7 @@ class _ImportActivationTransaction:
             ):
                 try:
                     os.replace(displaced_path, entry.target_path)
-                    self._sibling_artifacts.discard(displaced_path)
+                    self._sibling_artifacts.pop(displaced_path, None)
                     self._fsync_directory(entry.target_path.parent)
                 except Exception as exc:
                     recovery_error = exc
@@ -1028,11 +1097,17 @@ class _ImportActivationTransaction:
     def _park_original(self, entry: _ImportRollbackEntry) -> None:
         if entry.kind == "missing":
             return
+        current_kind = self._validate_target_path(
+            entry.target_path,
+            expected_kind=entry.expected_kind,
+        )
+        if current_kind == "missing":
+            raise ValueError("Live restore target changed after validation.")
         previous_path = self._new_sibling_path(entry.target_path, "previous")
         os.replace(entry.target_path, previous_path)
         entry.backup_path = previous_path
         entry.mutated = True
-        self._sibling_artifacts.add(previous_path)
+        self._sibling_artifacts[previous_path] = entry.expected_kind
         self._fsync_directory(entry.target_path.parent)
 
     def _ensure_parent_hierarchy(self, parent_path: Path) -> None:
@@ -1106,14 +1181,14 @@ class _ImportActivationTransaction:
                     hot["prior"],
                     label="prior hot database",
                 )
-            self._sibling_artifacts.discard(prepared.previous_hot_path)
+            self._sibling_artifacts.pop(prepared.previous_hot_path, None)
             if segments["prior"].get("kind") != "missing":
                 remove_recorded_restore_tree(
                     prepared.previous_segments_path,
                     segments["prior"],
                     label="prior segment tree",
                 )
-            self._sibling_artifacts.discard(prepared.previous_segments_path)
+            self._sibling_artifacts.pop(prepared.previous_segments_path, None)
             self._prepared_segmented_restore = None
         failures = self._cleanup_sibling_artifacts()
         if failures:
@@ -1129,10 +1204,13 @@ class _ImportActivationTransaction:
         return failures
 
     def _cleanup_sibling_artifact(self, artifact_path: Path) -> None:
+        expected_kind = self._sibling_artifacts.get(artifact_path)
         if self._path_exists(artifact_path):
-            self._remove_path(artifact_path)
+            if expected_kind is None:
+                raise RuntimeError("Untracked restore artifact cannot be removed.")
+            self._remove_path(artifact_path, expected_kind=expected_kind)
             self._fsync_directory(artifact_path.parent)
-        self._sibling_artifacts.discard(artifact_path)
+        self._sibling_artifacts.pop(artifact_path, None)
 
     def _cleanup_root(self) -> None:
         if self.root.exists():
@@ -1237,13 +1315,19 @@ class _ImportActivationTransaction:
         return path.exists() or path.is_symlink()
 
     @classmethod
-    def _remove_path(cls, path: Path) -> None:
-        if path.is_symlink() or path.is_file():
-            path.unlink(missing_ok=True)
-        elif path.is_dir():
+    def _remove_path(
+        cls,
+        path: Path,
+        *,
+        expected_kind: Literal["file", "directory"],
+    ) -> None:
+        kind = cls._validate_target_path(path, expected_kind=expected_kind)
+        if kind == "missing":
+            return
+        if expected_kind == "file":
+            path.unlink()
+        else:
             shutil.rmtree(path)
-        elif path.exists():
-            path.unlink(missing_ok=True)
 
     @staticmethod
     def _fsync_file(path: Path) -> None:
@@ -2299,6 +2383,11 @@ class SystemBackupService:
             self._validate_manifest_member_metadata(manifest, extracted)
             self._preflight_selected_group_members(manifest, group_entries, extracted)
             self._preflight_import_members(manifest, group_entries, extracted)
+            restore_destinations = self._build_restore_destination_graph(
+                manifest,
+                group_entries,
+                extracted,
+            )
             self._prepare_segmented_history_import(manifest, extracted)
             segmented_restore = manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
             segmented_activation = (
@@ -2355,6 +2444,7 @@ class SystemBackupService:
                                 detected_packaging,
                                 archive_meta,
                                 transaction,
+                                restore_destinations,
                             )
                             transaction.commit()
                     except Exception:
@@ -2372,6 +2462,191 @@ class SystemBackupService:
                 raise
         finally:
             self._cleanup_extracted_archive(cleanup_root)
+
+    def _build_restore_destination_graph(
+        self,
+        manifest: dict[str, Any],
+        group_entries: dict[str, dict[str, Any]],
+        extracted: dict[str, ExtractedMember],
+    ) -> dict[str, _ImportRestoreDestination]:
+        trusted_settings = self._load_app_settings()
+        config_path = Path(trusted_settings.config_file)
+        config_root = config_path.parent
+        layout_paths = _derive_runtime_layout_paths(config_path)
+        destinations = {
+            CONFIG_FILE_KEY: _ImportRestoreDestination(
+                CONFIG_FILE_KEY,
+                config_path,
+                "file",
+            ),
+            RUNTIME_OVERRIDES_FILE_KEY: _ImportRestoreDestination(
+                RUNTIME_OVERRIDES_FILE_KEY,
+                Path(trusted_settings.paths.runtime_overrides_file),
+                "file",
+            ),
+            PROFILE_FILE_KEY: _ImportRestoreDestination(
+                PROFILE_FILE_KEY,
+                Path(trusted_settings.paths.profile_file),
+                "file",
+            ),
+            MAPPING_FILE_KEY: _ImportRestoreDestination(
+                MAPPING_FILE_KEY,
+                Path(trusted_settings.paths.mapping_file),
+                "file",
+            ),
+            SAS_FABRIC_ALIAS_FILE_KEY: _ImportRestoreDestination(
+                SAS_FABRIC_ALIAS_FILE_KEY,
+                Path(trusted_settings.paths.sas_fabric_alias_file),
+                "file",
+            ),
+            SLOT_DETAIL_FILE_KEY: _ImportRestoreDestination(
+                SLOT_DETAIL_FILE_KEY,
+                Path(trusted_settings.paths.slot_detail_cache_file),
+                "file",
+            ),
+            SSH_KEYS_KEY: _ImportRestoreDestination(
+                SSH_KEYS_KEY,
+                config_root / "ssh",
+                "directory",
+            ),
+            TLS_TRUST_KEY: _ImportRestoreDestination(
+                TLS_TRUST_KEY,
+                config_root / "tls",
+                "directory",
+            ),
+            KNOWN_HOSTS_KEY: _ImportRestoreDestination(
+                KNOWN_HOSTS_KEY,
+                Path(layout_paths["known_hosts_path"]),
+                "file",
+            ),
+            HISTORY_DB_KEY: _ImportRestoreDestination(
+                HISTORY_DB_KEY,
+                self.store.file_path,
+                "file",
+            ),
+        }
+        self._validate_imported_restore_path_settings(
+            manifest,
+            group_entries,
+            extracted,
+            trusted_settings=trusted_settings,
+            layout_paths=layout_paths,
+        )
+
+        active_destinations = [
+            destination
+            for group_key, destination in destinations.items()
+            if self._manifest_group_selected(group_entries.get(group_key))
+            and bool(self._group_members(manifest, group_key))
+        ]
+        if (
+            manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
+            and any(
+                destination.group_key == HISTORY_DB_KEY
+                for destination in active_destinations
+            )
+        ):
+            catalog_path = self.store.segment_catalog_path
+            if catalog_path is None:
+                raise ValueError("Segmented history catalog target is not configured.")
+            segmented_destination = _ImportRestoreDestination(
+                SEGMENTED_CATALOG_STAGING_KEY,
+                catalog_path.parent,
+                "directory",
+            )
+            destinations[SEGMENTED_CATALOG_STAGING_KEY] = segmented_destination
+            active_destinations.append(segmented_destination)
+
+        self._validate_restore_destination_graph(active_destinations)
+        return destinations
+
+    def _validate_imported_restore_path_settings(
+        self,
+        manifest: dict[str, Any],
+        group_entries: dict[str, dict[str, Any]],
+        extracted: dict[str, ExtractedMember],
+        *,
+        trusted_settings: Settings,
+        layout_paths: dict[str, str],
+    ) -> None:
+        default_settings = Settings()
+        legacy_paths = _derive_runtime_layout_paths(Path("/app/config/config.yaml"))
+        trusted_values = {
+            field_name: str(getattr(trusted_settings.paths, field_name))
+            for field_name in (
+                "runtime_overrides_file",
+                "mapping_file",
+                "sas_fabric_alias_file",
+                "log_file",
+                "profile_file",
+                "slot_detail_cache_file",
+            )
+        }
+        for group_key in (CONFIG_FILE_KEY, RUNTIME_OVERRIDES_FILE_KEY):
+            group_entry = group_entries.get(group_key)
+            if not self._manifest_group_selected(group_entry):
+                continue
+            member_entry = self._first_group_member(manifest, group_key)
+            if member_entry is None or member_entry["key"] not in extracted:
+                continue
+            payload = self._load_yaml_mapping(
+                self._extracted_member_bytes(extracted[member_entry["key"]])
+            )
+            imported_paths = payload.get("paths")
+            if imported_paths is None:
+                continue
+            if not isinstance(imported_paths, dict):
+                raise ValueError(
+                    f"Backup bundle selected {group_key} restore paths are invalid."
+                )
+            for field_name, trusted_value in trusted_values.items():
+                if field_name not in imported_paths:
+                    continue
+                raw_value = imported_paths[field_name]
+                if not isinstance(raw_value, str) or not raw_value.strip():
+                    raise ValueError(
+                        f"Backup bundle selected {group_key} restore path is invalid."
+                    )
+                allowed_values = {
+                    trusted_value,
+                    layout_paths[field_name],
+                    str(getattr(default_settings.paths, field_name)),
+                    legacy_paths[field_name],
+                }
+                if self._path_identity(raw_value) not in {
+                    self._path_identity(value) for value in allowed_values
+                }:
+                    raise ValueError(
+                        f"Backup bundle selected {group_key} restore path is redirected."
+                    )
+
+    @staticmethod
+    def _path_identity(path: str | Path) -> str:
+        return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+    @staticmethod
+    def _validate_restore_destination_graph(
+        destinations: list[_ImportRestoreDestination],
+    ) -> None:
+        validated: list[tuple[str, str]] = []
+        for destination in destinations:
+            _ImportActivationTransaction._validate_target_path(
+                destination.target_path,
+                expected_kind=destination.expected_kind,
+            )
+            journal_key = _ImportActivationTransaction._journal_key(
+                destination.target_path
+            )
+            for existing_group, existing_key in validated:
+                if _ImportActivationTransaction._journal_paths_overlap(
+                    journal_key,
+                    existing_key,
+                ):
+                    raise ValueError(
+                        "Live restore target graph contains overlapping destinations "
+                        f"for {existing_group} and {destination.group_key}."
+                    )
+            validated.append((destination.group_key, journal_key))
 
     def _prepare_segmented_history_import(
         self,
@@ -2469,6 +2744,7 @@ class SystemBackupService:
         detected_packaging: ArchivePackaging,
         archive_meta: dict[str, Any],
         transaction: _ImportActivationTransaction,
+        restore_destinations: dict[str, _ImportRestoreDestination],
     ) -> dict[str, Any]:
         restored_paths: list[str] = []
         preserved_absent_groups = [
@@ -2477,36 +2753,30 @@ class SystemBackupService:
             if self._manifest_group_selected(group_entries.get(key))
             and not self._manifest_group_present(group_entries.get(key))
         ]
-        app_settings = self._load_app_settings()
-
         self._restore_file_group(
             CONFIG_FILE_KEY,
             manifest,
             group_entries,
             extracted,
-            Path(app_settings.config_file),
+            restore_destinations[CONFIG_FILE_KEY].target_path,
             restored_paths,
             transaction,
         )
-
-        imported_settings = self._load_app_settings()
         self._restore_file_group(
             RUNTIME_OVERRIDES_FILE_KEY,
             manifest,
             group_entries,
             extracted,
-            Path(imported_settings.paths.runtime_overrides_file),
+            restore_destinations[RUNTIME_OVERRIDES_FILE_KEY].target_path,
             restored_paths,
             transaction,
         )
-
-        imported_settings = self._load_app_settings()
         self._restore_file_group(
             PROFILE_FILE_KEY,
             manifest,
             group_entries,
             extracted,
-            Path(imported_settings.paths.profile_file),
+            restore_destinations[PROFILE_FILE_KEY].target_path,
             restored_paths,
             transaction,
         )
@@ -2515,7 +2785,7 @@ class SystemBackupService:
             manifest,
             group_entries,
             extracted,
-            Path(imported_settings.paths.mapping_file),
+            restore_destinations[MAPPING_FILE_KEY].target_path,
             restored_paths,
             transaction,
         )
@@ -2524,7 +2794,7 @@ class SystemBackupService:
             manifest,
             group_entries,
             extracted,
-            Path(imported_settings.paths.sas_fabric_alias_file),
+            restore_destinations[SAS_FABRIC_ALIAS_FILE_KEY].target_path,
             restored_paths,
             transaction,
         )
@@ -2533,19 +2803,16 @@ class SystemBackupService:
             manifest,
             group_entries,
             extracted,
-            Path(imported_settings.paths.slot_detail_cache_file),
+            restore_destinations[SLOT_DETAIL_FILE_KEY].target_path,
             restored_paths,
             transaction,
         )
-
-        imported_settings = self._load_app_settings()
-        config_root = Path(imported_settings.config_file).parent
         self._restore_directory_group(
             SSH_KEYS_KEY,
             manifest,
             group_entries,
             extracted,
-            config_root / "ssh",
+            restore_destinations[SSH_KEYS_KEY].target_path,
             restored_paths,
             transaction,
         )
@@ -2554,17 +2821,16 @@ class SystemBackupService:
             manifest,
             group_entries,
             extracted,
-            config_root / "tls",
+            restore_destinations[TLS_TRUST_KEY].target_path,
             restored_paths,
             transaction,
         )
-        known_hosts_target = Path(_derive_runtime_layout_paths(imported_settings.config_file)["known_hosts_path"])
         self._restore_file_group(
             KNOWN_HOSTS_KEY,
             manifest,
             group_entries,
             extracted,
-            known_hosts_target,
+            restore_destinations[KNOWN_HOSTS_KEY].target_path,
             restored_paths,
             transaction,
         )
