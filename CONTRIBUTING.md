@@ -603,9 +603,10 @@ Two scripts enforce this:
   header>"` runs during release prep. It collects merged pull request numbers
   from `git log <tag>..HEAD` squash and merge subjects and from
   `--merged-prs-json <file>`, produced with
-  `gh pr list --state merged --search "merged:>=<tag date>" --json number,mergedAt`
-  (squash subjects lose the number when the merge title is edited), and fails
-  when any number is missing from the target section. When `wiki/` changed
+  `gh pr list --state merged --search "merged:>=<tag date>" --limit 1000 --json number,mergedAt,labels`
+  (squash subjects lose the number when the merge title is edited). It removes
+  pull requests labelled `no-changelog`, then fails when any remaining number
+  is missing from the target section. When `wiki/` changed
   since the tag it also requires `--wiki-commit <sha>` and verifies with
   `git ls-remote` that the sha is a branch tip of the GitHub wiki repository.
   Its `Changelog coverage: pass (<N> PRs)` and `External wiki commit: <sha>`

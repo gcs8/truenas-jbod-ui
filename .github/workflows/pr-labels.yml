@@ -60,7 +60,10 @@ jobs:
               ci) want+=(ci) ;;
               refactor|chore|build) want+=(internal) ;;
               security) want+=(security) ;;
-              *) echo "Unknown conventional type '$type'; leaving labels unchanged." ;;
+              *)
+                echo "Unknown conventional type '$type'; leaving labels unchanged."
+                exit 0
+                ;;
             esac
             if [[ "$scope" == "security" ]]; then
               want+=(security)

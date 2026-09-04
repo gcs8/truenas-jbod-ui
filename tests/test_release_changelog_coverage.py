@@ -134,6 +134,27 @@ class ReleaseChangelogCoverageTests(unittest.TestCase):
         self.assertNotIn(5, result.missing | result.covered)
         self.assertNotIn(6, result.missing | result.covered)
 
+    def test_no_changelog_json_entries_are_excluded_from_release_coverage(self) -> None:
+        self._write("app/service.py", "VALUE = 4\n")
+        self._commit("chore: internal cleanup (#13)")
+        merged = self._json(
+            [
+                {"number": 13, "labels": [{"name": "no-changelog"}]},
+                {"number": 14, "labels": [{"name": "dependencies"}]},
+            ]
+        )
+
+        result = coverage.evaluate(
+            self.repo,
+            previous_tag="v0.1.0",
+            section_header="## Unreleased",
+            merged_prs_json=merged,
+        )
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertNotIn(13, result.covered | result.missing)
+        self.assertIn(14, result.covered)
+
     def test_numbers_count_only_in_the_target_section(self) -> None:
         self._write("app/service.py", "VALUE = 4\n")
         self._commit("fix: recorded only in an old section (#5)")

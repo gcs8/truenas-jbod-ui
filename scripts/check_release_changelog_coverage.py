@@ -12,7 +12,7 @@ union because neither is complete on its own:
   and merge commits whose subject starts ``Merge pull request #N``.
 * ``--merged-prs-json <file>`` -- the release operator produces it with
   ``gh pr list -R <owner>/<repo> --state merged --search "merged:>=<tag date>"
-  --json number,mergedAt`` (either a JSON list of objects with a ``number``
+  --limit 1000 --json number,mergedAt,labels`` (either a JSON list of objects with a ``number``
   field or a bare list of integers). Squash subjects lose the number when a
   contributor edits the merge title, so this file is the safety net.
 
@@ -106,11 +106,16 @@ def tag_commit_time(repo: Path, previous_tag: str) -> str:
     return _git(repo, "log", "-1", "--format=%cI", previous_tag).stdout.strip()
 
 
-def pr_numbers_from_json(path: Path, *, not_after: str | None = None) -> set[int]:
+def pr_number_sets_from_json(
+    path: Path,
+    *,
+    not_after: str | None = None,
+) -> tuple[set[int], set[int]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise CoverageError(f"{path} must hold a JSON list")
     numbers: set[int] = set()
+    excluded: set[int] = set()
     for item in payload:
         if isinstance(item, bool):
             raise CoverageError(f"{path} holds a boolean where a PR number was expected")
@@ -119,11 +124,25 @@ def pr_numbers_from_json(path: Path, *, not_after: str | None = None) -> set[int
             continue
         if not isinstance(item, dict) or "number" not in item:
             raise CoverageError(f"{path} entries must be integers or objects with a 'number' field")
+        raw_labels = item.get("labels", [])
+        if not isinstance(raw_labels, list):
+            raise CoverageError(f"{path} entry labels must be a JSON list")
+        label_names: set[str] = set()
+        for label in raw_labels:
+            if isinstance(label, str):
+                label_names.add(label)
+            elif isinstance(label, dict) and isinstance(label.get("name"), str):
+                label_names.add(label["name"])
+            else:
+                raise CoverageError(f"{path} entry labels must be strings or objects with a 'name' field")
+        if "no-changelog" in label_names:
+            excluded.add(int(item["number"]))
+            continue
         merged_at = item.get("mergedAt")
         if not_after and isinstance(merged_at, str) and _iso_key(merged_at) <= _iso_key(not_after):
             continue
         numbers.add(int(item["number"]))
-    return numbers
+    return numbers, excluded
 
 
 def _iso_key(value: str) -> str:
@@ -202,7 +221,12 @@ def evaluate(
 
     expected = merged_pr_numbers_from_git(repo, previous_tag, head)
     if merged_prs_json is not None:
-        expected |= pr_numbers_from_json(merged_prs_json, not_after=tag_commit_time(repo, previous_tag))
+        json_numbers, excluded = pr_number_sets_from_json(
+            merged_prs_json,
+            not_after=tag_commit_time(repo, previous_tag),
+        )
+        expected |= json_numbers
+        expected -= excluded
     expected -= released_pr_numbers(repo, previous_tag)
 
     changelog = (changelog_path or repo / CHANGELOG_PATH).read_text(encoding="utf-8")
@@ -266,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--merged-prs-json",
         type=Path,
-        help="JSON list from gh pr list --state merged ... --json number,mergedAt.",
+        help="JSON list from gh pr list --state merged ... --json number,mergedAt,labels.",
     )
     parser.add_argument("--wiki-commit", help="Published GitHub wiki commit sha, required when wiki/ changed.")
     parser.add_argument("--offline", action="store_true", help="Skip the git ls-remote wiki verification.")
