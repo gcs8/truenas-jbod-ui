@@ -387,8 +387,7 @@ class MappingStore:
             self._write(current)
         return saved_count
 
-    @staticmethod
-    def _mapping_system_id(key: str, mapping: ManualMapping) -> str | None:
+    def _mapping_system_id(self, key: str, mapping: ManualMapping) -> str | None:
         if mapping.system_id is not None:
             return mapping.system_id
         legacy_keys = {
@@ -397,27 +396,35 @@ class MappingStore:
         }
         if key in legacy_keys:
             return None
-        return key.split(":", 1)[0] if ":" in key else None
+        physical_enclosure_id = resolve_physical_mapping_scope(mapping.enclosure_id)
+        enclosure_ids = (
+            physical_enclosure_id or "default",
+            *self._drawer_alias_enclosure_ids(physical_enclosure_id),
+        )
+        for enclosure_id in enclosure_ids:
+            suffix = f":{enclosure_id}:{mapping.slot}"
+            if key.endswith(suffix):
+                scoped_system_id = key[:-len(suffix)]
+                return scoped_system_id or None
+        return None
 
-    @classmethod
     def _mapping_matches_system(
-        cls,
+        self,
         key: str,
         mapping: ManualMapping,
         system_id: str | None,
     ) -> bool:
         if system_id is None:
             return True
-        return cls._mapping_system_id(key, mapping) in {None, system_id}
+        return self._mapping_system_id(key, mapping) in {None, system_id}
 
-    @classmethod
     def _mapping_matches_clear_system(
-        cls,
+        self,
         key: str,
         mapping: ManualMapping,
         system_id: str | None,
     ) -> bool:
-        mapping_system_id = cls._mapping_system_id(key, mapping)
+        mapping_system_id = self._mapping_system_id(key, mapping)
         if system_id is None:
             return mapping_system_id in {None, "default_system"}
         return mapping_system_id in {None, system_id}
@@ -485,24 +492,37 @@ class MappingStore:
     ) -> bool:
         if slot is not None:
             return key in self._resolvable_keys(system_id, enclosure_id, slot)
-        if enclosure_id is None:
-            system_prefix = f"{system_id or 'default_system'}:"
-            if key.startswith(system_prefix):
-                return True
-            return key in self._legacy_keys_for_mapping(mapping)
-
-        physical_ids = (
-            enclosure_id,
-            *self._drawer_alias_enclosure_ids(enclosure_id),
+        key_enclosure_id = (
+            enclosure_id
+            if enclosure_id is not None
+            else resolve_physical_mapping_scope(mapping.enclosure_id)
         )
-        scoped_prefix = f"{system_id or 'default_system'}:"
-        prefixes = {
-            *(f"{scoped_prefix}{physical_id}:" for physical_id in physical_ids),
-            *(f"{physical_id}:" for physical_id in physical_ids),
-            f"{scoped_prefix}default:",
-            "default:",
-        }
-        return any(key.startswith(prefix) for prefix in prefixes)
+        return key in self._resolvable_keys(
+            system_id,
+            key_enclosure_id,
+            mapping.slot,
+        )
+
+    def _model_is_in_scope_namespace(
+        self,
+        key: str,
+        mapping: ManualMapping,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slot: int | None,
+    ) -> bool:
+        if slot is not None and mapping.slot != slot:
+            return False
+        mapping_system_id = self._mapping_system_id(key, mapping)
+        if system_id is None:
+            if mapping_system_id not in {None, "default_system"}:
+                return False
+        elif mapping_system_id not in {None, system_id}:
+            return False
+        if enclosure_id is None:
+            return True
+        mapping_enclosure_id = resolve_physical_mapping_scope(mapping.enclosure_id)
+        return mapping_enclosure_id in {None, enclosure_id}
 
     def _assert_scope_key_model_consistency(
         self,
@@ -515,13 +535,13 @@ class MappingStore:
     ) -> None:
         enclosure_id = resolve_physical_mapping_scope(enclosure_id)
         for key, mapping in current.items():
-            if not all_systems and not self._key_is_in_scope_namespace(
-                key,
-                mapping,
-                system_id,
-                enclosure_id,
-                slot,
-            ):
+            key_is_selected = self._key_is_in_scope_namespace(
+                key, mapping, system_id, enclosure_id, slot
+            )
+            model_is_selected = self._model_is_in_scope_namespace(
+                key, mapping, system_id, enclosure_id, slot
+            )
+            if not all_systems and not (key_is_selected or model_is_selected):
                 continue
             candidate_system_id = (
                 self._mapping_system_id(key, mapping)
