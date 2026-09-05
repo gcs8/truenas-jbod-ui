@@ -135,6 +135,8 @@ class HistoryCollector:
         self.background_backoff_until: datetime | None = None
         self.last_smart_failure_evidence_disks: int = 0
         self.last_max_temperature_celsius: float | None = None
+        self.last_smart_failure_evidence_at: str | None = None
+        self.last_temperature_evidence_at: str | None = None
         self.last_smart_evidence_at: str | None = None
         self.next_collection_at: datetime | None = None
         self._pending_topology_changes: dict[
@@ -247,9 +249,12 @@ class HistoryCollector:
             )
         )
         smart_evidence_expected: set[str] = set()
-        smart_evidence_observed: set[str] = set()
+        smart_failure_health_observed: set[str] = set()
+        smart_temperature_observed: set[str] = set()
         smart_failure_evidence: set[str] = set()
         smart_temperatures: dict[str, float] = {}
+        trusted_smart_scope_observed = False
+        smart_scope_unavailable = False
         force_inventory = self._should_force_inventory_for_collection(
             collect_fast=collect_fast,
             collect_slow=collect_slow,
@@ -277,6 +282,7 @@ class HistoryCollector:
             scope_label = self._scope_activity_label(scope)
             self._set_collection_activity(f"recording {scope_label} ({scope_index}/{len(scopes)})")
             if not self._should_record_scope_snapshot(scope.snapshot):
+                smart_scope_unavailable = True
                 logger.warning(
                     "Skipping history capture for %s%s because the inventory snapshot is degraded or untrusted.",
                     scope.system_id,
@@ -292,6 +298,7 @@ class HistoryCollector:
                     scope_index=scope_index,
                 )
                 continue
+            trusted_smart_scope_observed = True
             slot_records = [
                 SlotStateRecord.from_snapshot_slot(scope.snapshot, slot_payload)
                 for slot_payload in scope.snapshot.get("slots", [])
@@ -361,15 +368,16 @@ class HistoryCollector:
                 if not isinstance(summary, dict):
                     continue
                 evidence_key = self._smart_evidence_disk_key(record)
-                if self._smart_summary_has_alert_evidence(summary):
-                    smart_evidence_observed.add(evidence_key)
+                if self._smart_summary_has_failure_health_evidence(summary):
+                    smart_failure_health_observed.add(evidence_key)
                     if self._smart_summary_indicates_failure(summary):
                         smart_failure_evidence.add(evidence_key)
-                    temperature = self._smart_summary_temperature(summary)
-                    if temperature is not None:
-                        previous_temperature = smart_temperatures.get(evidence_key)
-                        if previous_temperature is None or temperature > previous_temperature:
-                            smart_temperatures[evidence_key] = temperature
+                temperature = self._smart_summary_temperature(summary)
+                if temperature is not None:
+                    smart_temperature_observed.add(evidence_key)
+                    previous_temperature = smart_temperatures.get(evidence_key)
+                    if previous_temperature is None or temperature > previous_temperature:
+                        smart_temperatures[evidence_key] = temperature
                 if collect_fast:
                     metric_samples.extend(
                         self._build_metric_samples(record, summary, observed_at, FAST_METRIC_FIELDS)
@@ -393,12 +401,24 @@ class HistoryCollector:
                     sample_count=len(metric_samples),
                 )
 
-        if (collect_fast or collect_slow) and smart_evidence_expected.issubset(smart_evidence_observed):
-            self.last_smart_failure_evidence_disks = len(smart_failure_evidence)
-            self.last_max_temperature_celsius = (
-                max(smart_temperatures.values()) if smart_temperatures else None
-            )
-            self.last_smart_evidence_at = observed_at
+        if (
+            (collect_fast or collect_slow)
+            and trusted_smart_scope_observed
+            and not smart_scope_unavailable
+        ):
+            if smart_evidence_expected.issubset(smart_failure_health_observed):
+                self.last_smart_failure_evidence_disks = len(smart_failure_evidence)
+                self.last_smart_failure_evidence_at = observed_at
+            if smart_evidence_expected.issubset(smart_temperature_observed):
+                self.last_max_temperature_celsius = (
+                    max(smart_temperatures.values()) if smart_temperatures else None
+                )
+                self.last_temperature_evidence_at = observed_at
+            if self.last_smart_failure_evidence_at and self.last_temperature_evidence_at:
+                self.last_smart_evidence_at = min(
+                    self.last_smart_failure_evidence_at,
+                    self.last_temperature_evidence_at,
+                )
 
         backup_succeeded = False
         retention_backup_at: datetime | None = None
@@ -496,6 +516,8 @@ class HistoryCollector:
             "last_slow_metrics_at": self.last_slow_metrics_at,
             "last_smart_failure_evidence_disks": self.last_smart_failure_evidence_disks,
             "last_max_temperature_celsius": self.last_max_temperature_celsius,
+            "last_smart_failure_evidence_at": self.last_smart_failure_evidence_at,
+            "last_temperature_evidence_at": self.last_temperature_evidence_at,
             "last_smart_evidence_at": self.last_smart_evidence_at,
             "last_success_at": self.last_success_at,
             "last_backup_at": self.last_backup_at,
@@ -1104,9 +1126,20 @@ class HistoryCollector:
 
     @staticmethod
     def _smart_summary_has_alert_evidence(summary: dict[str, Any]) -> bool:
-        return any(
-            summary.get(field_name) is not None
-            for field_name in ("smart_health_status", "predictive_errors", "temperature_c")
+        return (
+            HistoryCollector._smart_summary_has_failure_health_evidence(summary)
+            or HistoryCollector._smart_summary_temperature(summary) is not None
+        )
+
+    @staticmethod
+    def _smart_summary_has_failure_health_evidence(summary: dict[str, Any]) -> bool:
+        if normalize_text(summary.get("smart_health_status")):
+            return True
+        predictive_errors = summary.get("predictive_errors")
+        return (
+            isinstance(predictive_errors, int | float)
+            and not isinstance(predictive_errors, bool)
+            and math.isfinite(float(predictive_errors))
         )
 
     @staticmethod

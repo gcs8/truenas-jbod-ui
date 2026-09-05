@@ -6495,105 +6495,304 @@ class HistoryCollectorTests(unittest.TestCase):
             )
         )
 
-    def test_run_once_publishes_deduplicated_complete_smart_alert_evidence(self) -> None:
+    @staticmethod
+    def _smart_alert_scope(slots: list[dict[str, object]]) -> ScopeSnapshot:
+        return ScopeSnapshot(
+            system_id="test-system",
+            system_label="Test system",
+            enclosure_id="enc-a",
+            enclosure_label="Test shelf",
+            snapshot={
+                "selected_system_id": "test-system",
+                "selected_enclosure_id": "enc-a",
+                "slots": slots,
+            },
+        )
+
+    def _smart_alert_collector(self, slots: list[dict[str, object]]) -> HistoryCollector:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
         store.create_backup = MagicMock(return_value=None)  # type: ignore[method-assign]
-        settings = HistorySettings(
-            sqlite_path=str(temp_dir / "history.db"),
-            backup_dir=str(temp_dir / "backups"),
-            poll_interval_seconds=300,
-            failure_backoff_max_seconds=900,
-            startup_grace_seconds=0,
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                poll_interval_seconds=300,
+                failure_backoff_max_seconds=900,
+                startup_grace_seconds=0,
+            ),
+            store,
         )
-        collector = HistoryCollector(settings, store)
-        live_slots = [
-            {
-                "slot": 0,
-                "present": True,
-                "serial": "DISK-A",
-                "logical_unit_id": "0x5000cca000000001",
-                "device_name": "da0",
-                "state": "healthy",
-            },
-            {
-                "slot": 1,
-                "present": True,
-                "serial": "DISK-B",
-                "gptid": "gptid/disk-b",
-                "persistent_id_label": "GPTID",
-                "device_name": "da1",
-                "state": "healthy",
-            },
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._smart_alert_scope(slots)]
+        )
+        return collector
+
+    def _run_smart_alert_pass(
+        self,
+        collector: HistoryCollector,
+        summaries: dict[int, dict[str, object]],
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        collector._fetch_smart_summaries = AsyncMock(return_value=summaries)  # type: ignore[method-assign]
+        with patch("history_service.collector.utcnow", return_value=observed_at):
+            asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+        return collector.status()
+
+    def test_temperature_only_complete_pass_preserves_failure_evidence(self) -> None:
+        slots = [{"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"}]
+        collector = self._smart_alert_collector(slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        second_at = first_at + timedelta(minutes=5)
+
+        initial = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 61}},
+            first_at,
+        )
+        updated = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "temperature_c": 42}},
+            second_at,
+        )
+
+        self.assertEqual(initial["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(updated["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(updated["last_max_temperature_celsius"], 42)
+        self.assertEqual(updated["last_smart_failure_evidence_at"], isoformat_utc(first_at))
+        self.assertEqual(updated["last_temperature_evidence_at"], isoformat_utc(second_at))
+
+    def test_health_only_complete_pass_preserves_temperature_evidence(self) -> None:
+        slots = [{"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"}]
+        collector = self._smart_alert_collector(slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        second_at = first_at + timedelta(minutes=5)
+
+        self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 61}},
+            first_at,
+        )
+        updated = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "smart_health_status": "PASSED"}},
+            second_at,
+        )
+
+        self.assertEqual(updated["last_smart_failure_evidence_disks"], 0)
+        self.assertEqual(updated["last_max_temperature_celsius"], 61)
+        self.assertEqual(updated["last_smart_failure_evidence_at"], isoformat_utc(second_at))
+        self.assertEqual(updated["last_temperature_evidence_at"], isoformat_utc(first_at))
+
+    def test_partial_health_pass_recovers_only_after_every_disk_has_health_evidence(self) -> None:
+        slots = [
+            {"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"},
+            {"slot": 1, "present": True, "serial": "DISK-B", "state": "healthy"},
         ]
-        duplicate_view_slot = {
+        collector = self._smart_alert_collector(slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 50},
+                1: {"available": True, "smart_health_status": "PASSED", "temperature_c": 40},
+            },
+            first_at,
+        )
+
+        partial = self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "PASSED", "temperature_c": 35},
+                1: {"available": False, "temperature_c": 34},
+            },
+            first_at + timedelta(minutes=5),
+        )
+        recovered = self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "PASSED"},
+                1: {"available": True, "predictive_errors": 0},
+            },
+            first_at + timedelta(minutes=10),
+        )
+
+        self.assertEqual(partial["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(partial["last_max_temperature_celsius"], 35)
+        self.assertEqual(recovered["last_smart_failure_evidence_disks"], 0)
+        self.assertEqual(recovered["last_max_temperature_celsius"], 35)
+
+    def test_partial_temperature_pass_recovers_only_after_every_disk_has_temperature(self) -> None:
+        slots = [
+            {"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"},
+            {"slot": 1, "present": True, "serial": "DISK-B", "state": "healthy"},
+        ]
+        collector = self._smart_alert_collector(slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "PASSED", "temperature_c": 61},
+                1: {"available": True, "smart_health_status": "PASSED", "temperature_c": 45},
+            },
+            first_at,
+        )
+
+        partial = self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 36},
+                1: {"available": True, "smart_health_status": "PASSED"},
+            },
+            first_at + timedelta(minutes=5),
+        )
+        recovered = self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "temperature_c": 36},
+                1: {"available": True, "temperature_c": 40},
+            },
+            first_at + timedelta(minutes=10),
+        )
+
+        self.assertEqual(partial["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(partial["last_max_temperature_celsius"], 61)
+        self.assertEqual(recovered["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(recovered["last_max_temperature_celsius"], 40)
+
+    def test_mixed_sources_complete_each_alert_class_for_the_same_disk(self) -> None:
+        live_slot = {
+            "slot": 0,
+            "present": True,
+            "serial": "DISK-A",
+            "logical_unit_id": "0x5000cca000000001",
+            "state": "healthy",
+        }
+        view_slot = {
             "slot": 7,
             "present": True,
             "serial": "DISK-A",
             "logical_unit_id": "0x5000cca000000001",
-            "device_name": "view-da0",
             "state": "matched",
         }
+        collector = self._smart_alert_collector([live_slot])
         collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
             return_value=[
+                self._smart_alert_scope([live_slot]),
                 ScopeSnapshot(
-                    system_id="archive-core",
-                    system_label="Archive CORE",
-                    enclosure_id="enc-a",
-                    enclosure_label="Front Shelf",
-                    snapshot={
-                        "selected_system_id": "archive-core",
-                        "selected_enclosure_id": "enc-a",
-                        "slots": live_slots,
-                    },
-                ),
-                ScopeSnapshot(
-                    system_id="archive-core",
-                    system_label="Archive CORE",
+                    system_id="test-system",
+                    system_label="Test system",
                     enclosure_id="storage-view:critical",
                     enclosure_label="Critical disks",
                     snapshot={
-                        "selected_system_id": "archive-core",
+                        "selected_system_id": "test-system",
                         "selected_enclosure_id": "storage-view:critical",
-                        "slots": [duplicate_view_slot],
+                        "slots": [view_slot],
                     },
                 ),
             ]
         )
         collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
             side_effect=[
-                {
-                    0: {"available": True, "temperature_c": 61, "smart_health_status": "FAILED"},
-                    1: {"available": True, "temperature_c": 44, "predictive_errors": 2},
-                },
-                {7: {"available": True, "temperature_c": 60, "smart_health_status": "FAILED"}},
+                {0: {"available": True, "smart_health_status": "FAILED"}},
+                {7: {"available": True, "temperature_c": 62}},
             ]
         )
 
-        asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+        with patch(
+            "history_service.collector.utcnow",
+            return_value=datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc),
+        ):
+            asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
 
         status = collector.status()
-        self.assertEqual(status["poll_interval_seconds"], 300)
-        self.assertEqual(status["failure_backoff_max_seconds"], 900)
-        self.assertEqual(status["last_smart_failure_evidence_disks"], 2)
-        self.assertEqual(status["last_max_temperature_celsius"], 61)
-        self.assertIsNotNone(status["last_smart_evidence_at"])
-
-        collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
-            side_effect=[
-                {
-                    0: {"available": True, "power_on_hours": 100},
-                    1: {"available": True, "power_on_hours": 200},
-                },
-                {7: {"available": True, "power_on_hours": 100}},
-            ]
+        self.assertEqual(status["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(status["last_max_temperature_celsius"], 62)
+        self.assertEqual(
+            status["last_smart_failure_evidence_at"],
+            status["last_temperature_evidence_at"],
         )
-        asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
 
-        partial_status = collector.status()
-        self.assertEqual(partial_status["last_smart_failure_evidence_disks"], 2)
-        self.assertEqual(partial_status["last_max_temperature_celsius"], 61)
-        self.assertEqual(partial_status["last_smart_evidence_at"], status["last_smart_evidence_at"])
+    def test_failure_evidence_clears_after_failed_disk_disappears(self) -> None:
+        initial_slots = [
+            {"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"},
+            {"slot": 1, "present": True, "serial": "DISK-B", "state": "fault"},
+        ]
+        collector = self._smart_alert_collector(initial_slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "PASSED", "temperature_c": 35},
+                1: {"available": True, "smart_health_status": "FAILED", "temperature_c": 45},
+            },
+            first_at,
+        )
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._smart_alert_scope([initial_slots[0]])]
+        )
+
+        updated = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "smart_health_status": "PASSED"}},
+            first_at + timedelta(minutes=5),
+        )
+
+        self.assertEqual(updated["last_smart_failure_evidence_disks"], 0)
+        self.assertEqual(updated["last_max_temperature_celsius"], 45)
+
+    def test_max_temperature_drops_after_hottest_disk_disappears(self) -> None:
+        initial_slots = [
+            {"slot": 0, "present": True, "serial": "DISK-A", "state": "healthy"},
+            {"slot": 1, "present": True, "serial": "DISK-B", "state": "healthy"},
+        ]
+        collector = self._smart_alert_collector(initial_slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        self._run_smart_alert_pass(
+            collector,
+            {
+                0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 35},
+                1: {"available": True, "smart_health_status": "PASSED", "temperature_c": 61},
+            },
+            first_at,
+        )
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._smart_alert_scope([initial_slots[0]])]
+        )
+
+        updated = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "temperature_c": 37}},
+            first_at + timedelta(minutes=5),
+        )
+
+        self.assertEqual(updated["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(updated["last_max_temperature_celsius"], 37)
+
+    def test_untrusted_inventory_pass_preserves_both_alert_classes(self) -> None:
+        slots = [{"slot": 0, "present": True, "serial": "DISK-A", "state": "fault"}]
+        collector = self._smart_alert_collector(slots)
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        initial = self._run_smart_alert_pass(
+            collector,
+            {0: {"available": True, "smart_health_status": "FAILED", "temperature_c": 61}},
+            first_at,
+        )
+        degraded_scope = self._smart_alert_scope([])
+        degraded_scope.snapshot["sources"] = {"api": {"enabled": True, "ok": False}}
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._smart_alert_scope([]), degraded_scope]
+        )
+
+        updated = self._run_smart_alert_pass(
+            collector,
+            {},
+            first_at + timedelta(minutes=5),
+        )
+
+        self.assertEqual(updated["last_smart_failure_evidence_disks"], 1)
+        self.assertEqual(updated["last_max_temperature_celsius"], 61)
+        self.assertEqual(updated["last_smart_evidence_at"], initial["last_smart_evidence_at"])
 
     def test_run_once_skips_recent_history_backup_during_slow_collection(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
