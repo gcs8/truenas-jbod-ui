@@ -510,10 +510,7 @@ def create_app() -> FastAPI:
         app,
         build_router(sys.modules[__name__], admin_settings),
     )
-    app.add_exception_handler(
-        SystemNotConfiguredError,
-        system_not_configured_exception_handler,
-    )
+    app.add_exception_handler(SystemNotConfiguredError, system_not_configured_exception_handler)
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
