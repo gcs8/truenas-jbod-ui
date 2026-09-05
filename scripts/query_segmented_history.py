@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -23,15 +24,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metric-name")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--since")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Read the hot database beside a running history service with shared SQLite locking. "
+            "By default the hot database is opened immutable, which never creates -wal/-shm "
+            "sidecars on a quiesced database, and one that already has sidecars is refused."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    try:
+        payload = _query(args)
+    except ValueError as exc:
+        # Operator-facing CLI: a plain message, not a traceback.
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
+def _query(args: argparse.Namespace) -> Any:
     reader = (
-        SegmentedHistoryReader.from_catalog(hot_path=args.hot, catalog_path=args.catalog)
+        SegmentedHistoryReader.from_catalog(
+            hot_path=args.hot,
+            catalog_path=args.catalog,
+            quiesced_hot=not args.live,
+        )
         if args.catalog is not None
-        else SegmentedHistoryReader(hot_path=args.hot, segment_paths=args.segment)
+        else SegmentedHistoryReader(
+            hot_path=args.hot,
+            segment_paths=args.segment,
+            quiesced_hot=not args.live,
+        )
     )
     payload = (
         reader.list_raw_metric_samples(
@@ -60,8 +89,7 @@ def main() -> int:
             since=args.since,
         )
     )
-    print(json.dumps(payload, sort_keys=True))
-    return 0
+    return payload
 
 
 if __name__ == "__main__":

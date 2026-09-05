@@ -216,6 +216,34 @@ class SegmentSealerCliTests(unittest.TestCase):
             self.assertIn("sidecar", result.stderr)
             self.assertFalse((output_directory / "segment-0001.sqlite3").exists())
 
+    def test_copy_and_prune_of_a_service_wal_hot_creates_no_source_sidecars(self) -> None:
+        # The service leaves the hot database with a WAL header. A plain mode=ro
+        # open of that quiesced file creates -wal/-shm that survive close, and the
+        # next sidecar preflight refuses the source (issue #278).
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            self._create_source_database(source)
+            connection = sqlite3.connect(source)
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+            finally:
+                connection.close()
+            self.assertEqual(source.read_bytes()[18:20], b"\x02\x02")
+            for suffix in ("-wal", "-shm"):
+                self.assertFalse(Path(f"{source}{suffix}").exists(), suffix)
+
+            counts = segment_sealer._copy_and_prune(
+                source,
+                root / "segment.sqlite3",
+                "2025-01-02T00:00:00+00:00",
+            )
+
+            self.assertEqual(counts["slot_events"], 1)
+            for suffix in ("-wal", "-shm", "-journal"):
+                self.assertFalse(Path(f"{source}{suffix}").exists(), suffix)
+            segment_sealer._require_regular_source(source)
+
     def test_cli_seals_history_before_cutoff_without_changing_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

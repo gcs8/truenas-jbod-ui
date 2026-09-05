@@ -1037,6 +1037,33 @@ class SegmentedHistoryMigrationCliTests(unittest.TestCase):
                     "2025-01-01T00:00:00+00:00",
                 )
 
+    def test_stage_hot_replacement_of_a_service_wal_hot_creates_no_source_sidecars(self) -> None:
+        # The service leaves the hot database with a WAL header. A plain mode=ro
+        # open of that quiesced file creates -wal/-shm that survive close
+        # (issue #278). Needs POSIX (fchown); CI is authoritative.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            self._create_source_database(source)
+            connection = sqlite3.connect(source)
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+            finally:
+                connection.close()
+            self.assertEqual(source.read_bytes()[18:20], b"\x02\x02")
+            for suffix in ("-wal", "-shm"):
+                self.assertFalse(Path(f"{source}{suffix}").exists(), suffix)
+
+            staged = segment_migration._stage_hot_replacement(source, "2025-01-02T00:00:00+00:00")
+
+            try:
+                self.assertTrue(staged.is_file())
+                for suffix in ("-wal", "-shm", "-journal"):
+                    self.assertFalse(Path(f"{source}{suffix}").exists(), suffix)
+                segment_sealer._require_regular_source(source)
+            finally:
+                staged.unlink()
+
     def test_apply_migrates_pre_cutoff_history_into_cataloged_segment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
