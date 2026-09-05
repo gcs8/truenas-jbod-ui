@@ -112,7 +112,7 @@
   "docs/ADMIN_TRUST_BOUNDARY.md": {
     "findings": {
       "internal_hostname": {
-        "sha256:da0ebffc9bc0d33883db00fa26bab2c33603ca42fa29dfd0a95f99db73e53bb6": 1
+        "sha256:b8b6c63ef03f51a17813367f717da3c85425ada200d5c34af7282fa344b5038b": 2
       }
     },
     "reason": "Reviewed public documentation example; exact detector counts are pinned."
@@ -402,6 +402,22 @@
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
+  "tests/fixtures/platform_parity/scale_offset_1based_aes.txt": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:ef5b1cd564ede8c53702b904121868f2f8a0ca4aa6545d9900ed7c7b306c3d48": 8
+      }
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/fixtures/platform_parity/scale_offset_1based_join.txt": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:ef5b1cd564ede8c53702b904121868f2f8a0ca4aa6545d9900ed7c7b306c3d48": 8
+      }
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
   "tests/fixtures/platform_parity/scale_sg26_aes.txt": {
     "findings": {
       "sas_wwn_identifier": {
@@ -441,6 +457,14 @@
       }
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
+  "tests/js/admin_editor_flows.test.js": {
+    "findings": {
+      "internal_hostname": {
+        "sha256:70e64122b5b0d900cb7a690f79dac1b61c09be771c8df91fa64e9b6d600e5c21": 1
+      }
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
   "tests/js/mapping_health_accessibility.test.js": {
     "findings": {
@@ -489,10 +513,26 @@
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
+  "tests/test_ci_contract.py": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:94dca96a59cc1f790087567f6388322d487a2015dc4bb939bf081d853de52a6e": 1
+      }
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
   "tests/test_container_contract.py": {
     "findings": {
       "sas_wwn_identifier": {
         "sha256:572dee6fa33b24eaf17e44d8dc6212019c5b3fb15e70c6e8fe6068aa90cb014a": 1
+      }
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_dev_check.py": {
+    "findings": {
+      "local_windows_drive_path": {
+        "sha256:c419e6e9f7c0bcbee070ae11838cacd98e8e04d3532e227222c025b85d05746d": 1
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
@@ -639,7 +679,7 @@
         "sha256:6cb8593861b5a374425ec6c3b1fd75ccb83715cba8df9695ac9bcfa8396bae02": 6
       },
       "sas_wwn_identifier": {
-        "sha256:3af69c52ab86b0ca7caec431df623cf7bea31b0a72383df0e9987c51d6569da4": 11
+        "sha256:950e847264bb19aedf35eae180e0e31c60d206b3c8765ca84a75abd18c851bab": 12
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
