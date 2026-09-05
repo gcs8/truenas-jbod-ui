@@ -49,7 +49,9 @@ POST_PUBLISH_GATES = {
 OWNER_PUBLICATION_TARGETS = {"external wiki", "public demo"}
 VALID_RESULTS = {"pass", "blocked", "n/a"}
 WIKI_DRIFT_REQUIRED_FROM = (0, 22, 3)
+CHANGELOG_COVERAGE_REQUIRED_FROM = (0, 22, 3)
 VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?")
+CHANGELOG_COVERAGE_LINE = re.compile(r"^Changelog coverage: pass \(\d+ PRs\)$", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,7 @@ def validate_release_wrap_text(
     *,
     allow_blocked: bool = False,
     phase: str = "final",
+    require_changelog_coverage: bool = True,
     require_wiki_verification: bool = False,
     wiki_verification: WikiVerificationResult | None = None,
 ) -> list[ValidationIssue]:
@@ -136,6 +139,13 @@ def validate_release_wrap_text(
 
     if "docs/RELEASE_CHECKLIST.md" not in text:
         issues.append(ValidationIssue("release wrap must reference docs/RELEASE_CHECKLIST.md"))
+    if require_changelog_coverage and CHANGELOG_COVERAGE_LINE.search(text) is None:
+        issues.append(
+            ValidationIssue(
+                "release wrap must record the changelog coverage gate as "
+                "'Changelog coverage: pass (<N> PRs)' from scripts/check_release_changelog_coverage.py"
+            )
+        )
 
     rows = parse_checklist_evidence_table(text)
     if not rows:
@@ -218,6 +228,7 @@ def validate_release_wrap_path(
     *,
     allow_blocked: bool = False,
     phase: str = "final",
+    require_changelog_coverage: bool = True,
     require_wiki_verification: bool = False,
     wiki_verification: WikiVerificationResult | None = None,
 ) -> list[ValidationIssue]:
@@ -227,16 +238,24 @@ def validate_release_wrap_path(
         path.read_text(encoding="utf-8"),
         allow_blocked=allow_blocked,
         phase=phase,
+        require_changelog_coverage=require_changelog_coverage,
         require_wiki_verification=require_wiki_verification,
         wiki_verification=wiki_verification,
     )
 
 
 def wiki_drift_required(version: str) -> bool:
-    match = VERSION_RE.fullmatch(version)
+    match = VERSION_RE.fullmatch(version.removeprefix("v"))
     if match is None:
         raise ValueError("version must use semantic version form X.Y.Z")
     return tuple(int(part) for part in match.groups()) >= WIKI_DRIFT_REQUIRED_FROM
+
+
+def changelog_coverage_required(version: str) -> bool:
+    match = VERSION_RE.fullmatch(version.removeprefix("v"))
+    if match is None:
+        raise ValueError("version must use semantic version form X.Y.Z")
+    return tuple(int(part) for part in match.groups()) >= CHANGELOG_COVERAGE_REQUIRED_FROM
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -269,6 +288,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     version = args.version.removeprefix("v")
     try:
         require_wiki_verification = wiki_drift_required(version)
+        require_changelog_coverage = changelog_coverage_required(version)
     except ValueError as exc:
         print(f"- {exc}")
         return 1
@@ -309,6 +329,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         path,
         allow_blocked=args.allow_blocked,
         phase=args.phase,
+        require_changelog_coverage=require_changelog_coverage,
         require_wiki_verification=require_wiki_verification,
         wiki_verification=wiki_verification,
     )

@@ -78,7 +78,8 @@ them before starting the new images.
   authentication. In the shipped default `ADMIN_AUTH_MODE=network` the main UI
   is read-only: pages, static assets, health, metrics, and read-only API calls
   stay anonymous, and every write -- slot-mapping save and clear, enclosure
-  alias edits, mapping import, and LED locate -- is rejected with `403`. To
+  alias edits, Storage Fabric alias edits, mapping import, LED locate, and the
+  system locator -- is rejected with `403`. To
   keep those controls, set `ADMIN_AUTH_MODE=basic`, set `ADMIN_AUTH_USERNAME`
   and `ADMIN_AUTH_PASSWORD`, and set `APP_PUBLIC_ORIGIN` to the exact origin
   the browser uses. In `basic` mode the main UI refuses to start when
@@ -99,11 +100,13 @@ them before starting the new images.
   a private `/tmp`, all capabilities dropped, and `no-new-privileges`. The
   admin service stays UID `0` for Docker control but runs as `0:${APP_GID}`
   with only `CHOWN` and `FOWNER` added back and without its app-log mount.
-  Before the first start on the new file, run the ownership preflight and then
-  apply it:
-  `sudo python scripts/prepare_nonroot_bind_mounts.py . --uid 10001 --gid 10001`
-  and the same command with `--apply`. Without that step the non-root services
-  cannot write their bind-mounted state (#246).
+  Before the first start on the new file, stop the stack and use the configured
+  app identity for the ownership preflight and apply step:
+  `docker compose down`; `app_uid="${APP_UID:-10001}"`;
+  `app_gid="${APP_GID:-10001}"`;
+  `sudo python scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"`;
+  then repeat the helper command with `--apply`. Without that step the non-root
+  services cannot write their bind-mounted state (#246).
 - Legacy manual slot mappings saved by older releases under the unscoped
   `default:{slot}` and `{enclosure}:{slot}` key shapes are only resolved when
   the deployment has exactly one configured system and exactly one detected
@@ -163,6 +166,12 @@ them before starting the new images.
   (#244).
 - Replaced exception-derived mapping error details with stable public messages
   while preserving the conflict codes and revision fields retries need (#251).
+- Constrained backup restore targets to the approved data roots and rejected
+  unsafe aliases before mutation (#376).
+- Bound ownership migration to verified root descriptors instead of reopening
+  mutable paths during permission repair (#377).
+- Bounded unhandled-error traceback rendering, escaped control-bearing frame
+  metadata, and kept exception values out of logs (#310).
 
 ### Added
 
@@ -180,6 +189,13 @@ them before starting the new images.
   `disk.sync_all` on CORE and SCALE) to the enclosure header behind the main-UI
   write gate, with exact-argument sudo grants and a CORE multipath disk
   replacement runbook (#357).
+- Added guarded disk inventory synchronization controls for supported TrueNAS
+  systems, including immutable target confirmation and convergence polling
+  (#359).
+- Added memory-only in-page Basic sign-in for live-UI writes while keeping
+  anonymous reads and same-origin request boundaries (#358).
+- Added release-time changelog coverage and exact GitHub Wiki byte verification
+  before release-wrap completion (#348).
 
 ### Changed
 
@@ -304,6 +320,63 @@ them before starting the new images.
 - Hid the dedicated Storage Fabric route action from offline snapshots, which do
   not contain a Fabric payload, while keeping the in-page availability notice
   (#271).
+- Bounded drawer candidate construction by the highest rendered bay ID instead
+  of assuming a dense zero-based range (#305).
+- Resolved PATH tools before the platform-aware development checks dispatch them
+  (#306).
+- Cleared enclosure-less sibling mapping rows when a canonical scoped mapping is
+  saved (#307).
+- Checked slot-route bounds against the rendered slot set, including drawer and
+  sparse-layout bay IDs (#308).
+- Joined sysfs device hints to the corresponding merged device-slot bay instead
+  of dropping the association (#309).
+- Dropped hidden or disabled snapshot storage views together with their retained
+  slot selection (#312).
+- Restored diagnostic layer text for aborted-command and device-path faults
+  (#315).
+- Preserved the original QA failure when a later cleanup step also fails (#316).
+- Kept unchanged enclosure selector options mounted across renders, including
+  labels containing quotes (#317).
+- Opened quiesced hot history databases immutably during offline reads (#319).
+- Redacted both configured hostname forms from exports and minted stable aliases
+  for identifiers absent from the known set (#320).
+- Refused admin startup without a valid configured public origin for browser
+  mutations (#321).
+- Published the live read-UI write policy and disabled every blocked write with
+  an operator-readable reason (#322).
+- Accepted enclosure-less legacy mapping imports only under the resolved virtual
+  scope and rejected conflicting physical rewrites (#323).
+- Preflighted plaintext and encryption policy before enabling the full-backup
+  control (#324).
+- Built bootstrap sudoers from saved commands even when the admin editor hides
+  them behind preserve placeholders (#325).
+- Checked lifecycle markers on every history-store connection and preserved
+  atomic backup behavior (#326).
+- Granted the Linux collection probes their exact read-only sudo command shapes
+  (#333).
+- Kept cached SMART and history reads available when live layout resolution is
+  unavailable, with bounded degraded fallbacks (#339).
+- Replaced wildcard SMART and appliance CLI grants with the typed read-only
+  command forms the collectors actually issue (#340).
+- Identified incomplete history staging artifacts without misclassifying valid
+  published segments (#342).
+- Staged host-preparation packages on persistent runtime storage (#343).
+- Rejected explicit unknown system IDs instead of silently selecting the default
+  system (#344).
+- Created fresh SQLite history files with the required shared ownership modes
+  (#345).
+- Translated offset invalid AES descriptors only when bounded evidence proves a
+  consistent noncolliding mapping (#346).
+- Reported orphaned segment temporary files with escaped bounded diagnostics
+  (#349).
+- Exposed same-owner QuantaStor hardware shelves separately while retaining
+  unscoped disks for strong-identity correlation (#351).
+- Scoped SES presence to each descriptor so unrelated evidence cannot mark a bay
+  present (#352).
+- Pruned stale persistent host-preparation packages at startup (#353).
+- Retained trusted disk and topology data when an enclosure query fails (#354).
+- Backfilled CORE multipath association from unambiguous `gmultipath` consumers
+  while rejecting conflicting ZFS GUID folds (#356).
 
 ### Docs
 
@@ -354,6 +427,10 @@ them before starting the new images.
 - Consolidated the wave-two SMART, SES, and SSH command parsing paths behind
   shared helpers while preserving the separate dual-path and slot policies
   (#270).
+- Removed dead setup, parser, and browser leftovers while pinning the derived
+  known-hosts path contract (#318).
+- Added a repository-wide public-text privacy gate and enforced public artifact
+  size headroom in CI (#347).
 
 ## v0.22.2 - 2026-09-01
 

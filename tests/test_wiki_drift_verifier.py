@@ -101,6 +101,8 @@ class WikiDriftVerifierTests(unittest.TestCase):
             "",
             "Validated against `docs/RELEASE_CHECKLIST.md`.",
             "",
+            "Changelog coverage: pass (12 PRs)",
+            "",
             "| Gate | Required | Evidence | Result | N/A Reason |",
             "| --- | --- | --- | --- | --- |",
         ]

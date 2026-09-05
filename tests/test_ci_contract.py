@@ -319,7 +319,7 @@ class CIWorkflowContractTests(unittest.TestCase):
             r"\*\)\s+echo \"Unknown conventional type.*\n\s+exit 0\n\s+;;",
         )
 
-    def test_release_checklist_collects_bounded_branch_metadata_and_publishes_wiki_before_validation(self) -> None:
+    def test_release_checklist_collects_bounded_branch_metadata_and_keeps_wiki_publication_owner_gated(self) -> None:
         checklist = self.read(ROOT / "docs" / "RELEASE_CHECKLIST.md")
         contributing = self.read(ROOT / "CONTRIBUTING.md")
 
@@ -338,10 +338,8 @@ class CIWorkflowContractTests(unittest.TestCase):
             " ".join(contributing.split()),
         )
         checklist_text = " ".join(checklist.split())
-        self.assertLess(
-            checklist_text.index("publish the repo `wiki/` pages"),
-            checklist_text.index("pass the pre-tag validator"),
-        )
+        self.assertIn("No release command may push the wiki automatically", checklist_text)
+        self.assertIn("only its distinct publication row may remain `Blocked`", checklist_text)
 
     def test_dependencies_category_precedes_internal_for_mixed_label_prs(self) -> None:
         config = yaml.safe_load(self.read(ROOT / ".github" / "release.yml"))

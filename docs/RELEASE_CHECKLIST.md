@@ -60,9 +60,10 @@ release URL when published, full `name@sha256` image reference and exact source
 revision when published, pre-update rollback digest, running container image IDs,
 validated private deployment-receipt result, exact Compose project/file/profile/service
 contract, health and restart evidence, rollback result, public demo workflow or Pages URL
-when applicable, the exact `Wiki drift verification: PASS` receipt with its
-repository commit and external wiki commit, and any known deviations from the
-checklist.
+when applicable, the `Changelog coverage: pass (<N> PRs)` line from
+`scripts/check_release_changelog_coverage.py`, the exact `Wiki drift
+verification: PASS` receipt with its repository commit and external wiki
+commit, and any known deviations from the checklist.
 
 Before tagging, run the pre-tag release-wrap validator against the target
 version. This binds the wiki source to the pre-tag `HEAD`:
@@ -408,8 +409,19 @@ python scripts/validate_release_wrap.py "$version" \
 ## Release Notes And Docs
 
 - bump `app/__init__.py` to the release version
-- add the release section to `CHANGELOG.md`
-- refresh any checked-in draft release-notes file if the repo is using one
+- build the bounded repository-wide merged pull request list. Do not date-filter
+  it because a pull request can enter the candidate through an intermediate
+  same-repository branch:
+  `gh pr list -R gcs8/truenas-jbod-ui --state merged --limit 1000 --json number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository > merged-prs.json`
+- run the coverage gate against the previous tag and `## Unreleased`, then fix
+  every missing pull request number before proceeding:
+  `python scripts/check_release_changelog_coverage.py <previous tag> "## Unreleased" --merged-prs-json merged-prs.json`
+- rename `## Unreleased` to `## vX.Y.Z - YYYY-MM-DD`, write three to five
+  `### Highlights` bullets, review every `### Upgrade notes` bullet as an
+  operator would, and rerun the coverage gate against the final header
+- render and retain the release body head:
+  `python scripts/render_release_notes.py "## vX.Y.Z - YYYY-MM-DD" > release-notes.md`
+- record the exact `Changelog coverage: pass (<N> PRs)` line in the release wrap
 - refresh the checked-in release notes file for the target tag, for example
   `docs/RELEASE_NOTES_0.15.0.md`
 - review `README.md` for stale version or milestone wording
@@ -507,7 +519,8 @@ python scripts/validate_release_wrap.py "$version" \
 - read back the public wiki HEAD with `scripts/verify_wiki_drift.py`; require a
   byte-for-byte pass and put its exact repository commit, external wiki commit,
   and file count in the `Docs/wiki/public-demo publication` row
-- create the GitHub release notes from the final changelog section
+- create the GitHub release from generated categories plus the reviewed
+  changelog head: `gh release create <tag> --generate-notes --notes-file release-notes.md`
 - publish the GitHub release page so the `Publish GHCR Image` workflow runs
 - wait for the `Publish GHCR Image` Actions run to finish successfully
 - confirm GHCR has the expected release tags:
