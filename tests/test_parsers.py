@@ -1326,6 +1326,46 @@ ses0:
 
         self.assertEqual(slot.device_names, ["da5", "da29"])
 
+    def test_repeated_device_name_records_keep_bounded_incremental_state(self) -> None:
+        records = "\n".join(
+            f"""  Element {element}, Type: Array Device Slot
+    Status: OK
+    Description: Slot00
+    Device Names: da{element}"""
+            for element in range(256)
+        )
+
+        slot = parse_sesutil_map(f"ses0:\n{records}")[0].slots[0]
+
+        self.assertEqual(len(slot.device_names), parsers.MAX_SES_DEVICE_NAMES_PER_SLOT)
+        self.assertEqual(len(slot._device_name_keys), parsers.MAX_SES_DEVICE_NAMES_PER_SLOT)
+        self.assertEqual(slot._device_name_keys, set(slot.device_names))
+
+    def test_ses_element_count_is_rejected_before_parsing(self) -> None:
+        records = "\n".join(
+            f"  Element {element}, Type: Array Device Slot"
+            for element in range(parsers.MAX_SES_ELEMENTS + 1)
+        )
+
+        self.assertEqual(parse_sesutil_map(f"ses0:\n{records}"), [])
+
+    def test_many_unique_unmapped_elements_are_indexed_by_stable_key(self) -> None:
+        element_count = 512
+        records = "\n".join(
+            f"""  Element {element}, Type: Array Device Slot
+    Description: Mystery{element}"""
+            for element in range(element_count)
+        )
+
+        enclosure = parse_sesutil_map(f"ses0:\n{records}")[0]
+
+        self.assertEqual(len(enclosure.unmapped_slots), element_count)
+        self.assertEqual(len(enclosure._unmapped_slot_index), element_count)
+        self.assertEqual(
+            set(enclosure._unmapped_slot_index),
+            {("/dev/ses0", element) for element in range(element_count)},
+        )
+
     def test_parse_sg_ses_aes_duplicate_slot_keeps_first_nonempty_path_details(self) -> None:
         output = """
   ExampleCo  DualPathShelf  0001

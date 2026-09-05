@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import ipaddress
 import json
 import logging
@@ -392,6 +393,35 @@ def _slot_grid_position(
 
 
 ENCLOSURE_OPTION_ID_TAIL_MIN_LENGTH = 4
+# Appliance-provided identifiers are normalized to this small fixed ceiling
+# before selector-label disambiguation. Long values retain a stable digest so
+# distinct identifiers cannot collapse merely because their visible tails match.
+MAX_NORMALIZED_ENCLOSURE_IDENTIFIER_LENGTH = 128
+
+
+def _normalize_enclosure_identifier(value: Any) -> str:
+    identifier = str(value).strip()
+    if len(identifier) <= MAX_NORMALIZED_ENCLOSURE_IDENTIFIER_LENGTH:
+        return identifier
+    digest = hashlib.sha256(identifier.encode("utf-8")).hexdigest()[:16]
+    tail_length = MAX_NORMALIZED_ENCLOSURE_IDENTIFIER_LENGTH - len(digest) - 1
+    return f"{identifier[-tail_length:]}~{digest}"
+
+
+def _distinguishing_tail_length(identifiers: set[str]) -> int:
+    """Return one suffix length that distinguishes all bounded identifiers."""
+    if len(identifiers) < 2:
+        return ENCLOSURE_OPTION_ID_TAIL_MIN_LENGTH
+    reversed_ids = sorted(identifier[::-1] for identifier in identifiers)
+    common = 0
+    for left, right in zip(reversed_ids, reversed_ids[1:]):
+        shared = 0
+        for left_char, right_char in zip(left, right):
+            if left_char != right_char:
+                break
+            shared += 1
+        common = max(common, shared)
+    return max(ENCLOSURE_OPTION_ID_TAIL_MIN_LENGTH, common + 1)
 
 
 def disambiguate_enclosure_option_labels(options: list[EnclosureOption]) -> list[EnclosureOption]:
@@ -407,14 +437,18 @@ def disambiguate_enclosure_option_labels(options: list[EnclosureOption]) -> list
     """
     if len(options) < 2:
         return options
-    base_ids = [str(option.id).split("::", 1)[0] for option in options]
+    base_ids = [
+        _normalize_enclosure_identifier(str(option.id).split("::", 1)[0])
+        for option in options
+    ]
     label_counts = Counter(option.label for option in options)
     if all(count == 1 for count in label_counts.values()):
         return options
-    tail_length = ENCLOSURE_OPTION_ID_TAIL_MIN_LENGTH
-    longest = max(len(base_id) for base_id in base_ids)
-    while tail_length < longest and len({base_id[-tail_length:] for base_id in set(base_ids)}) < len(set(base_ids)):
-        tail_length += 1
+    distinct_base_ids = set(base_ids)
+    tail_length = min(
+        _distinguishing_tail_length(distinct_base_ids),
+        max(len(base_id) for base_id in distinct_base_ids),
+    )
     resolved: list[EnclosureOption] = []
     for option, base_id in zip(options, base_ids):
         if label_counts[option.label] > 1 and not option.alias:

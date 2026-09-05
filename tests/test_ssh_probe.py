@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import paramiko
 
 from app.config import ENV_OVERRIDES, SSHConfig, get_settings
+from app.services import ssh_probe
 from app.services.ssh_probe import AutoPinHostKeyPolicy, SSHCommandResult, SSHProbe, redact_ssh_command
 
 
@@ -515,6 +516,30 @@ class SSHProbeTests(unittest.TestCase):
             probe._run_commands_sync(["uptime"])
 
         self.assertIn("connections=1", "\n".join(logs.output))
+
+    def test_single_command_rejects_oversized_stdout_with_a_bounded_read(self) -> None:
+        client = MagicMock()
+        stdin = MagicMock()
+        stdout = MagicMock()
+        stderr = MagicMock()
+        stdout.read.return_value = b"x" * (ssh_probe.MAX_SSH_OUTPUT_BYTES + 1)
+        stderr.read.return_value = b""
+        client.exec_command.return_value = stdin, stdout, stderr
+        probe = SSHProbe(
+            SSHConfig(
+                enabled=True,
+                host="synthetic.example.test",
+                user="operator",
+                strict_host_key_checking=False,
+            )
+        )
+
+        result = probe._run_single_command(client, "synthetic command")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("output exceeded", result.stderr)
+        stdout.read.assert_called_once_with(ssh_probe.MAX_SSH_OUTPUT_BYTES + 1)
 
     @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_run_planned_commands_reuses_one_connection_for_dynamic_batches(

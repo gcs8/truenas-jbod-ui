@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import EnclosureOption, InventorySnapshot, SasFabricAlias
+from app.services import inventory
 from app.services.inventory import (
     InventoryService,
     disambiguate_enclosure_option_labels,
@@ -78,6 +79,25 @@ class DisambiguateEnclosureOptionLabelsTests(unittest.TestCase):
         ]
         labels = [option.label for option in disambiguate_enclosure_option_labels(options)]
         self.assertEqual(labels, ["Front 24 Bay [a1234]", "Front 24 Bay [b1234]"])
+
+    def test_long_common_suffixes_use_bounded_normalized_identifiers(self) -> None:
+        common_suffix = "a" * 20_000
+        options = [
+            _option(f"first-{common_suffix}", "Synthetic Shelf"),
+            _option(f"second-{common_suffix}", "Synthetic Shelf"),
+        ]
+
+        labels = [option.label for option in disambiguate_enclosure_option_labels(options)]
+
+        self.assertEqual(len(set(labels)), 2)
+        self.assertTrue(all(label.startswith("Synthetic Shelf [") for label in labels))
+        self.assertTrue(
+            all(
+                len(label.removeprefix("Synthetic Shelf [").removesuffix("]"))
+                <= inventory.MAX_NORMALIZED_ENCLOSURE_IDENTIFIER_LENGTH
+                for label in labels
+            )
+        )
 
     def test_pass_is_idempotent_and_keeps_ids_and_order(self) -> None:
         options = [

@@ -45,10 +45,16 @@ SES_EVIDENCE_SOURCE_STRENGTH = {
     "enclosure_sysfs": 50,
 }
 # Profiles support at most 4096 bays, and SES may report two descriptors for a
-# dual-path bay. Reject the entire untrusted page rather than return partial
-# geometry when either bounded parser input is exceeded.
-MAX_SES_AES_DESCRIPTORS = 2 * 4096
-MAX_SES_AES_OUTPUT_CHARS = 4 * 1024 * 1024
+# dual-path bay. Reject untrusted pages rather than return partial geometry when
+# the 8192-element or 4 MiB text ceiling is exceeded. A physical bay needs only
+# a small handful of path aliases; retain at most 16 names per slot.
+MAX_SES_ELEMENTS = 2 * 4096
+MAX_SES_OUTPUT_CHARS = 4 * 1024 * 1024
+MAX_SES_DEVICE_NAMES_PER_SLOT = 16
+MAX_SES_DEVICE_NAME_LENGTH = 128
+# Backward-compatible names for the AES parser's original bounds.
+MAX_SES_AES_DESCRIPTORS = MAX_SES_ELEMENTS
+MAX_SES_AES_OUTPUT_CHARS = MAX_SES_OUTPUT_CHARS
 
 
 @dataclass(slots=True)
@@ -133,6 +139,8 @@ class SESMapSlot:
     reported_slot_number: int | None = None
     slot_number_degraded: bool = False
     device_names: list[str] = field(default_factory=list)
+    _device_name_keys: set[str] = field(default_factory=set, repr=False, compare=False)
+    _device_name_index_ready: bool = field(default=False, repr=False, compare=False)
     identify_active: bool = False
     serial: str | None = None
     model: str | None = None
@@ -171,6 +179,12 @@ class SESMapEnclosure:
     slot_layout: list[list[int | None]] | None = None
     slots: dict[int, SESMapSlot] = field(default_factory=dict)
     unmapped_slots: list[SESMapSlot] = field(default_factory=list)
+    _unmapped_slot_index: dict[tuple[str, int], SESMapSlot] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    _unmapped_slot_index_ready: bool = field(default=False, repr=False, compare=False)
     # Kernel enclosure-driver bindings that found no bay keyed by a device slot
     # number, counted by contributing SES path (issue #276).
     unplaced_sysfs_bindings_by_ses_device: dict[str, int] = field(default_factory=dict)
@@ -684,6 +698,60 @@ def _device_name_sort_key(name: str) -> tuple[str, str]:
     return natural_name, name
 
 
+def _bounded_ses_device_names(names: Iterator[str] | list[str]) -> list[str]:
+    selected: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if not name or len(name) > MAX_SES_DEVICE_NAME_LENGTH or name in seen:
+            continue
+        if len(selected) >= MAX_SES_DEVICE_NAMES_PER_SLOT:
+            if _device_name_sort_key(name) >= _device_name_sort_key(selected[-1]):
+                continue
+            seen.remove(selected.pop())
+        selected.append(name)
+        seen.add(name)
+        selected.sort(key=_device_name_sort_key)
+    return selected
+
+
+def _replace_ses_device_names(slot: SESMapSlot, names: Iterator[str] | list[str]) -> None:
+    selected = _bounded_ses_device_names(names)
+    slot.device_names = selected
+    slot._device_name_keys = set(selected)
+    slot._device_name_index_ready = True
+
+
+def _ensure_ses_device_name_index(slot: SESMapSlot) -> None:
+    if slot._device_name_index_ready:
+        return
+    _replace_ses_device_names(slot, slot.device_names)
+
+
+def _add_ses_device_name(slot: SESMapSlot, name: str) -> None:
+    _ensure_ses_device_name_index(slot)
+    if not name or name in slot._device_name_keys:
+        return
+    if len(slot.device_names) >= MAX_SES_DEVICE_NAMES_PER_SLOT:
+        if _device_name_sort_key(name) >= _device_name_sort_key(slot.device_names[-1]):
+            return
+        removed = slot.device_names.pop()
+        slot._device_name_keys.remove(removed)
+    slot.device_names.append(name)
+    slot._device_name_keys.add(name)
+    slot.device_names.sort(key=_device_name_sort_key)
+
+
+def _ses_input_exceeds_bounds(output: str, element_pattern: str) -> bool:
+    if len(output) > MAX_SES_OUTPUT_CHARS:
+        return True
+    element_count = 0
+    for _match in re.finditer(element_pattern, output, re.MULTILINE | re.IGNORECASE):
+        element_count += 1
+        if element_count > MAX_SES_ELEMENTS:
+            return True
+    return False
+
+
 def _is_ses_device_slot_type(value: str | None) -> bool:
     element_type = normalize_text(value)
     return bool(
@@ -709,6 +777,8 @@ def _apply_ses_presence_evidence(
         slot.presence_conflict = conflict
         if not present and incoming_strength > _ses_evidence_strength(slot.device_names_source):
             slot.device_names = []
+            slot._device_name_keys.clear()
+            slot._device_name_index_ready = True
             slot.device_names_source = None
         return
     if incoming_strength < existing_strength:
@@ -735,7 +805,7 @@ def _apply_ses_device_name_evidence(
     device_names: list[str],
     source: str | None,
 ) -> None:
-    names = list(dict.fromkeys(name for name in device_names if name))
+    names = _bounded_ses_device_names(iter(device_names))
     if not names:
         return
     existing_strength = _ses_evidence_strength(slot.device_names_source)
@@ -743,14 +813,12 @@ def _apply_ses_device_name_evidence(
     if slot.present is False and _ses_evidence_strength(slot.presence_source) > incoming_strength:
         return
     if not slot.device_names or incoming_strength > existing_strength:
-        slot.device_names = names
+        _replace_ses_device_names(slot, names)
         slot.device_names_source = source
         return
     if incoming_strength == existing_strength:
-        slot.device_names = sorted(
-            dict.fromkeys(slot.device_names + names),
-            key=_device_name_sort_key,
-        )
+        for name in names:
+            _add_ses_device_name(slot, name)
         slot.device_names_source = slot.device_names_source or source
 
 
@@ -877,6 +945,43 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
 
 
 
+def _unmapped_slot_key(
+    enclosure: SESMapEnclosure,
+    slot: SESMapSlot,
+) -> tuple[str, int] | None:
+    if slot.element_id is None:
+        return None
+    return slot.ses_device or enclosure.ses_device or "", slot.element_id
+
+
+def _ensure_unmapped_slot_index(enclosure: SESMapEnclosure) -> None:
+    if enclosure._unmapped_slot_index_ready:
+        return
+    for slot in enclosure.unmapped_slots:
+        key = _unmapped_slot_key(enclosure, slot)
+        if key is not None:
+            enclosure._unmapped_slot_index.setdefault(key, slot)
+    enclosure._unmapped_slot_index_ready = True
+
+
+def _record_unmapped_ses_slot(
+    enclosure: SESMapEnclosure,
+    slot: SESMapSlot,
+) -> SESMapSlot:
+    key = _unmapped_slot_key(enclosure, slot)
+    if key is None:
+        return slot
+    _ensure_unmapped_slot_index(enclosure)
+    existing = enclosure._unmapped_slot_index.get(key)
+    if existing is None:
+        enclosure.unmapped_slots.append(slot)
+        enclosure._unmapped_slot_index[key] = slot
+        return slot
+    if existing is not slot:
+        _merge_ses_slot_evidence(existing, slot)
+    return existing
+
+
 def _demote_repeated_ses_slot_number(
     enclosure: SESMapEnclosure,
     slot: SESMapSlot,
@@ -897,21 +1002,7 @@ def _demote_repeated_ses_slot_number(
             "ses_slot_number": None,
         }
     ]
-    existing_unmapped = next(
-        (
-            candidate
-            for candidate in enclosure.unmapped_slots
-            if candidate.element_id == slot.element_id
-            and candidate.ses_device == slot.ses_device
-        ),
-        None,
-    )
-    if existing_unmapped is None:
-        enclosure.unmapped_slots.append(slot)
-        return slot
-    if existing_unmapped is not slot:
-        _merge_ses_slot_evidence(existing_unmapped, slot)
-    return existing_unmapped
+    return _record_unmapped_ses_slot(enclosure, slot)
 
 
 def _stage_ses_device_slot_evidence(
@@ -1082,20 +1173,7 @@ def _record_ses_slot(
                 }
             ],
         )
-        existing_unmapped = next(
-            (
-                candidate
-                for candidate in enclosure.unmapped_slots
-                if candidate.element_id == slot.element_id
-            ),
-            None,
-        )
-        if existing_unmapped is None:
-            enclosure.unmapped_slots.append(slot)
-            return slot
-        if existing_unmapped is not slot:
-            _merge_ses_slot_evidence(existing_unmapped, slot)
-        return existing_unmapped
+        return _record_unmapped_ses_slot(enclosure, slot)
 
     slot.slot_number = reported_slot_number
     slot.slot_number_source = source
@@ -1146,6 +1224,9 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
     This format is the most useful one we have seen on TrueNAS CORE for JBOD slot
     mapping because it includes both `Description: SlotNN` and `Device Names: daX`.
     """
+
+    if _ses_input_exceeds_bounds(output, r"^\s*Element\s+\d+,\s+Type:"):
+        return []
 
     enclosures: list[SESMapEnclosure] = []
     current_enclosure: SESMapEnclosure | None = None
@@ -1240,7 +1321,10 @@ def parse_sesutil_map(output: str) -> list[SESMapEnclosure]:
             continue
 
         if stripped.startswith("Device Names:"):
-            names = [item.strip() for item in stripped.split(":", 1)[1].split(",")]
+            names = [
+                item.strip()
+                for item in stripped.split(":", 1)[1].split(",", MAX_SES_DEVICE_NAMES_PER_SLOT)
+            ]
             descriptor_device_names = [
                 item for item in names if item and not item.startswith("pass")
             ]
@@ -1279,6 +1363,12 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
     hints, so we use it as a fallback parser and as a metadata overlay when both
     commands are available.
     """
+
+    if _ses_input_exceeds_bounds(
+        output,
+        r"^\s*(?:slot|bay|element)\D{0,4}\d{1,3}(?:\s|$)",
+    ):
+        return []
 
     enclosures: list[SESMapEnclosure] = []
     current_enclosure: SESMapEnclosure | None = None
@@ -1371,7 +1461,7 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     prettier enclosure APIs available.
     """
 
-    if len(output) > MAX_SES_AES_OUTPUT_CHARS:
+    if _ses_input_exceeds_bounds(output, r"^\s*Element index:\s*\d+"):
         return None
 
     ses_device = _extract_sg_ses_device(command)
@@ -1540,6 +1630,9 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
     currently asserted on a given slot after a refresh.
     """
 
+    if _ses_input_exceeds_bounds(output, r"^\s*Element\s+\d+\s+descriptor:"):
+        return None
+
     ses_device = _extract_sg_ses_device(command)
     enclosure = SESMapEnclosure(
         ses_device=ses_device,
@@ -1629,6 +1722,12 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     device slot number, and SAS addresses in one SG3 report. We still merge it
     through the same SESMapEnclosure model so AES/EC-only hosts keep working.
     """
+
+    if _ses_input_exceeds_bounds(
+        output,
+        r"^\s*(?:.*?)?\[-?\d+,-?\d+\]\s+Element type:",
+    ):
+        return None
 
     ses_device = _extract_sg_ses_device(command)
     enclosure = SESMapEnclosure(
@@ -1924,24 +2023,16 @@ def _infer_scale_enclosure_profile(
 def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclosure]:
     merged: dict[str, SESMapEnclosure] = {}
     slot_evidence: dict[str, list[SESMapSlot]] = {}
+    enclosure_ids: dict[str, str] = {}
+    ses_device_keys: dict[str, str] = {}
+    unkeyed_names: dict[str, str] = {}
 
     for enclosure in enclosures:
-        key: str | None = None
-        if enclosure.enclosure_id:
-            for candidate_key, candidate in merged.items():
-                if candidate.enclosure_id == enclosure.enclosure_id:
-                    key = candidate_key
-                    break
+        key = enclosure_ids.get(enclosure.enclosure_id) if enclosure.enclosure_id else None
         if key is None and enclosure.ses_device:
-            for candidate_key, candidate in merged.items():
-                if candidate.ses_device == enclosure.ses_device:
-                    key = candidate_key
-                    break
+            key = ses_device_keys.get(enclosure.ses_device)
         if key is None and enclosure.enclosure_name and not enclosure.enclosure_id:
-            for candidate_key, candidate in merged.items():
-                if candidate.enclosure_name == enclosure.enclosure_name and not candidate.enclosure_id:
-                    key = candidate_key
-                    break
+            key = unkeyed_names.get(enclosure.enclosure_name)
         if key is None:
             key = enclosure.enclosure_id or enclosure.ses_device or enclosure.enclosure_name or f"unknown-{len(merged)}"
             ses_devices = list(enclosure.ses_devices)
@@ -1976,22 +2067,16 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
         target.layout_rows = target.layout_rows or enclosure.layout_rows
         target.layout_columns = target.layout_columns or enclosure.layout_columns
         target.slot_layout = target.slot_layout or enclosure.slot_layout
+        if target.enclosure_id:
+            enclosure_ids.setdefault(target.enclosure_id, key)
+        if target.ses_device:
+            ses_device_keys.setdefault(target.ses_device, key)
+        if target.enclosure_name and not target.enclosure_id:
+            unkeyed_names.setdefault(target.enclosure_name, key)
         slot_evidence[key].extend(enclosure.slots.values())
 
         for slot in enclosure.unmapped_slots:
-            existing_unmapped = next(
-                (
-                    candidate
-                    for candidate in target.unmapped_slots
-                    if candidate.element_id == slot.element_id
-                    and candidate.ses_device == slot.ses_device
-                ),
-                None,
-            )
-            if existing_unmapped is None:
-                target.unmapped_slots.append(slot)
-            else:
-                _merge_ses_slot_evidence(existing_unmapped, slot)
+            _record_unmapped_ses_slot(target, slot)
 
     for key, target in merged.items():
         slots_by_element: list[SESMapSlot] = []
@@ -2283,8 +2368,8 @@ def _merge_candidate_device_names(
     incoming_names = incoming.get("device_names")
     incoming_names = incoming_names if isinstance(incoming_names, list) else []
     incoming_hint = normalize_device_name(incoming.get("device_hint"))
-    names = list(
-        dict.fromkeys(
+    names = _bounded_ses_device_names(
+        iter(
             [name for name in incoming_names if isinstance(name, str) and name]
             + ([incoming_hint] if incoming_hint else [])
         )
@@ -2302,6 +2387,7 @@ def _merge_candidate_device_names(
     existing_hint = normalize_device_name(target.get("device_hint"))
     if existing_hint and existing_hint not in existing_names:
         existing_names = [*existing_names, existing_hint]
+    existing_names = _bounded_ses_device_names(iter(existing_names))
     existing_source = normalize_text(target.get("device_names_source"))
     existing_strength = _ses_evidence_strength(existing_source)
     if not existing_names or incoming_strength > existing_strength:
@@ -2309,10 +2395,7 @@ def _merge_candidate_device_names(
         target["device_names_source"] = incoming_source
         target["device_hint"] = names[0]
     elif incoming_strength == existing_strength:
-        merged_names = sorted(
-            dict.fromkeys(existing_names + names),
-            key=_device_name_sort_key,
-        )
+        merged_names = _bounded_ses_device_names(iter(existing_names + names))
         target["device_names"] = merged_names
         target["device_names_source"] = existing_source or incoming_source
         target["device_hint"] = merged_names[0]
