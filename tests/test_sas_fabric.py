@@ -22,6 +22,7 @@ from app.services.inventory import InventoryService
 from app.services.parsers import canonicalize_ssh_command
 from app.services.sas_diagnostics.decoder import (
     MAX_DIAGNOSTIC_COLLECTION_ITEMS,
+    MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH,
     MAX_DIAGNOSTIC_TEXT_LENGTH,
     bound_diagnostic_value,
 )
@@ -903,6 +904,35 @@ Jun  7 10:39:05 truenas mpr0: Controller reported scsi ioc terminated tgt 12 SMI
         self.assertLessEqual(len(record["cam_error_code_raw"]), MAX_DIAGNOSTIC_TEXT_LENGTH)
         self.assertTrue(record["cam_error_code_raw"].endswith("..."))
         self.assertIn("too long to decode", record["decoder_note"])
+
+    def test_oversized_cam_target_tokens_are_not_converted_and_keep_bounded_evidence(self) -> None:
+        oversized_target = "9" * 5_000
+        bounded_target = f"{'9' * (MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH - 3)}..."
+
+        for line in (
+            f"(da1:mpr0:0:{oversized_target}:0): Retrying command",
+            f"mpr0: Controller reported scsi ioc terminated tgt {oversized_target} SMID 1 loginfo 31120302",
+        ):
+            with self.subTest(source=line[:20]):
+                events = parse_mpr_dmesg_events(line)
+                controller = events["by_controller"]["mpr0"]
+                record = controller["event_table"]["rows"][0]
+
+                self.assertEqual(controller["targets"], [bounded_target])
+                self.assertEqual(record["target"], bounded_target)
+                self.assertIn(f"mpr0:{bounded_target}", events["by_controller_target"])
+
+    def test_aggregated_finding_severity_is_monotonic_across_event_order(self) -> None:
+        info_event = "(da2:mpr0:0:10:0): SCSI sense: NO SENSE asc:7f,7e (Unknown hardware fault)"
+        error_event = "(da2:mpr0:0:10:0): SCSI sense: HARDWARE ERROR asc:7f,7e (Unknown hardware fault)"
+
+        for rows in ((info_event, error_event), (error_event, info_event)):
+            with self.subTest(first=rows[0].split("SCSI sense: ", 1)[1].split(" asc:", 1)[0]):
+                events = parse_mpr_dmesg_events("\n".join(rows))
+                finding = events["by_controller"]["mpr0"]["top_findings"][0]
+
+                self.assertEqual(finding["count"], 2)
+                self.assertEqual(finding["severity"], "error")
 
     def test_unknown_hardware_error_sense_keeps_parser_error_severity(self) -> None:
         events = parse_mpr_dmesg_events(

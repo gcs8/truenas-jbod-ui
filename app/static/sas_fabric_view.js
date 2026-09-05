@@ -1999,12 +1999,13 @@
     return list(diagnostics?.recent_events);
   }
 
-  function diagnosticTableKey(diagnostics, scopeLabel = "") {
+  function diagnosticTableKey(diagnostics, scopeLabel = "", panelInstanceIdentity = "") {
     const rows = diagnosticEventRows(diagnostics);
     const first = rows[0]?.event_id || rows[0]?.id || "first";
     const last = rows[rows.length - 1]?.event_id || rows[rows.length - 1]?.id || "last";
     const scope = [
       scopeLabel,
+      panelInstanceIdentity,
       list(diagnostics?.devices),
       list(diagnostics?.targets),
       diagnostics?.event_count,
@@ -2339,12 +2340,12 @@
     return true;
   }
 
-  function renderDiagnosticEvidencePanel(diagnostics, scopeLabel = "") {
+  function renderDiagnosticEvidencePanel(diagnostics, scopeLabel = "", panelInstanceIdentity = "") {
     if (!diagnostics || typeof diagnostics !== "object" || !Number(diagnostics.event_count || 0)) {
       return "";
     }
     const table = diagnostics.event_table || {};
-    const tableKey = diagnosticTableKey(diagnostics, scopeLabel);
+    const tableKey = diagnosticTableKey(diagnostics, scopeLabel, panelInstanceIdentity);
     const tableState = diagnosticTableState(tableKey);
     const presentation = diagnosticTablePresentation(diagnostics, tableState, tableKey);
     const eventRows = presentation.eventRows;
@@ -2624,7 +2625,7 @@
       stateName,
       mprDevice?.member_device_name || seed.device_name,
     ].filter(Boolean).join(" ");
-    return renderDiagnosticEvidencePanel(diagnostics, scopeLabel);
+    return renderDiagnosticEvidencePanel(diagnostics, scopeLabel, seed.expanderNode?.id || "");
   }
 
   function renderDiskPathBranch(seed, trace, fabric, slotNumber, options = {}) {

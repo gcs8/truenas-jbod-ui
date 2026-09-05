@@ -11,7 +11,7 @@ from app.services.sas_diagnostics import (
     new_mpr_event_summary,
     record_mpr_event_summary,
 )
-from app.services.sas_diagnostics.decoder import bound_diagnostic_value
+from app.services.sas_diagnostics.decoder import MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH, bound_diagnostic_value
 
 
 CORE_MPRUTIL_UNIT_SUBCOMMANDS = ("adapter", "devices", "enclosures", "expanders", "iocfacts")
@@ -365,12 +365,13 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
         disk_match = disk_pattern.match(source_line)
         if disk_match:
             message = disk_match.group("message").strip()
+            target = _bounded_numeric_token(disk_match.group("target"))
             event = {
                 "source": "cam",
                 "controller": disk_match.group("controller"),
                 "device": disk_match.group("device"),
                 "bus": disk_match.group("bus"),
-                "target": disk_match.group("target"),
+                "target": target,
                 "lun": disk_match.group("lun"),
                 "message": message,
                 "event_type": _mpr_dmesg_event_type(message),
@@ -386,10 +387,11 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
             controller_match = controller_pattern.match(source_line)
             if controller_match:
                 message = controller_match.group("message").strip()
+                target = _bounded_numeric_token(controller_match.group("target"))
                 event = {
                     "source": "controller",
                     "controller": controller_match.group("controller"),
-                    "target": controller_match.group("target"),
+                    "target": target,
                     "smid": controller_match.group("smid"),
                     "loginfo": controller_match.group("loginfo"),
                     "message": message,
@@ -428,6 +430,12 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
             for key, summary in sorted(summaries["by_controller_target"].items())
         },
     }
+
+
+def _bounded_numeric_token(value: str | None) -> str | None:
+    if value is None or len(value) <= MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH:
+        return value
+    return f"{value[: MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH - 3]}..."
 
 
 def _split_mpr_dmesg_timestamp(line: str) -> tuple[str | None, str]:

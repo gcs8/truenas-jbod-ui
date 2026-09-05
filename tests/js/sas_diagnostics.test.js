@@ -248,3 +248,51 @@ test("simultaneously filtered diagnostic panels refresh only their own DOM", () 
   assert.equal(firstPanel.regions["[data-fabric-diagnostic-status]"].innerHTML, "first_key:timeout:status");
   assert.equal(secondPanel.regions["[data-fabric-diagnostic-status]"].innerHTML, "second_key:medium:status");
 });
+
+test("fallback expander panels with identical diagnostics keep distinct table state", () => {
+  const state = { diagnosticTables: {} };
+  const diagnostics = {
+    devices: [],
+    targets: ["10"],
+    event_count: 1,
+    event_table: { rows: [{ event_id: "event-1" }] },
+  };
+  const controllerNode = { metrics: { kernel_diagnostics: diagnostics } };
+  const trace = { node_ids: [], metrics: {} };
+  const fabric = { nodes: [] };
+  const { diskPathBranchEvidence, diagnosticTableKey, diagnosticTableState, diagnosticEventRows, list } = loadFunctions([
+    "diskPathBranchEvidence",
+    "diagnosticTableKey",
+    "diagnosticTableState",
+    "diagnosticEventRows",
+    "list",
+  ], {
+    state,
+    nodeMap: () => new Map(),
+    branchMprDevice: () => null,
+    controllerNameFromId: () => null,
+    firstTraceNode: () => null,
+    renderDiagnosticEvidencePanel: (panelDiagnostics, scopeLabel, panelIdentity) => ({
+      diagnostics: panelDiagnostics,
+      scopeLabel,
+      panelIdentity,
+    }),
+  });
+  const first = diskPathBranchEvidence({
+    controller: "mpr0",
+    state: "reported",
+    controllerNode,
+    expanderNode: { id: "expander:first" },
+  }, trace, fabric);
+  const second = diskPathBranchEvidence({
+    controller: "mpr0",
+    state: "reported",
+    controllerNode,
+    expanderNode: { id: "expander:second" },
+  }, trace, fabric);
+  const firstKey = diagnosticTableKey(first.diagnostics, first.scopeLabel, first.panelIdentity);
+  const secondKey = diagnosticTableKey(second.diagnostics, second.scopeLabel, second.panelIdentity);
+
+  assert.notEqual(firstKey, secondKey);
+  assert.notEqual(diagnosticTableState(firstKey), diagnosticTableState(secondKey));
+});

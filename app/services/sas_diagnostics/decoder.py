@@ -302,6 +302,9 @@ def _record_finding(summary: dict[str, Any], record: dict[str, Any]) -> None:
             "last_event_id": record.get("event_id"),
         },
     )
+    record_severity = record.get("severity") or fault_family_severity(str(record.get("family") or ""))
+    if severity_rank(record_severity) < severity_rank(finding.get("severity")):
+        finding["severity"] = record_severity
     finding["count"] += 1
     finding["last_event_id"] = record.get("event_id")
     for key in ("controllers", "devices", "targets"):
