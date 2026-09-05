@@ -4,12 +4,13 @@ import threading
 import time
 import tempfile
 import unittest
+from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, patch
 
 import paramiko
 
-from app.config import SSHConfig
+from app.config import ENV_OVERRIDES, SSHConfig, get_settings
 from app.services.ssh_probe import AutoPinHostKeyPolicy, SSHCommandResult, SSHProbe, redact_ssh_command
 
 
@@ -624,3 +625,69 @@ class SSHProbeTests(unittest.TestCase):
         self.assertTrue(all(item.exit_code == 255 for item in results))
         self.assertTrue(all("timed out" in item.stderr for item in results))
         ssh_client.connect.assert_called_once()
+
+
+class KnownHostsPathContractTests(unittest.TestCase):
+    """The known-hosts file location is derived, not operator-configurable.
+
+    PR #201 made ``_apply_config_path_relative_defaults`` reassign
+    ``ssh.known_hosts_path`` after every other layer is merged, so any
+    configured value is discarded. These tests pin that contract so the
+    setting is not re-advertised as configurable without also honouring it.
+    """
+
+    def test_known_hosts_path_is_not_an_environment_override(self) -> None:
+        self.assertFalse(
+            "SSH_KNOWN_HOSTS_PATH" in ENV_OVERRIDES,
+            "SSH_KNOWN_HOSTS_PATH is discarded after merge; it must not be advertised",
+        )
+        self.assertFalse(
+            ("ssh", "known_hosts_path") in set(ENV_OVERRIDES.values()),
+            "no environment variable may target ssh.known_hosts_path",
+        )
+
+    def test_environment_variable_cannot_move_the_known_hosts_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            config_path = temp_root / "config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "ssh:",
+                        "  known_hosts_path: /operator/chosen/known_hosts",
+                        "systems:",
+                        "  - id: primary",
+                        "    ssh:",
+                        "      known_hosts_path: /operator/chosen/known_hosts",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "APP_CONFIG_PATH": config_path.as_posix(),
+                    "SSH_KNOWN_HOSTS_PATH": "/operator/chosen/known_hosts",
+                },
+                clear=False,
+            ):
+                get_settings.cache_clear()
+                settings = get_settings()
+                get_settings.cache_clear()
+
+            derived = temp_root / "known_hosts"
+            self.assertEqual(Path(settings.ssh.known_hosts_path), derived)
+            self.assertEqual(
+                [Path(system.ssh.known_hosts_path) for system in settings.systems],
+                [derived],
+            )
+
+    def test_documentation_does_not_advertise_the_removed_override(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        for relative in (".env.example", "docs/SSH_READ_ONLY_SETUP.md"):
+            with self.subTest(document=relative):
+                self.assertFalse(
+                    "SSH_KNOWN_HOSTS_PATH" in (root / relative).read_text(encoding="utf-8"),
+                    f"{relative} must not document SSH_KNOWN_HOSTS_PATH; it is ignored",
+                )

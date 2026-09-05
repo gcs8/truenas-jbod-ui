@@ -285,7 +285,6 @@ test("Quantastor discovery uses canonical preserved secrets and SSH timeout", as
     ssh_user: "svc",
     ssh_key_path: null,
     ssh_password: PRESERVE_SECRET_SENTINEL,
-    ssh_known_hosts_path: "/app/data/known_hosts",
     ssh_strict_host_key_checking: true,
     ssh_timeout_seconds: 45,
     ha_nodes: [],
@@ -398,7 +397,6 @@ test("ESXi host prep uses canonical preserved secrets and configured timeout", (
     ssh_user: "root",
     ssh_key_path: null,
     ssh_password: PRESERVE_SECRET_SENTINEL,
-    ssh_known_hosts_path: "/app/data/known_hosts",
     ssh_strict_host_key_checking: true,
     ssh_timeout_seconds: 240,
   };

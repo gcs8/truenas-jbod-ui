@@ -120,3 +120,34 @@ test("dead per-key cancellation stays absent while pagehide keeps cancel-all wir
     "pagehide must cancel every pending runtime action",
   );
 });
+
+test("setup-frontend and client-chosen known-hosts leftovers stay deleted", () => {
+  assertAbsent(
+    APP_SOURCE,
+    /\bsetupSshKeyModePanels\b/,
+    "setupSshKeyModePanels must stay deleted with the rest of the setup frontend",
+  );
+  assertAbsent(
+    APP_SOURCE,
+    /data-setup-ssh-key-mode-panel/,
+    "the setup ssh key mode panel attribute must not be queried",
+  );
+  assertAbsent(
+    TEMPLATE,
+    /data-setup-ssh-key-mode-panel/,
+    "the setup ssh key mode panel attribute must not be rendered",
+  );
+
+  for (const symbol of ["ssh_known_hosts_path", "bootstrap_known_hosts_path"]) {
+    assertAbsent(
+      ADMIN_SOURCE,
+      new RegExp(`\\b${symbol}\\b`),
+      `${symbol} must stay deleted; the server derives the known-hosts path from settings`,
+    );
+  }
+  assertAbsent(
+    ADMIN_SOURCE,
+    /known_hosts_path:/,
+    "setup requests must not assert a known-hosts path",
+  );
+});

@@ -307,7 +307,6 @@
   const exportSnapshotNote = document.getElementById("export-snapshot-note");
   const exportSnapshotWindowHint = document.getElementById("export-snapshot-window-hint");
   const exportSnapshotEstimate = document.getElementById("export-snapshot-estimate");
-  const setupSshKeyModePanels = Array.from(document.querySelectorAll("[data-setup-ssh-key-mode-panel]"));
   const historyToggleButton = document.getElementById("history-toggle-button");
   const detailHistoryPanel = document.getElementById("detail-history-panel");
   const historyDrawerTitle = document.getElementById("history-drawer-title");

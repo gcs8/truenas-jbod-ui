@@ -4019,12 +4019,6 @@ def _parse_storcli_json(output: str) -> dict[str, Any]:
     return controllers[0] if controllers else {}
 
 
-def _storcli_response_data(output: str) -> dict[str, Any]:
-    parsed = _parse_storcli_json(output)
-    response_data = parsed.get("response_data")
-    return response_data if isinstance(response_data, dict) else {}
-
-
 def parse_storcli_controller_info(output: str) -> dict[str, Any]:
     parsed = _parse_storcli_json(output)
     response_data = parsed.get("response_data")

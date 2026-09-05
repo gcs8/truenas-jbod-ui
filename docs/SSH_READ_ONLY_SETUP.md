@@ -399,16 +399,14 @@ SSH_STRICT_HOST_KEY_CHECKING=true
 If the appliance only exposes password SSH, set `SSH_PASSWORD` and leave
 `SSH_KEY_PATH` empty.
 
-If you want to override the default trust-on-first-use location, set:
-
-```env
-SSH_KNOWN_HOSTS_PATH=/app/data/known_hosts
-```
+The trust-on-first-use file is not configurable. The app always uses
+`known_hosts` in its own data directory (`/app/data/known_hosts` in the
+container), derived from the runtime layout, and ignores any value supplied by
+config, environment, or a setup request.
 
 The current default already uses:
 
 - `SSH_STRICT_HOST_KEY_CHECKING=true`
-- `SSH_KNOWN_HOSTS_PATH=/app/data/known_hosts`
 
 That means the first successful SSH connection pins the observed host key into
 the app's writable data directory, and later connections must match it unless
