@@ -24,7 +24,12 @@ from app.request_context import request_context
 from history_service import main as history_main
 from history_service import migration_lock
 from history_service import store as history_store
-from history_service.collector import HistoryCollectionStopping, HistoryCollector, ScopeSnapshot
+from history_service.collector import (
+    TOPOLOGY_CHANGE_CONFIRMATION_COUNT,
+    HistoryCollectionStopping,
+    HistoryCollector,
+    ScopeSnapshot,
+)
 from history_service.config import HistorySettings, get_history_settings
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
 from history_service.migration_lock import history_lock_path, history_write_lock
@@ -5216,6 +5221,89 @@ class HistoryStoreTests(unittest.TestCase):
 
 class HistoryCollectorTests(unittest.TestCase):
     @staticmethod
+    def _topology_history_fixture(
+        *,
+        system_id: str = "archive-core",
+        enclosure_id: str = "enc-a",
+        slot: int = 30,
+    ) -> tuple[HistoryStore, HistoryCollector, SlotStateRecord]:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                backup_dir=str(temp_dir / "backups"),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        baseline = SlotStateRecord(
+            system_id=system_id,
+            system_label="Archive CORE",
+            enclosure_key=enclosure_id,
+            enclosure_id=enclosure_id,
+            enclosure_label="Front Shelf",
+            slot=slot,
+            slot_label=f"{slot:02d}",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name=f"multipath/disk{slot}",
+            serial=f"SERIAL-{slot}",
+            model="WDC WUH721818AL5204",
+            gptid=f"gptid/{slot}",
+            pool_name="The-Repository",
+            vdev_name="raidz2-2",
+            health="ONLINE",
+            topology_label="The-Repository > raidz2-2 > data",
+            logical_unit_id=f"0x5000cca27c7f{slot:04d}",
+            disk_identity_key=f"disk:{slot}",
+        )
+        return store, collector, baseline
+
+    @staticmethod
+    def _topology_scope(record: SlotStateRecord, snapshot: dict[str, Any]) -> ScopeSnapshot:
+        return ScopeSnapshot(
+            system_id=record.system_id,
+            system_label=record.system_label,
+            enclosure_id=record.enclosure_id,
+            enclosure_label=record.enclosure_label,
+            snapshot=snapshot,
+        )
+
+    @staticmethod
+    def _topology_snapshot(record: SlotStateRecord, **overrides: Any) -> dict[str, Any]:
+        slot_payload = {
+            "slot": record.slot,
+            "slot_label": record.slot_label,
+            "enclosure_id": record.enclosure_id,
+            "enclosure_label": record.enclosure_label,
+            "present": record.present,
+            "state": record.state,
+            "identify_active": record.identify_active,
+            "device_name": record.device_name,
+            "serial": record.serial,
+            "model": record.model,
+            "gptid": record.gptid,
+            "pool_name": record.pool_name,
+            "vdev_name": record.vdev_name,
+            "health": record.health,
+            "topology_label": record.topology_label,
+            "logical_unit_id": record.logical_unit_id,
+            "disk_identity_key": record.disk_identity_key,
+        }
+        slot_payload.update(overrides.pop("slot_overrides", {}))
+        snapshot = {
+            "selected_system_id": record.system_id,
+            "selected_system_label": record.system_label,
+            "selected_system_platform": "core",
+            "sources": {"api": {"enabled": True, "ok": True}},
+            "slots": [slot_payload],
+        }
+        snapshot.update(overrides)
+        return snapshot
+
+    @staticmethod
     def _scheduled_backup_status(
         *,
         success_at: datetime,
@@ -6050,10 +6138,281 @@ class HistoryCollectorTests(unittest.TestCase):
         loaded = store.get_slot_state("archive-core", "enc-a", 30)
 
         self.assertEqual(events, [])
+        self.assertEqual(
+            collector._pending_topology_changes.get(("archive-core", "enc-a", 30)),
+            (("The-Repository", None, "The-Repository > data"), 1),
+        )
         self.assertIsNotNone(loaded)
         assert loaded is not None
         self.assertEqual(loaded.vdev_name, "raidz2-2")
         self.assertEqual(loaded.topology_label, "The-Repository > raidz2-2 > data")
+
+    def test_record_slot_changes_confirms_repeated_topology_degradation_at_threshold(self) -> None:
+        store, collector, baseline = self._topology_history_fixture()
+        degraded = replace(
+            baseline,
+            vdev_name=None,
+            topology_label="The-Repository > data",
+        )
+        first_observed_at = "2026-06-12T09:54:00+00:00"
+        confirming_observed_at = "2026-06-12T09:59:00+00:00"
+
+        self.assertEqual(TOPOLOGY_CHANGE_CONFIRMATION_COUNT, 2)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+        collector._record_slot_changes([degraded], first_observed_at)
+
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+        self.assertEqual(
+            collector._pending_topology_changes.get(collector._slot_state_key(baseline)),
+            (collector._topology_signature(degraded), 1),
+        )
+        after_first = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(after_first)
+        assert after_first is not None
+        self.assertEqual(after_first.vdev_name, baseline.vdev_name)
+        self.assertEqual(after_first.topology_label, baseline.topology_label)
+
+        collector._record_slot_changes([degraded], confirming_observed_at)
+
+        events = store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "slot_topology_changed")
+        self.assertEqual(events[0]["observed_at"], confirming_observed_at)
+        self.assertEqual(events[0]["previous_value"], baseline.topology_label)
+        self.assertEqual(events[0]["current_value"], degraded.topology_label)
+        self.assertEqual(
+            json.loads(events[0]["details_json"]),
+            {
+                "topology_label": {
+                    "label": "Topology",
+                    "previous": baseline.topology_label,
+                    "current": degraded.topology_label,
+                },
+                "vdev_name": {
+                    "label": "Vdev",
+                    "previous": baseline.vdev_name,
+                    "current": None,
+                },
+            },
+        )
+        accepted = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(accepted)
+        assert accepted is not None
+        self.assertIsNone(accepted.vdev_name)
+        self.assertEqual(accepted.topology_label, degraded.topology_label)
+        self.assertNotIn(collector._slot_state_key(baseline), collector._pending_topology_changes)
+
+        collector._record_slot_changes([degraded], "2026-06-12T10:04:00+00:00")
+
+        self.assertEqual(len(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot)), 1)
+
+    def test_record_slot_changes_clears_pending_degradation_on_transient_recovery(self) -> None:
+        store, collector, baseline = self._topology_history_fixture()
+        degraded = replace(baseline, vdev_name=None, topology_label="The-Repository > data")
+        key = collector._slot_state_key(baseline)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+
+        collector._record_slot_changes([degraded], "2026-06-12T09:54:00+00:00")
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded), 1))
+
+        collector._record_slot_changes([baseline], "2026-06-12T09:59:00+00:00")
+
+        self.assertNotIn(key, collector._pending_topology_changes)
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+        recovered = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertEqual(recovered.vdev_name, baseline.vdev_name)
+        self.assertEqual(recovered.topology_label, baseline.topology_label)
+
+    def test_record_slot_changes_replaces_pending_degradation_on_alternating_signatures(self) -> None:
+        store, collector, baseline = self._topology_history_fixture()
+        degraded_a = replace(baseline, vdev_name=None, topology_label="The-Repository > data")
+        degraded_b = replace(baseline, vdev_name=None, topology_label="The-Repository > unknown")
+        key = collector._slot_state_key(baseline)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+
+        for index, candidate in enumerate((degraded_a, degraded_b, degraded_a, degraded_b), start=1):
+            collector._record_slot_changes([candidate], f"2026-06-12T10:{index:02d}:00+00:00")
+            self.assertEqual(
+                collector._pending_topology_changes.get(key),
+                (collector._topology_signature(candidate), 1),
+            )
+
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+        loaded = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.vdev_name, baseline.vdev_name)
+        self.assertEqual(loaded.topology_label, baseline.topology_label)
+
+    def test_record_slot_changes_discards_pending_degradation_on_disk_identity_change(self) -> None:
+        store, collector, baseline = self._topology_history_fixture()
+        degraded_a = replace(baseline, vdev_name=None, topology_label="The-Repository > data")
+        replacement = replace(
+            baseline,
+            device_name="multipath/replacement30",
+            serial="REPLACEMENT-30",
+            gptid="gptid/replacement-30",
+            logical_unit_id="replacement-lun-30",
+            disk_identity_key="disk:replacement-30",
+        )
+        degraded_replacement = replace(
+            replacement,
+            vdev_name=None,
+            topology_label="The-Repository > data",
+        )
+        key = collector._slot_state_key(baseline)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+
+        collector._record_slot_changes([degraded_a], "2026-06-12T09:54:00+00:00")
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded_a), 1))
+
+        collector._record_slot_changes([replacement], "2026-06-12T09:59:00+00:00")
+
+        self.assertNotIn(key, collector._pending_topology_changes)
+        identity_events = store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertEqual([event["event_type"] for event in identity_events], ["slot_identity_changed"])
+        loaded = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.disk_identity_key, replacement.disk_identity_key)
+
+        collector._record_slot_changes([degraded_replacement], "2026-06-12T10:04:00+00:00")
+
+        self.assertEqual(
+            collector._pending_topology_changes.get(key),
+            (collector._topology_signature(degraded_replacement), 1),
+        )
+        self.assertEqual(len(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot)), 1)
+
+    def test_record_slot_changes_never_confirms_mass_topology_degradation(self) -> None:
+        store, collector, template = self._topology_history_fixture(slot=0)
+        baselines = [
+            replace(
+                template,
+                slot=slot,
+                slot_label=f"{slot:02d}",
+                device_name=f"multipath/disk{slot}",
+                serial=f"SERIAL-{slot}",
+                gptid=f"gptid/{slot}",
+                logical_unit_id=f"0x5000cca27c7f{slot:04d}",
+                disk_identity_key=f"disk:{slot}",
+            )
+            for slot in range(4)
+        ]
+        degraded = [
+            replace(record, vdev_name=None, topology_label="The-Repository > data") for record in baselines
+        ]
+        for record in baselines:
+            store.upsert_slot_state(record, "2026-06-12T09:50:00+00:00")
+
+        collector._record_slot_changes([degraded[0]], "2026-06-12T09:54:00+00:00")
+        self.assertEqual(
+            collector._pending_topology_changes.get(collector._slot_state_key(degraded[0])),
+            (collector._topology_signature(degraded[0]), 1),
+        )
+
+        for pass_number in range(TOPOLOGY_CHANGE_CONFIRMATION_COUNT + 1):
+            collector._record_slot_changes(degraded, f"2026-06-12T10:{pass_number:02d}:00+00:00")
+            for record in degraded:
+                self.assertNotIn(collector._slot_state_key(record), collector._pending_topology_changes)
+
+        for baseline in baselines:
+            self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+            loaded = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.vdev_name, baseline.vdev_name)
+            self.assertEqual(loaded.topology_label, baseline.topology_label)
+
+    def test_run_once_failed_source_breaks_pending_degradation_confirmation(self) -> None:
+        store, collector, baseline = self._topology_history_fixture()
+        degraded = replace(baseline, vdev_name=None, topology_label="The-Repository > data")
+        _, _, unrelated = self._topology_history_fixture(system_id="other-system", enclosure_id="enc-b", slot=8)
+        unrelated_degraded = replace(unrelated, vdev_name=None, topology_label="The-Repository > data")
+        key = collector._slot_state_key(baseline)
+        unrelated_key = collector._slot_state_key(unrelated)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+        store.upsert_slot_state(unrelated, "2026-06-12T09:50:00+00:00")
+        collector._record_slot_changes([degraded], "2026-06-12T09:54:00+00:00")
+        collector._record_slot_changes([unrelated_degraded], "2026-06-12T09:54:00+00:00")
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded), 1))
+        self.assertEqual(
+            collector._pending_topology_changes.get(unrelated_key),
+            (collector._topology_signature(unrelated_degraded), 1),
+        )
+        rejected = self._topology_snapshot(
+            degraded,
+            sources={"api": {"enabled": True, "ok": False}},
+        )
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._topology_scope(baseline, rejected)]
+        )
+
+        with patch.object(store, "record_slot_updates", wraps=store.record_slot_updates) as record_updates:
+            asyncio.run(collector.run_once())
+
+        record_updates.assert_not_called()
+        self.assertNotIn(key, collector._pending_topology_changes)
+        self.assertEqual(
+            collector._pending_topology_changes.get(unrelated_key),
+            (collector._topology_signature(unrelated_degraded), 1),
+        )
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+        loaded = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.topology_label, baseline.topology_label)
+
+        collector._record_slot_changes([degraded], "2026-06-12T10:04:00+00:00")
+
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded), 1))
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+
+    def test_run_once_incomplete_quantastor_topology_breaks_pending_degradation_confirmation(self) -> None:
+        store, collector, baseline = self._topology_history_fixture(
+            system_id="qs-cryostorage",
+            enclosure_id="node-a",
+            slot=0,
+        )
+        baseline = replace(
+            baseline,
+            system_label="QS CryoStorage",
+            enclosure_label="QSOSN-Right",
+            pool_name="HA-Pool-R10",
+            vdev_name="mirror-0",
+            topology_label="HA-Pool-R10 > mirror-0 > data",
+        )
+        degraded = replace(baseline, vdev_name="disk", topology_label="HA-Pool-R10 > disk")
+        key = collector._slot_state_key(baseline)
+        store.upsert_slot_state(baseline, "2026-06-12T09:50:00+00:00")
+        collector._record_slot_changes([degraded], "2026-06-12T09:54:00+00:00")
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded), 1))
+        incomplete = self._topology_snapshot(
+            degraded,
+            selected_system_platform="quantastor",
+            platform_context={"topology_complete": False},
+        )
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._topology_scope(baseline, incomplete)]
+        )
+
+        with patch.object(store, "record_slot_updates", wraps=store.record_slot_updates) as record_updates:
+            asyncio.run(collector.run_once())
+
+        record_updates.assert_not_called()
+        self.assertNotIn(key, collector._pending_topology_changes)
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
+        loaded = store.get_slot_state(baseline.system_id, baseline.enclosure_id, baseline.slot)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.topology_label, baseline.topology_label)
+
+        collector._record_slot_changes([degraded], "2026-06-12T10:04:00+00:00")
+
+        self.assertEqual(collector._pending_topology_changes.get(key), (collector._topology_signature(degraded), 1))
+        self.assertEqual(store.list_slot_events(baseline.system_id, baseline.enclosure_id, baseline.slot), [])
 
     def test_record_slot_changes_confirms_real_topology_change_before_event(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

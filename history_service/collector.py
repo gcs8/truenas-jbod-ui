@@ -285,6 +285,7 @@ class HistoryCollector:
             scope_label = self._scope_activity_label(scope)
             self._set_collection_activity(f"recording {scope_label} ({scope_index}/{len(scopes)})")
             if not self._should_record_scope_snapshot(scope.snapshot):
+                self._clear_pending_topology_changes_for_scope(scope.system_id, scope.enclosure_id)
                 smart_scope_unavailable = True
                 logger.warning(
                     "Skipping history capture for %s%s because the inventory snapshot is degraded or untrusted.",
@@ -949,18 +950,32 @@ class HistoryCollector:
         # One read per scope and one write transaction per pass instead of three
         # connection open/PRAGMA/commit cycles per slot.
         previous_by_scope: dict[tuple[str, str], dict[int, SlotStateRecord]] = {}
-        updates: list[SlotStateUpdate] = []
+        previous_records: list[SlotStateRecord | None] = []
         for record in slot_records:
             scope_key = (record.system_id, record.enclosure_key)
             if scope_key not in previous_by_scope:
                 previous_by_scope[scope_key] = self.store.get_slot_states(record.system_id, record.enclosure_id)
-            previous = previous_by_scope[scope_key].get(record.slot)
+            previous_records.append(previous_by_scope[scope_key].get(record.slot))
+
+        degraded_pairs = [
+            (previous, record)
+            for previous, record in zip(previous_records, slot_records, strict=True)
+            if previous is not None and self._is_topology_degradation(previous, record)
+        ]
+        mass_topology_degradation = self._is_mass_topology_degradation(len(degraded_pairs), len(slot_records))
+        if mass_topology_degradation:
+            for _previous, record in degraded_pairs:
+                self._pending_topology_changes.pop(self._slot_state_key(record), None)
+
+        updates: list[SlotStateUpdate] = []
+        for previous, record in zip(previous_records, slot_records, strict=True):
             if self._should_backfill_extended_state(previous, record):
                 updates.append(SlotStateUpdate(record=record, observed_at=observed_at))
                 continue
             record, topology_degraded, topology_pending = self._prepare_slot_record_for_history(
                 previous,
                 record,
+                suppress_topology_degradation=mass_topology_degradation,
             )
             if topology_degraded:
                 suppressed_topology_degradations += 1
@@ -970,7 +985,7 @@ class HistoryCollector:
             updates.append(SlotStateUpdate(record=record, observed_at=observed_at, events=list(events)))
         self.store.record_slot_updates(updates)
         if suppressed_topology_degradations:
-            if self._is_mass_topology_degradation(suppressed_topology_degradations, len(slot_records)):
+            if mass_topology_degradation:
                 logger.warning(
                     "Suppressed mass topology-detail degradation for %s/%s slots; keeping last trusted topology until the source stabilizes.",
                     suppressed_topology_degradations,
@@ -992,12 +1007,14 @@ class HistoryCollector:
         self,
         previous: SlotStateRecord | None,
         current: SlotStateRecord,
+        *,
+        suppress_topology_degradation: bool = False,
     ) -> tuple[SlotStateRecord, bool, bool]:
         if previous is None:
             return current, False, False
         key = self._slot_state_key(current)
-        if self._is_topology_degradation(previous, current):
-            self._pending_topology_changes.pop(key, None)
+        topology_degraded = self._is_topology_degradation(previous, current)
+        if topology_degraded and suppress_topology_degradation:
             return self._with_previous_topology(previous, current), True, False
         if not self._topology_changed(previous, current):
             self._pending_topology_changes.pop(key, None)
@@ -1011,13 +1028,19 @@ class HistoryCollector:
         pending_count = pending_count + 1 if pending_signature == signature else 1
         if pending_count < TOPOLOGY_CHANGE_CONFIRMATION_COUNT:
             self._pending_topology_changes[key] = (signature, pending_count)
-            return self._with_previous_topology(previous, current), False, True
+            return self._with_previous_topology(previous, current), topology_degraded, True
         self._pending_topology_changes.pop(key, None)
         return current, False, False
 
     @staticmethod
     def _slot_state_key(record: SlotStateRecord) -> tuple[str, str, int]:
         return (record.system_id, record.enclosure_id or "", record.slot)
+
+    def _clear_pending_topology_changes_for_scope(self, system_id: str, enclosure_id: str | None) -> None:
+        scope_key = (system_id, enclosure_id or "")
+        for key in tuple(self._pending_topology_changes):
+            if key[:2] == scope_key:
+                self._pending_topology_changes.pop(key, None)
 
     @staticmethod
     def _topology_signature(record: SlotStateRecord) -> tuple[str | None, str | None, str | None]:
