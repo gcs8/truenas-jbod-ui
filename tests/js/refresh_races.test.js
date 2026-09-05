@@ -432,6 +432,153 @@ test("mapping mutations without a scope revision fail closed before any request"
   assert.ok(statuses.every((message) => message.includes("Refresh inventory")));
 });
 
+test("virtual slot mapping editor is hidden with a truthful reason", () => {
+  const reason = "Manual mapping is unavailable because this system disk has no identified physical enclosure or stable physical location.";
+  const classes = new Set();
+  const mappingForm = {
+    classList: {
+      toggle(name, force) {
+        if (force) classes.add(name);
+        else classes.delete(name);
+      },
+    },
+  };
+  const emptyClasses = new Set(["hidden"]);
+  const mappingEmpty = {
+    textContent: "",
+    classList: {
+      toggle(name, force) {
+        if (force) emptyClasses.add(name);
+        else emptyClasses.delete(name);
+      },
+    },
+  };
+  const enabledStates = [];
+  const { fn: renderMappingEditorForSlot } = loadFunction(APP_SOURCE, "renderMappingEditorForSlot", {
+    state: { snapshotMode: false },
+    mappingForm,
+    mappingEmpty,
+    setMappingFormEnabled(enabled) { enabledStates.push(enabled); },
+  });
+
+  renderMappingEditorForSlot({ mapping_supported: false, mapping_reason: reason });
+
+  assert.equal(classes.has("hidden"), true);
+  assert.equal(emptyClasses.has("hidden"), false);
+  assert.equal(mappingEmpty.textContent, reason);
+  assert.deepEqual(enabledStates, [false]);
+
+  renderMappingEditorForSlot({ mapping_supported: true });
+
+  assert.equal(classes.has("hidden"), false);
+  assert.equal(emptyClasses.has("hidden"), true);
+  assert.deepEqual(enabledStates, [false, true]);
+});
+
+test("virtual slot mapping save and clear handlers fail closed before any request", async () => {
+  const reason = "Manual mapping is unavailable because this system disk has no identified physical enclosure or stable physical location.";
+  const state = { snapshotMode: false, selectedSlot: 0 };
+  const statuses = [];
+  let requestCount = 0;
+  let confirmCount = 0;
+  let prevented = false;
+  class FakeFormData {
+    get() { return "untrusted"; }
+  }
+  const context = {
+    state,
+    FormData: FakeFormData,
+    mappingForm: {},
+    writeBlockedByPolicy: () => false,
+    window: { confirm() { confirmCount += 1; return true; } },
+    getSlotById() {
+      return {
+        slot: 0,
+        slot_label: "Disk 1",
+        physical_location_known: false,
+        mapping_supported: false,
+        mapping_reason: reason,
+        mapping_revision: "a".repeat(64),
+        mapping_clear_revision: "b".repeat(64),
+      };
+    },
+    setStatus(message) { statuses.push(message); },
+    async sendScopedRequest() { requestCount += 1; return { snapshot: {} }; },
+    applySnapshot() {},
+    invalidateHistoryCaches() {},
+    renderAll() {},
+    scheduleSmartPrefetch() {},
+  };
+  const { fn: saveMapping } = loadFunction(APP_SOURCE, "saveMapping", context);
+  const { fn: clearMapping } = loadFunction(APP_SOURCE, "clearMapping", context);
+
+  await saveMapping({ preventDefault() { prevented = true; } });
+  await clearMapping();
+
+  assert.equal(prevented, true);
+  assert.equal(requestCount, 0);
+  assert.equal(confirmCount, 0);
+  assert.deepEqual(statuses, [reason, reason]);
+  assert.ok(statuses.every((message) => !/\b(?:slot|bay)\b/i.test(message)));
+});
+
+test("mapping import is disabled with a reason for the active virtual inventory", async () => {
+  const reasonView = { textContent: "", classList: { toggle(_name, hidden) { this.hidden = hidden; } } };
+  const button = { disabled: false, title: "" };
+  const selected = { id: "virtual-system:system-a", kind: "virtual" };
+  const { fn: mappingImportUnavailableReason } = loadFunction(APP_SOURCE, "mappingImportUnavailableReason", {
+    state: { snapshotMode: false },
+    getSelectedEnclosureOption: () => selected,
+  });
+  const reason = mappingImportUnavailableReason();
+  const { fn: renderMappingImportControl } = loadFunction(APP_SOURCE, "renderMappingImportControl", {
+    importMappingsButton: button,
+    mappingImportUnavailable: reasonView,
+    mappingImportUnavailableReason: () => reason,
+  });
+
+  renderMappingImportControl();
+
+  assert.match(reason, /no identified physical enclosure/i);
+  assert.equal(button.disabled, true);
+  assert.equal(button.title, reason);
+  assert.equal(reasonView.textContent, reason);
+  assert.equal(reasonView.classList.hidden, false);
+
+  let requests = 0;
+  const statuses = [];
+  const mappingImportFile = { value: "selected-file" };
+  const { fn: importMappingsFromFile } = loadFunction(APP_SOURCE, "importMappingsFromFile", {
+    state: { snapshotMode: false },
+    mappingImportFile,
+    writeBlockedByPolicy: () => false,
+    mappingImportUnavailableReason: () => reason,
+    setStatus(message) { statuses.push(message); },
+    async sendScopedRequest() { requests += 1; },
+  });
+
+  await importMappingsFromFile({ name: "mappings.json", async text() { return "{}"; } });
+
+  assert.equal(requests, 0);
+  assert.deepEqual(statuses, [reason]);
+  assert.equal(mappingImportFile.value, "");
+});
+
+test("virtual detail and aria location copy says disk while physical copy says slot", () => {
+  const { fn: slotLocationLabel } = loadFunction(APP_SOURCE, "slotLocationLabel", {});
+
+  assert.equal(
+    slotLocationLabel({ slot_label: "Disk 1", physical_location_known: false }),
+    "Disk 1",
+  );
+  assert.equal(
+    slotLocationLabel({ slot_label: "07", physical_location_known: true }),
+    "Slot 07",
+  );
+  assert.match(functionSource(APP_SOURCE, "renderLiveSlotDetail"), /slotLocationLabel\(slot\)/);
+  assert.match(functionSource(APP_SOURCE, "buildTooltipLines"), /slotLocationLabel\(slot\)/);
+});
+
 test("mapping import preview lists every exact scope and slot classification", () => {
   const { fn: mappingImportPreviewMessage } = loadFunction(APP_SOURCE, "mappingImportPreviewMessage", {});
   const message = mappingImportPreviewMessage({
@@ -472,6 +619,7 @@ test("mapping import previews and confirms the exact diff before rendering impor
     setStatus() {},
     writeBlockedByPolicy: () => false,
     handleWriteRejection: () => false,
+    mappingImportUnavailableReason: () => null,
     mappingImportPreviewMessage(preview) {
       return `Add ${preview.additions.length}; update ${preview.updates.length}; remove ${preview.removals.length}; unchanged ${preview.unchanged.length}`;
     },
@@ -531,6 +679,7 @@ test("canceling a mapping import preview performs no write and clears the file i
     state,
     mappingImportFile,
     window: { confirm: () => false },
+    mappingImportUnavailableReason: () => null,
     mappingImportPreviewMessage: () => "preview",
     setStatus(message) { statuses.push(message); },
     writeBlockedByPolicy: () => false,

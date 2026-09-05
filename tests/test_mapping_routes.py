@@ -5,6 +5,8 @@ import json
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from fastapi import HTTPException
+
 from app import main as app_main
 from app.models.domain import (
     InventorySnapshot,
@@ -19,6 +21,7 @@ from app.services.mapping_store import (
     MappingImportDigestMismatch,
     MappingRevisionConflict,
 )
+from app.services.truenas_ws import TrueNASAPIError
 
 
 PRIVATE_EXCEPTION_DETAIL = "Traceback: /srv/private/mappings.json contained operator data"
@@ -71,6 +74,53 @@ class MappingImportRouteTests(unittest.TestCase):
             bundle,
             selected_enclosure_id="enc-a",
         )
+
+    def test_virtual_mapping_import_routes_return_truthful_http_400_without_mutation(self) -> None:
+        routes = {
+            getattr(route, "path", ""): route
+            for route in app_main.app.routes
+        }
+        reason = (
+            "Mapping import is unavailable because this system disk inventory has no identified "
+            "physical enclosure or stable physical slot identities."
+        )
+        bundle = MappingBundle(mappings=[ManualMapping(slot=0, serial="UNSTABLE")])
+        confirmation = MappingImportConfirmation(
+            bundle=bundle,
+            expected_revision="a" * 64,
+            import_digest="b" * 64,
+            confirmed=True,
+        )
+        cases = [
+            (routes["/api/mappings/import/preview"], {"payload": bundle}),
+            (routes["/api/mappings/import"], {"payload": confirmation}),
+        ]
+
+        for route, arguments in cases:
+            with self.subTest(path=route.path):
+                service = Mock()
+                service.preview_mapping_bundle = AsyncMock(side_effect=TrueNASAPIError(reason))
+                service.import_mapping_bundle = AsyncMock(side_effect=TrueNASAPIError(reason))
+                service.get_snapshot = AsyncMock()
+                registry = Mock()
+                registry.get_service.return_value = service
+
+                with (
+                    patch.object(app_main, "get_inventory_registry", return_value=registry),
+                    self.assertRaises(HTTPException) as raised,
+                ):
+                    asyncio.run(
+                        route.endpoint(
+                            **arguments,
+                            system_id="system-a",
+                            enclosure_id="virtual-system:system-a",
+                        )
+                    )
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertEqual(raised.exception.detail, reason)
+                service.invalidate_snapshot_cache.assert_not_called()
+                service.get_snapshot.assert_not_awaited()
 
     def test_mapping_import_requires_exact_preview_confirmation_fields(self) -> None:
         app_main.app.openapi_schema = None
@@ -188,6 +238,57 @@ class MappingImportRouteTests(unittest.TestCase):
             reason="route.clear_mapping",
             enclosure_id="enc-a",
         )
+
+    def test_virtual_single_mapping_mutations_return_truthful_http_400(self) -> None:
+        routes = [
+            route
+            for route in app_main.app.routes
+            if getattr(route, "path", "") == "/api/slots/{slot}/mapping"
+        ]
+        reason = (
+            "Manual mapping is unavailable because this system disk has no identified physical "
+            "enclosure or stable physical location."
+        )
+        payload = MappingRequest(
+            expected_revision="a" * 64,
+            serial="UNSTABLE",
+            clear_identify_after_save=True,
+        )
+
+        for route in routes:
+            method = next(iter(route.methods))
+            with self.subTest(method=method):
+                service = Mock()
+                service.system.id = "system-a"
+                service.system.truenas.platform = "core"
+                service.save_mapping = AsyncMock(side_effect=TrueNASAPIError(reason))
+                service.clear_mapping = AsyncMock(side_effect=TrueNASAPIError(reason))
+                service.set_slot_led = AsyncMock()
+                service.get_snapshot = AsyncMock()
+                registry = Mock()
+                registry.get_service.return_value = service
+                arguments = {"payload": payload} if method == "POST" else {"expected_revision": "a" * 64}
+
+                with (
+                    patch.object(app_main, "get_inventory_registry", return_value=registry),
+                    patch.object(app_main, "ensure_slot_bounds"),
+                    patch.object(app_main, "add_perf_metadata"),
+                    self.assertRaises(HTTPException) as raised,
+                ):
+                    asyncio.run(
+                        route.endpoint(
+                            slot=0,
+                            **arguments,
+                            system_id="system-a",
+                            enclosure_id="virtual-system:system-a",
+                        )
+                    )
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertEqual(raised.exception.detail, reason)
+                service.set_slot_led.assert_not_awaited()
+                service.invalidate_physical_enclosure_snapshot_cache.assert_not_called()
+                service.get_snapshot.assert_not_awaited()
 
     def test_led_mutation_invalidates_every_view_of_the_physical_enclosure(self) -> None:
         route = next(

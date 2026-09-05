@@ -64,6 +64,21 @@ Good next steps:
 - confirm the SSH user can run the exact inventory commands shown in the admin
   setup page
 
+### Legacy unscoped mappings after an upgrade
+
+Legacy `default:{slot}` mappings are used only when one system is configured and
+exactly one physical enclosure is discovered. That is the only case where the
+old row can be attributed without choosing between systems or enclosures.
+
+If disks are visible but no physical enclosure can be identified, the UI groups
+only the known disk evidence in a system-scoped virtual inventory. Its order is
+not a physical bay or slot map, and legacy mappings are not applied. The stored
+rows are retained. After enclosure discovery is restored, select the affected
+physical enclosure and re-save each mapping so it is stored with system and
+enclosure scope. Multi-system and multi-enclosure deployments likewise deny the
+legacy fallback and show one bounded warning with the affected count and the same
+re-save guidance.
+
 ## The UI Says A Sudo Command Is Not Allowed
 
 That means the app tried to run a command the SSH user cannot execute.

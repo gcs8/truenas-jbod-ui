@@ -258,6 +258,8 @@ class InventoryHelpersTests(unittest.TestCase):
         )
         service.profile_registry = MagicMock()
         service.profile_registry.resolve_for_enclosure.return_value = selected_profile
+        service.mapping_store = MagicMock()
+        service.mapping_store.load_all.return_value = {}
 
         warnings: list[str] = []
         frame = service._resolve_layout_frame(
@@ -362,6 +364,278 @@ class InventoryHelpersTests(unittest.TestCase):
                 EnclosureOption(id="enc-a::drawer-b", label="Drawer B"),
             ])
         )
+        self.assertFalse(service._legacy_mapping_fallback_allowed([]))
+
+    def _legacy_fallback_service(
+        self,
+        temp_dir: str,
+        systems: list[SystemConfig],
+    ) -> InventoryService:
+        service = object.__new__(InventoryService)
+        service.settings = Settings(systems=systems)
+        service.system = service.settings.systems[0]
+        service.mapping_store = MappingStore(str(Path(temp_dir) / "slot_mappings.json"))
+        service.profile_registry = MagicMock()
+        service.profile_registry.resolve_for_enclosure.return_value = None
+        return service
+
+    def test_single_system_without_detected_enclosures_denies_legacy_mappings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
+            service.mapping_store._write({
+                "default:5": ManualMapping(slot=5, serial="SYNTH-LEGACY-5"),
+            })
+
+            warnings: list[str] = []
+            frame = service._resolve_layout_frame(
+                [],
+                None,
+                warnings,
+                require_selected_option=False,
+                require_profile=False,
+            )
+
+            self.assertIsInstance(frame, inventory_module._LayoutFrame)
+            self.assertFalse(frame.allow_legacy_mapping_fallback)
+            resolved = service.mapping_store.get_mapping(
+                "system-a",
+                None,
+                5,
+                allow_legacy_fallback=frame.allow_legacy_mapping_fallback,
+            )
+            self.assertIsNone(resolved)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("no identified physical enclosure", warnings[0])
+            self.assertIn("Re-save", warnings[0])
+
+    def test_zero_enclosure_disks_use_system_virtual_inventory_without_legacy_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="system-a",
+                default_profile_id="supermicro-cse-946-top-60",
+                truenas=TrueNASConfig(platform="core"),
+            )
+            settings = Settings(systems=[system])
+            settings.layout.rows = 2
+            settings.layout.columns = 4
+            settings.layout.slot_count = 8
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            service.mapping_store._write({
+                "default:0": ManualMapping(slot=0, serial="SYNTH-DISK-B"),
+            })
+            raw_data = TrueNASRawData(
+                enclosures=[],
+                disks=[
+                    {
+                        "name": "da0",
+                        "serial": "SYNTH-DISK-A",
+                        "model": "Synthetic A",
+                        "size": 1_000_000_000,
+                        "status": "ONLINE",
+                    },
+                    {
+                        "name": "da1",
+                        "serial": "SYNTH-DISK-B",
+                        "model": "Synthetic B",
+                        "size": 2_000_000_000,
+                        "status": "ONLINE",
+                    },
+                ],
+                pools=[],
+                disk_temperatures={"da0": 30, "da1": 31},
+                smart_test_results=[],
+            )
+            warnings: list[str] = []
+
+            slots, enclosures, selected_meta, rows, slot_count, columns = service._correlate(
+                raw_data,
+                ParsedSSHData(),
+                warnings,
+            )
+
+            self.assertEqual(len(enclosures), 1)
+            virtual_enclosure = enclosures[0]
+            self.assertEqual(virtual_enclosure.id, "virtual-system:system-a")
+            self.assertEqual(virtual_enclosure.label, "System disk inventory (virtual)")
+            self.assertEqual(virtual_enclosure.kind, "virtual")
+            self.assertEqual((virtual_enclosure.rows, virtual_enclosure.columns), (1, 2))
+            self.assertEqual(virtual_enclosure.slot_count, 2)
+            self.assertEqual(selected_meta["id"], virtual_enclosure.id)
+            self.assertEqual(rows, [[0, 1]])
+            self.assertEqual((slot_count, columns), (2, 2))
+            self.assertEqual([slot.device_name for slot in slots], ["da0", "da1"])
+            self.assertEqual([slot.slot_label for slot in slots], ["Disk 1", "Disk 2"])
+            self.assertTrue(all(slot.enclosure_id == virtual_enclosure.id for slot in slots))
+            self.assertTrue(all(slot.mapping_source == "system-inventory" for slot in slots))
+            self.assertTrue(all(slot.raw_status.get("virtual_enclosure") is True for slot in slots))
+            self.assertTrue(all(slot.raw_status.get("physical_location_known") is False for slot in slots))
+            self.assertTrue(all(slot.physical_location_known is False for slot in slots))
+            self.assertTrue(all(slot.led_supported is False for slot in slots))
+            self.assertTrue(all(slot.mapping_supported is False for slot in slots))
+            self.assertTrue(all("physical enclosure" in slot.mapping_reason for slot in slots))
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("1 manual mapping", warnings[0])
+            self.assertIn("no identified physical enclosure", warnings[0])
+            self.assertIn("system-scoped virtual inventory", warnings[0])
+            self.assertIn("Re-save", warnings[0])
+            self.assertNotIn("SYNTH", warnings[0])
+            self.assertNotIn("system-a", warnings[0])
+
+            capabilities = service._build_platform_capabilities(
+                slots=slots,
+                available_enclosures=enclosures,
+                summary=InventorySummary(
+                    disk_count=2,
+                    enclosure_count=0,
+                    mapped_slot_count=0,
+                ),
+                sources={"api": SourceStatus(enabled=True, ok=True)},
+                platform_context={},
+            )
+            self.assertEqual(capabilities["inventory"].status, "available")
+            self.assertEqual(capabilities["physical_slots"].status, "unavailable")
+
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=raw_data,
+                    ssh_outputs={},
+                    ssh_collected=False,
+                    warnings=[],
+                    sources={"api": SourceStatus(enabled=True, ok=True)},
+                    scale_ses_data=ParsedSSHData(),
+                    quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+            snapshot = asyncio.run(service._build_snapshot())
+            self.assertEqual(snapshot.summary.disk_count, 2)
+            self.assertEqual(snapshot.summary.enclosure_count, 0)
+            self.assertEqual(snapshot.summary.mapped_slot_count, 0)
+            self.assertEqual(snapshot.capabilities["physical_slots"].status, "unavailable")
+            self.assertIsNone(snapshot.selected_profile)
+            self.assertEqual(snapshot.layout_rows, [[0, 1]])
+            self.assertEqual(snapshot.layout_slot_count, 2)
+
+    def test_multi_enclosure_snapshot_warns_once_about_unapplied_legacy_mappings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
+            service.mapping_store._write({
+                "default:1": ManualMapping(slot=1, serial="SYNTH-LEGACY-1"),
+                "default:2": ManualMapping(slot=2, serial="SYNTH-LEGACY-2"),
+                service.mapping_store._slot_key("system-a", "enc-a", 3): ManualMapping(
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    slot=3,
+                    serial="SYNTH-SCOPED-3",
+                ),
+            })
+            enclosures = [
+                EnclosureOption(id="enc-a", label="Enclosure A", rows=2, columns=4, slot_count=8),
+                EnclosureOption(id="enc-b", label="Enclosure B", rows=2, columns=4, slot_count=8),
+            ]
+
+            warnings: list[str] = []
+            frame = service._resolve_layout_frame(
+                enclosures,
+                "enc-a",
+                warnings,
+                require_profile=False,
+            )
+
+            self.assertIsInstance(frame, inventory_module._LayoutFrame)
+            self.assertFalse(frame.allow_legacy_mapping_fallback)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("2 manual mappings", warnings[0])
+            self.assertNotIn("SYNTH", warnings[0])
+            self.assertNotIn("enc-a", warnings[0])
+
+    def test_legacy_mapping_warning_scopes_drawer_sub_views_to_the_base_enclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
+            service.mapping_store._write({
+                "default:1": ManualMapping(slot=1, serial="SYNTH-LEGACY-1"),
+                "default:2": ManualMapping(slot=2, serial="SYNTH-LEGACY-2"),
+                service.mapping_store._slot_key("system-a", "enc-a", 1): ManualMapping(
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    slot=1,
+                    serial="SYNTH-SCOPED-1",
+                ),
+            })
+            enclosures = [
+                EnclosureOption(
+                    id="enc-a::drawer-a",
+                    label="Drawer A",
+                    rows=2,
+                    columns=4,
+                    slot_count=8,
+                ),
+                EnclosureOption(
+                    id="enc-a::drawer-b",
+                    label="Drawer B",
+                    rows=2,
+                    columns=4,
+                    slot_count=8,
+                ),
+                EnclosureOption(id="enc-b", label="Enclosure B", rows=2, columns=4, slot_count=8),
+            ]
+
+            warnings: list[str] = []
+            frame = service._resolve_layout_frame(
+                enclosures,
+                "enc-a::drawer-b",
+                warnings,
+                require_profile=False,
+            )
+
+            self.assertIsInstance(frame, inventory_module._LayoutFrame)
+            self.assertFalse(frame.allow_legacy_mapping_fallback)
+            self.assertEqual(frame.selected_meta["id"], "enc-a::drawer-b")
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("1 manual mapping ", warnings[0])
+            self.assertNotIn("2 manual", warnings[0])
+
+    def test_legacy_mapping_warning_checks_the_selected_drawer_slot_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._legacy_fallback_service(temp_dir, [SystemConfig(id="system-a")])
+            service.mapping_store._write({
+                "default:42": ManualMapping(slot=42, serial="SYNTH-LEGACY-42"),
+            })
+            bottom_layout: list[list[int | None]] = [
+                list(range(42, 56)),
+                list(range(56, 70)),
+                list(range(70, 84)),
+            ]
+            enclosures = [
+                EnclosureOption(
+                    id="enc-a::bottom",
+                    label="Bottom drawer",
+                    rows=3,
+                    columns=14,
+                    slot_count=42,
+                    slot_layout=bottom_layout,
+                ),
+                EnclosureOption(id="enc-b", label="Enclosure B", rows=2, columns=4, slot_count=8),
+            ]
+
+            warnings: list[str] = []
+            frame = service._resolve_layout_frame(
+                enclosures,
+                "enc-a::bottom",
+                warnings,
+                require_profile=False,
+            )
+
+            self.assertIsInstance(frame, inventory_module._LayoutFrame)
+            self.assertFalse(frame.allow_legacy_mapping_fallback)
+            self.assertEqual(set(frame.slot_positions), set(range(42, 84)))
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("1 manual mapping ", warnings[0])
 
     def test_storage_view_slot_label_honors_profile_slot_number_base(self) -> None:
         storage_view = StorageViewConfig.model_validate(
@@ -10736,6 +11010,92 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("enc-1", service._cache)
             self.assertIn("enc-2", service._cache)
 
+    async def test_save_mapping_rejects_virtual_slot_without_mutating_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            virtual_enclosure_id = "virtual-system:default"
+            slot = SlotView(
+                slot=0,
+                slot_label="Disk 1",
+                row_index=0,
+                column_index=0,
+                enclosure_id=virtual_enclosure_id,
+                physical_location_known=False,
+                mapping_supported=False,
+                mapping_reason=(
+                    "Manual mapping is unavailable because this system disk has no identified physical enclosure "
+                    "or stable physical location."
+                ),
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
+            )
+            service.mapping_store.save_mapping(
+                ManualMapping(
+                    system_id=system.id,
+                    enclosure_id=virtual_enclosure_id,
+                    slot=0,
+                    serial="ORIGINAL",
+                )
+            )
+            before = service.mapping_store.load_all()
+
+            with self.assertRaisesRegex(TrueNASAPIError, "identified physical enclosure"):
+                await service.save_mapping(0, {"serial": "REPLACEMENT"})
+
+            self.assertEqual(service.mapping_store.load_all(), before)
+
+    async def test_clear_mapping_rejects_virtual_slot_without_mutating_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            virtual_enclosure_id = "virtual-system:default"
+            slot = SlotView(
+                slot=0,
+                slot_label="Disk 1",
+                row_index=0,
+                column_index=0,
+                enclosure_id=virtual_enclosure_id,
+                physical_location_known=False,
+                mapping_supported=False,
+                mapping_reason=(
+                    "Manual mapping is unavailable because this system disk has no identified physical enclosure "
+                    "or stable physical location."
+                ),
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
+            )
+            service.mapping_store.save_mapping(
+                ManualMapping(
+                    system_id=system.id,
+                    enclosure_id=virtual_enclosure_id,
+                    slot=0,
+                    serial="ORIGINAL",
+                )
+            )
+            before = service.mapping_store.load_all()
+
+            with self.assertRaisesRegex(TrueNASAPIError, "identified physical enclosure"):
+                await service.clear_mapping(0)
+
+            self.assertEqual(service.mapping_store.load_all(), before)
+
     async def test_save_mapping_invalidates_cache_without_second_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -10842,6 +11202,182 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(result["revision"], preview["revision"])
             self.assertEqual(service.get_snapshot.await_count, 0)
             self.assertIn("__default__", service._cache)
+
+    async def test_preview_mapping_bundle_rejects_unscoped_virtual_mapping_before_store_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(
+                mappings=[
+                    ManualMapping(slot=0, enclosure_id="virtual-system:default", serial="UNSTABLE"),
+                ]
+            )
+            before = service.mapping_store.load_all()
+            preview_replace_mappings = MagicMock(
+                wraps=service.mapping_store.preview_replace_mappings
+            )
+            service.mapping_store.preview_replace_mappings = preview_replace_mappings
+
+            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+                await service.preview_mapping_bundle(bundle)
+
+            preview_replace_mappings.assert_not_called()
+            self.assertEqual(service.mapping_store.load_all(), before)
+
+    async def test_import_mapping_bundle_rejects_unscoped_virtual_mapping_before_store_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(
+                mappings=[
+                    ManualMapping(slot=0, enclosure_id="virtual-system:default", serial="UNSTABLE"),
+                ]
+            )
+            before = service.mapping_store.load_all()
+            apply_mapping_import = MagicMock(
+                wraps=service.mapping_store.apply_mapping_import
+            )
+            service.mapping_store.apply_mapping_import = apply_mapping_import
+
+            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+                await service.import_mapping_bundle(
+                    bundle,
+                    expected_revision="a" * 64,
+                    import_digest="b" * 64,
+                )
+
+            apply_mapping_import.assert_not_called()
+            self.assertEqual(service.mapping_store.load_all(), before)
+
+    async def test_preview_mapping_bundle_allows_unscoped_physical_mapping_scopes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(
+                mappings=[
+                    ManualMapping(slot=0, enclosure_id="enc-a", serial="PHYSICAL-A"),
+                    ManualMapping(slot=0, enclosure_id="enc-b", serial="PHYSICAL-B"),
+                ]
+            )
+
+            preview = await service.preview_mapping_bundle(bundle)
+
+            self.assertEqual(
+                {(item["enclosure_id"], item["slot"]) for item in preview["additions"]},
+                {("enc-a", 0), ("enc-b", 0)},
+            )
+
+    async def test_preview_mapping_bundle_preserves_unscoped_zero_enclosure_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(mappings=[ManualMapping(slot=0, serial="LEGACY")])
+
+            preview = await service.preview_mapping_bundle(bundle)
+
+            self.assertEqual(preview["additions"][0]["enclosure_id"], None)
+            self.assertEqual(preview["additions"][0]["slot"], 0)
+
+    async def test_preview_mapping_bundle_rejects_virtual_mapping_conflict_before_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(
+                mappings=[
+                    ManualMapping(slot=0, enclosure_id="enc-a", serial="PHYSICAL"),
+                    ManualMapping(slot=1, enclosure_id="virtual-system:default", serial="UNSTABLE"),
+                ]
+            )
+            preview_replace_mappings = MagicMock(
+                wraps=service.mapping_store.preview_replace_mappings
+            )
+            service.mapping_store.preview_replace_mappings = preview_replace_mappings
+
+            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+                await service.preview_mapping_bundle(
+                    bundle,
+                    selected_enclosure_id="enc-a",
+                )
+
+            preview_replace_mappings.assert_not_called()
+
+    async def test_preview_mapping_bundle_rejects_virtual_inventory_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(mappings=[ManualMapping(slot=0, serial="UNSTABLE")])
+            before = service.mapping_store.load_all()
+
+            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+                await service.preview_mapping_bundle(
+                    bundle,
+                    selected_enclosure_id="virtual-system:default",
+                )
+
+            self.assertEqual(service.mapping_store.load_all(), before)
+
+    async def test_import_mapping_bundle_rejects_virtual_inventory_scope_without_persisting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            virtual_enclosure_id = "virtual-system:default"
+            bundle = MappingBundle(mappings=[ManualMapping(slot=0, serial="UNSTABLE")])
+            rewritten = service._rewrite_mapping_bundle(bundle, virtual_enclosure_id)
+            preview = service.mapping_store.preview_replace_mappings(
+                system.id,
+                virtual_enclosure_id,
+                rewritten,
+            )
+            before = service.mapping_store.load_all()
+
+            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+                await service.import_mapping_bundle(
+                    bundle,
+                    selected_enclosure_id=virtual_enclosure_id,
+                    expected_revision=preview["revision"],
+                    import_digest=preview["import_digest"],
+                )
+
+            self.assertEqual(service.mapping_store.load_all(), before)
 
     async def test_import_mapping_bundle_rejects_stale_preview_without_invalidating_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

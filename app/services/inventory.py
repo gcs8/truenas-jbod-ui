@@ -124,6 +124,10 @@ CacheValueT = TypeVar("CacheValueT")
 # horizon are evicted to keep the cache bounded.
 SMART_CACHE_STALE_RETENTION_TTL_MULTIPLIER = 12
 SMART_CACHE_STALE_RETENTION_FLOOR_SECONDS = 3600
+VIRTUAL_MAPPING_UNAVAILABLE_REASON = (
+    "Mapping import is unavailable because this system disk inventory has no identified "
+    "physical enclosure or stable physical slot identities."
+)
 
 logger = logging.getLogger(__name__)
 METRICS_SERVICE_NAME = "enclosure-ui"
@@ -350,7 +354,7 @@ def finalize_enclosure_option_labels(
     for option in options:
         raw_label = option.raw_label or option.label
         base_id, separator, _ = option.id.partition("::")
-        alias = enclosure_aliases.get(base_id)
+        alias = enclosure_aliases.get(base_id) if option.kind == "physical" else None
         label = raw_label
         if alias:
             if separator:
@@ -549,6 +553,7 @@ class _LayoutFrame:
     layout_columns: int
     slot_positions: dict[int, tuple[int, int]]
     allow_legacy_mapping_fallback: bool
+    loaded_mappings: dict[str, ManualMapping]
 
     def result(
         self,
@@ -881,6 +886,8 @@ class InventoryService:
         scope_name = str(scope or "auto").strip().lower()
         enclosure_scoped_kinds = {"bay", "backplane", "ses-enclosure", "mpr-enclosure", "expander"}
         if kind_name == "enclosure":
+            if object_text.startswith("virtual-system:"):
+                raise ValueError("Friendly enclosure names are available only for identified physical enclosures.")
             object_text = self._base_enclosure_id(object_text) or object_text
             enclosure_id = None
         else:
@@ -2893,6 +2900,11 @@ class InventoryService:
     ) -> ManualMapping:
         snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
+        if slot_view is not None and not slot_view.mapping_supported:
+            raise TrueNASAPIError(
+                slot_view.mapping_reason
+                or "Manual mapping is unavailable because this disk has no stable physical location."
+            )
         enclosure_id = slot_view.enclosure_id if slot_view else None
         mapping = ManualMapping(
             system_id=self.system.id,
@@ -2918,6 +2930,11 @@ class InventoryService:
     ) -> bool:
         snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
+        if slot_view is not None and not slot_view.mapping_supported:
+            raise TrueNASAPIError(
+                slot_view.mapping_reason
+                or "Manual mapping is unavailable because this disk has no stable physical location."
+            )
         enclosure_id = slot_view.enclosure_id if slot_view else None
         cleared = self.mapping_store.clear_mapping(
             self.system.id,
@@ -3463,11 +3480,27 @@ class InventoryService:
             )
         return rewritten
 
+    @staticmethod
+    def _require_physical_mapping_scope(
+        selected_enclosure_id: str | None,
+        bundle: MappingBundle,
+    ) -> None:
+        enclosure_ids = [
+            selected_enclosure_id,
+            *(mapping.enclosure_id for mapping in bundle.mappings),
+        ]
+        if any(
+            (normalize_text(enclosure_id) or "").startswith("virtual-system:")
+            for enclosure_id in enclosure_ids
+        ):
+            raise TrueNASAPIError(VIRTUAL_MAPPING_UNAVAILABLE_REASON)
+
     async def preview_mapping_bundle(
         self,
         bundle: MappingBundle,
         selected_enclosure_id: str | None = None,
     ) -> dict[str, Any]:
+        self._require_physical_mapping_scope(selected_enclosure_id, bundle)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
         preview = self.mapping_store.preview_replace_mappings(
             self.system.id,
@@ -3489,6 +3522,7 @@ class InventoryService:
         import_digest: str,
         invalidate_snapshot: bool = True,
     ) -> dict[str, Any]:
+        self._require_physical_mapping_scope(selected_enclosure_id, bundle)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
         result = self.mapping_store.apply_mapping_import(
             self.system.id,
@@ -3583,25 +3617,30 @@ class InventoryService:
 
         selected_option = option_by_id.get(resolved_enclosure_id) if resolved_enclosure_id else None
         with perf_stage("inventory.resolve_profile"):
-            selected_profile = self.profile_registry.resolve_for_enclosure(
-                self.system,
-                selected_option,
-                fallback_label=selected_option.label if selected_option else selected_meta.get("label"),
-                fallback_rows=len(layout_rows) if layout_rows else None,
-                fallback_columns=layout_columns or None,
-                fallback_slot_count=layout_slot_count or None,
-                fallback_slot_layout=layout_rows or None,
-            )
+            selected_profile = None
+            if selected_option is None or selected_option.kind == "physical":
+                selected_profile = self.profile_registry.resolve_for_enclosure(
+                    self.system,
+                    selected_option,
+                    fallback_label=selected_option.label if selected_option else selected_meta.get("label"),
+                    fallback_rows=len(layout_rows) if layout_rows else None,
+                    fallback_columns=layout_columns or None,
+                    fallback_slot_count=layout_slot_count or None,
+                    fallback_slot_layout=layout_rows or None,
+                )
         selected_slot = None
         if resolved_enclosure_id:
             selected_slot = next((slot for slot in slots if slot.enclosure_id == resolved_enclosure_id), None)
         if selected_slot is None:
             selected_slot = next((slot for slot in slots if slot.enclosure_id), slots[0] if slots else None)
 
+        physical_enclosure_count = sum(
+            1 for enclosure in available_enclosures if enclosure.kind == "physical"
+        )
         if self.system.truenas.platform in {"linux", "esxi"}:
             disk_count = sum(1 for slot in slots if slot.device_name)
             pool_count = len({slot.pool_name for slot in slots if slot.pool_name})
-            enclosure_count = len(available_enclosures)
+            enclosure_count = physical_enclosure_count
             ssh_slot_hint_count = max(
                 len((selected_profile.slot_hints if selected_profile else {}) or {}),
                 sum(1 for slot in slots if slot.smart_device_names),
@@ -3609,17 +3648,17 @@ class InventoryService:
         elif self.system.truenas.platform == "ipmi":
             disk_count = sum(1 for slot in slots if slot.device_name)
             pool_count = 0
-            enclosure_count = len(available_enclosures)
+            enclosure_count = physical_enclosure_count
             ssh_slot_hint_count = len((selected_profile.slot_hints if selected_profile else {}) or {})
         elif self.system.truenas.platform == "quantastor":
             disk_count = len(raw_data.disks)
             pool_count = len(raw_data.pools)
-            enclosure_count = len(available_enclosures)
+            enclosure_count = physical_enclosure_count
             ssh_slot_hint_count = 0
         else:
             disk_count = len(raw_data.disks)
             pool_count = len(raw_data.pools)
-            enclosure_count = max(len(raw_data.enclosures), len(available_enclosures))
+            enclosure_count = max(len(raw_data.enclosures), physical_enclosure_count)
             ssh_slot_hint_count = max(
                 len(ssh_data.ses_slot_candidates),
                 sum(len(enclosure.slots) for enclosure in ssh_data.ses_enclosures),
@@ -3656,7 +3695,11 @@ class InventoryService:
             disk_count=disk_count,
             pool_count=pool_count,
             enclosure_count=enclosure_count,
-            mapped_slot_count=sum(1 for slot in slots if slot.device_name),
+            mapped_slot_count=sum(
+                1
+                for slot in slots
+                if slot.device_name and not slot.raw_status.get("virtual_enclosure")
+            ),
             manual_mapping_count=self.mapping_store.count_for_system(self.system.id),
             ssh_slot_hint_count=ssh_slot_hint_count,
         )
@@ -3735,7 +3778,10 @@ class InventoryService:
         ssh_enabled = bool(self.system.ssh.enabled)
         bmc_enabled = bool(self.system.bmc.enabled)
         disk_or_slot_count = max(summary.disk_count, summary.mapped_slot_count)
-        has_enclosures = bool(available_enclosures or summary.enclosure_count)
+        has_enclosures = bool(
+            any(option.kind == "physical" for option in available_enclosures)
+            or summary.enclosure_count
+        )
         has_mapped_slots = summary.mapped_slot_count > 0
         has_profile = selected_profile is not None
         has_led_slots = any(slot.led_supported for slot in slots)
@@ -4049,6 +4095,20 @@ class InventoryService:
             else fallback_slot_count
         )
         layout_slot_count = infer_slot_count_from_layout(layout_rows, layout_count_fallback)
+        slot_positions = layout_slot_positions(layout_rows)
+        # #260 pins one mapping load per correlation pass, so the entries are
+        # loaded here and read back off the frame by every caller.
+        loaded_mappings = self.mapping_store.load_all()
+        if not allow_legacy_mapping_fallback:
+            self._warn_unapplied_legacy_mappings(
+                warnings,
+                # Drawer sub-views resolve mappings against the base shelf id,
+                # so the probe has to use the same key the correlator uses.
+                self._base_enclosure_id(resolved_meta.get("id")),
+                slot_positions,
+                loaded_mappings,
+                no_identified_physical_enclosure=not available_enclosures,
+            )
         return _LayoutFrame(
             available_enclosures=available_enclosures,
             selected_option=selected_option,
@@ -4057,8 +4117,9 @@ class InventoryService:
             layout_rows=layout_rows,
             layout_slot_count=layout_slot_count,
             layout_columns=layout_columns,
-            slot_positions=layout_slot_positions(layout_rows),
+            slot_positions=slot_positions,
             allow_legacy_mapping_fallback=allow_legacy_mapping_fallback,
+            loaded_mappings=loaded_mappings,
         )
 
     def _correlate(
@@ -4115,6 +4176,19 @@ class InventoryService:
             api_enclosure_ids.add(api_selected_meta["id"])
         slot_candidates = merge_slot_candidate_maps(ssh_data.ses_slot_candidates, api_candidates)
         api_topology_members = parse_pool_query_topology(raw_data.pools)
+        disk_records = self._build_disk_records(
+            raw_data.disks,
+            ssh_data,
+            raw_data.disk_temperatures,
+            parse_smart_test_results(raw_data.smart_test_results),
+        )
+        if not available_enclosures and disk_records:
+            return self._build_system_disk_virtual_enclosure(
+                disk_records,
+                ssh_data,
+                api_topology_members,
+                warnings,
+            )
         frame = self._resolve_layout_frame(
             available_enclosures,
             selected_enclosure_id,
@@ -4126,19 +4200,13 @@ class InventoryService:
         if not isinstance(frame, _LayoutFrame):
             return frame
         allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
-        disk_records = self._build_disk_records(
-            raw_data.disks,
-            ssh_data,
-            raw_data.disk_temperatures,
-            parse_smart_test_results(raw_data.smart_test_results),
-        )
 
         disks_by_key, disks_by_slot, disks_by_sas = _index_disk_records(
             disk_records,
             self.system.truenas.platform,
         )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
 
         slot_views: list[SlotView] = []
 
@@ -4190,6 +4258,81 @@ class InventoryService:
             slot_views.append(slot_view)
 
         return frame.result(slot_views)
+
+    def _build_system_disk_virtual_enclosure(
+        self,
+        disk_records: list[DiskRecord],
+        ssh_data: ParsedSSHData,
+        api_topology_members: dict[str, Any],
+        warnings: list[str],
+    ) -> _CorrelationResult:
+        """Render known disks without inventing physical enclosure or slot identity."""
+        virtual_id = f"virtual-system:{self.system.id}"
+        virtual_label = "System disk inventory (virtual)"
+        disk_count = len(disk_records)
+        layout_rows: list[list[int | None]] = [list(range(disk_count))]
+        option = EnclosureOption(
+            id=virtual_id,
+            label=virtual_label,
+            kind="virtual",
+            rows=1,
+            columns=disk_count,
+            slot_count=disk_count,
+            slot_layout=layout_rows,
+        )
+        selected_meta = {
+            "id": virtual_id,
+            "label": virtual_label,
+            "name": None,
+        }
+        loaded_mappings = self.mapping_store.load_all()
+        self._warn_unapplied_legacy_mappings(
+            warnings,
+            None,
+            {mapping.slot for mapping in loaded_mappings.values()},
+            loaded_mappings,
+            no_identified_physical_enclosure=True,
+        )
+
+        slots: list[SlotView] = []
+        for index, disk in enumerate(disk_records):
+            slot = self._build_slot_view(
+                slot=index,
+                row_index=0,
+                column_index=index,
+                enclosure_meta=selected_meta,
+                raw_slot_status={
+                    "virtual_enclosure": True,
+                    "physical_location_known": False,
+                },
+                disk=disk,
+                mapping=None,
+                ssh_data=ssh_data,
+                api_topology_members=api_topology_members,
+                api_enclosure_ids=set(),
+                resolution_source="system-inventory",
+            )
+            slots.append(
+                slot.model_copy(
+                    update={
+                        "slot_label": f"Disk {index + 1}",
+                        "led_supported": False,
+                        "led_backend": None,
+                        "led_reason": (
+                            "Identify unavailable because no physical enclosure or slot location was identified."
+                        ),
+                        "physical_location_known": False,
+                        "mapping_source": "system-inventory",
+                        "mapping_supported": False,
+                        "mapping_reason": (
+                            "Manual mapping is unavailable because this system disk has no identified physical "
+                            "enclosure or stable physical location."
+                        ),
+                    }
+                )
+            )
+
+        return slots, [option], selected_meta, layout_rows, disk_count, disk_count
 
     def _build_storage_view_candidate_records(
         self,
@@ -4442,7 +4585,7 @@ class InventoryService:
                 disks_by_slot[(None, vendor_slot)] = disk
 
         linux_topology_members = self._build_linux_topology_members(disk_records)
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
         selected_meta = frame.selected_meta
         vendor_slot_candidates = self._build_linux_vendor_slot_candidates(ssh_data, selected_option)
@@ -4607,7 +4750,7 @@ class InventoryService:
             for disk in bmc_disk_records
             if isinstance(disk.slot, int)
         }
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
         for slot in range(frame.layout_slot_count):
             row_index, column_index = _slot_grid_position(
@@ -4773,7 +4916,7 @@ class InventoryService:
             )
 
         empty_ssh = ParsedSSHData()
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
         for slot in range(frame.layout_slot_count):
             row_index, column_index = _slot_grid_position(
@@ -4920,7 +5063,7 @@ class InventoryService:
         )
         if is_sub_view:
             slot_count = len(slots_to_render)
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
 
         for slot in slots_to_render:
@@ -5029,7 +5172,7 @@ class InventoryService:
             frame.layout_slot_count,
             selected_profile.id,
         )
-        loaded_mappings = self.mapping_store.load_all()
+        loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
 
         for slot in range(frame.layout_slot_count):
@@ -8440,6 +8583,53 @@ class InventoryService:
         )
         return finalize_enclosure_option_labels(options, aliases)
 
+    def _warn_unapplied_legacy_mappings(
+        self,
+        warnings: list[str],
+        enclosure_id: str | None,
+        slot_ids: Iterable[int],
+        loaded_mappings: dict[str, ManualMapping],
+        *,
+        no_identified_physical_enclosure: bool = False,
+    ) -> None:
+        """Warn once per snapshot when legacy mapping rows cannot be applied."""
+        if not loaded_mappings:
+            return
+        unapplied = sum(
+            1
+            for slot in slot_ids
+            if self.mapping_store.has_legacy_only_mapping(
+                self.system.id,
+                enclosure_id,
+                slot,
+                loaded_entries=loaded_mappings,
+            )
+        )
+        if not unapplied:
+            return
+        noun, verb, auxiliary = (
+            ("mapping", "uses", "was") if unapplied == 1 else ("mappings", "use", "were")
+        )
+        if no_identified_physical_enclosure:
+            warnings.append(
+                f"{unapplied} manual {noun} {verb} the legacy unscoped format and "
+                f"{auxiliary} not applied because this system has no identified physical enclosure. "
+                "Disks are shown in a system-scoped virtual inventory without physical bay or slot "
+                "attribution. Re-save each affected mapping after selecting its discovered physical "
+                "enclosure."
+            )
+            return
+        scope = (
+            "multi-system deployment"
+            if len(self.settings.systems) > 1
+            else "multi-enclosure system"
+        )
+        warnings.append(
+            f"{unapplied} manual {noun} {verb} the legacy unscoped format and "
+            f"{auxiliary} not applied on this {scope}. Re-save each affected "
+            "mapping to scope it."
+        )
+
     @staticmethod
     def _base_enclosure_id(option_id: str | None) -> str | None:
         if not option_id:
@@ -8453,10 +8643,18 @@ class InventoryService:
         base_enclosure_ids = {
             base_id
             for option in available_enclosures
-            if (base_id := self._base_enclosure_id(option.id))
+            if option.kind == "physical"
+            and (base_id := self._base_enclosure_id(option.id))
         }
+        has_only_physical_options = all(
+            option.kind == "physical" for option in available_enclosures
+        )
         configured_system_count = max(1, len(self.settings.systems))
-        return configured_system_count == 1 and len(base_enclosure_ids) == 1
+        return (
+            configured_system_count == 1
+            and has_only_physical_options
+            and len(base_enclosure_ids) == 1
+        )
 
     @staticmethod
     def _enclosure_option_meta(option: EnclosureOption) -> dict[str, str | None]:

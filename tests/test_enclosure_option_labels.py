@@ -143,6 +143,21 @@ class EnclosureAliasOptionLabelTests(unittest.TestCase):
         self.assertEqual([option.label for option in resolved], ["Archive", "Archive"])
         self.assertEqual([option.raw_label for option in resolved], ["Dell MD1280 84 Bay", "Dell MD1280 84 Bay"])
 
+    def test_virtual_enclosure_ignores_persisted_physical_enclosure_alias(self) -> None:
+        virtual = _option(
+            "virtual-system:system-a",
+            "System disk inventory (virtual)",
+            kind="virtual",
+        )
+
+        [resolved] = finalize_enclosure_option_labels(
+            [virtual],
+            [self._alias("virtual-system:system-a", "Rack Alias")],
+        )
+
+        self.assertEqual(resolved.label, "System disk inventory (virtual)")
+        self.assertIsNone(resolved.alias)
+
     def test_save_and_clear_use_base_enclosure_id_and_system_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SasFabricAliasStore(Path(temp_dir) / "sas_fabric_aliases.json")
@@ -176,6 +191,26 @@ class EnclosureAliasOptionLabelTests(unittest.TestCase):
 
             self.assertTrue(cleared["cleared"])
             self.assertEqual(store.list_aliases("system-a"), [])
+
+    def test_virtual_enclosure_alias_cannot_be_persisted_as_physical(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SasFabricAliasStore(Path(temp_dir) / "sas_fabric_aliases.json")
+            service = object.__new__(InventoryService)
+            service.system = SystemConfig(id="system-a", truenas=TrueNASConfig(platform="core"))
+            service.sas_fabric_alias_store = store
+            service.invalidate_physical_enclosure_snapshot_cache = Mock()
+
+            with self.assertRaisesRegex(ValueError, "physical enclosures"):
+                service.save_sas_fabric_alias(
+                    object_id="virtual-system:system-a",
+                    object_kind="enclosure",
+                    label="Rack Alias",
+                    selected_enclosure_id="virtual-system:system-a",
+                    scope="system",
+                )
+
+            self.assertEqual(store.list_aliases("system-a"), [])
+            service.invalidate_physical_enclosure_snapshot_cache.assert_not_called()
 
     def test_unreadable_alias_store_falls_back_to_inferred_labels_and_tails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -99,6 +99,29 @@ class MappingStore:
             return candidate
         return None
 
+    def has_legacy_only_mapping(
+        self,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        loaded_entries: Mapping[str, ManualMapping] | None = None,
+    ) -> bool:
+        """Report whether this bay has a legacy row and no exact scoped row."""
+        current = self.load_all() if loaded_entries is None else loaded_entries
+        if self.get_mapping(system_id, enclosure_id, slot, loaded_entries=current) is not None:
+            return False
+        return (
+            self.get_mapping(
+                system_id,
+                enclosure_id,
+                slot,
+                allow_legacy_fallback=True,
+                loaded_entries=current,
+            )
+            is not None
+        )
+
     def count_for_system(self, system_id: str | None) -> int:
         mappings = self.load_all()
         if not system_id:

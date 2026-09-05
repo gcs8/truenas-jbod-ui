@@ -25,6 +25,12 @@ complete release-note draft.
   enclosure discovery alone fails. The API source now reports degraded and a
   failed query cannot replace the last trusted enclosure topology with a blank
   shelf (#292).
+- Restricted legacy unscoped manual mappings to one configured system with exactly
+  one discovered physical enclosure. When disks are visible but no physical
+  enclosure is identified, they now appear in a system-scoped virtual inventory
+  without physical bay or slot attribution; affected legacy mappings remain
+  stored and must be re-saved after selecting the discovered physical enclosure
+  (#249, #293).
 
 ### Fixed
 
