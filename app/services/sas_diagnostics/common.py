@@ -39,6 +39,44 @@ FAULT_FAMILY_LABELS = {
     "scsi_command": "SCSI command",
 }
 
+FAULT_FAMILY_SEVERITIES = {
+    family: "error"
+    for family in {
+        "sas_protocol",
+        "link_loss",
+        "timeout",
+        "controller_terminated_io",
+        "controller_configuration",
+        "sas_transport",
+        "ses_enclosure",
+        "logical_unit_communication",
+        "target_failure",
+        "pcie_fabric",
+        "data_buffer_error",
+        "write_error",
+        "read_error",
+        "medium_format",
+    }
+} | {
+    family: "warning"
+    for family in {
+        "cam_error",
+        "bus_reset",
+        "scsi_status",
+        "retry",
+        "aborted_command",
+        "device_path_exception",
+        "protection_error",
+        "recovered_data",
+        "write_protect",
+        "failure_prediction",
+        "log_exception",
+        "power_condition",
+        "unit_attention",
+        "enclosure_warning",
+    }
+}
+
 
 def fault_family_priority(family: str) -> int:
     priorities = {
@@ -82,40 +120,7 @@ def fault_family_priority(family: str) -> int:
 
 
 def fault_family_severity(family: str) -> str:
-    if family in {
-        "sas_protocol",
-        "link_loss",
-        "timeout",
-        "controller_terminated_io",
-        "controller_configuration",
-        "sas_transport",
-        "ses_enclosure",
-        "logical_unit_communication",
-        "target_failure",
-        "pcie_fabric",
-        "data_buffer_error",
-        "write_error",
-        "read_error",
-    }:
-        return "error"
-    if family in {
-        "cam_error",
-        "bus_reset",
-        "scsi_status",
-        "retry",
-        "aborted_command",
-        "device_path_exception",
-        "protection_error",
-        "recovered_data",
-        "write_protect",
-        "failure_prediction",
-        "log_exception",
-        "power_condition",
-        "unit_attention",
-        "enclosure_warning",
-    }:
-        return "warning"
-    return "info"
+    return FAULT_FAMILY_SEVERITIES.get(family, "info")
 
 
 def severity_rank(severity: str | None) -> int:
