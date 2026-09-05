@@ -1505,6 +1505,7 @@ ses0:
             slots={
                 3: SESMapSlot(
                     slot_number=3,
+                    slot_number_source="ses_device_slot_number",
                     present=False,
                     presence_source="sg_ses_aes",
                     sas_address="0",
@@ -1520,6 +1521,89 @@ ses0:
         self.assertEqual(slot.presence_source, "enclosure_sysfs")
         self.assertEqual(slot.device_names, ["sdb"])
         self.assertEqual(slot.device_names_source, "enclosure_sysfs")
+
+    def test_sysfs_device_binding_skips_slots_not_keyed_by_device_slot_number(self) -> None:
+        # The kernel `slot` attribute is the SES device slot number. Slots
+        # keyed by an EC element index (no source) or by an invalid AES
+        # descriptor's element index share no coordinate with it, so the
+        # hint has no bay to land on (issue #276).
+        enclosure = SESMapEnclosure(
+            ses_device="/dev/sg4",
+            slots={
+                1: SESMapSlot(slot_number=1, element_id=1, present=True, presence_source="sg_ses_ec"),
+                2: SESMapSlot(
+                    slot_number=2,
+                    element_id=2,
+                    slot_number_source="ses_element_index_invalid_descriptor",
+                    present=False,
+                    presence_source="sg_ses_aes",
+                ),
+                3: SESMapSlot(slot_number=3, element_id=2, slot_number_source="ses_description"),
+                4: SESMapSlot(slot_number=4, element_id=3, slot_number_source="ses_device_slot_number"),
+            },
+        )
+
+        _apply_enclosure_sysfs_device_names(
+            [enclosure],
+            {"sg4": {1: ["sda"], 2: ["sdb"], 3: ["sdc"], 4: ["sdd"]}},
+        )
+
+        self.assertEqual(enclosure.slots[1].device_names, [])
+        self.assertIsNone(enclosure.slots[1].device_names_source)
+        self.assertEqual(enclosure.slots[2].device_names, [])
+        self.assertIs(enclosure.slots[2].present, False)
+        self.assertEqual(enclosure.slots[2].presence_source, "sg_ses_aes")
+        # `SlotNN` descriptor text has no checked-in evidence of equalling the
+        # device slot number, so it is not a joinable coordinate either.
+        self.assertEqual(enclosure.slots[3].device_names, [])
+        self.assertEqual(enclosure.slots[4].device_names, ["sdd"])
+        self.assertEqual(enclosure.slots[4].device_names_source, "enclosure_sysfs")
+        # Every dropped binding is counted once for its SES path; the placed
+        # one is not.
+        self.assertEqual(enclosure.unplaced_sysfs_bindings_by_ses_device, {"/dev/sg4": 3})
+
+    def test_merged_ses_sysfs_warnings_keep_path_counts_and_secondary_placements(self) -> None:
+        enclosure = SESMapEnclosure(
+            ses_device="/dev/sg10",
+            ses_devices=["/dev/sg10", "/dev/sg2"],
+            slots={
+                0: SESMapSlot(slot_number=0, element_id=0, presence_source="sg_ses_ec"),
+                1: SESMapSlot(
+                    slot_number=1,
+                    element_id=1,
+                    slot_number_source="ses_device_slot_number",
+                ),
+            },
+        )
+
+        _apply_enclosure_sysfs_device_names(
+            [enclosure],
+            {
+                "sg10": {0: ["sda"], 1: ["sdb"]},
+                "sg2": {0: ["sdc"], 1: ["sdd"], 2: ["sde"]},
+            },
+        )
+        _, selected = build_slot_candidates_from_ses_enclosures(
+            [enclosure],
+            2,
+            None,
+            enclosures_are_merged=True,
+        )
+
+        self.assertEqual(enclosure.slots[1].device_names, ["sdb", "sdd"])
+        self.assertEqual(
+            enclosure.unplaced_sysfs_bindings_by_ses_device,
+            {"/dev/sg10": 1, "/dev/sg2": 2},
+        )
+        self.assertEqual(
+            [warning for warning in selected["warnings"] if "Kernel enclosure bindings" in warning],
+            [
+                "Kernel enclosure bindings for /dev/sg2 could not be placed: "
+                "SES reported no device slot numbers for 2 bound devices.",
+                "Kernel enclosure bindings for /dev/sg10 could not be placed: "
+                "SES reported no device slot numbers for 1 bound device.",
+            ],
+        )
 
     def test_candidate_map_keeps_stronger_empty_presence_in_any_merge_order(self) -> None:
         strong = {
@@ -2650,6 +2734,24 @@ Additional element status diagnostic page:
         self.assertTrue(
             any("shared SAS address" in warning for warning in parsed.ses_selected_meta.get("warnings") or [])
         )
+
+    def test_parse_ssh_outputs_keeps_sysfs_bindings_from_every_merged_ses_path(self) -> None:
+        parsed = parse_ssh_outputs(
+            {
+                "sudo -n /usr/bin/sg_ses -p aes /dev/sg84": self.SHARED_ADDRESS_AES,
+                "sudo -n /usr/bin/sg_ses -p aes /dev/sg85": self.SHARED_ADDRESS_AES,
+                "for c in /sys/class/enclosure/*/*; do printf x; done": (
+                    "13:0:0:0|sg85 |1|1|sdz"
+                ),
+            },
+            4,
+            None,
+            None,
+        )
+
+        self.assertEqual(len(parsed.ses_enclosures), 1)
+        self.assertEqual(parsed.ses_slot_candidates[1]["device_names"], ["sdz"])
+        self.assertEqual(parsed.ses_slot_to_device[1], "sdz")
 
     def test_parse_ssh_outputs_keeps_unique_aes_addresses_unflagged(self) -> None:
         output = """

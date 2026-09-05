@@ -1,0 +1,46 @@
+  SYNTH     OFFSET1BASED      0100
+Enclosure Status diagnostic page:
+  INVOP=0, INFO=0, NON-CRIT=0, CRIT=0, UNRECOV=0
+  generation code: 0x0
+  status descriptor list
+    Element type: Array device slot, subenclosure id: 0 [ti=0]
+      Overall descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: Unsupported
+        OK=0, Reserved device=0, Hot spare=0, Cons check=0
+        In crit array=0, In failed array=0, Rebuild/remap=0, R/R abort=0
+        App client bypass A=0, Do not remove=0, Enc bypass A=0, Enc bypass B=0
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+        App client bypass B=0, Fault sensed=0, Fault reqstd=0, Device off=0
+        Bypassed A=0, Bypassed B=0, Dev bypassed A=0, Dev bypassed B=0
+      Element 0 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+        OK=0, Reserved device=0, Hot spare=0, Cons check=0
+        In crit array=0, In failed array=0, Rebuild/remap=0, R/R abort=0
+        App client bypass A=0, Do not remove=0, Enc bypass A=0, Enc bypass B=0
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+        App client bypass B=0, Fault sensed=0, Fault reqstd=0, Device off=0
+        Bypassed A=0, Bypassed B=0, Dev bypassed A=0, Dev bypassed B=0
+      Element 1 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+        OK=0, Reserved device=0, Hot spare=0, Cons check=0
+        In crit array=0, In failed array=0, Rebuild/remap=0, R/R abort=0
+        App client bypass A=0, Do not remove=0, Enc bypass A=0, Enc bypass B=0
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+        App client bypass B=0, Fault sensed=0, Fault reqstd=0, Device off=0
+        Bypassed A=0, Bypassed B=0, Dev bypassed A=0, Dev bypassed B=0
+      Element 2 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: Not installed
+        OK=0, Reserved device=0, Hot spare=0, Cons check=0
+        In crit array=0, In failed array=0, Rebuild/remap=0, R/R abort=0
+        App client bypass A=0, Do not remove=0, Enc bypass A=0, Enc bypass B=0
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+        App client bypass B=0, Fault sensed=0, Fault reqstd=0, Device off=0
+        Bypassed A=0, Bypassed B=0, Dev bypassed A=0, Dev bypassed B=0
+      Element 3 descriptor:
+        Predicted failure=0, Disabled=0, Swap=0, status: OK
+        OK=0, Reserved device=0, Hot spare=0, Cons check=0
+        In crit array=0, In failed array=0, Rebuild/remap=0, R/R abort=0
+        App client bypass A=0, Do not remove=0, Enc bypass A=0, Enc bypass B=0
+        Ready to insert=0, RMV=0, Ident=0, Report=0
+        App client bypass B=0, Fault sensed=0, Fault reqstd=0, Device off=0
+        Bypassed A=0, Bypassed B=0, Dev bypassed A=0, Dev bypassed B=0

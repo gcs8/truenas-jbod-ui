@@ -117,6 +117,86 @@ class InventoryHelpersTests(unittest.TestCase):
             {"enclosure_name": "overlay"},
         )
 
+    def test_first_ses_overlay_preserves_secondary_path_unplaced_binding_warning(self) -> None:
+        overlay = ParsedSSHData(
+            ses_enclosures=[
+                SESMapEnclosure(
+                    ses_device="/dev/sg84",
+                    ses_devices=["/dev/sg84", "/dev/sg85"],
+                    enclosure_id="enc-a",
+                    slots={0: SESMapSlot(slot_number=0, slot_number_source="ses_device_slot_number")},
+                    unplaced_sysfs_bindings_by_ses_device={"/dev/sg85": 2},
+                )
+            ]
+        )
+
+        merged = InventoryService._merge_ses_overlay_data(ParsedSSHData(), overlay)
+        _, selected = build_slot_candidates_from_ses_enclosures(
+            merged.ses_enclosures,
+            1,
+            None,
+            enclosures_are_merged=True,
+        )
+
+        self.assertEqual(
+            merged.ses_enclosures[0].unplaced_sysfs_bindings_by_ses_device,
+            {"/dev/sg85": 2},
+        )
+        self.assertEqual(
+            [warning for warning in selected["warnings"] if "Kernel enclosure bindings" in warning],
+            [
+                "Kernel enclosure bindings for /dev/sg85 could not be placed: "
+                "SES reported no device slot numbers for 2 bound devices."
+            ],
+        )
+
+    def test_subsequent_ses_overlay_combines_unplaced_binding_counts_per_path(self) -> None:
+        base = ParsedSSHData(
+            ses_enclosures=[
+                SESMapEnclosure(
+                    ses_device="/dev/sg84",
+                    enclosure_id="enc-a",
+                    slots={0: SESMapSlot(slot_number=0, slot_number_source="ses_device_slot_number")},
+                    unplaced_sysfs_bindings_by_ses_device={"/dev/sg84": 1},
+                )
+            ]
+        )
+        overlay = ParsedSSHData(
+            ses_enclosures=[
+                SESMapEnclosure(
+                    ses_device="/dev/sg85",
+                    enclosure_id="enc-a",
+                    slots={0: SESMapSlot(slot_number=0, slot_number_source="ses_device_slot_number")},
+                    unplaced_sysfs_bindings_by_ses_device={
+                        "/dev/sg84": 2,
+                        "/dev/sg85": 3,
+                    },
+                )
+            ]
+        )
+
+        merged = InventoryService._merge_ses_overlay_data(base, overlay)
+        _, selected = build_slot_candidates_from_ses_enclosures(
+            merged.ses_enclosures,
+            1,
+            None,
+            enclosures_are_merged=True,
+        )
+
+        self.assertEqual(
+            merged.ses_enclosures[0].unplaced_sysfs_bindings_by_ses_device,
+            {"/dev/sg84": 3, "/dev/sg85": 3},
+        )
+        self.assertEqual(
+            [warning for warning in selected["warnings"] if "Kernel enclosure bindings" in warning],
+            [
+                "Kernel enclosure bindings for /dev/sg84 could not be placed: "
+                "SES reported no device slot numbers for 3 bound devices.",
+                "Kernel enclosure bindings for /dev/sg85 could not be placed: "
+                "SES reported no device slot numbers for 3 bound devices.",
+            ],
+        )
+
     def test_all_platform_correlators_route_through_shared_scaffolding(self) -> None:
         self.assertTrue(hasattr(inventory_module, "_LayoutFrame"))
         self.assertTrue(hasattr(InventoryService, "_resolve_layout_frame"))
