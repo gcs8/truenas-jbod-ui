@@ -413,8 +413,7 @@ class HistoryStore:
                 raise ValueError(f"History {label} mode must be between 0000 and 0777.")
             if mode & 0o002:
                 raise ValueError(f"History {label} mode must not be world-writable.")
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        self._normalize_shared_path_permissions(self.file_path.parent, is_dir=True)
+        self._ensure_database_parent()
         self._lock = threading.Lock()
         self._journal_mode_lock = threading.Lock()
         self._journal_mode_identity: tuple[int, int] | None = None
@@ -425,6 +424,17 @@ class HistoryStore:
             with history_write_lock(self.file_path, blocking=False):
                 self._require_no_pending_lifecycle_markers()
                 self._initialize(migration_lock_held=True)
+
+    def _ensure_database_parent(self) -> None:
+        try:
+            self.file_path.parent.mkdir(
+                mode=self.shared_dir_mode,
+                parents=True,
+            )
+        except FileExistsError:
+            self._normalize_shared_path_permissions(self.file_path.parent, is_dir=True)
+            return
+        self._set_shared_path_permissions(self.file_path.parent, is_dir=True)
 
     def _require_no_pending_lifecycle_markers(self) -> None:
         """
@@ -759,8 +769,34 @@ class HistoryStore:
             self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
 
     def _initialize_schema_and_permissions(self, *, migration_lock_held: bool = False) -> None:
+        self._create_database_file_for_shared_access()
         self._initialize_schema(migration_lock_held=migration_lock_held)
         self._normalize_database_permissions()
+
+    def _create_database_file_for_shared_access(self) -> None:
+        # SQLite derives new WAL/SHM ownership and modes from the main database.
+        # Publish the fresh database before the first SQLite connection opens it.
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(self.file_path, flags, self.shared_file_mode)
+        except FileExistsError:
+            return
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(
+                    f"History shared database creation refuses non-regular path {self.file_path}."
+                )
+            if stat.S_IMODE(metadata.st_mode) != self.shared_file_mode:
+                os.fchmod(descriptor, self.shared_file_mode)
+        finally:
+            os.close(descriptor)
 
     def _initialize_schema(self, *, migration_lock_held: bool = False) -> None:
         with closing(self._connect(migration_lock_held=migration_lock_held)) as connection:
@@ -2625,6 +2661,9 @@ class HistoryStore:
     def _normalize_shared_path_permissions(self, path: Path, *, is_dir: bool | None = None) -> None:
         if not self.permission_repair_enabled:
             return
+        self._set_shared_path_permissions(path, is_dir=is_dir)
+
+    def _set_shared_path_permissions(self, path: Path, *, is_dir: bool | None = None) -> None:
         try:
             initial_metadata = path.lstat()
         except FileNotFoundError:

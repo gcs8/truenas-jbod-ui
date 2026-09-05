@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
@@ -1393,6 +1394,58 @@ class HistoryStoreTests(unittest.TestCase):
                     connection = store._connect()
                     connection.close()
 
+    def test_new_store_publishes_fresh_database_and_live_sidecars_with_shared_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "history"
+            db_path = root / "history.db"
+            open_connections: list[sqlite3.Connection] = []
+            original_connect = sqlite3.connect
+
+            class HeldOpenConnection:
+                def __init__(self, connection: sqlite3.Connection) -> None:
+                    self.connection = connection
+
+                @property
+                def row_factory(self) -> object:
+                    return self.connection.row_factory
+
+                @row_factory.setter
+                def row_factory(self, value: object) -> None:
+                    self.connection.row_factory = value  # type: ignore[assignment]
+
+                def close(self) -> None:
+                    pass
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(self.connection, name)
+
+            def held_open_connect(*args: object, **kwargs: object) -> HeldOpenConnection:
+                connection = original_connect(*args, **kwargs)  # type: ignore[arg-type]
+                open_connections.append(connection)
+                return HeldOpenConnection(connection)
+
+            previous_umask = os.umask(0o022)
+            try:
+                with patch("history_service.store.sqlite3.connect", side_effect=held_open_connect):
+                    HistoryStore(
+                        str(db_path),
+                        permission_repair_enabled=False,
+                        shared_dir_mode=0o770,
+                        shared_file_mode=0o660,
+                    )
+
+                expected_owner = (os.geteuid(), os.getegid())
+                self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o770)
+                for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+                    with self.subTest(path=path):
+                        metadata = path.stat()
+                        self.assertEqual((metadata.st_uid, metadata.st_gid), expected_owner)
+                        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o660)
+            finally:
+                for connection in open_connections:
+                    connection.close()
+                os.umask(previous_umask)
+
     def test_default_store_does_not_widen_existing_database_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "history"
@@ -1401,7 +1454,16 @@ class HistoryStoreTests(unittest.TestCase):
             db_path.write_bytes(b"")
             db_path.chmod(0o640)
 
-            HistoryStore(str(db_path))
+            previous_umask = os.umask(0o022)
+            try:
+                HistoryStore(
+                    str(db_path),
+                    permission_repair_enabled=False,
+                    shared_dir_mode=0o770,
+                    shared_file_mode=0o660,
+                )
+            finally:
+                os.umask(previous_umask)
 
             self.assertEqual(root.stat().st_mode & 0o777, 0o750)
             self.assertEqual(db_path.stat().st_mode & 0o777, 0o640)
