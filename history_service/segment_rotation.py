@@ -18,6 +18,7 @@ from history_service.scheduled_backup import read_scheduled_backup_status
 from history_service.segment_catalog import activation_pending_path, path_entry_exists
 from history_service.segment_migration import (
     _fsync_directory,
+    _raise_for_unreferenced_segment_temporaries,
     _remove_authenticated_orphan_segment,
     _sha256_file,
     _stage_hot_replacement,
@@ -853,6 +854,10 @@ def _recover_pending_rotation_locked(
     if apply:
         segments_directory = _prepare_output_directory(segments_directory, source_metadata)
     if not path_entry_exists(journal_path):
+        _raise_for_unreferenced_segment_temporaries(
+            segments_directory,
+            label="Segment rotation",
+        )
         catalog_path, catalog, catalog_record = _validated_catalog(source, segments_directory)
         candidate_generation_id, _, _ = _next_generation(catalog)
         prior_generation_id = str(catalog["generation_id"])
@@ -927,6 +932,16 @@ def _recover_pending_rotation_locked(
         or not isinstance(rollback_catalog_record, dict)
     ):
         raise ValueError("Segment rotation journal is invalid.")
+    referenced_segment_path: Path | None = None
+    if isinstance(new_segment_record, dict):
+        file_name = new_segment_record.get("file_name")
+        if isinstance(file_name, str) and Path(file_name).name == file_name:
+            referenced_segment_path = segments_directory / file_name
+    _raise_for_unreferenced_segment_temporaries(
+        segments_directory,
+        label="Segment rotation",
+        referenced_segment_path=referenced_segment_path,
+    )
     expected_staged_hot = (
         _record_path(source.parent, staged_hot_record, label="staged hot")
         if isinstance(staged_hot_record, dict)

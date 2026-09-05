@@ -1190,6 +1190,69 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
             self.assertFalse(rollback_hot.exists())
             self.assertFalse(rollback_catalog.exists())
 
+    def test_recovery_reports_segment_temp_left_by_process_kill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_generation_0001(source, segments_directory)
+            self._append_event(source, "generation-2-sealed", "2025-01-02T12:00:00+00:00")
+            backup_directory, backup_status_path = self._create_full_backup_evidence(root)
+            rotation = self._rotation_module()
+            original_copy_and_prune = segment_sealer._copy_and_prune
+            original_unlink = Path.unlink
+            orphan_path: Path | None = None
+
+            def copy_then_kill(copy_source: Path, destination: Path, cutoff: str) -> dict[str, int]:
+                nonlocal orphan_path
+                original_copy_and_prune(copy_source, destination, cutoff)
+                orphan_path = destination
+                raise SimulatedRotationCrash("segment-copy")
+
+            def preserve_process_kill_temp(path: Path, *args, **kwargs) -> None:
+                if path == orphan_path:
+                    return
+                original_unlink(path, *args, **kwargs)
+
+            with (
+                patch.object(segment_sealer, "_copy_and_prune", side_effect=copy_then_kill),
+                patch.object(Path, "unlink", preserve_process_kill_temp),
+            ):
+                with self.assertRaises(SimulatedRotationCrash):
+                    rotation.rotate_segmented_history(
+                        source=source,
+                        segments_directory=segments_directory,
+                        cutoff="2025-01-03T00:00:00+00:00",
+                        key_id="generation-key-2",
+                        scheduled_backup_directory=backup_directory,
+                        scheduled_backup_status_path=backup_status_path,
+                        apply=True,
+                    )
+
+            self.assertIsNotNone(orphan_path)
+            assert orphan_path is not None
+            marker_path = activation_pending_path(source)
+            self.assertTrue(marker_path.is_file())
+            self.assertTrue(orphan_path.is_file())
+            marker_bytes = marker_path.read_bytes()
+            orphan_bytes = orphan_path.read_bytes()
+
+            with self.assertRaises(ValueError) as raised:
+                rotation.recover_pending_rotation(
+                    source=source,
+                    segments_directory=segments_directory,
+                    apply=True,
+                )
+
+            self.assertEqual(
+                str(raised.exception),
+                "Segment rotation found unreferenced segment temporary artifact: "
+                + json.dumps(str(orphan_path))
+                + ".",
+            )
+            self.assertEqual(marker_path.read_bytes(), marker_bytes)
+            self.assertEqual(orphan_path.read_bytes(), orphan_bytes)
+
     def test_recovery_fails_closed_on_unjournaled_staging_artifact(self) -> None:
         for missing_record in ("staged_hot", "candidate_catalog"):
             with self.subTest(missing_record=missing_record), tempfile.TemporaryDirectory() as temporary_directory:

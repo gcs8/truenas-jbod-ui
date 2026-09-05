@@ -176,6 +176,60 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _unreferenced_segment_temporary_paths(
+    segments_directory: Path,
+    *,
+    referenced_segment_path: Path | None = None,
+) -> list[Path]:
+    referenced_identity: tuple[int, int] | None = None
+    if referenced_segment_path is not None:
+        try:
+            referenced_metadata = os.stat(referenced_segment_path, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISREG(referenced_metadata.st_mode):
+                referenced_identity = (
+                    referenced_metadata.st_dev,
+                    referenced_metadata.st_ino,
+                )
+
+    unreferenced_paths: list[Path] = []
+    for candidate in sorted(segments_directory.glob(".segment-*.sqlite3"), key=str):
+        if referenced_identity is not None:
+            try:
+                candidate_metadata = os.stat(candidate, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (
+                stat.S_ISREG(candidate_metadata.st_mode)
+                and (candidate_metadata.st_dev, candidate_metadata.st_ino) == referenced_identity
+            ):
+                continue
+        unreferenced_paths.append(candidate)
+    return unreferenced_paths
+
+
+def _raise_for_unreferenced_segment_temporaries(
+    segments_directory: Path,
+    *,
+    label: str,
+    referenced_segment_path: Path | None = None,
+) -> None:
+    paths = _unreferenced_segment_temporary_paths(
+        segments_directory,
+        referenced_segment_path=referenced_segment_path,
+    )
+    if not paths:
+        return
+    noun = "artifact" if len(paths) == 1 else "artifacts"
+    raise ValueError(
+        f"{label} found unreferenced segment temporary {noun}: "
+        + ", ".join(json.dumps(str(path)) for path in paths)
+        + "."
+    )
+
+
 def _create_rollback_snapshot(
     source: Path,
     segments_directory: Path,
@@ -855,6 +909,10 @@ def _recover_pending_migration_locked(
     source_metadata = _require_regular_source(source)
     _require_source_owner(source_metadata)
     if not path_entry_exists(pending_path):
+        _raise_for_unreferenced_segment_temporaries(
+            segments_directory,
+            label="Segmented history recovery",
+        )
         if path_entry_exists(catalog_path) or not path_entry_exists(rollback_path):
             raise ValueError("Segmented history migration recovery is not pending.")
         rollback_path = SegmentedHistoryReader._require_regular_file(
@@ -902,6 +960,17 @@ def _recover_pending_migration_locked(
         or _sha256_file(rollback_path) != rollback_sha256
     ):
         raise ValueError("Segmented history migration recovery integrity check failed.")
+    publication = pending.get("segment_publication")
+    referenced_segment_path: Path | None = None
+    if isinstance(publication, dict):
+        file_name = publication.get("file_name")
+        if isinstance(file_name, str) and Path(file_name).name == file_name:
+            referenced_segment_path = segments_directory / file_name
+    _raise_for_unreferenced_segment_temporaries(
+        segments_directory,
+        label="Segmented history recovery",
+        referenced_segment_path=referenced_segment_path,
+    )
     if path_entry_exists(catalog_path):
         catalog, segment_paths = _load_rollback_catalog(
             catalog_path,
@@ -969,7 +1038,6 @@ def _recover_pending_migration_locked(
         for path in candidate_segment_paths
     ):
         raise ValueError("Segmented history recovery found an unauthenticated orphan segment.")
-    publication = pending.get("segment_publication")
     expected_segment_path: Path | None = None
     if publication is not None:
         if not isinstance(publication, dict) or not isinstance(publication.get("file_name"), str):

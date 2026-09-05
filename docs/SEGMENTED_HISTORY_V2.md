@@ -169,9 +169,11 @@ publication state match the journal.
 ### Leftover staging artifact
 
 An unauthenticated staging error lists every unexpected
-`.<hot-name>.segmented-*.sqlite3` and `.rotation-catalog-*.json` path. Treat those
-paths as untrusted evidence. A matching filename does not prove that rotation
-created the file.
+`.<hot-name>.segmented-*.sqlite3` and `.rotation-catalog-*.json` path. Migration
+recovery and later-generation `--recover` also name every path for an
+unreferenced `.segment-*.sqlite3` temporary artifact. Treat every reported path
+as untrusted evidence. A matching filename does not prove that migration or
+rotation created the file.
 
 1. Stop or otherwise quiesce the history service and every history writer or
    maintenance job.

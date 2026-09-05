@@ -15,6 +15,10 @@ from history_service import segment_migration, segment_sealer
 from history_service.store import SCHEMA, HistoryStore
 
 
+class SimulatedMigrationCrash(BaseException):
+    pass
+
+
 class SegmentedHistoryMigrationCliTests(unittest.TestCase):
     def test_dry_run_refuses_legacy_schema_without_creating_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -652,6 +656,96 @@ class SegmentedHistoryMigrationCliTests(unittest.TestCase):
             self.assertEqual(receipt["recovery_state"], "orphan-snapshot-removed")
             self.assertFalse(rollback_path.exists())
             self.assertFalse((segments_directory / ".migration-pending.json").exists())
+
+    def test_recovery_reports_segment_temp_left_by_process_kill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            self._create_source_database(source)
+            original_copy_and_prune = segment_sealer._copy_and_prune
+            original_unlink = Path.unlink
+            orphan_path: Path | None = None
+
+            def copy_then_kill(copy_source: Path, destination: Path, cutoff: str) -> dict[str, int]:
+                nonlocal orphan_path
+                original_copy_and_prune(copy_source, destination, cutoff)
+                orphan_path = destination
+                raise SimulatedMigrationCrash("segment-copy")
+
+            def preserve_process_kill_temp(path: Path, *args, **kwargs) -> None:
+                if path == orphan_path:
+                    return
+                original_unlink(path, *args, **kwargs)
+
+            with (
+                patch.object(segment_sealer, "_copy_and_prune", side_effect=copy_then_kill),
+                patch.object(Path, "unlink", preserve_process_kill_temp),
+            ):
+                with self.assertRaises(SimulatedMigrationCrash):
+                    segment_migration.migrate_segmented_history(
+                        source=source,
+                        segments_directory=segments_directory,
+                        cutoff="2025-01-02T00:00:00+00:00",
+                        key_id="test-key-1",
+                        apply=True,
+                    )
+
+            self.assertIsNotNone(orphan_path)
+            assert orphan_path is not None
+            self.assertTrue(orphan_path.is_file())
+            orphan_bytes = orphan_path.read_bytes()
+            rollback_path = segments_directory / ".v1-rollback.sqlite3"
+            self.assertTrue(rollback_path.is_file())
+
+            with self.assertRaises(ValueError) as raised:
+                segment_migration.recover_pending_migration(
+                    source=source,
+                    segments_directory=segments_directory,
+                    apply=True,
+                )
+
+            self.assertEqual(
+                str(raised.exception),
+                "Segmented history recovery found unreferenced segment temporary artifact: "
+                + json.dumps(str(orphan_path))
+                + ".",
+            )
+            self.assertEqual(orphan_path.read_bytes(), orphan_bytes)
+            self.assertTrue(rollback_path.is_file())
+
+    def test_recovery_json_escapes_hostile_segment_temp_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "history.db"
+            segments_directory = root / "segments"
+            rollback_path = segments_directory / ".v1-rollback.sqlite3"
+            orphan_path = segments_directory / ".segment-hostile\nname\x1b[31m.sqlite3"
+            orphan_bytes = b"unauthenticated-segment"
+            self._create_source_database(source)
+            segments_directory.mkdir()
+            rollback_path.write_bytes(source.read_bytes())
+            rollback_path.chmod(0o600)
+            orphan_path.write_bytes(orphan_bytes)
+
+            with self.assertRaises(ValueError) as raised:
+                segment_migration.recover_pending_migration(
+                    source=source,
+                    segments_directory=segments_directory,
+                    apply=True,
+                )
+
+            message = str(raised.exception)
+            self.assertEqual(
+                message,
+                "Segmented history recovery found unreferenced segment temporary artifact: "
+                + json.dumps(str(orphan_path))
+                + ".",
+            )
+            self.assertNotIn("\n", message)
+            self.assertNotIn("\x1b", message)
+            self.assertEqual(orphan_path.read_bytes(), orphan_bytes)
+            self.assertTrue(rollback_path.is_file())
 
     def test_cli_recover_rollback_restores_a_pre_catalog_pending_migration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
