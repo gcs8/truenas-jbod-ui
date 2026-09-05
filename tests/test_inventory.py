@@ -4734,7 +4734,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
 
             self.assertEqual(
                 revised.mapping_revision,
-                service.mapping_store.scope_revision(system.id, "enc-a"),
+                service.mapping_store.save_revision(system.id, "enc-a", 1),
             )
             self.assertEqual(
                 revised.mapping_clear_revision,
@@ -6188,7 +6188,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
         for slot in snapshot.slots:
             self.assertEqual(
                 getattr(slot, "mapping_revision", None),
-                service.mapping_store.scope_revision(system.id, slot.enclosure_id),
+                service.mapping_store.save_revision(system.id, slot.enclosure_id, slot.slot),
             )
         self.assertEqual(
             [option.id for option in snapshot.enclosures],
