@@ -41,6 +41,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_ssh_probe",
     "tests.test_tls_trust",
     "tests.test_truenas_ws",
+    "tests.test_wiki_drift_verifier",
 )
 
 

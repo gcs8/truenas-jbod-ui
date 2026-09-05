@@ -1,64 +1,87 @@
-# Publishing the Wiki
+# Publishing the wiki
 
-This repo keeps a GitHub-wiki-ready copy of the pages in the `wiki/` folder so
-they can be maintained like normal project docs first.
+The `wiki/` directory is the reviewed source for GitHub Wiki pages. The files
+under `wiki/images/` are the reviewed source for wiki images.
 
-## Basic Publish Flow
+Publishing is an owner-approved action.
+The verification command does not publish or change the external wiki.
+It reads committed Git objects and compares the root Markdown pages plus the
+complete `images/` tree byte for byte.
 
-Clone the GitHub wiki repo:
+## Verify an external wiki commit
 
-```bash
-git clone <your-github-repo>.wiki.git repo-wiki
-```
-
-Copy the page set in:
-
-```bash
-cp wiki/*.md repo-wiki/
-mkdir -p repo-wiki/images
-cp wiki/images/* repo-wiki/images/
-```
-
-Commit and push:
+Supply full 40-character commit IDs for both repositories. A local external-wiki
+checkout keeps the check deterministic and does not need credentials:
 
 ```bash
-cd repo-wiki
-git add .
-git commit -m "Refresh wiki pages"
-git push
+repo_commit="$(git rev-parse HEAD)"
+wiki_commit="$(git -C repo-wiki rev-parse HEAD)"
+python scripts/verify_wiki_drift.py \
+  --repository . \
+  --repository-commit "$repo_commit" \
+  --wiki-source repo-wiki \
+  --external-wiki-commit "$wiki_commit"
 ```
 
-## Recommended Maintainer Workflow
+The source may also be the public Git URL. The verifier clones it into a
+temporary directory and deletes that clone when the check finishes:
 
-- treat the repo `wiki/` folder as the source of truth
-- treat `wiki/images/` as the source of truth for wiki-embedded screenshots
-- review changes in normal PRs
-- publish to GitHub Wiki after the docs look right
+```bash
+python scripts/verify_wiki_drift.py \
+  --repository . \
+  --repository-commit "$repo_commit" \
+  --wiki-source https://github.com/gcs8/truenas-jbod-ui.wiki.git \
+  --external-wiki-commit "$wiki_commit"
+```
 
-## Refresh Screenshots Before A Release-Oriented Publish
+A passing check prints an exact receipt:
+
+```text
+Wiki drift verification: PASS
+Repository commit: <sha>
+External wiki commit: <sha>
+Compared files: <count>
+```
+
+Missing, extra, or changed page and image bytes fail the check. Missing Git
+sources, abbreviated or malformed commit IDs, non-regular files, and unreadable
+objects fail closed as errors. Uncommitted files in either checkout are ignored
+because the verifier reads only the named commits.
+
+## Owner publish flow
+
+1. Freeze and review the repository commit that will supply `wiki/`.
+2. Clone the GitHub wiki repository into `repo-wiki`.
+3. Run the verifier against its current commit. If it reports drift, review that
+   exact diff before copying files.
+4. Replace the root Markdown pages and `images/` tree in `repo-wiki` with the
+   files from the frozen repository commit. Remove stale pages and images rather
+   than leaving extra files behind.
+5. Commit the external wiki change locally and run the verifier against the new
+   external commit. It must pass before push.
+6. The owner approves and pushes that exact external commit.
+7. Run the verifier again with the public Git URL and the pushed commit. Record
+   its four-line receipt in the release wrap.
+
+The verifier never runs `git add`, `git commit`, or `git push`. Publication stays
+manual even when the release gate reports drift.
+
+## Refresh screenshots before a release-oriented publish
 
 If the release changed operator-facing flows, regenerate the tracked screenshot
-set before you copy `wiki/images/` into the GitHub wiki repo.
+set before copying `wiki/images/` into the GitHub wiki repository.
 
-From the repo root in PowerShell:
+From the repository root in PowerShell, use the release tag being prepared:
 
 ```powershell
-$env:SCREENSHOT_TAG='v0.18.0'
+$env:SCREENSHOT_TAG='vX.Y.Z'
 .\.venv\Scripts\python.exe scripts\capture_readme_screenshots.py
 .\.venv\Scripts\python.exe scripts\capture_history_export_screenshots.py
 .\.venv\Scripts\python.exe scripts\capture_release_workflow_screenshots.py
 ```
 
-That refreshes the repo screenshots under `docs/images/screenshots/` and the
-wiki-facing copies under `wiki/images/`.
+This refreshes the repository screenshots under `docs/images/screenshots/` and
+the wiki copies under `wiki/images/`.
 
-## Good Times To Refresh The Wiki
-
-- after a release
-- after a new platform guide lands
-- after a profile system change
-- after a setup flow becomes simpler or safer
-
-For the full repo release flow, use:
-
-- [`docs/RELEASE_CHECKLIST.md`](../docs/RELEASE_CHECKLIST.md)
+For the full release flow, use
+[`docs/RELEASE_CHECKLIST.md`](../docs/RELEASE_CHECKLIST.md).

@@ -17,8 +17,10 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   time" is not a valid reason; stop the release instead.
 - Do not push the release tag until the pre-tag release wrap proves every
   pre-publish gate is `Pass` or justified `N/A`. Only inherently post-publish
-  gates may remain `Blocked` at this point: GHCR publish verification,
-  deployment refresh/sniff tests, and post-release reopen.
+  rows may remain `Blocked` at this point: `Docs/wiki/public-demo publication`,
+  GHCR publish verification, deployment refresh/sniff tests, and post-release
+  reopen. The separate `Docs/wiki/public-demo gate` covers the source review,
+  diff, privacy, and checked-in artifact checks and must pass before tagging.
 - Do not call the release complete until the final release wrap proves every
   required gate is `Pass` or justified `N/A`, including GHCR, deployment sniff
   tests, and the next development reopen.
@@ -47,7 +49,8 @@ using this shape:
 | Linux QA restore gate | yes | target, counts, health, smoke evidence | Pass/Blocked/N/A | reason |
 | Restored Linux QA perf harnesses | yes | artifact path and summary | Pass/Blocked/N/A | reason |
 | Snapshot/export/offline artifact gate | yes | command and browser smoke | Pass/Blocked/N/A | reason |
-| Docs/wiki/public-demo gate | yes | changed files, URLs, workflow runs | Pass/Blocked/N/A | reason |
+| Docs/wiki/public-demo gate | yes | changed files, reviewed source diff, privacy checks, checked-in artifact commands and results | Pass/Blocked/N/A | reason |
+| Docs/wiki/public-demo publication | yes | exact wiki verification receipt, public-demo workflow run and Pages URL when applicable | Pass/Blocked/N/A | reason |
 | GHCR publish verification | yes | workflow URL, full `name@sha256` image reference, and exact source revision | Pass/Blocked/N/A | reason |
 | Deployment refresh/sniff tests | yes | validated private deployment receipt, exact Compose project/file/profile/service contract, pre-update rollback digest, running container image IDs, health/restart evidence, and rollback result | Pass/Blocked/N/A | reason |
 | Post-release reopen | yes | branch, commit, version | Pass/Blocked/N/A | reason |
@@ -57,18 +60,37 @@ release URL when published, full `name@sha256` image reference and exact source
 revision when published, pre-update rollback digest, running container image IDs,
 validated private deployment-receipt result, exact Compose project/file/profile/service
 contract, health and restart evidence, rollback result, public demo workflow or Pages URL
-when applicable, external wiki commit when applicable, and any known deviations
-from the checklist.
+when applicable, the exact `Wiki drift verification: PASS` receipt with its
+repository commit and external wiki commit, and any known deviations from the
+checklist.
 
 Before tagging, run the pre-tag release-wrap validator against the target
-version:
+version. This binds the wiki source to the pre-tag `HEAD`:
 
-- `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --phase pre-tag`
+```bash
+version="<version>"
+repo_commit="$(git rev-parse HEAD)"
+wiki_commit="<full 40-character external wiki commit>"
+python scripts/validate_release_wrap.py "$version" --phase pre-tag \
+  --repository . \
+  --repository-commit "$repo_commit" \
+  --wiki-source https://github.com/gcs8/truenas-jbod-ui.wiki.git \
+  --external-wiki-commit "$wiki_commit"
+```
 
 After GHCR publish, deployment sniff tests, and reopen work are recorded, run
-the final release-wrap validator:
+the final release-wrap validator against the immutable release tag:
 
-- `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version>`
+```bash
+version="<version>"
+repo_commit="$(git rev-parse "v${version#v}^{commit}")"
+wiki_commit="<full 40-character external wiki commit>"
+python scripts/validate_release_wrap.py "$version" \
+  --repository . \
+  --repository-commit "$repo_commit" \
+  --wiki-source https://github.com/gcs8/truenas-jbod-ui.wiki.git \
+  --external-wiki-commit "$wiki_commit"
+```
 
 ## Release Gate Order
 
@@ -78,16 +100,19 @@ the final release-wrap validator:
    feature release, patch, hotfix, docs-only correction, or process correction.
 3. Draft or update the release notes and release wrap before tagging.
 4. Run local unit, syntax, hygiene, Docker health, optional-sidecar, browser,
-   feature-specific, public-demo, and perf gates.
+   feature-specific, public-demo, perf, docs/wiki source-diff, and privacy gates.
 5. Run the Linux QA Docker restore gate and restored-stack perf/browser gates.
 6. Fill in the release wrap checklist evidence table and pass the pre-tag
-   validator.
+   validator. The `Docs/wiki/public-demo gate` must be `Pass`; only its distinct
+   publication row may remain `Blocked` with canonical owner-publication
+   evidence.
 7. Only after the pre-tag table is complete, merge/cut the release commit, tag
    it, push it, publish the GitHub release, and verify GHCR digest convergence.
 8. Refresh and sniff-test local, Linux, and production deployments after GHCR
    is available.
-9. Sync the external wiki and public demo deployment when those artifacts
-   changed, and record workflow URLs or commit hashes.
+9. The owner syncs the external wiki and public demo when those artifacts
+   changed. Read back and verify the published bytes, then record workflow URLs
+   and commit hashes.
 10. Reopen the next development branch only after post-publish deployment
     evidence is recorded, then rerun the final release-wrap validator.
 
@@ -126,8 +151,8 @@ the final release-wrap validator:
   app/test packages; raw reference:
   - `python -m compileall app admin_service history_service scripts tests`
 - validate the target release wrap before tagging:
-  - `.\.venv\Scripts\python.exe scripts\validate_release_wrap.py <version> --phase pre-tag`
-    (run the no-flag final validator after post-publish evidence exists)
+  - run the complete pre-tag command under `Required Release Wrap Evidence`
+    above (use the final command there after post-publish evidence exists)
 - use the wrapper's dynamic JavaScript syntax gates for app, admin, history,
   every `qa/*.spec.js`, and changed JS files; raw reference:
   - `node --check app/static/app.js`
@@ -387,6 +412,47 @@ the final release-wrap validator:
 - review profile/config docs for dead or outdated comments, especially builder
   mode and custom-profile authoring guidance
 - review the repo `wiki/` pages for stale setup or release wording
+- freeze the repository commit that supplies `wiki/`, then verify the published
+  wiki HEAD against that exact commit. Use the owner-confirmed full external
+  commit ID:
+
+  ```bash
+  repo_commit="$(git rev-parse HEAD)"
+  wiki_commit="<full 40-character external wiki commit>"
+  python scripts/verify_wiki_drift.py \
+    --repository . \
+    --repository-commit "$repo_commit" \
+    --wiki-source https://github.com/gcs8/truenas-jbod-ui.wiki.git \
+    --external-wiki-commit "$wiki_commit"
+  ```
+
+  The command must print these four lines with concrete values:
+
+  ```text
+  Wiki drift verification: PASS
+  Repository commit: <sha>
+  External wiki commit: <sha>
+  Compared files: <count>
+  ```
+
+  Copy the four values into the `Docs/wiki/public-demo publication` evidence
+  cell on one line, separated by semicolons. A missing, extra, or changed page
+  or image keeps that row `Blocked`. The verifier does not publish anything.
+- for every release after v0.22.2, run the complete final release-wrap
+  validator command under `Required Release Wrap Evidence`. It resolves the
+  repository commit from the immutable version tag; the validator rejects a
+  supplied commit that does not match that tag
+
+  During the pre-tag phase, the `Docs/wiki/public-demo gate` must record `Pass`
+  evidence for every applicable source review, source diff, privacy scan, and
+  checked-in artifact check. Publication is recorded separately. The
+  `Docs/wiki/public-demo publication` row may remain `Blocked` only with the
+  machine-readable evidence form
+  `Pending owner publication: external wiki`,
+  `Pending owner publication: public demo`, or
+  `Pending owner publication: external wiki, public demo`. A blocker for GHCR,
+  deployment, reopen work, or any other gate does not satisfy this row. A
+  publication `Pass` always requires the live comparison and exact receipt.
 - add the completed checklist evidence table to the release wrap before the
   tag is cut
 - if the release changes public-demo behavior or data, regenerate and verify
@@ -399,6 +465,9 @@ the final release-wrap validator:
   - `.\.venv\Scripts\python.exe scripts\check_public_demo_artifact.py public-demo`
   - `set PUBLIC_DEMO_ARTIFACT=public-demo/index.html`
   - `npx playwright test qa/public-demo.spec.js`
+  - record the changed files, artifact publishability/privacy result, and
+    browser result in `Docs/wiki/public-demo gate` before tagging; record the
+    Pages workflow run and URL later in `Docs/wiki/public-demo publication`
 
 ## Config And Examples
 
@@ -427,7 +496,12 @@ the final release-wrap validator:
   publish action
 - push `main`
 - push the release tag
-- publish the repo `wiki/` pages if they changed
+- if `wiki/` changed, the owner reviews the exact page and image diff and
+  publishes it to the GitHub wiki. No release command may push the wiki
+  automatically
+- read back the public wiki HEAD with `scripts/verify_wiki_drift.py`; require a
+  byte-for-byte pass and put its exact repository commit, external wiki commit,
+  and file count in the `Docs/wiki/public-demo publication` row
 - create the GitHub release notes from the final changelog section
 - publish the GitHub release page so the `Publish GHCR Image` workflow runs
 - wait for the `Publish GHCR Image` Actions run to finish successfully
@@ -449,7 +523,8 @@ the final release-wrap validator:
 
 - confirm the pushed tag matches the intended commit
 - confirm the GitHub README renders the new screenshots correctly
-- confirm the wiki publish completed if applicable
+- confirm the wiki publish completed if applicable and rerun the final
+  release-wrap validator with the exact wiki verification arguments
 - next-cycle source work may begin before production deployment only in a
   separate clean worktree after the tag and immutable image are published. Keep
   the production release lane frozen, and do not mark `Post-release reopen` as

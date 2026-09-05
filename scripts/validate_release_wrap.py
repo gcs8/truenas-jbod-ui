@@ -1,8 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
+
+if __package__:
+    from scripts.verify_wiki_drift import (
+        WikiVerificationError,
+        WikiVerificationResult,
+        verify_wiki_drift,
+    )
+else:
+    from verify_wiki_drift import (  # type: ignore[no-redef]
+        WikiVerificationError,
+        WikiVerificationResult,
+        verify_wiki_drift,
+    )
 
 
 REQUIRED_GATES = (
@@ -23,13 +38,18 @@ REQUIRED_GATES = (
     "Post-release reopen",
 )
 
+DOCS_PUBLICATION_GATE = "Docs/wiki/public-demo publication"
 POST_PUBLISH_GATES = {
+    DOCS_PUBLICATION_GATE.lower(),
     "ghcr publish verification",
     "deployment refresh/sniff tests",
     "post-release reopen",
 }
 
+OWNER_PUBLICATION_TARGETS = {"external wiki", "public demo"}
 VALID_RESULTS = {"pass", "blocked", "n/a"}
+WIKI_DRIFT_REQUIRED_FROM = (0, 22, 3)
+VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?")
 
 
 @dataclass(frozen=True)
@@ -79,11 +99,35 @@ def parse_checklist_evidence_table(text: str) -> dict[str, list[str]]:
     return rows
 
 
+def _has_pending_owner_publication_evidence(evidence: str) -> bool:
+    match = re.fullmatch(r"Pending owner publication:\s*(.+)", evidence, flags=re.IGNORECASE)
+    if match is None:
+        return False
+    targets = {
+        target.strip().lower()
+        for target in re.split(r"\s*(?:,|;|\band\b)\s*", match.group(1), flags=re.IGNORECASE)
+        if target.strip()
+    }
+    return bool(targets) and targets <= OWNER_PUBLICATION_TARGETS
+
+
+def _docs_publication_is_deferred(rows: dict[str, list[str]], phase: str) -> bool:
+    row = rows.get(DOCS_PUBLICATION_GATE.lower())
+    return bool(
+        row
+        and phase == "pre-tag"
+        and row[3].lower() == "blocked"
+        and _has_pending_owner_publication_evidence(row[2])
+    )
+
+
 def validate_release_wrap_text(
     text: str,
     *,
     allow_blocked: bool = False,
     phase: str = "final",
+    require_wiki_verification: bool = False,
+    wiki_verification: WikiVerificationResult | None = None,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     normalized_phase = phase.lower()
@@ -98,7 +142,11 @@ def validate_release_wrap_text(
         issues.append(ValidationIssue("release wrap is missing the checklist evidence table"))
         return issues
 
-    for gate in REQUIRED_GATES:
+    required_gates = REQUIRED_GATES
+    if require_wiki_verification:
+        required_gates += (DOCS_PUBLICATION_GATE,)
+
+    for gate in required_gates:
         row = rows.get(gate.lower())
         if row is None:
             issues.append(ValidationIssue(f"missing checklist evidence row: {gate}"))
@@ -121,8 +169,46 @@ def validate_release_wrap_text(
                 issues.append(ValidationIssue(f"{gate}: Blocked gates cannot ship"))
         if normalized_result == "blocked" and not evidence:
             issues.append(ValidationIssue(f"{gate}: Blocked requires evidence"))
+        if (
+            gate == DOCS_PUBLICATION_GATE
+            and normalized_phase == "pre-tag"
+            and normalized_result == "blocked"
+            and not _has_pending_owner_publication_evidence(evidence)
+        ):
+            issues.append(
+                ValidationIssue(
+                    f"{DOCS_PUBLICATION_GATE}: Blocked evidence must identify pending owner publication"
+                )
+            )
         if normalized_result == "n/a" and reason.lower() in {"", "-", "n/a", "none", "reason"}:
             issues.append(ValidationIssue(f"{gate}: N/A requires a concrete reason"))
+
+    wiki_row = rows.get(DOCS_PUBLICATION_GATE.lower())
+    wiki_is_deferred = _docs_publication_is_deferred(rows, normalized_phase)
+    if require_wiki_verification and not wiki_is_deferred:
+        if wiki_row is not None and wiki_row[3].lower() != "pass":
+            issues.append(
+                ValidationIssue(
+                    f"{DOCS_PUBLICATION_GATE}: Result must be Pass after publication"
+                )
+            )
+        if wiki_verification is None:
+            issues.append(
+                ValidationIssue(f"{DOCS_PUBLICATION_GATE}: wiki drift verification was not run")
+            )
+        elif not wiki_verification.matches:
+            issues.append(
+                ValidationIssue(
+                    f"{DOCS_PUBLICATION_GATE}: external wiki differs from repository wiki/"
+                )
+            )
+        elif wiki_row is not None and wiki_verification.release_evidence() not in wiki_row[2]:
+            issues.append(
+                ValidationIssue(
+                    f"{DOCS_PUBLICATION_GATE}: evidence does not contain the exact wiki "
+                    "verification receipt"
+                )
+            )
 
     return issues
 
@@ -132,6 +218,8 @@ def validate_release_wrap_path(
     *,
     allow_blocked: bool = False,
     phase: str = "final",
+    require_wiki_verification: bool = False,
+    wiki_verification: WikiVerificationResult | None = None,
 ) -> list[ValidationIssue]:
     if not path.exists():
         return [ValidationIssue(f"release wrap not found: {path}")]
@@ -139,12 +227,25 @@ def validate_release_wrap_path(
         path.read_text(encoding="utf-8"),
         allow_blocked=allow_blocked,
         phase=phase,
+        require_wiki_verification=require_wiki_verification,
+        wiki_verification=wiki_verification,
     )
 
 
-def main() -> int:
+def wiki_drift_required(version: str) -> bool:
+    match = VERSION_RE.fullmatch(version)
+    if match is None:
+        raise ValueError("version must use semantic version form X.Y.Z")
+    return tuple(int(part) for part in match.groups()) >= WIKI_DRIFT_REQUIRED_FROM
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Validate release-wrap checklist evidence.")
     parser.add_argument("version", help="Release version, for example 0.20.2 or v0.20.2.")
+    parser.add_argument("--repository", type=Path, default=Path("."))
+    parser.add_argument("--repository-commit")
+    parser.add_argument("--wiki-source")
+    parser.add_argument("--external-wiki-commit")
     parser.add_argument(
         "--allow-blocked",
         action="store_true",
@@ -159,11 +260,58 @@ def main() -> int:
             "Use final after GHCR, deployment sniff tests, and reopen work are recorded."
         ),
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     version = args.version.removeprefix("v")
-    path = Path("docs") / f"RELEASE_WRAP_{version}.md"
-    issues = validate_release_wrap_path(path, allow_blocked=args.allow_blocked, phase=args.phase)
+    try:
+        require_wiki_verification = wiki_drift_required(version)
+    except ValueError as exc:
+        print(f"- {exc}")
+        return 1
+    path = args.repository / "docs" / f"RELEASE_WRAP_{version}.md"
+    wiki_verification = None
+    rows = {}
+    if path.exists():
+        rows = parse_checklist_evidence_table(path.read_text(encoding="utf-8"))
+    wiki_is_deferred = _docs_publication_is_deferred(rows, args.phase)
+    if require_wiki_verification and not wiki_is_deferred:
+        required_arguments = {
+            "--repository-commit": args.repository_commit,
+            "--wiki-source": args.wiki_source,
+            "--external-wiki-commit": args.external_wiki_commit,
+        }
+        missing_arguments = [name for name, value in required_arguments.items() if not value]
+        if missing_arguments:
+            print(f"- wiki verification requires {', '.join(missing_arguments)}")
+            return 1
+        repository_authority = "HEAD"
+        repository_authority_label = "repository source HEAD"
+        if args.phase == "final":
+            repository_authority = f"refs/tags/v{version}"
+            repository_authority_label = f"release tag v{version}"
+        try:
+            wiki_verification = verify_wiki_drift(
+                repository=args.repository,
+                repository_commit=args.repository_commit,
+                wiki_source=args.wiki_source,
+                external_wiki_commit=args.external_wiki_commit,
+                repository_authority=repository_authority,
+                repository_authority_label=repository_authority_label,
+            )
+        except (OSError, UnicodeError, WikiVerificationError) as exc:
+            print(f"- {DOCS_PUBLICATION_GATE}: wiki verification failed: {exc}")
+            return 1
+    issues = validate_release_wrap_path(
+        path,
+        allow_blocked=args.allow_blocked,
+        phase=args.phase,
+        require_wiki_verification=require_wiki_verification,
+        wiki_verification=wiki_verification,
+    )
     if issues:
         for issue in issues:
             print(f"- {issue.message}")
