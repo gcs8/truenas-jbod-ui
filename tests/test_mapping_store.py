@@ -362,6 +362,255 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
             self.assertEqual(store.file_path.read_bytes(), before)
 
 
+class AliasKeyModelConsistencyTests(unittest.TestCase):
+    SYSTEM_A = "synthetic-system-a"
+    SYSTEM_B = "synthetic-system-b"
+    SHELF_A = "synthetic-shelf-a"
+    SHELF_B = "synthetic-shelf-b"
+    SLOT = 7
+
+    def make_store(self, root: str) -> MappingStore:
+        return MappingStore(str(Path(root) / "mappings.json"))
+
+    def malformed_store(
+        self,
+        root: str,
+        *,
+        system_id: str | None = SYSTEM_A,
+        enclosure_id: str | None = SHELF_B,
+        slot: int = SLOT,
+    ) -> MappingStore:
+        store = self.make_store(root)
+        store._write({
+            f"{self.SYSTEM_A}:{DRAWER_TOP}:{self.SLOT}": ManualMapping(
+                system_id=system_id,
+                enclosure_id=enclosure_id,
+                slot=slot,
+                serial="MISMATCH",
+            )
+        })
+        return store
+
+    def test_each_reported_enclosure_mismatch_fails_closed_for_get_and_filter(self) -> None:
+        mismatches = (
+            self.SHELF_B,
+            "virtual-system:pool-a",
+            f"{self.SHELF_A}::unknown",
+            None,
+        )
+        for enclosure_id in mismatches:
+            with self.subTest(enclosure_id=enclosure_id), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.malformed_store(temp_dir, enclosure_id=enclosure_id)
+                before = store.file_path.read_bytes()
+
+                with self.assertRaises(MappingScopeConflict):
+                    store.get_mapping(self.SYSTEM_A, self.SHELF_A, self.SLOT)
+                with self.assertRaises(MappingScopeConflict):
+                    store.list_mappings(self.SYSTEM_A, self.SHELF_A)
+                with self.assertRaises(MappingScopeConflict):
+                    store.list_mappings()
+
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_foreign_model_system_and_disagreeing_model_slot_fail_closed(self) -> None:
+        mismatches = (
+            {"system_id": self.SYSTEM_B, "enclosure_id": self.SHELF_A, "slot": self.SLOT},
+            {"system_id": self.SYSTEM_A, "enclosure_id": self.SHELF_A, "slot": self.SLOT + 1},
+        )
+        for mismatch in mismatches:
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.malformed_store(temp_dir, **mismatch)
+                before = store.file_path.read_bytes()
+
+                with self.assertRaises(MappingScopeConflict):
+                    store.get_mapping(self.SYSTEM_A, self.SHELF_A, self.SLOT)
+
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_save_rejects_foreign_model_system_before_deleting_alias_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.malformed_store(
+                temp_dir,
+                system_id=self.SYSTEM_B,
+                enclosure_id=self.SHELF_A,
+            )
+            before = store.file_path.read_bytes()
+
+            with self.assertRaises(MappingScopeConflict):
+                store.save_mapping(ManualMapping(
+                    system_id=self.SYSTEM_A,
+                    enclosure_id=self.SHELF_A,
+                    slot=self.SLOT,
+                    serial="NEW",
+                ))
+
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_consistent_canonical_and_drawer_alias_rows_remain_accepted(self) -> None:
+        rows = (
+            (self.SHELF_A, self.SHELF_A),
+            (DRAWER_TOP, DRAWER_TOP),
+            (DRAWER_BOTTOM, self.SHELF_A),
+        )
+        for keyed_enclosure_id, model_enclosure_id in rows:
+            with (
+                self.subTest(
+                    keyed_enclosure_id=keyed_enclosure_id,
+                    model_enclosure_id=model_enclosure_id,
+                ),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                store = self.make_store(temp_dir)
+                store._write({
+                    f"{self.SYSTEM_A}:{keyed_enclosure_id}:{self.SLOT}": ManualMapping(
+                        system_id=self.SYSTEM_A,
+                        enclosure_id=model_enclosure_id,
+                        slot=self.SLOT,
+                        serial="VALID",
+                    )
+                })
+
+                mapping = store.get_mapping(self.SYSTEM_A, self.SHELF_A, self.SLOT)
+
+                self.assertIsNotNone(mapping)
+                assert mapping is not None
+                self.assertEqual(mapping.enclosure_id, self.SHELF_A)
+
+    def test_system_scoped_key_with_legacy_none_model_system_remains_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            store._write({
+                f"{self.SYSTEM_A}:{DRAWER_TOP}:{self.SLOT}": ManualMapping(
+                    system_id=None,
+                    enclosure_id=DRAWER_BOTTOM,
+                    slot=self.SLOT,
+                    serial="LEGACY-SCOPED",
+                )
+            })
+
+            mapping = store.get_mapping(self.SYSTEM_A, self.SHELF_A, self.SLOT)
+
+            self.assertIsNotNone(mapping)
+            assert mapping is not None
+            self.assertEqual(mapping.serial, "LEGACY-SCOPED")
+            self.assertEqual(
+                [item.serial for item in store.list_mappings()],
+                ["LEGACY-SCOPED"],
+            )
+
+    def test_selected_scope_operations_reject_inconsistent_row_before_mutation(self) -> None:
+        operations = (
+            lambda store: store.save_mapping(ManualMapping(
+                system_id=self.SYSTEM_A,
+                enclosure_id=self.SHELF_A,
+                slot=self.SLOT,
+                serial="NEW",
+            )),
+            lambda store: store.clear_mapping(self.SYSTEM_A, self.SHELF_A, self.SLOT),
+            lambda store: store.replace_mappings(self.SYSTEM_A, self.SHELF_A, []),
+            lambda store: store.preview_replace_mappings(self.SYSTEM_A, self.SHELF_A, []),
+            lambda store: store.apply_mapping_import(
+                self.SYSTEM_A,
+                self.SHELF_A,
+                [],
+                expected_revision="0" * 64,
+                import_digest="1" * 64,
+            ),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.malformed_store(temp_dir)
+                before = store.file_path.read_bytes()
+
+                with self.assertRaises(MappingScopeConflict):
+                    operation(store)
+
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_revision_and_digest_issuance_reject_inconsistent_removable_row(self) -> None:
+        operations = (
+            lambda store: store.scope_revision(self.SYSTEM_A, self.SHELF_A),
+            lambda store: store.save_revision(self.SYSTEM_A, self.SHELF_A, self.SLOT),
+            lambda store: store.clear_revision(self.SYSTEM_A, self.SHELF_A, self.SLOT),
+            lambda store: store.save_revisions(
+                self.SYSTEM_A, [(self.SHELF_A, self.SLOT)]
+            ),
+            lambda store: store.clear_revisions(
+                self.SYSTEM_A, [(self.SHELF_A, self.SLOT)]
+            ),
+            lambda store: store.preview_replace_mappings(self.SYSTEM_A, self.SHELF_A, []),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.malformed_store(temp_dir)
+                before = store.file_path.read_bytes()
+
+                with self.assertRaises(MappingScopeConflict):
+                    operation(store)
+
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_different_physical_scope_does_not_admit_malformed_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.malformed_store(temp_dir)
+            before = store.file_path.read_bytes()
+
+            self.assertEqual(store.list_mappings(self.SYSTEM_A, self.SHELF_B), [])
+            self.assertIsNone(store.get_mapping(self.SYSTEM_A, self.SHELF_B, self.SLOT))
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_different_system_scope_does_not_admit_foreign_model_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.malformed_store(
+                temp_dir,
+                system_id=self.SYSTEM_B,
+                enclosure_id=self.SHELF_A,
+            )
+            before = store.file_path.read_bytes()
+
+            self.assertEqual(store.list_mappings(self.SYSTEM_B), [])
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_malformed_row_outside_selected_physical_or_system_scope_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.malformed_store(temp_dir)
+            unrelated = ManualMapping(
+                system_id=self.SYSTEM_B,
+                enclosure_id=self.SHELF_B,
+                slot=self.SLOT,
+                serial="UNRELATED",
+            )
+            current = store.load_all()
+            current[store._slot_key(self.SYSTEM_B, self.SHELF_B, self.SLOT)] = unrelated
+            current[store._slot_key(
+                self.SYSTEM_A, self.SHELF_B, self.SLOT
+            )] = unrelated.model_copy(
+                update={"system_id": self.SYSTEM_A, "serial": "OTHER-PHYSICAL"}
+            )
+            store._write(current)
+            before = store.file_path.read_bytes()
+
+            self.assertEqual(
+                [mapping.serial for mapping in store.list_mappings(self.SYSTEM_B, self.SHELF_B)],
+                ["UNRELATED"],
+            )
+            self.assertEqual(
+                [mapping.serial for mapping in store.list_mappings(self.SYSTEM_B)],
+                ["UNRELATED"],
+            )
+            mapping = store.get_mapping(self.SYSTEM_B, self.SHELF_B, self.SLOT)
+            self.assertIsNotNone(mapping)
+            assert mapping is not None
+            self.assertEqual(mapping.serial, "UNRELATED")
+            self.assertEqual(
+                [mapping.serial for mapping in store.list_mappings(
+                    self.SYSTEM_A, self.SHELF_B
+                )],
+                ["OTHER-PHYSICAL"],
+            )
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+
 class MappingStoreImportTests(unittest.TestCase):
     def make_store(self, root: str) -> MappingStore:
         return MappingStore(str(Path(root) / "mappings.json"))
@@ -794,7 +1043,7 @@ class MappingStoreImportTests(unittest.TestCase):
             assert admitted is not None
             self.assertEqual(admitted.serial, "SYSTEM-FALLBACK")
 
-    def test_exact_key_rejects_mapping_owned_by_another_system(self) -> None:
+    def test_exact_key_with_foreign_model_system_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
             store._write({
@@ -805,8 +1054,12 @@ class MappingStoreImportTests(unittest.TestCase):
                     serial="WRONG-SYSTEM",
                 )
             })
+            before = store.file_path.read_bytes()
 
-            self.assertIsNone(store.get_mapping("system-b", "enc-b", 3))
+            with self.assertRaises(MappingScopeConflict):
+                store.get_mapping("system-b", "enc-b", 3)
+
+            self.assertEqual(store.file_path.read_bytes(), before)
 
     def test_colon_bearing_legacy_enclosure_key_remains_unscoped(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

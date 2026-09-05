@@ -215,6 +215,13 @@ class MappingStore:
                 for identity in sorted(selected_scope, key=lambda item: (item[0] or "", item[1]))
             ]
 
+        self._assert_scope_key_model_consistency(
+            mappings,
+            None,
+            physical_enclosure_id,
+            all_systems=True,
+        )
+
         effective_system_ids = {
             self._mapping_system_id(key, mapping)
             for key, mapping in mappings.items()
@@ -434,6 +441,99 @@ class MappingStore:
     def _scope_identity(mapping: ManualMapping) -> tuple[str | None, int]:
         return resolve_physical_mapping_scope(mapping.enclosure_id), mapping.slot
 
+    def _consistent_keys_for_mapping(
+        self,
+        mapping: ManualMapping,
+        selected_system_id: str | None,
+    ) -> set[str]:
+        physical_enclosure_id = resolve_physical_mapping_scope(mapping.enclosure_id)
+        scoped_system_id = (
+            mapping.system_id
+            if mapping.system_id is not None
+            else selected_system_id
+        )
+        keys = set(
+            self._physical_scope_keys(
+                scoped_system_id,
+                physical_enclosure_id,
+                mapping.slot,
+            )
+        )
+        if physical_enclosure_id is None:
+            keys.add(self._slot_key(scoped_system_id, None, mapping.slot))
+        keys.update(self._legacy_keys_for_mapping(mapping))
+        return keys
+
+    def _legacy_keys_for_mapping(self, mapping: ManualMapping) -> set[str]:
+        physical_enclosure_id = resolve_physical_mapping_scope(mapping.enclosure_id)
+        keys = {f"{physical_enclosure_id or 'default'}:{mapping.slot}"}
+        keys.update(
+            f"{alias_id}:{mapping.slot}"
+            for alias_id in self._drawer_alias_enclosure_ids(
+                physical_enclosure_id
+            )
+        )
+        return keys
+
+    def _key_is_in_scope_namespace(
+        self,
+        key: str,
+        mapping: ManualMapping,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slot: int | None,
+    ) -> bool:
+        if slot is not None:
+            return key in self._resolvable_keys(system_id, enclosure_id, slot)
+        if enclosure_id is None:
+            system_prefix = f"{system_id or 'default_system'}:"
+            if key.startswith(system_prefix):
+                return True
+            return key in self._legacy_keys_for_mapping(mapping)
+
+        physical_ids = (
+            enclosure_id,
+            *self._drawer_alias_enclosure_ids(enclosure_id),
+        )
+        scoped_prefix = f"{system_id or 'default_system'}:"
+        prefixes = {
+            *(f"{scoped_prefix}{physical_id}:" for physical_id in physical_ids),
+            *(f"{physical_id}:" for physical_id in physical_ids),
+            f"{scoped_prefix}default:",
+            "default:",
+        }
+        return any(key.startswith(prefix) for prefix in prefixes)
+
+    def _assert_scope_key_model_consistency(
+        self,
+        current: Mapping[str, ManualMapping],
+        system_id: str | None,
+        enclosure_id: str | None,
+        *,
+        slot: int | None = None,
+        all_systems: bool = False,
+    ) -> None:
+        enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        for key, mapping in current.items():
+            if not all_systems and not self._key_is_in_scope_namespace(
+                key,
+                mapping,
+                system_id,
+                enclosure_id,
+                slot,
+            ):
+                continue
+            candidate_system_id = (
+                self._mapping_system_id(key, mapping)
+                if all_systems
+                else system_id
+            )
+            if key not in self._consistent_keys_for_mapping(
+                mapping,
+                candidate_system_id,
+            ):
+                raise MappingScopeConflict()
+
     @classmethod
     def _semantic_mapping(cls, mapping: ManualMapping) -> dict[str, Any]:
         mapping = cls._canonical_mapping(mapping)
@@ -455,11 +555,25 @@ class MappingStore:
         slot: int | None = None,
     ) -> None:
         physical_enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        self._assert_scope_key_model_consistency(
+            current,
+            system_id,
+            physical_enclosure_id,
+            slot=slot,
+        )
         grouped: dict[
             tuple[str | None, int],
             list[tuple[bool, dict[str, Any]]],
         ] = {}
         for key, mapping in current.items():
+            if not self._key_is_in_scope_namespace(
+                key,
+                mapping,
+                system_id,
+                physical_enclosure_id,
+                slot,
+            ):
+                continue
             mapping_system_id = self._mapping_system_id(key, mapping)
             if system_id is not None:
                 if mapping_system_id not in {None, system_id}:
@@ -509,6 +623,14 @@ class MappingStore:
         self._assert_no_alias_conflicts(current, system_id, enclosure_id)
         selected: dict[tuple[str | None, int], tuple[tuple[int, str], ManualMapping]] = {}
         for key, mapping in current.items():
+            if not self._key_is_in_scope_namespace(
+                key,
+                mapping,
+                system_id,
+                enclosure_id,
+                None,
+            ):
+                continue
             if not self._mapping_matches_system(key, mapping, system_id):
                 continue
             canonical = self._canonical_mapping(mapping)
