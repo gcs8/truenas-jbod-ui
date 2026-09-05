@@ -319,6 +319,8 @@ test("successful mapping save renders the authoritative snapshot instead of the 
     mappingForm: {},
     getSlotById() { return { slot: 7, slot_label: "07", mapping_revision: "a".repeat(64) }; },
     setStatus() {},
+    writeBlockedByPolicy: () => false,
+    handleWriteRejection: () => false,
     async sendScopedRequest(_url, options) {
       sentPayload = JSON.parse(options.body);
       return { snapshot: { marker: "server-normalized" } };
@@ -348,6 +350,8 @@ test("successful mapping clear invalidates history before render", async () => {
       return { slot: 7, slot_label: "07", mapping_clear_revision: "a".repeat(64) };
     },
     setStatus() {},
+    writeBlockedByPolicy: () => false,
+    handleWriteRejection: () => false,
     async sendScopedRequest() { return { snapshot: { marker: "cleared" } }; },
     applySnapshot() { events.push("apply"); },
     invalidateHistoryCaches() { events.push("invalidate"); },
@@ -375,6 +379,8 @@ test("mapping clear sends the selected slot scope revision", async () => {
       };
     },
     setStatus() {},
+    writeBlockedByPolicy: () => false,
+    handleWriteRejection: () => false,
     async sendScopedRequest(url) {
       requestedUrl = url;
       return { snapshot: { marker: "cleared" } };
@@ -407,6 +413,8 @@ test("mapping mutations without a scope revision fail closed before any request"
     window: { confirm() { confirmCount += 1; return true; } },
     getSlotById() { return { slot: 7, slot_label: "07" }; },
     setStatus(message) { statuses.push(message); },
+    writeBlockedByPolicy: () => false,
+    handleWriteRejection: () => false,
     async sendScopedRequest() { requestCount += 1; return { snapshot: {} }; },
     applySnapshot() {},
     renderAll() {},
@@ -462,6 +470,8 @@ test("mapping import previews and confirms the exact diff before rendering impor
       },
     },
     setStatus() {},
+    writeBlockedByPolicy: () => false,
+    handleWriteRejection: () => false,
     mappingImportPreviewMessage(preview) {
       return `Add ${preview.additions.length}; update ${preview.updates.length}; remove ${preview.removals.length}; unchanged ${preview.unchanged.length}`;
     },
@@ -523,6 +533,8 @@ test("canceling a mapping import preview performs no write and clears the file i
     window: { confirm: () => false },
     mappingImportPreviewMessage: () => "preview",
     setStatus(message) { statuses.push(message); },
+    writeBlockedByPolicy: () => false,
+    handleWriteRejection: () => false,
     async sendScopedRequest(url) {
       requests.push(url);
       if (url.endsWith("/preview")) {

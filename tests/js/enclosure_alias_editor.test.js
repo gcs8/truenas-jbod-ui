@@ -260,6 +260,7 @@ test("blank submit clears the base enclosure alias and refreshes the live snapsh
       requests.push({ url, options });
       return { ok: true, cleared: true };
     },
+    writeBlockedByPolicy: () => false,
     closeEnclosureAliasEditor() { closed += 1; },
     async refreshSnapshot(force) {
       assert.equal(force, true);
@@ -285,6 +286,62 @@ test("blank submit clears the base enclosure alias and refreshes the live snapsh
   });
   assert.equal(closed, 1);
   assert.equal(refreshed, 1);
+});
+
+test("a rejected alias write reports the server detail and keeps the editor open", async () => {
+  const statuses = [];
+  const rejections = [];
+  let focused = 0;
+  let closed = 0;
+  let refreshed = 0;
+  const state = {
+    snapshotMode: false,
+    selectedStorageViewRuntimeId: "",
+    selectedSystemId: "system-a",
+    selectedEnclosureId: "enc-a",
+    writePolicy: { enabled: true, mode: "basic", reason: "" },
+  };
+  const { submitEnclosureAlias, writeBlockedByPolicy, writePolicyAllowsWrites, writePolicyReason } = loadFunctions(
+    ["submitEnclosureAlias", "writeBlockedByPolicy", "writePolicyAllowsWrites", "writePolicyReason"],
+    {
+      state,
+      enclosureAliasInput: { value: "Archive East", focus() { focused += 1; } },
+      getSelectedEnclosureOption: () => ({ id: "enc-a" }),
+      currentLiveEnclosureId: () => "enc-a",
+      fetchJson: async () => {
+        const denied = new Error("Read UI authentication required.");
+        denied.status = 401;
+        denied.detail = "Read UI authentication required.";
+        throw denied;
+      },
+      handleWriteRejection(error) {
+        rejections.push(error);
+        state.writePolicy = { enabled: false, mode: "basic", reason: error.detail };
+        return true;
+      },
+      closeEnclosureAliasEditor() { closed += 1; },
+      async refreshSnapshot() { refreshed += 1; },
+      setStatus(message, tone) { statuses.push({ message, tone }); },
+    }
+  );
+
+  await submitEnclosureAlias({ preventDefault() {} });
+
+  assert.equal(rejections.length, 1);
+  assert.equal(rejections[0].status, 401);
+  assert.deepEqual(statuses, [{ message: "Read UI authentication required.", tone: "error" }]);
+  assert.equal(focused, 1);
+  assert.equal(closed, 0);
+  assert.equal(refreshed, 0);
+
+  // The next attempt is refused before any request is sent.
+  await submitEnclosureAlias({ preventDefault() {} });
+  assert.equal(rejections.length, 1);
+  assert.equal(statuses.length, 2);
+  assert.equal(statuses[1].message, "Read UI authentication required.");
+  assert.equal(writePolicyAllowsWrites(), false);
+  assert.equal(writeBlockedByPolicy(), true);
+  assert.equal(writePolicyReason(), "Read UI authentication required.");
 });
 
 test("clear control clears the draft and submits the clear operation", async () => {

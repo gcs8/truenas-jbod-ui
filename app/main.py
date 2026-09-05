@@ -364,6 +364,37 @@ def _clear_snapshot_export_source_cache_for_tests() -> None:
     SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
 
 
+READ_UI_WRITES_DISABLED_NETWORK_MODE_REASON = (
+    "Writes are disabled: this deployment runs the read UI in network auth mode. "
+    "Set ADMIN_AUTH_MODE=basic to enable mapping, LED and alias changes."
+)
+
+
+def build_read_ui_write_policy(auth_settings: Any | None) -> dict[str, object]:
+    """Describe whether the main UI's write controls can succeed (#273).
+
+    Mirrors the first check in :func:`require_read_ui_mutation_authorization`: every
+    read-UI mutation is denied with 403 unless ``ADMIN_AUTH_MODE=basic``. Missing auth
+    settings fail closed so the page never advertises writes it cannot perform.
+    """
+
+    if getattr(auth_settings, "auth_mode", None) == "basic":
+        return {"enabled": True, "mode": "basic", "reason": ""}
+    return {
+        "enabled": False,
+        "mode": "network",
+        "reason": READ_UI_WRITES_DISABLED_NETWORK_MODE_REASON,
+    }
+
+
+def resolve_read_ui_write_policy(request: Request) -> dict[str, object]:
+    try:
+        app_state = getattr(request.app, "state", None)
+    except (KeyError, AttributeError):
+        app_state = None
+    return build_read_ui_write_policy(getattr(app_state, "operator_auth_settings", None))
+
+
 def require_read_ui_mutation_authorization(request: Request) -> None:
     auth_settings = request.app.state.operator_auth_settings
     if auth_settings.auth_mode != "basic":
@@ -500,6 +531,7 @@ def build_index_context(
         if snapshot_mode
         else request.url_for("sas_fabric_view").path
     )
+    write_policy = resolve_read_ui_write_policy(request)
     return {
         "request": request,
         "snapshot": snapshot,
@@ -526,6 +558,8 @@ def build_index_context(
         "initial_history_panel_open_json": initial_history_panel_open_json,
         "initial_history_io_chart_mode_json": initial_history_io_chart_mode_json,
         "admin_launch_url": admin_launch_url,
+        "write_policy": write_policy,
+        "write_policy_json": json.dumps(write_policy),
     }
 
 

@@ -136,6 +136,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             "systemId": snapshot.selected_system_id or service.system.id,
             "enclosureId": snapshot.selected_enclosure_id or enclosure_id,
             "appVersion": __version__,
+            "writePolicy": resolve_read_ui_write_policy(request),
         }
         return templates.TemplateResponse(
             request,
