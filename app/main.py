@@ -56,7 +56,11 @@ from app.metrics import install_metrics
 from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
 from app.script_json import register_script_json_filters
 from app.services.history_backend import HistoryBackendClient
-from app.services.inventory import DiskInventorySyncBusy
+from app.services.inventory import (
+    DiskInventorySyncBusy,
+    SnapshotStateBusyError,
+    UnknownEnclosureError,
+)
 from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
 from app.services.mapping_store import MappingImportDigestMismatch, MappingRevisionConflict
 from app.services.profile_registry import build_profile_reference_warnings
@@ -83,6 +87,24 @@ async def system_not_configured_exception_handler(
     return JSONResponse(
         {"ok": False, "detail": str(exc)},
         status_code=404,
+    )
+
+
+async def unknown_enclosure_exception_handler(
+    _: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return JSONResponse({"ok": False, "detail": str(exc)}, status_code=404)
+
+
+async def snapshot_state_busy_exception_handler(
+    _: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "detail": str(exc)},
+        status_code=503,
+        headers={"Retry-After": "1"},
     )
 
 
@@ -500,6 +522,14 @@ def create_app() -> FastAPI:
         SystemNotConfiguredError,
         system_not_configured_exception_handler,
     )
+    app.add_exception_handler(
+        UnknownEnclosureError,
+        unknown_enclosure_exception_handler,
+    )
+    app.add_exception_handler(
+        SnapshotStateBusyError,
+        snapshot_state_busy_exception_handler,
+    )
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
@@ -629,6 +659,14 @@ async def resolve_layout_slots(
             selected_enclosure_id=selected_enclosure_id,
             allow_stale_cache=True,
         )
+    except UnknownEnclosureError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SnapshotStateBusyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "1"},
+        ) from exc
     except Exception as exc:  # noqa: BLE001 - expose a stable route error, not source details
         logger.debug("Slot bounds: selected enclosure snapshot unavailable (%s)", exc)
         raise HTTPException(
@@ -638,7 +676,7 @@ async def resolve_layout_slots(
     if selected_enclosure_id and snapshot.selected_enclosure_id != selected_enclosure_id:
         raise HTTPException(
             status_code=404,
-            detail=f"Enclosure {selected_enclosure_id!r} is not available for this system.",
+            detail="Requested enclosure is not available for this system.",
         )
     layout_slots = snapshot_layout_slots(snapshot)
     if not layout_slots:

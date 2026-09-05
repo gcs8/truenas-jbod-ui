@@ -10644,6 +10644,355 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
                 self.assertEqual(len(store.load_all()), slot_count)
 
 
+class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase):
+    def _service(self, temp_dir: str) -> InventoryService:
+        return build_inventory_service(
+            Settings(),
+            SystemConfig(id="bounded", truenas=TrueNASConfig(platform="core")),
+            AsyncMock(),
+            AsyncMock(),
+            temp_dir,
+        )
+
+    @staticmethod
+    def _snapshot(selected: str | None = "enc-a") -> InventorySnapshot:
+        return InventorySnapshot(
+            slots=[],
+            refresh_interval_seconds=30,
+            selected_system_id="bounded",
+            selected_system_platform="core",
+            selected_enclosure_id=selected,
+            enclosures=[
+                EnclosureOption(id="enc-a", label="Shelf A"),
+                EnclosureOption(id="enc-b", label="Shelf B"),
+                EnclosureOption(id="enc-a:drawer-top", label="Shelf A top"),
+                EnclosureOption(id="view:flash", label="Flash view", kind="virtual"),
+            ],
+        )
+
+    async def test_unknown_ids_fail_before_request_keyed_state_or_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._build_snapshot = AsyncMock(return_value=self._snapshot())
+
+            for index in range(80):
+                raw_id = f"untrusted-{index}-" + ("x" * index)
+                with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                    await service.get_snapshot(selected_enclosure_id=raw_id)
+                self.assertNotIn(raw_id, service._cache)
+                self.assertNotIn(raw_id, service._cache_until)
+                self.assertNotIn(raw_id, service._snapshot_locks)
+                self.assertNotIn(raw_id, service._snapshot_refresh_tasks)
+
+            self.assertEqual(
+                [call.kwargs["selected_enclosure_id"] for call in service._build_snapshot.await_args_list],
+                [None],
+            )
+
+    async def test_none_and_exact_default_coalesce_while_aliases_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            default_snapshot = self._snapshot()
+            service._build_snapshot = AsyncMock(return_value=default_snapshot)
+
+            omitted, explicit = await asyncio.gather(
+                service.get_snapshot(),
+                service.get_snapshot(selected_enclosure_id="enc-a"),
+            )
+
+            self.assertIs(omitted, default_snapshot)
+            self.assertIs(explicit, default_snapshot)
+            self.assertEqual(set(service._cache), {"enc-a"})
+            self.assertNotIn("__default__", service._cache)
+            self.assertEqual(service._build_snapshot.await_count, 1)
+            for alias in ("Shelf A", "enc", "ENC-A", "drawer-top", "enc-a:drawer"):
+                with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                    await service.get_snapshot(selected_enclosure_id=alias)
+
+    async def test_perf_metadata_uses_only_canonical_snapshot_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._build_snapshot = AsyncMock(return_value=self._snapshot())
+            raw_id = "caller-" + ("x" * 512)
+
+            with patch("app.services.inventory.add_perf_metadata") as metadata:
+                await service.get_snapshot()
+                await service.get_snapshot(selected_enclosure_id="enc-a")
+                with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                    await service.get_snapshot(selected_enclosure_id=raw_id)
+
+            cache_keys = [
+                call.kwargs["snapshot_cache_key"]
+                for call in metadata.call_args_list
+                if "snapshot_cache_key" in call.kwargs
+            ]
+            self.assertTrue(cache_keys)
+            self.assertEqual(set(cache_keys), {"enc-a"})
+            self.assertNotIn(raw_id, repr(metadata.call_args_list))
+
+    async def test_exact_physical_drawer_and_virtual_ids_remain_distinct(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                return self._snapshot(selected_enclosure_id or "enc-a")
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            requested = ("enc-a", "enc-b", "enc-a:drawer-top", "view:flash")
+            returned = [
+                await service.get_snapshot(selected_enclosure_id=key)
+                for key in requested
+            ]
+
+            self.assertEqual([snapshot.selected_enclosure_id for snapshot in returned], list(requested))
+            self.assertEqual(set(service._cache), set(requested))
+            self.assertEqual(set(service._cache_until), set(requested))
+
+    async def test_inactive_snapshot_state_uses_deterministic_lru_eviction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            option_ids = [f"enc-{index}" for index in range(65)]
+            options = [EnclosureOption(id=item, label=item) for item in option_ids]
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                selected = selected_enclosure_id or option_ids[0]
+                return InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_system_id="bounded",
+                    selected_system_platform="core",
+                    selected_enclosure_id=selected,
+                    enclosures=options,
+                )
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            for enclosure_id in option_ids[:64]:
+                await service.get_snapshot(selected_enclosure_id=enclosure_id)
+            await service.get_snapshot(selected_enclosure_id="enc-0")
+            await service.get_snapshot(selected_enclosure_id="enc-64")
+
+            state_keys = (
+                set(service._cache)
+                | set(service._cache_until)
+                | set(service._snapshot_locks)
+                | set(service._snapshot_refresh_tasks)
+            )
+            self.assertLessEqual(len(state_keys), 64)
+            self.assertIn("enc-0", state_keys)
+            self.assertNotIn("enc-1", state_keys)
+            self.assertEqual(set(service._cache), set(service._cache_until))
+
+    async def test_new_admission_prunes_expired_payload_expiry_lock_and_lru(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._canonical_enclosure_options = {
+                "expired": EnclosureOption(id="expired", label="Expired"),
+                "fresh": EnclosureOption(id="fresh", label="Fresh"),
+            }
+            service._admit_snapshot_key("expired")
+            service._cache["expired"] = self._snapshot("expired")
+            service._cache_until["expired"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._get_snapshot_lock("expired")
+            service._build_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_system_platform="core",
+                    selected_enclosure_id="fresh",
+                    enclosures=list(service._canonical_enclosure_options.values()),
+                )
+            )
+
+            await service.get_snapshot(selected_enclosure_id="fresh")
+
+            self.assertNotIn("expired", service._snapshot_state_keys())
+            self.assertEqual(service._snapshot_state_keys(), {"fresh"})
+
+    async def test_physical_invalidation_cleans_coordinated_drawer_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            keys = ("enc-a", "enc-a::drawer-top", "enc-a::drawer-bottom", "enc-b")
+            fresh_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+            for key in keys:
+                service._admit_snapshot_key(key)
+                service._cache[key] = self._snapshot("enc-a" if key.startswith("enc-a") else "enc-b")
+                service._cache_until[key] = fresh_until
+                service._get_snapshot_lock(key)
+            sleeper = asyncio.create_task(asyncio.sleep(60))
+            service._snapshot_refresh_tasks["enc-a::drawer-top"] = sleeper
+            service._canonical_enclosure_options = {
+                key: EnclosureOption(id=key, label=key) for key in keys
+            }
+
+            service.invalidate_physical_enclosure_snapshot_cache(
+                reason="test.physical",
+                enclosure_id="enc-a",
+            )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            self.assertTrue(sleeper.cancelled())
+            for state in (
+                service._cache,
+                service._cache_until,
+                service._snapshot_locks,
+                service._snapshot_refresh_tasks,
+                service._snapshot_activity,
+                service._snapshot_lru,
+                service._canonical_enclosure_options,
+            ):
+                self.assertFalse(any(key.startswith("enc-a") for key in state))
+            self.assertIn("enc-b", service._cache)
+
+    async def test_source_invalidation_fences_an_older_discovery_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            started = asyncio.Event()
+            release = asyncio.Event()
+            old_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="old",
+                enclosures=[EnclosureOption(id="old", label="Old")],
+            )
+            new_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="new",
+                enclosures=[EnclosureOption(id="new", label="New")],
+            )
+
+            async def discover(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                if not started.is_set():
+                    started.set()
+                    await release.wait()
+                    return old_snapshot
+                return new_snapshot
+
+            service._build_snapshot = AsyncMock(side_effect=discover)
+            request = asyncio.create_task(service.get_snapshot(selected_enclosure_id="old"))
+            await started.wait()
+            service.invalidate_snapshot_cache(reason="test.source", invalidate_source_bundle=True)
+            release.set()
+
+            with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                await request
+            self.assertEqual(set(service._canonical_enclosure_options or {}), {"new"})
+            self.assertNotIn("old", service._snapshot_state_keys())
+
+    async def test_trusted_refresh_replaces_the_canonical_option_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            initial = self._snapshot()
+            refreshed = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="enc-a",
+                enclosures=[
+                    EnclosureOption(id="enc-a", label="Shelf A"),
+                    EnclosureOption(id="enc-c", label="Shelf C"),
+                ],
+            )
+            selected_c = refreshed.model_copy(update={"selected_enclosure_id": "enc-c"})
+            service._build_snapshot = AsyncMock(side_effect=[initial, refreshed, selected_c])
+
+            await service.get_snapshot()
+            await service.get_snapshot(force_refresh=True)
+            returned = await service.get_snapshot(selected_enclosure_id="enc-c")
+
+            self.assertIs(returned, selected_c)
+            self.assertEqual(set(service._canonical_enclosure_options or {}), {"enc-a", "enc-c"})
+            with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                await service.get_snapshot(selected_enclosure_id="enc-b")
+
+    async def test_parsed_ssh_cache_never_retains_a_none_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=True,
+                warnings=[],
+                sources={},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+
+            service._parsed_ssh_data_for_enclosure(bundle, None)
+
+            self.assertNotIn(None, bundle.parsed_ssh_data_by_enclosure)
+            self.assertTrue(all(key is not None for key in bundle.parsed_ssh_data_by_enclosure))
+
+    async def test_all_active_capacity_fails_closed_without_transient_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            option_ids = [f"active-{index}" for index in range(inventory_module.SNAPSHOT_STATE_MAX_ENTRIES + 1)]
+            service._canonical_enclosure_options = {
+                key: EnclosureOption(id=key, label=key) for key in option_ids
+            }
+            for key in option_ids[:-1]:
+                service._admit_snapshot_key(key)
+                service._snapshot_activity[key] = 1
+            service._build_snapshot = AsyncMock()
+
+            with self.assertRaisesRegex(Exception, "Snapshot state capacity is temporarily busy"):
+                await service.get_snapshot(selected_enclosure_id=option_ids[-1])
+
+            self.assertEqual(
+                len(service._snapshot_state_keys()),
+                inventory_module.SNAPSHOT_STATE_MAX_ENTRIES,
+            )
+            service._build_snapshot.assert_not_awaited()
+
+    async def test_cancelled_build_leaves_no_orphan_coordination_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._canonical_enclosure_options = {
+                "enc-a": EnclosureOption(id="enc-a", label="Shelf A")
+            }
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                started.set()
+                await release.wait()
+                return self._snapshot()
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            request = asyncio.create_task(service.get_snapshot(selected_enclosure_id="enc-a"))
+            await started.wait()
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+
+            self.assertNotIn("enc-a", service._snapshot_state_keys())
+
+
 class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _empty_source_bundle(*, warning: str | None = None) -> InventorySourceBundle:
@@ -10900,6 +11249,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 selected_system_id=system.id,
                 selected_system_platform="quantastor",
                 selected_enclosure_id="node-a",
+                enclosures=[EnclosureOption(id="node-a", label="Node A")],
                 platform_context={"topology_complete": True},
             )
             incomplete_snapshot = InventorySnapshot(
@@ -10984,7 +11334,10 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIs(returned, stale_snapshot)
             await asyncio.sleep(0.05)
-            self.assertEqual(service._cache["__default__"].slots[0].device_name, "da1")
+            self.assertEqual(
+                service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY].slots[0].device_name,
+                "da1",
+            )
 
     async def test_background_stale_snapshot_refresh_recollects_sources_without_invalidating_sg_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -11026,9 +11379,12 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             first = await service.get_snapshot(allow_stale_cache=True)
             await asyncio.wait_for(collect_started.wait(), timeout=0.1)
-            background_task = service._snapshot_refresh_tasks["__default__"]
+            background_task = service._snapshot_refresh_tasks[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY]
             second = await service.get_snapshot(allow_stale_cache=True)
-            self.assertIs(service._snapshot_refresh_tasks["__default__"], background_task)
+            self.assertIs(
+                service._snapshot_refresh_tasks[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY],
+                background_task,
+            )
             release_collect.set()
             await asyncio.wait_for(background_task, timeout=0.1)
 
@@ -11072,7 +11428,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             service._build_snapshot = AsyncMock(wraps=service._build_snapshot)
 
-            await service._background_snapshot_refresh("__default__", None)
+            await service._background_snapshot_refresh(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY)
             await asyncio.sleep(0)
 
             service._build_snapshot.assert_not_awaited()
@@ -11102,6 +11458,10 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                     selected_system_id=system.id,
                     selected_system_platform="scale",
                     selected_enclosure_id=enclosure_id,
+                    enclosures=[
+                        EnclosureOption(id="enc-a", label="Shelf A"),
+                        EnclosureOption(id="enc-b", label="Shelf B"),
+                    ],
                 )
 
             stale_snapshots = {
@@ -11168,14 +11528,20 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             stale_snapshot = InventorySnapshot(
                 slots=[SlotView(slot=0, slot_label="00", row_index=0, column_index=0, device_name="da0")],
                 refresh_interval_seconds=30,
+                selected_enclosure_id="enc-a",
+                enclosures=[EnclosureOption(id="enc-a", label="A"), EnclosureOption(id="enc-b", label="B")],
             )
             fresh_snapshot = InventorySnapshot(
                 slots=[SlotView(slot=1, slot_label="01", row_index=0, column_index=1, device_name="da1")],
                 refresh_interval_seconds=30,
+                selected_enclosure_id="enc-a",
+                enclosures=[EnclosureOption(id="enc-a", label="A"), EnclosureOption(id="enc-b", label="B")],
             )
             other_snapshot = InventorySnapshot(
                 slots=[SlotView(slot=2, slot_label="02", row_index=0, column_index=2, device_name="da2")],
                 refresh_interval_seconds=30,
+                selected_enclosure_id="enc-b",
+                enclosures=[EnclosureOption(id="enc-a", label="A"), EnclosureOption(id="enc-b", label="B")],
             )
             service._cache["enc-a"] = stale_snapshot
             service._cache_until["enc-a"] = datetime.now(timezone.utc) - timedelta(seconds=1)
@@ -11495,6 +11861,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 selected_system_id=system.id,
                 selected_system_platform="quantastor",
                 selected_enclosure_id="node-a",
+                enclosures=[EnclosureOption(id="node-a", label="Node A")],
                 platform_context={"topology_complete": True},
             )
             incomplete_snapshot = InventorySnapshot(
@@ -11553,6 +11920,26 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(),
                 temp_dir,
             )
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                await service._get_inventory_source_bundle(force_refresh=force_source_refresh)
+                selected = selected_enclosure_id or "enc-a"
+                return InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_system_platform="core",
+                    selected_enclosure_id=selected,
+                    enclosures=[
+                        EnclosureOption(id="enc-a", label="Shelf A"),
+                        EnclosureOption(id="enc-b", label="Shelf B"),
+                    ],
+                )
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
 
             await service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-a")
             await service.get_snapshot(selected_enclosure_id="enc-b")

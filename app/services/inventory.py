@@ -8,7 +8,7 @@ import logging
 import re
 import shlex
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -323,6 +323,8 @@ SMART_SUMMARY_VALUE_FIELDS = tuple(
 OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
 QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES = 64
+SNAPSHOT_STATE_MAX_ENTRIES = 64
+SNAPSHOT_NO_ENCLOSURE_KEY = "__service_no_enclosure__"
 SSH_CONNECTION_FAILURE_MARKERS = (
     "error reading ssh protocol banner",
     "no existing session",
@@ -689,6 +691,20 @@ class CacheResult(Generic[CacheValueT]):
     cache_state: CacheState
 
 
+class UnknownEnclosureError(Exception):
+    """Raised when a request does not name a discovered enclosure option."""
+
+    def __init__(self) -> None:
+        super().__init__("Requested enclosure is not available for this system.")
+
+
+class SnapshotStateBusyError(Exception):
+    """Raised when every bounded snapshot-state entry is active."""
+
+    def __init__(self) -> None:
+        super().__init__("Snapshot state capacity is temporarily busy; retry later.")
+
+
 @dataclass(slots=True)
 class InventorySourceBundle:
     raw_data: TrueNASRawData
@@ -700,7 +716,7 @@ class InventorySourceBundle:
     quantastor_ses_data: ParsedSSHData
     ssh_failure_details: list[dict[str, Any]] = field(default_factory=list)
     bmc_inventory: BMCInventory | None = None
-    parsed_ssh_data_by_enclosure: dict[str | None, ParsedSSHData] = field(default_factory=dict)
+    parsed_ssh_data_by_enclosure: dict[str, ParsedSSHData] = field(default_factory=dict)
 
 
 class InventoryService:
@@ -734,6 +750,13 @@ class InventoryService:
         self._source_bundle: InventorySourceBundle | None = None
         self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
+        self._snapshot_activity: dict[str, int] = {}
+        self._snapshot_lru: OrderedDict[str, None] = OrderedDict()
+        self._snapshot_invalidated: set[str] = set()
+        self._snapshot_discovery_lock = asyncio.Lock()
+        self._canonical_enclosure_options: dict[str, EnclosureOption] | None = None
+        self._canonical_default_enclosure_id: str | None = None
+        self._snapshot_topology_generation = 0
         self._source_bundle_lock = asyncio.Lock()
         self._ssh_session_locks: dict[str, asyncio.Lock] = {}
         self._disk_inventory_sync_lock = asyncio.Lock()
@@ -843,66 +866,273 @@ class InventoryService:
         allow_stale_cache: bool = False,
         force_source_refresh: bool | None = None,
     ) -> CacheResult[InventorySnapshot]:
-        cache_key = selected_enclosure_id or "__default__"
         refresh_sources = force_refresh if force_source_refresh is None else force_source_refresh
+        cache_key, discovered_snapshot = await self._resolve_snapshot_cache_key(
+            selected_enclosure_id,
+            force_source_refresh=bool(refresh_sources),
+        )
+        self._admit_snapshot_key(cache_key)
+        if discovered_snapshot is not None:
+            if cache_key != SNAPSHOT_NO_ENCLOSURE_KEY and discovered_snapshot.selected_enclosure_id != cache_key:
+                raise UnknownEnclosureError()
+            self._cache[cache_key] = discovered_snapshot
+            self._cache_until[cache_key] = utcnow() + timedelta(
+                seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
+            )
+            self._touch_snapshot_key(cache_key)
+            cache_state: CacheState = "forced-refresh" if force_refresh else "miss"
+            add_perf_metadata(snapshot_cache=cache_state, snapshot_cache_key=cache_key)
+            self._observe_inventory_cache_metrics()
+            self._observe_inventory_snapshot_request(cache_state)
+            return CacheResult(discovered_snapshot, cache_state)
         cached = self._cache.get(cache_key)
         cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
         now = utcnow()
         if not force_refresh and cached and now < cache_until:
+            self._touch_snapshot_key(cache_key)
             add_perf_metadata(snapshot_cache="hit", snapshot_cache_key=cache_key)
             self._observe_inventory_snapshot_request("hit")
             return CacheResult(cached, "hit")
         if not force_refresh and allow_stale_cache and cached:
+            self._touch_snapshot_key(cache_key)
             add_perf_metadata(snapshot_cache="stale-hit", snapshot_cache_key=cache_key)
             self._observe_inventory_snapshot_request("stale-hit")
-            self._schedule_background_snapshot_refresh(cache_key, selected_enclosure_id)
+            self._schedule_background_snapshot_refresh(cache_key)
             return CacheResult(cached, "stale-hit")
 
-        async with self._get_snapshot_lock(cache_key):
-            cached = self._cache.get(cache_key)
-            cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
-            now = utcnow()
-            if not force_refresh and cached and now < cache_until:
-                add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
-                self._observe_inventory_snapshot_request("hit-after-wait")
-                return CacheResult(cached, "hit-after-wait")
+        self._snapshot_activity[cache_key] = self._snapshot_activity.get(cache_key, 0) + 1
+        try:
+            async with self._get_snapshot_lock(cache_key):
+                cached = self._cache.get(cache_key)
+                cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
+                now = utcnow()
+                if not force_refresh and cached and now < cache_until:
+                    self._touch_snapshot_key(cache_key)
+                    add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
+                    self._observe_inventory_snapshot_request("hit-after-wait")
+                    return CacheResult(cached, "hit-after-wait")
 
-            refresh_trigger: CacheState = "forced-refresh" if force_refresh else "miss"
-            add_perf_metadata(
-                snapshot_cache=refresh_trigger,
-                snapshot_cache_key=cache_key,
-                system_id=self.system.id,
-                platform=self.system.truenas.platform,
-            )
-            build_started = time.perf_counter()
-            with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=selected_enclosure_id):
-                snapshot = await self._build_snapshot(
-                    selected_enclosure_id=selected_enclosure_id,
-                    force_source_refresh=refresh_sources,
+                refresh_trigger: CacheState = "forced-refresh" if force_refresh else "miss"
+                add_perf_metadata(
+                    snapshot_cache=refresh_trigger,
+                    snapshot_cache_key=cache_key,
+                    system_id=self.system.id,
+                    platform=self.system.truenas.platform,
                 )
-            self._observe_inventory_snapshot_build(
-                trigger=refresh_trigger,
-                snapshot=snapshot,
-                duration_seconds=time.perf_counter() - build_started,
-            )
-            if not self._snapshot_has_trusted_topology(snapshot):
-                add_perf_metadata(snapshot_topology="untrusted", snapshot_cache_key=cache_key)
-                if cached and self._snapshot_has_trusted_topology(cached):
-                    self._observe_inventory_snapshot_request("trusted-fallback")
-                    logger.warning(
-                        "Preserving previously trusted snapshot for %s because the refreshed topology is incomplete.",
-                        cache_key,
+                build_started = time.perf_counter()
+                with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=cache_key):
+                    snapshot = await self._build_snapshot(
+                        selected_enclosure_id=None if cache_key == SNAPSHOT_NO_ENCLOSURE_KEY else cache_key,
+                        force_source_refresh=refresh_sources,
                     )
-                    return CacheResult(cached, "trusted-fallback")
+                self._observe_inventory_snapshot_build(
+                    trigger=refresh_trigger,
+                    snapshot=snapshot,
+                    duration_seconds=time.perf_counter() - build_started,
+                )
+                if not self._snapshot_has_trusted_topology(snapshot):
+                    add_perf_metadata(snapshot_topology="untrusted", snapshot_cache_key=cache_key)
+                    if cached and self._snapshot_has_trusted_topology(cached):
+                        self._observe_inventory_snapshot_request("trusted-fallback")
+                        logger.warning(
+                            "Preserving previously trusted snapshot for %s because the refreshed topology is incomplete.",
+                            cache_key,
+                        )
+                        return CacheResult(cached, "trusted-fallback")
+                    self._observe_inventory_snapshot_request(refresh_trigger)
+                    return CacheResult(snapshot, refresh_trigger)
+                if cache_key != SNAPSHOT_NO_ENCLOSURE_KEY and snapshot.selected_enclosure_id != cache_key:
+                    if self._canonical_enclosure_options is not None:
+                        self._canonical_enclosure_options.pop(cache_key, None)
+                    self._snapshot_invalidated.add(cache_key)
+                    raise UnknownEnclosureError()
+                self._replace_canonical_options_from_trusted_snapshot(snapshot)
+                self._cache[cache_key] = snapshot
+                self._cache_until[cache_key] = utcnow() + timedelta(
+                    seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
+                )
+                self._touch_snapshot_key(cache_key)
+                self._observe_inventory_cache_metrics()
                 self._observe_inventory_snapshot_request(refresh_trigger)
                 return CacheResult(snapshot, refresh_trigger)
-            self._cache[cache_key] = snapshot
-            self._cache_until[cache_key] = utcnow() + timedelta(
-                seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
+        finally:
+            remaining = self._snapshot_activity.get(cache_key, 1) - 1
+            if remaining:
+                self._snapshot_activity[cache_key] = remaining
+            else:
+                self._snapshot_activity.pop(cache_key, None)
+                if cache_key in self._snapshot_invalidated or cache_key not in self._cache:
+                    self._remove_snapshot_state_key(cache_key)
+
+    def _snapshot_state_keys(self) -> set[str]:
+        return (
+            set(self._cache)
+            | set(self._cache_until)
+            | set(self._snapshot_locks)
+            | set(self._snapshot_refresh_tasks)
+            | set(self._snapshot_activity)
+            | set(self._snapshot_lru)
+        )
+
+    def _snapshot_key_is_active(self, cache_key: str) -> bool:
+        task = self._snapshot_refresh_tasks.get(cache_key)
+        return bool(self._snapshot_activity.get(cache_key) or (task is not None and not task.done()))
+
+    def _touch_snapshot_key(self, cache_key: str) -> None:
+        self._snapshot_lru[cache_key] = None
+        self._snapshot_lru.move_to_end(cache_key)
+
+    def _remove_snapshot_state_key(self, cache_key: str, *, cancel_task: bool = False) -> bool:
+        if self._snapshot_activity.get(cache_key):
+            self._cache.pop(cache_key, None)
+            self._cache_until.pop(cache_key, None)
+            self._snapshot_invalidated.add(cache_key)
+            return False
+        task = self._snapshot_refresh_tasks.get(cache_key)
+        if task is not None and not task.done():
+            if not cancel_task:
+                return False
+            self._cache.pop(cache_key, None)
+            self._cache_until.pop(cache_key, None)
+            task.cancel()
+            self._snapshot_invalidated.add(cache_key)
+
+            def _finish_invalidation(completed: asyncio.Task[None], *, key: str = cache_key) -> None:
+                if self._snapshot_refresh_tasks.get(key) is completed:
+                    self._snapshot_refresh_tasks.pop(key, None)
+                self._remove_snapshot_state_key(key)
+
+            task.add_done_callback(_finish_invalidation)
+            return False
+        self._cache.pop(cache_key, None)
+        self._cache_until.pop(cache_key, None)
+        self._snapshot_locks.pop(cache_key, None)
+        self._snapshot_refresh_tasks.pop(cache_key, None)
+        self._snapshot_activity.pop(cache_key, None)
+        self._snapshot_lru.pop(cache_key, None)
+        self._snapshot_invalidated.discard(cache_key)
+        return True
+
+    def _admit_snapshot_key(self, cache_key: str) -> None:
+        if cache_key in self._snapshot_state_keys():
+            self._snapshot_invalidated.discard(cache_key)
+            self._touch_snapshot_key(cache_key)
+            return
+        now = utcnow()
+        for candidate in tuple(self._snapshot_lru):
+            if self._snapshot_key_is_active(candidate):
+                continue
+            if self._cache_until.get(candidate, datetime.min.replace(tzinfo=timezone.utc)) <= now:
+                self._remove_snapshot_state_key(candidate)
+        while len(self._snapshot_state_keys()) >= SNAPSHOT_STATE_MAX_ENTRIES:
+            victim = next(
+                (candidate for candidate in self._snapshot_lru if not self._snapshot_key_is_active(candidate)),
+                None,
             )
-            self._observe_inventory_cache_metrics()
-            self._observe_inventory_snapshot_request(refresh_trigger)
-            return CacheResult(snapshot, refresh_trigger)
+            if victim is None:
+                raise SnapshotStateBusyError()
+            self._remove_snapshot_state_key(victim)
+        self._touch_snapshot_key(cache_key)
+
+    async def _resolve_snapshot_cache_key(
+        self,
+        selected_enclosure_id: str | None,
+        *,
+        force_source_refresh: bool,
+    ) -> tuple[str, InventorySnapshot | None]:
+        self._migrate_legacy_default_snapshot()
+        self._learn_canonical_options_from_cache()
+        options = self._canonical_enclosure_options
+        discovered_snapshot: InventorySnapshot | None = None
+        if options is None:
+            async with self._snapshot_discovery_lock:
+                options = self._canonical_enclosure_options
+                while options is None:
+                    generation = self._snapshot_topology_generation
+                    candidate = await self._build_snapshot(
+                        selected_enclosure_id=None,
+                        force_source_refresh=force_source_refresh,
+                    )
+                    if generation != self._snapshot_topology_generation:
+                        continue
+                    discovered_snapshot = candidate
+                    trusted_topology = self._snapshot_has_trusted_topology(discovered_snapshot)
+                    options = {option.id: option for option in discovered_snapshot.enclosures}
+                    if not options and not trusted_topology:
+                        raise SnapshotStateBusyError()
+                    self._canonical_enclosure_options = options
+                    self._canonical_default_enclosure_id = (
+                        discovered_snapshot.selected_enclosure_id
+                        if discovered_snapshot.selected_enclosure_id in options
+                        else next(iter(options), None)
+                    )
+                    if not trusted_topology:
+                        discovered_snapshot = None
+        if selected_enclosure_id is None:
+            return self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY, discovered_snapshot
+        if selected_enclosure_id not in options:
+            raise UnknownEnclosureError()
+        return selected_enclosure_id, (
+            discovered_snapshot
+            if discovered_snapshot is not None
+            and discovered_snapshot.selected_enclosure_id == selected_enclosure_id
+            else None
+        )
+
+    def _migrate_legacy_default_snapshot(self) -> None:
+        legacy_key = "__default__"
+        if legacy_key not in self._cache:
+            return
+        snapshot = self._cache.pop(legacy_key)
+        target_key = snapshot.selected_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
+        self._cache[target_key] = snapshot
+        if legacy_key in self._cache_until:
+            self._cache_until[target_key] = self._cache_until.pop(legacy_key)
+        self._snapshot_locks.pop(legacy_key, None)
+        self._snapshot_lru.pop(legacy_key, None)
+        self._touch_snapshot_key(target_key)
+        if target_key == SNAPSHOT_NO_ENCLOSURE_KEY and self._canonical_enclosure_options is None:
+            self._canonical_enclosure_options = {}
+            self._canonical_default_enclosure_id = None
+
+    def _learn_canonical_options_from_cache(self) -> None:
+        if self._canonical_enclosure_options is not None:
+            return
+        trusted_snapshots = [
+            snapshot
+            for snapshot in self._cache.values()
+            if snapshot.enclosures and self._snapshot_has_trusted_topology(snapshot)
+        ]
+        if not trusted_snapshots:
+            return
+        options = {
+            option.id: option
+            for snapshot in trusted_snapshots
+            for option in snapshot.enclosures
+        }
+        self._canonical_enclosure_options = options
+        self._canonical_default_enclosure_id = next(
+            (
+                snapshot.selected_enclosure_id
+                for snapshot in trusted_snapshots
+                if snapshot.selected_enclosure_id in options
+            ),
+            next(iter(options), None),
+        )
+
+    def _replace_canonical_options_from_trusted_snapshot(self, snapshot: InventorySnapshot) -> None:
+        options = {option.id: option for option in snapshot.enclosures}
+        if not options and snapshot.selected_enclosure_id is not None:
+            return
+        removed_keys = set(self._canonical_enclosure_options or {}) - set(options)
+        self._canonical_enclosure_options = options
+        self._canonical_default_enclosure_id = (
+            snapshot.selected_enclosure_id
+            if snapshot.selected_enclosure_id in options
+            else next(iter(options), None)
+        )
+        for key in removed_keys:
+            self._remove_snapshot_state_key(key, cancel_task=True)
 
     async def get_sas_fabric_snapshot(
         self,
@@ -1656,8 +1886,10 @@ class InventoryService:
         invalidate_source_bundle: bool = False,
     ) -> None:
         if cache_keys is None:
-            self._cache.clear()
-            self._cache_until.clear()
+            snapshot_keys_to_remove = self._snapshot_state_keys()
+            self._canonical_enclosure_options = None
+            self._canonical_default_enclosure_id = None
+            self._snapshot_topology_generation += 1
             self._smart_cache_global_generation += 1
             smart_keys_to_remove = (
                 set(self._smart_cache)
@@ -1665,10 +1897,17 @@ class InventoryService:
                 | set(self._smart_refresh_tasks)
             )
         else:
-            normalized_keys = {key or "__default__" for key in cache_keys}
-            for key in normalized_keys:
-                self._cache.pop(key, None)
-                self._cache_until.pop(key, None)
+            requested_keys = tuple(cache_keys)
+            normalized_keys = {
+                key
+                if key is not None
+                else self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
+                for key in requested_keys
+            }
+            if any(key is None for key in requested_keys):
+                normalized_keys.add("__default__")
+            snapshot_keys_to_remove = set(normalized_keys)
+            for key in snapshot_keys_to_remove:
                 self._smart_cache_enclosure_generations[key] = (
                     self._smart_cache_enclosure_generations.get(key, 0) + 1
                 )
@@ -1681,6 +1920,16 @@ class InventoryService:
                 )
                 if key[2] in normalized_keys
             }
+            if self._canonical_enclosure_options is not None:
+                for key in snapshot_keys_to_remove:
+                    self._canonical_enclosure_options.pop(key, None)
+                if self._canonical_default_enclosure_id in snapshot_keys_to_remove:
+                    self._canonical_default_enclosure_id = next(
+                        iter(self._canonical_enclosure_options),
+                        None,
+                    )
+        for key in snapshot_keys_to_remove:
+            self._remove_snapshot_state_key(key, cancel_task=True)
         self._remove_smart_cache_keys(smart_keys_to_remove)
         for smart_key in smart_keys_to_remove:
             task = self._smart_refresh_tasks.pop(smart_key, None)
@@ -1704,9 +1953,9 @@ class InventoryService:
         else:
             base_enclosure_id = self._base_enclosure_id(enclosure_id)
             known_enclosure_keys = (
-                set(self._cache)
-                | set(self._cache_until)
+                self._snapshot_state_keys()
                 | set(self._smart_cache_enclosure_generations)
+                | set(self._canonical_enclosure_options or {})
                 | {key[2] for key in self._smart_cache}
                 | {key[2] for key in self._smart_cache_until}
                 | {key[2] for key in self._smart_refresh_tasks}
@@ -1714,9 +1963,9 @@ class InventoryService:
             cache_keys = {
                 key
                 for key in known_enclosure_keys
-                if key != "__default__" and self._base_enclosure_id(key) == base_enclosure_id
+                if key != SNAPSHOT_NO_ENCLOSURE_KEY and self._base_enclosure_id(key) == base_enclosure_id
             }
-            cache_keys.update({base_enclosure_id, enclosure_id, None})
+            cache_keys.update({base_enclosure_id, enclosure_id, "__default__"})
         self.invalidate_snapshot_cache(
             reason=reason,
             cache_keys=cache_keys,
@@ -1727,6 +1976,8 @@ class InventoryService:
         preferred_keys: list[str] = []
         if selected_enclosure_id:
             preferred_keys.append(selected_enclosure_id)
+        else:
+            preferred_keys.append(self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY)
         preferred_keys.append("__default__")
         for key in preferred_keys:
             snapshot = self._cache.get(key)
@@ -2592,17 +2843,19 @@ class InventoryService:
             bmc_inventory=bmc_inventory,
         )
 
-    def _schedule_background_snapshot_refresh(self, cache_key: str, selected_enclosure_id: str | None) -> None:
+    def _schedule_background_snapshot_refresh(self, cache_key: str) -> None:
         existing = self._snapshot_refresh_tasks.get(cache_key)
         if existing is not None and not existing.done():
             return
 
-        task = asyncio.create_task(self._background_snapshot_refresh(cache_key, selected_enclosure_id))
+        task = asyncio.create_task(self._background_snapshot_refresh(cache_key))
         self._snapshot_refresh_tasks[cache_key] = task
 
         def _cleanup(completed: asyncio.Task[None], *, key: str = cache_key) -> None:
             if self._snapshot_refresh_tasks.get(key) is completed:
                 self._snapshot_refresh_tasks.pop(key, None)
+            if key in self._snapshot_invalidated or key not in self._cache:
+                self._remove_snapshot_state_key(key)
             if completed.cancelled():
                 return
             exc = completed.exception()
@@ -2611,14 +2864,14 @@ class InventoryService:
 
         task.add_done_callback(_cleanup)
 
-    async def _background_snapshot_refresh(self, cache_key: str, selected_enclosure_id: str | None) -> None:
+    async def _background_snapshot_refresh(self, cache_key: str) -> None:
         try:
             source_refresh_succeeded = await asyncio.shield(self._schedule_background_source_bundle_refresh())
             if not source_refresh_succeeded:
                 return
             await self._get_snapshot_result(
                 force_refresh=True,
-                selected_enclosure_id=selected_enclosure_id,
+                selected_enclosure_id=None if cache_key == SNAPSHOT_NO_ENCLOSURE_KEY else cache_key,
                 force_source_refresh=False,
             )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
@@ -4718,7 +4971,14 @@ class InventoryService:
         source_bundle: InventorySourceBundle,
         selected_enclosure_id: str | None,
     ) -> ParsedSSHData:
-        cache_key = normalize_text(selected_enclosure_id)
+        cache_key = selected_enclosure_id
+        if cache_key is None:
+            return parse_ssh_outputs(
+                source_bundle.ssh_outputs,
+                self.settings.layout.slot_count,
+                self.system.truenas.enclosure_filter,
+                selected_enclosure_id=None,
+            )
         cached = source_bundle.parsed_ssh_data_by_enclosure.get(cache_key)
         if cached is not None:
             return cached

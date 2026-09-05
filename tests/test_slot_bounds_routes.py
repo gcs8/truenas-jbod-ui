@@ -21,7 +21,7 @@ from app.models.domain import (
     SmartSummaryView,
     utcnow,
 )
-from app.services.inventory import InventoryService
+from app.services.inventory import InventoryService, UnknownEnclosureError
 from app.services.profile_registry import dell_md1280_bottom_drawer_slot_layout
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 
@@ -154,6 +154,17 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.detail, "Unable to resolve selected enclosure layout.")
 
+    def test_unknown_enclosure_keeps_slot_bound_route_404(self) -> None:
+        service = _service(layout_slot_count=12)
+        service.get_snapshot.side_effect = UnknownEnclosureError()
+
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(app_main.ensure_slot_bounds(4, service, "caller-controlled-value"))
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(raised.exception.detail, "Requested enclosure is not available for this system.")
+        self.assertNotIn("caller-controlled-value", raised.exception.detail)
+
     def test_scoped_bounds_reject_a_snapshot_for_a_different_enclosure(self) -> None:
         service = _service(layout_slot_count=84)
         service.get_snapshot.return_value.selected_enclosure_id = "other-shelf"
@@ -162,7 +173,7 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
             asyncio.run(app_main.ensure_slot_bounds(40, service, "small-shelf"))
 
         self.assertEqual(raised.exception.status_code, 404)
-        self.assertEqual(raised.exception.detail, "Enclosure 'small-shelf' is not available for this system.")
+        self.assertEqual(raised.exception.detail, "Requested enclosure is not available for this system.")
 
     def test_smart_route_reaches_the_service_for_an_md1280_upper_bay(self) -> None:
         route = _route("/api/slots/{slot}/smart", "GET")
