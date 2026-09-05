@@ -17,6 +17,14 @@ from app.services.truenas_ws import TrueNASWebsocketClient
 logger = logging.getLogger(__name__)
 
 
+class SystemNotConfiguredError(LookupError):
+    """Raised when an explicitly selected system is not configured."""
+
+    def __init__(self, system_id: str) -> None:
+        self.system_id = system_id
+        super().__init__(f"System '{system_id}' is not configured.")
+
+
 class InventoryRegistry:
     """Create and reuse one inventory service per configured system."""
 
@@ -32,10 +40,12 @@ class InventoryRegistry:
         self._services: dict[str, InventoryService] = {}
 
     def get_system(self, system_id: str | None) -> SystemConfig:
-        selected_id = system_id or self.settings.default_system_id
+        selected_id = self.settings.default_system_id if system_id is None else system_id
         for system in self.settings.systems:
             if system.id == selected_id:
                 return system
+        if system_id is not None:
+            raise SystemNotConfiguredError(system_id)
         return next(system for system in self.settings.systems if system.id == self.settings.default_system_id)
 
     def get_service(self, system_id: str | None) -> InventoryService:

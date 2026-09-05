@@ -52,45 +52,5 @@ class SlotHistoryRouteTests(unittest.TestCase):
             window_hours=24,
         )
 
-    def test_slot_history_preserves_an_explicit_unknown_system_scope(self) -> None:
-        route = self._route("/api/slots/{slot}/history")
-        service = Mock()
-        service.system = SimpleNamespace(id="default-system", truenas=SimpleNamespace(platform="core"))
-        service.get_snapshot = AsyncMock(
-            return_value=InventorySnapshot(
-                slots=[],
-                layout_slot_count=60,
-                selected_enclosure_id="enc-a",
-                refresh_interval_seconds=30,
-            )
-        )
-        registry = Mock()
-        registry.get_service.return_value = service
-        history_backend = Mock()
-        history_backend.get_slot_history = AsyncMock(return_value={"available": False})
-
-        with (
-            patch.object(app_main, "get_settings", return_value=Settings()),
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_history_backend", return_value=history_backend),
-        ):
-            asyncio.run(
-                route.endpoint(
-                    slot=5,
-                    system_id="unknown-system",
-                    enclosure_id="enc-a",
-                    window_hours=24,
-                )
-            )
-
-        registry.get_service.assert_called_once_with("unknown-system")
-        history_backend.get_slot_history.assert_awaited_once_with(
-            5,
-            "unknown-system",
-            "enc-a",
-            window_hours=24,
-        )
-
-
 if __name__ == "__main__":
     unittest.main()

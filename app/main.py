@@ -53,7 +53,7 @@ from app.metrics import install_metrics
 from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
 from app.script_json import register_script_json_filters
 from app.services.history_backend import HistoryBackendClient
-from app.services.inventory_registry import InventoryRegistry
+from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
 from app.services.mapping_store import MappingImportDigestMismatch, MappingRevisionConflict
 from app.services.profile_registry import build_profile_reference_warnings
 from app.services.release_status import ReleaseStatusService
@@ -70,6 +70,16 @@ register_script_json_filters(templates.env)
 
 logger = logging.getLogger(__name__)
 INVALID_MAPPING_BUNDLE_DETAIL = "Mapping bundle is invalid."
+
+
+async def system_not_configured_exception_handler(
+    _: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "detail": str(exc)},
+        status_code=404,
+    )
 
 
 @dataclass(slots=True)
@@ -436,7 +446,10 @@ def create_app() -> FastAPI:
     from app.routes import build_router
 
     include_router_preserving_route_objects(app, build_router(sys.modules[__name__]))
-
+    app.add_exception_handler(
+        SystemNotConfiguredError,
+        system_not_configured_exception_handler,
+    )
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
