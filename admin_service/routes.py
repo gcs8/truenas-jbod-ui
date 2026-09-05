@@ -440,6 +440,58 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
     @router.post("/api/admin/system-setup/quantastor-nodes")
     async def discover_quantastor_nodes(payload: QuantastorNodeDiscoveryRequest) -> JSONResponse:
         settings = reload_app_settings()
+
+        def matches_saved_api_credential_authority(system: Any) -> bool:
+            if not same_credential_authority(
+                api_credential_authority(
+                    platform="quantastor",
+                    host=payload.truenas_host,
+                    username=payload.api_user,
+                    verify_tls=payload.verify_ssl,
+                    tls_ca_bundle_path=payload.tls_ca_bundle_path,
+                    tls_server_name=payload.tls_server_name,
+                ),
+                api_credential_authority(
+                    platform=system.truenas.platform,
+                    host=system.truenas.host,
+                    username=system.truenas.api_user,
+                    verify_tls=system.truenas.verify_ssl,
+                    tls_ca_bundle_path=system.truenas.tls_ca_bundle_path,
+                    tls_server_name=system.truenas.tls_server_name,
+                ),
+            ):
+                return False
+
+            ssh_sink_hosts = quantastor_node_discovery_seed_hosts(payload)
+            if (
+                not payload.api_user
+                or not payload.ssh_enabled
+                or not payload.ssh_user
+                or not (payload.ssh_key_path or payload.ssh_password)
+                or not ssh_sink_hosts
+            ):
+                return True
+            return system.ssh.enabled and credential_authorities_are_approved(
+                ssh_credential_authorities(
+                    platform="quantastor",
+                    hosts=ssh_sink_hosts,
+                    port=payload.ssh_port,
+                    username=payload.ssh_user,
+                    strict_host_key_checking=payload.ssh_strict_host_key_checking,
+                ),
+                ssh_credential_authorities(
+                    platform=system.truenas.platform,
+                    hosts=[
+                        system.ssh.host,
+                        *system.ssh.extra_hosts,
+                        *(node.host for node in system.ssh.ha_nodes),
+                    ],
+                    port=system.ssh.port,
+                    username=system.ssh.user,
+                    strict_host_key_checking=system.ssh.strict_host_key_checking,
+                ),
+            )
+
         try:
             payload = payload.model_copy(
                 update={
@@ -448,24 +500,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                         payload.system_id,
                         payload.api_password,
                         lambda system: system.truenas.api_password,
-                        lambda system: same_credential_authority(
-                            api_credential_authority(
-                                platform="quantastor",
-                                host=payload.truenas_host,
-                                username=payload.api_user,
-                                verify_tls=payload.verify_ssl,
-                                tls_ca_bundle_path=payload.tls_ca_bundle_path,
-                                tls_server_name=payload.tls_server_name,
-                            ),
-                            api_credential_authority(
-                                platform=system.truenas.platform,
-                                host=system.truenas.host,
-                                username=system.truenas.api_user,
-                                verify_tls=system.truenas.verify_ssl,
-                                tls_ca_bundle_path=system.truenas.tls_ca_bundle_path,
-                                tls_server_name=system.truenas.tls_server_name,
-                            ),
-                        ),
+                        matches_saved_api_credential_authority,
                     ),
                     "ssh_password": resolve_saved_secondary_secret(
                         settings,
