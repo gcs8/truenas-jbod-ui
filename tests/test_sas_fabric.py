@@ -1,5 +1,7 @@
 import importlib
+import inspect
 import json
+import re
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -23,8 +25,16 @@ from app.services.sas_diagnostics.decoder import (
     MAX_DIAGNOSTIC_TEXT_LENGTH,
     bound_diagnostic_value,
 )
-from app.services.sas_diagnostics.common import fault_family_likely_layer
-from app.services.sas_diagnostics.scsi import _sense_likely_layer, decode_scsi_cdb_message
+from app.services.sas_diagnostics import lsi_loginfo as lsi_loginfo_module
+from app.services.sas_diagnostics import scsi as scsi_module
+from app.services.sas_diagnostics.common import FAULT_FAMILY_LABELS, fault_family_likely_layer
+from app.services.sas_diagnostics.decoder import decode_mpr_dmesg_event
+from app.services.sas_diagnostics.scsi import (
+    _sense_likely_layer,
+    decode_scsi_cdb_message,
+    decode_scsi_sense_event,
+    decode_scsi_status_value,
+)
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.sas_fabric import (
     CORE_DMIDECODE_SLOT_COMMAND,
@@ -62,20 +72,68 @@ from app.services.ssh_probe import SSHCommandResult
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "sas_fabric"
 
 
-class SasDiagnosticLayerTests(unittest.TestCase):
-    def test_sense_likely_layer_matches_the_common_fault_family_mapping(self) -> None:
-        families = (
-            "sas_protocol",
-            "bus_reset",
-            "aborted_command",
-            "device_path_exception",
-            "controller_terminated_io",
-            "ses_enclosure",
-        )
+def _decoder_fault_families() -> set[str]:
+    """Every fault family a diagnostics decoder can stamp on a record."""
+    families = set(FAULT_FAMILY_LABELS)
+    for classifier in (scsi_module._sense_fault_family, scsi_module._cdb_fault_family, scsi_module.decode_scsi_status_value):
+        families.update(re.findall(r'"([a-z_]+)"', " ".join(re.findall(r'(?:return|family =) (.+)', inspect.getsource(classifier)))))
+    for name, table in vars(lsi_loginfo_module).items():
+        if name.startswith("LSI_SAS_") and isinstance(table, dict):
+            for entry in table.values():
+                if isinstance(entry, tuple) and len(entry) >= 3 and isinstance(entry[2], str):
+                    families.add(entry[2])
+    return families
 
-        for family in families:
+
+class SasDiagnosticLayerTests(unittest.TestCase):
+    # Command/sense classification families, not faults: the fabric-wide
+    # default is the intended layer text for them.
+    GENERIC_LAYER_FAMILIES = frozenset({"scsi_sense", "scsi_command", "capacity_query", "maintenance"})
+
+    def test_every_decoder_fault_family_has_a_canonical_likely_layer(self) -> None:
+        catch_all = fault_family_likely_layer("not_a_fault_family")
+        families = _decoder_fault_families()
+
+        # The label table is the family registry; a decoder must not mint a
+        # family the table (and therefore the layer map) does not know.
+        self.assertEqual(sorted(families - set(FAULT_FAMILY_LABELS)), [])
+        self.assertIn("aborted_command", families)
+        self.assertIn("device_path_exception", families)
+
+        for family in sorted(families):
             with self.subTest(family=family):
-                self.assertEqual(_sense_likely_layer(family), fault_family_likely_layer(family))
+                layer = fault_family_likely_layer(family)
+                self.assertEqual(_sense_likely_layer(family), layer)
+                if family in self.GENERIC_LAYER_FAMILIES:
+                    self.assertEqual(layer, catch_all)
+                elif family == "retry":
+                    # The retry decoder stamps its layer text on the record itself.
+                    self.assertEqual(
+                        decode_mpr_dmesg_event({"event_type": "retry"})["likely_layer"],
+                        "OS retry path",
+                    )
+                else:
+                    self.assertNotEqual(
+                        layer,
+                        catch_all,
+                        f"{family} falls through to the catch-all layer text",
+                    )
+
+    def test_aborted_command_and_device_path_exception_keep_specific_layer_text(self) -> None:
+        self.assertEqual(fault_family_likely_layer("aborted_command"), "Target or transport aborted command")
+        self.assertEqual(fault_family_likely_layer("device_path_exception"), "Target device or path state")
+
+        sense_abort = decode_scsi_sense_event({"reason": "ABORTED COMMAND", "sense_key": "ABORTED COMMAND"})
+        self.assertEqual(sense_abort["family"], "aborted_command")
+        self.assertEqual(sense_abort["likely_layer"], "Target or transport aborted command")
+
+        task_aborted = decode_scsi_status_value("TASK ABORTED")
+        self.assertEqual(task_aborted["family"], "aborted_command")
+        self.assertEqual(task_aborted["likely_layer"], "Target or transport aborted command")
+
+        path_exception = decode_scsi_sense_event({"sense_key": "NOT READY", "asc": "4,0b"})
+        self.assertEqual(path_exception["family"], "device_path_exception")
+        self.assertEqual(path_exception["likely_layer"], "Target device or path state")
 
     def test_read_capacity_commands_are_capacity_queries_not_read_io(self) -> None:
         messages = (

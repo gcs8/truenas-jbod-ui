@@ -161,6 +161,10 @@ def fault_family_likely_layer(family: str) -> str:
         return "Target media or command data path"
     if family == "bus_reset":
         return "SCSI/SAS recovery"
+    if family == "aborted_command":
+        return "Target or transport aborted command"
+    if family == "device_path_exception":
+        return "Target device or path state"
     if family in {"write_io", "read_io"}:
         return "Workload IO context"
     if family == "cam_error":
