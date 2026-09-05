@@ -572,9 +572,9 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     ) -> SmartBatchResponse:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        layout_slot_count = await resolve_layout_slot_count(service, enclosure_id)
+        layout_slots = await resolve_layout_slots(service, enclosure_id)
         for slot in payload.slots:
-            check_slot_bounds(slot, layout_slot_count)
+            check_slot_bounds(slot, layout_slots)
         add_perf_metadata(
             system_id=service.system.id,
             platform=service.system.truenas.platform,
@@ -638,9 +638,9 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         service = registry.get_service(system_id)
         normalized_slots = sorted({int(slot) for slot in (slots or [])})
         if normalized_slots:
-            layout_slot_count = await resolve_layout_slot_count(service, enclosure_id)
+            layout_slots = await resolve_layout_slots(service, enclosure_id)
             for slot in normalized_slots:
-                check_slot_bounds(slot, layout_slot_count)
+                check_slot_bounds(slot, layout_slots)
         add_perf_metadata(
             system_id=service.system.id,
             platform=service.system.truenas.platform,

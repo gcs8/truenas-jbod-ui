@@ -8,7 +8,8 @@ from fastapi import HTTPException
 
 from app import main as app_main
 from app.config import Settings
-from app.models.domain import InventorySnapshot
+from app.models.domain import InventorySnapshot, SlotView
+from app.services.profile_registry import dell_md1280_bottom_drawer_slot_layout
 
 
 def _route(path: str, method: str):
@@ -22,6 +23,8 @@ def _route(path: str, method: str):
 def _service(
     layout_slot_count: int | None,
     selected_enclosure_id: str | None = "50050cc11ac013fc",
+    slots: list[SlotView] | None = None,
+    layout_rows: list[list[int | None]] | None = None,
 ) -> Mock:
     service = Mock()
     service.system.id = "system-a"
@@ -31,7 +34,8 @@ def _service(
     else:
         service.get_snapshot = AsyncMock(
             return_value=InventorySnapshot(
-                slots=[],
+                slots=slots or [],
+                layout_rows=layout_rows or [],
                 layout_slot_count=layout_slot_count,
                 selected_enclosure_id=selected_enclosure_id,
                 refresh_interval_seconds=30,
@@ -39,6 +43,31 @@ def _service(
         )
     service.get_slot_smart_summary = AsyncMock(return_value={"slot": 78})
     return service
+
+
+BOTTOM_DRAWER_ID = "50050cc11ac013fc::dell-md1280-drawer-bottom-42"
+
+
+def _layout_slots(layout_rows: list[list[int | None]]) -> list[int]:
+    return sorted(slot for row in layout_rows for slot in row if slot is not None)
+
+
+def _drawer_service(layout_rows_in_snapshot: bool = False) -> Mock:
+    """Snapshot shaped like the MD1280 bottom-drawer sub-view: the visible bays
+    are numbered 42-83 while ``layout_slot_count`` reports the 42 visible bays,
+    exactly as ``_correlate_scale_linux`` renders a drawer sub-view."""
+    layout_rows = dell_md1280_bottom_drawer_slot_layout()
+    rendered = _layout_slots(layout_rows)
+    slot_views = [
+        SlotView(slot=slot, slot_label=str(slot + 1), row_index=0, column_index=index)
+        for index, slot in enumerate(rendered)
+    ]
+    return _service(
+        layout_slot_count=len(rendered),
+        selected_enclosure_id=BOTTOM_DRAWER_ID,
+        slots=[] if layout_rows_in_snapshot else slot_views,
+        layout_rows=layout_rows if layout_rows_in_snapshot else None,
+    )
 
 
 class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
@@ -156,6 +185,129 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
             with self.assertRaises(HTTPException):
                 asyncio.run(route.endpoint(payload=payload, system_id="system-a", enclosure_id="50050cc11ac013fc"))
 
+        self.assertEqual(service.get_snapshot.await_count, 2)
+
+
+class SlotBoundsFollowRenderedSlotsTests(unittest.TestCase):
+    """Regression for #275: a drawer sub-view numbers its bays from a non-zero
+    base (MD1280 bottom drawer = bays 42-83) while ``layout_slot_count`` only
+    says how many bays are visible, so a count-based bound rejected every real
+    bay in the drawer and accepted the other drawer's bays instead."""
+
+    def test_drawer_sub_view_admits_every_rendered_bay(self) -> None:
+        service = _drawer_service()
+        for slot in range(42, 84):
+            with self.subTest(slot=slot):
+                asyncio.run(app_main.ensure_slot_bounds(slot, service, BOTTOM_DRAWER_ID))
+
+    def test_drawer_sub_view_rejects_bays_from_the_other_drawer(self) -> None:
+        service = _drawer_service()
+        for slot in (0, 41, 84):
+            with self.subTest(slot=slot), self.assertRaises(HTTPException) as raised:
+                asyncio.run(app_main.ensure_slot_bounds(slot, service, BOTTOM_DRAWER_ID))
+            self.assertEqual(raised.exception.status_code, 404)
+            self.assertIn(f"Slot {slot}", raised.exception.detail)
+
+    def test_layout_rows_bound_the_view_when_no_slot_views_are_rendered_yet(self) -> None:
+        service = _drawer_service(layout_rows_in_snapshot=True)
+        asyncio.run(app_main.ensure_slot_bounds(42, service, BOTTOM_DRAWER_ID))
+        asyncio.run(app_main.ensure_slot_bounds(83, service, BOTTOM_DRAWER_ID))
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(app_main.ensure_slot_bounds(0, service, BOTTOM_DRAWER_ID))
+        self.assertEqual(raised.exception.status_code, 404)
+
+    def test_noncontiguous_layout_rejects_ids_in_the_gap(self) -> None:
+        service = _service(
+            layout_slot_count=6,
+            selected_enclosure_id="sparse-shelf",
+            layout_rows=[[0, 1, 2], [10, 11, 12]],
+        )
+        asyncio.run(app_main.ensure_slot_bounds(2, service, "sparse-shelf"))
+        asyncio.run(app_main.ensure_slot_bounds(10, service, "sparse-shelf"))
+        for slot in (5, 6, 13):
+            with self.subTest(slot=slot), self.assertRaises(HTTPException) as raised:
+                asyncio.run(app_main.ensure_slot_bounds(slot, service, "sparse-shelf"))
+            self.assertEqual(raised.exception.status_code, 404)
+
+    def test_count_only_snapshot_keeps_the_zero_based_rule(self) -> None:
+        service = _service(layout_slot_count=12, selected_enclosure_id="small-shelf")
+        asyncio.run(app_main.ensure_slot_bounds(11, service, "small-shelf"))
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(app_main.ensure_slot_bounds(12, service, "small-shelf"))
+        self.assertEqual(raised.exception.status_code, 404)
+
+    def test_smart_batch_admits_drawer_bays_and_resolves_the_layout_once(self) -> None:
+        route = _route("/api/slots/smart-batch", "POST")
+        service = _drawer_service()
+        service.get_slot_smart_summaries = AsyncMock(return_value=[])
+        registry = Mock()
+        registry.get_service.return_value = service
+        payload = Mock()
+        payload.slots = [42, 57, 83]
+        payload.max_concurrency = 2
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "get_settings", return_value=Settings()),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            try:
+                asyncio.run(route.endpoint(payload=payload, system_id="system-a", enclosure_id=BOTTOM_DRAWER_ID))
+            except HTTPException as exc:  # pragma: no cover - the bounds check must not fire
+                self.fail(f"bounds check rejected a drawer bay: {exc.detail}")
+            except Exception:
+                # Downstream service wiring is mocked loosely; only the bounds
+                # behaviour is under test here.
+                pass
+            payload.slots = [42, 5]
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(route.endpoint(payload=payload, system_id="system-a", enclosure_id=BOTTOM_DRAWER_ID))
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertIn("Slot 5", raised.exception.detail)
+        self.assertEqual(service.get_snapshot.await_count, 2)
+
+    def test_history_scope_admits_drawer_bays_and_rejects_the_other_drawer(self) -> None:
+        route = _route("/api/history/scope", "GET")
+        service = _drawer_service()
+        registry = Mock()
+        registry.get_service.return_value = service
+        history_backend = Mock()
+        history_backend.configured = True
+        history_backend.get_scope_history = AsyncMock(return_value={})
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "get_history_backend", return_value=history_backend),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            response = asyncio.run(
+                route.endpoint(
+                    system_id="system-a",
+                    enclosure_id=BOTTOM_DRAWER_ID,
+                    slots=[42, 83],
+                    window_hours=24,
+                    metrics=None,
+                    event_limit=12,
+                )
+            )
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(
+                    route.endpoint(
+                        system_id="system-a",
+                        enclosure_id=BOTTOM_DRAWER_ID,
+                        slots=[41],
+                        window_hours=24,
+                        metrics=None,
+                        event_limit=12,
+                    )
+                )
+
+        self.assertEqual(response.status_code, 200)
+        history_backend.get_scope_history.assert_awaited_once()
+        self.assertEqual(history_backend.get_scope_history.await_args.kwargs["slots"], [42, 83])
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertIn("Slot 41", raised.exception.detail)
         self.assertEqual(service.get_snapshot.await_count, 2)
 
 
