@@ -410,6 +410,14 @@
     },
     "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
   },
+  "tests/fixtures/platform_parity/scale_offset_1based_invalid_aes.txt": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:6e86674949804c806cc868c46e0cef6e4e0b9fc9fa18413ac343bf96e893a982": 7
+      }
+    },
+    "reason": "Deterministic synthetic fixture; exact detector counts are pinned."
+  },
   "tests/fixtures/platform_parity/scale_offset_1based_join.txt": {
     "findings": {
       "sas_wwn_identifier": {

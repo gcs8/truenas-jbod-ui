@@ -44,6 +44,11 @@ SES_EVIDENCE_SOURCE_STRENGTH = {
     "sg_ses_join": 40,
     "enclosure_sysfs": 50,
 }
+# Profiles support at most 4096 bays, and SES may report two descriptors for a
+# dual-path bay. Reject the entire untrusted page rather than return partial
+# geometry when either bounded parser input is exceeded.
+MAX_SES_AES_DESCRIPTORS = 2 * 4096
+MAX_SES_AES_OUTPUT_CHARS = 4 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -980,6 +985,70 @@ def _finalize_ses_device_slot_evidence(
             )
 
 
+def _finalize_ses_invalid_descriptor_evidence(
+    enclosure: SESMapEnclosure,
+    invalid_descriptors: list[SESMapSlot],
+    device_slot_evidence: list[SESMapSlot],
+) -> None:
+    if not invalid_descriptors:
+        return
+
+    offsets = {
+        slot.reported_slot_number - slot.element_id
+        for slot in device_slot_evidence
+        if slot.reported_slot_number is not None and slot.element_id is not None
+    }
+    translated_slots: dict[int, int] = {}
+    translated_slot_numbers: set[int] = set()
+    if len(offsets) == 1:
+        offset = next(iter(offsets))
+        occupied_slots = {
+            slot.reported_slot_number
+            for slot in device_slot_evidence
+            if slot.reported_slot_number is not None
+        }
+        for slot in invalid_descriptors:
+            if slot.element_id is None:
+                translated_slots.clear()
+                break
+            translated_slot = slot.element_id + offset
+            if (
+                translated_slot < 0
+                or translated_slot in occupied_slots
+                or translated_slot in translated_slot_numbers
+            ):
+                translated_slots.clear()
+                break
+            translated_slots[slot.element_id] = translated_slot
+            translated_slot_numbers.add(translated_slot)
+
+    translation_is_valid = len(translated_slots) == len(invalid_descriptors)
+    for slot in invalid_descriptors:
+        if translation_is_valid and slot.element_id is not None:
+            translated_slot = translated_slots[slot.element_id]
+            _record_ses_slot(
+                enclosure,
+                slot,
+                reported_slot_number=translated_slot,
+                source="ses_element_index_invalid_descriptor",
+                warning=(
+                    f"SES AES element {slot.element_id} is flagged invalid; mapped to device slot "
+                    f"{translated_slot} using the consistent offset reported by valid descriptors."
+                ),
+            )
+            continue
+        _record_ses_slot(
+            enclosure,
+            slot,
+            reported_slot_number=None,
+            source="ses_element_index_invalid_descriptor",
+            warning=(
+                f"SES AES element {slot.element_id} is flagged invalid; no consistent "
+                "element-to-device-slot offset is available, preserving it as unmapped SES evidence."
+            ),
+        )
+
+
 def _record_ses_slot(
     enclosure: SESMapEnclosure,
     slot: SESMapSlot,
@@ -1302,6 +1371,9 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     prettier enclosure APIs available.
     """
 
+    if len(output) > MAX_SES_AES_OUTPUT_CHARS:
+        return None
+
     ses_device = _extract_sg_ses_device(command)
     enclosure = SESMapEnclosure(
         ses_device=ses_device,
@@ -1309,8 +1381,10 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     )
     current_slot: SESMapSlot | None = None
     in_array_slots = False
+    descriptor_count = 0
     device_slot_evidence: list[SESMapSlot] = []
     descriptor_presence_evidence: list[bool] = []
+    invalid_descriptor_evidence: list[SESMapSlot] = []
 
     for raw_line in output.splitlines():
         line = raw_line.rstrip()
@@ -1350,6 +1424,9 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
                 descriptor_presence_evidence,
                 "sg_ses_aes",
             )
+            descriptor_count += 1
+            if descriptor_count > MAX_SES_AES_DESCRIPTORS:
+                return None
             _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
             descriptor_presence_evidence = []
             raw_element_id = int(element_match.group("element"))
@@ -1372,10 +1449,9 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
             # SES sets the INVALID bit on additional-element descriptors that
             # carry no valid device data — issue #119's Dell EN-8435A shelf
             # does this for every empty bay, so the descriptor has no device
-            # slot number at all. Fall back to the element index with
-            # low-strength provenance (stronger sources still override on
-            # merge) and record the bay as empty instead of dropping it from
-            # the shelf geometry.
+            # slot number at all. Keep it out of the device-slot keyed map
+            # until the complete AES page proves one consistent translation
+            # from element indexes to device slot numbers (issue #277).
             current_slot.description = f"Element {current_slot.element_id} (invalid AES descriptor)"
             descriptor_presence_evidence.append(False)
             _apply_resolved_ses_descriptor_presence(
@@ -1384,16 +1460,8 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
                 "sg_ses_aes",
             )
             descriptor_presence_evidence = []
-            current_slot = _record_ses_slot(
-                enclosure,
-                current_slot,
-                reported_slot_number=current_slot.element_id,
-                source="ses_element_index_invalid_descriptor",
-                warning=(
-                    f"SES AES element {current_slot.element_id} is flagged invalid; "
-                    "using the element index as the bay number."
-                ),
-            )
+            invalid_descriptor_evidence.append(current_slot)
+            current_slot = None
             continue
 
         if common_field is not None:
@@ -1451,6 +1519,11 @@ def parse_sg_ses_aes(output: str, command: str | None = None) -> SESMapEnclosure
     )
     _record_sg_ses_aes_fallback_slot(enclosure, current_slot)
     _finalize_ses_device_slot_evidence(enclosure, device_slot_evidence)
+    _finalize_ses_invalid_descriptor_evidence(
+        enclosure,
+        invalid_descriptor_evidence,
+        device_slot_evidence,
+    )
     if not enclosure.slots and not enclosure.unmapped_slots:
         return None
 

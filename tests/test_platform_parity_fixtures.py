@@ -500,6 +500,45 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
+    def test_scale_offset_invalid_aes_descriptor_keeps_its_physical_bay(self) -> None:
+        """Issue #277: invalid element indexes must not collide with offset bays."""
+
+        parsed = parse_ssh_outputs(
+            {
+                "sudo -n /usr/bin/sg_ses -p aes /dev/sg9": fixture_text(
+                    "scale_offset_1based_invalid_aes.txt"
+                ),
+                "sudo -n /usr/bin/sg_ses -p ec /dev/sg9": fixture_text(
+                    "scale_offset_1based_ec.txt"
+                ),
+                LINUX_ENCLOSURE_SYSFS_MAP_COMMAND: fixture_text(
+                    "scale_offset_1based_sysfs.txt"
+                ),
+            },
+            4,
+            None,
+            None,
+        )
+
+        candidates = parsed.ses_slot_candidates
+        self.assertEqual(sorted(candidates), [0, 1, 2, 3])
+        self.assertEqual(parsed.ses_slot_to_device, {0: "sda", 1: "sdb", 3: "sdd"})
+        self.assertFalse(candidates[2]["present"])
+        self.assertFalse(candidates[2].get("device_names"))
+        self.assertEqual(
+            {bay: candidate["ses_targets"] for bay, candidate in candidates.items()},
+            {
+                bay: [
+                    {
+                        "ses_device": "/dev/sg9",
+                        "ses_element_id": bay,
+                        "ses_slot_number": bay + 1,
+                    }
+                ]
+                for bay in range(4)
+            },
+        )
+
     def test_scale_md1280_join_captures_parse_all_reported_bays(self) -> None:
         for dev in ("sg1", "sg76"):
             with self.subTest(dev=dev):
