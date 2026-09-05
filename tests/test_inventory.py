@@ -5178,6 +5178,95 @@ ses2:
                 ["ACTIVE-SERIAL", "PASSIVE-SERIAL"],
             )
 
+    @staticmethod
+    def _core_matching_identity_rows() -> tuple[dict[str, object], dict[str, object]]:
+        common = {
+            "serial": "SHARED-SERIAL",
+            "identifier": "{serial_lunid}SHARED-SERIAL_5000c500a0000049",
+            "lunid": "5000c500a0000049",
+            "model": "SYNTH IDENTITY MODEL",
+            "multipath_name": "",
+            "multipath_member": "",
+        }
+        return (
+            dict(common, name="da84", devname="da84", zfs_guid="guid-active"),
+            dict(common, name="da69", devname="da69", zfs_guid="guid-passive"),
+        )
+
+    def test_build_disk_records_does_not_fold_conflicting_zfs_guids_in_either_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_core_multipath_service(temp_dir)
+            ssh_data = ParsedSSHData(
+                glabel=parse_glabel_status(self.CORE_GLABEL_STATUS_FIXTURE),
+                multipath_info=parse_gmultipath_list(self.CORE_GMULTIPATH_LIST_FIXTURE),
+            )
+            active_member, passive_member = self._core_matching_identity_rows()
+
+            for rows in (
+                [active_member, passive_member],
+                [passive_member, active_member],
+            ):
+                with self.subTest(order=[row["name"] for row in rows]):
+                    records = service._build_disk_records(rows, ssh_data, {}, {})
+
+                    self.assertEqual(len(records), 2)
+                    self.assertEqual(
+                        sorted(
+                            (record.path_device_name, record.raw.get("zfs_guid"))
+                            for record in records
+                        ),
+                        [("da69", "guid-passive"), ("da84", "guid-active")],
+                    )
+                    for record in records:
+                        own_guid = record.raw["zfs_guid"]
+                        other_guid = (
+                            "guid-passive"
+                            if own_guid == "guid-active"
+                            else "guid-active"
+                        )
+                        self.assertIn(own_guid, record.lookup_keys)
+                        self.assertNotIn(other_guid, record.lookup_keys)
+
+    def test_build_disk_records_folds_matching_zfs_guids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_core_multipath_service(temp_dir)
+            ssh_data = ParsedSSHData(
+                multipath_info=parse_gmultipath_list(self.CORE_GMULTIPATH_LIST_FIXTURE),
+            )
+            active_member, passive_member = self._core_matching_identity_rows()
+            passive_member["zfs_guid"] = active_member["zfs_guid"]
+
+            records = service._build_disk_records(
+                [active_member, passive_member],
+                ssh_data,
+                {},
+                {},
+            )
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(len(records[0].raw["multipath_member_api_rows"]), 2)
+            self.assertIn("guid-active", records[0].lookup_keys)
+
+    def test_build_disk_records_folds_when_zfs_guid_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._build_core_multipath_service(temp_dir)
+            ssh_data = ParsedSSHData(
+                multipath_info=parse_gmultipath_list(self.CORE_GMULTIPATH_LIST_FIXTURE),
+            )
+            active_member, passive_member = self._core_matching_identity_rows()
+            passive_member.pop("zfs_guid")
+
+            records = service._build_disk_records(
+                [active_member, passive_member],
+                ssh_data,
+                {},
+                {},
+            )
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(len(records[0].raw["multipath_member_api_rows"]), 2)
+            self.assertIn("guid-active", records[0].lookup_keys)
+
     def test_build_disk_records_keeps_api_named_multipath_over_gmultipath_backfill(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._build_core_multipath_service(temp_dir)

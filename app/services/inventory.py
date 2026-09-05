@@ -10374,8 +10374,28 @@ class InventoryService:
             else:
                 group[2].append((record, authoritative))
 
-        for record_index, parsed_multipath, group_records in multipath_groups.values():
+        for record_index, parsed_multipath, group_records in sorted(
+            multipath_groups.values(),
+            key=lambda group: group[0],
+            reverse=True,
+        ):
             if len(group_records) > 1:
+                zfs_guids = {
+                    value.casefold()
+                    for record, _authoritative in group_records
+                    if (
+                        value := normalize_text(
+                            str(record.raw.get("zfs_guid"))
+                            if record.raw.get("zfs_guid") is not None
+                            else None
+                        )
+                    )
+                }
+                if len(zfs_guids) > 1:
+                    records[record_index : record_index + 1] = [
+                        record for record, _authoritative in group_records
+                    ]
+                    continue
                 records[record_index] = self._merge_backfilled_multipath_records(
                     group_records,
                     parsed_multipath,
