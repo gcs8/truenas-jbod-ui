@@ -261,13 +261,15 @@ class MappingStore:
             if strict:
                 raise MappingScopeConflict()
             return 1, {}
+        version = payload.get("version", 1)
+        if isinstance(version, bool) or version not in (1, 2):
+            raise MappingScopeConflict()
         raw_mappings = payload.get("slot_mappings")
         if not isinstance(raw_mappings, dict):
             if strict:
                 raise MappingScopeConflict()
-            return 1, {}
-        version = payload.get("version", 1)
-        if isinstance(version, bool) or version not in (1, 2):
+            if version == 1:
+                return version, {}
             raise MappingScopeConflict()
         entries: dict[str, ManualMapping] = {}
         for key, value in raw_mappings.items():

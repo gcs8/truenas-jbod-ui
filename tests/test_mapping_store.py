@@ -2295,8 +2295,29 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
                 ["FIRST"],
             )
 
+    def test_load_all_rejects_explicit_non_v1_versions_before_shape_tolerance(self) -> None:
+        malformed_documents = (
+            b'{"version":2}',
+            b'{"version":2,"slot_mappings":[]}',
+            b'{"version":3,"slot_mappings":[]}',
+            b'{"version":true,"slot_mappings":[]}',
+        )
+        for raw in malformed_documents:
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.make_store(temp_dir)
+                store.file_path.write_bytes(raw)
+
+                with self.assertRaises(MappingScopeConflict):
+                    store.load_all()
+                self.assertEqual(store.file_path.read_bytes(), raw)
+                self.assertEqual(self.temp_paths(store), set())
+
     def test_load_all_preserves_historical_malformed_v1_tolerance_without_writing(self) -> None:
         malformed_v1_documents = (
+            b'{"version":1}',
+            b'{"version":1,"slot_mappings":[]}',
+            b'{}',
+            b'{"slot_mappings":[]}',
             b'{"version":1,"slot_mappings":{"legacy:7":{"slot":true}}}',
             b'{"version":1,"slot_mappings":',
         )
@@ -2308,6 +2329,17 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
                 self.assertEqual(store.load_all(), {})
                 self.assertEqual(store.file_path.read_bytes(), raw)
                 self.assertEqual(self.temp_paths(store), set())
+
+    def test_load_all_rejects_duplicate_keys_without_writing(self) -> None:
+        raw = b'{"version":1,"version":1,"slot_mappings":{}}'
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            store.file_path.write_bytes(raw)
+
+            with self.assertRaises(MappingScopeConflict):
+                store.load_all()
+            self.assertEqual(store.file_path.read_bytes(), raw)
+            self.assertEqual(self.temp_paths(store), set())
 
 
 if __name__ == "__main__":
