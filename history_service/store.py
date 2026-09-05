@@ -446,13 +446,16 @@ class HistoryStore:
         switch) and the collector's writes used to run regardless. A service
         restart during a pending journal then mutated the hot file, and
         `rotate --recover` could match neither the prior nor the candidate
-        digest (issue #174). Raise the same error type the migration lock
-        raises so callers keep one failure path.
+        digest (issue #174). Plain reads and the segmented-retention claim
+        writes reached `_connect` without this check and rewrote the journal
+        header the same way (issue #279), so `_connect` now calls it for every
+        connection. Raise the same error type the migration lock raises so
+        callers keep one failure path.
         """
         if path_entry_exists(activation_pending_path(self.file_path)):
             raise sqlite3.OperationalError(
                 "Segmented history activation is pending; refusing to open the history "
-                "database for writes until the pending rotation or restore is recovered."
+                "database until the pending rotation or restore is recovered."
             )
         if self.segment_catalog_path is None:
             return
@@ -460,7 +463,7 @@ class HistoryStore:
         if path_entry_exists(pending_path):
             raise sqlite3.OperationalError(
                 "Segmented history migration recovery is pending; refusing to open the history "
-                "database for writes until the pending migration is recovered."
+                "database until the pending migration is recovered."
             )
 
     def _segmented_reader(self) -> SegmentedHistoryReader | None:
@@ -665,6 +668,18 @@ class HistoryStore:
                 raise
 
     def _connect(self, *, migration_lock_held: bool = False) -> sqlite3.Connection:
+        lock_context = (
+            nullcontext()
+            if migration_lock_held
+            else history_write_lock(self.file_path, blocking=True)
+        )
+        with lock_context:
+            return self._connect_locked()
+
+    def _connect_locked(self) -> sqlite3.Connection:
+        """Open and fully configure a connection while the lifecycle lock is held."""
+
+        self._require_no_pending_lifecycle_markers()
         connection = sqlite3.connect(
             self.file_path,
             timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
@@ -673,26 +688,11 @@ class HistoryStore:
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
             connection.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_SIZE_KIB}")
-            self._ensure_journal_mode(connection, migration_lock_held=migration_lock_held)
-        except sqlite3.Error:
+            self._ensure_journal_mode_locked(connection)
+        except BaseException:
             connection.close()
             raise
         return connection
-
-    def _ensure_journal_mode(self, connection: sqlite3.Connection, *, migration_lock_held: bool = False) -> None:
-        if migration_lock_held:
-            self._ensure_journal_mode_locked(connection)
-            return
-        try:
-            stat_result = self.file_path.stat()
-            identity = (int(stat_result.st_dev), int(stat_result.st_ino))
-        except FileNotFoundError:
-            identity = None
-        with self._journal_mode_lock:
-            if identity is not None and identity == self._journal_mode_identity:
-                return
-        with history_write_lock(self.file_path, blocking=False):
-            self._ensure_journal_mode_locked(connection)
 
     def _ensure_journal_mode_locked(self, connection: sqlite3.Connection) -> None:
         try:
@@ -939,36 +939,37 @@ class HistoryStore:
         )
         temp_metadata = os.fstat(temp_fd)
 
-        with self._lock:
-            try:
-                with closing(self._connect()) as source_connection, closing(
-                    sqlite3.connect(f"/proc/self/fd/{temp_fd}")
-                ) as backup_connection:
-                    backup_connection.execute("PRAGMA journal_mode=MEMORY")
-                    source_connection.backup(backup_connection)
-                    backup_connection.commit()
-                publish_descriptor = temp_fd
-                temp_fd = None
-                self._publish_replacement(
-                    temp_path,
-                    final_path,
-                    temp_descriptor=publish_descriptor,
-                )
-                self._prune_backup_snapshots(backup_root, retention_count)
-                try:
-                    self._promote_long_term_backups(
+        try:
+            with history_write_lock(self.file_path, blocking=True):
+                with self._lock:
+                    with closing(self._connect(migration_lock_held=True)) as source_connection, closing(
+                        sqlite3.connect(f"/proc/self/fd/{temp_fd}")
+                    ) as backup_connection:
+                        backup_connection.execute("PRAGMA journal_mode=MEMORY")
+                        source_connection.backup(backup_connection)
+                        backup_connection.commit()
+                    publish_descriptor = temp_fd
+                    temp_fd = None
+                    self._publish_replacement(
+                        temp_path,
                         final_path,
-                        snapshot_label=snapshot_label,
-                        long_term_backup_dir=long_term_backup_dir,
-                        weekly_retention_count=weekly_retention_count,
-                        monthly_retention_count=monthly_retention_count,
+                        temp_descriptor=publish_descriptor,
                     )
-                except Exception as exc:  # noqa: BLE001 - best-effort archival path should not break local backup rotation.
-                    logger.warning("History long-term backup promotion failed for %s: %s", final_path, exc)
-            finally:
-                if temp_fd is not None:
-                    os.close(temp_fd)
-                self._discard_owned_path(temp_path, temp_metadata)
+                    self._prune_backup_snapshots(backup_root, retention_count)
+                    try:
+                        self._promote_long_term_backups(
+                            final_path,
+                            snapshot_label=snapshot_label,
+                            long_term_backup_dir=long_term_backup_dir,
+                            weekly_retention_count=weekly_retention_count,
+                            monthly_retention_count=monthly_retention_count,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - best-effort archival path should not break local backup rotation.
+                        logger.warning("History long-term backup promotion failed for %s: %s", final_path, exc)
+        finally:
+            if temp_fd is not None:
+                os.close(temp_fd)
+            self._discard_owned_path(temp_path, temp_metadata)
 
         return final_path
 

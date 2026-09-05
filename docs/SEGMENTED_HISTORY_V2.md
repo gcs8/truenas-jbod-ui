@@ -635,7 +635,9 @@ device/inode identities, modes, and ownership before the durable hot-adjacent
 activation marker is published. Post-marker activation reauthenticates the live
 prior and staged candidate immediately before rename, rejects any SQLite sidecar,
 uses rename-only publication, and retains exact prior-file and prior-tree records.
-Segmented reads reject while the marker exists.
+Segmented reads reject while the marker exists, and so does every history store
+connection, read or write, so no collector pass or API read can rewrite the hot
+database header before recovery has compared it with the journal.
 
 Recovery authenticates every live, staged, and previous artifact before acting.
 It restores the complete prior generation when publication stopped before both

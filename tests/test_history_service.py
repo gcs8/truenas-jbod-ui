@@ -1335,10 +1335,241 @@ class HistoryStoreTests(unittest.TestCase):
                 1,
             )
 
+    def test_store_refuses_reads_and_retention_claims_while_a_lifecycle_marker_is_pending(self) -> None:
+        # PR #191 gated __init__ and _execute_write, but plain reads and the
+        # segmented-retention claim/finish/release writes reached _connect
+        # directly. _connect -> _ensure_journal_mode rewrites the hot header
+        # (PRAGMA journal_mode=WAL) whenever the hot inode changed, which is
+        # exactly what a crashed restore or rotation leaves behind, so one
+        # collector read made the hot diverge from the journal digest (issue #279).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            segments_directory = root / "segments"
+            segments_directory.mkdir()
+            catalog_path = segments_directory / "catalog.json"
+            store = HistoryStore(
+                str(database_path),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog_path,
+            )
+            # Replace the hot with a DELETE-mode candidate at a new inode, the
+            # state a crashed segmented restore leaves after publishing its marker.
+            candidate_path = root / "candidate.db"
+            connection = sqlite3.connect(candidate_path)
+            try:
+                connection.executescript(history_store.SCHEMA)
+                connection.execute("PRAGMA journal_mode=DELETE")
+                connection.commit()
+            finally:
+                connection.close()
+            for suffix in ("-wal", "-shm"):
+                Path(f"{database_path}{suffix}").unlink(missing_ok=True)
+            os.replace(candidate_path, database_path)
+            self.assertEqual(database_path.read_bytes()[18:20], b"\x01\x01")
+            pristine = database_path.read_bytes()
+            backup_at = datetime(2030, 1, 1, tzinfo=timezone.utc)
+            operations = (
+                ("get_slot_states", lambda: store.get_slot_states("synthetic-system", None)),
+                ("get_slot_state", lambda: store.get_slot_state("synthetic-system", None, 1)),
+                ("claim", lambda: store.claim_segmented_retention_backup(backup_at)),
+                ("finish", lambda: store.finish_segmented_retention_backup(backup_at, has_more=False)),
+                ("release", lambda: store.release_segmented_retention_backup(backup_at)),
+            )
+
+            markers = (
+                (activation_pending_path(database_path), "activation is pending"),
+                (segments_directory / MIGRATION_PENDING_MARKER, "migration recovery is pending"),
+            )
+            for marker_path, message in markers:
+                marker_path.write_text("{}", encoding="utf-8")
+                try:
+                    for label, operation in operations:
+                        with self.subTest(marker=marker_path.name, operation=label):
+                            with self.assertRaisesRegex(sqlite3.OperationalError, message):
+                                operation()
+                            self.assertEqual(database_path.read_bytes(), pristine)
+                            self.assertFalse(Path(f"{database_path}-wal").exists())
+                finally:
+                    marker_path.unlink()
+
+            # Without a marker the same store adopts the replaced hot normally.
+            self.assertEqual(store.get_slot_states("synthetic-system", None), {})
+
+    def test_ordinary_read_waits_for_ordinary_write_instead_of_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = HistoryStore(str(Path(temp_dir) / "history.db"))
+            writer_entered = threading.Event()
+            release_writer = threading.Event()
+            reader_lock_attempted = threading.Event()
+            reader_done = threading.Event()
+            writer_errors: list[BaseException] = []
+            reader_errors: list[BaseException] = []
+            reader_results: list[dict[int, SlotStateRecord]] = []
+
+            def hold_ordinary_write(connection: sqlite3.Connection) -> None:
+                connection.execute(
+                    "UPDATE history_table_counts SET row_count = row_count WHERE table_name = 'slot_events'"
+                )
+                writer_entered.set()
+                if not release_writer.wait(5):
+                    raise TimeoutError("ordinary writer was not released")
+
+            def run_writer() -> None:
+                try:
+                    store._execute_write(hold_ordinary_write)
+                except BaseException as exc:
+                    writer_errors.append(exc)
+
+            def run_reader() -> None:
+                try:
+                    reader_results.append(store.get_slot_states("synthetic-system", None))
+                except BaseException as exc:
+                    reader_errors.append(exc)
+                finally:
+                    reader_done.set()
+
+            reader_thread = threading.Thread(target=run_reader, name="ordinary-history-reader")
+
+            @contextmanager
+            def tracking_history_write_lock(*args: Any, **kwargs: Any):
+                if threading.current_thread() is reader_thread:
+                    reader_lock_attempted.set()
+                with history_write_lock(*args, **kwargs):
+                    yield
+
+            writer_thread = threading.Thread(target=run_writer, name="ordinary-history-writer")
+            with patch("history_service.store.history_write_lock", tracking_history_write_lock):
+                writer_thread.start()
+                self.assertTrue(writer_entered.wait(2), "ordinary writer did not acquire the lifecycle lock")
+                reader_thread.start()
+                self.assertTrue(reader_lock_attempted.wait(2), "ordinary reader did not attempt connection setup")
+                try:
+                    self.assertFalse(
+                        reader_done.wait(0.2),
+                        f"ordinary reader failed instead of waiting: {reader_errors!r}",
+                    )
+                finally:
+                    release_writer.set()
+                    writer_thread.join(5)
+                    reader_thread.join(5)
+
+            self.assertFalse(writer_thread.is_alive(), "ordinary writer did not finish")
+            self.assertFalse(reader_thread.is_alive(), "ordinary reader did not finish")
+            self.assertEqual(writer_errors, [])
+            self.assertEqual(reader_errors, [])
+            self.assertEqual(reader_results, [{}])
+
+    def test_backup_and_ordinary_write_do_not_invert_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            backup_has_thread_lock = threading.Event()
+            backup_has_lifecycle_lock = threading.Event()
+            writer_attempted_lifecycle_lock = threading.Event()
+            writer_waits_for_thread_lock = threading.Event()
+            backup_errors: list[BaseException] = []
+            writer_errors: list[BaseException] = []
+            backup_paths: list[Path | None] = []
+            real_thread_lock = threading.Lock()
+
+            class TrackingThreadLock:
+                def __enter__(self) -> TrackingThreadLock:
+                    current_thread = threading.current_thread()
+                    if current_thread is writer_thread:
+                        writer_waits_for_thread_lock.set()
+                    real_thread_lock.acquire()
+                    if current_thread is backup_thread:
+                        backup_has_thread_lock.set()
+                        if backup_has_lifecycle_lock.is_set() and not writer_attempted_lifecycle_lock.wait(5):
+                            real_thread_lock.release()
+                            raise TimeoutError("ordinary writer did not attempt the lifecycle lock")
+                    return self
+
+                def __exit__(self, *args: object) -> None:
+                    if threading.current_thread() is backup_thread:
+                        backup_has_thread_lock.clear()
+                    real_thread_lock.release()
+
+            def run_backup() -> None:
+                try:
+                    backup_paths.append(
+                        store.create_backup(
+                            root / "backups",
+                            snapshot_label="2030-01-02T03:04:05+00:00",
+                            retention_count=1,
+                        )
+                    )
+                except BaseException as exc:
+                    backup_errors.append(exc)
+
+            def run_writer() -> None:
+                try:
+                    store._execute_write(
+                        lambda connection: connection.execute(
+                            "UPDATE history_table_counts SET row_count = row_count "
+                            "WHERE table_name = 'slot_events'"
+                        )
+                    )
+                except BaseException as exc:
+                    writer_errors.append(exc)
+
+            backup_thread = threading.Thread(target=run_backup, name="history-backup")
+            writer_thread = threading.Thread(target=run_writer, name="ordinary-history-writer")
+
+            @contextmanager
+            def tracking_history_write_lock(*args: Any, **kwargs: Any):
+                current_thread = threading.current_thread()
+                if current_thread is backup_thread and backup_has_thread_lock.is_set():
+                    if not writer_waits_for_thread_lock.wait(5):
+                        raise TimeoutError("ordinary writer did not wait for the thread lock")
+                    raise AssertionError(
+                        "lock-order deadlock: backup holds the thread lock while waiting for the "
+                        "lifecycle lock, and ordinary writer holds the lifecycle lock while waiting "
+                        "for the thread lock"
+                    )
+                if current_thread is writer_thread:
+                    writer_attempted_lifecycle_lock.set()
+                with history_write_lock(*args, **kwargs):
+                    if current_thread is backup_thread:
+                        backup_has_lifecycle_lock.set()
+                    try:
+                        yield
+                    finally:
+                        if current_thread is backup_thread:
+                            backup_has_lifecycle_lock.clear()
+
+            store._lock = TrackingThreadLock()  # type: ignore[assignment]
+            with patch("history_service.store.history_write_lock", tracking_history_write_lock):
+                backup_thread.start()
+                self.assertTrue(backup_has_thread_lock.wait(5), "backup did not acquire the thread lock")
+                writer_thread.start()
+                backup_thread.join(5)
+                writer_thread.join(5)
+
+            self.assertFalse(backup_thread.is_alive(), "backup did not finish")
+            self.assertFalse(writer_thread.is_alive(), "ordinary writer did not finish")
+            self.assertEqual(backup_errors, [])
+            self.assertEqual(len(backup_paths), 1)
+            backup_path = backup_paths[0]
+            self.assertIsNotNone(backup_path)
+            assert backup_path is not None
+            self.assertTrue(backup_path.exists())
+            self.assertEqual(len(writer_errors), 1)
+            self.assertIsInstance(writer_errors[0], sqlite3.OperationalError)
+            self.assertRegex(str(writer_errors[0]), "migration lock")
+
     def test_store_rechecks_lifecycle_markers_after_acquiring_the_history_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "history.db"
             marker_path = activation_pending_path(database_path)
+            HistoryStore(str(database_path), recover_unreadable_database=False)
+            store = HistoryStore(
+                str(database_path),
+                recover_unreadable_database=False,
+                initialize=False,
+            )
+            store._journal_mode_identity = None
 
             @contextmanager
             def lifecycle_lock_that_creates_a_pending_marker(*args: Any, **kwargs: Any):
@@ -1352,7 +1583,215 @@ class HistoryStoreTests(unittest.TestCase):
                     lifecycle_lock_that_creates_a_pending_marker,
                 ):
                     with self.assertRaisesRegex(sqlite3.OperationalError, "activation is pending"):
-                        HistoryStore(str(database_path), recover_unreadable_database=False)
+                        connection = store._connect()
+                        connection.close()
+            finally:
+                marker_path.unlink(missing_ok=True)
+
+    def test_store_does_not_open_replacement_published_with_a_lifecycle_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            marker_path = activation_pending_path(database_path)
+            store = HistoryStore(str(database_path), recover_unreadable_database=False)
+            replacement_path = root / "replacement.db"
+            with sqlite3.connect(replacement_path) as connection:
+                connection.executescript(history_store.SCHEMA)
+                connection.execute("PRAGMA journal_mode=DELETE")
+                connection.commit()
+            replacement_bytes = replacement_path.read_bytes()
+            for suffix in ("-wal", "-shm"):
+                Path(f"{database_path}{suffix}").unlink(missing_ok=True)
+
+            @contextmanager
+            def lifecycle_lock_that_publishes_replacement(*args: Any, **kwargs: Any):
+                with history_write_lock(*args, **kwargs):
+                    os.replace(replacement_path, database_path)
+                    marker_path.write_text("{}", encoding="utf-8")
+                    yield
+
+            try:
+                with (
+                    patch(
+                        "history_service.store.history_write_lock",
+                        lifecycle_lock_that_publishes_replacement,
+                    ),
+                    patch(
+                        "history_service.store.sqlite3.connect",
+                        wraps=sqlite3.connect,
+                    ) as connect,
+                ):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "activation is pending"):
+                        connection = store._connect()
+                        connection.close()
+
+                connect.assert_not_called()
+                self.assertEqual(database_path.read_bytes(), replacement_bytes)
+                self.assertFalse(Path(f"{database_path}-wal").exists())
+            finally:
+                marker_path.unlink(missing_ok=True)
+
+    def test_connect_configures_connection_entirely_under_the_lifecycle_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "history.db"
+            store = HistoryStore(str(database_path), initialize=False)
+            real_connect = sqlite3.connect
+            lock_owned = False
+            configuration_events: list[tuple[str, bool]] = []
+
+            class TrackingConnection:
+                def __init__(self, connection: sqlite3.Connection) -> None:
+                    self.connection = connection
+
+                @property
+                def row_factory(self) -> object:
+                    return self.connection.row_factory
+
+                @row_factory.setter
+                def row_factory(self, value: object) -> None:
+                    configuration_events.append(("row_factory", lock_owned))
+                    self.connection.row_factory = value  # type: ignore[assignment]
+
+                def execute(self, statement: str, parameters: object = ()) -> sqlite3.Cursor:
+                    configuration_events.append((statement, lock_owned))
+                    return self.connection.execute(statement, parameters)  # type: ignore[arg-type]
+
+                def close(self) -> None:
+                    self.connection.close()
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(self.connection, name)
+
+            @contextmanager
+            def tracking_lifecycle_lock(*args: Any, **kwargs: Any):
+                nonlocal lock_owned
+                with history_write_lock(*args, **kwargs):
+                    self.assertFalse(lock_owned)
+                    lock_owned = True
+                    try:
+                        yield
+                        self.assertIsNotNone(store._journal_mode_identity)
+                    finally:
+                        lock_owned = False
+
+            def tracking_marker_check() -> None:
+                configuration_events.append(("marker_check", lock_owned))
+                store_marker_check()
+
+            def tracking_connect(*args: object, **kwargs: object) -> TrackingConnection:
+                configuration_events.append(("connect", lock_owned))
+                return TrackingConnection(real_connect(*args, **kwargs))  # type: ignore[arg-type]
+
+            store_marker_check = store._require_no_pending_lifecycle_markers
+            with (
+                patch("history_service.store.history_write_lock", tracking_lifecycle_lock),
+                patch.object(
+                    store,
+                    "_require_no_pending_lifecycle_markers",
+                    side_effect=tracking_marker_check,
+                ),
+                patch("history_service.store.sqlite3.connect", side_effect=tracking_connect),
+            ):
+                connection = store._connect()
+                connection.execute("SELECT 1").fetchone()
+                connection.close()
+
+            config_names = {
+                "marker_check",
+                "connect",
+                "row_factory",
+                f"PRAGMA temp_store={history_store.SQLITE_TEMP_STORE}",
+                f"PRAGMA cache_size=-{history_store.SQLITE_CACHE_SIZE_KIB}",
+                "PRAGMA journal_mode=WAL",
+            }
+            self.assertTrue(config_names.issubset({name for name, _owned in configuration_events}))
+            self.assertTrue(
+                all(owned for name, owned in configuration_events if name in config_names),
+                configuration_events,
+            )
+            self.assertIn(("SELECT 1", False), configuration_events)
+
+    def test_connect_with_caller_owned_lifecycle_lock_does_not_reacquire_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "history.db"
+            store = HistoryStore(str(database_path), initialize=False)
+
+            with history_write_lock(database_path, blocking=False):
+                with patch(
+                    "history_service.store.history_write_lock",
+                    side_effect=AssertionError("caller-owned lifecycle lock was reacquired"),
+                ):
+                    connection = store._connect(migration_lock_held=True)
+                    connection.close()
+
+            self.assertIsNotNone(store._journal_mode_identity)
+
+    def test_connect_closes_partial_connection_after_each_configuration_failure(self) -> None:
+        class FailingConfigurationConnection:
+            def __init__(self, failure_point: str) -> None:
+                self.failure_point = failure_point
+                self.close_count = 0
+                self._row_factory: object = None
+
+            @property
+            def row_factory(self) -> object:
+                return self._row_factory
+
+            @row_factory.setter
+            def row_factory(self, value: object) -> None:
+                if self.failure_point == "row_factory":
+                    raise RuntimeError("injected row factory failure")
+                self._row_factory = value
+
+            def execute(self, statement: str, _parameters: object = ()) -> MagicMock:
+                if self.failure_point == statement:
+                    raise RuntimeError(f"injected {statement} failure")
+                return MagicMock()
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        failure_points = (
+            "row_factory",
+            f"PRAGMA temp_store={history_store.SQLITE_TEMP_STORE}",
+            f"PRAGMA cache_size=-{history_store.SQLITE_CACHE_SIZE_KIB}",
+            "PRAGMA journal_mode=WAL",
+        )
+        for failure_point in failure_points:
+            with self.subTest(failure_point=failure_point):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    store = HistoryStore(str(Path(temp_dir) / "history.db"), initialize=False)
+                    connection = FailingConfigurationConnection(failure_point)
+                    with patch(
+                        "history_service.store.sqlite3.connect",
+                        return_value=connection,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "injected"):
+                            store._connect(migration_lock_held=True)
+
+                    self.assertEqual(connection.close_count, 1)
+
+    def test_cached_journal_identity_still_rechecks_markers_under_the_history_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "history.db"
+            marker_path = activation_pending_path(database_path)
+            store = HistoryStore(str(database_path), recover_unreadable_database=False)
+            self.assertIsNotNone(store._journal_mode_identity)
+
+            @contextmanager
+            def lifecycle_lock_that_creates_a_pending_marker(*args: Any, **kwargs: Any):
+                with history_write_lock(*args, **kwargs):
+                    marker_path.write_text("{}", encoding="utf-8")
+                    yield
+
+            try:
+                with patch(
+                    "history_service.store.history_write_lock",
+                    lifecycle_lock_that_creates_a_pending_marker,
+                ):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "activation is pending"):
+                        connection = store._connect()
+                        connection.close()
             finally:
                 marker_path.unlink(missing_ok=True)
 
@@ -1381,18 +1820,50 @@ class HistoryStoreTests(unittest.TestCase):
 
             self.assertEqual(store.file_path.read_bytes(), original_bytes)
 
-    def test_journal_mode_setup_rejects_while_migration_owns_shared_lock(self) -> None:
+    def test_journal_mode_setup_waits_while_lifecycle_lock_is_owned(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = HistoryStore(
                 str(Path(temp_dir) / "history.db"),
                 recover_unreadable_database=False,
             )
             store._journal_mode_identity = None
+            lock_attempted = threading.Event()
+            setup_done = threading.Event()
+            setup_errors: list[BaseException] = []
 
-            with history_write_lock(store.file_path, blocking=False):
-                with self.assertRaisesRegex(sqlite3.OperationalError, "migration"):
+            def run_setup() -> None:
+                try:
                     connection = store._connect()
                     connection.close()
+                except BaseException as exc:
+                    setup_errors.append(exc)
+                finally:
+                    setup_done.set()
+
+            setup_thread = threading.Thread(target=run_setup, name="history-journal-setup")
+
+            @contextmanager
+            def tracking_history_write_lock(*args: Any, **kwargs: Any):
+                if threading.current_thread() is setup_thread:
+                    lock_attempted.set()
+                with history_write_lock(*args, **kwargs):
+                    yield
+
+            real_connect = sqlite3.connect
+            with (
+                patch("history_service.store.history_write_lock", tracking_history_write_lock),
+                patch("history_service.store.sqlite3.connect", wraps=real_connect) as connect,
+            ):
+                with history_write_lock(store.file_path, blocking=False):
+                    setup_thread.start()
+                    self.assertTrue(lock_attempted.wait(2), "journal setup did not attempt the lifecycle lock")
+                    self.assertFalse(setup_done.wait(0.2), "journal setup did not wait for lifecycle exclusivity")
+                    connect.assert_not_called()
+                setup_thread.join(5)
+
+            self.assertFalse(setup_thread.is_alive(), "journal setup did not finish")
+            self.assertEqual(setup_errors, [])
+            self.assertIsNotNone(store._journal_mode_identity)
 
     def test_new_store_publishes_fresh_database_and_live_sidecars_with_shared_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
