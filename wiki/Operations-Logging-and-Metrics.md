@@ -112,6 +112,12 @@ enabled. Performance warnings reuse the same request ID and normalized route.
 They omit per-request metadata and stage details; bounded stage timing remains
 available in the response's `Server-Timing` header.
 
+When a request fails with an unhandled exception, a separate `http_request_error`
+record is written at `ERROR` immediately before the completion record. That
+record is the only one that carries a full stack trace, and it carries the same
+request ID, so the traceback can be matched to the `500` response the caller
+received. The completion record stays free of stack traces.
+
 ## Optional Syslog Shipping
 
 If you want the normal `docker compose up -d` path to ship container logs to a
@@ -174,6 +180,14 @@ Allowed `operation` values: `inspect`, `import`, or `unknown`. Allowed
 the bounded `unknown` or `error` buckets. Request IDs never become metric labels.
 Paths, archive names, system identifiers, credentials, request content, and
 exception messages are also excluded from these metrics.
+
+The HTTP request metrics (`truenas_jbod_ui_http_requests_total` and
+`truenas_jbod_ui_http_request_duration_seconds`) bound their `method` label the
+same way. Allowed values are `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`,
+and `OPTIONS`; every other method token, including one an unauthenticated
+client invents, collapses to `other`. The `route` label is the matched route
+template or `unmatched`. The completion log record uses the same bounded
+method value.
 
 The starter alert rules use these bounded history-sidecar gauges. Every gauge
 has only the `service` application label:
