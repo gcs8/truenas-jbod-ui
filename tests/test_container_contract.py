@@ -556,6 +556,10 @@ class ContainerResourceContractTests(unittest.TestCase):
                     admin["environment"].get("ADMIN_HOST_PREP_TEMP_DIR"),
                     "${ADMIN_HOST_PREP_TEMP_DIR:-/app/host-prep}",
                 )
+                self.assertEqual(
+                    admin["environment"].get("ADMIN_HOST_PREP_STALE_TTL_SECONDS"),
+                    "${ADMIN_HOST_PREP_STALE_TTL_SECONDS:-86400}",
+                )
                 self.assertIn("host-prep-staging", compose.get("volumes", {}))
                 self.assertIn("host-prep-staging:/app/host-prep", admin["volumes"])
 
@@ -603,6 +607,7 @@ class ContainerResourceContractTests(unittest.TestCase):
             "ADMIN_HOST_PREP_TEMP_DIR=/app/host-prep",
             env_example,
         )
+        self.assertIn("ADMIN_HOST_PREP_STALE_TTL_SECONDS=86400", env_example)
         self.assertRegex(
             env_example,
             r"(?i)disk-backed[^\n]*host-prep|host-prep[^\n]*disk-backed",
@@ -611,13 +616,14 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertIn("`/app/host-prep`", admin_guide)
         self.assertRegex(admin_guide, r"(?i)incoming upload[^\n]*spool[^\n]*`/app/host-prep`")
 
-    def test_host_prep_docs_recommend_removal_within_24_hours(self) -> None:
+    def test_host_prep_docs_describe_configurable_24_hour_startup_pruning(self) -> None:
         admin_guide = (REPO_ROOT / "wiki/Admin-UI-and-System-Setup.md").read_text(
             encoding="utf-8"
         )
 
-        self.assertRegex(admin_guide, r"(?i)remove[^\n]*within 24 hours")
-        self.assertIn("not an automatic TTL", admin_guide)
+        self.assertIn("`ADMIN_HOST_PREP_STALE_TTL_SECONDS`", admin_guide)
+        self.assertRegex(admin_guide, r"(?i)startup[^\n]*stale[^\n]*24 hours")
+        self.assertRegex(admin_guide, r"(?i)set[^\n]*`0`[^\n]*disable")
 
     def test_default_nonroot_migration_is_documented_before_start(self) -> None:
         env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")

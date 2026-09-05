@@ -351,7 +351,10 @@ def get_maintenance_service() -> AdminMaintenanceService:
 @lru_cache
 def get_esxi_host_prep_service() -> ESXiHostPrepService:
     admin_settings = get_admin_settings()
-    return ESXiHostPrepService(admin_settings.host_prep_temp_dir)
+    return ESXiHostPrepService(
+        admin_settings.host_prep_temp_dir,
+        stale_ttl_seconds=admin_settings.host_prep_stale_ttl_seconds,
+    )
 
 
 @lru_cache
@@ -416,6 +419,23 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI):
         shutdown_task: asyncio.Task[None] | None = None
         release_task: asyncio.Task[None] | None = None
+        try:
+            cleanup_summary = await asyncio.to_thread(
+                get_esxi_host_prep_service().prune_stale_packages
+            )
+        except Exception as exc:
+            logger.warning(
+                "Host-prep staging cleanup failed safely error_type=%s",
+                type(exc).__name__,
+            )
+        else:
+            logger.info(
+                "Host-prep staging cleanup completed removed=%s skipped=%s failed=%s limited=%s",
+                cleanup_summary["removed"],
+                cleanup_summary["skipped"],
+                cleanup_summary["failed"],
+                cleanup_summary["limited"],
+            )
         if admin_settings.auto_stop_seconds > 0:
             shutdown_task = asyncio.create_task(_shutdown_after_ttl(admin_settings.auto_stop_seconds))
         release_task = asyncio.create_task(get_release_status_service().run_periodic_refresh())

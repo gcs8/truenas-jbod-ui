@@ -331,6 +331,58 @@ test("Quantastor discovery uses canonical preserved secrets and SSH timeout", as
   assert.equal(requestBody.ssh_timeout_seconds, 45);
 });
 
+test("failed ESXi install refreshes packages before restoring controls", async () => {
+  const installSource = sourceBetween(
+    "  async function installEsxiHostPrepPackage() {",
+    "\n  async function inspectTlsCertificate"
+  );
+  const installButton = { disabled: false };
+  const state = {
+    esxiHostPrep: {
+      staged_packages: [{ token: "dead-token", filename: "vendor.vib" }],
+    },
+  };
+  let refreshCalls = 0;
+  const { installEsxiHostPrepPackage } = loadFunctions(
+    [installSource],
+    ["installEsxiHostPrepPackage"],
+    {
+      collectEsxiHostPrepInstallPayload: () => ({
+        host: "192.0.2.25",
+        upload_token: "dead-token",
+      }),
+      currentStagedEsxiHostPrepPackages: () => state.esxiHostPrep.staged_packages,
+      elements: sparseElements({
+        setupEsxiHostPrepInstallButton: installButton,
+        setupEsxiHostPrepResult: { textContent: "" },
+      }),
+      fetchJson: async () => {
+        throw new Error("synthetic install failure");
+      },
+      getSelectedEsxiHostPrepPackage: () => ({
+        token: "dead-token",
+        filename: "vendor.vib",
+      }),
+      refreshState: async () => {
+        refreshCalls += 1;
+        state.esxiHostPrep.staged_packages = [];
+      },
+      renderEsxiHostPrepPackages: () => {},
+      setBanner: () => {},
+      state,
+      syncEsxiHostPrepFields: () => {
+        installButton.disabled = state.esxiHostPrep.staged_packages.length === 0;
+      },
+    }
+  );
+
+  await installEsxiHostPrepPackage();
+
+  assert.equal(refreshCalls, 1);
+  assert.deepEqual(state.esxiHostPrep.staged_packages, []);
+  assert.equal(installButton.disabled, true);
+});
+
 test("ESXi host prep uses canonical preserved secrets and configured timeout", () => {
   const collectEsxiSource = sourceBetween(
     "  function collectEsxiHostPrepInstallPayload",

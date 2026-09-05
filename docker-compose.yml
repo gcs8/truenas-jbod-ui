@@ -125,6 +125,7 @@ services:
       # Spool inbound uploads on the dedicated admin-only volume, not history or /tmp.
       TMPDIR: /app/host-prep
       ADMIN_HOST_PREP_TEMP_DIR: ${ADMIN_HOST_PREP_TEMP_DIR:-/app/host-prep}
+      ADMIN_HOST_PREP_STALE_TTL_SECONDS: ${ADMIN_HOST_PREP_STALE_TTL_SECONDS:-86400}
       HISTORY_SQLITE_PATH: /app/history/history.db
       HISTORY_SEGMENT_CATALOG_PATH: ${HISTORY_SEGMENT_CATALOG_PATH:-}
       HISTORY_BACKUP_DIR: ${HISTORY_BACKUP_DIR:-/app/history/backups}

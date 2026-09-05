@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import shlex
+import stat
+import threading
 import uuid
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from app.config import SSHConfig
 from app.models.domain import ESXiHostPrepInstallRequest
@@ -14,10 +20,24 @@ from app.services.ssh_probe import SSHCommandResult, SSHProbe
 
 
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+MAX_PRUNE_ENTRIES = 1000
+MAX_METADATA_BYTES = 16 * 1024
 ALLOWED_UPLOAD_EXTENSIONS: dict[str, str] = {
     ".zip": "component_bundle",
     ".vib": "vib",
 }
+PACKAGE_TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}")
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _OwnedStagedPackage:
+    token: str
+    filename: str
+    created_at: datetime
+    directory_identity: tuple[int, int]
+    metadata_identity: tuple[int, int]
+    package_identity: tuple[int, int]
 
 
 def utcnow() -> datetime:
@@ -29,11 +49,325 @@ class ESXiHostPrepService:
         self,
         staging_root: str,
         *,
+        stale_ttl_seconds: int = 24 * 60 * 60,
         probe_factory: Callable[[SSHConfig], SSHProbe] = SSHProbe,
     ) -> None:
+        self._service_uid = os.geteuid()
         self.staging_root = Path(staging_root)
         self.staging_root.mkdir(parents=True, exist_ok=True)
+        self.stale_ttl_seconds = stale_ttl_seconds
         self.probe_factory = probe_factory
+        self._activity_lock = threading.RLock()
+        self._active_tokens: dict[str, int] = {}
+
+    def prune_stale_packages(self, *, now: datetime | None = None) -> dict[str, int | bool]:
+        summary: dict[str, int | bool] = {
+            "removed": 0,
+            "skipped": 0,
+            "failed": 0,
+            "limited": False,
+        }
+        if self.stale_ttl_seconds == 0:
+            return summary
+        current_time = now or utcnow()
+        if current_time.tzinfo is None or current_time.utcoffset() is None:
+            raise ValueError("Host-prep cleanup requires an aware current time.")
+        cutoff = current_time - timedelta(seconds=self.stale_ttl_seconds)
+        root_fd: int | None = None
+        try:
+            root_lstat = self.staging_root.lstat()
+            if not stat.S_ISDIR(root_lstat.st_mode):
+                summary["failed"] = 1
+                return summary
+            root_fd = os.open(
+                self.staging_root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            root_fstat = os.fstat(root_fd)
+            root_identity = (root_lstat.st_dev, root_lstat.st_ino)
+            if (root_fstat.st_dev, root_fstat.st_ino) != root_identity:
+                summary["failed"] = 1
+                return summary
+
+            with os.scandir(root_fd) as entries:
+                for index, entry in enumerate(entries):
+                    if index >= MAX_PRUNE_ENTRIES:
+                        summary["limited"] = True
+                        break
+                    token = entry.name
+                    with self._activity_lock:
+                        if self._active_tokens.get(token, 0) > 0:
+                            summary["skipped"] = int(summary["skipped"]) + 1
+                            continue
+                        try:
+                            package = self._load_owned_package_for_cleanup(
+                                root_fd,
+                                root_fstat,
+                                token,
+                            )
+                        except OSError:
+                            summary["failed"] = int(summary["failed"]) + 1
+                            continue
+                        if package is None or package.created_at > cutoff:
+                            summary["skipped"] = int(summary["skipped"]) + 1
+                            continue
+                        try:
+                            self._delete_owned_package(root_fd, root_fstat, package)
+                        except OSError:
+                            summary["failed"] = int(summary["failed"]) + 1
+                        else:
+                            summary["removed"] = int(summary["removed"]) + 1
+        except OSError:
+            summary["failed"] = int(summary["failed"]) + 1
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+        return summary
+
+    def _load_owned_package_for_cleanup(
+        self,
+        root_fd: int,
+        root_stat: os.stat_result,
+        token: str,
+    ) -> _OwnedStagedPackage | None:
+        if PACKAGE_TOKEN_PATTERN.fullmatch(token) is None:
+            return None
+        directory_lstat = os.stat(token, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(directory_lstat.st_mode)
+            or directory_lstat.st_dev != root_stat.st_dev
+            or directory_lstat.st_uid != self._service_uid
+        ):
+            return None
+
+        package_fd = os.open(
+            token,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        try:
+            directory_fstat = os.fstat(package_fd)
+            directory_identity = (directory_lstat.st_dev, directory_lstat.st_ino)
+            if (directory_fstat.st_dev, directory_fstat.st_ino) != directory_identity:
+                return None
+
+            entry_names: list[str] = []
+            with os.scandir(package_fd) as entries:
+                for index, entry in enumerate(entries):
+                    if index >= 2:
+                        return None
+                    entry_names.append(entry.name)
+            if len(entry_names) != 2 or "meta.json" not in entry_names:
+                return None
+
+            metadata_lstat = os.stat(
+                "meta.json",
+                dir_fd=package_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(metadata_lstat.st_mode)
+                or metadata_lstat.st_dev != root_stat.st_dev
+                or metadata_lstat.st_uid != self._service_uid
+                or metadata_lstat.st_nlink != 1
+                or metadata_lstat.st_size > MAX_METADATA_BYTES
+            ):
+                return None
+            metadata_fd = os.open(
+                "meta.json",
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=package_fd,
+            )
+            try:
+                metadata_fstat = os.fstat(metadata_fd)
+                metadata_identity = (metadata_lstat.st_dev, metadata_lstat.st_ino)
+                if (metadata_fstat.st_dev, metadata_fstat.st_ino) != metadata_identity:
+                    return None
+                with os.fdopen(metadata_fd, "rb", closefd=True) as metadata_file:
+                    metadata_fd = -1
+                    raw_metadata = metadata_file.read(MAX_METADATA_BYTES + 1)
+            finally:
+                if metadata_fd >= 0:
+                    os.close(metadata_fd)
+            if len(raw_metadata) > MAX_METADATA_BYTES:
+                return None
+            try:
+                metadata = json.loads(raw_metadata.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+            expected_keys = {
+                "token",
+                "filename",
+                "extension",
+                "install_mode",
+                "size_bytes",
+                "created_at",
+            }
+            if not isinstance(metadata, dict) or set(metadata) != expected_keys:
+                return None
+            filename = metadata["filename"]
+            if not isinstance(filename, str):
+                return None
+            try:
+                if self._sanitize_filename(filename) != filename:
+                    return None
+            except ValueError:
+                return None
+            extension = Path(filename).suffix.lower()
+            if (
+                metadata["token"] != token
+                or metadata["extension"] != extension
+                or metadata["install_mode"] != ALLOWED_UPLOAD_EXTENSIONS.get(extension)
+                or type(metadata["size_bytes"]) is not int
+                or type(metadata["created_at"]) is not str
+                or set(entry_names) != {"meta.json", filename}
+            ):
+                return None
+
+            package_lstat = os.stat(
+                filename,
+                dir_fd=package_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(package_lstat.st_mode)
+                or package_lstat.st_dev != root_stat.st_dev
+                or package_lstat.st_uid != self._service_uid
+                or package_lstat.st_nlink != 1
+                or package_lstat.st_size != metadata["size_bytes"]
+            ):
+                return None
+            try:
+                created_at = datetime.fromisoformat(metadata["created_at"])
+            except ValueError:
+                return None
+            if created_at.tzinfo is None or created_at.utcoffset() is None:
+                return None
+            return _OwnedStagedPackage(
+                token=token,
+                filename=filename,
+                created_at=created_at,
+                directory_identity=directory_identity,
+                metadata_identity=metadata_identity,
+                package_identity=(package_lstat.st_dev, package_lstat.st_ino),
+            )
+        finally:
+            os.close(package_fd)
+
+    def _remove_completed_package(self, token: str) -> str:
+        root_fd: int | None = None
+        try:
+            root_lstat = self.staging_root.lstat()
+            if not stat.S_ISDIR(root_lstat.st_mode):
+                return "skipped"
+            root_fd = os.open(
+                self.staging_root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            root_fstat = os.fstat(root_fd)
+            if (root_fstat.st_dev, root_fstat.st_ino) != (
+                root_lstat.st_dev,
+                root_lstat.st_ino,
+            ):
+                return "skipped"
+            package = self._load_owned_package_for_cleanup(
+                root_fd,
+                root_fstat,
+                token,
+            )
+            if package is None:
+                return "skipped"
+            self._delete_owned_package(root_fd, root_fstat, package)
+        except OSError:
+            return "failed"
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+        return "removed"
+
+    @staticmethod
+    def _delete_owned_package(
+        root_fd: int,
+        root_stat: os.stat_result,
+        package: _OwnedStagedPackage,
+    ) -> None:
+        directory_lstat = os.stat(
+            package.token,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(directory_lstat.st_mode)
+            or (directory_lstat.st_dev, directory_lstat.st_ino)
+            != package.directory_identity
+            or directory_lstat.st_dev != root_stat.st_dev
+        ):
+            raise OSError("Host-prep package directory changed before cleanup.")
+        package_fd = os.open(
+            package.token,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        try:
+            if (os.fstat(package_fd).st_dev, os.fstat(package_fd).st_ino) != package.directory_identity:
+                raise OSError("Host-prep package directory changed before cleanup.")
+            with os.scandir(package_fd) as entries:
+                entry_names = {entry.name for entry in entries}
+            if entry_names != {"meta.json", package.filename}:
+                raise OSError("Host-prep package contents changed before cleanup.")
+            metadata_lstat = os.stat(
+                "meta.json",
+                dir_fd=package_fd,
+                follow_symlinks=False,
+            )
+            package_lstat = os.stat(
+                package.filename,
+                dir_fd=package_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(metadata_lstat.st_mode)
+                or (metadata_lstat.st_dev, metadata_lstat.st_ino)
+                != package.metadata_identity
+                or not stat.S_ISREG(package_lstat.st_mode)
+                or (package_lstat.st_dev, package_lstat.st_ino)
+                != package.package_identity
+            ):
+                raise OSError("Host-prep package contents changed before cleanup.")
+            os.unlink(package.filename, dir_fd=package_fd)
+            os.unlink("meta.json", dir_fd=package_fd)
+        finally:
+            os.close(package_fd)
+        os.rmdir(package.token, dir_fd=root_fd)
+
+    @contextmanager
+    def _active_package(self, token: str) -> Iterator[None]:
+        cleaned_token = str(token or "").strip()
+        with self._activity_lock:
+            if self._active_tokens.get(cleaned_token, 0) > 0:
+                raise ValueError(
+                    "The selected staged ESXi package is already being installed."
+                )
+            self._active_tokens[cleaned_token] = 1
+        try:
+            yield
+        finally:
+            with self._activity_lock:
+                self._active_tokens.pop(cleaned_token, None)
 
     def list_staged_packages(self) -> list[dict[str, Any]]:
         packages: list[dict[str, Any]] = []
@@ -80,6 +414,24 @@ class ESXiHostPrepService:
         *,
         known_hosts_path: str | None = None,
     ) -> dict[str, Any]:
+        with self._active_package(payload.upload_token):
+            try:
+                return self._install_package(payload, known_hosts_path=known_hosts_path)
+            finally:
+                cleanup_outcome = self._remove_completed_package(payload.upload_token)
+                if cleanup_outcome != "removed":
+                    logger.warning(
+                        "Host-prep completed-package cleanup did not remove the artifact "
+                        "outcome=%s",
+                        cleanup_outcome,
+                    )
+
+    def _install_package(
+        self,
+        payload: ESXiHostPrepInstallRequest,
+        *,
+        known_hosts_path: str | None = None,
+    ) -> dict[str, Any]:
         package = self.get_staged_package(payload.upload_token)
         local_path = Path(str(package["staged_path"]))
         filename = str(package.get("filename") or local_path.name)
@@ -99,6 +451,7 @@ class ESXiHostPrepService:
         remote_name = self._build_remote_filename(str(package["token"]), str(package["filename"]))
         remote_path = f"/tmp/{remote_name}"
 
+        cleanup_result: SSHCommandResult | None = None
         try:
             with probe.open_client() as client:
                 pre_upload_cleanup = self._run_remote_command(
@@ -116,23 +469,39 @@ class ESXiHostPrepService:
                         f"Unable to clear the previous ESXi temp file at {remote_path} before upload: "
                         f"{cleanup_detail}"
                     )
+                remote_cleanup_required = False
                 try:
-                    with client.open_sftp() as sftp:
-                        sftp.put(str(local_path), remote_path)
-                except Exception as exc:
-                    raise ValueError(
-                        f"Unable to upload {filename} to {remote_path} on the ESXi host. "
-                        "The admin flow clears any previous temp file at that path before upload, "
-                        f"so this was not a simple existing-file conflict. Remote upload error: {exc}"
-                    ) from exc
-                install_command = self._build_install_command(remote_path, str(package["extension"]))
-                install_result = self._run_remote_command(client, install_command, payload.timeout_seconds)
-                verification = self._run_verification_commands(client, payload.timeout_seconds)
-                cleanup_result = self._run_remote_command(
-                    client,
-                    f"rm -f {shlex.quote(remote_path)}",
-                    payload.timeout_seconds,
-                )
+                    try:
+                        with client.open_sftp() as sftp:
+                            remote_cleanup_required = True
+                            sftp.put(str(local_path), remote_path)
+                    except Exception as exc:
+                        raise ValueError(
+                            f"Unable to upload {filename} to {remote_path} on the ESXi host. "
+                            "The admin flow clears any previous temp file at that path before upload, "
+                            f"so this was not a simple existing-file conflict. Remote upload error: {exc}"
+                        ) from exc
+                    install_command = self._build_install_command(remote_path, str(package["extension"]))
+                    install_result = self._run_remote_command(client, install_command, payload.timeout_seconds)
+                    verification = self._run_verification_commands(client, payload.timeout_seconds)
+                finally:
+                    if remote_cleanup_required:
+                        try:
+                            cleanup_result = self._run_remote_command(
+                                client,
+                                f"rm -f {shlex.quote(remote_path)}",
+                                payload.timeout_seconds,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Host-prep remote cleanup did not complete outcome=exception"
+                            )
+                        else:
+                            if not cleanup_result.ok:
+                                logger.warning(
+                                    "Host-prep remote cleanup did not complete "
+                                    "outcome=command_failed"
+                                )
         except TimeoutError as exc:
             raise ValueError(
                 f"Timed out while installing or verifying {filename} on ESXi host {payload.host} "
@@ -140,6 +509,14 @@ class ESXiHostPrepService:
                 "verification can take longer on some hosts; retry with a larger host-prep timeout."
             ) from exc
 
+        if cleanup_result is None:
+            cleanup_result = SSHCommandResult(
+                command="remote package cleanup",
+                ok=False,
+                stdout="",
+                stderr="",
+                exit_code=-1,
+            )
         detail = self._build_install_detail(package, install_result, verification)
         return {
             "ok": install_result.ok,
@@ -186,20 +563,30 @@ class ESXiHostPrepService:
         raise ValueError(f"Unsupported ESXi package type: {extension}")
 
     def _load_package(self, package_dir: Path) -> dict[str, Any] | None:
-        if not package_dir.exists() or not package_dir.is_dir():
+        try:
+            if not stat.S_ISDIR(package_dir.lstat().st_mode):
+                return None
+        except OSError:
             return None
         meta_path = package_dir / "meta.json"
-        if not meta_path.exists():
+        try:
+            if not stat.S_ISREG(meta_path.lstat().st_mode):
+                return None
+        except OSError:
             return None
         try:
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         filename = str(metadata.get("filename") or "").strip()
         if not filename:
             return None
         staged_path = package_dir / filename
-        if not staged_path.exists():
+        try:
+            staged_stat = staged_path.lstat()
+        except OSError:
+            return None
+        if not stat.S_ISREG(staged_stat.st_mode):
             return None
         return {
             "token": str(metadata.get("token") or package_dir.name),

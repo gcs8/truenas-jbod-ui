@@ -157,6 +157,7 @@ class DevCheckPlanTests(unittest.TestCase):
         self.assertNotIn("tests.test_scheduled_backup", python_tests.argv)
         self.assertNotIn("tests.test_history_service", python_tests.argv)
         self.assertNotIn("tests.test_system_backup", python_tests.argv)
+        self.assertNotIn("tests.test_esxi_host_prep", python_tests.argv)
 
         exclusion_skips = [skip for skip in plan.skips if skip.name.startswith("Windows exclusion:")]
         self.assertEqual(len(exclusion_skips), len(dev_check.WINDOWS_EXCLUSIONS))
@@ -166,6 +167,7 @@ class DevCheckPlanTests(unittest.TestCase):
             self.assertIn(exclusion.reason, rendered)
             for module in exclusion.modules:
                 self.assertIn(module, rendered)
+        self.assertIn("tests.test_esxi_host_prep", rendered)
 
     def test_every_tracked_test_is_classified_for_windows(self) -> None:
         discovered = {
