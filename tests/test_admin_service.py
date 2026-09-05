@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from app import __version__
 # Must precede admin_service.main, which builds its app at import time.
-import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
+from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings
 from admin_service.services.esxi_host_prep import MAX_UPLOAD_BYTES
 from admin_service.services.runtime_control import DockerRuntimeService
@@ -287,7 +287,10 @@ class MainAppBoundaryTests(unittest.TestCase):
             get_esxi_host_prep_service.cache_clear()
 
     def test_admin_startup_prunes_stale_host_prep_packages(self) -> None:
-        settings = AdminSettings(auto_stop_seconds=0)
+        settings = AdminSettings(
+            auto_stop_seconds=0,
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
+        )
         host_prep_service = MagicMock()
         host_prep_service.prune_stale_packages.return_value = {
             "removed": 2,
@@ -319,7 +322,10 @@ class MainAppBoundaryTests(unittest.TestCase):
         host_prep_service.prune_stale_packages.assert_called_once_with()
 
     def test_host_prep_cleanup_failure_is_sanitized_and_does_not_block_startup(self) -> None:
-        settings = AdminSettings(auto_stop_seconds=0)
+        settings = AdminSettings(
+            auto_stop_seconds=0,
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
+        )
         host_prep_service = MagicMock()
         host_prep_service.prune_stale_packages.side_effect = OSError(
             f"{MARKER_ALPHA} /private/staging/vendor.vib"
