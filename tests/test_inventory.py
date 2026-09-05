@@ -11078,6 +11078,64 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
             self.assertIs(bundle.parsed_ssh_data_by_enclosure["enc-a"], valid)
             self.assertNotIn("unknown-secondary-key", bundle.parsed_ssh_data_by_enclosure)
 
+    async def test_parsed_ssh_cache_prunes_removed_topology_before_canonical_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            current_ids = [
+                f"enc-{index}"
+                for index in range(inventory_module.PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES)
+            ]
+            service._canonical_enclosure_options = {
+                "old-removed": EnclosureOption(id="old-removed", label="Old shelf"),
+                **{
+                    key: EnclosureOption(id=key, label=key)
+                    for key in current_ids[:-1]
+                },
+            }
+            retained = {
+                key: ParsedSSHData(warnings=[f"cached {key}"])
+                for key in current_ids[:-1]
+            }
+            retained["old-removed"] = ParsedSSHData(warnings=["stale removed shelf"])
+            bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=True,
+                warnings=[],
+                sources={},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+                parsed_ssh_data_by_enclosure=retained,
+            )
+            service._replace_canonical_options_from_trusted_snapshot(
+                InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    selected_enclosure_id="enc-0",
+                    enclosures=[
+                        EnclosureOption(id=key, label=key)
+                        for key in current_ids
+                    ],
+                )
+            )
+
+            service._parsed_ssh_data_for_enclosure(bundle, current_ids[-1])
+
+            retained_keys = set(bundle.parsed_ssh_data_by_enclosure)
+            self.assertNotIn("old-removed", retained_keys)
+            self.assertIn("enc-0", retained_keys)
+            self.assertEqual(retained_keys, set(current_ids))
+            self.assertLessEqual(
+                len(retained_keys),
+                inventory_module.PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES,
+            )
+
     async def test_all_active_capacity_fails_closed_without_transient_overflow(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._service(temp_dir)

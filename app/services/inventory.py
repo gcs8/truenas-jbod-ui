@@ -5002,6 +5002,11 @@ class InventoryService:
                 self.system.truenas.enclosure_filter,
                 selected_enclosure_id=cache_key,
             )
+        for stale_key in (
+            set(source_bundle.parsed_ssh_data_by_enclosure)
+            - set(self._canonical_enclosure_options or {})
+        ):
+            source_bundle.parsed_ssh_data_by_enclosure.pop(stale_key, None)
         cached = source_bundle.parsed_ssh_data_by_enclosure.get(cache_key)
         if cached is not None:
             return cached
