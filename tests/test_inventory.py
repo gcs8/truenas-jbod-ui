@@ -61,6 +61,7 @@ from app.services.parsers import (
     ZpoolMember,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
+    extract_enclosure_slot_candidates,
     merge_slot_candidate_maps,
     parse_ssh_outputs,
 )
@@ -9605,12 +9606,19 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             quantastor_ses_data=ParsedSSHData(),
         )
 
-    async def test_core_api_enclosure_failure_preserves_cached_shelf_and_reports_source_error(self) -> None:
+    async def test_core_api_enclosure_failure_keeps_fresh_payloads_and_trusted_enclosure_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
             system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
             truenas_client = AsyncMock()
-            truenas_client.fetch_all.side_effect = TrueNASAPIError("enclosure2.query failed: EPERM")
+            truenas_client.fetch_all.return_value = TrueNASRawData(
+                enclosures=[],
+                disks=[{"name": "da1", "serial": "FRESH-DISK"}],
+                pools=[{"name": "fresh-pool"}],
+                disk_temperatures={"da1": 31},
+                smart_test_results=[{"disk": "da1", "status": "SUCCESS"}],
+                enclosure_query_failed=True,
+            )
             service = build_inventory_service(
                 settings,
                 system,
@@ -9618,37 +9626,144 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(),
                 temp_dir,
             )
-            cached_snapshot = InventorySnapshot(
-                slots=[
-                    SlotView(
-                        slot=0,
-                        slot_label="00",
-                        row_index=0,
-                        column_index=0,
-                        enclosure_id="enc-1",
-                        device_name="da0",
-                    )
-                ],
-                refresh_interval_seconds=30,
-                selected_system_id=system.id,
-                selected_system_platform="core",
-                selected_enclosure_id="enc-1",
-                enclosures=[EnclosureOption(id="enc-1", label="Synthetic Shelf")],
+            trusted_enclosures = [
+                {
+                    "id": "enc-1",
+                    "name": "Synthetic Shelf",
+                    "label": "Shelf A",
+                    "elements": [
+                        {
+                            "descriptor": "Slot 1",
+                            "dev": "da0",
+                            "status": "OK",
+                            "value": "/dev/da0",
+                            "value_raw": "0x01",
+                            "original": "da0",
+                        }
+                    ],
+                }
+            ]
+            service._source_bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=trusted_enclosures,
+                    disks=[{"name": "da0", "serial": "STALE-DISK"}],
+                    pools=[{"name": "stale-pool"}],
+                    disk_temperatures={"da0": 29},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=False,
+                warnings=[],
                 sources={
                     "api": SourceStatus(enabled=True, ok=True, message="TrueNAS API reachable."),
                 },
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
             )
-            service._cache["__default__"] = cached_snapshot
-            service._cache_until["__default__"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._source_bundle_until = datetime.now(timezone.utc) - timedelta(seconds=1)
 
-            returned = await service.get_snapshot(force_refresh=True)
+            returned = await service._get_inventory_source_bundle(force_refresh=True)
 
-            self.assertIs(returned, cached_snapshot)
-            self.assertIs(service._cache["__default__"], cached_snapshot)
-            self.assertIsNotNone(service._source_bundle)
-            assert service._source_bundle is not None
-            self.assertFalse(service._source_bundle.sources["api"].ok)
-            self.assertEqual(service._source_bundle.sources["api"].message, "enclosure2.query failed: EPERM")
+            self.assertEqual(
+                returned.raw_data.enclosures,
+                [
+                    {
+                        "id": "enc-1",
+                        "name": "Synthetic Shelf",
+                        "label": "Shelf A",
+                        "elements": [{"descriptor": "Slot 1", "slot": 1}],
+                    }
+                ],
+            )
+            cached_candidates, _cached_meta = extract_enclosure_slot_candidates(
+                returned.raw_data.enclosures,
+                enclosure_filter=None,
+                slot_count=24,
+                api_slot_number_base=0,
+            )
+            self.assertEqual(
+                {
+                    "status": cached_candidates[1]["status"],
+                    "value": cached_candidates[1]["value"],
+                    "value_raw": cached_candidates[1]["value_raw"],
+                    "device_hint": cached_candidates[1]["device_hint"],
+                },
+                {"status": None, "value": None, "value_raw": None, "device_hint": None},
+            )
+            self.assertEqual(returned.raw_data.disks, [{"name": "da1", "serial": "FRESH-DISK"}])
+            self.assertEqual(returned.raw_data.pools, [{"name": "fresh-pool"}])
+            self.assertEqual(returned.raw_data.disk_temperatures, {"da1": 31})
+            self.assertEqual(returned.raw_data.smart_test_results, [{"disk": "da1", "status": "SUCCESS"}])
+            self.assertTrue(returned.raw_data.enclosure_query_failed)
+            self.assertFalse(returned.sources["api"].ok)
+            self.assertEqual(
+                returned.sources["api"].message,
+                "TrueNAS API reachable with degraded enclosure data.",
+            )
+            self.assertIn(
+                "TrueNAS API enclosure discovery failed; using the last trusted enclosure topology.",
+                returned.warnings,
+            )
+
+    async def test_core_degraded_enclosure_refresh_disables_stale_api_led_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            truenas_client = AsyncMock()
+            truenas_client.fetch_all.return_value = TrueNASRawData(
+                enclosures=[],
+                disks=[{"name": "da1", "serial": "FRESH-DISK"}],
+                pools=[{"name": "fresh-pool"}],
+                disk_temperatures={"da1": 31},
+                smart_test_results=[{"disk": "da1", "status": "SUCCESS"}],
+                enclosure_query_failed=True,
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                truenas_client,
+                AsyncMock(),
+                temp_dir,
+            )
+            service._source_bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[
+                        {
+                            "id": "enc-1",
+                            "name": "Synthetic Shelf",
+                            "elements": [
+                                {
+                                    "descriptor": "Slot 1",
+                                    "dev": "da0",
+                                    "status": "OK",
+                                    "value": "/dev/da0",
+                                }
+                            ],
+                        }
+                    ],
+                    disks=[{"name": "da0", "serial": "STALE-DISK"}],
+                    pools=[{"name": "stale-pool"}],
+                    disk_temperatures={"da0": 29},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=False,
+                warnings=[],
+                sources={
+                    "api": SourceStatus(enabled=True, ok=True, message="TrueNAS API reachable."),
+                },
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+            service._source_bundle_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+            snapshot = await service.get_snapshot(force_refresh=True)
+
+            slot = next(item for item in snapshot.slots if item.slot == 0)
+            self.assertFalse(slot.led_supported)
+            self.assertIsNone(slot.led_backend)
+            self.assertIn("enclosure discovery failed", slot.led_reason or "")
+            self.assertEqual(snapshot.capabilities["identify"].status, "partial")
 
     async def test_sas_fabric_snapshot_reports_stale_inventory_and_source_cache_states(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -10903,6 +11018,45 @@ class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(slot.led_supported)
             self.assertIsNone(slot.led_backend)
             self.assertIn("exactly one authentic SES element", slot.led_reason or "")
+
+    async def test_core_degraded_api_enclosure_keeps_authentic_ssh_identify_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="core-degraded-api-ssh-led",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                Settings(), system, AsyncMock(), AsyncMock(), temp_dir
+            )
+
+            slot = service._build_slot_view(
+                slot=0,
+                row_index=0,
+                column_index=0,
+                enclosure_meta={"id": "5000000000000505"},
+                raw_slot_status={
+                    "ses_device": "/dev/ses2",
+                    "ses_element_id": 2,
+                    "ses_targets": [
+                        {
+                            "ses_device": "/dev/ses2",
+                            "ses_element_id": 2,
+                            "ses_slot_number": 1,
+                        }
+                    ],
+                },
+                disk=None,
+                mapping=None,
+                ssh_data=ParsedSSHData(),
+                api_topology_members={},
+                api_enclosure_ids={"5000000000000505"},
+                api_enclosure_query_failed=True,
+            )
+
+            self.assertTrue(slot.led_supported)
+            self.assertEqual(slot.led_backend, "ssh")
+            self.assertIsNone(slot.led_reason)
 
     async def test_core_led_control_uses_authentic_element_index_not_slot_number(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

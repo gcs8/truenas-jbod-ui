@@ -128,4 +128,5 @@ even better because:
 
 - Some tested SCALE systems expose useful disk and pool data but no usable enclosure rows through the middleware API.
 - That is why the app leans on Linux SES access over SSH for first-pass SCALE slot mapping.
+- If both middleware enclosure methods fail, the app marks the API source degraded but keeps fresh disk, pool, temperature, and SMART data. It also keeps the last trusted enclosure topology when one is cached. A failed query never replaces that topology with a blank shelf.
 - Advisory non-zero `smartctl` exit codes are normal on some disks; the app already tolerates that when the output is still valid.

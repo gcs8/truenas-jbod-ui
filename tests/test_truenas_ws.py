@@ -130,6 +130,43 @@ class TrueNASWebsocketClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload.disk_temperatures["da0"], 30)
         self.assertEqual(payload.smart_test_results[0]["status"], "SUCCESS")
 
+    async def test_fetch_all_retains_other_payloads_when_only_enclosures_fail(self) -> None:
+        class EnclosureFailureClient(TrueNASWebsocketClient):
+            @asynccontextmanager
+            async def _session(self):
+                class DummyWS:
+                    async def send(self, _payload):
+                        return None
+
+                    async def recv(self):
+                        await asyncio.Future()
+
+                yield DummyWS()
+
+            async def _fetch_enclosures(self, _call_method):
+                raise TrueNASAPIError("enclosure.query failed: EPERM")
+
+            async def _fetch_disks(self, _call_method):
+                return [{"name": "da0"}]
+
+            async def _fetch_pools(self, _call_method):
+                return [{"name": "tank"}]
+
+            async def _fetch_disk_temperatures(self, _call_method):
+                return {"da0": 30}
+
+            async def _fetch_smart_test_results(self, _call_method):
+                return [{"disk": "da0", "status": "SUCCESS"}]
+
+        payload = await EnclosureFailureClient(TrueNASConfig(api_key="token")).fetch_all()
+
+        self.assertEqual(payload.enclosures, [])
+        self.assertTrue(payload.enclosure_query_failed)
+        self.assertEqual(payload.disks, [{"name": "da0"}])
+        self.assertEqual(payload.pools, [{"name": "tank"}])
+        self.assertEqual(payload.disk_temperatures, {"da0": 30})
+        self.assertEqual(payload.smart_test_results, [{"disk": "da0", "status": "SUCCESS"}])
+
     async def test_fetch_all_failure_cancels_sibling_calls_instead_of_leaving_them_pending(self) -> None:
         class OneErrorWS:
             """Answers pool.query with a middleware error; every other call never answers."""

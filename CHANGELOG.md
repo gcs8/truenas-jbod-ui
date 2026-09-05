@@ -21,6 +21,10 @@ complete release-note draft.
   default Compose runtime contract (#245 and #246).
 - Expanded the private QA restore matrix and its sanitized deployment evidence
   checks without publishing private runtime details (#247).
+- Retained fresh disk, pool, temperature, and SMART payloads when TrueNAS
+  enclosure discovery alone fails. The API source now reports degraded and a
+  failed query cannot replace the last trusted enclosure topology with a blank
+  shelf (#292).
 
 ### Fixed
 

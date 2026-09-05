@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import ipaddress
 import json
 import logging
@@ -83,6 +84,7 @@ from app.services.quantastor_api import QuantastorRESTClient
 from app.services.parsers import (
     ParsedSSHData,
     ZpoolMember,
+    _extract_slot_number,
     _merge_ses_enclosures,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
@@ -128,6 +130,10 @@ METRICS_SERVICE_NAME = "enclosure-ui"
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
 BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
 SERIAL_LUNID_IDENTIFIER_REGEX = re.compile(r"^\{\$?serial_lunid\}\$?(?P<identifier>.+)$", re.IGNORECASE)
+_CACHED_ENCLOSURE_RUNTIME_EVIDENCE_KEYS = frozenset(
+    {"dev", "device", "original", "status", "value", "value_raw"}
+)
+_ENCLOSURE_SLOT_NUMBER_KEYS = frozenset({"slot", "slot_number", "slotNumber", "index", "number"})
 SCALE_CONFIGURED_SG_SES_FAILURE_REGEX = re.compile(
     r"^SSH command failed: .*\bsg_ses\b\s+-p\s+(?:aes|ec)\s+/dev/sg\d+\s+\(exit\s+\d+\)$"
 )
@@ -136,6 +142,27 @@ QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
     r"Skipping optional SSH command batch after a recent connection startup failure; "
     r"retry after (?P<retry_at>\S+)"
 )
+
+
+def _structural_enclosure_topology(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_structural_enclosure_topology(item) for item in value]
+    if not isinstance(value, dict):
+        return copy.deepcopy(value)
+
+    raw_slot = _extract_slot_number(value)
+    structural: dict[str, Any] = {}
+    for key, child in value.items():
+        if key in _CACHED_ENCLOSURE_RUNTIME_EVIDENCE_KEYS:
+            if isinstance(child, (dict, list)):
+                nested = _structural_enclosure_topology(child)
+                if nested:
+                    structural[key] = nested
+            continue
+        structural[key] = _structural_enclosure_topology(child)
+    if raw_slot is not None and not _ENCLOSURE_SLOT_NUMBER_KEYS.intersection(structural):
+        structural["slot"] = raw_slot
+    return structural
 UNIFI_GPIO_LED_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
@@ -1689,7 +1716,17 @@ class InventoryService:
                 platform=self.system.truenas.platform,
             )
             build_started = time.perf_counter()
+            previous_bundle = self._source_bundle
             bundle = await self._collect_inventory_source_bundle()
+            if bundle.raw_data.enclosure_query_failed and previous_bundle is not None:
+                previous_api = previous_bundle.sources.get("api")
+                if previous_api is not None and previous_api.enabled and previous_bundle.raw_data.enclosures:
+                    bundle.raw_data.enclosures = _structural_enclosure_topology(
+                        previous_bundle.raw_data.enclosures
+                    )
+                    bundle.warnings.append(
+                        "TrueNAS API enclosure discovery failed; using the last trusted enclosure topology."
+                    )
             self._source_bundle = bundle
             self._source_bundle_until = utcnow() + timedelta(
                 seconds=max(0, int(self.settings.app.source_bundle_cache_ttl_seconds))
@@ -2337,7 +2374,17 @@ class InventoryService:
             else:
                 if api_result is not None:
                     raw_data = api_result
-                sources["api"] = SourceStatus(enabled=True, ok=True, message=f"{api_label} reachable.")
+                if raw_data.enclosure_query_failed:
+                    sources["api"] = SourceStatus(
+                        enabled=True,
+                        ok=False,
+                        message=f"{api_label} reachable with degraded enclosure data.",
+                    )
+                    warnings.append(
+                        f"{api_label} enclosure discovery failed; fresh disk, pool, temperature, and SMART data are retained."
+                    )
+                else:
+                    sources["api"] = SourceStatus(enabled=True, ok=True, message=f"{api_label} reachable.")
 
         if ssh_task is not None:
             try:
@@ -4137,6 +4184,7 @@ class InventoryService:
                 ssh_data=ssh_data,
                 api_topology_members=api_topology_members,
                 api_enclosure_ids=api_enclosure_ids,
+                api_enclosure_query_failed=raw_data.enclosure_query_failed,
             )
             _warn_unmatched_mapping(warnings, mapping, disk, slot, "disk")
             slot_views.append(slot_view)
@@ -4916,6 +4964,7 @@ class InventoryService:
                 ssh_data=ssh_data,
                 api_topology_members=api_topology_members,
                 api_enclosure_ids=api_enclosure_ids,
+                api_enclosure_query_failed=raw_data.enclosure_query_failed,
             )
             _warn_unmatched_mapping(warnings, mapping, disk, slot, "disk")
             slot_views.append(slot_view)
@@ -9710,6 +9759,7 @@ class InventoryService:
         ssh_data: ParsedSSHData,
         api_topology_members: dict[str, Any],
         api_enclosure_ids: set[str],
+        api_enclosure_query_failed: bool = False,
         resolution_source: str | None = None,
         stale_manual_mapping: bool = False,
     ) -> SlotView:
@@ -9853,7 +9903,11 @@ class InventoryService:
                 }
             )
 
-        api_led_supported = bool(enclosure_id and enclosure_id in api_enclosure_ids)
+        api_led_supported = bool(
+            not api_enclosure_query_failed
+            and enclosure_id
+            and enclosure_id in api_enclosure_ids
+        )
         scale_linux_ses_targets = bool(
             self.system.truenas.platform == "scale"
             and any(
@@ -9914,12 +9968,6 @@ class InventoryService:
             led_supported = True
             led_backend = "api"
             led_reason = None
-        elif core_ses_target_invalid:
-            led_supported = False
-            led_backend = None
-            led_reason = (
-                f"Slot {slot:02d} must resolve to exactly one authentic SES element before CORE identify control can run."
-            )
         elif scale_linux_ses_targets and self.system.ssh.enabled:
             led_supported = True
             led_backend = "scale_sg_ses"
@@ -9932,6 +9980,16 @@ class InventoryService:
             led_supported = True
             led_backend = "ssh"
             led_reason = None
+        elif api_enclosure_query_failed:
+            led_supported = False
+            led_backend = None
+            led_reason = "API LED control is unavailable because enclosure discovery failed for this refresh."
+        elif core_ses_target_invalid:
+            led_supported = False
+            led_backend = None
+            led_reason = (
+                f"Slot {slot:02d} must resolve to exactly one authentic SES element before CORE identify control can run."
+            )
         elif not enclosure_id and not ses_device:
             led_supported = False
             led_backend = None
