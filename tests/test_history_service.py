@@ -1460,6 +1460,105 @@ class HistoryStoreTests(unittest.TestCase):
             self.assertEqual(reader_errors, [])
             self.assertEqual(reader_results, [{}])
 
+    def test_backup_and_ordinary_write_do_not_invert_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            backup_has_thread_lock = threading.Event()
+            backup_has_lifecycle_lock = threading.Event()
+            writer_attempted_lifecycle_lock = threading.Event()
+            writer_waits_for_thread_lock = threading.Event()
+            backup_errors: list[BaseException] = []
+            writer_errors: list[BaseException] = []
+            backup_paths: list[Path | None] = []
+            real_thread_lock = threading.Lock()
+
+            class TrackingThreadLock:
+                def __enter__(self) -> TrackingThreadLock:
+                    current_thread = threading.current_thread()
+                    if current_thread is writer_thread:
+                        writer_waits_for_thread_lock.set()
+                    real_thread_lock.acquire()
+                    if current_thread is backup_thread:
+                        backup_has_thread_lock.set()
+                        if backup_has_lifecycle_lock.is_set() and not writer_attempted_lifecycle_lock.wait(5):
+                            real_thread_lock.release()
+                            raise TimeoutError("ordinary writer did not attempt the lifecycle lock")
+                    return self
+
+                def __exit__(self, *args: object) -> None:
+                    if threading.current_thread() is backup_thread:
+                        backup_has_thread_lock.clear()
+                    real_thread_lock.release()
+
+            def run_backup() -> None:
+                try:
+                    backup_paths.append(
+                        store.create_backup(
+                            root / "backups",
+                            snapshot_label="2030-01-02T03:04:05+00:00",
+                            retention_count=1,
+                        )
+                    )
+                except BaseException as exc:
+                    backup_errors.append(exc)
+
+            def run_writer() -> None:
+                try:
+                    store._execute_write(
+                        lambda connection: connection.execute(
+                            "UPDATE history_table_counts SET row_count = row_count "
+                            "WHERE table_name = 'slot_events'"
+                        )
+                    )
+                except BaseException as exc:
+                    writer_errors.append(exc)
+
+            backup_thread = threading.Thread(target=run_backup, name="history-backup")
+            writer_thread = threading.Thread(target=run_writer, name="ordinary-history-writer")
+
+            @contextmanager
+            def tracking_history_write_lock(*args: Any, **kwargs: Any):
+                current_thread = threading.current_thread()
+                if current_thread is backup_thread and backup_has_thread_lock.is_set():
+                    if not writer_waits_for_thread_lock.wait(5):
+                        raise TimeoutError("ordinary writer did not wait for the thread lock")
+                    raise AssertionError(
+                        "lock-order deadlock: backup holds the thread lock while waiting for the "
+                        "lifecycle lock, and ordinary writer holds the lifecycle lock while waiting "
+                        "for the thread lock"
+                    )
+                if current_thread is writer_thread:
+                    writer_attempted_lifecycle_lock.set()
+                with history_write_lock(*args, **kwargs):
+                    if current_thread is backup_thread:
+                        backup_has_lifecycle_lock.set()
+                    try:
+                        yield
+                    finally:
+                        if current_thread is backup_thread:
+                            backup_has_lifecycle_lock.clear()
+
+            store._lock = TrackingThreadLock()  # type: ignore[assignment]
+            with patch("history_service.store.history_write_lock", tracking_history_write_lock):
+                backup_thread.start()
+                self.assertTrue(backup_has_thread_lock.wait(5), "backup did not acquire the thread lock")
+                writer_thread.start()
+                backup_thread.join(5)
+                writer_thread.join(5)
+
+            self.assertFalse(backup_thread.is_alive(), "backup did not finish")
+            self.assertFalse(writer_thread.is_alive(), "ordinary writer did not finish")
+            self.assertEqual(backup_errors, [])
+            self.assertEqual(len(backup_paths), 1)
+            backup_path = backup_paths[0]
+            self.assertIsNotNone(backup_path)
+            assert backup_path is not None
+            self.assertTrue(backup_path.exists())
+            self.assertEqual(len(writer_errors), 1)
+            self.assertIsInstance(writer_errors[0], sqlite3.OperationalError)
+            self.assertRegex(str(writer_errors[0]), "migration lock")
+
     def test_store_rechecks_lifecycle_markers_after_acquiring_the_history_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "history.db"

@@ -939,36 +939,37 @@ class HistoryStore:
         )
         temp_metadata = os.fstat(temp_fd)
 
-        with self._lock:
-            try:
-                with closing(self._connect()) as source_connection, closing(
-                    sqlite3.connect(f"/proc/self/fd/{temp_fd}")
-                ) as backup_connection:
-                    backup_connection.execute("PRAGMA journal_mode=MEMORY")
-                    source_connection.backup(backup_connection)
-                    backup_connection.commit()
-                publish_descriptor = temp_fd
-                temp_fd = None
-                self._publish_replacement(
-                    temp_path,
-                    final_path,
-                    temp_descriptor=publish_descriptor,
-                )
-                self._prune_backup_snapshots(backup_root, retention_count)
-                try:
-                    self._promote_long_term_backups(
+        try:
+            with history_write_lock(self.file_path, blocking=True):
+                with self._lock:
+                    with closing(self._connect(migration_lock_held=True)) as source_connection, closing(
+                        sqlite3.connect(f"/proc/self/fd/{temp_fd}")
+                    ) as backup_connection:
+                        backup_connection.execute("PRAGMA journal_mode=MEMORY")
+                        source_connection.backup(backup_connection)
+                        backup_connection.commit()
+                    publish_descriptor = temp_fd
+                    temp_fd = None
+                    self._publish_replacement(
+                        temp_path,
                         final_path,
-                        snapshot_label=snapshot_label,
-                        long_term_backup_dir=long_term_backup_dir,
-                        weekly_retention_count=weekly_retention_count,
-                        monthly_retention_count=monthly_retention_count,
+                        temp_descriptor=publish_descriptor,
                     )
-                except Exception as exc:  # noqa: BLE001 - best-effort archival path should not break local backup rotation.
-                    logger.warning("History long-term backup promotion failed for %s: %s", final_path, exc)
-            finally:
-                if temp_fd is not None:
-                    os.close(temp_fd)
-                self._discard_owned_path(temp_path, temp_metadata)
+                    self._prune_backup_snapshots(backup_root, retention_count)
+                    try:
+                        self._promote_long_term_backups(
+                            final_path,
+                            snapshot_label=snapshot_label,
+                            long_term_backup_dir=long_term_backup_dir,
+                            weekly_retention_count=weekly_retention_count,
+                            monthly_retention_count=monthly_retention_count,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - best-effort archival path should not break local backup rotation.
+                        logger.warning("History long-term backup promotion failed for %s: %s", final_path, exc)
+        finally:
+            if temp_fd is not None:
+                os.close(temp_fd)
+            self._discard_owned_path(temp_path, temp_metadata)
 
         return final_path
 
