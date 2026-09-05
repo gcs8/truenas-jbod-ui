@@ -8,7 +8,7 @@ from typing import Callable
 
 from cryptography.hazmat.primitives import serialization
 
-from app.config import SSHConfig, _derive_runtime_layout_paths
+from app.config import Settings, SSHConfig, _derive_runtime_layout_paths, normalize_text
 from app.models.domain import SystemSetupBootstrapRequest
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.ssh_probe import SSHProbe
@@ -16,6 +16,8 @@ from app.services.ssh_probe import SSHProbe
 
 PUBLIC_KEY_PREFIXES = ("ssh-ed25519 ", "ssh-rsa ", "ecdsa-", "sk-ssh-")
 SUDOERS_DIR_CANDIDATES = ("/usr/local/etc/sudoers.d", "/etc/sudoers.d")
+SAVED_SUDO_COMMAND_PREFIX = re.compile(r"^sudo\b", re.IGNORECASE)
+SAVED_SSH_COMMANDS_UNAVAILABLE_DETAIL = "The saved SSH command list is unavailable."
 ESXI_BOOTSTRAP_UNSUPPORTED_DETAIL = (
     "VMware ESXi does not use the Linux one-time bootstrap or sudoers flow. "
     "Save the SSH host, root or key-based auth, and the read-only runtime commands directly instead."
@@ -138,6 +140,31 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     ),
     "esxi": (),
 }
+
+
+def saved_sudo_commands_for_system(settings: Settings, source_system_id: str | None) -> list[str]:
+    """Return the saved ``sudo ...`` SSH command lines of a configured system.
+
+    The admin editor hides saved commands behind placeholders, so bootstrap and the
+    sudoers preview cannot read them from the request body. They send the saved
+    system's id instead and the server resolves the list here, mirroring the
+    ``sudo`` prefix filter the editor applies to visible command text. A blank id
+    yields an empty list (platform defaults apply); an id that names no configured
+    system raises so a stale editor state fails closed instead of silently
+    installing the default set.
+    """
+    normalized_id = normalize_text(source_system_id)
+    if not normalized_id:
+        return []
+    for system in settings.systems:
+        if system.id != normalized_id:
+            continue
+        return [
+            str(command).strip()
+            for command in system.ssh.commands
+            if SAVED_SUDO_COMMAND_PREFIX.match(str(command).strip())
+        ]
+    raise ValueError(SAVED_SSH_COMMANDS_UNAVAILABLE_DETAIL)
 
 
 class ServiceAccountBootstrapService:

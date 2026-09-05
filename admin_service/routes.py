@@ -777,6 +777,18 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         settings = reload_app_settings()
         bootstrap_service = ServiceAccountBootstrapService(settings.config_file)
         try:
+            if not payload.sudo_commands and payload.ssh_commands_source_system_id:
+                # Re-validate so saved commands pass the same request-model sanitizer
+                # (per-item length cap) as commands typed into the editor.
+                payload = SystemSetupBootstrapRequest.model_validate(
+                    {
+                        **payload.model_dump(),
+                        "sudo_commands": saved_sudo_commands_for_system(
+                            settings,
+                            payload.ssh_commands_source_system_id,
+                        ),
+                    }
+                )
             result = await asyncio.to_thread(bootstrap_service.bootstrap_service_account, payload)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -785,6 +797,17 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
     @router.post("/api/admin/system-setup/sudoers-preview")
     async def preview_sudoers_file(payload: SystemSetupSudoPreviewRequest) -> JSONResponse:
         try:
+            if not payload.sudo_commands and payload.ssh_commands_source_system_id:
+                # Same re-validation as the bootstrap route: one sanitizer for both sources.
+                payload = SystemSetupSudoPreviewRequest.model_validate(
+                    {
+                        **payload.model_dump(),
+                        "sudo_commands": saved_sudo_commands_for_system(
+                            reload_app_settings(),
+                            payload.ssh_commands_source_system_id,
+                        ),
+                    }
+                )
             result = await asyncio.to_thread(
                 ServiceAccountBootstrapService.build_sudoers_preview,
                 payload.service_user,

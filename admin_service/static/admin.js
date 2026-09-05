@@ -3710,7 +3710,7 @@
     }
     if (elements.setupSshCommandsNote) {
       elements.setupSshCommandsNote.innerHTML = unchangedRedactedSshCommands(elements.setupSshCommands)
-        ? "Saved SSH commands are hidden. Leave these placeholders unchanged to keep the saved list, replace them with a new list, or clear all lines to remove the saved commands."
+        ? "Saved SSH commands are hidden. Leave these placeholders unchanged to keep the saved list, replace them with a new list, or clear all lines to remove the saved commands. While the placeholders stay unchanged, the one-time bootstrap and its sudoers preview use the saved <code>sudo -n ...</code> lines."
         : bootstrapSupported
         ? platform === "core"
           ? "These are the exact SSH commands the app runs. When you use the one-time bootstrap, any <code>sudo -n ...</code> lines here are also converted into the CORE <code>midclt user.update</code> permission payload, with on-demand SMART, LED-control, and topology diagnostic extras kept in place."
@@ -3797,13 +3797,29 @@
     return collectSetupCommands().filter((line) => /^sudo\b/i.test(line));
   }
 
+  function collectBootstrapSudoCommandPayload() {
+    // Saved commands are shown as hidden placeholders that never match /^sudo/, so
+    // while they are unchanged the server resolves the saved sudo lines from the
+    // source system instead of falling back to the platform defaults.
+    const field = elements.setupSshCommands;
+    const useSavedCommands = unchangedRedactedSshCommands(field);
+    return {
+      sudo_commands: collectBootstrapSudoCommands(),
+      ssh_commands_source_system_id: useSavedCommands
+        ? String(field?.dataset?.sshCommandsSourceSystemId || "")
+        : null,
+    };
+  }
+
   function collectSudoersPreviewPayload() {
     const bootstrapEnabled = bootstrapEnabledForSession();
     return {
       platform: elements.setupPlatform?.value || "core",
       service_user: elements.setupSshUser?.value?.trim() || recommendedSshUserForPlatform(elements.setupPlatform?.value || "core"),
       install_sudo_rules: bootstrapEnabled && Boolean(elements.setupBootstrapInstallSudo?.checked),
-      sudo_commands: bootstrapEnabled ? collectBootstrapSudoCommands() : [],
+      ...(bootstrapEnabled
+        ? collectBootstrapSudoCommandPayload()
+        : { sudo_commands: [], ssh_commands_source_system_id: null }),
     };
   }
 
@@ -4978,7 +4994,7 @@
       service_user: setupPayload.ssh_user,
       service_shell: "/bin/sh",
       install_sudo_rules: Boolean(elements.setupBootstrapInstallSudo?.checked),
-      sudo_commands: collectBootstrapSudoCommands(),
+      ...collectBootstrapSudoCommandPayload(),
       ...resolveBootstrapServiceKey(),
     };
   }

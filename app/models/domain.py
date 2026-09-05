@@ -1190,6 +1190,9 @@ class SystemSetupBootstrapRequest(BaseModel):
     service_public_key: str | None = None
     install_sudo_rules: bool = True
     sudo_commands: list[str] = Field(default_factory=list)
+    # Saved-system handle used when the editor still shows redacted command placeholders;
+    # the server resolves the saved `sudo ...` lines instead of the platform defaults.
+    ssh_commands_source_system_id: str | None = None
 
     @field_validator(
         "host",
@@ -1200,6 +1203,7 @@ class SystemSetupBootstrapRequest(BaseModel):
         "service_key_name",
         "service_key_path",
         "service_public_key",
+        "ssh_commands_source_system_id",
     )
     @classmethod
     def sanitize_bootstrap_text_fields(cls, value: str | None) -> str | None:
@@ -1294,11 +1298,17 @@ class SystemSetupSudoPreviewRequest(BaseModel):
     service_user: str = "jbodmap"
     install_sudo_rules: bool = True
     sudo_commands: list[str] = Field(default_factory=list)
+    ssh_commands_source_system_id: str | None = None
 
     @field_validator("service_user")
     @classmethod
     def sanitize_service_user(cls, value: str | None) -> str:
         return trim_optional_text(value, max_length=256) or "jbodmap"
+
+    @field_validator("ssh_commands_source_system_id")
+    @classmethod
+    def sanitize_source_system_id(cls, value: str | None) -> str | None:
+        return trim_optional_text(value, max_length=1024)
 
     @field_validator("sudo_commands")
     @classmethod
