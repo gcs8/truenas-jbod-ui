@@ -937,8 +937,12 @@ async def enrich_quantastor_nodes_from_ssh(
                 results = await probe.run_commands([command])
             else:
                 results = await probe.run_commands([command], stdin_data=stdin_data)
-        except Exception as exc:  # noqa: BLE001 - keep discovery helper best-effort.
-            logger.warning("Quantastor HA node host discovery failed on %s: %s", seed_host, exc)
+        except Exception:  # noqa: BLE001 - keep discovery helper best-effort.
+            # Transport exceptions may contain credentials derived from SSH stdin.
+            logger.warning(
+                "Quantastor HA node host discovery failed; SSH interface discovery unavailable",
+                extra={"discovery_stage": "ssh_interface_discovery"},
+            )
             failures.append(f"{seed_host}: SSH interface discovery failed; see admin logs")
             continue
         result = results[0] if results else None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import secrets
 import shlex
 import stat
 import tempfile
@@ -3840,6 +3841,75 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertIn("saved connection settings", detail)
         self.assertNotIn(saved_api_password, detail)
         self.assertNotIn(fresh_ssh_password, detail)
+
+    def test_quantastor_discovery_never_logs_preserved_credentials_from_ssh_exception(self) -> None:
+        route = next(
+            route for route in admin_app.routes
+            if route.path == "/api/admin/system-setup/quantastor-nodes"
+        )
+        secret = secrets.token_hex(32)
+        saved_host = "saved-node.example.test"
+        settings = Settings(systems=[SystemConfig(
+            id="saved-quantastor",
+            truenas=TrueNASConfig(
+                host="https://saved-api.example.test", platform="quantastor",
+                api_user="operator", api_password=secret,
+            ),
+            ssh=SSHConfig(
+                enabled=True, host=saved_host, user="operator",
+                password="synthetic-ssh-password",
+            ),
+        )])
+        raw_data = TrueNASRawData(
+            enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[],
+            systems=[{"id": "node-a", "name": "Synthetic node"}],
+        )
+        transport_hosts: list[str] = []
+        encoded_inputs: list[str] = []
+
+        async def fail_transport(probe, commands, *, stdin_data=None):
+            transport_hosts.append(probe.config.host)
+            self.assertTrue(isinstance(stdin_data, str), "Expected credential-bearing SSH stdin")
+            decoded = base64.b64decode(stdin_data.strip(), validate=True).decode("utf-8")
+            # Boolean assertions keep random credentials out of failure diagnostics.
+            self.assertTrue(secret in decoded, "Saved API credential did not reach approved SSH stdin")
+            self.assertFalse(secret in repr(commands), "Credential entered command arguments")
+            encoded_inputs.append(stdin_data.strip())
+            raise RuntimeError(f"Synthetic transport failure: {decoded}; input={stdin_data}")
+
+        client = MagicMock()
+        client.fetch_all = AsyncMock(return_value=raw_data)
+        with (
+            patch("admin_service.main.reload_app_settings", return_value=settings),
+            patch("admin_service.main.QuantastorRESTClient", return_value=client),
+            patch("admin_service.main.SSHProbe.run_commands", new=fail_transport),
+            self.assertLogs(level="WARNING") as captured,
+        ):
+            response = asyncio.run(route.endpoint(QuantastorNodeDiscoveryRequest(
+                system_id="saved-quantastor", truenas_host="https://saved-api.example.test",
+                api_user="operator", api_password=PRESERVE_SECRET_SENTINEL,
+                ssh_enabled=True, ssh_host=saved_host, ssh_user="operator",
+                ssh_password=PRESERVE_SECRET_SENTINEL,
+            )))
+
+        self.assertEqual(transport_hosts, [saved_host])
+        # Enrichment catches transport assertions too; prove the fake reached its intended failure.
+        self.assertEqual(len(encoded_inputs), 1)
+        client.fetch_all.assert_awaited_once()
+        result = json.loads(response.body)
+        self.assertTrue(result["host_discovery"]["attempted"])
+        self.assertFalse(result["host_discovery"]["ok"])
+        self.assertEqual(len(captured.records), 1)
+        log_text = repr([record.__dict__ for record in captured.records]) + repr(captured.output)
+        for sensitive in (secret, *encoded_inputs):
+            self.assertFalse(sensitive in log_text, "Credential-bearing transport data leaked into warning logs")
+            self.assertFalse(sensitive in response.body.decode(), "Credential-bearing data leaked into response")
+        record = captured.records[0]
+        self.assertEqual(record.getMessage(), "Quantastor HA node host discovery failed; SSH interface discovery unavailable")
+        self.assertEqual(record.discovery_stage, "ssh_interface_discovery")
+        self.assertEqual(record.levelname, "WARNING")
+        self.assertIsNone(record.exc_info)
+        self.assertIsNone(record.exc_text)
 
     def test_quantastor_discovery_rejects_saved_secrets_for_different_endpoint(self) -> None:
         route = next(
