@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
 from history_service.migration_lock import history_write_lock
+from history_service.operation_bounds import validate_store_scope_request
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
     activation_pending_path,
@@ -2189,6 +2190,12 @@ class HistoryStore:
         metric_limits: dict[str, int] | None = None,
         since: str | None = None,
     ) -> dict[int, dict[str, Any]]:
+        validate_store_scope_request(
+            slots=slots,
+            event_limit=event_limit,
+            metric_limits=metric_limits,
+            since=since,
+        )
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
             return segmented_reader.list_scope_history(

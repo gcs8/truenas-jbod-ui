@@ -13,14 +13,16 @@ import urllib.request
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Collection
+from typing import Any, Collection, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, ConfigDict
 
 from admin_service.config import get_admin_settings
 from app import __version__
@@ -55,7 +57,7 @@ from app.models.domain import (
 from app.metrics import install_metrics
 from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
 from app.script_json import register_script_json_filters
-from app.services.history_backend import HistoryBackendClient
+from app.services.history_backend import HistoryBackendClient, HistoryBackendPolicyError
 from app.services.inventory import (
     DiskInventorySyncBusy,
     SnapshotStateBusyError,
@@ -76,6 +78,12 @@ from app.services.snapshot_export import (
     collect_configured_hostnames,
 )
 from app.services.truenas_ws import TrueNASAPIError
+from history_service.operation_bounds import (
+    ALLOWED_HISTORY_METRICS,
+    HistoryBudgetExceeded,
+    HistoryRequestShapeError,
+    build_history_read_plan,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -83,6 +91,30 @@ register_script_json_filters(templates.env)
 
 logger = logging.getLogger(__name__)
 INVALID_MAPPING_BUNDLE_DETAIL = "Mapping bundle is invalid."
+
+
+class HistoryRefreshProxyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["fast", "full"]
+
+
+class HistoryScopeProxyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    system_id: str
+    enclosure_id: str | None = None
+    slots: list[int]
+
+
+class HistoryScopesProxyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scopes: list[HistoryScopeProxyRequest]
+    metrics: list[str]
+    since: str
+    event_limit: int
+    metric_limit: int
 
 
 async def system_not_configured_exception_handler(

@@ -521,8 +521,9 @@ def measure_modeled_perf_case(slot_count: int) -> dict[str, Any]:
                 system_id,
                 enclosure_id,
                 slots=list(range(slot_count)),
-                event_limit=12,
+                event_limit=11,
                 metric_limits={metric_name: 2 for metric_name in HISTORY_METRIC_NAMES},
+                since=(datetime.now(timezone.utc) - timedelta(hours=8760)).isoformat(),
             )
         scope_history_response_bytes = len(
             _compact_json_bytes(

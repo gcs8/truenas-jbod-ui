@@ -5179,10 +5179,12 @@
     const selectedView = getSelectedStorageViewRuntime();
     const params = buildSelectionParams();
     const windowHours = currentHeatmapWindowHours();
-    if (Number.isInteger(windowHours)) {
-      params.set("window_hours", String(windowHours));
-    }
+    const boundedWindowHours = Number.isInteger(windowHours)
+      ? Math.max(1, Math.min(8760, windowHours))
+      : 8760;
+    params.set("window_hours", String(boundedWindowHours));
     params.set("event_limit", "0");
+    params.set("metric_limit", "24");
     heatmapHistoryMetricNames().forEach((metricName) => {
       params.append("metrics", metricName);
     });

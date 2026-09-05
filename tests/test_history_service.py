@@ -399,6 +399,11 @@ class HistoryConfigTests(unittest.TestCase):
 
 
 class HistoryDashboardRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        history_main.refresh_admission = history_main.ManualRefreshAdmission(
+            cooldown_seconds=history_main.settings.full_refresh_cooldown_seconds
+        )
+
     @staticmethod
     def _request(*, root_path: str = "") -> Request:
         return Request(
@@ -416,6 +421,34 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                 "server": ("testserver", 80),
                 "app": history_main.app,
             }
+        )
+
+    @staticmethod
+    def _refresh_request(mode: str) -> Request:
+        body = json.dumps({"mode": mode}).encode("utf-8")
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if sent:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        return Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/history/refresh",
+                "raw_path": b"/api/history/refresh",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 80),
+            },
+            receive,
         )
 
     @staticmethod
@@ -491,7 +524,8 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn('id="history-refresh-full"', markup)
         self.assertIn('src="http://testserver/static/dashboard.js"', markup)
         self.assertIn('href="http://testserver/static/dashboard.css"', markup)
-        self.assertIn("/api/history/refresh?mode=", script_source)
+        self.assertIn('fetch("/api/history/refresh"', script_source)
+        self.assertIn('body: JSON.stringify({ mode })', script_source)
         self.assertIn("const body = await response.text();", script_source)
         self.assertIn("JSON.parse(body)", script_source)
         self.assertIn("Next background pass", markup)
@@ -514,6 +548,23 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn('id="status-current-collection"', markup)
         self.assertIn('id="collector-state-value"', markup)
         self.assertIn('id="tracked-scopes-body"', markup)
+
+    def test_dashboard_hides_direct_refresh_controls_in_token_mode(self) -> None:
+        token_settings = HistorySettings(
+            refresh_auth_mode="token",
+            refresh_token="synthetic-token",
+            public_origin="https://history.example.test",
+        )
+        with patch.object(history_main, "settings", token_settings):
+            markup = self._render_dashboard(
+                {"collector_running": True},
+                {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
+                [],
+            )
+        self.assertNotIn('id="history-refresh-fast"', markup)
+        self.assertNotIn('id="history-refresh-full"', markup)
+        self.assertNotIn("synthetic-token", markup)
+        self.assertIn("authenticated main UI", markup)
 
     def test_dashboard_omits_release_link_for_non_http_urls(self) -> None:
         markup = self._render_dashboard(
@@ -655,7 +706,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
         ):
-            payload = asyncio.run(route.endpoint(mode="fast"))
+            payload = asyncio.run(route.endpoint(request=self._refresh_request("fast")))
 
         run_once.assert_awaited_once_with(
             force_fast=True,
@@ -676,7 +727,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
         ):
-            payload = asyncio.run(route.endpoint(mode="full"))
+            payload = asyncio.run(route.endpoint(request=self._refresh_request("full")))
 
         run_once.assert_awaited_once_with(
             force_fast=True,
@@ -709,7 +760,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             patch.object(history_main.store, "list_scopes", return_value=[]),
             patch.object(history_main.logger, "exception"),
         ):
-            response = asyncio.run(route.endpoint(mode="full"))
+            response = asyncio.run(route.endpoint(request=self._refresh_request("full")))
 
         run_once.assert_awaited_once_with(
             force_fast=True,
@@ -739,7 +790,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             patch.object(history_main.store, "estimated_counts", return_value={"tracked_slots": 0}),
             patch.object(history_main.store, "list_scopes", return_value=[]),
         ):
-            response = asyncio.run(route.endpoint(mode="full"))
+            response = asyncio.run(route.endpoint(request=self._refresh_request("full")))
 
         run_once.assert_not_awaited()
         self.assertEqual(response.status_code, 409)
@@ -800,8 +851,9 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                     "enclosure_id": "front",
                     "slots": [5],
                     "metrics": ["temperature_c"],
-                    "since": None,
+                    "since": (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(),
                     "event_limit": 12,
+                    "metric_limit": 60,
                 },
             ),
         )
@@ -2866,7 +2918,7 @@ class HistoryStoreTests(unittest.TestCase):
             [30, 20.0],
         )
 
-    def test_all_history_queries_include_retained_rollups_without_since(self) -> None:
+    def test_single_history_query_allows_all_time_while_bulk_requires_since(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
         store.insert_metric_samples(
@@ -2892,6 +2944,7 @@ class HistoryStoreTests(unittest.TestCase):
             slots=[5],
             event_limit=0,
             metric_limits={"temperature_c": 10},
+            since="2025-09-05T00:00:00+00:00",
         )
 
         self.assertEqual([sample["value"] for sample in samples], [30.0])
@@ -3527,6 +3580,7 @@ class HistoryStoreTests(unittest.TestCase):
             slots=[5],
             event_limit=0,
             metric_limits={"bytes_written": 10},
+            since="2026-04-16T00:00:00+00:00",
         )
 
         self.assertEqual(payload[5]["events"], [])

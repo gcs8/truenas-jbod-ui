@@ -22,6 +22,21 @@ from app.script_json import register_script_json_filters
 from app.services.release_status import ReleaseStatusService
 from history_service.collector import HistoryCollectionAlreadyRunning, HistoryCollector
 from history_service.config import HistorySettings, get_history_settings
+from history_service.operation_bounds import (
+    MAX_REQUEST_BYTES,
+    MAX_RESPONSE_BYTES,
+    HistoryBudgetExceeded,
+    HistoryReadPlan,
+    HistoryRequestShapeError,
+    build_history_read_plan,
+    count_history_rows,
+)
+from history_service.refresh_auth import (
+    ManualRefreshAdmission,
+    authorize_refresh_request,
+    read_limited_request_body,
+    read_refresh_document,
+)
 from history_service.store import HistoryStore
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -49,7 +64,9 @@ settings = get_history_settings()
 store = build_history_store(settings)
 collector = HistoryCollector(settings, store)
 logger = logging.getLogger(__name__)
-refresh_lock = asyncio.Lock()
+refresh_admission = ManualRefreshAdmission(
+    cooldown_seconds=settings.full_refresh_cooldown_seconds,
+)
 HISTORY_COLLECTOR_ERROR_DETAIL = "History collector error; see service logs."
 SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "temperature_c": 96,
@@ -59,6 +76,78 @@ SLOT_HISTORY_METRIC_LIMITS: dict[str, int] = {
     "annualized_bytes_written": 60,
     "power_on_hours": 60,
 }
+
+
+def _duplicate_key_rejector(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError("duplicate JSON key")
+        payload[key] = value
+    return payload
+
+
+def _history_error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, HistoryBudgetExceeded):
+        return JSONResponse(
+            {
+                "detail": f"History request exceeds {exc.limit_name} limit.",
+                "limit": exc.limit,
+            },
+            status_code=413,
+        )
+    return JSONResponse({"detail": "History request shape is invalid."}, status_code=422)
+
+
+def bounded_history_json_response(
+    payload: dict[str, object],
+    *,
+    max_bytes: int = MAX_RESPONSE_BYTES,
+) -> JSONResponse:
+    budget = payload.get("budget")
+    if isinstance(budget, dict):
+        for _ in range(4):
+            response = JSONResponse(payload)
+            current = budget.get("response_bytes")
+            budget["response_bytes"] = len(response.body)
+            if current == len(response.body):
+                break
+    response = JSONResponse(payload)
+    if len(response.body) > max_bytes:
+        return JSONResponse(
+            {
+                "detail": "History response exceeds serialized byte limit.",
+                "limit": MAX_RESPONSE_BYTES,
+            },
+            status_code=413,
+        )
+    return response
+
+
+async def _execute_history_plan(plan: HistoryReadPlan) -> tuple[list[dict[str, object]], int]:
+    scope_payloads: list[dict[str, object]] = []
+    returned_rows = 0
+    for scope in plan.scopes:
+        histories = await asyncio.to_thread(
+            store.list_scope_history,
+            scope.system_id,
+            scope.enclosure_id,
+            slots=list(scope.slots),
+            event_limit=plan.event_limit,
+            since=plan.since,
+            metric_limits=dict(plan.metric_limits),
+        )
+        returned_rows += count_history_rows(histories.values())
+        if returned_rows > plan.projected_rows:
+            raise HistoryBudgetExceeded("returned_rows", returned_rows, plan.projected_rows)
+        scope_payloads.append(
+            {
+                "system_id": scope.system_id,
+                "enclosure_id": scope.enclosure_id,
+                "histories": histories,
+            }
+        )
+    return scope_payloads, returned_rows
 
 
 def public_collector_status(
@@ -174,39 +263,48 @@ async def overview(exact_counts: bool = Query(default=False)) -> dict[str, objec
 
 
 @app.post("/api/history/refresh", response_model=None)
-async def refresh_history(mode: str = Query(default="fast")) -> dict[str, object] | JSONResponse:
-    normalized_mode = mode.lower().strip()
-    if normalized_mode not in {"fast", "full"}:
-        raise HTTPException(status_code=400, detail="mode must be 'fast' or 'full'")
-    if refresh_lock.locked():
-        raise HTTPException(status_code=409, detail="History refresh already running.")
+async def refresh_history(request: Request) -> dict[str, object] | JSONResponse:
+    authorize_refresh_request(request, settings)
+    normalized_mode = await read_refresh_document(request)
     if collector.collection_running:
-        payload = await overview(exact_counts=False)
         return JSONResponse(
             {
                 "ok": False,
                 "mode": normalized_mode,
                 "detail": "History collection already running.",
-                **payload,
             },
             status_code=409,
         )
+    admission = await refresh_admission.try_acquire(normalized_mode)
+    if not admission.accepted:
+        detail = (
+            "History full refresh is cooling down."
+            if admission.status_code == 429
+            else "History refresh already running."
+        )
+        headers = (
+            {"Retry-After": str(admission.retry_after)}
+            if admission.retry_after is not None
+            else None
+        )
+        return JSONResponse(
+            {"ok": False, "mode": normalized_mode, "detail": detail},
+            status_code=admission.status_code or 409,
+            headers=headers,
+        )
     try:
-        async with refresh_lock:
-            await collector.run_once(
-                force_fast=True,
-                force_slow=normalized_mode == "full",
-                include_due_intervals=False,
-                cached_root_only=normalized_mode == "fast",
-            )
+        await collector.run_once(
+            force_fast=True,
+            force_slow=normalized_mode == "full",
+            include_due_intervals=False,
+            cached_root_only=normalized_mode == "fast",
+        )
     except HistoryCollectionAlreadyRunning:
-        payload = await overview(exact_counts=False)
         return JSONResponse(
             {
                 "ok": False,
                 "mode": normalized_mode,
                 "detail": "History collection already running.",
-                **payload,
             },
             status_code=409,
         )
@@ -238,6 +336,8 @@ async def refresh_history(mode: str = Query(default="fast")) -> dict[str, object
             },
             status_code=500,
         )
+    finally:
+        await refresh_admission.release()
     payload = await overview(exact_counts=False)
     return {
         "ok": True,
@@ -313,39 +413,82 @@ async def scope_slot_history(
     slots: list[int] | None = Query(default=None),
     metrics: list[str] | None = Query(default=None),
     since: str | None = Query(default=None),
-    event_limit: int = Query(default=12, ge=0, le=1000),
-) -> dict[str, object]:
-    requested_metrics = [
-        metric_name
-        for metric_name in (metrics or SLOT_HISTORY_METRIC_LIMITS.keys())
-        if metric_name in SLOT_HISTORY_METRIC_LIMITS
-    ]
-    histories = await asyncio.to_thread(
-        store.list_scope_history,
-        system_id,
-        enclosure_id,
-        slots=slots or [],
-        event_limit=event_limit,
-        since=since,
-        metric_limits={
-            metric_name: SLOT_HISTORY_METRIC_LIMITS[metric_name]
-            for metric_name in requested_metrics
-        },
-    )
-    return {
-        "histories": {
-            str(slot): {
-                "slot": slot,
-                "system_id": system_id,
-                "enclosure_id": enclosure_id,
-                "events": payload.get("events", []),
-                "metrics": payload.get("metrics", {}),
-                "sample_counts": payload.get("sample_counts", {}),
-                "latest_values": payload.get("latest_values", {}),
-            }
-            for slot, payload in histories.items()
+    event_limit: int = Query(default=12),
+    metric_limit: int = 60,
+) -> JSONResponse:
+    try:
+        plan = build_history_read_plan(
+            scopes=[{"system_id": system_id, "enclosure_id": enclosure_id, "slots": slots or []}],
+            metrics=metrics or SLOT_HISTORY_METRIC_LIMITS.keys(),
+            since=since,
+            event_limit=event_limit,
+            metric_limit=metric_limit,
+        )
+        scope_payloads, returned_rows = await _execute_history_plan(plan)
+    except (HistoryRequestShapeError, HistoryBudgetExceeded) as exc:
+        raise HTTPException(
+            status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
+            detail=(
+                f"History request exceeds {exc.limit_name} limit ({exc.limit})."
+                if isinstance(exc, HistoryBudgetExceeded)
+                else "History request shape is invalid."
+            ),
+        ) from exc
+    histories = cast(dict[int, dict[str, object]], scope_payloads[0]["histories"])
+    budget = plan.with_result(returned_row_count=returned_rows, response_bytes=0).budget_metadata()
+    return bounded_history_json_response(
+        {
+            "histories": {
+                str(slot): {
+                    "slot": slot,
+                    "system_id": system_id,
+                    "enclosure_id": enclosure_id,
+                    "events": payload.get("events", []),
+                    "metrics": payload.get("metrics", {}),
+                    "sample_counts": payload.get("sample_counts", {}),
+                    "latest_values": payload.get("latest_values", {}),
+                }
+                for slot, payload in histories.items()
+            },
+            "budget": budget,
         }
-    }
+    )
+
+
+@app.post("/api/history/scopes/bundle")
+async def scopes_history_bundle(request: Request) -> JSONResponse:
+    try:
+        body = await read_limited_request_body(
+            request,
+            limit=MAX_REQUEST_BYTES,
+            detail=f"History request exceeds request_bytes limit ({MAX_REQUEST_BYTES}).",
+        )
+    except HTTPException as exc:
+        return JSONResponse({"detail": exc.detail, "limit": MAX_REQUEST_BYTES}, status_code=exc.status_code)
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        return _history_error_response(HistoryRequestShapeError("invalid content type"))
+    try:
+        document = json.loads(body, object_pairs_hook=_duplicate_key_rejector)
+        if not isinstance(document, dict) or set(document) != {
+            "scopes", "metrics", "since", "event_limit", "metric_limit"
+        }:
+            raise HistoryRequestShapeError("invalid document fields")
+        plan = build_history_read_plan(
+            scopes=document["scopes"],
+            metrics=document["metrics"],
+            since=document["since"],
+            event_limit=document["event_limit"],
+            metric_limit=document["metric_limit"],
+        )
+        scope_payloads, returned_rows = await _execute_history_plan(plan)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        if isinstance(exc, HistoryBudgetExceeded):
+            return _history_error_response(exc)
+        return _history_error_response(
+            exc if isinstance(exc, HistoryRequestShapeError) else HistoryRequestShapeError("invalid document")
+        )
+    budget = plan.with_result(returned_row_count=returned_rows, response_bytes=0).budget_metadata()
+    return bounded_history_json_response({"scopes": scope_payloads, "budget": budget})
 
 
 def format_count(value: object, *, estimated: bool = False) -> str:
@@ -454,6 +597,7 @@ def build_dashboard_context(
         "backoff_label": f"{backoff_seconds}s remaining" if backoff_seconds > 0 else "inactive",
         "current_collection_label": current_collection_label,
         "collector_banner_text": collector_banner_text,
+        "direct_refresh_enabled": settings.refresh_auth_mode == "network",
         "last_collection_duration_label": collection_duration_label(
             status.get("last_collection_duration_seconds")
         ),

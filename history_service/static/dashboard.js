@@ -210,8 +210,10 @@
         : "Running fast history refresh...";
     }
     try {
-      const response = await fetch(`/api/history/refresh?mode=${encodeURIComponent(mode)}`, {
+      const response = await fetch("/api/history/refresh", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
       });
       const body = await response.text();
       let payload = {};

@@ -175,17 +175,20 @@ $EDITOR secrets/truenas_api_password
 $EDITOR secrets/ssh_password
 $EDITOR secrets/ssh_sudo_password
 $EDITOR secrets/admin_auth_password
+$EDITOR secrets/history_refresh_token
 chmod 600 secrets/*
 ```
 
-Create all five files before applying the overlay. An unused optional secret
+Create all six files before applying the overlay. An unused optional secret
 may be an empty private file. Do not set a blank `_FILE` path: that is treated
-as a startup error. The overlay mounts all five files into both UI and admin;
-history and scheduled backup receive none.
+as a startup error. The overlay mounts appliance, SSH, admin-auth, and history
+refresh secrets only into the services that consume them: the history refresh token
+reaches UI and history, but not admin or scheduled backup.
 
 Supported variables are `TRUENAS_API_KEY_FILE`,
 `TRUENAS_API_PASSWORD_FILE`, `SSH_PASSWORD_FILE`,
-`SSH_SUDO_PASSWORD_FILE`, and `ADMIN_AUTH_PASSWORD_FILE`. A file-backed value
+`SSH_SUDO_PASSWORD_FILE`, `ADMIN_AUTH_PASSWORD_FILE`, and
+`HISTORY_REFRESH_TOKEN_FILE`. A file-backed value
 takes precedence over its direct environment value. The loader rejects
 symlinks, non-regular or group/world-writable files, invalid UTF-8, NUL,
 and values larger than 64 KiB. It preserves whitespace except one final LF or

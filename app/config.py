@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from app.secret_files import load_secret_environment_value
 from app.slot_layout import normalize_slot_layout, validate_slot_layout
@@ -408,11 +408,21 @@ class PathConfig(BaseModel):
 
 
 class HistoryConfig(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     service_url: str = ""
     timeout_seconds: int = 10
     # Upper bound on concurrent per-slot requests when the batched scope endpoint fails
     # and the client falls back to one request per slot.
     fallback_max_concurrency: int = 4
+    refresh_token: SecretStr | None = None
+
+    @field_validator("refresh_token", mode="before")
+    @classmethod
+    def normalize_refresh_token(cls, value: Any) -> Any:
+        if value is None or (isinstance(value, str) and not value):
+            return None
+        return value
 
 
 class AdminSurfaceConfig(BaseModel):
@@ -512,6 +522,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "HISTORY_BACKEND_URL": ("history", "service_url"),
     "HISTORY_BACKEND_TIMEOUT": ("history", "timeout_seconds"),
     "HISTORY_BACKEND_FALLBACK_CONCURRENCY": ("history", "fallback_max_concurrency"),
+    "HISTORY_REFRESH_TOKEN": ("history", "refresh_token"),
     "ADMIN_SERVICE_URL": ("admin", "service_url"),
     "ADMIN_PUBLIC_URL": ("admin", "public_url"),
     "ADMIN_PORT": ("admin", "port"),
@@ -534,6 +545,7 @@ FILE_SECRET_ENV_OVERRIDES = frozenset(
         "TRUENAS_API_PASSWORD",
         "SSH_PASSWORD",
         "SSH_SUDO_PASSWORD",
+        "HISTORY_REFRESH_TOKEN",
     }
 )
 EXACT_STRING_ENV_OVERRIDES = FILE_SECRET_ENV_OVERRIDES | {

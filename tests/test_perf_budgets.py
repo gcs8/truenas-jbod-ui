@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -244,8 +245,9 @@ class ModeledPerfFixtureTests(unittest.TestCase):
                         snapshot.selected_system_id or "",
                         snapshot.selected_enclosure_id,
                         slots=list(range(slot_count)),
-                        event_limit=12,
+                        event_limit=11,
                         metric_limits={metric_name: 2 for metric_name in HISTORY_METRIC_NAMES},
+                        since=(datetime.now(timezone.utc) - timedelta(hours=8760)).isoformat(),
                     )
 
                 self.assertEqual(list(histories), list(range(slot_count)))
@@ -281,16 +283,18 @@ class ModeledPerfFixtureTests(unittest.TestCase):
                             enclosure_id=snapshot.selected_enclosure_id,
                             slots=list(range(slot_count)),
                             metrics=list(HISTORY_METRIC_NAMES),
-                            since=None,
-                            event_limit=12,
+                            since=(datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(),
+                            event_limit=11,
+                            metric_limit=2,
                         )
                     )
 
-                histories = payload["histories"]
+                payload_data = json.loads(payload.body)
+                histories = payload_data["histories"]
                 self.assertIsInstance(histories, dict)
                 assert isinstance(histories, dict)
                 self.assertEqual(list(histories), [str(slot) for slot in range(slot_count)])
-                self.assertLessEqual(len(compact_json_bytes(payload)), byte_budget)
+                self.assertLessEqual(len(payload.body), byte_budget)
 
     def test_snapshot_export_html_cache_and_retained_byte_budgets(self) -> None:
         from tests.perf_fixtures import ModeledHistoryBackend, build_modeled_request

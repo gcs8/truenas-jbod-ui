@@ -149,6 +149,9 @@ them before starting the new images.
 
 ### Security
 
+- Required explicit bearer authorization, trusted-origin validation, atomic
+  admission, and a server-owned cooldown for exposed history refreshes; bulk
+  history reads now enforce aggregate work and serialized-byte ceilings (#371).
 - Routed the admin bootstrap payload through the shared script-safe JSON
   boundary (#151).
 - Bounded ESXi host-prep uploads through the private file-backed request limiter

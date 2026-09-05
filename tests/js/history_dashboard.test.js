@@ -137,8 +137,10 @@ test("refresh preserves success payload rendering and button state", async () =>
   await runRefresh("fast");
 
   assert.equal(requests.length, 1);
-  assert.equal(requests[0][0], "/api/history/refresh?mode=fast");
+  assert.equal(requests[0][0], "/api/history/refresh");
   assert.equal(requests[0][1].method, "POST");
+  assert.equal(requests[0][1].headers["Content-Type"], "application/json");
+  assert.equal(requests[0][1].body, JSON.stringify({ mode: "fast" }));
   assert.equal(status.textContent, "History fast refresh completed.");
   assert.deepEqual(rendered, [payload]);
   assert.deepEqual(buttons.map((button) => button.disabled), [false, false]);

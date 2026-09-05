@@ -18,6 +18,7 @@ from history_service.segment_catalog import (
     activation_pending_path,
     path_entry_exists,
 )
+from history_service.operation_bounds import validate_store_scope_request
 from history_service.segment_sealer import HISTORY_TABLE_TIMESTAMPS
 
 MAX_SEGMENTS_PER_QUERY = 32
@@ -1093,6 +1094,12 @@ class SegmentedHistoryReader:
         metric_limits: dict[str, int] | None = None,
         since: str | None = None,
     ) -> dict[int, dict[str, Any]]:
+        validate_store_scope_request(
+            slots=slots,
+            event_limit=event_limit,
+            metric_limits=metric_limits,
+            since=since,
+        )
         if type(event_limit) is not int or not 0 <= event_limit <= MAX_HISTORY_QUERY_LIMIT:
             raise ValueError("Segmented history query limit is invalid.")
         enclosure_key = enclosure_id or ""
@@ -1116,7 +1123,7 @@ class SegmentedHistoryReader:
         rollups_by_metric_interval_slot: dict[str, dict[int, dict[int, list[dict[str, Any]]]]] = {
             metric_name: {3600: {}, 86400: {}} for metric_name in metric_limits
         }
-        for path in (self.hot_path, *self._selected_segment_paths(since=since)):
+        for path in (self.hot_path, *reversed(self._selected_segment_paths(since=since))):
             with self._query_connection(path) as connection:
                 if not requested_slots:
                     rows = connection.execute(
@@ -1149,7 +1156,10 @@ class SegmentedHistoryReader:
                     for row in rows:
                         item = dict(row)
                         item.pop("row_number", None)
-                        events_by_slot.setdefault(int(item["slot"]), []).append(item)
+                        slot = int(item["slot"])
+                        retained_events = events_by_slot.setdefault(slot, [])
+                        if len(retained_events) < event_limit:
+                            retained_events.append(item)
                 for metric_name, limit in metric_limits.items():
                     metric_where = [*where_clauses, "metric_name = ?"]
                     metric_parameters = [*parameters, metric_name]
@@ -1177,7 +1187,10 @@ class SegmentedHistoryReader:
                             if item["value_integer"] is not None
                             else item["value_real"]
                         )
-                        raw_by_metric_slot[metric_name].setdefault(int(item["slot"]), []).append(item)
+                        slot = int(item["slot"])
+                        retained_raw = raw_by_metric_slot[metric_name].setdefault(slot, [])
+                        if len(retained_raw) < limit:
+                            retained_raw.append(item)
                     for bucket_seconds in (3600, 86400):
                         rollup_where = [*where_clauses, "metric_name = ?", "bucket_seconds = ?"]
                         rollup_parameters: list[Any] = [*parameters, metric_name, bucket_seconds]
@@ -1221,9 +1234,32 @@ class SegmentedHistoryReader:
                             item = dict(row)
                             item.pop("row_number", None)
                             item["value"] = item["value_real"]
-                            rollups_by_metric_interval_slot[metric_name][bucket_seconds].setdefault(
-                                int(item["slot"]), []
-                            ).append(item)
+                            slot = int(item["slot"])
+                            retained_rollups = rollups_by_metric_interval_slot[metric_name][bucket_seconds].setdefault(
+                                slot, []
+                            )
+                            already_retained = len(raw_by_metric_slot[metric_name].get(slot, [])) + sum(
+                                len(rollups_by_metric_interval_slot[metric_name][interval].get(slot, []))
+                                for interval in (3600, 86400)
+                            )
+                            if already_retained < limit:
+                                retained_rollups.append(item)
+            event_quotas_filled = event_limit == 0 or all(
+                len(events_by_slot.get(slot, [])) >= event_limit for slot in slot_numbers
+            )
+            metric_quotas_filled = all(
+                all(
+                    len(raw_by_metric_slot[metric_name].get(slot, []))
+                    + sum(
+                        len(rollups_by_metric_interval_slot[metric_name][interval].get(slot, []))
+                        for interval in (3600, 86400)
+                    ) >= limit
+                    for metric_name, limit in metric_limits.items()
+                )
+                for slot in slot_numbers
+            )
+            if event_quotas_filled and metric_quotas_filled:
+                break
         payload_by_slot: dict[int, dict[str, Any]] = {}
         for slot in sorted(discovered_slots):
             events = sorted(

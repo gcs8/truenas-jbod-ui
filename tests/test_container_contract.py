@@ -24,6 +24,7 @@ EXPECTED_COMPOSE_SECRETS = {
     "ssh_password": "SSH_PASSWORD_FILE",
     "ssh_sudo_password": "SSH_SUDO_PASSWORD_FILE",
     "admin_auth_password": "ADMIN_AUTH_PASSWORD_FILE",
+    "history_refresh_token": "HISTORY_REFRESH_TOKEN_FILE",
 }
 EXPECTED_MEMORY_LIMITS = {
     "enclosure-ui": "${APP_MEM_LIMIT:-1g}",
@@ -771,20 +772,22 @@ class ContainerResourceContractTests(unittest.TestCase):
         self.assertTrue(overlay_path.is_file())
         overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
         services = overlay["services"]
-        self.assertEqual(set(services), {"enclosure-ui", "enclosure-admin"})
+        self.assertEqual(set(services), {"enclosure-ui", "enclosure-history", "enclosure-admin"})
         self.assertEqual(set(overlay["secrets"]), set(EXPECTED_COMPOSE_SECRETS))
 
         ui_secret_names = set(services["enclosure-ui"]["secrets"])
         admin_secret_names = set(services["enclosure-admin"]["secrets"])
         self.assertEqual(ui_secret_names, set(EXPECTED_COMPOSE_SECRETS))
-        self.assertEqual(admin_secret_names, set(EXPECTED_COMPOSE_SECRETS))
+        self.assertEqual(admin_secret_names, set(EXPECTED_COMPOSE_SECRETS) - {"history_refresh_token"})
+        self.assertEqual(set(services["enclosure-history"]["secrets"]), {"history_refresh_token"})
 
         for secret_name, env_name in EXPECTED_COMPOSE_SECRETS.items():
             with self.subTest(secret=secret_name):
-                self.assertEqual(
-                    services["enclosure-admin"]["environment"][env_name],
-                    f"/run/secrets/{secret_name}",
-                )
+                if secret_name != "history_refresh_token":
+                    self.assertEqual(
+                        services["enclosure-admin"]["environment"][env_name],
+                        f"/run/secrets/{secret_name}",
+                    )
                 source = overlay["secrets"][secret_name]["file"]
                 self.assertTrue(str(source).startswith("./secrets/"))
         for secret_name in ui_secret_names:
@@ -797,7 +800,7 @@ class ContainerResourceContractTests(unittest.TestCase):
         deployment_guide = (
             REPO_ROOT / "wiki/Docker-and-GHCR-Deployment.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("all five files into both UI and admin", deployment_guide)
+        self.assertIn("history refresh token", deployment_guide)
         self.assertNotIn("only the four appliance/SSH files into the UI", deployment_guide)
 
         for compose_name in COMPOSE_FILES:

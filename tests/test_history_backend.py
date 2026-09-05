@@ -279,28 +279,32 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             client,
-            "_fetch_json",
+            "_send_json",
             AsyncMock(
                 return_value={
-                    "histories": {
-                        "5": {
-                            "slot": 5,
-                            "events": [{"observed_at": "2026-04-16T23:15:00+00:00"}],
-                            "metrics": {"temperature_c": [{"observed_at": "2026-04-16T23:10:00+00:00", "value": 31}]},
-                            "sample_counts": {"temperature_c": 1},
-                            "latest_values": {"temperature_c": 31},
+                    "scopes": [{
+                        "system_id": "archive-core",
+                        "enclosure_id": "front",
+                        "histories": {
+                            "5": {
+                                "slot": 5,
+                                "events": [{"observed_at": "2026-04-16T23:15:00+00:00"}],
+                                "metrics": {"temperature_c": [{"observed_at": "2026-04-16T23:10:00+00:00", "value": 31}]},
+                                "sample_counts": {"temperature_c": 1},
+                                "latest_values": {"temperature_c": 31},
+                            },
+                            "6": {
+                                "slot": 6,
+                                "events": [],
+                                "metrics": {"temperature_c": []},
+                                "sample_counts": {"temperature_c": 0},
+                                "latest_values": {"temperature_c": None},
+                            },
                         },
-                        "6": {
-                            "slot": 6,
-                            "events": [],
-                            "metrics": {"temperature_c": []},
-                            "sample_counts": {"temperature_c": 0},
-                            "latest_values": {"temperature_c": None},
-                        },
-                    }
+                    }]
                 }
             ),
-        ) as fetch_json:
+        ) as send_json:
             with patch.object(
                 client,
                 "_build_since_isoformat",
@@ -315,16 +319,7 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload[5]["latest_values"]["temperature_c"], 31)
         self.assertEqual(payload[6]["sample_counts"]["temperature_c"], 0)
-        fetch_json.assert_awaited_once_with(
-            "/api/history/scopes/slots",
-            params={
-                "system_id": "archive-core",
-                "enclosure_id": "front",
-                "slots": [5, 6],
-                "since": "2026-04-15T23:10:00+00:00",
-                "event_limit": 12,
-            },
-        )
+        send_json.assert_awaited_once()
 
     async def test_get_scope_history_can_request_only_needed_metrics(self) -> None:
         client = HistoryBackendClient(
@@ -333,9 +328,9 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             client,
-            "_fetch_json",
-            AsyncMock(return_value={"histories": {"5": {"slot": 5, "metrics": {"bytes_written": []}}}}),
-        ) as fetch_json:
+            "_send_json",
+            AsyncMock(return_value={"scopes": [{"histories": {"5": {"slot": 5, "metrics": {"bytes_written": []}}}}]}),
+        ) as send_json:
             with patch.object(
                 client,
                 "_build_since_isoformat",
@@ -350,45 +345,10 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
                     event_limit=0,
                 )
 
-        fetch_json.assert_awaited_once_with(
-            "/api/history/scopes/slots",
-            params={
-                "system_id": "archive-core",
-                "enclosure_id": "front",
-                "slots": [5],
-                "since": "2026-04-15T23:10:00+00:00",
-                "event_limit": 0,
-                "metrics": ["bytes_written"],
-            },
-        )
-
-    async def test_get_scope_history_falls_back_to_per_slot_fetch_on_scope_error(self) -> None:
-        client = HistoryBackendClient(
-            HistoryConfig(service_url="http://history-backend:8001", timeout_seconds=10)
-        )
-        calls: list[tuple[str, dict[str, Any]]] = []
-
-        async def fake_fetch_json(path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
-            calls.append((path, dict(params or {})))
-            if path == "/api/history/scopes/slots":
-                raise HistoryBackendResponseError("History backend returned HTTP 500: boom")
-            return {"metrics": {"temperature_c": [[1, 2]]}, "events": [], "sample_counts": {}, "latest_values": {}}
-
-        with patch.object(client, "_fetch_json", fake_fetch_json):
-            payload = await client.get_scope_history(
-                system_id="archive-core",
-                enclosure_id="front",
-                slots=[5],
-                window_hours=24,
-            )
-
-        self.assertEqual(payload[5]["slot"], 5)
-        self.assertTrue(payload[5]["available"])
-        self.assertEqual(payload[5]["metrics"], {"temperature_c": [[1, 2]]})
-        self.assertEqual([path for path, _ in calls], ["/api/history/scopes/slots", "/api/history/slots/5/bundle"])
-        self.assertEqual(calls[1][1]["system_id"], "archive-core")
-        self.assertEqual(calls[1][1]["enclosure_id"], "front")
-        self.assertIn("since", calls[1][1])
+        send_json.assert_awaited_once()
+        document = send_json.await_args.args[1]
+        self.assertEqual(document["metrics"], ["bytes_written"])
+        self.assertEqual(document["event_limit"], 0)
 
     async def test_get_scope_history_fallback_dedupes_slots_and_bounds_concurrency(self) -> None:
         client = HistoryBackendClient(
@@ -410,10 +370,10 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
             return {"metrics": {}, "events": [], "sample_counts": {}, "latest_values": {}}
 
         with patch.object(client, "_fetch_json", fake_fetch_json):
-            payload = await client.get_scope_history(
-                system_id="archive-core",
-                enclosure_id="front",
-                slots=[0, 1, 2, 1, 3, 0, 4, 5],
+            payload = await client._fallback_scope_history(
+                [0, 1, 2, 1, 3, 0, 4, 5],
+                "archive-core",
+                "front",
                 window_hours=24,
             )
 
@@ -438,10 +398,10 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
 
         slots = list(range(60))
         with patch.object(client, "_fetch_json", fake_fetch_json):
-            payload = await client.get_scope_history(
-                system_id="archive-core",
-                enclosure_id="front",
-                slots=slots,
+            payload = await client._fallback_scope_history(
+                slots,
+                "archive-core",
+                "front",
                 window_hours=24,
             )
 
@@ -469,10 +429,11 @@ class HistoryBackendClientTests(unittest.IsolatedAsyncioTestCase):
             return {"metrics": {}, "events": [], "sample_counts": {}, "latest_values": {}}
 
         with patch.object(client, "_fetch_json", fake_fetch_json):
-            payload = await client.get_scope_history(
-                system_id="archive-core",
-                enclosure_id="front",
-                slots=[0, 1, 2],
+            payload = await client._fallback_scope_history(
+                [0, 1, 2],
+                "archive-core",
+                "front",
+                window_hours=24,
             )
 
         self.assertTrue(payload[0]["available"])

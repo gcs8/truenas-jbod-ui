@@ -446,11 +446,11 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(raised.exception.status_code, 422)
+        self.assertEqual(raised.exception.status_code, 413)
         self.registry.get_service.assert_not_called()
         history_backend.get_scope_history.assert_not_awaited()
 
-    def test_history_scope_rejects_oversized_slot_value_before_degraded_fallback(self) -> None:
+    def test_history_scope_allows_sparse_high_slot_value_during_degraded_fallback(self) -> None:
         route = _route("/api/history/scope", "GET")
         history_backend = Mock()
         history_backend.configured = True
@@ -460,21 +460,21 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
             patch.object(app_main, "get_inventory_registry", return_value=self.registry),
             patch.object(app_main, "get_history_backend", return_value=history_backend),
         ):
-            with self.assertRaises(HTTPException) as raised:
-                asyncio.run(
-                    route.endpoint(
-                        system_id="system-a",
-                        enclosure_id="enc-a",
-                        slots=[SMART_BATCH_MAX_SLOTS + 1],
-                        window_hours=24,
-                        metrics=None,
-                        event_limit=12,
-                    )
+            response = asyncio.run(
+                route.endpoint(
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                    slots=[SMART_BATCH_MAX_SLOTS + 1],
+                    window_hours=24,
+                    metrics=["temperature_c"],
+                    event_limit=0,
+                    metric_limit=24,
                 )
+            )
 
-        self.assertEqual(raised.exception.status_code, 422)
-        self.registry.get_service.assert_not_called()
-        history_backend.get_scope_history.assert_not_awaited()
+        self.assertEqual(response.status_code, 200)
+        self.registry.get_service.assert_called_once_with("system-a")
+        history_backend.get_scope_history.assert_awaited_once()
 
     def test_cached_smart_read_continues_when_layout_is_unavailable(self) -> None:
         route = _route("/api/slots/{slot}/smart", "GET")

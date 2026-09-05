@@ -46,6 +46,8 @@ APP_ROUTE_MATRIX = [
     ("/api/storage-views/{view_id}/slots/{slot_index}/history", ("GET",), "get_storage_view_slot_history", "starlette.responses.JSONResponse", None),
     ("/api/slots/smart-batch", ("POST",), "get_slot_smart_summaries", "starlette.responses.JSONResponse", "app.models.domain.SmartBatchResponse"),
     ("/api/history/status", ("GET",), "get_history_status", "starlette.responses.JSONResponse", None),
+    ("/api/history/refresh", ("POST",), "refresh_history_proxy", "starlette.responses.JSONResponse", None),
+    ("/api/history/scopes/bundle", ("POST",), "get_history_scopes_bundle", "starlette.responses.JSONResponse", None),
     ("/api/slots/{slot}/history", ("GET",), "get_slot_history", "starlette.responses.JSONResponse", None),
     ("/api/history/scope", ("GET",), "get_history_scope", "starlette.responses.JSONResponse", None),
     ("/api/storage-views/{view_id}/history", ("GET",), "get_storage_view_history", "starlette.responses.JSONResponse", None),

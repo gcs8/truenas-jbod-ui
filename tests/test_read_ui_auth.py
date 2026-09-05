@@ -40,11 +40,13 @@ MUTATION_ROUTE_TEMPLATES = {
     ("POST", "/api/slots/{slot}/mapping"),
     ("DELETE", "/api/slots/{slot}/mapping"),
     ("POST", "/api/mappings/import"),
+    ("POST", "/api/history/refresh"),
 }
 READ_ONLY_NON_GET_ROUTES = {
     ("POST", "/api/mappings/import/preview"),
     ("POST", "/api/slots/smart-batch"),
     ("POST", "/api/export/enclosure-snapshot"),
+    ("POST", "/api/history/scopes/bundle"),
     ("POST", "/api/export/enclosure-snapshot/estimate"),
 }
 

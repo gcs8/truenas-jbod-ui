@@ -201,6 +201,7 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
                         slots=[1],
                         event_limit=10,
                         metric_limits={"temperature": 10},
+                        since="2025-01-01T00:00:00+00:00",
                     )[1]["metrics"]["temperature"]
                 ],
                 [2, 1],
@@ -331,6 +332,7 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
                     slots=[1, 2],
                     event_limit=10,
                     metric_limits={"temperature": 10},
+                    since="2025-01-01T00:00:00+00:00",
                 )
 
             self.assertEqual([event["id"] for event in histories[1]["events"]], [3, 1])
@@ -346,6 +348,29 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
             self.assertEqual(histories[1]["sample_counts"], {"temperature": 2})
             self.assertEqual(histories[2]["latest_values"], {"temperature": 44})
             self.assertEqual(query_connection.call_count, 2)
+
+    def test_scope_history_stops_opening_older_segments_when_all_quotas_fill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            observed_at = datetime.now(timezone.utc).isoformat()
+            paths = [root / "hot.sqlite3", root / "segment-0001.sqlite3", root / "segment-0002.sqlite3"]
+            for index, path in enumerate(paths, start=1):
+                self._create_database(path, [(index, observed_at)], [(index, observed_at, 30 + index)])
+                with sqlite3.connect(path) as connection:
+                    connection.execute("UPDATE metric_samples SET metric_name = 'temperature_c'")
+            reader = SegmentedHistoryReader(hot_path=paths[0], segment_paths=paths[1:])
+            with patch.object(reader, "_query_connection", wraps=reader._query_connection) as query_connection:
+                histories = reader.list_scope_history(
+                    "system-1",
+                    "enclosure-1",
+                    slots=[1],
+                    event_limit=1,
+                    metric_limits={"temperature_c": 1},
+                    since=(datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(),
+                )
+            self.assertEqual(len(histories[1]["events"]), 1)
+            self.assertEqual(len(histories[1]["metrics"]["temperature_c"]), 1)
+            self.assertEqual(query_connection.call_count, 1)
 
     def test_reader_follows_one_disk_identity_across_hot_and_sealed_homes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -845,6 +870,7 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
                 slots=[1],
                 event_limit=0,
                 metric_limits={"temperature": 10},
+                since="2025-01-01T00:00:00+00:00",
             )[1]["metrics"]["temperature"]
 
             self.assertEqual(len(batched_samples), 1)

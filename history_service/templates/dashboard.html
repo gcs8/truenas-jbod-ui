@@ -14,9 +14,13 @@
         the main UI so collection can be enabled or disabled without changing the core dashboard.
       </p>
       <div class="actions" aria-label="History refresh actions">
+        {% if direct_refresh_enabled %}
         <button id="history-refresh-fast" type="button">Refresh Fast</button>
         <button id="history-refresh-full" class="secondary" type="button">Refresh Full</button>
         <span id="history-refresh-status" class="action-status" role="status" aria-live="polite"></span>
+        {% else %}
+        <span class="action-status">Refresh through the authenticated main UI or a bearer-authenticated API client.</span>
+        {% endif %}
       </div>
       <div id="collector-activity-banner" class="collector-banner" role="status" aria-live="polite"{% if not collector_banner_text %} hidden{% endif %}>{{ collector_banner_text }}</div>
 
