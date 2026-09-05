@@ -391,11 +391,13 @@ The following pull-request checks are release-blocking and required for `main`:
 - `JavaScript syntax and npm lock`
 - `Checked-in public demo artifact`
 - `Admin clean-room browser QA`
+- `Changelog entry` (pull requests only; see "Changelog And Release Notes")
 
 Coverage is report-only. CodeQL is report-only until repository branch
 protection explicitly makes it required. Publish workflows are release gates,
-not ordinary pull-request checks. If a check name changes, update branch
-protection and this list together after the new workflow has run successfully.
+not ordinary pull-request checks. `PR type labels` is a labelling helper, not a
+check. If a check name changes, update branch protection and this list together
+after the new workflow has run successfully.
 
 ## High-Risk File Rules
 
@@ -547,6 +549,92 @@ Platform-specific wording:
 - BMC/IPMI evidence should be capability-scoped and should not replace stronger
   host-side facts.
 
+## Changelog And Release Notes
+
+Every pull request that operators could notice records itself in
+`CHANGELOG.md`, and the GitHub release body is generated from pull request
+labels plus that file. The rules:
+
+- **One line per merged pull request** under `## Unreleased`, past tense,
+  ending with the pull request number as `(#N)`. Several numbers may share a
+  line as `(#12, #13, and #14)`, and the `(#N)` may sit on a wrapped
+  continuation line. Wrap at about 80 columns like the rest of the file.
+- **Subsections**, in this order: `Highlights`, `Breaking changes`,
+  `Upgrade notes`, `Security`, `Added`, `Changed`, `Fixed`, `Performance`,
+  `Docs`, `Internal`. Omit empty ones. Per-PR lines go in any subsection except
+  `Highlights`, which holds three to five one-sentence release themes written
+  at release time.
+- **Upgrade notes rule.** A pull request labelled `breaking` must also add a
+  bullet under `### Breaking changes` or `### Upgrade notes` that starts with
+  the variable, file, or action the operator must handle, says what to do, and
+  ends with `(#N)`.
+- **Labels drive the release body.** `.github/workflows/pr-labels.yml` derives
+  a label from the conventional title prefix, after stripping a leading
+  `[tag]`: `feat` to `enhancement`, `fix` to `bug`, `perf` to `performance`,
+  `docs` to `documentation`, `test` to `tests`, `ci` to `ci`,
+  `refactor`/`chore`/`build` to `internal`, `security` (type or scope) to
+  `security`, and a `!` after the type or scope (`feat!:`, `fix(api)!:`) adds
+  `breaking`. Changing the title swaps the type label; `security` and
+  `breaking` are only ever added automatically, so a hand-applied one stays.
+  `.github/release.yml` maps those labels to the categories Breaking changes,
+  Security, Features, Fixes, Performance, Documentation, Dependencies, and
+  Internal. Dependencies precedes Internal so a Dependabot pull request that
+  also carries `internal` remains categorized as a dependency.
+- **`no-changelog` escape.** Apply the `no-changelog` label to a pull request
+  that is invisible to operators (tests-only, CI-only, tooling). It needs no
+  entry and is excluded from the generated release notes. Re-run the
+  `Changelog entry` job after applying the label; it reads labels live.
+  The `dependencies` label (Dependabot) skips the entry gate the same way,
+  but those pull requests still appear in the release body under
+  Dependencies. Pull requests with no operator-visible paths must still carry
+  `no-changelog`; an unlabeled invisible pull request fails the entry gate so
+  release coverage cannot discover an implicit escape later.
+
+Two scripts enforce this:
+
+- `scripts/check_changelog_entry.py` runs as the `Changelog entry` job on
+  every pull request. When the diff touches `app/`, `admin_service/`,
+  `history_service/`, `scripts/`, `config/`, `wiki/`, `docs/` (excluding
+  release wrap and release notes files), `docker-compose*.yml`, `Dockerfile*`,
+  or `.env.example`, it requires an added `(#N)` bullet for this pull request
+  under `## Unreleased`, and the upgrade-note bullet when `breaking` is set.
+  The pull request number does not exist before `gh pr create`, so the first
+  run of a new pull request fails until the changelog line is pushed; add it
+  as the next commit. Locally:
+  `python scripts/check_changelog_entry.py --base origin/main --pr <N>`.
+- `scripts/check_release_changelog_coverage.py <previous tag> "<section
+  header>"` runs during release prep. It collects merged pull request numbers
+  from `git log <tag>..HEAD` squash and merge subjects and from
+  `--merged-prs-json <file>`, produced with
+  `gh pr list --state merged --limit 1000 --json number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository`
+  (squash subjects lose the number when the merge title is edited). It removes
+  pull requests labelled `no-changelog` or `dependencies`, uses candidate and
+  previous-tag ancestry to seed a timestamp-bounded walk through the pull
+  request base/head branch graph, then fails when any remaining number is
+  missing from the target section. The branch walk follows only
+  same-repository head branches, retains inner pull requests when an
+  intermediate branch is squash-merged, including inner merges older than the
+  tag timestamp, and does not admit unrelated or same-named fork branches. When
+  `wiki/` changed
+  since the tag it also requires `--wiki-commit <sha>` and verifies with
+  `git ls-remote` that the sha is a branch tip of the GitHub wiki repository.
+  Its `Changelog coverage: pass (<N> PRs)` and online-verified `External wiki
+  commit: <sha> (branch tip on <remote>)` lines are the evidence the release
+  wrap validator requires. `--offline` cannot produce release evidence.
+
+Release body recipe, after the coverage gate passes and the release section
+header is final:
+
+```bash
+python scripts/render_release_notes.py "## vX.Y.Z - YYYY-MM-DD" > release-notes.md
+gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes --notes-file release-notes.md
+```
+
+`render_release_notes.py` prints the section's Highlights and Upgrade notes;
+GitHub appends the label-categorized pull request list from
+`.github/release.yml`. Check the rendered release for pull requests that landed
+in the wrong category and fix the label rather than editing the body by hand.
+
 ## AI / Codex Handoff Shape
 
 Every substantial agent handoff should be concise and auditable.
@@ -564,6 +652,7 @@ Use this shape:
 - Files changed:
 - Behavior changed:
 - Docs/tests changed:
+- Changelog line: (the `(#N)` bullet added under `## Unreleased`, or `no-changelog` and why)
 
 ## Verified
 - Commands run:

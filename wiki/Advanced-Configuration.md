@@ -165,6 +165,20 @@ That means:
 - they are easy to back up
 - they can be exported and imported in the UI
 
+### Mappings Saved Before The Scoped-Mapping Change
+
+Mappings saved by older releases were stored without the system and enclosure
+they belong to. On a deployment with more than one configured system, or more
+than one detected enclosure, such a row cannot be tied to a specific shelf, so
+the app no longer resolves it: it could otherwise label or light up the wrong
+physical disk on another shelf. Those bays render unmapped after the upgrade.
+
+Nothing is deleted. The rows are still in the mapping file. To bring one back,
+open the bay and save the mapping again. The save writes the current
+system- and enclosure-scoped key and removes the old unscoped aliases for that
+bay. Deployments with a single system and a single enclosure are unaffected,
+because there is nothing to disambiguate.
+
 ## History Sidecar Retention Knobs
 
 If you are running the optional history sidecar, the main retention knobs are:

@@ -92,6 +92,48 @@ class ReleaseStatusTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, unreleased)
 
+    def test_segment_permission_upgrade_note_uses_the_bounded_repair_procedure(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## v0.22.2", maxsplit=1)[0]
+        normalized = " ".join(unreleased.split())
+
+        self.assertNotIn("same preflight helper", unreleased)
+        self.assertIn("Do not run the generic ownership helper over an existing segmented-history tree", normalized)
+        self.assertIn("wiki/Backup-Restore-and-Debug-Bundles.md#optional-scheduled-state-backups", unreleased)
+        self.assertIn("`0750`", unreleased)
+        self.assertIn("`0640`", unreleased)
+
+    def test_nonroot_upgrade_note_quiesces_and_uses_the_configured_identity(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## v0.22.2", maxsplit=1)[0]
+        normalized = " ".join(unreleased.split())
+
+        self.assertIn("docker compose down", normalized)
+        self.assertIn('app_uid="${APP_UID:-10001}"', normalized)
+        self.assertIn('app_gid="${APP_GID:-10001}"', normalized)
+        self.assertIn('--uid "$app_uid" --gid "$app_gid"', normalized)
+        self.assertNotIn("--uid 10001 --gid 10001", normalized)
+
+    def test_network_mode_upgrade_note_names_every_write_control(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## v0.22.2", maxsplit=1)[0]
+
+        self.assertIn("system locator", unreleased)
+        self.assertIn("Storage Fabric alias", unreleased)
+
+    def test_segment_repair_covers_writable_and_immutable_history_paths(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        text = (repository / "wiki" / "Backup-Restore-and-Debug-Bundles.md").read_text(encoding="utf-8")
+        normalized = " ".join(text.split())
+
+        for marker in ("docker compose down", "history root", "history.db", "`0770`", "`0660`", "`0750`", "`0640`"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, normalized)
+        self.assertIn("Do not recursively relax rollback snapshots", normalized)
+
     def test_describe_release_status_reports_update_available_for_older_build(self) -> None:
         status, summary = describe_release_status("0.14.0", "v0.14.1")
 

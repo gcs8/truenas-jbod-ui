@@ -113,11 +113,13 @@ that does not own the hot database, preventing a root-owned replacement from
 making the history service read-only.
 
 Deployments that already published a `0600` catalog or segments need one bounded,
-quiesced permission repair before the separate backup UID can read them. Stop the
-history and backup containers, verify that `history.db`, `segments/catalog.json`,
-and the cataloged `segment-*.sqlite3` files are the intended regular files, then
-set the segment directory owner to `APP_UID:APP_GID` with mode `0750` and only the
-active catalog and cataloged segment files to that owner/group with mode `0640`.
+quiesced permission repair before the separate backup UID can read them. Run
+`docker compose down`, then verify that the history root, `history.db`,
+`segments/catalog.json`, and the cataloged `segment-*.sqlite3` files are the
+intended directories and regular files. Set the history root owner to
+`APP_UID:APP_GID` with mode `0770`, and set the writable `history.db` owner and
+group to the same identity with mode `0660`. Set the segment directory to mode
+`0750` and only the active catalog and cataloged segment files to mode `0640`.
 Do not recursively relax rollback snapshots, pending journals, or unrelated
 history files. Restart the history service, run a manual FULL backup, and verify
 its status before allowing retention or rotation.

@@ -659,6 +659,14 @@
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   },
+  "tests/test_release_changelog_coverage.py": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:177c6558d1f427f30d865da7602dcf3c040fb7895def02e82f885ec38808483b": 1
+      }
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
   "tests/test_sas_fabric.py": {
     "findings": {
       "private_posix_host_path": {
