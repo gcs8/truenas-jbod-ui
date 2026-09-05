@@ -24,6 +24,7 @@ from app.models.domain import (
 )
 from app.services.inventory import InventoryService
 from app.services.mapping_store import (
+    MappingDurabilityError,
     MappingImportDigestMismatch,
     MappingRevisionConflict,
     MappingScopeConflict,
@@ -43,6 +44,22 @@ def with_private_exception_detail(error: Exception) -> Exception:
 
 
 class MappingImportRouteTests(unittest.TestCase):
+    def test_mapping_durability_failure_has_a_bounded_global_503_handler(self) -> None:
+        handler = app_main.app.exception_handlers.get(MappingDurabilityError)
+        self.assertIsNotNone(handler)
+        assert handler is not None
+
+        error = with_private_exception_detail(MappingDurabilityError())
+        response = asyncio.run(handler(Mock(), error))
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.body), {
+            "ok": False,
+            "error": "mapping_durability_indeterminate",
+            "detail": MappingDurabilityError.public_detail,
+        })
+        self.assertNotIn(PRIVATE_EXCEPTION_DETAIL, response.body.decode("utf-8"))
+
     def test_mapping_scope_conflict_has_a_bounded_global_409_handler(self) -> None:
         handler = app_main.app.exception_handlers.get(MappingScopeConflict)
         self.assertIsNotNone(handler)

@@ -63,6 +63,7 @@ from app.services.inventory import (
 )
 from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
 from app.services.mapping_store import (
+    MappingDurabilityError,
     MappingImportDigestMismatch,
     MappingRevisionConflict,
     MappingScopeConflict,
@@ -123,6 +124,20 @@ async def mapping_scope_conflict_exception_handler(
             "detail": MappingScopeConflict.public_detail,
         },
         status_code=409,
+    )
+
+
+async def mapping_durability_exception_handler(
+    _: Request,
+    _exc: Exception,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": "mapping_durability_indeterminate",
+            "detail": MappingDurabilityError.public_detail,
+        },
+        status_code=503,
     )
 
 
@@ -551,6 +566,10 @@ def create_app() -> FastAPI:
     app.add_exception_handler(
         MappingScopeConflict,
         mapping_scope_conflict_exception_handler,
+    )
+    app.add_exception_handler(
+        MappingDurabilityError,
+        mapping_durability_exception_handler,
     )
 
     @app.exception_handler(HTTPException)

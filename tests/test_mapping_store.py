@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +14,7 @@ from app.services.mapping_store import (
     MappingStore,
     resolve_physical_mapping_scope,
 )
+import app.services.mapping_store as mapping_store_module
 
 
 DRAWER_TOP = "synthetic-shelf-a::dell-md1280-drawer-top-42"
@@ -103,7 +106,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                     )
             self.assertEqual(
                 list(store.load_all()),
-                [store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7)],
+                [store._encode_v2_key("synthetic-system-a", "synthetic-shelf-a", 7)],
             )
 
             incoming = [mapping.model_copy(update={"enclosure_id": DRAWER_BOTTOM, "serial": "IMPORTED"})]
@@ -156,7 +159,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
             self.assertNotIn(alias_key, current)
             self.assertEqual(
                 list(current),
-                [store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7)],
+                [store._encode_v2_key("synthetic-system-a", "synthetic-shelf-a", 7)],
             )
             self.assertEqual(next(iter(current.values())).enclosure_id, "synthetic-shelf-a")
 
@@ -200,7 +203,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                     self.assertNotIn(alias_key, current)
                     self.assertEqual(
                         list(current),
-                        [store._slot_key(
+                        [store._encode_v2_key(
                             "synthetic-system-a",
                             "synthetic-shelf-a",
                             7,
@@ -226,7 +229,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
             current = store.load_all()
             self.assertEqual(
                 list(current),
-                [store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7)],
+                [store._encode_v2_key("synthetic-system-a", "synthetic-shelf-a", 7)],
             )
             mapping = next(iter(current.values()))
             self.assertEqual(mapping.system_id, "synthetic-system-a")
@@ -1314,7 +1317,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 self.assertNotIn(legacy_key, current)
                 self.assertEqual(
                     list(current),
-                    [store._slot_key("system-a", enclosure_id, 0)],
+                    [store._encode_v2_key("system-a", enclosure_id, 0)],
                 )
 
     def test_canonical_save_removes_global_legacy_alias(self) -> None:
@@ -1342,7 +1345,7 @@ class MappingStoreImportTests(unittest.TestCase):
             self.assertNotIn("default:0", current)
             self.assertEqual(
                 list(current),
-                [store._slot_key("system-a", "enc-a", 0)],
+                [store._encode_v2_key("system-a", "enc-a", 0)],
             )
 
     def test_preexisting_legacy_alias_collapses_to_canonical_effective_row(self) -> None:
@@ -1452,8 +1455,8 @@ class MappingStoreImportTests(unittest.TestCase):
             )
 
             current = store.load_all()
-            self.assertNotIn(store._slot_key("system-a", None, 5), current)
-            self.assertEqual(list(current), [store._slot_key("system-a", "enc-a", 5)])
+            self.assertNotIn(store._encode_v2_key("system-a", None, 5), current)
+            self.assertEqual(list(current), [store._encode_v2_key("system-a", "enc-a", 5)])
 
     def test_clear_removes_scoped_enclosureless_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1592,6 +1595,417 @@ class MappingStoreImportTests(unittest.TestCase):
                 )
 
             self.assertIsNone(store.get_mapping("system-a", "enc-a", 0))
+
+
+class MappingStoreInjectiveKeyV2Tests(unittest.TestCase):
+    def make_store(self, root: str) -> MappingStore:
+        return MappingStore(str(Path(root) / "mappings.json"))
+
+    @staticmethod
+    def write_document(store: MappingStore, version: int, rows: dict[str, ManualMapping]) -> bytes:
+        payload = {
+            "version": version,
+            "updated_at": "2026-09-05T00:00:00+00:00",
+            "slot_mappings": {
+                key: mapping.model_dump(mode="json") for key, mapping in rows.items()
+            },
+        }
+        raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        store.file_path.write_bytes(raw)
+        return raw
+
+    def test_v2_keys_are_injective_and_round_trip_exactly(self) -> None:
+        cases = (
+            (None, None, 1),
+            ("", "", 10),
+            ("default_system", "default", 1),
+            ("system:a", "enc:part", 1),
+            ("system::a", "enc::part", 10),
+            ('sys"quote', "enc\\slash", 1),
+            ("systém", "棚", 10),
+            ("x" * 2048, "y" * 2048, 1),
+            ("v2", "v2:", 10),
+        )
+        encoded = [MappingStore._encode_v2_key(*identity) for identity in cases]
+        self.assertEqual(len(encoded), len(set(encoded)))
+        for identity, key in zip(cases, encoded, strict=True):
+            with self.subTest(identity=identity):
+                self.assertEqual(key, "v2:" + json.dumps(
+                    list(identity), ensure_ascii=True, separators=(",", ":")
+                ))
+                self.assertEqual(MappingStore._decode_v2_key(key), identity)
+
+    def test_v2_decoder_rejects_noncanonical_or_malformed_keys(self) -> None:
+        malformed = (
+            "v1:[\"s\",\"e\",1]",
+            "v2: [\"s\",\"e\",1]",
+            "v2:[\"s\", \"e\",1]",
+            "v2:[\"s\",\"e\",1] ",
+            "v2:[\"s\",\"e\",1]null",
+            "v2:[\"s\",\"e\"]",
+            "v2:[\"s\",\"e\",1,2]",
+            "v2:{\"0\":\"s\"}",
+            "v2:[1,\"e\",1]",
+            "v2:[\"s\",1,1]",
+            "v2:[\"s\",\"e\",true]",
+            "v2:[\"s\",\"e\",1.0]",
+            "v2:[\"s\",\"\\u0065\",1]",
+            "v2:[\"s\",\"é\",1]",
+            "v2:not-json",
+        )
+        for key in malformed:
+            with self.subTest(key=key), self.assertRaises(MappingScopeConflict):
+                MappingStore._decode_v2_key(key)
+
+    def test_v2_key_model_identity_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            model = ManualMapping(system_id="system-a", enclosure_id="enc-a", slot=1)
+            key = "v2:" + json.dumps(["system-b", "enc-a", 1], separators=(",", ":"))
+            before = self.write_document(store, 2, {key: model})
+            with self.assertRaises(MappingScopeConflict):
+                store.list_mappings()
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_v1_reads_do_not_mutate_and_first_write_migrates_complete_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            rows = {
+                "system:a:enc:part:1": ManualMapping(
+                    system_id="system:a", enclosure_id="enc:part", slot=1, serial="SELECTED"
+                ),
+                "system-b:enc-b:10": ManualMapping(
+                    system_id="system-b", enclosure_id="enc-b", slot=10, serial="FOREIGN"
+                ),
+                "legacy:enc:1": ManualMapping(
+                    system_id=None, enclosure_id="legacy:enc", slot=1, serial="LEGACY"
+                ),
+            }
+            before = self.write_document(store, 1, rows)
+
+            self.assertEqual(store.get_mapping("system:a", "enc:part", 1).serial, "SELECTED")
+            self.assertEqual(len(store.list_mappings()), 3)
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+            store.save_mapping(ManualMapping(
+                system_id="system-c", enclosure_id="enc-c", slot=1, serial="NEW"
+            ))
+            payload = json.loads(store.file_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["version"], 2)
+            self.assertEqual(len(payload["slot_mappings"]), 4)
+            self.assertTrue(all(key.startswith("v2:") for key in payload["slot_mappings"]))
+            self.assertEqual(
+                {mapping.serial for mapping in store.load_all().values()},
+                {"SELECTED", "FOREIGN", "LEGACY", "NEW"},
+            )
+
+    def test_v1_collision_row_is_classified_by_its_model_on_every_surface(self) -> None:
+        collision_key = "system:a:enc:part:1"
+        variants = (
+            (ManualMapping(system_id="system:a", enclosure_id="enc:part", slot=1, serial="SELECTED"), True),
+            (ManualMapping(system_id="system:a:enc", enclosure_id="part", slot=1, serial="FOREIGN"), False),
+            (ManualMapping(system_id=None, enclosure_id="system:a:enc:part", slot=1, serial="LEGACY"), False),
+        )
+        for row, selected in variants:
+            with self.subTest(row=row.serial), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.make_store(temp_dir)
+                self.write_document(store, 1, {collision_key: row})
+                before = store.file_path.read_bytes()
+
+                resolved = store.get_mapping("system:a", "enc:part", 1, allow_legacy_fallback=True)
+                listed = store.list_mappings("system:a", "enc:part")
+                store.save_revision("system:a", "enc:part", 1)
+                store.clear_revision("system:a", "enc:part", 1)
+                preview = store.preview_replace_mappings("system:a", "enc:part", [])
+                self.assertEqual(resolved is not None, selected)
+                self.assertEqual(bool(listed), selected)
+                self.assertEqual(bool(preview["removals"]), selected)
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+                store.replace_mappings("system:a", "enc:part", [])
+                remaining = store.list_mappings()
+                self.assertEqual(bool(remaining), not selected)
+                if remaining:
+                    self.assertEqual(remaining[0].serial, row.serial)
+
+    def test_v1_equal_aliases_collapse_and_divergent_aliases_fail_before_write(self) -> None:
+        for divergent in (False, True):
+            with self.subTest(divergent=divergent), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.make_store(temp_dir)
+                canonical = ManualMapping(
+                    system_id="system-a", enclosure_id="synthetic-shelf-a", slot=7, serial="SAME"
+                )
+                alias = canonical.model_copy(update={
+                    "enclosure_id": DRAWER_TOP,
+                    "serial": "OTHER" if divergent else "SAME",
+                })
+                before = self.write_document(store, 1, {
+                    "system-a:synthetic-shelf-a:7": canonical,
+                    f"system-a:{DRAWER_TOP}:7": alias,
+                })
+                if divergent:
+                    with self.assertRaises(MappingScopeConflict):
+                        store.save_mapping(ManualMapping(
+                            system_id="system-b", enclosure_id="enc-b", slot=1
+                        ))
+                    self.assertEqual(store.file_path.read_bytes(), before)
+                else:
+                    store.save_mapping(ManualMapping(
+                        system_id="system-b", enclosure_id="enc-b", slot=1
+                    ))
+                    payload = json.loads(store.file_path.read_text(encoding="utf-8"))
+                    self.assertEqual(len(payload["slot_mappings"]), 2)
+
+    def test_orphan_temps_are_ignored_and_not_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            orphan = store.file_path.parent / f"{store.file_path.name}.untrusted.tmp"
+            orphan.write_text("untrusted", encoding="utf-8")
+            store.save_mapping(ManualMapping(system_id="system-a", enclosure_id="enc-a", slot=1))
+            self.assertEqual(orphan.read_text(encoding="utf-8"), "untrusted")
+
+    def test_atomic_writer_failure_boundaries_preserve_defined_restart_state(self) -> None:
+        self.assertTrue(hasattr(mapping_store_module, "MappingDurabilityError"))
+        durability_error = mapping_store_module.MappingDurabilityError
+        pre_replace = ("_serialize_v2", "_create_temp_file", "_write_temp_file")
+        for method in pre_replace:
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.make_store(temp_dir)
+                old = self.write_document(store, 1, {
+                    "system-a:enc-a:1": ManualMapping(
+                        system_id="system-a", enclosure_id="enc-a", slot=1, serial="OLD"
+                    )
+                })
+                with patch.object(store, method, side_effect=OSError("synthetic failure")):
+                    with self.assertRaises(OSError):
+                        store.save_mapping(ManualMapping(
+                            system_id="system-b", enclosure_id="enc-b", slot=1
+                        ))
+                self.assertEqual(store.file_path.read_bytes(), old)
+                self.assertEqual(
+                    list(store.file_path.parent.glob(f"{store.file_path.name}.*.tmp")), []
+                )
+                self.assertEqual(store.get_mapping("system-a", "enc-a", 1).serial, "OLD")
+
+        for method in ("_fsync_parent_directory", "_validate_published_bytes"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.make_store(temp_dir)
+                self.write_document(store, 1, {
+                    "system-a:enc-a:1": ManualMapping(
+                        system_id="system-a", enclosure_id="enc-a", slot=1, serial="OLD"
+                    )
+                })
+                with patch.object(store, method, side_effect=OSError("synthetic failure")):
+                    with self.assertRaises(durability_error):
+                        store.save_mapping(ManualMapping(
+                            system_id="system-b", enclosure_id="enc-b", slot=1, serial="NEW"
+                        ))
+                payload = json.loads(store.file_path.read_text(encoding="utf-8"))
+                self.assertEqual(payload["version"], 2)
+                restarted = self.make_store(temp_dir)
+                self.assertEqual(
+                    {mapping.serial for mapping in restarted.load_all().values()},
+                    {"OLD", "NEW"},
+                )
+
+    def test_collision_save_clear_replace_and_import_never_remove_other_identities(self) -> None:
+        collision_key = "system:a:enc:part:1"
+        variants = (
+            ManualMapping(system_id="system:a", enclosure_id="enc:part", slot=1, serial="SELECTED"),
+            ManualMapping(system_id="system:a:enc", enclosure_id="part", slot=1, serial="FOREIGN"),
+            ManualMapping(system_id=None, enclosure_id="system:a:enc:part", slot=1, serial="LEGACY"),
+        )
+        for original in variants:
+            for operation in ("save", "clear", "replace", "import"):
+                with (
+                    self.subTest(original=original.serial, operation=operation),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    store = self.make_store(temp_dir)
+                    self.write_document(store, 1, {collision_key: original})
+                    selected = ManualMapping(
+                        system_id="system:a",
+                        enclosure_id="enc:part",
+                        slot=1,
+                        serial="NEW",
+                    )
+                    if operation == "save":
+                        store.save_mapping(selected)
+                    elif operation == "clear":
+                        store.clear_mapping("system:a", "enc:part", 1)
+                    elif operation == "replace":
+                        store.replace_mappings("system:a", "enc:part", [])
+                    else:
+                        preview = store.preview_replace_mappings(
+                            "system:a", "enc:part", []
+                        )
+                        store.apply_mapping_import(
+                            "system:a",
+                            "enc:part",
+                            [],
+                            expected_revision=preview["revision"],
+                            import_digest=preview["import_digest"],
+                        )
+                    serials = {
+                        mapping.serial for mapping in store.list_mappings()
+                    }
+                    if original.serial == "SELECTED":
+                        self.assertEqual(
+                            serials,
+                            {"NEW"} if operation == "save" else set(),
+                        )
+                    elif operation == "save":
+                        self.assertEqual(serials, {original.serial, "NEW"})
+                    else:
+                        self.assertEqual(serials, {original.serial})
+
+    def test_atomic_writer_uses_exclusive_owner_only_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            observed: dict[str, int] = {}
+
+            def inspect_before_replace(temp_path: Path) -> None:
+                observed["mode"] = os.stat(temp_path).st_mode & 0o777
+                raise OSError("synthetic replace failure")
+
+            with patch.object(store, "_replace_temp_file", side_effect=inspect_before_replace):
+                with self.assertRaises(OSError):
+                    store.save_mapping(ManualMapping(
+                        system_id="system-a", enclosure_id="enc-a", slot=1
+                    ))
+            self.assertEqual(observed, {"mode": 0o600})
+            self.assertFalse(store.file_path.exists())
+            self.assertEqual(
+                list(store.file_path.parent.glob(f"{store.file_path.name}.*.tmp")), []
+            )
+
+    def test_all_pre_replace_fault_boundaries_keep_exact_v1_target(self) -> None:
+        methods = (
+            "_classify_row",
+            "_serialize_v2",
+            "_create_temp_file",
+            "_write_temp_bytes",
+            "_flush_temp_file",
+            "_fsync_temp_file",
+            "_replace_temp_file",
+        )
+        for method in methods:
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.make_store(temp_dir)
+                old = self.write_document(store, 1, {
+                    "system-a:enc-a:1": ManualMapping(
+                        system_id="system-a", enclosure_id="enc-a", slot=1, serial="OLD"
+                    )
+                })
+                with patch.object(store, method, side_effect=OSError("synthetic failure")):
+                    with self.assertRaises(OSError):
+                        store.save_mapping(ManualMapping(
+                            system_id="system-b", enclosure_id="enc-b", slot=1
+                        ))
+                self.assertEqual(store.file_path.read_bytes(), old)
+                self.assertEqual(
+                    list(store.file_path.parent.glob(f"{store.file_path.name}.*.tmp")), []
+                )
+                restarted = self.make_store(temp_dir)
+                resolved = restarted.get_mapping("system-a", "enc-a", 1)
+                self.assertIsNotNone(resolved)
+                assert resolved is not None
+                self.assertEqual(resolved.serial, "OLD")
+
+    def test_classification_failure_precedes_temp_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            before = self.write_document(store, 1, {
+                "wrong:key": ManualMapping(
+                    system_id="system-a", enclosure_id="enc-a", slot=1
+                )
+            })
+            with patch.object(
+                store,
+                "_create_temp_file",
+                side_effect=AssertionError("classification must precede temp creation"),
+            ) as create:
+                with self.assertRaises(MappingScopeConflict):
+                    store.save_mapping(ManualMapping(
+                        system_id="system-b", enclosure_id="enc-b", slot=1
+                    ))
+            create.assert_not_called()
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_v1_tokens_are_stale_after_an_unrelated_confirmed_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            selected = ManualMapping(
+                system_id="system-a", enclosure_id="enc-a", slot=1, serial="OLD"
+            )
+            self.write_document(store, 1, {"system-a:enc-a:1": selected})
+            save_revision = store.save_revision("system-a", "enc-a", 1)
+            clear_revision = store.clear_revision("system-a", "enc-a", 1)
+            preview = store.preview_replace_mappings("system-a", "enc-a", [selected])
+
+            store.save_mapping(ManualMapping(
+                system_id="system-b", enclosure_id="enc-b", slot=1, serial="MIGRATE"
+            ))
+
+            with self.assertRaises(MappingRevisionConflict):
+                store.save_mapping(selected, expected_revision=save_revision)
+            with self.assertRaises(MappingRevisionConflict):
+                store.clear_mapping(
+                    "system-a", "enc-a", 1, expected_revision=clear_revision
+                )
+            with self.assertRaises(MappingRevisionConflict):
+                store.apply_mapping_import(
+                    "system-a",
+                    "enc-a",
+                    [selected],
+                    expected_revision=preview["revision"],
+                    import_digest=preview["import_digest"],
+                )
+
+    def test_collision_identity_change_invalidates_preview_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            key = "system:a:enc:part:1"
+            foreign = ManualMapping(
+                system_id="system:a:enc", enclosure_id="part", slot=1, serial="FOREIGN"
+            )
+            selected = ManualMapping(
+                system_id="system:a", enclosure_id="enc:part", slot=1, serial="SELECTED"
+            )
+            self.write_document(store, 1, {key: foreign})
+            preview = store.preview_replace_mappings("system:a", "enc:part", [])
+            self.write_document(store, 1, {key: selected})
+
+            with self.assertRaises(MappingRevisionConflict):
+                store.apply_mapping_import(
+                    "system:a",
+                    "enc:part",
+                    [],
+                    expected_revision=preview["revision"],
+                    import_digest=preview["import_digest"],
+                )
+
+    def test_v2_rewrites_remain_canonical_and_identity_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            rows = [
+                ManualMapping(system_id="system:a", enclosure_id="enc:part", slot=1, serial="ONE"),
+                ManualMapping(system_id="system:b", enclosure_id=None, slot=10, serial="TEN"),
+            ]
+            store.replace_mappings("system:a", None, rows[:1])
+            store.replace_mappings("system:b", None, rows[1:])
+            first_keys = set(json.loads(
+                store.file_path.read_text(encoding="utf-8")
+            )["slot_mappings"])
+            store.replace_mappings("system:a", None, rows[:1])
+            second_payload = json.loads(store.file_path.read_text(encoding="utf-8"))
+            self.assertEqual(second_payload["version"], 2)
+            self.assertEqual(set(second_payload["slot_mappings"]), first_keys)
+            for key in first_keys:
+                self.assertEqual(
+                    MappingStore._encode_v2_key(*MappingStore._decode_v2_key(key)),
+                    key,
+                )
 
 
 if __name__ == "__main__":
