@@ -78,8 +78,8 @@ test("snapshot export payload identifies the active storage view", () => {
 
 test("snapshot bootstrap preserves a valid view and clears an unresolved view slot", () => {
   const { resolveInitialSnapshotSelection } = loadFunctions(
-    ["resolveInitialSnapshotSelection"],
-    { Number, Set, URLSearchParams },
+    ["resolveInitialSnapshotSelection", "isMainUiStorageViewRuntimeOption"],
+    { Boolean, Number, Set, URLSearchParams },
   );
   const validBootstrap = {
     initialSelectedSlot: 1,
@@ -109,4 +109,110 @@ test("snapshot bootstrap preserves a valid view and clears an unresolved view sl
     },
     { selectedSlot: 0, storageViewId: "" },
   );
+});
+
+test("snapshot bootstrap drops a hidden or disabled view together with its slot", () => {
+  const { resolveInitialSnapshotSelection } = loadFunctions(
+    ["resolveInitialSnapshotSelection", "isMainUiStorageViewRuntimeOption"],
+    { Boolean, Number, Set, URLSearchParams },
+  );
+
+  assert.deepEqual(
+    {
+      ...resolveInitialSnapshotSelection(
+        {
+          initialSelectedSlot: 41,
+          initialSelectedStorageViewId: "maint-view",
+          storageViewsRuntime: {
+            views: [{ id: "maint-view", render: { show_in_main_ui: false } }],
+          },
+        },
+        true,
+      ),
+    },
+    { selectedSlot: null, storageViewId: "" },
+  );
+  assert.deepEqual(
+    {
+      ...resolveInitialSnapshotSelection(
+        {
+          initialSelectedSlot: 41,
+          initialSelectedStorageViewId: "off-view",
+          storageViewsRuntime: { views: [{ id: "off-view", enabled: false }] },
+        },
+        true,
+      ),
+    },
+    { selectedSlot: null, storageViewId: "" },
+  );
+});
+
+test("dropping a storage view runtime selection clears its slot index", () => {
+  const state = {
+    selectedSlot: 41,
+    selectedStorageViewRuntimeId: "maint-view",
+    storageViewsRuntime: {
+      views: [{ id: "maint-view", enabled: false }, { id: "boot-doms" }],
+    },
+  };
+  const { ensureStorageViewRuntimeSelection } = loadFunctions(
+    [
+      "storageViewRuntimeViews",
+      "isMainUiStorageViewRuntimeOption",
+      "getMainUiStorageViewRuntimeOptions",
+      "getStorageViewRuntimeById",
+      "dropStorageViewRuntimeSelection",
+      "ensureStorageViewRuntimeSelection",
+    ],
+    { Array, Boolean, Number, state },
+  );
+
+  assert.equal(ensureStorageViewRuntimeSelection(false), null);
+  assert.equal(state.selectedStorageViewRuntimeId, "");
+  assert.equal(state.selectedSlot, null);
+});
+
+test("keeping a visible storage view runtime selection preserves its slot index", () => {
+  const state = {
+    selectedSlot: 3,
+    selectedStorageViewRuntimeId: "boot-doms",
+    storageViewsRuntime: { views: [{ id: "boot-doms" }] },
+  };
+  const { ensureStorageViewRuntimeSelection } = loadFunctions(
+    [
+      "storageViewRuntimeViews",
+      "isMainUiStorageViewRuntimeOption",
+      "getMainUiStorageViewRuntimeOptions",
+      "getStorageViewRuntimeById",
+      "dropStorageViewRuntimeSelection",
+      "ensureStorageViewRuntimeSelection",
+    ],
+    { Array, Boolean, Number, state },
+  );
+
+  assert.equal(ensureStorageViewRuntimeSelection(false)?.id, "boot-doms");
+  assert.equal(state.selectedStorageViewRuntimeId, "boot-doms");
+  assert.equal(state.selectedSlot, 3);
+});
+
+test("a live enclosure bay selection survives an empty storage view runtime", () => {
+  const state = {
+    selectedSlot: 12,
+    selectedStorageViewRuntimeId: "",
+    storageViewsRuntime: { views: [] },
+  };
+  const { ensureStorageViewRuntimeSelection } = loadFunctions(
+    [
+      "storageViewRuntimeViews",
+      "isMainUiStorageViewRuntimeOption",
+      "getMainUiStorageViewRuntimeOptions",
+      "getStorageViewRuntimeById",
+      "dropStorageViewRuntimeSelection",
+      "ensureStorageViewRuntimeSelection",
+    ],
+    { Array, Boolean, Number, state },
+  );
+
+  assert.equal(ensureStorageViewRuntimeSelection(false), null);
+  assert.equal(state.selectedSlot, 12);
 });
