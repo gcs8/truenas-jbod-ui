@@ -6794,6 +6794,124 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(updated["last_max_temperature_celsius"], 61)
         self.assertEqual(updated["last_smart_evidence_at"], initial["last_smart_evidence_at"])
 
+    def _assert_enumeration_failure_preserves_smart_evidence(
+        self,
+        failure_kind: str,
+        expected_stage: str,
+    ) -> None:
+        survivor_scope = ScopeSnapshot(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            snapshot={
+                "selected_system_id": "archive-core",
+                "selected_system_label": "Archive CORE",
+                "selected_enclosure_id": "enc-a",
+                "selected_enclosure_label": "Front Shelf",
+                "slots": [{"slot": 0, "present": True, "serial": "HEALTHY-DISK", "state": "healthy"}],
+            },
+        )
+        unavailable_scope = ScopeSnapshot(
+            system_id="slow-system" if failure_kind == "system" else "archive-core",
+            system_label="Slow System" if failure_kind == "system" else "Archive CORE",
+            enclosure_id="storage-view:critical" if failure_kind == "storage-view" else "enc-b",
+            enclosure_label="Critical Disks" if failure_kind == "storage-view" else "Rear Shelf",
+            snapshot={
+                "selected_system_id": "slow-system" if failure_kind == "system" else "archive-core",
+                "selected_enclosure_id": "storage-view:critical" if failure_kind == "storage-view" else "enc-b",
+                "storage_view_id": "critical" if failure_kind == "storage-view" else None,
+                "slots": [{"slot": 1, "present": True, "serial": "FAILED-DISK", "state": "fault"}],
+            },
+        )
+        collector = self._smart_alert_collector([])
+        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[survivor_scope, unavailable_scope]
+        )
+        collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {0: {"available": True, "smart_health_status": "PASSED", "temperature_c": 35}},
+                {1: {"available": True, "smart_health_status": "FAILED", "temperature_c": 61}},
+            ]
+        )
+        first_at = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        with patch("history_service.collector.utcnow", return_value=first_at):
+            asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+        initial = collector.status()
+
+        root_snapshot = {
+            "systems": (
+                [
+                    {"id": "slow-system", "label": "Slow System"},
+                    {"id": "archive-core", "label": "Archive CORE"},
+                ]
+                if failure_kind == "system"
+                else [{"id": "archive-core", "label": "Archive CORE"}]
+            ),
+            "selected_system_id": "archive-core",
+            "selected_system_label": "Archive CORE",
+        }
+        survivor_snapshot = {
+            **survivor_scope.snapshot,
+            "enclosures": (
+                [{"id": "enc-a", "label": "Front Shelf"}, {"id": "enc-b", "label": "Rear Shelf"}]
+                if failure_kind == "enclosure"
+                else [{"id": "enc-a", "label": "Front Shelf"}]
+            ),
+        }
+
+        async def fetch_inventory(
+            system_id: str | None = None,
+            enclosure_id: str | None = None,
+            *,
+            force: bool = True,
+        ) -> dict[str, object]:
+            if system_id is None:
+                return root_snapshot
+            if failure_kind == "system" and system_id == "slow-system":
+                raise RuntimeError("saved system unavailable")
+            if failure_kind == "enclosure" and enclosure_id == "enc-b":
+                raise RuntimeError("enclosure unavailable")
+            return survivor_snapshot
+
+        collector._enumerate_scopes = collector.__class__._enumerate_scopes.__get__(collector)  # type: ignore[method-assign]
+        collector._fetch_inventory = fetch_inventory  # type: ignore[method-assign]
+        collector._enumerate_storage_view_scopes = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("storage views unavailable")
+            if failure_kind == "storage-view"
+            else None,
+            return_value=[],
+        )
+        collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
+            return_value={0: {"available": True, "smart_health_status": "PASSED", "temperature_c": 35}}
+        )
+
+        with patch(
+            "history_service.collector.utcnow",
+            return_value=first_at + timedelta(minutes=5),
+        ):
+            asyncio.run(collector.run_once(force_fast=True, include_due_intervals=False))
+        updated = collector.status()
+
+        self.assertIn(expected_stage, [entry["stage"] for entry in updated["collection_stage_timings"]])
+        for field in (
+            "last_smart_failure_evidence_disks",
+            "last_max_temperature_celsius",
+            "last_smart_failure_evidence_at",
+            "last_temperature_evidence_at",
+            "last_smart_evidence_at",
+        ):
+            self.assertEqual(updated[field], initial[field], field)
+
+    def test_system_enumeration_failure_preserves_smart_evidence(self) -> None:
+        self._assert_enumeration_failure_preserves_smart_evidence("system", "inventory.system_failed")
+
+    def test_enclosure_enumeration_failure_preserves_smart_evidence(self) -> None:
+        self._assert_enumeration_failure_preserves_smart_evidence("enclosure", "inventory.enclosure_failed")
+
+    def test_storage_view_enumeration_failure_preserves_smart_evidence(self) -> None:
+        self._assert_enumeration_failure_preserves_smart_evidence("storage-view", "storage_views.failed")
+
     def test_run_once_skips_recent_history_backup_during_slow_collection(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))

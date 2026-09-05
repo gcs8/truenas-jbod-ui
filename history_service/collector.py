@@ -138,6 +138,7 @@ class HistoryCollector:
         self.last_smart_failure_evidence_at: str | None = None
         self.last_temperature_evidence_at: str | None = None
         self.last_smart_evidence_at: str | None = None
+        self._scope_enumeration_complete = True
         self.next_collection_at: datetime | None = None
         self._pending_topology_changes: dict[
             tuple[str, str, int],
@@ -266,7 +267,9 @@ class HistoryCollector:
         enumerate_kwargs: dict[str, bool] = {"force_inventory": force_inventory}
         if cached_root_only and not force_inventory:
             enumerate_kwargs["cached_root_only"] = True
+        self._scope_enumeration_complete = True
         scopes = await self._enumerate_scopes(**enumerate_kwargs)
+        smart_scope_unavailable = not self._scope_enumeration_complete
         self._raise_if_stopping()
         self._record_collection_stage(
             "enumerate.scopes",
@@ -1216,6 +1219,7 @@ class HistoryCollector:
         force_inventory: bool = True,
         cached_root_only: bool = False,
     ) -> list[ScopeSnapshot]:
+        self._scope_enumeration_complete = True
         root_started = time.perf_counter()
         root_snapshot = await self._fetch_inventory(force=force_inventory)
         self._record_collection_stage(
@@ -1282,6 +1286,7 @@ class HistoryCollector:
             try:
                 system_snapshot = await self._fetch_inventory(system_id=system_id, force=force_inventory)
             except Exception as exc:  # noqa: BLE001 - keep broad saved-fleet sweeps moving.
+                self._scope_enumeration_complete = False
                 logger.warning("Skipping history scope enumeration for %s: %s", system_id, exc)
                 self._record_collection_stage(
                     "inventory.system_failed",
@@ -1344,6 +1349,7 @@ class HistoryCollector:
                             force=force_inventory,
                         )
                     except Exception as exc:  # noqa: BLE001 - preserve the rest of the full-fleet pass.
+                        self._scope_enumeration_complete = False
                         logger.warning(
                             "Skipping history scope enumeration for %s enclosure %s: %s",
                             system_id,
@@ -1404,6 +1410,7 @@ class HistoryCollector:
                 force_inventory=force_inventory,
             )
         except Exception as exc:  # noqa: BLE001 - storage views should not kill the whole sweep.
+            self._scope_enumeration_complete = False
             logger.warning("Skipping history storage-view enumeration for %s: %s", system_id, exc)
             self._record_collection_stage(
                 "storage_views.failed",
