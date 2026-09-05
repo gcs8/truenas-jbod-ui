@@ -2419,6 +2419,9 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             settings = Settings()
             system = SystemConfig(id="linux-host", truenas=TrueNASConfig(platform="linux"))
             service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service._canonical_enclosure_options = {
+                "enc-a": EnclosureOption(id="enc-a", label="Shelf A")
+            }
             source_bundle = InventorySourceBundle(
                 raw_data=TrueNASRawData(
                     enclosures=[],
@@ -2451,6 +2454,10 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             settings = Settings()
             system = SystemConfig(id="linux-host", truenas=TrueNASConfig(platform="linux"))
             service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service._canonical_enclosure_options = {
+                f"enc-{index}": EnclosureOption(id=f"enc-{index}", label=f"Shelf {index}")
+                for index in range(65)
+            }
             source_bundle = InventorySourceBundle(
                 raw_data=TrueNASRawData(
                     enclosures=[],
@@ -10852,6 +10859,96 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
                 self.assertFalse(any(key.startswith("enc-a") for key in state))
             self.assertIn("enc-b", service._cache)
 
+    async def test_physical_invalidation_fences_a_blocked_cold_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            started = asyncio.Event()
+            release = asyncio.Event()
+            old_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="enc-a",
+                enclosures=[
+                    EnclosureOption(id="enc-a", label="Shelf A"),
+                    EnclosureOption(id="enc-b", label="Shelf B"),
+                ],
+            )
+            new_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="enc-b",
+                enclosures=[EnclosureOption(id="enc-b", label="Shelf B")],
+            )
+
+            async def discover(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                if not started.is_set():
+                    started.set()
+                    await release.wait()
+                    return old_snapshot
+                return new_snapshot
+
+            service._build_snapshot = AsyncMock(side_effect=discover)
+            request = asyncio.create_task(service.get_snapshot(selected_enclosure_id="enc-a"))
+            await started.wait()
+            generation = service._snapshot_topology_generation
+            service.invalidate_physical_enclosure_snapshot_cache(
+                reason="test.physical.discovery",
+                enclosure_id="enc-a",
+            )
+            release.set()
+
+            with self.assertRaisesRegex(Exception, "Requested enclosure is not available"):
+                await request
+            self.assertGreater(service._snapshot_topology_generation, generation)
+            self.assertEqual(set(service._canonical_enclosure_options or {}), {"enc-b"})
+            self.assertNotIn("enc-a", service._snapshot_state_keys())
+            self.assertEqual(service._build_snapshot.await_count, 2)
+
+    async def test_full_invalidation_fences_a_blocked_foreground_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._canonical_enclosure_options = {
+                "enc-a": EnclosureOption(id="enc-a", label="Shelf A"),
+                "enc-b": EnclosureOption(id="enc-b", label="Shelf B"),
+            }
+            started = asyncio.Event()
+            release = asyncio.Event()
+            stale_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_platform="core",
+                selected_enclosure_id="enc-a",
+                enclosures=list(service._canonical_enclosure_options.values()),
+            )
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+            ) -> InventorySnapshot:
+                started.set()
+                await release.wait()
+                return stale_snapshot
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            request = asyncio.create_task(
+                service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-a")
+            )
+            await started.wait()
+            service.invalidate_snapshot_cache(reason="test.full.foreground")
+            release.set()
+
+            with self.assertRaises(inventory_module.SnapshotStateBusyError):
+                await request
+            self.assertIsNone(service._canonical_enclosure_options)
+            self.assertNotIn("enc-a", service._snapshot_state_keys())
+
     async def test_source_invalidation_fences_an_older_discovery_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._service(temp_dir)
@@ -10943,6 +11040,43 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
 
             self.assertNotIn(None, bundle.parsed_ssh_data_by_enclosure)
             self.assertTrue(all(key is not None for key in bundle.parsed_ssh_data_by_enclosure))
+
+    async def test_parsed_ssh_cache_does_not_retain_an_unknown_secondary_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            service._canonical_enclosure_options = {
+                "enc-a": EnclosureOption(id="enc-a", label="Shelf A")
+            }
+            valid = ParsedSSHData(warnings=["valid canonical cached data"])
+            retained = {"enc-a": valid}
+            retained.update(
+                {
+                    f"legacy-{index}": ParsedSSHData()
+                    for index in range(inventory_module.PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES - 1)
+                }
+            )
+            bundle = InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_outputs={},
+                ssh_collected=True,
+                warnings=[],
+                sources={},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+                parsed_ssh_data_by_enclosure=retained,
+            )
+
+            parsed = service._parsed_ssh_data_for_enclosure(bundle, "unknown-secondary-key")
+
+            self.assertIsInstance(parsed, ParsedSSHData)
+            self.assertIs(bundle.parsed_ssh_data_by_enclosure["enc-a"], valid)
+            self.assertNotIn("unknown-secondary-key", bundle.parsed_ssh_data_by_enclosure)
 
     async def test_all_active_capacity_fails_closed_without_transient_overflow(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -871,6 +871,7 @@ class InventoryService:
             selected_enclosure_id,
             force_source_refresh=bool(refresh_sources),
         )
+        topology_generation = self._snapshot_topology_generation
         self._admit_snapshot_key(cache_key)
         if discovered_snapshot is not None:
             if cache_key != SNAPSHOT_NO_ENCLOSURE_KEY and discovered_snapshot.selected_enclosure_id != cache_key:
@@ -903,6 +904,11 @@ class InventoryService:
         self._snapshot_activity[cache_key] = self._snapshot_activity.get(cache_key, 0) + 1
         try:
             async with self._get_snapshot_lock(cache_key):
+                if (
+                    topology_generation != self._snapshot_topology_generation
+                    and cache_key in self._snapshot_invalidated
+                ):
+                    raise SnapshotStateBusyError()
                 cached = self._cache.get(cache_key)
                 cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
                 now = utcnow()
@@ -925,6 +931,9 @@ class InventoryService:
                         selected_enclosure_id=None if cache_key == SNAPSHOT_NO_ENCLOSURE_KEY else cache_key,
                         force_source_refresh=refresh_sources,
                     )
+                topology_changed = topology_generation != self._snapshot_topology_generation
+                if topology_changed and cache_key in self._snapshot_invalidated:
+                    raise SnapshotStateBusyError()
                 self._observe_inventory_snapshot_build(
                     trigger=refresh_trigger,
                     snapshot=snapshot,
@@ -946,7 +955,8 @@ class InventoryService:
                         self._canonical_enclosure_options.pop(cache_key, None)
                     self._snapshot_invalidated.add(cache_key)
                     raise UnknownEnclosureError()
-                self._replace_canonical_options_from_trusted_snapshot(snapshot)
+                if not topology_changed:
+                    self._replace_canonical_options_from_trusted_snapshot(snapshot)
                 self._cache[cache_key] = snapshot
                 self._cache_until[cache_key] = utcnow() + timedelta(
                     seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
@@ -1015,7 +1025,8 @@ class InventoryService:
 
     def _admit_snapshot_key(self, cache_key: str) -> None:
         if cache_key in self._snapshot_state_keys():
-            self._snapshot_invalidated.discard(cache_key)
+            if not self._snapshot_key_is_active(cache_key):
+                self._snapshot_invalidated.discard(cache_key)
             self._touch_snapshot_key(cache_key)
             return
         now = utcnow()
@@ -1897,6 +1908,7 @@ class InventoryService:
                 | set(self._smart_refresh_tasks)
             )
         else:
+            self._snapshot_topology_generation += 1
             requested_keys = tuple(cache_keys)
             normalized_keys = {
                 key
@@ -4978,6 +4990,17 @@ class InventoryService:
                 self.settings.layout.slot_count,
                 self.system.truenas.enclosure_filter,
                 selected_enclosure_id=None,
+            )
+        retain_parsed = (
+            self._canonical_enclosure_options is not None
+            and cache_key in self._canonical_enclosure_options
+        )
+        if not retain_parsed:
+            return parse_ssh_outputs(
+                source_bundle.ssh_outputs,
+                self.settings.layout.slot_count,
+                self.system.truenas.enclosure_filter,
+                selected_enclosure_id=cache_key,
             )
         cached = source_bundle.parsed_ssh_data_by_enclosure.get(cache_key)
         if cached is not None:
