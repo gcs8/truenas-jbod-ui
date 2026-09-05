@@ -665,7 +665,7 @@
   "tests/test_slot_bounds_routes.py": {
     "findings": {
       "sas_wwn_identifier": {
-        "sha256:1a3d2f5b66455dc3466bfe150d760f198aa2fd50408f39ab9b89752c2595a4b4": 9
+        "sha256:9ec72357035cc0aade457280fba5d41d88a53a0828112c094c8f381854ead42b": 10
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
