@@ -11203,6 +11203,129 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(service.get_snapshot.await_count, 0)
             self.assertIn("__default__", service._cache)
 
+    async def test_preview_mapping_bundle_rejects_unscoped_virtual_mapping_before_store_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(
+                mappings=[
+                    ManualMapping(slot=0, enclosure_id="virtual-system:default", serial="UNSTABLE"),
+                ]
+            )
+            before = service.mapping_store.load_all()
+            preview_replace_mappings = MagicMock(
+                wraps=service.mapping_store.preview_replace_mappings
+            )
+            service.mapping_store.preview_replace_mappings = preview_replace_mappings
+
+            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+                await service.preview_mapping_bundle(bundle)
+
+            preview_replace_mappings.assert_not_called()
+            self.assertEqual(service.mapping_store.load_all(), before)
+
+    async def test_import_mapping_bundle_rejects_unscoped_virtual_mapping_before_store_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(
+                mappings=[
+                    ManualMapping(slot=0, enclosure_id="virtual-system:default", serial="UNSTABLE"),
+                ]
+            )
+            before = service.mapping_store.load_all()
+            apply_mapping_import = MagicMock(
+                wraps=service.mapping_store.apply_mapping_import
+            )
+            service.mapping_store.apply_mapping_import = apply_mapping_import
+
+            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+                await service.import_mapping_bundle(
+                    bundle,
+                    expected_revision="a" * 64,
+                    import_digest="b" * 64,
+                )
+
+            apply_mapping_import.assert_not_called()
+            self.assertEqual(service.mapping_store.load_all(), before)
+
+    async def test_preview_mapping_bundle_allows_unscoped_physical_mapping_scopes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(
+                mappings=[
+                    ManualMapping(slot=0, enclosure_id="enc-a", serial="PHYSICAL-A"),
+                    ManualMapping(slot=0, enclosure_id="enc-b", serial="PHYSICAL-B"),
+                ]
+            )
+
+            preview = await service.preview_mapping_bundle(bundle)
+
+            self.assertEqual(
+                {(item["enclosure_id"], item["slot"]) for item in preview["additions"]},
+                {("enc-a", 0), ("enc-b", 0)},
+            )
+
+    async def test_preview_mapping_bundle_preserves_unscoped_zero_enclosure_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(mappings=[ManualMapping(slot=0, serial="LEGACY")])
+
+            preview = await service.preview_mapping_bundle(bundle)
+
+            self.assertEqual(preview["additions"][0]["enclosure_id"], None)
+            self.assertEqual(preview["additions"][0]["slot"], 0)
+
+    async def test_preview_mapping_bundle_rejects_virtual_mapping_conflict_before_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="default", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bundle = MappingBundle(
+                mappings=[
+                    ManualMapping(slot=0, enclosure_id="enc-a", serial="PHYSICAL"),
+                    ManualMapping(slot=1, enclosure_id="virtual-system:default", serial="UNSTABLE"),
+                ]
+            )
+            preview_replace_mappings = MagicMock(
+                wraps=service.mapping_store.preview_replace_mappings
+            )
+            service.mapping_store.preview_replace_mappings = preview_replace_mappings
+
+            with self.assertRaisesRegex(TrueNASAPIError, "no identified physical enclosure"):
+                await service.preview_mapping_bundle(
+                    bundle,
+                    selected_enclosure_id="enc-a",
+                )
+
+            preview_replace_mappings.assert_not_called()
+
     async def test_preview_mapping_bundle_rejects_virtual_inventory_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()

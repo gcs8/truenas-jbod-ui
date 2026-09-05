@@ -3481,8 +3481,18 @@ class InventoryService:
         return rewritten
 
     @staticmethod
-    def _require_physical_mapping_scope(selected_enclosure_id: str | None) -> None:
-        if (normalize_text(selected_enclosure_id) or "").startswith("virtual-system:"):
+    def _require_physical_mapping_scope(
+        selected_enclosure_id: str | None,
+        bundle: MappingBundle,
+    ) -> None:
+        enclosure_ids = [
+            selected_enclosure_id,
+            *(mapping.enclosure_id for mapping in bundle.mappings),
+        ]
+        if any(
+            (normalize_text(enclosure_id) or "").startswith("virtual-system:")
+            for enclosure_id in enclosure_ids
+        ):
             raise TrueNASAPIError(VIRTUAL_MAPPING_UNAVAILABLE_REASON)
 
     async def preview_mapping_bundle(
@@ -3490,7 +3500,7 @@ class InventoryService:
         bundle: MappingBundle,
         selected_enclosure_id: str | None = None,
     ) -> dict[str, Any]:
-        self._require_physical_mapping_scope(selected_enclosure_id)
+        self._require_physical_mapping_scope(selected_enclosure_id, bundle)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
         preview = self.mapping_store.preview_replace_mappings(
             self.system.id,
@@ -3512,7 +3522,7 @@ class InventoryService:
         import_digest: str,
         invalidate_snapshot: bool = True,
     ) -> dict[str, Any]:
-        self._require_physical_mapping_scope(selected_enclosure_id)
+        self._require_physical_mapping_scope(selected_enclosure_id, bundle)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
         result = self.mapping_store.apply_mapping_import(
             self.system.id,
