@@ -8,11 +8,12 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import NamedTuple, Sequence
+from typing import Callable, NamedTuple, Sequence
 
 
 APP_UID = 10001
@@ -728,6 +729,37 @@ def _compose_project_name(prefix: Sequence[str]) -> str:
     raise RuntimeError("Compose matrix project name is unavailable.")
 
 
+def _cleanup_after_run(step: Callable[[], None], description: str) -> bool:
+    """Run a ``finally`` cleanup step without masking the failure that got us here.
+
+    Returns True when the step succeeded. A cleanup failure is raised only when it is
+    the first failure; when another exception is already propagating the cleanup
+    failure is reported on stderr and suppressed so the original error survives.
+    """
+    active_exception = sys.exc_info()[0] is not None
+    try:
+        step()
+    except BaseException as cleanup_error:
+        if not active_exception:
+            raise
+        print(
+            f"warning: {description} failed and was suppressed so the original "
+            f"failure propagates: {cleanup_error!r}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _remove_runtime_root(runtime_root: Path) -> None:
+    cleanup = subprocess.run(
+        ("sudo", "rm", "-rf", str(runtime_root)),
+        check=False,
+    )
+    if cleanup.returncode != 0 or runtime_root.exists():
+        raise RuntimeError("Compose matrix runtime-root cleanup failed.")
+
+
 def _cleanup_variant(prefix: Sequence[str], root: Path) -> None:
     compose_cleanup = subprocess.run(
         (*prefix, "down", "--volumes", "--remove-orphans"),
@@ -799,7 +831,10 @@ def _run_variant(
         _safe_diagnostics(prefix)
         raise
     finally:
-        _cleanup_variant(prefix, root)
+        _cleanup_after_run(
+            lambda: _cleanup_variant(prefix, root),
+            "compose matrix variant cleanup",
+        )
 
 
 def main() -> int:
@@ -832,12 +867,10 @@ def main() -> int:
                 ports=ports,
             )
     finally:
-        cleanup = subprocess.run(
-            ("sudo", "rm", "-rf", str(runtime_root)),
-            check=False,
+        _cleanup_after_run(
+            lambda: _remove_runtime_root(runtime_root),
+            "compose matrix runtime-root cleanup",
         )
-        if cleanup.returncode != 0 or runtime_root.exists():
-            raise RuntimeError("Compose matrix runtime-root cleanup failed.")
     print(SUCCESS_MARKER)
     return 0
 

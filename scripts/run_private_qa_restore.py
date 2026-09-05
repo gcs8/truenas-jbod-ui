@@ -20,7 +20,7 @@ import time
 import urllib.parse
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Any, NamedTuple, Sequence
+from typing import Any, Callable, NamedTuple, Sequence
 
 import yaml
 
@@ -797,6 +797,28 @@ def _count_app_owned_files(
     return count
 
 
+def _cleanup_after_run(step: Callable[[], None], description: str) -> bool:
+    """Run a ``finally`` cleanup step without masking the failure that got us here.
+
+    Returns True when the step succeeded. A cleanup failure is raised only when it is
+    the first failure; when another exception is already propagating the cleanup
+    failure is reported on stderr and suppressed so the original error survives.
+    """
+    active_exception = sys.exc_info()[0] is not None
+    try:
+        step()
+    except BaseException as cleanup_error:
+        if not active_exception:
+            raise
+        print(
+            f"warning: {description} failed and was suppressed so the original "
+            f"failure propagates: {cleanup_error!r}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def _remove_runtime_root(runtime_root: Path) -> None:
     cleanup = subprocess.run(
         ["sudo", "rm", "-rf", str(runtime_root)],
@@ -914,13 +936,10 @@ def _write_runtime_files(
         },
     }
     override_path = runtime_root / "qa-restore.override.yml"
-    override_path.write_text(
-        "networks:\n  default:\n    internal: "
-        + ("false\n" if live_read_only else "true\n"),
-        encoding="utf-8",
-    )
+    override_text = yaml.safe_dump(override, default_flow_style=False, sort_keys=True)
+    override_path.write_text(override_text, encoding="utf-8")
     override_path.chmod(0o600)
-    if override["networks"]["default"] != {"internal": not live_read_only}:
+    if yaml.safe_load(override_text) != override:
         raise QaRestoreError("QA network override construction failed")
 
 
@@ -1781,16 +1800,11 @@ def main() -> int:
     finally:
         passphrase = ""
         if service_access is not None:
-            active_exception = sys.exc_info()[0] is not None
-            try:
-                service_access.close()
+            if _cleanup_after_run(service_access.close, "QA service access close"):
                 service_access = None
-            except BaseException:
-                if not active_exception:
-                    raise
         if stack_started and compose and not (completed and args.keep_running):
-            active_exception = sys.exc_info()[0] is not None
-            try:
+
+            def _teardown_stack() -> None:
                 _run(
                     [*compose, "down", "--remove-orphans", "--volumes"],
                     cwd=args.runtime_root,
@@ -1799,21 +1813,18 @@ def main() -> int:
                     env=compose_env,
                 )
                 _assert_compose_resources_removed(project, env=compose_env)
+
+            if _cleanup_after_run(_teardown_stack, "QA compose stack teardown"):
                 stack_started = False
-            except BaseException:
-                if not active_exception:
-                    raise
         if (
             not stack_started
             and args.runtime_root.exists()
             and not (completed and args.keep_running)
         ):
-            active_exception = sys.exc_info()[0] is not None
-            try:
-                _remove_runtime_root(args.runtime_root)
-            except BaseException:
-                if not active_exception:
-                    raise
+            _cleanup_after_run(
+                lambda: _remove_runtime_root(args.runtime_root),
+                "QA runtime-root cleanup",
+            )
 
 
 if __name__ == "__main__":

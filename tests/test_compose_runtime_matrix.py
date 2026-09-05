@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -479,6 +481,79 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
         self.assertIn("`--ui-port 19080 --history-port 19081 --admin-port 19082`", checklist)
         self.assertIn("3,072 MiB of available memory", checklist)
         self.assertIn("5 GiB of free scratch space", checklist)
+
+    def test_runtime_root_cleanup_failure_does_not_mask_the_matrix_failure(self) -> None:
+        module = self.load_matrix_module()
+
+        class VariantFailure(RuntimeError):
+            pass
+
+        runtime_root = Path("/synthetic-scratch/compose-matrix-runtime")
+        args = Mock(
+            ack="I_APPROVE_DISPOSABLE_COMPOSE_QA",
+            image="sha256:" + "a" * 64,
+            source_commit="b" * 40,
+            ui_port=19080,
+            history_port=19081,
+            admin_port=19082,
+            scratch_root=Mock(),
+            runtime_root=runtime_root,
+            compose=Path("docker-compose.yml"),
+            config_fixture=Path("ci-smoke-config.yaml"),
+        )
+        stderr = io.StringIO()
+        with (
+            patch.object(module, "parse_args", return_value=args),
+            patch.object(module, "validate_exact_image"),
+            patch.object(module, "validate_ports", return_value=(19080, 19081, 19082)),
+            patch.object(module, "validate_ports_available"),
+            patch.object(module, "_read_available_memory_kib", return_value=1),
+            patch.object(module, "validate_available_memory"),
+            patch.object(module.shutil, "disk_usage", return_value=Mock(free=1)),
+            patch.object(module, "validate_free_disk"),
+            patch.object(module, "_validate_container_names_available"),
+            patch.object(module, "_require_regular_file", side_effect=lambda path, label: path),
+            patch.object(module, "validate_runtime_root", return_value=runtime_root),
+            patch.object(
+                module,
+                "_run_variant",
+                side_effect=VariantFailure("mapping readback mismatch"),
+            ),
+            patch.object(module.subprocess, "run", return_value=Mock(returncode=1)),
+        ):
+            with self.assertRaises(VariantFailure), contextlib.redirect_stderr(stderr):
+                module.main()
+
+        self.assertIn("compose matrix runtime-root cleanup", stderr.getvalue())
+
+    def test_cleanup_failure_raises_when_it_is_the_first_failure(self) -> None:
+        module = self.load_matrix_module()
+
+        def failing_cleanup() -> None:
+            raise RuntimeError("synthetic cleanup failure")
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic cleanup failure"):
+            module._cleanup_after_run(failing_cleanup, "synthetic cleanup")
+
+    def test_cleanup_failure_is_reported_and_suppressed_while_another_error_propagates(self) -> None:
+        module = self.load_matrix_module()
+
+        class BodyFailure(RuntimeError):
+            pass
+
+        def failing_cleanup() -> None:
+            raise RuntimeError("synthetic cleanup failure")
+
+        stderr = io.StringIO()
+        with self.assertRaises(BodyFailure), contextlib.redirect_stderr(stderr):
+            try:
+                raise BodyFailure("original failure")
+            finally:
+                module._cleanup_after_run(failing_cleanup, "synthetic cleanup")
+
+        report = stderr.getvalue()
+        self.assertIn("synthetic cleanup", report)
+        self.assertIn("synthetic cleanup failure", report)
 
 
 if __name__ == "__main__":
