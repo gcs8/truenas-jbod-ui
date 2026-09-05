@@ -932,11 +932,6 @@ def _recover_pending_rotation_locked(
         if isinstance(staged_hot_record, dict)
         else None
     )
-    if any(
-        path != expected_staged_hot
-        for path in source.parent.glob(f".{source.name}.segmented-*.sqlite3")
-    ):
-        raise ValueError("Segment rotation found an unauthenticated staging artifact.")
     expected_staged_catalog = (
         _record_path(
             segments_directory,
@@ -946,11 +941,25 @@ def _recover_pending_rotation_locked(
         if isinstance(candidate_catalog_record, dict)
         else None
     )
-    if any(
-        path != expected_staged_catalog
-        for path in segments_directory.glob(".rotation-catalog-*.json")
-    ):
-        raise ValueError("Segment rotation found an unauthenticated staging artifact.")
+    unexpected_staging_paths = sorted(
+        [
+            path
+            for path in source.parent.glob(f".{source.name}.segmented-*.sqlite3")
+            if path != expected_staged_hot
+        ]
+        + [
+            path
+            for path in segments_directory.glob(".rotation-catalog-*.json")
+            if path != expected_staged_catalog
+        ],
+        key=str,
+    )
+    if unexpected_staging_paths:
+        raise ValueError(
+            "Segment rotation found unauthenticated staging artifacts: "
+            + ", ".join(json.dumps(str(path)) for path in unexpected_staging_paths)
+            + "."
+        )
     rollback_hot_path = _record_path(
         source.parent,
         rollback_hot_record,

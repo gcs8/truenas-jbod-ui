@@ -166,6 +166,28 @@ preserved and recovery fails. A segment published immediately before a crash is
 removed only when its filename, size, digest, inode, and one-link or two-link
 publication state match the journal.
 
+### Leftover staging artifact
+
+An unauthenticated staging error lists every unexpected
+`.<hot-name>.segmented-*.sqlite3` and `.rotation-catalog-*.json` path. Treat those
+paths as untrusted evidence. A matching filename does not prove that rotation
+created the file.
+
+1. Stop or otherwise quiesce the history service and every history writer or
+   maintenance job.
+2. Record the exact path and metadata for each reported file before changing
+   anything.
+3. Inspect the pending activation journal and active `catalog.json`. Prove that
+   each reported file is not journal-referenced and not catalog-selected.
+4. After that proof, remove only the named path. Do not remove a file based only
+   on its name, age, SQLite contents, or JSON contents.
+5. Rerun dry-run recovery without `--apply`. Review the result before applying
+   recovery.
+
+Never use wildcard deletion in the history directory. Keep the activation
+journal and every other staging, rollback, hot, catalog, and segment artifact in
+place unless its exact identity and recovery role have been verified.
+
 Rollback a completed cataloged migration:
 
 ```bash
