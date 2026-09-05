@@ -132,6 +132,8 @@ CacheValueT = TypeVar("CacheValueT")
 # horizon are evicted to keep the cache bounded.
 SMART_CACHE_STALE_RETENTION_TTL_MULTIPLIER = 12
 SMART_CACHE_STALE_RETENTION_FLOOR_SECONDS = 3600
+SMART_NEGATIVE_CACHE_TTL_SECONDS = 15
+SMART_NEGATIVE_CACHE_MAX_ENTRIES = 1024
 VIRTUAL_MAPPING_UNAVAILABLE_REASON = (
     "Mapping import is unavailable because this system disk inventory has no identified "
     "physical enclosure or stable physical slot identities."
@@ -749,8 +751,15 @@ class InventoryService:
         self._cache_until: dict[str, datetime] = {}
         self._smart_cache: dict[SmartCacheKey, SmartSummaryView] = {}
         self._smart_cache_until: dict[SmartCacheKey, datetime] = {}
+        self._smart_negative_cache: OrderedDict[
+            SmartCacheKey,
+            tuple[SmartSummaryView, datetime],
+        ] = OrderedDict()
         self._smart_cache_global_generation = 0
         self._smart_cache_enclosure_generations: dict[str, int] = {}
+        self._smart_load_tasks: dict[SmartCacheKey, asyncio.Task[SmartSummaryView]] = {}
+        self._smart_operation_limit = max(1, self.settings.app.smart_batch_max_concurrency)
+        self._smart_operation_semaphore = asyncio.Semaphore(self._smart_operation_limit)
         self._source_bundle: InventorySourceBundle | None = None
         self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
@@ -772,9 +781,6 @@ class InventoryService:
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[bool] | None = None
         self._smart_refresh_tasks: dict[SmartCacheKey, asyncio.Task[None]] = {}
-        self._background_smart_refresh_semaphore = asyncio.Semaphore(
-            max(1, self.settings.app.smart_batch_max_concurrency)
-        )
         self._scale_preferred_ses_host: str | None = None
         self._quantastor_preferred_ses_host: str | None = None
         self._sg_ses_device_cache: dict[str, tuple[list[str], datetime]] = {}
@@ -1352,6 +1358,7 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
         *,
         allow_stale_cache: bool = False,
+        bypass_negative_cache: bool = False,
     ) -> SmartSummaryView:
         runtime = await self.get_storage_view_runtime(
             force_refresh=False,
@@ -1369,12 +1376,14 @@ class InventoryService:
                 runtime_slot.snapshot_slot,
                 selected_enclosure_id=selected_enclosure_id or runtime_view.backing_enclosure_id,
                 allow_stale_cache=allow_stale_cache,
+                bypass_negative_cache=bypass_negative_cache,
             )
 
         synthetic_slot = self._build_slot_view_from_storage_view_runtime_slot(runtime_view, runtime_slot)
         return await self._get_slot_smart_summary_for_slot_view(
             synthetic_slot,
             allow_stale_cache=allow_stale_cache,
+            bypass_negative_cache=bypass_negative_cache,
         )
 
     async def resolve_storage_view_slot_history_target(
@@ -1909,7 +1918,9 @@ class InventoryService:
             smart_keys_to_remove = (
                 set(self._smart_cache)
                 | set(self._smart_cache_until)
+                | set(self._smart_negative_cache)
                 | set(self._smart_refresh_tasks)
+                | set(self._smart_load_tasks)
             )
         else:
             self._snapshot_topology_generation += 1
@@ -1932,7 +1943,9 @@ class InventoryService:
                 for key in (
                     set(self._smart_cache)
                     | set(self._smart_cache_until)
+                    | set(self._smart_negative_cache)
                     | set(self._smart_refresh_tasks)
+                    | set(self._smart_load_tasks)
                 )
                 if key[2] in normalized_keys
             }
@@ -1947,6 +1960,9 @@ class InventoryService:
         for key in snapshot_keys_to_remove:
             self._remove_snapshot_state_key(key, cancel_task=True)
         self._remove_smart_cache_keys(smart_keys_to_remove)
+        for smart_key in smart_keys_to_remove:
+            self._smart_negative_cache.pop(smart_key, None)
+            self._smart_load_tasks.pop(smart_key, None)
         for smart_key in smart_keys_to_remove:
             task = self._smart_refresh_tasks.pop(smart_key, None)
             if task is not None and not task.done():
@@ -1974,7 +1990,9 @@ class InventoryService:
                 | set(self._canonical_enclosure_options or {})
                 | {key[2] for key in self._smart_cache}
                 | {key[2] for key in self._smart_cache_until}
+                | {key[2] for key in self._smart_negative_cache}
                 | {key[2] for key in self._smart_refresh_tasks}
+                | {key[2] for key in self._smart_load_tasks}
             )
             cache_keys = {
                 key
@@ -2940,12 +2958,11 @@ class InventoryService:
         generation_token: SmartCacheGenerationToken,
     ) -> None:
         try:
-            async with self._background_smart_refresh_semaphore:
-                await self._get_slot_smart_summary_for_slot_view(
-                    slot_view,
-                    allow_stale_cache=False,
-                    expected_generation=generation_token,
-                )
+            await self._get_slot_smart_summary_for_slot_view(
+                slot_view,
+                allow_stale_cache=False,
+                expected_generation=generation_token,
+            )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background SMART refresh failed for %s", cache_key)
 
@@ -3567,6 +3584,7 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
         *,
         allow_stale_cache: bool = False,
+        bypass_negative_cache: bool = False,
     ) -> SmartSummaryView:
         with perf_stage("smart.summary.total", slot=slot, platform=self.system.truenas.platform):
             snapshot = await self.get_snapshot(
@@ -3579,6 +3597,7 @@ class InventoryService:
             return await self._get_slot_smart_summary_for_slot_view(
                 slot_view,
                 allow_stale_cache=allow_stale_cache,
+                bypass_negative_cache=bypass_negative_cache,
             )
 
     def _smart_cache_expiry(self) -> datetime:
@@ -3627,7 +3646,8 @@ class InventoryService:
         # a batch destroy every other slot's stale-serve entry and force
         # foreground refetches across the grid.  Evicting past the horizon also
         # bounds how old a stale-served summary can get.
-        eviction_horizon = utcnow() - self._smart_cache_stale_retention()
+        now = utcnow()
+        eviction_horizon = now - self._smart_cache_stale_retention()
         expired_keys = {
             cache_key
             for cache_key in set(self._smart_cache) | set(self._smart_cache_until)
@@ -3636,6 +3656,9 @@ class InventoryService:
         }
         if self._remove_smart_cache_keys(expired_keys):
             self._observe_inventory_cache_metrics()
+        for cache_key, (_summary, expires_at) in tuple(self._smart_negative_cache.items()):
+            if expires_at <= now:
+                self._smart_negative_cache.pop(cache_key, None)
 
     def _store_smart_summary_cache(
         self,
@@ -3646,6 +3669,8 @@ class InventoryService:
         expected_generation: SmartCacheGenerationToken | None = None,
     ) -> bool:
         cache_key = self._smart_cache_key(slot_view)
+        if summary.available is False:
+            return False
         if (
             expected_generation is not None
             and self._smart_cache_generation_token(cache_key) != expected_generation
@@ -3654,6 +3679,28 @@ class InventoryService:
         self._evict_expired_smart_cache_entries()
         self._smart_cache[cache_key] = summary
         self._smart_cache_until[cache_key] = expires_at or self._smart_cache_expiry()
+        self._smart_negative_cache.pop(cache_key, None)
+        return True
+
+    def _store_negative_smart_summary(
+        self,
+        cache_key: SmartCacheKey,
+        summary: SmartSummaryView,
+        *,
+        expected_generation: SmartCacheGenerationToken,
+    ) -> bool:
+        if summary.available is not False:
+            return False
+        if self._smart_cache_generation_token(cache_key) != expected_generation:
+            return False
+        self._evict_expired_smart_cache_entries()
+        self._smart_negative_cache.pop(cache_key, None)
+        self._smart_negative_cache[cache_key] = (
+            summary,
+            utcnow() + timedelta(seconds=SMART_NEGATIVE_CACHE_TTL_SECONDS),
+        )
+        while len(self._smart_negative_cache) > SMART_NEGATIVE_CACHE_MAX_ENTRIES:
+            self._smart_negative_cache.popitem(last=False)
         return True
 
     async def _get_slot_smart_summary_for_slot_view(
@@ -3661,6 +3708,7 @@ class InventoryService:
         slot_view: SlotView,
         *,
         allow_stale_cache: bool = False,
+        bypass_negative_cache: bool = False,
         expected_generation: SmartCacheGenerationToken | None = None,
     ) -> SmartSummaryView:
         cache_key = self._smart_cache_key(slot_view)
@@ -3677,14 +3725,86 @@ class InventoryService:
             self._observe_smart_summary_request("stale-hit")
             self._schedule_background_smart_refresh(cache_key, slot_view)
             return cached
+        if not bypass_negative_cache:
+            negative_entry = self._smart_negative_cache.get(cache_key)
+            if negative_entry is not None:
+                self._smart_negative_cache.move_to_end(cache_key)
+                add_perf_metadata(smart_cache="negative-hit")
+                self._observe_smart_summary_request("negative-hit")
+                return negative_entry[0]
 
+        task = self._smart_load_tasks.get(cache_key)
+        if task is None:
+            generation_token = expected_generation or self._smart_cache_generation_token(cache_key)
+            task = asyncio.create_task(
+                self._run_smart_loader(
+                    slot_view,
+                    cache_key=cache_key,
+                    candidates=candidates,
+                    generation_token=generation_token,
+                    allow_stale_cache=allow_stale_cache,
+                )
+            )
+            self._smart_load_tasks[cache_key] = task
+            task.add_done_callback(
+                lambda completed, key=cache_key: self._cleanup_smart_load_task(key, completed)
+            )
+        return await asyncio.shield(task)
+
+    def _cleanup_smart_load_task(
+        self,
+        cache_key: SmartCacheKey,
+        completed: asyncio.Task[SmartSummaryView],
+    ) -> None:
+        if self._smart_load_tasks.get(cache_key) is completed:
+            self._smart_load_tasks.pop(cache_key, None)
+        if completed.cancelled():
+            return
+        completed.exception()
+
+    async def _run_smart_loader(
+        self,
+        slot_view: SlotView,
+        *,
+        cache_key: SmartCacheKey,
+        candidates: list[str],
+        generation_token: SmartCacheGenerationToken,
+        allow_stale_cache: bool,
+    ) -> SmartSummaryView:
+        async with self._smart_operation_semaphore:
+            summary = await self._load_uncached_smart_summary(
+                slot_view,
+                cache_key=cache_key,
+                candidates=candidates,
+                generation_token=generation_token,
+                allow_stale_cache=allow_stale_cache,
+            )
+        if summary.available is False:
+            self._store_negative_smart_summary(
+                cache_key,
+                summary,
+                expected_generation=generation_token,
+            )
+        elif self._smart_cache_generation_token(cache_key) == generation_token:
+            self._smart_negative_cache.pop(cache_key, None)
+        return summary
+
+    async def _load_uncached_smart_summary(
+        self,
+        slot_view: SlotView,
+        *,
+        cache_key: SmartCacheKey,
+        candidates: list[str],
+        generation_token: SmartCacheGenerationToken,
+        allow_stale_cache: bool,
+    ) -> SmartSummaryView:
         smartctl_device_type = self._smart_candidate_device_type(slot_view)
         if self.system.truenas.platform == "esxi":
             summary = await self._build_esxi_slot_smart_summary(slot_view)
             if self._store_smart_summary_cache(
                 slot_view,
                 summary,
-                expected_generation=expected_generation,
+                expected_generation=generation_token,
             ):
                 self._persist_slot_detail_cache(slot_view, smart_summary=summary)
                 self._observe_inventory_cache_metrics()
@@ -3692,11 +3812,16 @@ class InventoryService:
             return summary
         if self.system.truenas.platform == "quantastor":
             summary = self._merge_smart_summary(slot_view, self._build_quantastor_smart_summary(slot_view))
-            if self.system.ssh.enabled and candidates and self._summary_needs_ssh_enrichment(summary):
+            if (
+                self.system.ssh.enabled
+                and candidates
+                and self._summary_needs_ssh_enrichment(summary, slot_view, candidates)
+            ):
                 ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(
                     candidates,
                     hosts=self._build_quantastor_preferred_hosts(slot_view),
                     device_type=smartctl_device_type,
+                    slot_view=slot_view,
                 )
                 if ssh_summary is not None:
                     summary = self._merge_missing_smart_fields(
@@ -3706,7 +3831,7 @@ class InventoryService:
             if self._store_smart_summary_cache(
                 slot_view,
                 summary,
-                expected_generation=expected_generation,
+                expected_generation=generation_token,
             ):
                 self._persist_slot_detail_cache(slot_view, smart_summary=summary)
                 self._observe_inventory_cache_metrics()
@@ -3729,7 +3854,7 @@ class InventoryService:
                 slot_view,
                 persisted,
                 expires_at=utcnow(),
-                expected_generation=expected_generation,
+                expected_generation=generation_token,
             ):
                 self._schedule_background_smart_refresh(cache_key, slot_view)
                 self._observe_inventory_cache_metrics()
@@ -3741,13 +3866,14 @@ class InventoryService:
             summary, error_message = await self._fetch_smart_summary_over_ssh(
                 candidates,
                 device_type=smartctl_device_type,
+                slot_view=slot_view,
             )
             if summary is not None:
                 summary = self._merge_smart_summary(slot_view, summary)
                 if self._store_smart_summary_cache(
                     slot_view,
                     summary,
-                    expected_generation=expected_generation,
+                    expected_generation=generation_token,
                 ):
                     self._persist_slot_detail_cache(slot_view, smart_summary=summary)
                     self._observe_inventory_cache_metrics()
@@ -3786,7 +3912,8 @@ class InventoryService:
             break
 
         if api_summary is not None:
-            if api_candidate and self._summary_needs_ssh_enrichment(api_summary):
+            transport, groups = self._smart_enrichment_plan(api_summary, slot_view, candidates)
+            if api_candidate and "smartctl-text" in groups:
                 try:
                     with perf_stage("smart.api.fetch_text_enrichment", candidate=api_candidate):
                         enrichment_payload = await self.truenas_client.fetch_disk_smartctl(api_candidate, ["-x"])
@@ -3799,21 +3926,24 @@ class InventoryService:
                             parse_smartctl_text_enrichment(enrichment_payload)
                         ),
                     )
-            if self._summary_prefers_core_ssh_json(api_summary):
+            if self._summary_prefers_core_ssh_json(api_summary, slot_view, candidates):
                 ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(
                     candidates,
                     device_type=smartctl_device_type,
+                    slot_view=slot_view,
                 )
                 if ssh_summary is not None:
                     api_summary = self._merge_missing_smart_fields(
                         self._merge_smart_summary(slot_view, ssh_summary),
                         api_summary,
                     )
+            if api_summary.transport_protocol is None and transport != "unknown":
+                api_summary.transport_protocol = transport
 
             if self._store_smart_summary_cache(
                 slot_view,
                 api_summary,
-                expected_generation=expected_generation,
+                expected_generation=generation_token,
             ):
                 self._persist_slot_detail_cache(slot_view, smart_summary=api_summary)
                 self._observe_inventory_cache_metrics()
@@ -3824,13 +3954,14 @@ class InventoryService:
             ssh_summary, ssh_error = await self._fetch_smart_summary_over_ssh(
                 candidates,
                 device_type=smartctl_device_type,
+                slot_view=slot_view,
             )
             if ssh_summary is not None:
                 ssh_summary = self._merge_smart_summary(slot_view, ssh_summary)
                 if self._store_smart_summary_cache(
                     slot_view,
                     ssh_summary,
-                    expected_generation=expected_generation,
+                    expected_generation=generation_token,
                 ):
                     self._persist_slot_detail_cache(slot_view, smart_summary=ssh_summary)
                     self._observe_inventory_cache_metrics()
@@ -3854,6 +3985,7 @@ class InventoryService:
         max_concurrency: int | None = None,
         *,
         allow_stale_cache: bool = False,
+        bypass_negative_cache: bool = False,
     ) -> list[SmartBatchItem]:
         with perf_stage("smart.batch.total", requested_slot_count=len(slots)):
             snapshot = await self.get_snapshot(
@@ -3872,7 +4004,9 @@ class InventoryService:
             if not ordered_slots:
                 return []
 
-            effective_concurrency = max_concurrency or self.settings.app.smart_batch_max_concurrency
+            effective_concurrency = self._smart_operation_limit
+            if max_concurrency is not None:
+                effective_concurrency = min(effective_concurrency, max(1, max_concurrency))
             semaphore = asyncio.Semaphore(max(1, effective_concurrency))
 
             async def load_summary(slot: int) -> SmartBatchItem:
@@ -3881,6 +4015,7 @@ class InventoryService:
                         summary = await self._get_slot_smart_summary_for_slot_view(
                             slot_lookup[slot],
                             allow_stale_cache=allow_stale_cache,
+                            bypass_negative_cache=bypass_negative_cache,
                         )
                     except TrueNASAPIError as exc:
                         summary = self._fallback_smart_summary(slot_lookup.get(slot), str(exc))
@@ -3893,6 +4028,7 @@ class InventoryService:
         candidates: list[str],
         hosts: list[str] | None = None,
         device_type: str | None = None,
+        slot_view: SlotView | None = None,
     ) -> tuple[SmartSummaryView | None, str | None]:
         if not self.system.ssh.enabled:
             return None, (
@@ -3900,92 +4036,171 @@ class InventoryService:
                 "and SSH fallback is disabled."
             )
 
-        last_error: str | None = None
         host_candidates = [normalize_text(host) for host in (hosts or []) if normalize_text(host)]
         if not host_candidates:
             host_candidates = [None]
+        attempts: list[
+            tuple[
+                str,
+                str,
+                str,
+                str,
+                tuple[tuple[str, Any], ...],
+            ]
+        ] = []
+        for candidate in candidates:
+            device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
+            for smartctl_binary in self._smartctl_binary_candidates():
+                command_parts = ["sudo", "-n", smartctl_binary]
+                if device_type:
+                    command_parts.extend(["-d", device_type])
+                command_parts.extend(["-x", "-j", device_path])
+                json_command = shlex.join(command_parts)
+                text_command_parts = ["sudo", "-n", smartctl_binary]
+                if device_type:
+                    text_command_parts.extend(["-d", device_type])
+                text_command_parts.extend(["-x", device_path])
+                attempts.append(
+                    (
+                        candidate,
+                        device_path,
+                        json_command,
+                        shlex.join(text_command_parts),
+                        self._linux_nvme_enrichment_command_parsers(device_path),
+                    )
+                )
 
-        with perf_stage("smart.ssh.fetch", candidate_count=len(candidates), host_count=len(host_candidates)):
+        if not attempts:
+            return None, None
+
+        def parse_primary(result: SSHCommandResult | None) -> SmartSummaryView | None:
+            if result is None or not result.stdout.strip():
+                return None
+            candidate_summary = SmartSummaryView.model_validate(
+                parse_smartctl_summary(result.stdout)
+            )
+            # smartctl commonly returns advisory non-zero exit codes even when
+            # the JSON payload is intact and contains useful SMART data.
+            if (
+                candidate_summary.available
+                or candidate_summary.message != "SMART JSON parsing failed."
+            ):
+                return candidate_summary
+            return None
+
+        def command_groups(
+            summary: SmartSummaryView,
+            attempt: tuple[str, str, str, str, tuple[tuple[str, Any], ...]],
+        ) -> list[str]:
+            candidate, _device_path, _json_command, text_command, nvme_parsers = attempt
+            transport, groups = self._smart_enrichment_plan(
+                summary,
+                slot_view,
+                [candidate],
+            )
+            commands: list[str] = []
+            if "smartctl-text" in groups:
+                commands.append(text_command)
+            nvme_groups = ("nvme-smart-log", "nvme-id-ctrl", "nvme-id-ns")
+            for group, command_parser in zip(nvme_groups, nvme_parsers, strict=False):
+                if group in groups:
+                    commands.append(command_parser[0])
+            return commands
+
+        last_error: str | None = None
+        with perf_stage(
+            "smart.ssh.fetch",
+            candidate_count=len(candidates),
+            host_count=len(host_candidates),
+        ):
             for target_host in host_candidates:
-                for candidate in candidates:
-                    device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
-                    for smartctl_binary in self._smartctl_binary_candidates():
-                        command_parts = ["sudo", "-n", smartctl_binary]
-                        if device_type:
-                            command_parts.extend(["-d", device_type])
-                        command_parts.extend(["-x", "-j", device_path])
-                        command = shlex.join(command_parts)
-                        text_command_parts = ["sudo", "-n", smartctl_binary]
-                        if device_type:
-                            text_command_parts.extend(["-d", device_type])
-                        text_command_parts.extend(["-x", device_path])
-                        text_command = shlex.join(text_command_parts)
-                        nvme_command_parsers = self._linux_nvme_enrichment_command_parsers(device_path)
-                        command_results = {
-                            result.command: result
-                            for result in await self._run_ssh_commands(
-                                [
-                                    command,
-                                    text_command,
-                                    *(nvme_command for nvme_command, _parser in nvme_command_parsers),
-                                ],
-                                target_host,
-                            )
-                        }
-                        result = command_results.get(
-                            command,
-                            SSHCommandResult(
-                                command=command,
-                                ok=False,
-                                stderr="SSH command result missing.",
-                                exit_code=255,
+                def planner(results: list[SSHCommandResult]) -> list[str]:
+                    result_by_command = {result.command: result for result in results}
+                    skipped_candidate: str | None = None
+                    for attempt in attempts:
+                        candidate, _device_path, json_command, _text_command, _nvme_parsers = attempt
+                        if candidate == skipped_candidate:
+                            continue
+                        result = result_by_command.get(json_command)
+                        if result is None:
+                            return [json_command]
+                        summary = parse_primary(result)
+                        if summary is not None:
+                            return [
+                                command
+                                for command in command_groups(summary, attempt)
+                                if command not in result_by_command
+                            ]
+                        detail = result.stderr.strip() or result.stdout.strip()
+                        if "command not found" not in detail.lower():
+                            skipped_candidate = candidate
+                    return []
+
+                planned_results = await self._run_ssh_planned_commands(
+                    planner,
+                    initial_commands=[attempts[0][2]],
+                    host=target_host,
+                )
+                result_by_command = {
+                    result.command: result
+                    for result in planned_results
+                }
+                skipped_candidate: str | None = None
+                for attempt in attempts:
+                    candidate, device_path, json_command, text_command, nvme_parsers = attempt
+                    if candidate == skipped_candidate:
+                        continue
+                    result = result_by_command.get(json_command)
+                    if result is None:
+                        continue
+                    summary = parse_primary(result)
+                    if summary is None:
+                        detail = (
+                            result.stderr.strip()
+                            or result.stdout.strip()
+                            or "Unknown SSH smartctl error."
+                        )
+                        detail = self._describe_smartctl_ssh_failure(detail, device_path)
+                        last_error = (
+                            f"{target_host}:{device_path}: {detail}"
+                            if target_host
+                            else f"{device_path}: {detail}"
+                        )
+                        if "command not found" not in detail.lower():
+                            skipped_candidate = candidate
+                        continue
+
+                    transport, _groups = self._smart_enrichment_plan(
+                        summary,
+                        slot_view,
+                        [candidate],
+                    )
+                    text_result = result_by_command.get(text_command)
+                    if text_result is not None and text_result.stdout.strip():
+                        summary = self._merge_missing_smart_fields(
+                            summary,
+                            SmartSummaryView.model_validate(
+                                parse_smartctl_text_enrichment(text_result.stdout)
                             ),
                         )
-                        summary = None
-                        if result.stdout.strip():
-                            parsed = parse_smartctl_summary(result.stdout)
-                            candidate_summary = SmartSummaryView.model_validate(parsed)
-                            # smartctl commonly returns advisory non-zero exit codes even when the
-                            # JSON payload is intact and contains useful SMART data.
-                            if candidate_summary.available or candidate_summary.message != "SMART JSON parsing failed.":
-                                summary = candidate_summary
-                        if summary is None:
-                            detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH smartctl error."
-                            detail = self._describe_smartctl_ssh_failure(detail, device_path)
-                            last_error = (
-                                f"{target_host}:{device_path}: {detail}"
-                                if target_host
-                                else f"{device_path}: {detail}"
-                            )
-                            if "command not found" in detail.lower():
-                                continue
-                            break
-
-                        text_result = command_results.get(text_command)
-                        if text_result is not None and text_result.stdout.strip():
-                            summary = self._merge_missing_smart_fields(
-                                summary,
-                                SmartSummaryView.model_validate(
-                                    parse_smartctl_text_enrichment(text_result.stdout)
-                                ),
-                            )
-                        if self.system.truenas.platform == "linux":
-                            nvme_summary = self._parse_linux_nvme_enrichment_results(
-                                nvme_command_parsers,
-                                command_results,
-                            )
-                            if nvme_summary is not None:
-                                summary = self._merge_missing_smart_fields(summary, nvme_summary)
-                        if summary.available or summary.message != "SMART JSON parsing failed.":
-                            if self.system.truenas.platform == "quantastor" and target_host:
-                                self._quantastor_preferred_ses_host = target_host
-                            return summary, None
-                        last_error = (
-                            f"{target_host}:{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
-                            if target_host
-                            else f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
-                        )
-                        break
+                    nvme_summary = self._parse_linux_nvme_enrichment_results(
+                        nvme_parsers,
+                        result_by_command,
+                    )
+                    if nvme_summary is not None:
+                        summary = self._merge_missing_smart_fields(summary, nvme_summary)
+                    if summary.transport_protocol is None and transport != "unknown":
+                        summary.transport_protocol = transport
+                    if summary.available or summary.message != "SMART JSON parsing failed.":
+                        if self.system.truenas.platform == "quantastor" and target_host:
+                            self._quantastor_preferred_ses_host = target_host
+                        return summary, None
+                    last_error = (
+                        f"{target_host}:{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                        if target_host
+                        else f"{device_path}: {summary.message or 'SMART JSON parsing failed.'}"
+                    )
+                    skipped_candidate = candidate
 
         return None, last_error
 
@@ -12064,29 +12279,158 @@ class InventoryService:
         return summary
 
     @staticmethod
-    def _summary_needs_ssh_enrichment(summary: SmartSummaryView) -> bool:
-        return any(
-            value is None
-            for value in (
-                summary.power_on_hours,
-                summary.rotation_rate_rpm,
-                summary.form_factor,
-                summary.read_cache_enabled,
-                summary.writeback_cache_enabled,
-                summary.transport_protocol,
-                summary.sas_address,
-                summary.attached_sas_address,
-                summary.negotiated_link_rate,
-            )
-        )
+    def _normalize_smart_transport_value(value: str | None) -> str | None:
+        normalized = (normalize_text(value) or "").upper()
+        if "NVME" in normalized:
+            return "NVMe"
+        if "SAS" in normalized or "SCSI" in normalized:
+            return "SAS"
+        if "SATA" in normalized or normalized == "ATA" or normalized.startswith("ATA "):
+            return "ATA"
+        return None
 
-    def _summary_prefers_core_ssh_json(self, summary: SmartSummaryView) -> bool:
+    def _normalized_smart_transport(
+        self,
+        summary: SmartSummaryView,
+        slot_view: SlotView | None,
+        candidates: Iterable[str],
+    ) -> str:
+        for value in (
+            summary.transport_protocol,
+            summary.protocol_version,
+            slot_view.transport_protocol if slot_view is not None else None,
+            slot_view.smart_device_type if slot_view is not None else None,
+        ):
+            transport = self._normalize_smart_transport_value(value)
+            if transport is not None:
+                return transport
+
+        evidence = " ".join(str(candidate).lower() for candidate in candidates)
+        device_name = normalize_text(slot_view.device_name) if slot_view is not None else None
+        if device_name:
+            evidence = f"{device_name.lower()} {evidence}"
+        if "nvme" in evidence:
+            return "NVMe"
+        if "disk/by-id/ata-" in evidence or any(
+            token.startswith("ada") for token in evidence.replace("/dev/", "").split()
+        ):
+            return "ATA"
+        if "disk/by-id/scsi-" in evidence or "multipath/" in evidence:
+            return "SAS"
+        return "unknown"
+
+    def _smart_enrichment_plan(
+        self,
+        summary: SmartSummaryView,
+        slot_view: SlotView | None,
+        candidates: Iterable[str],
+    ) -> tuple[str, tuple[str, ...]]:
+        transport = self._normalized_smart_transport(summary, slot_view, candidates)
+        groups: list[str] = []
+        if transport == "ATA":
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "read_cache_enabled",
+                    "writeback_cache_enabled",
+                    "protocol_version",
+                    "negotiated_link_rate",
+                )
+            ):
+                groups.append("smartctl-text")
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "power_on_hours",
+                    "rotation_rate_rpm",
+                    "form_factor",
+                    "bytes_read",
+                    "bytes_written",
+                    "read_commands",
+                    "write_commands",
+                )
+            ):
+                groups.append("smartctl-json")
+        elif transport == "SAS":
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "read_cache_enabled",
+                    "writeback_cache_enabled",
+                    "logical_unit_id",
+                    "sas_address",
+                    "attached_sas_address",
+                    "negotiated_link_rate",
+                )
+            ):
+                groups.append("smartctl-text")
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "power_on_hours",
+                    "rotation_rate_rpm",
+                    "form_factor",
+                )
+            ):
+                groups.append("smartctl-json")
+        elif transport == "NVMe":
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "temperature_c",
+                    "power_on_hours",
+                    "available_spare_percent",
+                    "available_spare_threshold_percent",
+                    "endurance_used_percent",
+                    "bytes_read",
+                    "bytes_written",
+                    "media_errors",
+                    "unsafe_shutdowns",
+                )
+            ):
+                groups.append("nvme-smart-log")
+            if any(
+                getattr(summary, field_name) is None
+                for field_name in (
+                    "firmware_version",
+                    "protocol_version",
+                    "warning_temperature_c",
+                    "critical_temperature_c",
+                )
+            ):
+                groups.append("nvme-id-ctrl")
+            if summary.namespace_eui64 is None or summary.namespace_nguid is None:
+                groups.append("nvme-id-ns")
+        elif any(
+            getattr(summary, field_name) is None
+            for field_name in (
+                "transport_protocol",
+                "read_cache_enabled",
+                "writeback_cache_enabled",
+            )
+        ):
+            groups.append("smartctl-text")
+        return transport, tuple(groups)
+
+    def _summary_needs_ssh_enrichment(
+        self,
+        summary: SmartSummaryView,
+        slot_view: SlotView | None = None,
+        candidates: Iterable[str] = (),
+    ) -> bool:
+        _transport, groups = self._smart_enrichment_plan(summary, slot_view, candidates)
+        return bool(groups)
+
+    def _summary_prefers_core_ssh_json(
+        self,
+        summary: SmartSummaryView,
+        slot_view: SlotView | None = None,
+        candidates: Iterable[str] = (),
+    ) -> bool:
         if self.system.truenas.platform != "core" or not self.system.ssh.enabled:
             return False
-
-        transport = (summary.transport_protocol or "").strip().upper()
-        protocol_version = (summary.protocol_version or "").strip().upper()
-        return transport == "ATA" or protocol_version.startswith("SATA")
+        transport, groups = self._smart_enrichment_plan(summary, slot_view, candidates)
+        return transport == "ATA" and "smartctl-json" in groups
 
     @staticmethod
     def _merge_missing_smart_fields(

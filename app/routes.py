@@ -526,6 +526,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                     slot,
                     selected_enclosure_id=enclosure_id,
                     allow_stale_cache=not fresh,
+                    bypass_negative_cache=fresh,
                 )
             return SmartSummaryView.model_validate(summary).model_copy(
                 update={"layout_bounds": layout_bounds}
@@ -553,6 +554,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 slot_index,
                 selected_enclosure_id=enclosure_id,
                 allow_stale_cache=not fresh,
+                bypass_negative_cache=fresh,
             )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -641,6 +643,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                     selected_enclosure_id=enclosure_id,
                     max_concurrency=payload.max_concurrency,
                     allow_stale_cache=not fresh,
+                    bypass_negative_cache=fresh,
                 )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

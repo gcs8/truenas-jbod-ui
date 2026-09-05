@@ -931,6 +931,35 @@ class InventoryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('system_id="metrics-smart-system"', metrics_text)
         self.assertIn('cache_state="hit"', metrics_text)
 
+    async def test_inventory_metrics_distinguish_negative_hits_from_positive_cache_entries(self) -> None:
+        app = FastAPI()
+        system_id = "metrics-smart-negative"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict("os.environ", {"METRICS_ENABLED": "true", "METRICS_PATH": "/metrics"}, clear=False):
+                install_metrics(app, service_name="test-metrics-scrape-smart-negative", version="0.0.0-test")
+                service = build_inventory_service(temp_dir=temp_dir, system_id=system_id)
+                slot_view = SlotView(
+                    slot=8,
+                    slot_label="08",
+                    row_index=0,
+                    column_index=8,
+                    enclosure_id="enc-negative",
+                )
+
+                first = await service._get_slot_smart_summary_for_slot_view(slot_view)
+                second = await service._get_slot_smart_summary_for_slot_view(slot_view)
+
+        self.assertFalse(first.available)
+        self.assertFalse(second.available)
+        metrics_messages = await invoke_asgi(app, "/metrics")
+        metrics_text = response_body(metrics_messages)
+        self.assertIn('cache_state="negative-hit"', metrics_text)
+        self.assertIn(
+            "# HELP truenas_jbod_ui_smart_summary_cache_entries "
+            "Current in-memory positive SMART summary cache entries for this system service.",
+            metrics_text,
+        )
+
     async def test_smart_cache_retention_eviction_updates_entry_gauge_before_cache_hit_returns(self) -> None:
         app = FastAPI()
         system_id = "metrics-smart-eviction"

@@ -3968,6 +3968,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             12,
             selected_enclosure_id="enc-a",
             allow_stale_cache=True,
+            bypass_negative_cache=False,
         )
 
     def test_get_storage_view_slot_smart_summary_builds_synthetic_slot_for_inventory_bound_view(self) -> None:
@@ -4036,6 +4037,10 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
 
         self.assertIs(summary, expected_summary)
         synthetic_slot = service._get_slot_smart_summary_for_slot_view.await_args.args[0]
+        self.assertEqual(
+            service._get_slot_smart_summary_for_slot_view.await_args.kwargs,
+            {"allow_stale_cache": True, "bypass_negative_cache": False},
+        )
         self.assertEqual(synthetic_slot.enclosure_id, "storage-view:boot-doms")
         self.assertEqual(synthetic_slot.enclosure_label, "Boot SATADOMs")
         self.assertEqual(synthetic_slot.device_name, "ada0")
@@ -6264,6 +6269,1240 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
 
 
 class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _smart_budget_slots(count: int, *, enclosure_id: str = "enc-budget") -> list[SlotView]:
+        return [
+            SlotView(
+                slot=index,
+                slot_label=f"{index:02d}",
+                row_index=0,
+                column_index=index,
+                enclosure_id=enclosure_id,
+                device_name=f"sd{index}",
+                transport_protocol="SAS",
+            )
+            for index in range(count)
+        ]
+
+    async def test_inventory_service_owns_one_server_smart_budget_with_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 0
+            system = SystemConfig(
+                id="single-budget-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+
+            self.assertEqual(service._smart_operation_limit, 1)
+            self.assertIsInstance(service._smart_operation_semaphore, asyncio.Semaphore)
+            self.assertFalse(hasattr(service, "_background_smart_refresh_semaphore"))
+
+    async def test_positive_and_negative_cache_hits_skip_server_smart_budget(self) -> None:
+        class ForbiddenSemaphore:
+            async def __aenter__(self):
+                raise AssertionError("cache hits must not acquire the SMART work budget")
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="cache-hit-budget-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-cache-hit")[0]
+            cache_key = service._smart_cache_key(slot)
+            positive = SmartSummaryView(available=True, power_on_hours=1)
+            service._smart_cache[cache_key] = positive
+            service._smart_cache_until[cache_key] = datetime.now(timezone.utc) + timedelta(minutes=1)
+            service._smart_operation_semaphore = ForbiddenSemaphore()  # type: ignore[assignment]
+
+            positive_result = await service._get_slot_smart_summary_for_slot_view(slot)
+            service._smart_cache.clear()
+            service._smart_cache_until.clear()
+            negative = SmartSummaryView(available=False, message="synthetic unavailable")
+            service._smart_negative_cache[cache_key] = (
+                negative,
+                datetime.now(timezone.utc) + timedelta(seconds=15),
+            )
+            negative_result = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertIs(positive_result, positive)
+            self.assertIs(negative_result, negative)
+
+    async def test_get_slot_smart_summaries_caps_client_hint_at_server_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 2
+            system = SystemConfig(
+                id="budget-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slots = self._smart_budget_slots(4)
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(slots=slots, refresh_interval_seconds=30)
+            )
+            release = asyncio.Event()
+            server_capacity_reached = asyncio.Event()
+            active = 0
+            peak = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                if active >= 2:
+                    server_capacity_reached.set()
+                try:
+                    await release.wait()
+                    return SmartSummaryView(available=True, power_on_hours=1), None
+                finally:
+                    active -= 1
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            request = asyncio.create_task(
+                service.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=128)
+            )
+            try:
+                await server_capacity_reached.wait()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                self.assertEqual(peak, 2)
+            finally:
+                release.set()
+                await request
+
+    async def test_get_slot_smart_summaries_allows_client_hint_to_lower_server_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 4
+            system = SystemConfig(
+                id="hint-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slots = self._smart_budget_slots(4)
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(slots=slots, refresh_interval_seconds=30)
+            )
+            release = asyncio.Event()
+            hint_capacity_reached = asyncio.Event()
+            active = 0
+            peak = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                if active >= 2:
+                    hint_capacity_reached.set()
+                try:
+                    await release.wait()
+                    return SmartSummaryView(available=True, power_on_hours=1), None
+                finally:
+                    active -= 1
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            request = asyncio.create_task(
+                service.get_slot_smart_summaries([0, 1, 2, 3], max_concurrency=2)
+            )
+            try:
+                await hint_capacity_reached.wait()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                self.assertEqual(peak, 2)
+            finally:
+                release.set()
+                await request
+
+    async def test_concurrent_smart_requests_share_one_system_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 2
+            system = SystemConfig(
+                id="shared-budget-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slots = self._smart_budget_slots(5)
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(slots=slots, refresh_interval_seconds=30)
+            )
+            release = asyncio.Event()
+            capacity_reached = asyncio.Event()
+            active = 0
+            peak = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                if active >= 2:
+                    capacity_reached.set()
+                try:
+                    await release.wait()
+                    return SmartSummaryView(available=True, power_on_hours=1), None
+                finally:
+                    active -= 1
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            requests = [
+                asyncio.create_task(service.get_slot_smart_summaries([0, 1], max_concurrency=8)),
+                asyncio.create_task(service.get_slot_smart_summaries([2, 3], max_concurrency=8)),
+                asyncio.create_task(service.get_slot_smart_summary(4)),
+            ]
+            try:
+                await capacity_reached.wait()
+                for _ in range(6):
+                    await asyncio.sleep(0)
+                self.assertEqual(peak, 2)
+            finally:
+                release.set()
+                await asyncio.gather(*requests)
+
+    async def test_background_and_foreground_smart_work_share_one_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 1
+            system = SystemConfig(
+                id="background-budget-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            stale_slot, cold_slot = self._smart_budget_slots(2)
+            stale_key = service._smart_cache_key(stale_slot)
+            service._smart_cache[stale_key] = SmartSummaryView(available=True, power_on_hours=1)
+            service._smart_cache_until[stale_key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[stale_slot, cold_slot],
+                    refresh_interval_seconds=30,
+                )
+            )
+            release = asyncio.Event()
+            first_started = asyncio.Event()
+            active = 0
+            peak = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                first_started.set()
+                try:
+                    await release.wait()
+                    return SmartSummaryView(available=True, power_on_hours=2), None
+                finally:
+                    active -= 1
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            await service.get_slot_smart_summary(0, allow_stale_cache=True)
+            foreground = asyncio.create_task(service.get_slot_smart_summary(1))
+            try:
+                await first_started.wait()
+                for _ in range(6):
+                    await asyncio.sleep(0)
+                self.assertEqual(peak, 1)
+            finally:
+                release.set()
+                await foreground
+                await asyncio.gather(*service._smart_refresh_tasks.values())
+
+    async def test_stale_background_and_foreground_same_key_share_one_live_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="background-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-background-flight")[0]
+            cache_key = service._smart_cache_key(slot)
+            stale = SmartSummaryView(available=True, power_on_hours=1)
+            service._smart_cache[cache_key] = stale
+            service._smart_cache_until[cache_key] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def load_summary(*_args, **_kwargs):
+                started.set()
+                await release.wait()
+                return SmartSummaryView(available=True, power_on_hours=2)
+
+            service._load_uncached_smart_summary = AsyncMock(side_effect=load_summary)
+            stale_result = await service._get_slot_smart_summary_for_slot_view(
+                slot,
+                allow_stale_cache=True,
+            )
+            await started.wait()
+            foreground = asyncio.create_task(
+                service._get_slot_smart_summary_for_slot_view(slot)
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            release.set()
+            foreground_result = await foreground
+            await asyncio.gather(*service._smart_refresh_tasks.values())
+
+            self.assertIs(stale_result, stale)
+            self.assertEqual(foreground_result.power_on_hours, 2)
+            self.assertEqual(service._load_uncached_smart_summary.await_count, 1)
+
+    async def test_concurrent_cold_slot_and_batch_misses_share_one_live_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="single-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-flight")[0]
+            snapshot = InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
+            service.get_snapshot = AsyncMock(return_value=snapshot)
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def load_summary(*_args, **_kwargs):
+                started.set()
+                await release.wait()
+                return SmartSummaryView(available=True, power_on_hours=700)
+
+            service._load_uncached_smart_summary = AsyncMock(side_effect=load_summary)
+            direct = asyncio.create_task(service.get_slot_smart_summary(0))
+            batch = asyncio.create_task(service.get_slot_smart_summaries([0]))
+            try:
+                await started.wait()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+            finally:
+                release.set()
+            direct_result, batch_result = await asyncio.gather(direct, batch)
+
+            self.assertEqual(service._load_uncached_smart_summary.await_count, 1)
+            self.assertEqual(direct_result, batch_result[0].summary)
+
+    async def test_single_flight_is_keyed_by_full_smart_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 2
+            system = SystemConfig(
+                id="keyed-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            first = self._smart_budget_slots(1, enclosure_id="enc-keyed")[0]
+            second = first.model_copy(update={"device_name": "different-device"})
+            both_started = asyncio.Event()
+            release = asyncio.Event()
+            started = 0
+
+            async def load_summary(_slot, *, candidates, **_kwargs):
+                nonlocal started
+                started += 1
+                if started == 2:
+                    both_started.set()
+                await release.wait()
+                return SmartSummaryView(
+                    available=True,
+                    power_on_hours=1 if candidates == ["sd0"] else 2,
+                )
+
+            service._load_uncached_smart_summary = AsyncMock(side_effect=load_summary)
+            requests = [
+                asyncio.create_task(service._get_slot_smart_summary_for_slot_view(first)),
+                asyncio.create_task(service._get_slot_smart_summary_for_slot_view(second)),
+            ]
+            try:
+                await both_started.wait()
+            finally:
+                release.set()
+            results = await asyncio.gather(*requests)
+
+            self.assertEqual(service._load_uncached_smart_summary.await_count, 2)
+            self.assertEqual([result.power_on_hours for result in results], [1, 2])
+
+    async def test_cancelled_waiter_does_not_cancel_shared_smart_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="cancelled-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-cancel")[0]
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def load_summary(*_args, **_kwargs):
+                started.set()
+                await release.wait()
+                return SmartSummaryView(available=True, power_on_hours=900)
+
+            service._load_uncached_smart_summary = AsyncMock(side_effect=load_summary)
+            cancelled_waiter = asyncio.create_task(
+                service._get_slot_smart_summary_for_slot_view(slot)
+            )
+            surviving_waiter = asyncio.create_task(
+                service._get_slot_smart_summary_for_slot_view(slot)
+            )
+            await started.wait()
+            for _ in range(4):
+                await asyncio.sleep(0)
+            cancelled_waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cancelled_waiter
+            release.set()
+
+            result = await surviving_waiter
+
+            self.assertEqual(result.power_on_hours, 900)
+            self.assertEqual(service._load_uncached_smart_summary.await_count, 1)
+            self.assertEqual(service._smart_load_tasks, {})
+
+    async def test_invalidation_during_foreground_flight_fences_successful_cache_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="fenced-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-fenced")[0]
+            started = asyncio.Event()
+            release = asyncio.Event()
+            attempts = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    started.set()
+                    await release.wait()
+                return SmartSummaryView(available=True, power_on_hours=attempts), None
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            request = asyncio.create_task(
+                service._get_slot_smart_summary_for_slot_view(slot)
+            )
+            await started.wait()
+            service.invalidate_snapshot_cache(
+                reason="test.foreground_fence",
+                cache_keys=["enc-fenced"],
+            )
+            release.set()
+
+            first = await request
+            second = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertEqual(first.power_on_hours, 1)
+            self.assertEqual(second.power_on_hours, 2)
+            self.assertEqual(attempts, 2)
+
+    async def test_concurrent_unavailable_cold_misses_single_flight_and_negative_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-flight-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-negative")[0]
+            started = asyncio.Event()
+            release = asyncio.Event()
+            attempts = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                started.set()
+                await release.wait()
+                return None, "synthetic unavailable"
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            requests = [
+                asyncio.create_task(service._get_slot_smart_summary_for_slot_view(slot))
+                for _ in range(3)
+            ]
+            await started.wait()
+            for _ in range(4):
+                await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.gather(*requests)
+            cached = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertTrue(all(result.available is False for result in results))
+            self.assertFalse(cached.available)
+            self.assertEqual(attempts, 1)
+
+    async def test_unavailable_summary_is_reused_only_until_negative_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-ttl-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-ttl")[0]
+            current = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+            attempts = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                return None, "synthetic unavailable"
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            with patch.object(inventory_module, "utcnow", side_effect=lambda: current):
+                await service._get_slot_smart_summary_for_slot_view(slot)
+                await service._get_slot_smart_summary_for_slot_view(slot)
+                self.assertEqual(attempts, 1)
+                current += timedelta(seconds=15)
+                await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertEqual(attempts, 2)
+
+    async def test_fresh_read_bypasses_negative_cache_but_still_single_flights(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-bypass-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-bypass")[0]
+            attempts = 0
+            release = asyncio.Event()
+            retry_started = asyncio.Event()
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 2:
+                    retry_started.set()
+                    await release.wait()
+                return None, "synthetic unavailable"
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            await service._get_slot_smart_summary_for_slot_view(slot)
+            requests = [
+                asyncio.create_task(
+                    service._get_slot_smart_summary_for_slot_view(
+                        slot,
+                        bypass_negative_cache=True,
+                    )
+                )
+                for _ in range(3)
+            ]
+            try:
+                for _ in range(2):
+                    await asyncio.sleep(0)
+                if any(request.done() for request in requests):
+                    await asyncio.gather(*requests)
+                await retry_started.wait()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                self.assertEqual(attempts, 2)
+            finally:
+                release.set()
+            await asyncio.gather(*requests)
+
+    async def test_success_replaces_negative_entry_and_uses_normal_positive_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-replaced-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = self._smart_budget_slots(1, enclosure_id="enc-replaced")[0]
+            attempts = 0
+
+            async def fetch_summary(*_args, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    return None, "synthetic unavailable"
+                return SmartSummaryView(available=True, power_on_hours=55), None
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            first = await service._get_slot_smart_summary_for_slot_view(slot)
+            second = await service._get_slot_smart_summary_for_slot_view(
+                slot,
+                bypass_negative_cache=True,
+            )
+            third = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertFalse(first.available)
+            self.assertEqual(second.power_on_hours, 55)
+            self.assertEqual(third.power_on_hours, 55)
+            self.assertEqual(attempts, 2)
+            self.assertNotIn(service._smart_cache_key(slot), service._smart_negative_cache)
+
+    async def test_negative_smart_cache_is_bounded_by_oldest_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-bounded-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slots = self._smart_budget_slots(3, enclosure_id="enc-bounded")
+            service._fetch_smart_summary_over_ssh = AsyncMock(
+                return_value=(None, "synthetic unavailable")
+            )
+
+            with patch.object(inventory_module, "SMART_NEGATIVE_CACHE_MAX_ENTRIES", 2):
+                for slot in slots:
+                    await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertEqual(len(service._smart_negative_cache), 2)
+            self.assertNotIn(service._smart_cache_key(slots[0]), service._smart_negative_cache)
+            self.assertIn(service._smart_cache_key(slots[1]), service._smart_negative_cache)
+            self.assertIn(service._smart_cache_key(slots[2]), service._smart_negative_cache)
+
+    async def test_unavailable_summary_is_not_stored_as_positive_or_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="negative-not-persisted-esxi",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-negative",
+                device_name="naa.synthetic",
+            )
+            service._build_esxi_slot_smart_summary = AsyncMock(
+                return_value=SmartSummaryView(available=False, message="synthetic unavailable")
+            )
+
+            summary = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            cache_key = service._smart_cache_key(slot)
+            self.assertFalse(summary.available)
+            self.assertNotIn(cache_key, service._smart_cache)
+            self.assertIn(cache_key, service._smart_negative_cache)
+            store = service.slot_detail_store
+            self.assertIsNotNone(store)
+            assert store is not None
+            self.assertTrue(all(not entry.smart_fields for entry in store.load_all().values()))
+
+    async def test_scoped_invalidation_removes_matching_negative_entries_and_fences_inflight_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 2
+            system = SystemConfig(
+                id="negative-invalidation-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            selected = self._smart_budget_slots(1, enclosure_id="enc-selected")[0]
+            other = self._smart_budget_slots(1, enclosure_id="enc-other")[0]
+            other = other.model_copy(update={"device_name": "other-device"})
+            attempts: dict[str, int] = {}
+            retry_started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def fetch_summary(candidates, **_kwargs):
+                candidate = candidates[0]
+                attempts[candidate] = attempts.get(candidate, 0) + 1
+                if candidate == "sd0" and attempts[candidate] == 2:
+                    retry_started.set()
+                    await release.wait()
+                return None, "synthetic unavailable"
+
+            service._fetch_smart_summary_over_ssh = AsyncMock(side_effect=fetch_summary)
+            await service._get_slot_smart_summary_for_slot_view(selected)
+            await service._get_slot_smart_summary_for_slot_view(other)
+            inflight = asyncio.create_task(
+                service._get_slot_smart_summary_for_slot_view(
+                    selected,
+                    bypass_negative_cache=True,
+                )
+            )
+            for _ in range(2):
+                await asyncio.sleep(0)
+            if inflight.done():
+                await inflight
+            await retry_started.wait()
+            service.invalidate_snapshot_cache(
+                reason="test.negative_fence",
+                cache_keys=["enc-selected"],
+            )
+            release.set()
+            await inflight
+
+            await service._get_slot_smart_summary_for_slot_view(other)
+            await service._get_slot_smart_summary_for_slot_view(selected)
+
+            self.assertEqual(attempts["other-device"], 1)
+            self.assertEqual(attempts["sd0"], 3)
+
+    async def test_transport_specific_smart_enrichment_command_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="transport-matrix",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            complete_common = {
+                "available": True,
+                "power_on_hours": 10,
+                "rotation_rate_rpm": 7200,
+                "form_factor": "2.5 inches",
+                "read_cache_enabled": True,
+                "writeback_cache_enabled": True,
+            }
+            cases = [
+                (
+                    "ATA",
+                    SmartSummaryView(
+                        **complete_common,
+                        transport_protocol="ATA",
+                        protocol_version="SATA 3.3",
+                        negotiated_link_rate="6 Gb/s",
+                        bytes_read=1,
+                        bytes_written=2,
+                        read_commands=3,
+                        write_commands=4,
+                    ),
+                    (),
+                ),
+                (
+                    "ATA",
+                    SmartSummaryView(available=True, transport_protocol="ATA"),
+                    ("smartctl-text", "smartctl-json"),
+                ),
+                (
+                    "ATA",
+                    SmartSummaryView(
+                        available=True,
+                        transport_protocol="ATA",
+                        protocol_version="SATA 3.3",
+                        negotiated_link_rate="6 Gb/s",
+                        rotation_rate_rpm=7200,
+                        form_factor="2.5 inches",
+                        read_cache_enabled=True,
+                        writeback_cache_enabled=True,
+                        bytes_read=1,
+                        bytes_written=2,
+                        read_commands=3,
+                        write_commands=4,
+                    ),
+                    ("smartctl-json",),
+                ),
+                (
+                    "SAS",
+                    SmartSummaryView(
+                        **complete_common,
+                        transport_protocol="SAS",
+                        logical_unit_id="0x1",
+                        sas_address="0x2",
+                        attached_sas_address="0x3",
+                        negotiated_link_rate="12 Gbps",
+                    ),
+                    (),
+                ),
+                (
+                    "SAS",
+                    SmartSummaryView(**complete_common, transport_protocol="SAS"),
+                    ("smartctl-text",),
+                ),
+                (
+                    "SAS",
+                    SmartSummaryView(
+                        available=True,
+                        transport_protocol="SAS",
+                        rotation_rate_rpm=7200,
+                        form_factor="2.5 inches",
+                        read_cache_enabled=True,
+                        writeback_cache_enabled=True,
+                        logical_unit_id="0x1",
+                        sas_address="0x2",
+                        attached_sas_address="0x3",
+                        negotiated_link_rate="12 Gbps",
+                    ),
+                    ("smartctl-json",),
+                ),
+                (
+                    "NVMe",
+                    SmartSummaryView(
+                        available=True,
+                        transport_protocol="NVMe",
+                        temperature_c=30,
+                        power_on_hours=10,
+                        available_spare_percent=100,
+                        available_spare_threshold_percent=10,
+                        endurance_used_percent=1,
+                        bytes_read=1,
+                        bytes_written=2,
+                        media_errors=0,
+                        unsafe_shutdowns=0,
+                        firmware_version="1.0",
+                        protocol_version="NVMe 2.0",
+                        warning_temperature_c=70,
+                        critical_temperature_c=80,
+                        namespace_eui64="0x1",
+                        namespace_nguid="0x2",
+                    ),
+                    (),
+                ),
+                (
+                    "NVMe",
+                    SmartSummaryView(available=True, transport_protocol="NVMe"),
+                    ("nvme-smart-log", "nvme-id-ctrl", "nvme-id-ns"),
+                ),
+                (
+                    "unknown",
+                    SmartSummaryView(available=True),
+                    ("smartctl-text",),
+                ),
+            ]
+
+            for expected_transport, summary, expected_groups in cases:
+                with self.subTest(transport=expected_transport, groups=expected_groups):
+                    slot = SlotView(
+                        slot=0,
+                        slot_label="00",
+                        row_index=0,
+                        column_index=0,
+                    )
+                    transport, groups = service._smart_enrichment_plan(
+                        summary,
+                        slot,
+                        ["device0"],
+                    )
+                    self.assertEqual(transport, expected_transport)
+                    self.assertEqual(groups, expected_groups)
+
+    async def test_core_nvme_json_does_not_fetch_text_or_ssh_for_missing_sas_fields(self) -> None:
+        class DummyTrueNASClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+            async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None):
+                self.calls.append((disk_name, tuple(args or [])))
+                if args != ["-a", "-j"]:
+                    raise AssertionError("complete NVMe JSON must not request text enrichment")
+                return json.dumps(
+                    {
+                        "device": {"protocol": "NVMe"},
+                        "smart_status": {"passed": True},
+                        "temperature": {"current": 31},
+                        "power_on_time": {"hours": 120},
+                        "rotation_rate": 0,
+                        "firmware_version": "1.0",
+                        "nvme_version": {"string": "NVMe 2.0"},
+                        "nvme_smart_health_information_log": {
+                            "available_spare": 100,
+                            "available_spare_threshold": 10,
+                            "percentage_used": 1,
+                            "data_units_read": 2,
+                            "data_units_written": 3,
+                            "media_errors": 0,
+                            "unsafe_shutdowns": 0,
+                        },
+                        "nvme_namespaces": [{"eui64": "".join(("00112233", "44556677"))}],
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="core-nvme",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True),
+            )
+            client = DummyTrueNASClient()
+            service = build_inventory_service(settings, system, client, AsyncMock(), temp_dir)
+            slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                device_name="nvme0n1",
+                transport_protocol="NVMe",
+            )
+            service._fetch_smart_summary_over_ssh = AsyncMock()
+
+            summary = await service._get_slot_smart_summary_for_slot_view(slot)
+
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.transport_protocol, "NVMe")
+            self.assertEqual(client.calls, [("nvme0n1", ("-a", "-j"))])
+            service._fetch_smart_summary_over_ssh.assert_not_awaited()
+
+    async def test_complete_core_ata_json_skips_ssh_json_while_sparse_ata_triggers_it(self) -> None:
+        class DummyTrueNASClient:
+            async def fetch_disk_smartctl(self, disk_name: str, args: list[str] | None = None):
+                if args == ["-x"]:
+                    return (
+                        "SMART overall-health self-assessment test result: PASSED\n"
+                        "Read Cache is: Enabled\n"
+                        "Writeback Cache is: Enabled\n"
+                        "SATA Version is: SATA 3.3 (current: 6 Gb/s)\n"
+                    )
+                if disk_name == "complete-ata":
+                    return json.dumps(
+                        {
+                            "device": {"protocol": "ATA"},
+                            "smart_status": {"passed": True},
+                            "power_on_time": {"hours": 10},
+                            "rotation_rate": 7200,
+                            "form_factor": {"name": "2.5 inches"},
+                            "sata_version": {"string": "SATA 3.3"},
+                            "interface_speed": {"current": {"string": "6 Gb/s"}},
+                            "read_lookahead": {"enabled": True},
+                            "write_cache": {"enabled": True},
+                            "ata_device_statistics": {
+                                "pages": [
+                                    {
+                                        "table": [
+                                            {"name": "Logical Sectors Read", "value": 2},
+                                            {"name": "Logical Sectors Written", "value": 3},
+                                            {"name": "Number of Read Commands", "value": 4},
+                                            {"name": "Number of Write Commands", "value": 5},
+                                        ]
+                                    }
+                                ]
+                            },
+                        }
+                    )
+                return json.dumps({"device": {"protocol": "ATA"}, "smart_status": {"passed": True}})
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="core-ata-staging",
+                truenas=TrueNASConfig(platform="core"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                DummyTrueNASClient(),
+                AsyncMock(),
+                temp_dir,
+            )
+            complete = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-ata",
+                device_name="complete-ata",
+                transport_protocol="ATA",
+            )
+            sparse = complete.model_copy(update={"slot": 1, "device_name": "sparse-ata"})
+            service._fetch_smart_summary_over_ssh = AsyncMock(
+                return_value=(SmartSummaryView(available=True, transport_protocol="ATA"), None)
+            )
+
+            await service._get_slot_smart_summary_for_slot_view(complete)
+            await service._get_slot_smart_summary_for_slot_view(sparse)
+
+            service._fetch_smart_summary_over_ssh.assert_awaited_once()
+            self.assertEqual(
+                service._fetch_smart_summary_over_ssh.await_args.args[0],
+                ["sparse-ata"],
+            )
+
+    async def test_smart_summary_over_ssh_stages_primary_json_before_sas_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="staged-sas",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            observed_batches: list[list[str]] = []
+
+            async def run_planned(planner, *, initial_commands, host=None):
+                self.assertIsNone(host)
+                initial = list(initial_commands)
+                observed_batches.append(initial)
+                self.assertEqual(len(initial), 1)
+                results = [
+                    SSHCommandResult(
+                        command=initial[0],
+                        ok=True,
+                        stdout=json.dumps(
+                            {
+                                "device": {"protocol": "SAS"},
+                                "smart_status": {"passed": True},
+                                "power_on_time": {"hours": 10},
+                            }
+                        ),
+                        exit_code=0,
+                    )
+                ]
+                followups = list(planner(results))
+                observed_batches.append(followups)
+                self.assertEqual(len(followups), 1)
+                results.append(
+                    SSHCommandResult(
+                        command=followups[0],
+                        ok=True,
+                        stdout=(
+                            "Transport protocol: SAS\n"
+                            "SAS address = 0x1\n"
+                            "attached SAS address = 0x2\n"
+                            "negotiated logical link rate: 12 Gbps\n"
+                        ),
+                        exit_code=0,
+                    )
+                )
+                return results
+
+            service._run_ssh_planned_commands = AsyncMock(side_effect=run_planned)
+            service._run_ssh_commands = AsyncMock(
+                side_effect=AssertionError("eager SMART command batches are forbidden")
+            )
+
+            summary, error = await service._fetch_smart_summary_over_ssh(["sda"])
+
+            self.assertIsNone(error)
+            self.assertIsNotNone(summary)
+            assert summary is not None
+            self.assertEqual(summary.transport_protocol, "SAS")
+            self.assertEqual(len(observed_batches), 2)
+            self.assertIn("-x -j /dev/sda", observed_batches[0][0])
+            self.assertIn("-x /dev/sda", observed_batches[1][0])
+
+    async def test_linux_nvme_staging_requests_only_missing_command_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="staged-nvme",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            followup_commands: list[str] = []
+
+            async def run_planned(planner, *, initial_commands, host=None):
+                initial = list(initial_commands)
+                results = [
+                    SSHCommandResult(
+                        command=initial[0],
+                        ok=True,
+                        stdout=json.dumps(
+                            {
+                                "device": {"protocol": "NVMe"},
+                                "temperature": {"current": 30},
+                                "power_on_time": {"hours": 100},
+                                "nvme_smart_health_information_log": {
+                                    "available_spare": 100,
+                                    "available_spare_threshold": 10,
+                                    "percentage_used": 1,
+                                    "data_units_read": 2,
+                                    "data_units_written": 3,
+                                    "media_errors": 0,
+                                    "unsafe_shutdowns": 0,
+                                },
+                            }
+                        ),
+                        exit_code=0,
+                    )
+                ]
+                followup_commands.extend(planner(results))
+                results.extend(
+                    SSHCommandResult(command=command, ok=True, stdout="{}", exit_code=0)
+                    for command in followup_commands
+                )
+                return results
+
+            service._run_ssh_planned_commands = AsyncMock(side_effect=run_planned)
+            service._run_ssh_commands = AsyncMock(
+                side_effect=AssertionError("eager SMART command batches are forbidden")
+            )
+
+            summary, error = await service._fetch_smart_summary_over_ssh(["nvme0n1"])
+
+            self.assertIsNone(error)
+            self.assertIsNotNone(summary)
+            self.assertEqual(len(followup_commands), 2)
+            self.assertTrue(any(" id-ctrl " in command for command in followup_commands))
+            self.assertTrue(any(" id-ns " in command for command in followup_commands))
+            self.assertFalse(any(" smart-log " in command for command in followup_commands))
+            self.assertFalse(any("smartctl" in command and " -j " not in command for command in followup_commands))
+
+    async def test_mixed_transport_concurrent_requests_bound_and_coalesce_remote_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.app.smart_batch_max_concurrency = 2
+            system = SystemConfig(
+                id="mixed-transport-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            sas_slot = SlotView(
+                slot=0,
+                slot_label="00",
+                row_index=0,
+                column_index=0,
+                enclosure_id="enc-mixed",
+                device_name="sas0",
+                transport_protocol="SAS",
+            )
+            nvme_slot = SlotView(
+                slot=1,
+                slot_label="01",
+                row_index=0,
+                column_index=1,
+                enclosure_id="enc-mixed",
+                device_name="nvme0n1",
+                transport_protocol="NVMe",
+            )
+            service.get_snapshot = AsyncMock(
+                return_value=InventorySnapshot(
+                    slots=[sas_slot, nvme_slot],
+                    refresh_interval_seconds=30,
+                )
+            )
+            release = asyncio.Event()
+            both_started = asyncio.Event()
+            active = 0
+            peak = 0
+            primary_counts: dict[str, int] = {}
+            followups_by_device: dict[str, list[str]] = {}
+
+            async def run_planned(planner, *, initial_commands, host=None):
+                nonlocal active, peak
+                initial = list(initial_commands)
+                command = initial[0]
+                device = "nvme" if "/dev/nvme0n1" in command else "sas"
+                primary_counts[device] = primary_counts.get(device, 0) + 1
+                active += 1
+                peak = max(peak, active)
+                if len(primary_counts) == 2:
+                    both_started.set()
+                try:
+                    await release.wait()
+                    payload = (
+                        {
+                            "device": {"protocol": "NVMe"},
+                            "smart_status": {"passed": True},
+                        }
+                        if device == "nvme"
+                        else {
+                            "device": {"protocol": "SAS"},
+                            "smart_status": {"passed": True},
+                        }
+                    )
+                    results = [
+                        SSHCommandResult(
+                            command=command,
+                            ok=True,
+                            stdout=json.dumps(payload),
+                            exit_code=0,
+                        )
+                    ]
+                    followups = list(planner(results))
+                    followups_by_device[device] = followups
+                    results.extend(
+                        SSHCommandResult(command=item, ok=True, stdout="{}", exit_code=0)
+                        for item in followups
+                    )
+                    return results
+                finally:
+                    active -= 1
+
+            service._run_ssh_planned_commands = AsyncMock(side_effect=run_planned)
+            first = asyncio.create_task(
+                service.get_slot_smart_summaries([0, 1, 0, 99], max_concurrency=8)
+            )
+            second = asyncio.create_task(
+                service.get_slot_smart_summaries([1, 0], max_concurrency=8)
+            )
+            try:
+                await both_started.wait()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                self.assertEqual(peak, 2)
+            finally:
+                release.set()
+            first_result, second_result = await asyncio.gather(first, second)
+
+            self.assertEqual([item.slot for item in first_result], [0, 1])
+            self.assertEqual([item.slot for item in second_result], [1, 0])
+            self.assertEqual(primary_counts, {"sas": 1, "nvme": 1})
+            self.assertTrue(followups_by_device["sas"])
+            self.assertTrue(all("nvme " not in command for command in followups_by_device["sas"]))
+            self.assertTrue(followups_by_device["nvme"])
+            self.assertTrue(all("nvme " in command for command in followups_by_device["nvme"]))
+            self.assertTrue(all("smartctl" not in command for command in followups_by_device["nvme"]))
+
+    async def test_real_ssh_smart_request_uses_one_planned_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="planned-session-linux",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.50", user="operator"),
+            )
+            probe = SSHProbe(system.ssh)
+            service = build_inventory_service(settings, system, AsyncMock(), probe, temp_dir)
+
+            async def run_planned(planner, *, initial_commands):
+                initial = list(initial_commands)
+                results = [
+                    SSHCommandResult(
+                        command=initial[0],
+                        ok=True,
+                        stdout=json.dumps(
+                            {
+                                "device": {"protocol": "SAS"},
+                                "smart_status": {"passed": True},
+                            }
+                        ),
+                        exit_code=0,
+                    )
+                ]
+                results.extend(
+                    SSHCommandResult(command=command, ok=True, stdout="", exit_code=0)
+                    for command in planner(results)
+                )
+                return results
+
+            probe.run_planned_commands = AsyncMock(side_effect=run_planned)  # type: ignore[method-assign]
+
+            summary, error = await service._fetch_smart_summary_over_ssh(["sda"])
+
+            self.assertIsNone(error)
+            self.assertIsNotNone(summary)
+            probe.run_planned_commands.assert_awaited_once()
+
     async def test_degraded_smart_cache_uses_default_snapshot_scope_when_enclosure_is_omitted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -6633,11 +7872,11 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsNone(error)
             self.assertIsNotNone(summary)
-            self.assertEqual(service._run_ssh_commands.await_count, 1)
-            combined_batch = service._run_ssh_commands.await_args
-            self.assertIsNotNone(combined_batch)
-            assert combined_batch is not None
-            self.assertEqual(len(combined_batch.args[0]), 5)
+            self.assertEqual(service._run_ssh_commands.await_count, 2)
+            staged_batches = [call.args[0] for call in service._run_ssh_commands.await_args_list]
+            self.assertEqual(len(staged_batches[0]), 1)
+            self.assertEqual(len(staged_batches[1]), 3)
+            self.assertTrue(all("nvme " in command for command in staged_batches[1]))
 
     async def test_esxi_host_smart_candidates_share_one_command_batch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -8575,7 +9814,12 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            async def fetch_summary(slot_view: SlotView, *, allow_stale_cache: bool = False) -> SmartSummaryView:
+            async def fetch_summary(
+                slot_view: SlotView,
+                *,
+                allow_stale_cache: bool = False,
+                bypass_negative_cache: bool = False,
+            ) -> SmartSummaryView:
                 return SmartSummaryView(available=True, power_on_hours=100 + slot_view.slot)
 
             service._get_slot_smart_summary_for_slot_view = AsyncMock(side_effect=fetch_summary)
@@ -8620,7 +9864,12 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             active_calls = 0
             peak_calls = 0
 
-            async def fetch_summary(slot_view: SlotView, *, allow_stale_cache: bool = False) -> SmartSummaryView:
+            async def fetch_summary(
+                slot_view: SlotView,
+                *,
+                allow_stale_cache: bool = False,
+                bypass_negative_cache: bool = False,
+            ) -> SmartSummaryView:
                 nonlocal active_calls, peak_calls
                 active_calls += 1
                 peak_calls = max(peak_calls, active_calls)
@@ -9210,7 +10459,13 @@ Enclosure Status diagnostic page:
                 id="quantastor-lab",
                 label="Quantastor Lab",
                 truenas=TrueNASConfig(platform="quantastor"),
-                ssh=SSHConfig(enabled=True, host="10.0.0.10", user="jbodmap", commands=[]),
+                ssh=SSHConfig(
+                    enabled=True,
+                    host="10.0.0.10",
+                    extra_hosts=[f"10.0.0.{20}"],
+                    user="jbodmap",
+                    commands=[],
+                ),
             )
             service = build_inventory_service(
                 settings,
@@ -9222,32 +10477,28 @@ Enclosure Status diagnostic page:
 
             async def run_commands(commands: list[str], host: str | None = None) -> list[SSHCommandResult]:
                 self.assertEqual(host, "10.0.0.20")
-                self.assertEqual(len(commands), 2)
-                json_command, text_command = commands
                 return [
                     SSHCommandResult(
-                        command=json_command,
+                        command=command,
                         ok=True,
                         stdout=(
-                            '{'
-                            '"power_on_time":{"hours":47003},'
-                            '"rotation_rate":0,'
-                            '"smart_status":{"passed":true}'
-                            '}'
+                            (
+                                '{'
+                                '"power_on_time":{"hours":47003},'
+                                '"rotation_rate":0,'
+                                '"smart_status":{"passed":true}'
+                                '}'
+                            )
+                            if " -j " in command
+                            else (
+                                "Read Cache is:        Enabled\n"
+                                "Writeback Cache is:   Enabled\n"
+                            )
                         ),
                         stderr="",
                         exit_code=0,
-                    ),
-                    SSHCommandResult(
-                        command=text_command,
-                        ok=True,
-                        stdout=(
-                            "Read Cache is:        Enabled\n"
-                            "Writeback Cache is:   Enabled\n"
-                        ),
-                        stderr="",
-                        exit_code=0,
-                    ),
+                    )
+                    for command in commands
                 ]
 
             service._run_ssh_commands = AsyncMock(side_effect=run_commands)
@@ -9261,10 +10512,10 @@ Enclosure Status diagnostic page:
             self.assertEqual(summary.power_on_hours, 47003)
             self.assertTrue(summary.read_cache_enabled)
             self.assertTrue(summary.writeback_cache_enabled)
-            service._run_ssh_commands.assert_awaited_once()
-            batched_commands = service._run_ssh_commands.await_args.args[0]
-            self.assertIn("-x -j /dev/sdb", batched_commands[0])
-            self.assertIn("-x /dev/sdb", batched_commands[1])
+            self.assertEqual(service._run_ssh_commands.await_count, 2)
+            staged_batches = [call.args[0] for call in service._run_ssh_commands.await_args_list]
+            self.assertIn("-x -j /dev/sdb", staged_batches[0][0])
+            self.assertIn("-x /dev/sdb", staged_batches[1][0])
 
     async def test_real_ssh_probe_command_batches_are_serialized_per_inventory_service(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -9935,9 +11186,8 @@ Enclosure Status diagnostic page:
                     ("ada0", ("-x",)),
                 ],
             )
-            self.assertEqual(len(service.ssh_probe.commands), 2)
+            self.assertEqual(len(service.ssh_probe.commands), 1)
             self.assertIn("/usr/local/sbin/smartctl -x -j /dev/ada0", service.ssh_probe.commands[0])
-            self.assertIn("/usr/local/sbin/smartctl -x /dev/ada0", service.ssh_probe.commands[1])
 
     async def test_core_smart_summary_falls_back_to_ssh_when_api_smartctl_fails(self) -> None:
         class DummyTrueNASClient:
