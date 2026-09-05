@@ -1,0 +1,107 @@
+name: PR type labels
+
+# Applies the release-notes type label from the pull request title's
+# conventional prefix so `.github/release.yml` can categorize it. Runs in the
+# base branch context with the default token only; it never checks out or runs
+# pull request code and reads nothing but the event title and number.
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: pr-labels-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    name: Apply type label from title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Derive and apply labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+
+          # Mutually exclusive type labels swapped when the title type changes.
+          # 'security' and 'breaking' are sticky: added from the title, never
+          # removed automatically, because maintainers also apply them by hand.
+          type_labels=(enhancement bug performance documentation tests ci internal)
+
+          title="$PR_TITLE"
+          # Strip leading bracketed tags such as "[verified] fix: ...".
+          while [[ "$title" =~ ^[[:space:]]*\[[^]]*\][[:space:]]*(.*)$ ]]; do
+            title="${BASH_REMATCH[1]}"
+          done
+
+          declare -a want=()
+          if [[ "$title" =~ ^([a-z]+)(\(([^)]*)\))?(!)?: ]]; then
+            type="${BASH_REMATCH[1]}"
+            scope="${BASH_REMATCH[3]:-}"
+            bang="${BASH_REMATCH[4]:-}"
+            case "$type" in
+              feat) want+=(enhancement) ;;
+              fix) want+=(bug) ;;
+              perf) want+=(performance) ;;
+              docs) want+=(documentation) ;;
+              test) want+=(tests) ;;
+              ci) want+=(ci) ;;
+              refactor|chore|build) want+=(internal) ;;
+              security) want+=(security) ;;
+              *)
+                echo "Unknown conventional type '$type'; leaving labels unchanged."
+                exit 0
+                ;;
+            esac
+            if [[ "$scope" == "security" ]]; then
+              want+=(security)
+            fi
+            if [[ -n "$bang" ]]; then
+              want+=(breaking)
+            fi
+          else
+            echo "Title has no conventional prefix; leaving labels unchanged."
+            exit 0
+          fi
+
+          mapfile -t current < <(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name')
+
+          contains() {
+            local needle="$1"; shift
+            local item
+            for item in "$@"; do
+              [[ "$item" == "$needle" ]] && return 0
+            done
+            return 1
+          }
+
+          add_args=()
+          remove_args=()
+          for label in "${want[@]}"; do
+            if ! contains "$label" "${current[@]}"; then
+              add_args+=(--add-label "$label")
+            fi
+          done
+          for label in "${type_labels[@]}"; do
+            if contains "$label" "${current[@]}" && ! contains "$label" "${want[@]}"; then
+              remove_args+=(--remove-label "$label")
+            fi
+          done
+          if [[ ${#add_args[@]} -eq 0 && ${#remove_args[@]} -eq 0 ]]; then
+            echo "Labels already match title: ${want[*]}"
+            exit 0
+          fi
+          gh pr edit "$PR_NUMBER" "${add_args[@]}" "${remove_args[@]}"
+          echo "Applied: ${want[*]}"
