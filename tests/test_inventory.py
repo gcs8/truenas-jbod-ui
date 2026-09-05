@@ -6000,9 +6000,198 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
                 ],
             )
 
-            index = service._build_bmc_serial_disk_index(bmc_inventory)
+            platform_disks = service._build_disk_records(
+                [{"name": "da0", "serial": "SERIAL-1"}],
+                ParsedSSHData(),
+                {},
+                {},
+            )
+            index = service._build_bmc_serial_disk_index(bmc_inventory, platform_disks)
 
             self.assertNotIn("serial-1", index)
+
+    def test_bmc_serial_match_is_consumed_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(
+                Settings(),
+                SystemConfig(id="core-1", truenas=TrueNASConfig(platform="core")),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            platform_disks = service._build_disk_records(
+                [{"name": "da0", "serial": "SERIAL-1"}],
+                ParsedSSHData(),
+                {},
+                {},
+            )
+            bmc_inventory = BMCInventory(
+                drives=[BMCDriveRecord(controller_id=0, physical_index=0, slot_number=1, serial="SERIAL-1")]
+            )
+            index = service._build_bmc_serial_disk_index(bmc_inventory, platform_disks)
+
+            self.assertIsNotNone(service._match_bmc_disk_by_serial(platform_disks[0], index))
+            self.assertIsNone(service._match_bmc_disk_by_serial(platform_disks[0], index))
+
+    def _assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates(
+        self,
+        platform: str,
+        *,
+        conflicting: bool,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system_id = "example-qs-ha" if platform == "quantastor" else f"{platform}-1"
+            service = build_inventory_service(
+                settings,
+                SystemConfig(id=system_id, truenas=TrueNASConfig(platform=platform)),
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            bmc_inventory = BMCInventory(
+                drives=[
+                    BMCDriveRecord(
+                        controller_id=7,
+                        physical_index=11,
+                        slot_number=13,
+                        serial="SERIAL-1",
+                    )
+                ],
+            )
+
+            if platform == "quantastor":
+                disks = [
+                    {
+                        "id": "pdisk-1",
+                        "storageSystemId": "node-a",
+                        "devicePath": "/dev/sda",
+                        "serialNumber": "SERIAL-1",
+                        "serial": "SERIAL-OTHER" if conflicting else "SERIAL-1",
+                        "healthStatus": "ONLINE",
+                        "slot": "01",
+                    }
+                ]
+                if not conflicting:
+                    disks.append(
+                        {
+                            "id": "pdisk-2",
+                            "storageSystemId": "node-a",
+                            "devicePath": "/dev/sdb",
+                            "serialNumber": " serial-1 ",
+                            "healthStatus": "ONLINE",
+                            "slot": "02",
+                        }
+                    )
+                raw_data = TrueNASRawData(
+                    enclosures=[],
+                    systems=[{"id": "node-a", "name": "Example QS"}],
+                    disks=disks,
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                )
+                ssh_data = ParsedSSHData()
+                correlate_kwargs = {"quantastor_ses_data": ParsedSSHData()}
+            else:
+                disks = [
+                    {
+                        "name": "da0" if platform == "core" else "sda",
+                        "serial": "SERIAL-1",
+                        "serialNumber": "SERIAL-OTHER" if conflicting else "SERIAL-1",
+                        "status": "ONLINE",
+                    }
+                ]
+                if not conflicting:
+                    disks.append(
+                        {
+                            "name": "da1" if platform == "core" else "sdb",
+                            "serial": " serial-1 ",
+                            "status": "ONLINE",
+                        }
+                    )
+                if platform == "core":
+                    for index, disk in enumerate(disks, start=1):
+                        disk["enclosure"] = {"id": "enc-1", "slot": index}
+                    raw_data = TrueNASRawData(
+                        enclosures=[
+                            {
+                                "id": "enc-1",
+                                "label": "Core Front",
+                                "elements": [
+                                    {"slot": index, "dev": f"/dev/{disk['name']}", "status": "OK"}
+                                    for index, disk in enumerate(disks, start=1)
+                                ],
+                            }
+                        ],
+                        disks=disks,
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    )
+                    ssh_data = ParsedSSHData()
+                else:
+                    raw_data = TrueNASRawData(
+                        enclosures=[],
+                        disks=disks,
+                        pools=[],
+                        disk_temperatures={},
+                        smart_test_results=[],
+                    )
+                    ssh_data = ParsedSSHData(
+                        ses_enclosures=[
+                            SESMapEnclosure(
+                                ses_device="/dev/sg27",
+                                enclosure_id="scale-ses",
+                                enclosure_label="Scale SES",
+                                slots={
+                                    index: SESMapSlot(
+                                        slot_number=index,
+                                        element_id=index,
+                                        device_names=[disk["name"]],
+                                        status="OK",
+                                        present=True,
+                                    )
+                                    for index, disk in enumerate(disks)
+                                },
+                            )
+                        ]
+                    )
+                correlate_kwargs = {}
+
+            slot_views, *_rest = service._correlate(
+                raw_data,
+                ssh_data,
+                [],
+                bmc_inventory=bmc_inventory,
+                **correlate_kwargs,
+            )
+            correlated_slots = [slot for slot in slot_views if slot.serial]
+
+            self.assertEqual(len(correlated_slots), 1 if conflicting else 2)
+            for slot in correlated_slots:
+                self.assertNotEqual(slot.led_backend, "supermicro_bmc")
+                self.assertNotIn("bmc_match_source", slot.raw_status)
+                self.assertNotIn("bmc_controller_id", slot.raw_status)
+                self.assertNotIn("bmc_physical_index", slot.raw_status)
+
+    def test_core_duplicate_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("core", conflicting=False)
+
+    def test_core_conflicting_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("core", conflicting=True)
+
+    def test_scale_duplicate_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("scale", conflicting=False)
+
+    def test_scale_conflicting_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("scale", conflicting=True)
+
+    def test_quantastor_duplicate_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("quantastor", conflicting=False)
+
+    def test_quantastor_conflicting_platform_serials_do_not_gain_bmc_coordinates(self) -> None:
+        self._assert_ambiguous_platform_serials_do_not_gain_bmc_coordinates("quantastor", conflicting=True)
 
     def test_core_slot_is_augmented_by_matching_bmc_serial(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

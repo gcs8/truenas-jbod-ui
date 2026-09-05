@@ -5053,7 +5053,7 @@ class InventoryService:
             disk_records,
             self.system.truenas.platform,
         )
-        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
+        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory, disk_records)
         loaded_mappings = frame.loaded_mappings
 
         slot_views: list[SlotView] = []
@@ -5925,7 +5925,7 @@ class InventoryService:
             disk_records,
             self.system.truenas.platform,
         )
-        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
+        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory, disk_records)
 
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_option.id)
         is_sub_view = mapping_enclosure_id != selected_option.id
@@ -6055,7 +6055,7 @@ class InventoryService:
         disks_by_sas = index_disks_by_sas(
             (disk, *self._disk_sas_alias_tiers(disk)) for disk in disk_records
         )
-        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
+        bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory, disk_records)
 
         api_topology_members = self._build_quantastor_topology_members(raw_data, disk_records)
         selected_meta = frame.selected_meta
@@ -9271,31 +9271,42 @@ class InventoryService:
             keys.update(normalize_lookup_keys(str(value) if value is not None else None))
         return keys
 
-    def _build_bmc_serial_disk_index(self, bmc_inventory: BMCInventory | None) -> dict[str, DiskRecord]:
+    def _build_bmc_serial_disk_index(
+        self,
+        bmc_inventory: BMCInventory | None,
+        platform_disks: Iterable[DiskRecord],
+    ) -> dict[str, DiskRecord]:
+        bmc_disks = self._build_bmc_disk_records(bmc_inventory)
+        bmc_serial_counts: Counter[str] = Counter()
+        platform_serial_counts: Counter[str] = Counter()
+
+        for disk in bmc_disks:
+            bmc_serial_counts.update(self._disk_record_serial_identity_keys(disk))
+        for disk in platform_disks:
+            platform_serial_counts.update(self._disk_record_serial_identity_keys(disk))
+
         index: dict[str, DiskRecord] = {}
-        ambiguous_keys: set[str] = set()
-        for disk in self._build_bmc_disk_records(bmc_inventory):
-            for key in self._disk_record_serial_identity_keys(disk):
-                if key in ambiguous_keys:
-                    continue
-                existing = index.get(key)
-                if existing is not None:
-                    ambiguous_keys.add(key)
-                    index.pop(key, None)
-                    continue
-                index[key] = disk
-        return {key: disk for key, disk in index.items() if key not in ambiguous_keys}
+        for disk in bmc_disks:
+            serial_keys = self._disk_record_serial_identity_keys(disk)
+            if len(serial_keys) != 1:
+                continue
+            serial_key = next(iter(serial_keys))
+            if bmc_serial_counts[serial_key] != 1:
+                continue
+            if platform_serial_counts[serial_key] != 1:
+                continue
+            index[serial_key] = disk
+        return index
 
     def _match_bmc_disk_by_serial(
         self,
         disk: DiskRecord | None,
         bmc_disks_by_serial: dict[str, DiskRecord],
     ) -> DiskRecord | None:
-        for key in self._disk_record_serial_identity_keys(disk):
-            matched = bmc_disks_by_serial.get(key)
-            if matched is not None:
-                return matched
-        return None
+        serial_keys = self._disk_record_serial_identity_keys(disk)
+        if len(serial_keys) != 1:
+            return None
+        return bmc_disks_by_serial.pop(next(iter(serial_keys)), None)
 
     @staticmethod
     def _build_bmc_platform_context(bmc_inventory: BMCInventory) -> dict[str, Any]:
