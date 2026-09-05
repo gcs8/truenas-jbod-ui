@@ -455,6 +455,7 @@ jobs:
           ADMIN_AUTO_STOP_SECONDS: "0"
           ADMIN_DOCKER_SOCKET_PATH: /tmp/truenas-jbod-ui-admin-cleanroom/missing-docker.sock
           ADMIN_HOST_PREP_TEMP_DIR: /tmp/truenas-jbod-ui-admin-cleanroom/host-prep
+          ADMIN_PUBLIC_ORIGIN: http://127.0.0.1:8082
           APP_CONFIG_PATH: ${{ github.workspace }}/qa/fixtures/admin-cleanroom-config.yaml
           HISTORY_SQLITE_PATH: /tmp/truenas-jbod-ui-admin-cleanroom/history/history.db
           PLAYWRIGHT_ADMIN_BASE_URL: http://127.0.0.1:8082

@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, patch
 
 from fastapi.routing import APIRoute
 
+# Must precede admin_service.main, which builds its app at import time.
+import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
 from admin_service import main as admin_main
 from app import main as app_main
 from app.models.domain import SystemBackupExportRequest

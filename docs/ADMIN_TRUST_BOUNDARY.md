@@ -15,6 +15,23 @@ Remote binding remains supported. The default `0.0.0.0:8082` publication assumes
 
 Auto-stop limits exposure time, but it is not authentication. The Docker socket and writable configuration mounts make reachability the authorization boundary in this mode.
 
+## Admin browser origin
+
+`ADMIN_PUBLIC_ORIGIN` is required in both authentication modes. Set it to the
+exact origin the browser shows for the admin UI: scheme, host, and port, with no
+path, for example `http://jbod-admin.example.test:8082` for the default port
+publication or `https://jbod-admin.example.test` behind a reverse proxy.
+
+Browser-initiated admin changes (POST, PUT, PATCH, DELETE) are accepted only when
+their `Origin` or `Referer` header matches this value. Because an unset or
+malformed value would reject every browser change while leaving header-less CLI
+requests unaffected, the admin service refuses to start until the value is a
+valid origin. Deployments that upgrade with an empty `ADMIN_PUBLIC_ORIGIN=` line
+in `.env` must fill it in before the admin container starts again. A mismatch
+(for example a different port, or `https` served through a proxy while the value
+still says `http`) shows up as `403 Cross-origin admin mutation rejected.` on
+every admin action.
+
 For the main UI on port `8080`, network mode is read-only. Inventory, history,
 SMART, export, and import-preview requests remain available, including the
 read-only POST routes they use. Persistent mapping and alias changes, confirmed
@@ -66,6 +83,7 @@ ADMIN_AUTH_MODE=basic
 ADMIN_AUTH_USERNAME=operator
 ADMIN_AUTH_PASSWORD=replace-with-a-long-random-secret
 APP_PUBLIC_ORIGIN=https://storage-ui.example.local
+ADMIN_PUBLIC_ORIGIN=https://storage-admin.example.local
 ```
 
 The same credentials protect main-UI mutation endpoints and all admin HTML,
@@ -77,12 +95,13 @@ Prometheus scraping continue to work.
 Basic credentials are only encoded, not encrypted. Use HTTPS through a reverse proxy or a private encrypted VPN. Do not expose Basic authentication over plaintext Internet transport. Keep the password in the ignored local `.env` or another deployment secret source, never in tracked configuration or command output.
 
 Main-UI browser mutations are accepted only when their `Origin` or `Referer`
-matches `APP_PUBLIC_ORIGIN`. Admin browser mutations use the separate
-`ADMIN_PUBLIC_ORIGIN` setting because the services normally publish on different
-ports. Requests without either header remain available to authenticated CLI and
-automation clients. A reverse proxy that replaces Basic authentication with
-cookies must still provide its own CSRF controls and must prevent direct access
-to the underlying service ports.
+matches `APP_PUBLIC_ORIGIN`. Admin browser mutations use the separate, always
+required `ADMIN_PUBLIC_ORIGIN` setting (see
+[Admin browser origin](#admin-browser-origin)) because the services normally
+publish on different ports. Requests without either header remain available to
+authenticated CLI and automation clients. A reverse proxy that replaces Basic
+authentication with cookies must still provide its own CSRF controls and must
+prevent direct access to the underlying service ports.
 
 ## Backup export policy
 
@@ -109,7 +128,8 @@ published port, or Docker socket. The admin sidecar retains its default
 Before starting the admin profile:
 
 1. Confirm who can route to the published admin port.
-2. Choose `network` only when that entire population is trusted to control containers and read or replace application state.
-3. Otherwise select `basic` or place an authenticated reverse proxy in front of the service and block direct port access.
-4. Keep health and metrics reachability separate from privileged route reachability where the network design permits it.
-5. Leave plaintext backup export disabled unless its risk is accepted for that deployment.
+2. Set `ADMIN_PUBLIC_ORIGIN` to the exact origin operators will type into the browser; the service does not start without it.
+3. Choose `network` only when that entire population is trusted to control containers and read or replace application state.
+4. Otherwise select `basic` or place an authenticated reverse proxy in front of the service and block direct port access.
+5. Keep health and metrics reachability separate from privileged route reachability where the network design permits it.
+6. Leave plaintext backup export disabled unless its risk is accepted for that deployment.

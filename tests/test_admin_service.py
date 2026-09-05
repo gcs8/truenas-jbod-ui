@@ -20,6 +20,8 @@ from fastapi import Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from app import __version__
+# Must precede admin_service.main, which builds its app at import time.
+import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
 from admin_service.config import AdminSettings
 from admin_service.services.esxi_host_prep import MAX_UPLOAD_BYTES
 from admin_service.services.runtime_control import DockerRuntimeService

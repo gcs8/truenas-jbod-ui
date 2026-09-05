@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 
 from pydantic import SecretStr
 
+# Must precede admin_service.main, which builds its app at import time.
+from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings
 from admin_service.main import create_app
 
@@ -103,7 +105,11 @@ class AdminRuntimeRouteTests(unittest.TestCase):
         return service
 
     def test_runtime_get_route_returns_a_narrow_fresh_runtime_payload(self) -> None:
-        settings = AdminSettings(auth_mode="network", auto_stop_seconds=0)
+        settings = AdminSettings(
+            auth_mode="network",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
+            auto_stop_seconds=0,
+        )
         runtime_service = self._runtime_service()
         release_service = SimpleNamespace(
             snapshot=lambda: {"latest_tag": "v0.22.0", "latest_version": "0.22.0"}
@@ -163,6 +169,7 @@ class AdminRuntimeRouteTests(unittest.TestCase):
             auth_mode="basic",
             auth_username="operator",
             auth_password=SecretStr("runtime-passphrase"),
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         runtime_service = self._runtime_service()
@@ -191,7 +198,11 @@ class AdminRuntimeRouteTests(unittest.TestCase):
         runtime_service.status_payload.assert_called_once_with()
 
     def test_runtime_get_route_replaces_unavailable_runtime_detail(self) -> None:
-        settings = AdminSettings(auth_mode="network", auto_stop_seconds=0)
+        settings = AdminSettings(
+            auth_mode="network",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
+            auto_stop_seconds=0,
+        )
         runtime_service = MagicMock()
         runtime_service.status_payload.return_value = {
             "available": False,

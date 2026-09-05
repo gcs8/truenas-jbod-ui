@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
+import os
 import re
 import tempfile
 import unittest
@@ -13,6 +15,8 @@ from pydantic import SecretStr, ValidationError
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
 
+# Must precede admin_service.main, which builds its app at import time.
+from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings, get_admin_settings
 from admin_service.main import (
     _basic_auth_matches,
@@ -193,6 +197,7 @@ class AdminAuthenticationTests(unittest.TestCase):
             auth_mode="basic",
             auth_username="operator",
             auth_password=SecretStr(MARKER_ALPHA),
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
@@ -221,6 +226,7 @@ class AdminAuthenticationTests(unittest.TestCase):
             auth_mode="basic",
             auth_username="operator",
             auth_password=SecretStr(MARKER_ALPHA),
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
@@ -254,7 +260,7 @@ class AdminAuthenticationTests(unittest.TestCase):
     def test_origin_gate_wraps_every_admin_router_mutation(self) -> None:
         settings = AdminSettings(
             auth_mode="network",
-            public_origin="http://admin.example.test",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
@@ -286,19 +292,96 @@ class AdminAuthenticationTests(unittest.TestCase):
                 )
 
     def test_network_boundary_mode_preserves_remote_unauthenticated_contract(self) -> None:
-        settings = AdminSettings(auth_mode="network", auto_stop_seconds=0)
+        settings = AdminSettings(
+            auth_mode="network",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
+            auto_stop_seconds=0,
+        )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
             app = create_app()
 
         status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing"))
         self.assertEqual(status, 404)
 
+    def test_admin_test_env_replaces_a_blank_or_malformed_inherited_origin(self) -> None:
+        # A shell that sourced .env inherits the shipped empty `ADMIN_PUBLIC_ORIGIN=` line as a
+        # present-but-blank variable; the helper must still supply the synthetic origin.
+        import tests.admin_test_env as admin_test_env
+
+        try:
+            for inherited in ("", "   ", "not-an-origin", "https://admin.example.test/path"):
+                with self.subTest(inherited=inherited):
+                    with patch.dict("os.environ", {"ADMIN_PUBLIC_ORIGIN": inherited}):
+                        importlib.reload(admin_test_env)
+                        self.assertEqual(os.environ["ADMIN_PUBLIC_ORIGIN"], ADMIN_TEST_PUBLIC_ORIGIN)
+                        self.assertEqual(get_admin_settings().public_origin, ADMIN_TEST_PUBLIC_ORIGIN)
+            with patch.dict("os.environ", {"ADMIN_PUBLIC_ORIGIN": "https://inherited.example.test"}):
+                importlib.reload(admin_test_env)
+                self.assertEqual(os.environ["ADMIN_PUBLIC_ORIGIN"], "https://inherited.example.test")
+                self.assertEqual(get_admin_settings().public_origin, "https://inherited.example.test")
+        finally:
+            importlib.reload(admin_test_env)
+            get_admin_settings.cache_clear()
+
+    def test_create_app_refuses_to_start_without_a_valid_public_origin(self) -> None:
+        for public_origin in (
+            None,
+            "",
+            "   ",
+            "not-an-origin",
+            "ftp://admin.example.test",
+            "https://user@admin.example.test",
+            "https://admin.example.test/path",
+            "https://admin.example.test?query=1",
+            "https://admin.example.test#fragment",
+        ):
+            with self.subTest(public_origin=public_origin):
+                settings = AdminSettings(
+                    auth_mode="network",
+                    public_origin=public_origin,
+                    auto_stop_seconds=0,
+                )
+                with patch("admin_service.main.get_admin_settings", return_value=settings):
+                    with self.assertRaisesRegex(ValueError, "ADMIN_PUBLIC_ORIGIN"):
+                        create_app()
+
+    def test_configured_public_origin_gates_browser_mutations_on_a_real_route(self) -> None:
+        settings = AdminSettings(
+            auth_mode="network",
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
+            auto_stop_seconds=0,
+        )
+        with patch("admin_service.main.get_admin_settings", return_value=settings):
+            app = create_app()
+
+        same_origin_status, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/api/admin/system-setup/sudoers-preview",
+                method="POST",
+                origin="http://admin.example.test",
+            )
+        )
+        foreign_origin_status, _headers, foreign_body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/api/admin/system-setup/sudoers-preview",
+                method="POST",
+                origin="http://admin.example.test:8082",
+            )
+        )
+
+        # The empty request body reaches the handler and fails validation instead of the origin gate.
+        self.assertEqual(same_origin_status, 422)
+        self.assertEqual(foreign_origin_status, 403)
+        self.assertEqual(foreign_body, b'{"detail":"Cross-origin admin mutation rejected."}')
+
     def test_browser_mutations_require_same_origin_in_both_auth_modes(self) -> None:
         for settings, authorization in (
             (
                 AdminSettings(
                     auth_mode="network",
-                    public_origin="http://admin.example.test",
+                    public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
                     auto_stop_seconds=0,
                 ),
                 None,
@@ -308,7 +391,7 @@ class AdminAuthenticationTests(unittest.TestCase):
                     auth_mode="basic",
                     auth_username="operator",
                     auth_password=SecretStr(MARKER_ALPHA),
-                    public_origin="http://admin.example.test",
+                    public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
                     auto_stop_seconds=0,
                 ),
                 basic_header("operator", MARKER_ALPHA),
@@ -358,7 +441,13 @@ class AdminAuthenticationTests(unittest.TestCase):
                 self.assertEqual(cli_status, 404)
 
     def test_browser_mutations_do_not_trust_a_host_derived_origin(self) -> None:
-        settings = AdminSettings(auth_mode="network", auto_stop_seconds=0)
+        # The configured origin differs from the request's Host header; an Origin that
+        # merely matches Host must still be rejected.
+        settings = AdminSettings(
+            auth_mode="network",
+            public_origin="https://admin.example.test:9443",
+            auto_stop_seconds=0,
+        )
         with patch("admin_service.main.get_admin_settings", return_value=settings):
             app = create_app()
 
@@ -400,6 +489,7 @@ class AdminAuthenticationTests(unittest.TestCase):
             auth_mode="basic",
             auth_username="operator",
             auth_password=SecretStr(MARKER_ALPHA),
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with (
@@ -414,6 +504,7 @@ class AdminAuthenticationTests(unittest.TestCase):
             auth_mode="basic",
             auth_username="operator",
             auth_password=SecretStr(MARKER_ALPHA),
+            public_origin=ADMIN_TEST_PUBLIC_ORIGIN,
             auto_stop_seconds=0,
         )
         with (
@@ -446,7 +537,7 @@ class AdminAuthenticationTests(unittest.TestCase):
         )
 
     def test_export_routes_enforce_plaintext_policy_before_maintenance(self) -> None:
-        settings = AdminSettings(auto_stop_seconds=0)
+        settings = AdminSettings(auto_stop_seconds=0, public_origin=ADMIN_TEST_PUBLIC_ORIGIN)
         with patch("admin_service.main.get_admin_settings", return_value=settings):
             app = create_app()
         backup_route = next(

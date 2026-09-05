@@ -87,7 +87,11 @@ Optional services from the published image:
 
 Before starting the admin profile, read the
 [Admin Trust Boundary](docs/ADMIN_TRUST_BOUNDARY.md). Its default network mode
-assumes every client that can reach port `8082` is a trusted operator.
+assumes every client that can reach port `8082` is a trusted operator. Set
+`ADMIN_PUBLIC_ORIGIN` in `.env` to the exact origin your browser shows for the
+admin UI (for example `http://jbod-admin.example.test:8082`); the admin service
+refuses to start while it is missing, because browser-initiated admin changes are
+rejected without it.
 
 The same operator-auth settings now control main-UI writes. The compatibility
 default, `ADMIN_AUTH_MODE=network`, keeps inventory and history views available
