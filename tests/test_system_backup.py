@@ -3570,6 +3570,169 @@ sys.stdout.flush()
                     "archive-core.local ssh-ed25519 AAAATEST\n",
                 )
 
+    def test_import_rejects_config_path_redirection_before_any_activation(self) -> None:
+        original_config = self.config_path.read_bytes()
+        original_mapping = self.mapping_path.read_bytes()
+        redirected_mapping = self.temp_dir / "redirected" / "slot_mappings.json"
+        imported_config = yaml.safe_load(original_config)
+        imported_config["paths"]["mapping_file"] = str(redirected_mapping)
+        bundle = self._build_selected_group_bundle(
+            {
+                CONFIG_FILE_KEY: yaml.safe_dump(imported_config, sort_keys=False).encode("utf-8"),
+                MAPPING_FILE_KEY: b'{"version": 1, "slot_mappings": {}}',
+            }
+        )
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with patch("history_service.system_backup.os.replace", wraps=os.replace) as replace:
+                with self.assertRaisesRegex(ValueError, "restore path|redirect"):
+                    self.backup_service.import_bundle(bundle)
+
+        replace.assert_not_called()
+        self.assertEqual(self.config_path.read_bytes(), original_config)
+        self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+        self.assertFalse(redirected_mapping.exists())
+
+    def test_import_rejects_runtime_override_path_redirection_before_any_activation(self) -> None:
+        original_overrides = self.runtime_overrides_path.read_bytes()
+        original_mapping = self.mapping_path.read_bytes()
+        redirected_mapping = self.temp_dir / "redirected-overrides" / "slot_mappings.json"
+        imported_overrides = yaml.safe_dump(
+            {
+                "app": {"source_bundle_cache_ttl_seconds": 321},
+                "paths": {"mapping_file": str(redirected_mapping)},
+            },
+            sort_keys=False,
+        ).encode("utf-8")
+        bundle = self._build_selected_group_bundle(
+            {
+                RUNTIME_OVERRIDES_FILE_KEY: imported_overrides,
+                MAPPING_FILE_KEY: b'{"version": 1, "slot_mappings": {}}',
+            }
+        )
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with patch("history_service.system_backup.os.replace", wraps=os.replace) as replace:
+                with self.assertRaisesRegex(ValueError, "restore path|redirect"):
+                    self.backup_service.import_bundle(bundle)
+
+        replace.assert_not_called()
+        self.assertEqual(self.runtime_overrides_path.read_bytes(), original_overrides)
+        self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+        self.assertFalse(redirected_mapping.exists())
+
+    def test_import_rejects_directory_substitution_for_file_target_without_deleting_it(self) -> None:
+        self.mapping_path.unlink()
+        self.mapping_path.mkdir()
+        sentinel = self.mapping_path / "preserve.txt"
+        sentinel.write_bytes(b"PRESERVE")
+        bundle = self._build_selected_group_bundle(
+            {MAPPING_FILE_KEY: b'{"version": 1, "slot_mappings": {}}'}
+        )
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                self.backup_service.import_bundle(bundle)
+
+        self.assertTrue(self.mapping_path.is_dir())
+        self.assertEqual(sentinel.read_bytes(), b"PRESERVE")
+
+    def test_import_rejects_file_substitution_for_directory_target_without_deleting_it(self) -> None:
+        shutil.rmtree(self.ssh_dir)
+        self.ssh_dir.write_bytes(b"PRESERVE")
+        member = b"IMPORTED-KEY"
+        archive_path = "config/ssh/id_imported"
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "packaging": "zip",
+            "groups": [
+                {
+                    "key": SSH_KEYS_KEY,
+                    "selected": True,
+                    "present": True,
+                    "restore_mode": "directory",
+                }
+            ],
+            "files": [
+                {
+                    "key": "ssh-key",
+                    "group_key": SSH_KEYS_KEY,
+                    "archive_path": archive_path,
+                    "size_bytes": len(member),
+                    "sha256": hashlib.sha256(member).hexdigest(),
+                }
+            ],
+        }
+        bundle = self._build_zip_bundle(manifest, {archive_path: member})
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "directory"):
+                self.backup_service.import_bundle(bundle)
+
+        self.assertTrue(self.ssh_dir.is_file())
+        self.assertEqual(self.ssh_dir.read_bytes(), b"PRESERVE")
+
+    def test_import_rejects_symlinked_file_target_without_replacing_it(self) -> None:
+        original_mapping = self.mapping_path.read_bytes()
+        real_mapping = self.temp_dir / "real-slot-mappings.json"
+        real_mapping.write_bytes(original_mapping)
+        self.mapping_path.unlink()
+        self.mapping_path.symlink_to(real_mapping)
+        bundle = self._build_selected_group_bundle(
+            {MAPPING_FILE_KEY: b'{"version": 1, "slot_mappings": {}}'}
+        )
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                self.backup_service.import_bundle(bundle)
+
+        self.assertTrue(self.mapping_path.is_symlink())
+        self.assertEqual(real_mapping.read_bytes(), original_mapping)
+
+    def test_import_rejects_symlinked_directory_target_without_replacing_it(self) -> None:
+        real_ssh_dir = self.temp_dir / "real-ssh"
+        self.ssh_dir.rename(real_ssh_dir)
+        self.ssh_dir.symlink_to(real_ssh_dir, target_is_directory=True)
+        member = b"IMPORTED-KEY"
+        archive_path = "config/ssh/id_imported"
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "packaging": "zip",
+            "groups": [
+                {
+                    "key": SSH_KEYS_KEY,
+                    "selected": True,
+                    "present": True,
+                    "restore_mode": "directory",
+                }
+            ],
+            "files": [
+                {
+                    "key": "ssh-key",
+                    "group_key": SSH_KEYS_KEY,
+                    "archive_path": archive_path,
+                    "size_bytes": len(member),
+                    "sha256": hashlib.sha256(member).hexdigest(),
+                }
+            ],
+        }
+        bundle = self._build_zip_bundle(manifest, {archive_path: member})
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                self.backup_service.import_bundle(bundle)
+
+        self.assertTrue(self.ssh_dir.is_symlink())
+        self.assertEqual((real_ssh_dir / "id_truenas").read_text(encoding="utf-8"), "PRIVATE-KEY\n")
+
     def test_import_rolls_back_all_live_state_when_final_validation_fails(self) -> None:
         def tree_bytes(root: Path) -> dict[str, bytes]:
             if not root.exists():
@@ -3671,7 +3834,7 @@ sys.stdout.flush()
                 def fail_after_history_activation():
                     nonlocal load_calls
                     load_calls += 1
-                    if load_calls == 5:
+                    if load_calls == 2:
                         raise RuntimeError("injected final validation failure")
                     return real_load_settings()
 
@@ -3686,7 +3849,7 @@ sys.stdout.flush()
                             passphrase="topsecret",
                         )
 
-                self.assertEqual(load_calls, 5)
+                self.assertEqual(load_calls, 2)
                 for path, expected_content in expected_files.items():
                     with self.subTest(path=path):
                         self.assertEqual(path.read_bytes(), expected_content)
@@ -3819,7 +3982,7 @@ sys.stdout.flush()
         self.assertEqual(original_file.read_bytes(), b"ORIGINAL")
         self.assertEqual(sorted(path.name for path in target_dir.iterdir()), ["original.key"])
 
-    def test_file_target_collision_with_history_is_rejected_before_history_activation(self) -> None:
+    def test_config_path_redirection_to_history_is_rejected_before_history_activation(self) -> None:
         rollback_dir = self.temp_dir / "collision-history-snapshot"
         history_snapshot = self.store.create_backup(rollback_dir, retention_count=1)
         self.assertIsNotNone(history_snapshot)
@@ -3837,12 +4000,12 @@ sys.stdout.flush()
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
             get_settings.cache_clear()
             with patch.object(self.store, "restore_backup", wraps=self.store.restore_backup) as restore:
-                with self.assertRaisesRegex(ValueError, "collides with the history database"):
+                with self.assertRaisesRegex(ValueError, "redirected"):
                     self.backup_service.import_bundle(bundle)
 
         restore.assert_not_called()
 
-    def test_file_target_collision_with_unselected_history_is_rejected(self) -> None:
+    def test_config_path_redirection_to_unselected_history_is_rejected(self) -> None:
         imported_config = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
         imported_config["paths"]["mapping_file"] = str(self.history_db_path)
         bundle = self._build_selected_group_bundle(
@@ -3855,7 +4018,7 @@ sys.stdout.flush()
 
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
             get_settings.cache_clear()
-            with self.assertRaisesRegex(ValueError, "collides with the history database"):
+            with self.assertRaisesRegex(ValueError, "redirected"):
                 self.backup_service.import_bundle(bundle)
 
         self.assertEqual(self.store.counts(), expected_counts)
