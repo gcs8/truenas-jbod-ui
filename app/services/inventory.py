@@ -18,6 +18,8 @@ from app import __version__
 from app.config import Settings, StorageViewConfig, SystemConfig
 from app.models.domain import (
     CacheState,
+    DiskInventorySyncMode,
+    DiskInventorySyncResult,
     EnclosureOption,
     EnclosureProfileView,
     InventorySnapshot,
@@ -175,6 +177,77 @@ UNIFI_BOOT_MEDIA_PROFILE_IDS = {
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 }
+# TrueNAS middleware CLI the disk inventory sync action drives over the system's
+# existing SSH channel (issue #357). CORE installs midclt under /usr/local/bin,
+# SCALE under /usr/bin; other platforms have no TrueNAS middleware to ask.
+DISK_INVENTORY_SYNC_MIDCLT_BY_PLATFORM: dict[str, str] = {
+    "core": "/usr/local/bin/midclt",
+    "scale": "/usr/bin/midclt",
+}
+DISK_INVENTORY_SYNC_JOB_STATES = frozenset({"WAITING", "RUNNING", "SUCCESS", "FAILED", "ABORTED"})
+DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES = frozenset({"SUCCESS", "FAILED", "ABORTED"})
+DISK_INVENTORY_SYNC_ERROR_MAX_CHARS = 400
+
+
+class DiskInventorySyncUnavailable(TrueNASAPIError):
+    """The requested disk inventory sync mode cannot run on this system."""
+
+
+class DiskInventorySyncBusy(TrueNASAPIError):
+    """Another disk inventory sync is already running for this system."""
+
+
+def _bounded_middleware_text(value: Any) -> str | None:
+    """Collapse middleware error text to one bounded line for operator display."""
+
+    if value is None:
+        return None
+    text = " ".join(str(value).split())
+    if not text:
+        return None
+    if len(text) > DISK_INVENTORY_SYNC_ERROR_MAX_CHARS:
+        return text[: DISK_INVENTORY_SYNC_ERROR_MAX_CHARS - 3].rstrip() + "..."
+    return text
+
+
+def _parse_disk_inventory_sync_job_id(stdout: str) -> int | None:
+    text = (stdout or "").strip()
+    if not text:
+        return None
+    try:
+        value: Any = json.loads(text)
+    except ValueError:
+        value = text
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _parse_disk_inventory_sync_job(stdout: str, job_id: int) -> tuple[str, str | None]:
+    try:
+        payload = json.loads((stdout or "").strip() or "null")
+    except ValueError as exc:
+        raise TrueNASAPIError(
+            f"TrueNAS returned an unreadable status for disk sync job {job_id}."
+        ) from exc
+    entries = payload if isinstance(payload, list) else [payload]
+    entry = next(
+        (item for item in entries if isinstance(item, dict) and item.get("id") == job_id),
+        None,
+    )
+    if entry is None:
+        raise TrueNASAPIError(f"TrueNAS no longer lists disk sync job {job_id}.")
+    raw_state = entry.get("state")
+    state = raw_state.strip().upper() if isinstance(raw_state, str) else "UNKNOWN"
+    if state not in DISK_INVENTORY_SYNC_JOB_STATES:
+        state = "UNKNOWN"
+    return state, _bounded_middleware_text(entry.get("error"))
+
+
 LINUX_NVME_LIST_SUBSYS_COMMAND = (
     "/usr/sbin/nvme list-subsys -o json 2>/dev/null || "
     "/usr/bin/nvme list-subsys -o json 2>/dev/null || true"
@@ -660,6 +733,11 @@ class InventoryService:
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
         self._source_bundle_lock = asyncio.Lock()
         self._ssh_session_locks: dict[str, asyncio.Lock] = {}
+        self._disk_inventory_sync_lock = asyncio.Lock()
+        self._disk_inventory_sync_active_job_id: int | None = None
+        # Injected so tests can drive the full-sync poll loop with a fake clock.
+        self._disk_inventory_sync_clock = time.monotonic
+        self._disk_inventory_sync_sleep = asyncio.sleep
         self._optional_ssh_backoff_until: dict[str, datetime] = {}
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[bool] | None = None
@@ -2841,6 +2919,152 @@ class InventoryService:
                 enclosure_id=slot_view.enclosure_id,
                 invalidate_source_bundle=True,
             )
+
+    def disk_inventory_sync_unavailable_reason(self, mode: DiskInventorySyncMode) -> str | None:
+        """Return the plain-sentence reason a sync mode cannot run here, or None."""
+
+        platform = self.system.truenas.platform
+        if platform not in DISK_INVENTORY_SYNC_MIDCLT_BY_PLATFORM:
+            return (
+                "TrueNAS disk inventory sync is unsupported on this platform because it "
+                "needs the TrueNAS middleware."
+            )
+        if mode == DiskInventorySyncMode.multipath and platform != "core":
+            return "Multipath table sync is only available on TrueNAS CORE."
+        if not self.system.ssh.enabled:
+            return (
+                "SSH is disabled for this system, so the app cannot ask the TrueNAS "
+                "middleware to re-read its disks."
+            )
+        return None
+
+    async def sync_disk_inventory(self, mode: DiskInventorySyncMode) -> DiskInventorySyncResult:
+        """Ask the TrueNAS middleware to re-read its disk inventory (issue #357).
+
+        ``multipath`` runs the synchronous CORE-only ``disk.multipath_sync``;
+        ``full`` starts ``disk.sync_all`` and polls ``core.get_jobs`` until the
+        job reaches a terminal state or the configured timeout passes. Both run
+        over the system's existing SSH channel with exact-argument sudo grants.
+        Pools and data are never touched; only the middleware disk table is.
+        """
+
+        reason = self.disk_inventory_sync_unavailable_reason(mode)
+        if reason:
+            raise DiskInventorySyncUnavailable(reason)
+        if self._disk_inventory_sync_lock.locked():
+            raise DiskInventorySyncBusy(
+                "A TrueNAS disk inventory sync is already running for this system. "
+                "Wait for it to finish before starting another."
+            )
+        async with self._disk_inventory_sync_lock:
+            midclt = DISK_INVENTORY_SYNC_MIDCLT_BY_PLATFORM[self.system.truenas.platform]
+            active_job_id = self._disk_inventory_sync_active_job_id
+            if active_job_id is not None:
+                state, _error = await self._get_disk_inventory_sync_job_state(midclt, active_job_id)
+                if state not in DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES:
+                    raise DiskInventorySyncBusy(
+                        f"TrueNAS disk sync job {active_job_id} is still running for this system. "
+                        "Wait for it to finish before starting another."
+                    )
+                self._disk_inventory_sync_active_job_id = None
+            started = self._disk_inventory_sync_clock()
+            if mode == DiskInventorySyncMode.multipath:
+                # disk.multipath_sync is synchronous and returns null on success.
+                await self._run_disk_inventory_sync_command(
+                    [midclt, "call", "disk.multipath_sync"],
+                    failure_prefix="TrueNAS could not rebuild its multipath table",
+                )
+                result = DiskInventorySyncResult(
+                    mode=mode,
+                    state="SUCCESS",
+                    job_id=None,
+                    elapsed_seconds=self._disk_inventory_sync_elapsed(started),
+                    message="TrueNAS rebuilt its multipath table. Refresh to see the updated bays.",
+                )
+            else:
+                result = await self._run_full_disk_inventory_sync(midclt, started)
+        if result.state == "SUCCESS":
+            self.invalidate_snapshot_cache(
+                reason=f"disk_inventory_sync.{mode.value}",
+                invalidate_source_bundle=True,
+            )
+        return result
+
+    def _disk_inventory_sync_elapsed(self, started: float) -> float:
+        return round(max(0.0, float(self._disk_inventory_sync_clock() - started)), 1)
+
+    async def _run_disk_inventory_sync_command(self, argv: list[str], *, failure_prefix: str) -> Any:
+        command = shlex.join(["sudo", "-n", *argv])
+        result = await self._run_ssh_command(command)
+        if not result.ok:
+            detail = (
+                _bounded_middleware_text(result.stderr)
+                or _bounded_middleware_text(result.stdout)
+                or f"exit {result.exit_code}"
+            )
+            raise TrueNASAPIError(f"{failure_prefix}: {detail}")
+        return result
+
+    async def _run_full_disk_inventory_sync(self, midclt: str, started: float) -> DiskInventorySyncResult:
+        start_result = await self._run_disk_inventory_sync_command(
+            [midclt, "call", "disk.sync_all"],
+            failure_prefix="TrueNAS could not start the full disk sync",
+        )
+        job_id = _parse_disk_inventory_sync_job_id(start_result.stdout)
+        if job_id is None:
+            raise TrueNASAPIError(
+                "TrueNAS did not return a job id for disk.sync_all, so the sync could not be tracked."
+            )
+        self._disk_inventory_sync_active_job_id = job_id
+        timeout_seconds = max(1, int(self.settings.app.disk_inventory_sync_timeout_seconds))
+        poll_interval = max(0.0, float(self.settings.app.disk_inventory_sync_poll_interval_seconds))
+        while True:
+            state, error = await self._get_disk_inventory_sync_job_state(midclt, job_id)
+            elapsed = self._disk_inventory_sync_elapsed(started)
+            if state in DISK_INVENTORY_SYNC_TERMINAL_JOB_STATES:
+                self._disk_inventory_sync_active_job_id = None
+                break
+            if elapsed >= timeout_seconds:
+                return DiskInventorySyncResult(
+                    mode=DiskInventorySyncMode.full,
+                    state=state,
+                    job_id=job_id,
+                    elapsed_seconds=elapsed,
+                    timed_out=True,
+                    error=error,
+                    message=(
+                        f"TrueNAS is still running disk sync job {job_id} after {int(elapsed)} s. "
+                        "Check the job in the TrueNAS UI, then refresh here when it finishes."
+                    ),
+                )
+            await self._disk_inventory_sync_sleep(poll_interval)
+
+        if state == "SUCCESS":
+            message = "TrueNAS re-read its disk inventory. Refresh to see the updated bays."
+        elif state == "ABORTED":
+            message = f"TrueNAS aborted disk sync job {job_id} before it finished."
+        else:
+            message = f"TrueNAS reported disk sync job {job_id} failed."
+        return DiskInventorySyncResult(
+            mode=DiskInventorySyncMode.full,
+            state=state,
+            job_id=job_id,
+            elapsed_seconds=elapsed,
+            error=error,
+            message=message,
+        )
+
+    async def _get_disk_inventory_sync_job_state(
+        self,
+        midclt: str,
+        job_id: int,
+    ) -> tuple[str, str | None]:
+        job_filter = json.dumps([["id", "=", job_id]], separators=(",", ":"))
+        poll_result = await self._run_disk_inventory_sync_command(
+            [midclt, "call", "core.get_jobs", job_filter],
+            failure_prefix=f"TrueNAS could not report disk sync job {job_id}",
+        )
+        return _parse_disk_inventory_sync_job(poll_result.stdout, job_id)
 
     async def get_system_locator_status(self) -> SystemLocatorStatusView:
         if not self.system.bmc.enabled or self.bmc_service is None:

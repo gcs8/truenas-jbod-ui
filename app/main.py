@@ -33,6 +33,7 @@ from app.http_auth import (
 from app.logging_config import configure_logging
 from app.request_context import request_id_headers
 from app.models.domain import (
+    DiskInventorySyncRequest,
     InventorySnapshot,
     LedAction,
     LedRequest,
@@ -53,6 +54,7 @@ from app.metrics import install_metrics
 from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
 from app.script_json import register_script_json_filters
 from app.services.history_backend import HistoryBackendClient
+from app.services.inventory import DiskInventorySyncBusy
 from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
 from app.services.mapping_store import MappingImportDigestMismatch, MappingRevisionConflict
 from app.services.profile_registry import build_profile_reference_warnings
@@ -508,6 +510,7 @@ def build_index_context(
     storage_view_runtime: StorageViewRuntimePayload,
     settings: Settings,
     history_configured: bool,
+    read_ui_mutation_auth_mode: str = "network",
     admin_launch_url: str | None = None,
     app_version: str = __version__,
     release_status: dict[str, object] | None = None,
@@ -540,6 +543,7 @@ def build_index_context(
         "initial_snapshot_json": json.dumps(snapshot.model_dump(mode="json")),
         "initial_storage_view_runtime_json": json.dumps(storage_view_runtime.model_dump(mode="json")),
         "history_configured": history_configured,
+        "read_ui_mutation_auth_mode": read_ui_mutation_auth_mode,
         "app_version": app_version,
         "release_status": release_status or {},
         "snapshot_mode": snapshot_mode,

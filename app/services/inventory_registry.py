@@ -48,6 +48,9 @@ class InventoryRegistry:
             raise SystemNotConfiguredError(system_id)
         return next(system for system in self.settings.systems if system.id == self.settings.default_system_id)
 
+    def has_system(self, system_id: str) -> bool:
+        return any(system.id == system_id for system in self.settings.systems)
+
     def get_service(self, system_id: str | None) -> InventoryService:
         system = self.get_system(system_id)
         service = self._services.get(system.id)

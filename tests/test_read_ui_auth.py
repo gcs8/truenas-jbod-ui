@@ -26,6 +26,7 @@ from app.models.domain import (
 MUTATION_ROUTES = (
     ("POST", "/api/sas-fabric/aliases"),
     ("POST", "/api/slots/0/led"),
+    ("POST", "/api/systems/system-a/disk-inventory-sync"),
     ("POST", "/api/system-locator"),
     ("POST", "/api/slots/0/mapping"),
     ("DELETE", "/api/slots/0/mapping"),
@@ -34,6 +35,7 @@ MUTATION_ROUTES = (
 MUTATION_ROUTE_TEMPLATES = {
     ("POST", "/api/sas-fabric/aliases"),
     ("POST", "/api/slots/{slot}/led"),
+    ("POST", "/api/systems/{system_id}/disk-inventory-sync"),
     ("POST", "/api/system-locator"),
     ("POST", "/api/slots/{slot}/mapping"),
     ("DELETE", "/api/slots/{slot}/mapping"),

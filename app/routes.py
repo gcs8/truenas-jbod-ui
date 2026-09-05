@@ -13,8 +13,15 @@ from app.route_compat import MainModuleAPIRouter
 def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     router = MainModuleAPIRouter(main_module, globals())
 
-    def route_service(system_id: str | None, **perf_metadata: Any) -> Any:
+    def route_service(
+        system_id: str | None,
+        *,
+        exact_system_id: bool = False,
+        **perf_metadata: Any,
+    ) -> Any:
         registry = get_inventory_registry()
+        if exact_system_id and (system_id is None or not registry.has_system(system_id)):
+            raise HTTPException(status_code=404, detail=f"System {system_id!r} is not configured.")
         service = registry.get_service(system_id)
         add_perf_metadata(
             system_id=service.system.id,
@@ -105,6 +112,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 storage_view_runtime=storage_view_runtime,
                 settings=current_settings,
                 history_configured=bool(current_settings.history.service_url),
+                read_ui_mutation_auth_mode=request.app.state.operator_auth_settings.auth_mode,
                 admin_launch_url=admin_launch_url,
                 app_version=__version__,
                 release_status=get_release_status_service().snapshot(),
@@ -257,6 +265,32 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         )
         snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
         return JSONResponse({"ok": True, "snapshot": snapshot.model_dump(mode="json")})
+
+    @router.post(
+        "/api/systems/{system_id}/disk-inventory-sync",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
+    async def sync_disk_inventory(
+        system_id: str,
+        payload: DiskInventorySyncRequest,
+    ) -> JSONResponse:
+        service = route_service(
+            system_id,
+            exact_system_id=True,
+            disk_inventory_sync=payload.mode.value,
+        )
+        if not payload.confirm:
+            raise HTTPException(
+                status_code=400,
+                detail="Confirm the TrueNAS disk inventory sync before running it.",
+            )
+        try:
+            result = await service.sync_disk_inventory(payload.mode)
+        except DiskInventorySyncBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(result.model_dump(mode="json"))
 
     @router.get("/api/system-locator", response_model=SystemLocatorStatusView)
     async def get_system_locator(

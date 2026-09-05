@@ -31,6 +31,7 @@ APP_ROUTE_MATRIX = [
     ("/api/sas-fabric/aliases", ("POST",), "save_sas_fabric_alias", "starlette.responses.JSONResponse", None),
     ("/api/storage-views", ("GET",), "get_storage_views", "starlette.responses.JSONResponse", "app.models.domain.StorageViewRuntimePayload"),
     ("/api/slots/{slot}/led", ("POST",), "set_slot_led", "starlette.responses.JSONResponse", None),
+    ("/api/systems/{system_id}/disk-inventory-sync", ("POST",), "sync_disk_inventory", "starlette.responses.JSONResponse", None),
     ("/api/system-locator", ("GET",), "get_system_locator", "starlette.responses.JSONResponse", "app.models.domain.SystemLocatorStatusView"),
     ("/api/system-locator", ("POST",), "set_system_locator", "starlette.responses.JSONResponse", "app.models.domain.SystemLocatorStatusView"),
     ("/api/slots/{slot}/mapping", ("POST",), "save_mapping", "starlette.responses.JSONResponse", None),

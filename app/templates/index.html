@@ -306,6 +306,16 @@
               Storage Fabric
             </a>
             {% endif %}
+            <div id="disk-inventory-sync-controls" class="disk-inventory-sync-controls hidden" role="group" aria-label="TrueNAS disk inventory">
+              <span class="disk-inventory-sync-label">TrueNAS disk inventory</span>
+              <button class="button secondary small" id="disk-inventory-sync-multipath-button" type="button" data-disk-inventory-sync-mode="multipath">
+                Sync multipath table
+              </button>
+              <button class="button secondary small" id="disk-inventory-sync-full-button" type="button" data-disk-inventory-sync-mode="full">
+                Full disk sync
+              </button>
+              <span id="disk-inventory-sync-hint" class="disk-inventory-sync-hint hidden" role="note"></span>
+            </div>
             <div id="heatmap-controls" class="heatmap-controls hidden">
               <label class="field heatmap-control-field heatmap-metric-field" id="heatmap-metric-field">
                 <span>Metric</span>
@@ -648,6 +658,7 @@
     uiPerfEnabled: {{ settings.perf.enabled | tojson }},
     slotCount: {{ snapshot.layout_slot_count or settings.layout.slot_count }},
     historyConfigured: {{ history_configured | tojson }},
+    readUiMutationAuthMode: {{ read_ui_mutation_auth_mode | default("network") | tojson }},
     snapshotMode: {{ snapshot_mode | tojson }},
     sasFabricViewUrl: {{ sas_fabric_view_url | tojson }},
     snapshotExportMeta: {{ snapshot_export_meta_json | script_json_text }},

@@ -929,6 +929,55 @@ textarea {
   min-width: 0;
 }
 
+/* Per-system TrueNAS disk inventory sync actions (#357): an action group in the
+   enclosure header, visually separated from the view toggles it sits beside. */
+.disk-inventory-sync-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  padding-left: 12px;
+  border-left: 1px solid var(--panel-border);
+}
+
+.disk-inventory-sync-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.disk-inventory-sync-controls .button[data-armed="true"] {
+  border-color: rgba(215, 182, 43, 0.75);
+  background: rgba(215, 182, 43, 0.16);
+  color: #fff6d6;
+}
+
+.disk-inventory-sync-hint {
+  flex-basis: 100%;
+  max-width: 34rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.35;
+  text-align: right;
+}
+
+@media (max-width: 820px) {
+  .disk-inventory-sync-controls {
+    flex-basis: 100%;
+    justify-content: flex-start;
+    padding-left: 0;
+    border-left: 0;
+  }
+
+  .disk-inventory-sync-hint {
+    text-align: left;
+  }
+}
+
 .heatmap-control-field {
   width: 190px;
   margin: 0;
