@@ -1405,6 +1405,7 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
 
         slot_number = int(slot_match.group("slot"))
         device_name = normalize_device_name(columns[1] if columns[1] != "-" else None)
+        device_names = _bounded_ses_device_names([device_name] if device_name else [])
         model = normalize_text(columns[2]) if columns[2] != "-" else None
         serial = normalize_text(columns[3]) if columns[3] != "-" else None
         status_text = normalize_text(columns[4]) or "Unknown"
@@ -1415,13 +1416,13 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
             ses_device=current_enclosure.ses_device,
             status=status_text,
             description=normalize_text(columns[0]),
-            device_names=[device_name] if device_name else [],
-            device_names_source="sesutil_show" if device_name else None,
+            device_names=device_names,
+            device_names_source="sesutil_show" if device_names else None,
             identify_active="led=locate" in status_lower or "identify" in status_lower,
             serial=serial,
             model=model,
             size_text=None if "not installed" in status_lower else normalize_text(status_text.split(",", 1)[0]),
-            present=bool(device_name) and "not installed" not in status_lower,
+            present=bool(device_names) and "not installed" not in status_lower,
             presence_source="sesutil_show",
         )
 
@@ -2146,18 +2147,20 @@ def parse_enclosure_sysfs_map(output: str) -> dict[str, dict[int, list[str]]]:
                 slot_number = int(component_field)
             else:
                 continue
-        devices = []
-        for token in devices_field.split():
-            normalized = normalize_device_name(token)
-            if normalized and normalized not in devices:
-                devices.append(normalized)
+        devices = _bounded_ses_device_names(
+            normalized
+            for token in devices_field.split()
+            if (normalized := normalize_device_name(token))
+        )
         if not devices:
             continue
         slots = mapping.setdefault(sg_name, {})
-        existing = slots.setdefault(slot_number, [])
-        for device in devices:
-            if device not in existing:
-                existing.append(device)
+        existing = slots.get(slot_number, [])
+        slots[slot_number] = _bounded_ses_device_names(
+            device
+            for device_names in (existing, devices)
+            for device in device_names
+        )
     return mapping
 
 
