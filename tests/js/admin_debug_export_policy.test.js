@@ -101,6 +101,7 @@ function buildHarness() {
     backupPackaging: { value: "tar.zst", disabled: false },
     backupExportPassphrase: { value: "synthetic-backup", disabled: false },
     backupExportButton: { disabled: false },
+    backupExportResult: { textContent: "initial" },
     debugScrubSecretsToggle: { checked: false },
     debugEncryptToggle: { checked: false, disabled: false },
     debugPackaging: { value: "tar.zst", disabled: false },
@@ -117,7 +118,7 @@ function buildHarness() {
     readOptionalSecretValue(field) { return String(field?.value || "").trim() || null; },
   };
   const functions = loadFunctions(
-    ["syncSingleBundleControls", "getDebugExportPolicy", "syncBackupControls"],
+    ["syncSingleBundleControls", "getDebugExportPolicy", "getBackupExportPolicy", "syncBackupControls"],
     bindings
   );
   return { state, elements, functions };
@@ -170,5 +171,72 @@ test("submission and passphrase input recheck the same policy", () => {
   assert.match(
     SOURCE,
     /debugExportPassphrase\?\.addEventListener\("input",\s*syncBackupControls\)/
+  );
+});
+
+// Full backup export (#284): the route always passes scrub_secrets=False, so under the
+// secure defaults the request can only succeed with encryption on. The button must say so
+// before the click instead of returning 400 after it (same class of bug as #220/#239).
+test("secure-default full backup with encryption off is blocked with guidance", () => {
+  const { state, elements, functions } = buildHarness();
+  state.selectedBackupPaths = ["history_db"];
+  state.backupManualEncrypt = false;
+  elements.backupEncryptToggle.checked = false;
+
+  functions.syncBackupControls();
+
+  assert.equal(elements.backupExportButton.disabled, true);
+  assert.match(elements.backupExportResult.textContent, /Enable encryption/i);
+  assert.equal(functions.getBackupExportPolicy().allowed, false);
+});
+
+test("encrypted full backup needs a passphrase and is otherwise exportable", () => {
+  const { state, elements, functions } = buildHarness();
+  state.selectedBackupPaths = ["history_db"];
+
+  functions.syncBackupControls();
+  assert.equal(elements.backupExportButton.disabled, false);
+  assert.equal(elements.backupExportResult.textContent, "initial");
+
+  elements.backupExportPassphrase.value = "";
+  functions.syncBackupControls();
+  assert.equal(elements.backupExportButton.disabled, true);
+  assert.match(elements.backupExportResult.textContent, /Enter a passphrase/i);
+
+  elements.backupExportPassphrase.value = "synthetic-passphrase";
+  functions.syncBackupControls();
+  assert.equal(elements.backupExportButton.disabled, false);
+  assert.match(elements.backupExportResult.textContent, /Exports can stay live/);
+});
+
+test("explicit plaintext policy permits an unencrypted full backup", () => {
+  const { state, elements, functions } = buildHarness();
+  state.selectedBackupPaths = ["history_db"];
+  state.backupDefaults.allow_plaintext_backup_export = true;
+  state.backupManualEncrypt = false;
+  elements.backupEncryptToggle.checked = false;
+
+  functions.syncBackupControls();
+
+  assert.equal(elements.backupExportButton.disabled, false);
+  assert.equal(functions.getBackupExportPolicy().allowed, true);
+});
+
+test("full backup without selected paths stays disabled even when policy allows it", () => {
+  const { state, elements, functions } = buildHarness();
+  state.selectedBackupPaths = [];
+
+  functions.syncBackupControls();
+
+  assert.equal(functions.getBackupExportPolicy().allowed, true);
+  assert.equal(elements.backupExportButton.disabled, true);
+});
+
+test("full backup submission and passphrase input recheck the backup policy", () => {
+  assert.match(functionSource("exportBackup"), /getBackupExportPolicy\(\)/);
+  assert.match(functionSource("exportBackup"), /if \(!policy\.allowed\)/);
+  assert.match(
+    SOURCE,
+    /backupExportPassphrase\?\.addEventListener\("input",\s*syncBackupControls\)/
   );
 });
