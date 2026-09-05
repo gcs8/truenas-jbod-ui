@@ -1,23 +1,35 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import shlex
 import stat
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from admin_service.services.account_bootstrap import (
+    SUDO_COMMANDS_BY_PLATFORM,
     ServiceAccountBootstrapService,
     saved_sudo_commands_for_system,
 )
-from app.config import Settings, SSHConfig, SystemConfig
-from app.models.domain import SystemSetupBootstrapRequest
+from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
+from app.models.domain import LedAction, SystemSetupBootstrapRequest
+from app.services.inventory import (
+    LINUX_BOOT_MEDIA_SMARTCTL_DEVICE_TYPE,
+    InventoryService,
+)
+from app.services.mapping_store import MappingStore
+from app.services.profile_registry import ProfileRegistry
+from app.services.slot_detail_store import SlotDetailStore
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.ssh_probe import SSHCommandResult
+from app.services.system_setup import default_ssh_commands_for_platform
 
 
 class FakeProbe:
@@ -301,6 +313,171 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
         self.assertIn("/usr/sbin/smartctl -a /dev/sda", content)
         self.assertNotIn("/usr/bin/sg_ses -p aes /dev/sg*", content)
         self.assertNotIn("sudo -n", content)
+
+
+def sudoers_grant_matches(grant: str, command: str) -> bool:
+    """Model how sudoers matches a granted command spec against a real command.
+
+    Wildcards are matched per argument, the way sudo compares an invoked command
+    against a `Cmnd_Spec`, so `smartctl -x -j *` does not silently cover
+    `smartctl -d scsi -x -j /dev/sda`.
+    """
+
+    grant_tokens = shlex.split(grant)
+    command_tokens = shlex.split(command)
+    if len(grant_tokens) != len(command_tokens):
+        return False
+    return all(
+        fnmatch.fnmatchcase(command_token, grant_token)
+        for grant_token, command_token in zip(grant_tokens, command_tokens)
+    )
+
+
+def strip_sudo_prefix(command: str) -> str | None:
+    """Return the command sudo would match against sudoers, or None if not sudo."""
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens or tokens[0] != "sudo":
+        return None
+    remainder = tokens[1:]
+    while remainder and remainder[0].startswith("-"):
+        remainder.pop(0)
+    if not remainder:
+        return None
+    return shlex.join(remainder)
+
+
+class LinuxBootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
+    """The Linux bootstrap grant list must cover every sudo-run Linux probe.
+
+    The expected set is derived by running the generic-Linux collection paths in
+    `app.services.inventory` against a recording SSH runner, so a new sudo-run
+    command fails this test until the bootstrap grants it (issue #332).
+    """
+
+    maxDiff = None
+
+    def build_linux_service(self, temp_dir: str) -> InventoryService:
+        system = SystemConfig(
+            id="linux-contract",
+            label="Generic Linux",
+            truenas=TrueNASConfig(platform="linux"),
+            ssh=SSHConfig(enabled=True, host="linux-host.invalid", user="jbodmap", commands=[]),
+        )
+        return InventoryService(
+            Settings(),
+            system,
+            AsyncMock(),
+            AsyncMock(),
+            None,
+            MappingStore(str(Path(temp_dir) / "slot_mappings.json")),
+            ProfileRegistry(Settings()),
+            SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
+        )
+
+    async def collect_linux_sudo_commands(self) -> set[str]:
+        recorded: list[str] = []
+
+        async def record_many(commands, host=None, **_kwargs):
+            command_list = list(commands)
+            recorded.extend(command_list)
+            return [
+                SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
+                for command in command_list
+            ]
+
+        async def record_one(command, host=None, **_kwargs):
+            recorded.append(command)
+            return SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.build_linux_service(temp_dir)
+            service._run_ssh_commands = record_many
+            service._run_ssh_command = record_one
+
+            # Commands the setup wizard seeds for a generic Linux host.
+            recorded.extend(default_ssh_commands_for_platform("linux"))
+
+            # SES page reads for a discovered generic SCSI enclosure.
+            await service._fetch_sg_ses_host_overlay(
+                "linux-host.invalid",
+                ["/dev/sg3"],
+                failure_prefix="SES",
+            )
+
+            # SMART reads, including the NVMe enrichment probes and the forced
+            # device type the UniFi boot-media path sets.
+            await service._fetch_smart_summary_over_ssh(["nvme0n1"])
+            await service._fetch_smart_summary_over_ssh(["sda"])
+            await service._fetch_smart_summary_over_ssh(
+                ["sda"],
+                device_type=LINUX_BOOT_MEDIA_SMARTCTL_DEVICE_TYPE,
+            )
+
+            # Identify LED control over the SES device discovered above.
+            slot_view = SimpleNamespace(
+                slot=3,
+                slot_label="03",
+                led_reason=None,
+                ssh_ses_targets=[
+                    {
+                        "ses_device": "/dev/sg3",
+                        "ses_element_id": 3,
+                        "ses_slot_number": 3,
+                        "ssh_host": "linux-host.invalid",
+                    }
+                ],
+                ssh_ses_device="/dev/sg3",
+                ssh_ses_element_id=3,
+            )
+            await service._set_slot_led_over_ssh(slot_view, LedAction.identify)
+            await service._set_slot_led_over_ssh(slot_view, LedAction.clear)
+
+        sudo_commands = {
+            stripped
+            for command in recorded
+            if (stripped := strip_sudo_prefix(command)) is not None
+        }
+        self.assertTrue(sudo_commands, "no sudo-run Linux commands were captured")
+        return sudo_commands
+
+    async def test_linux_bootstrap_grants_cover_every_sudo_run_linux_command(self) -> None:
+        grants = SUDO_COMMANDS_BY_PLATFORM["linux"]
+        ungranted = sorted(
+            command
+            for command in await self.collect_linux_sudo_commands()
+            if not any(sudoers_grant_matches(grant, command) for grant in grants)
+        )
+
+        self.assertEqual(
+            ungranted,
+            [],
+            "Linux bootstrap sudo grants do not cover these sudo-run commands: "
+            + ", ".join(ungranted),
+        )
+
+    async def test_linux_supplemental_grants_cover_device_specific_sudo_commands(self) -> None:
+        # Commands built per device never appear in an operator's saved command
+        # list, so they have to survive the supplemental merge too.
+        grants = ServiceAccountBootstrapService._resolve_sudo_commands(
+            "linux",
+            ["sudo -n /usr/sbin/mdadm --detail --scan"],
+        )
+        ungranted = sorted(
+            command
+            for command in await self.collect_linux_sudo_commands()
+            if not any(sudoers_grant_matches(grant, command) for grant in grants)
+        )
+
+        self.assertEqual(
+            ungranted,
+            [],
+            "Linux supplemental sudo grants do not cover these sudo-run commands: "
+            + ", ".join(ungranted),
+        )
 
 
 if __name__ == "__main__":
