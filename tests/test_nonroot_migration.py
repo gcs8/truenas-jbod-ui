@@ -44,6 +44,45 @@ class NonRootMigrationTests(unittest.TestCase):
                 },
             )
 
+    def test_inventory_rejects_tree_beyond_explicit_depth_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            current = root / "data"
+            current.mkdir()
+            for _ in range(257):
+                current /= "d"
+                current.mkdir()
+
+            with self.assertRaisesRegex(ValueError, "bounded depth limit"):
+                MODULE.inventory(root)
+
+    def test_inventory_does_not_retain_one_descriptor_per_tree_level(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            current = root / "data"
+            current.mkdir()
+            for _ in range(200):
+                current /= "d"
+                current.mkdir()
+            (current / "runtime.db").write_bytes(b"runtime")
+
+            soft_limit, hard_limit = MODULE.resource.getrlimit(MODULE.resource.RLIMIT_NOFILE)
+            open_count = len(tuple(Path("/proc/self/fd").iterdir()))
+            test_limit = max(open_count + 16, 48)
+            if hard_limit != MODULE.resource.RLIM_INFINITY and hard_limit < test_limit:
+                self.skipTest("descriptor hard limit is too small for the bounded fixture")
+
+            MODULE.resource.setrlimit(MODULE.resource.RLIMIT_NOFILE, (test_limit, hard_limit))
+            try:
+                entries = MODULE.inventory(root)
+            finally:
+                MODULE.resource.setrlimit(
+                    MODULE.resource.RLIMIT_NOFILE,
+                    (soft_limit, hard_limit),
+                )
+
+            self.assertIn(current / "runtime.db", {path for path, _ in entries})
+
     def test_inventory_preserves_backup_identity_and_secret_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -10,6 +10,7 @@ from pathlib import Path
 APP_RECURSIVE_ROOTS = ("data", "history", "logs")
 APP_CONFIG_PATHS = ("config.yaml", "ssh", "tls")
 MAX_ENTRIES = 100_000
+MAX_TREE_DEPTH = 256
 DESCRIPTOR_RESERVE = 64
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
@@ -182,6 +183,41 @@ def _append_entry(
         raise ValueError("runtime ownership preflight exceeded its bounded entry limit")
 
 
+def _open_tree_directory(
+    root_descriptor: int,
+    runtime_root: Path,
+    root_metadata: os.stat_result,
+    chain: tuple[tuple[str, os.stat_result], ...],
+) -> tuple[int, os.stat_result, bool]:
+    descriptor = root_descriptor
+    descriptor_owned = False
+    current_path = runtime_root
+    current_metadata = os.fstat(descriptor)
+    if not _same_inode(current_metadata, root_metadata):
+        raise ValueError(f"runtime entry changed during ownership migration: {runtime_root}")
+    try:
+        for name, expected in chain:
+            current_path /= name
+            next_descriptor, current_metadata = _bind_child(
+                descriptor,
+                name,
+                current_path,
+                expected=expected,
+                directory_only=True,
+            )
+            previous_descriptor = descriptor
+            previous_owned = descriptor_owned
+            descriptor = next_descriptor
+            descriptor_owned = True
+            if previous_owned:
+                _close_descriptor(previous_descriptor)
+    except BaseException:
+        if descriptor_owned:
+            _close_descriptor(descriptor)
+        raise
+    return descriptor, current_metadata, descriptor_owned
+
+
 def _append_tree(
     entries: list[tuple[Path, os.stat_result]],
     seen: set[Path],
@@ -191,19 +227,52 @@ def _append_tree(
 ) -> None:
     if not stat.S_ISDIR(root_metadata.st_mode):
         raise ValueError(f"runtime root is not a directory: {runtime_root}")
-    _append_entry(entries, seen, runtime_root, root_metadata)
-    with os.scandir(root_descriptor) as directory:
-        names = sorted(entry.name for entry in directory)
-    for name in names:
-        candidate = runtime_root / name
-        descriptor, metadata = _bind_child(root_descriptor, name, candidate)
+
+    pending: list[
+        tuple[
+            Path,
+            os.stat_result,
+            tuple[tuple[str, os.stat_result], ...] | None,
+        ]
+    ] = [(runtime_root, root_metadata, ())]
+    while pending:
+        current_path, expected, chain = pending.pop()
+        if chain is None:
+            _append_entry(entries, seen, current_path, expected)
+            continue
+        if len(chain) > MAX_TREE_DEPTH:
+            raise ValueError("runtime ownership preflight exceeded its bounded depth limit")
+
+        descriptor, metadata, descriptor_owned = _open_tree_directory(
+            root_descriptor,
+            runtime_root,
+            root_metadata,
+            chain,
+        )
         try:
-            if stat.S_ISDIR(metadata.st_mode):
-                _append_tree(entries, seen, candidate, descriptor, metadata)
-            else:
-                _append_entry(entries, seen, candidate, metadata)
+            _append_entry(entries, seen, current_path, metadata)
+            with os.scandir(descriptor) as directory:
+                names = sorted((entry.name for entry in directory), reverse=True)
+            for name in names:
+                candidate = current_path / name
+                child_descriptor, child_metadata = _bind_child(descriptor, name, candidate)
+                try:
+                    if len(entries) + len(pending) + 1 > MAX_ENTRIES:
+                        raise ValueError("runtime ownership preflight exceeded its bounded entry limit")
+                    if stat.S_ISDIR(child_metadata.st_mode):
+                        child_chain = chain + ((name, child_metadata),)
+                        if len(child_chain) > MAX_TREE_DEPTH:
+                            raise ValueError(
+                                "runtime ownership preflight exceeded its bounded depth limit"
+                            )
+                        pending.append((candidate, child_metadata, child_chain))
+                    else:
+                        pending.append((candidate, child_metadata, None))
+                finally:
+                    _close_descriptor(child_descriptor)
         finally:
-            _close_descriptor(descriptor)
+            if descriptor_owned:
+                _close_descriptor(descriptor)
 
 
 def _bind_optional_child(
