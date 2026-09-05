@@ -489,6 +489,7 @@ test("virtual slot mapping save and clear handlers fail closed before any reques
     state,
     FormData: FakeFormData,
     mappingForm: {},
+    writeBlockedByPolicy: () => false,
     window: { confirm() { confirmCount += 1; return true; } },
     getSlotById() {
       return {
@@ -550,6 +551,7 @@ test("mapping import is disabled with a reason for the active virtual inventory"
   const { fn: importMappingsFromFile } = loadFunction(APP_SOURCE, "importMappingsFromFile", {
     state: { snapshotMode: false },
     mappingImportFile,
+    writeBlockedByPolicy: () => false,
     mappingImportUnavailableReason: () => reason,
     setStatus(message) { statuses.push(message); },
     async sendScopedRequest() { requests += 1; },
