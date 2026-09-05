@@ -85,6 +85,7 @@ from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.quantastor_cli import build_quantastor_cli_invocation
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.parsers import (
+    MultipathInfo,
     ParsedSSHData,
     ZpoolMember,
     _extract_slot_number,
@@ -10155,6 +10156,15 @@ class InventoryService:
         records: list[DiskRecord] = []
         linux_block_index = self._index_linux_blockdevices(ssh_data)
         linux_scsi_index = self._index_linux_scsi_devices(ssh_data)
+        multipath_consumer_index = (
+            self._index_multipath_consumers(ssh_data)
+            if self.system.truenas.platform == "core"
+            else {}
+        )
+        multipath_groups: dict[
+            str,
+            tuple[int, MultipathInfo, list[tuple[DiskRecord, bool]]],
+        ] = {}
         for disk in disks:
             device_name = normalize_device_name(
                 disk.get("devname") or disk.get("name") or disk.get("device") or disk.get("disk")
@@ -10162,6 +10172,47 @@ class InventoryService:
             path_device_name = normalize_device_name(disk.get("name"))
             multipath_name = normalize_text(disk.get("multipath_name"))
             multipath_member = normalize_device_name(disk.get("multipath_member"))
+            multipath_source: str | None = None
+            grouped_multipath: tuple[str, MultipathInfo, bool] | None = None
+            if multipath_name and self.system.truenas.platform == "core":
+                parsed_multipath = ssh_data.multipath_info.get(
+                    (device_name or f"multipath/{multipath_name}").lower()
+                ) or ssh_data.multipath_info.get(f"multipath/{multipath_name}".lower())
+                if parsed_multipath is not None:
+                    grouped_multipath = (
+                        parsed_multipath.name.lower(),
+                        parsed_multipath,
+                        True,
+                    )
+            if not multipath_name and multipath_consumer_index:
+                # Issue #355: the API disk record can lag gmultipath (a hot-added
+                # spare whose disk table row is not yet synced) and the passive
+                # member may be absent from the API list entirely. The parsed
+                # `gmultipath list` consumers are then the only evidence tying
+                # this bare member to its geom; use them so the provider's GPT
+                # label and pool membership can join.
+                api_device_name = path_device_name or device_name
+                parsed_multipath = self._match_multipath_consumer(
+                    multipath_consumer_index,
+                    ssh_data,
+                    api_device_name,
+                    device_name,
+                )
+                if parsed_multipath is not None:
+                    geom_key = parsed_multipath.name.lower()
+                    multipath_name = parsed_multipath.name
+                    multipath_member = next(
+                        (
+                            consumer.device_name
+                            for consumer in parsed_multipath.consumers
+                            if not api_device_name or consumer.device_name.lower() != api_device_name.lower()
+                        ),
+                        None,
+                    )
+                    path_device_name = api_device_name
+                    device_name = parsed_multipath.device_name
+                    multipath_source = "gmultipath list"
+                    grouped_multipath = (geom_key, parsed_multipath, False)
             serial = normalize_text(disk.get("serial") or disk.get("serial_lunid") or disk.get("lunid"))
             model = normalize_text(disk.get("model"))
             size_bytes = disk.get("size") if isinstance(disk.get("size"), int) else None
@@ -10239,6 +10290,8 @@ class InventoryService:
             linux_block_summary = self._linux_blockdevice_summary(linux_blockdevice)
             linux_scsi_summary = self._linux_scsi_device_summary(linux_scsi_device)
             disk_raw = dict(disk)
+            if multipath_source:
+                disk_raw["multipath_source"] = multipath_source
             if linux_block_summary:
                 disk_raw["linux_blockdevice"] = linux_block_summary
             if linux_scsi_summary:
@@ -10280,34 +10333,252 @@ class InventoryService:
                 )
             ]
 
-            records.append(
-                DiskRecord(
-                    raw=disk_raw,
-                    device_name=device_name,
-                    path_device_name=path_device_name,
-                    multipath_name=multipath_name,
-                    multipath_member=multipath_member,
-                    serial=serial,
-                    model=model,
-                    size_bytes=size_bytes,
-                    identifier=identifier,
-                    health=health,
-                    pool_name=pool_name,
-                    lunid=normalize_text(disk.get("lunid")),
-                    bus=bus,
-                    temperature_c=temperature_c,
-                    last_smart_test_type=normalize_text(latest_test.get("description")) if latest_test else None,
-                    last_smart_test_status=normalize_text(latest_test.get("status_verbose") or latest_test.get("status")) if latest_test else None,
-                    last_smart_test_lifetime_hours=latest_test.get("lifetime") if latest_test else None,
-                    logical_block_size=logical_block_size,
-                    physical_block_size=physical_block_size,
-                    enclosure_id=enclosure_id,
-                    slot=slot,
-                    smart_devices=smart_devices,
-                    lookup_keys=lookup_keys,
-                )
+            record = DiskRecord(
+                raw=disk_raw,
+                device_name=device_name,
+                path_device_name=path_device_name,
+                multipath_name=multipath_name,
+                multipath_member=multipath_member,
+                serial=serial,
+                model=model,
+                size_bytes=size_bytes,
+                identifier=identifier,
+                health=health,
+                pool_name=pool_name,
+                lunid=normalize_text(disk.get("lunid")),
+                bus=bus,
+                temperature_c=temperature_c,
+                last_smart_test_type=normalize_text(latest_test.get("description")) if latest_test else None,
+                last_smart_test_status=normalize_text(latest_test.get("status_verbose") or latest_test.get("status")) if latest_test else None,
+                last_smart_test_lifetime_hours=latest_test.get("lifetime") if latest_test else None,
+                logical_block_size=logical_block_size,
+                physical_block_size=physical_block_size,
+                enclosure_id=enclosure_id,
+                slot=slot,
+                smart_devices=smart_devices,
+                lookup_keys=lookup_keys,
             )
+            if grouped_multipath is None:
+                records.append(record)
+                continue
+
+            geom_key, parsed_multipath, authoritative = grouped_multipath
+            group = multipath_groups.get(geom_key)
+            if group is None:
+                multipath_groups[geom_key] = (
+                    len(records),
+                    parsed_multipath,
+                    [(record, authoritative)],
+                )
+                records.append(record)
+            else:
+                group[2].append((record, authoritative))
+
+        for record_index, parsed_multipath, group_records in sorted(
+            multipath_groups.values(),
+            key=lambda group: group[0],
+            reverse=True,
+        ):
+            if len(group_records) > 1:
+                zfs_guids = {
+                    value.casefold()
+                    for record, _authoritative in group_records
+                    if (
+                        value := normalize_text(
+                            str(record.raw.get("zfs_guid"))
+                            if record.raw.get("zfs_guid") is not None
+                            else None
+                        )
+                    )
+                }
+                if len(zfs_guids) > 1:
+                    records[record_index : record_index + 1] = [
+                        record for record, _authoritative in group_records
+                    ]
+                    continue
+                records[record_index] = self._merge_backfilled_multipath_records(
+                    group_records,
+                    parsed_multipath,
+                )
         return records
+
+    @staticmethod
+    def _merge_backfilled_multipath_records(
+        grouped_records: list[tuple[DiskRecord, bool]],
+        multipath: MultipathInfo,
+    ) -> DiskRecord:
+        """Fold API rows for one proven geom without discarding member evidence."""
+        consumer_states = {
+            consumer.device_name.lower(): normalize_text(consumer.state)
+            for consumer in multipath.consumers
+            if consumer.device_name
+        }
+        state_priority = {"ACTIVE": 0, "PASSIVE": 1, "FAIL": 3}
+
+        def record_rank(item: tuple[DiskRecord, bool]) -> tuple[int, int, str]:
+            record, authoritative = item
+            path_device = normalize_device_name(record.path_device_name)
+            state = consumer_states.get((path_device or "").lower())
+            return (
+                0 if authoritative else 1,
+                state_priority.get((state or "").upper(), 2),
+                (path_device or "").lower(),
+            )
+
+        ordered_items = sorted(grouped_records, key=record_rank)
+        ordered = [record for record, _authoritative in ordered_items]
+        primary = ordered[0]
+        for field_name in (
+            "serial",
+            "model",
+            "size_bytes",
+            "identifier",
+            "health",
+            "pool_name",
+            "lunid",
+            "bus",
+            "temperature_c",
+            "last_smart_test_type",
+            "last_smart_test_status",
+            "last_smart_test_lifetime_hours",
+            "logical_block_size",
+            "physical_block_size",
+            "enclosure_id",
+            "slot",
+        ):
+            setattr(
+                primary,
+                field_name,
+                next(
+                    (
+                        getattr(record, field_name)
+                        for record in ordered
+                        if getattr(record, field_name) is not None
+                    ),
+                    None,
+                ),
+            )
+
+        raw_rows = [
+            {
+                key: value
+                for key, value in record.raw.items()
+                if key != "multipath_member_api_rows"
+            }
+            for record in ordered
+        ]
+
+        def useful_raw_value(value: Any) -> bool:
+            return value is not None and value != "" and value != [] and value != {}
+
+        merged_raw: dict[str, Any] = {}
+        for row in raw_rows:
+            for key, value in row.items():
+                if key not in merged_raw or (
+                    not useful_raw_value(merged_raw[key]) and useful_raw_value(value)
+                ):
+                    merged_raw[key] = value
+        if any(authoritative for _record, authoritative in ordered_items):
+            merged_raw.pop("multipath_source", None)
+        merged_raw["multipath_member_api_rows"] = raw_rows
+        primary.raw = merged_raw
+
+        smart_devices: list[str] = []
+        seen_smart_devices: set[str] = set()
+        for record in ordered:
+            for candidate in record.smart_devices:
+                key = candidate.lower()
+                if key in seen_smart_devices:
+                    continue
+                seen_smart_devices.add(key)
+                smart_devices.append(candidate)
+        primary.smart_devices = smart_devices
+
+        identity_conflict = any(
+            len(
+                {
+                    value.casefold()
+                    for record in ordered
+                    if (value := normalize_text(getattr(record, field_name)))
+                }
+            )
+            > 1
+            for field_name in ("serial", "identifier", "lunid")
+        )
+        if identity_conflict:
+            # Conflicting API identity must not make the geom resolve through
+            # every claimed serial/identifier/LUN. Keep the preferred member's
+            # evidence and add only proven device aliases from its peer rows.
+            lookup_keys = set(primary.lookup_keys)
+            for record in ordered:
+                for value in (
+                    record.device_name,
+                    record.path_device_name,
+                    record.multipath_name,
+                    record.multipath_member,
+                    *record.smart_devices,
+                ):
+                    lookup_keys.update(normalize_lookup_keys(value))
+            primary.lookup_keys = lookup_keys
+        else:
+            primary.lookup_keys = set().union(*(record.lookup_keys for record in ordered))
+        return primary
+
+    @staticmethod
+    def _index_multipath_consumers(
+        ssh_data: ParsedSSHData,
+    ) -> dict[str, MultipathInfo | None]:
+        """Map each gmultipath consumer (member path) to the one geom that claims it.
+
+        `parse_gmultipath_list` stores every geom under both `multipath/<name>` and
+        its provider name, so geoms are deduplicated by identity first. A consumer
+        claimed by more than one geom is dropped: that evidence is ambiguous and
+        must not backfill anything.
+        """
+        geoms: list[MultipathInfo] = []
+        seen: set[int] = set()
+        for info in ssh_data.multipath_info.values():
+            if id(info) in seen:
+                continue
+            seen.add(id(info))
+            geoms.append(info)
+
+        index: dict[str, MultipathInfo | None] = {}
+        for info in geoms:
+            for consumer in info.consumers:
+                key = normalize_device_name(consumer.device_name)
+                if not key:
+                    continue
+                key = key.lower()
+                if key not in index:
+                    index[key] = info
+                elif index[key] is not info:
+                    index[key] = None
+        return index
+
+    @staticmethod
+    def _match_multipath_consumer(
+        index: dict[str, MultipathInfo | None],
+        ssh_data: ParsedSSHData,
+        *device_names: str | None,
+    ) -> MultipathInfo | None:
+        """Return the one geom whose consumers include a given name or a camcontrol peer of it."""
+        candidates = list(dict.fromkeys(filter(None, device_names)))
+        for name in list(candidates):
+            candidates.extend(ssh_data.camcontrol_peer_devices.get(name.lower(), []))
+
+        matched: MultipathInfo | None = None
+        for name in dict.fromkeys(candidates):
+            key = name.lower()
+            if key not in index:
+                continue
+            info = index[key]
+            if info is None:
+                return None
+            if matched is not None and info is not matched:
+                return None
+            matched = info
+        return matched
 
     def _extract_pool_name(self, disk: dict[str, Any]) -> str | None:
         pool = disk.get("pool")
