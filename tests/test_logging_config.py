@@ -428,7 +428,7 @@ class LoggingConfigTests(unittest.TestCase):
             raise exception
 
         raise_with_metadata.__code__ = raise_with_metadata.__code__.replace(
-            co_filename="F" * 300 + "TRACE_FILE\r\x00\x1b.py",
+            co_filename="F" * 300 + "TRACE_FILE\r\x1b.py",
             co_name="TRACE_FUNCTION\n\r\x00\x1b" + "N" * 300,
         )
         try:
