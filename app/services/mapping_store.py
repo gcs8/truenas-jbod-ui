@@ -90,6 +90,23 @@ class _ClassifiedStore:
     mappings: dict[Identity, ManualMapping]
 
 
+class _VersionedEntries(dict[str, ManualMapping]):
+    __slots__ = ("__store_version",)
+
+    def __init__(
+        self,
+        entries: Mapping[str, ManualMapping],
+        *,
+        store_version: int,
+    ) -> None:
+        super().__init__(entries)
+        self.__store_version = store_version
+
+    @property
+    def store_version(self) -> int:
+        return self.__store_version
+
+
 class MappingStore:
     """Persist slot-to-disk calibration in a small JSON file on a bind mount."""
 
@@ -496,6 +513,8 @@ class MappingStore:
         self,
         entries: Mapping[str, ManualMapping],
     ) -> _ClassifiedStore:
+        if isinstance(entries, _VersionedEntries):
+            return self._classify_entries(entries.store_version, entries)
         if not entries:
             return self._classify_entries(2, entries)
         prefixes = {key.startswith("v2:") for key in entries}
@@ -511,7 +530,7 @@ class MappingStore:
         )
         if version == 2:
             self._classify_entries(version, entries)
-        return entries
+        return _VersionedEntries(entries, store_version=version)
 
     @staticmethod
     def _query_identities(
@@ -1217,8 +1236,19 @@ class MappingStore:
         raise FileExistsError("Could not allocate a unique mapping temporary file.")
 
     @staticmethod
-    def _write_temp_bytes(handle: BinaryIO, data: bytes) -> None:
-        handle.write(data)
+    def _write_temp_bytes(handle: BinaryIO, data: bytes) -> int:
+        total = 0
+        while total < len(data):
+            written = handle.write(data[total:])
+            if (
+                isinstance(written, bool)
+                or not isinstance(written, int)
+                or written <= 0
+                or written > len(data) - total
+            ):
+                raise OSError("Could not write the complete mapping temporary file.")
+            total += written
+        return total
 
     @staticmethod
     def _flush_temp_file(handle: BinaryIO) -> None:
@@ -1230,7 +1260,9 @@ class MappingStore:
 
     def _write_temp_file(self, descriptor: int, data: bytes) -> None:
         with os.fdopen(descriptor, "wb", closefd=False) as handle:
-            self._write_temp_bytes(handle, data)
+            written = self._write_temp_bytes(handle, data)
+            if written != len(data):
+                raise OSError("Mapping temporary file write was incomplete.")
             self._flush_temp_file(handle)
             self._fsync_temp_file(handle)
 

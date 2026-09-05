@@ -1699,6 +1699,170 @@ class MappingStoreInjectiveKeyV2Tests(unittest.TestCase):
                 {"SELECTED", "FOREIGN", "LEGACY", "NEW"},
             )
 
+    def test_preloaded_v1_entries_preserve_document_version_for_v2_prefixed_keys(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "v2",
+                "enc:a",
+                ManualMapping(
+                    system_id="v2",
+                    enclosure_id="enc:a",
+                    slot=1,
+                    serial="SCOPED",
+                ),
+                False,
+            ),
+            (
+                "v2:[x]",
+                "enc::a:part",
+                ManualMapping(
+                    system_id="v2:[x]",
+                    enclosure_id="enc::a:part",
+                    slot=2,
+                    serial="COMPLEX",
+                ),
+                False,
+            ),
+            (
+                "v2",
+                "enc:a",
+                ManualMapping(
+                    system_id=None,
+                    enclosure_id="enc:a",
+                    slot=3,
+                    serial="SCOPED-HISTORY",
+                ),
+                False,
+            ),
+            (
+                "other-system",
+                "v2:enc:a",
+                ManualMapping(
+                    system_id=None,
+                    enclosure_id="v2:enc:a",
+                    slot=4,
+                    serial="LEGACY",
+                ),
+                True,
+            ),
+        )
+        for system_id, enclosure_id, mapping, legacy_only in cases:
+            with (
+                self.subTest(serial=mapping.serial),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                store = self.make_store(temp_dir)
+                key = (
+                    store._slot_key(system_id, enclosure_id, mapping.slot)
+                    if mapping.serial != "LEGACY"
+                    else store._v1_legacy_keys(enclosure_id, mapping.slot)[0]
+                )
+                self.assertTrue(key.startswith("v2:"))
+                before = self.write_document(store, 1, {key: mapping})
+
+                direct = store.get_mapping(
+                    system_id,
+                    enclosure_id,
+                    mapping.slot,
+                    allow_legacy_fallback=True,
+                )
+                direct_legacy = store.has_legacy_only_mapping(
+                    system_id,
+                    enclosure_id,
+                    mapping.slot,
+                )
+                direct_list = store.list_mappings(system_id, enclosure_id)
+                loaded = store.load_all()
+                preloaded = store.get_mapping(
+                    system_id,
+                    enclosure_id,
+                    mapping.slot,
+                    allow_legacy_fallback=True,
+                    loaded_entries=loaded,
+                )
+                preloaded_legacy = store.has_legacy_only_mapping(
+                    system_id,
+                    enclosure_id,
+                    mapping.slot,
+                    loaded_entries=loaded,
+                )
+
+                self.assertEqual(preloaded, direct)
+                self.assertEqual(preloaded_legacy, direct_legacy)
+                self.assertEqual(preloaded_legacy, legacy_only)
+                self.assertEqual(direct_list, [direct])
+                self.assertEqual(loaded, {key: mapping})
+                self.assertEqual(list(loaded), [key])
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_loaded_entry_version_survives_empty_state_and_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            before = self.write_document(store, 1, {})
+            loaded = store.load_all()
+
+            self.assertEqual(loaded, {})
+            self.assertIs(type(getattr(loaded, "store_version")), int)
+            self.assertEqual(getattr(loaded, "store_version"), 1)
+            with self.assertRaises(AttributeError):
+                setattr(loaded, "store_version", 2)
+            self.assertEqual(store._state_from_entries(loaded).version, 1)
+            mapping = ManualMapping(
+                system_id="v2",
+                enclosure_id="enc:a",
+                slot=1,
+                serial="MUTATED",
+            )
+            loaded[store._slot_key("v2", "enc:a", 1)] = mapping
+
+            self.assertEqual(store._state_from_entries(loaded).version, 1)
+            self.assertEqual(
+                store.get_mapping("v2", "enc:a", 1, loaded_entries=loaded),
+                mapping,
+            )
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_plain_preloaded_mappings_keep_conservative_version_inference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            v1_mapping = ManualMapping(
+                system_id="system-a", enclosure_id="enc-a", slot=1
+            )
+            v2_mapping = ManualMapping(
+                system_id="system-b", enclosure_id="enc-b", slot=2
+            )
+
+            self.assertEqual(
+                store.get_mapping(
+                    "system-a",
+                    "enc-a",
+                    1,
+                    loaded_entries={"system-a:enc-a:1": v1_mapping},
+                ),
+                v1_mapping,
+            )
+            self.assertEqual(
+                store.get_mapping(
+                    "system-b",
+                    "enc-b",
+                    2,
+                    loaded_entries={store._encode_v2_key("system-b", "enc-b", 2): v2_mapping},
+                ),
+                v2_mapping,
+            )
+            with self.assertRaises(MappingScopeConflict):
+                store.get_mapping(
+                    "system-a",
+                    "enc-a",
+                    1,
+                    loaded_entries={
+                        "system-a:enc-a:1": v1_mapping,
+                        store._encode_v2_key("system-b", "enc-b", 2): v2_mapping,
+                    },
+                )
+
     def test_v1_collision_row_is_classified_by_its_model_on_every_surface(self) -> None:
         collision_key = "system:a:enc:part:1"
         variants = (
@@ -1911,6 +2075,161 @@ class MappingStoreInjectiveKeyV2Tests(unittest.TestCase):
                 self.assertIsNotNone(resolved)
                 assert resolved is not None
                 self.assertEqual(resolved.serial, "OLD")
+
+    def test_write_temp_bytes_handles_partial_counts_and_rejects_no_progress(self) -> None:
+        class PartialWriter:
+            def __init__(self, counts: list[int | None]) -> None:
+                self.counts = iter(counts)
+                self.data = bytearray()
+
+            def write(self, data: bytes) -> int | None:
+                count = next(self.counts)
+                if count is not None and count > 0:
+                    self.data.extend(data[:count])
+                return count
+
+        payload = b"complete-payload"
+        writer = PartialWriter([1, 2, 3, 4, 6])
+        self.assertEqual(
+            MappingStore._write_temp_bytes(writer, payload),  # type: ignore[arg-type]
+            len(payload),
+        )
+        self.assertEqual(bytes(writer.data), payload)
+
+        count_cases: tuple[list[int | None], ...] = ([2, 0], [2, None])
+        for counts in count_cases:
+            with self.subTest(counts=counts):
+                stalled = PartialWriter(counts)
+                with self.assertRaises(OSError):
+                    MappingStore._write_temp_bytes(  # type: ignore[arg-type]
+                        stalled, payload
+                    )
+                self.assertEqual(bytes(stalled.data), payload[:2])
+
+    def test_incomplete_helper_result_never_replaces_target_or_leaves_temp(self) -> None:
+        for target_exists in (True, False):
+            for result in (1, 0, None):
+                with (
+                    self.subTest(target_exists=target_exists, result=result),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    store = self.make_store(temp_dir)
+                    old = None
+                    if target_exists:
+                        old = self.write_document(
+                            store,
+                            1,
+                            {
+                                "system-a:enc-a:1": ManualMapping(
+                                    system_id="system-a",
+                                    enclosure_id="enc-a",
+                                    slot=1,
+                                    serial="OLD",
+                                )
+                            },
+                        )
+
+                    def incomplete(handle: object, data: bytes) -> int | None:
+                        if result:
+                            handle.write(data[:result])  # type: ignore[attr-defined]
+                        return result
+
+                    with (
+                        patch.object(store, "_write_temp_bytes", side_effect=incomplete),
+                        patch.object(
+                            store,
+                            "_replace_temp_file",
+                            wraps=store._replace_temp_file,
+                        ) as replace,
+                        patch.object(
+                            store,
+                            "_flush_temp_file",
+                            wraps=store._flush_temp_file,
+                        ) as flush,
+                        patch.object(
+                            store,
+                            "_fsync_temp_file",
+                            wraps=store._fsync_temp_file,
+                        ) as fsync,
+                        self.assertRaises(OSError),
+                    ):
+                        store.save_mapping(
+                            ManualMapping(
+                                system_id="system-b",
+                                enclosure_id="enc-b",
+                                slot=2,
+                                serial="NEW",
+                            )
+                        )
+
+                    replace.assert_not_called()
+                    flush.assert_not_called()
+                    fsync.assert_not_called()
+                    self.assertEqual(
+                        list(store.file_path.parent.glob(f"{store.file_path.name}.*.tmp")),
+                        [],
+                    )
+                    if old is None:
+                        self.assertFalse(store.file_path.exists())
+                        self.assertEqual(self.make_store(temp_dir).load_all(), {})
+                    else:
+                        self.assertEqual(store.file_path.read_bytes(), old)
+                        restarted = self.make_store(temp_dir)
+                        resolved = restarted.get_mapping("system-a", "enc-a", 1)
+                        self.assertIsNotNone(resolved)
+                        assert resolved is not None
+                        self.assertEqual(resolved.serial, "OLD")
+
+    def test_successive_partial_writes_publish_exact_canonical_v2_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            self.write_document(
+                store,
+                1,
+                {
+                    "system-a:enc-a:1": ManualMapping(
+                        system_id="system-a",
+                        enclosure_id="enc-a",
+                        slot=1,
+                        serial="OLD",
+                    )
+                },
+            )
+            expected: dict[str, bytes] = {}
+            serialize = store._serialize_v2
+
+            def capture(mappings: object) -> bytes:
+                data = serialize(mappings)  # type: ignore[arg-type]
+                expected["data"] = data
+                return data
+
+            def partial(handle: object, data: bytes) -> int:
+                total = 0
+                for size in (1, 2, 3, len(data)):
+                    if total == len(data):
+                        break
+                    count = handle.write(data[total : total + size])  # type: ignore[attr-defined]
+                    total += count
+                return total
+
+            with (
+                patch.object(store, "_serialize_v2", side_effect=capture),
+                patch.object(store, "_write_temp_bytes", side_effect=partial),
+            ):
+                store.save_mapping(
+                    ManualMapping(
+                        system_id="system-b",
+                        enclosure_id="enc-b",
+                        slot=2,
+                        serial="NEW",
+                    )
+                )
+
+            self.assertEqual(store.file_path.read_bytes(), expected["data"])
+            self.assertEqual(
+                {mapping.serial for mapping in store.load_all().values()},
+                {"OLD", "NEW"},
+            )
 
     def test_classification_failure_precedes_temp_creation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
