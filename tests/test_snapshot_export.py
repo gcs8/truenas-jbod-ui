@@ -779,7 +779,8 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         snapshot = build_snapshot()
         snapshot.warnings = [
             f"API request to https://{hostnames['api']}:8443/api/v2 failed at 2026-09-02T00:01:00Z; "
-            f"unrelated {hostnames['api']}.example and prefix{hostnames['api']} stay literal.",
+            f"unrelated {hostnames['api']}.example collapses too; "
+            f"prefix{hostnames['api']} stays literal.",
             f"SSH warning from {hostnames['ssh']}.",
         ]
         snapshot.slots[0].raw_status = {
@@ -837,8 +838,9 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://host-01:8443/api/v2", rendered.html)
         self.assertIn("SSH warning from host-01.", rendered.html)
         self.assertIn("2026-09-02T00:01:00Z", rendered.html)
-        self.assertIn(f"{hostnames['api']}.example", rendered.html)
-        self.assertIn(f"prefix{hostnames['api']}", rendered.html)
+        self.assertNotIn(f"{hostnames['api']}.example", rendered.html)
+        self.assertIn("unrelated host-01 collapses too;", rendered.html)
+        self.assertIn(f"prefix{hostnames['api']} stays literal.", rendered.html)
         self.assertIn(f"x{hostnames['short']}", rendered.html)
         self.assertEqual(rendered.snapshot.slots[0].raw_status["sas_address_hint"], "0")
         self.assertIn("host-01", rendered.html)
@@ -1758,6 +1760,138 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SnapshotRedactorIdentifierKeyTests(unittest.TestCase):
+    def test_partial_redaction_never_reuses_alias_shaped_system_or_enclosure_ids(self) -> None:
+        snapshot = build_snapshot()
+        snapshot.selected_system_id = "host-01"
+        snapshot.selected_system_label = "host-01"
+        snapshot.systems = [
+            SystemOption(id="host-01", label="host-01"),
+            SystemOption(id="host-02", label="host-02"),
+        ]
+        snapshot.selected_enclosure_id = "enc-01"
+        snapshot.selected_enclosure_label = "enc-01"
+        snapshot.enclosures = [
+            EnclosureOption(id="enc-01", label="enc-01"),
+            EnclosureOption(id="enc-02", label="enc-02"),
+        ]
+        snapshot.slots[0].enclosure_id = "enc-01"
+        snapshot.slots[0].enclosure_label = "enc-01"
+
+        redacted = SnapshotRedactor(snapshot, {}, {}).redact_snapshot(snapshot)
+
+        system_aliases = {system.id for system in redacted.systems}
+        enclosure_aliases = {enclosure.id for enclosure in redacted.enclosures}
+        self.assertTrue(system_aliases.isdisjoint({"host-01", "host-02"}))
+        self.assertTrue(enclosure_aliases.isdisjoint({"enc-01", "enc-02"}))
+        self.assertEqual(len(system_aliases), 2)
+        self.assertEqual(len(enclosure_aliases), 2)
+
+    def test_partial_redaction_reserves_alias_shaped_ids_from_extra_payloads(self) -> None:
+        snapshot = build_snapshot()
+        extra_payload = {
+            "system_id": "host-01",
+            "enclosure_id": "enc-01",
+            "detail": "moved from host-01 through enc-01",
+        }
+
+        redactor = SnapshotRedactor(snapshot, {}, {}, extra_payloads=[extra_payload])
+        redacted_snapshot = redactor.redact_snapshot(snapshot)
+        redacted_extra = redactor.redact_object(extra_payload)
+
+        self.assertNotEqual(redacted_snapshot.selected_system_id, "host-01")
+        self.assertNotEqual(redacted_snapshot.selected_enclosure_id, "enc-01")
+        self.assertNotEqual(redacted_extra["system_id"], "host-01")
+        self.assertNotEqual(redacted_extra["enclosure_id"], "enc-01")
+        self.assertNotIn("host-01", redacted_extra["detail"])
+        self.assertNotIn("enc-01", redacted_extra["detail"])
+
+    def test_partial_redaction_reserves_raw_ids_across_alias_namespaces(self) -> None:
+        snapshot = build_snapshot()
+        snapshot.selected_system_id = "enc-01"
+        snapshot.selected_system_label = "System One"
+        snapshot.systems = [SystemOption(id="enc-01", label="System One")]
+        snapshot.selected_enclosure_id = "host-01"
+        snapshot.selected_enclosure_label = "Enclosure One"
+        snapshot.enclosures = [EnclosureOption(id="host-01", label="Enclosure One")]
+        snapshot.slots[0].enclosure_id = "host-01"
+        snapshot.slots[0].enclosure_label = "Enclosure One"
+
+        redacted = SnapshotRedactor(snapshot, {}, {}).redact_snapshot(snapshot)
+
+        self.assertEqual(redacted.selected_system_id, "host-02")
+        self.assertEqual(redacted.selected_enclosure_id, "enc-02")
+
+    def test_partial_redaction_reserves_cross_namespace_ids_case_insensitively(self) -> None:
+        snapshot = build_snapshot()
+        snapshot.selected_system_id = "ENC-01"
+        snapshot.selected_system_label = "System One"
+        snapshot.systems = [SystemOption(id="ENC-01", label="System One")]
+        snapshot.selected_enclosure_id = "HOST-01"
+        snapshot.selected_enclosure_label = "Enclosure One"
+        snapshot.enclosures = [EnclosureOption(id="HOST-01", label="Enclosure One")]
+        snapshot.slots[0].enclosure_id = "HOST-01"
+        snapshot.slots[0].enclosure_label = "Enclosure One"
+
+        redacted = SnapshotRedactor(snapshot, {}, {}).redact_snapshot(snapshot)
+
+        self.assertEqual(redacted.selected_system_id, "host-02")
+        self.assertEqual(redacted.selected_enclosure_id, "enc-02")
+
+    def test_partial_redaction_dynamic_aliases_share_raw_id_reservations(self) -> None:
+        enclosure_first = SnapshotRedactor(build_snapshot(), {}, {})
+        enclosure_first.redact_object({"enclosure_id": "HOST-02"})
+        redacted_system = enclosure_first.redact_object({"system_id": "late-system"})
+
+        system_first = SnapshotRedactor(build_snapshot(), {}, {})
+        system_first.redact_object({"system_id": "ENC-02"})
+        redacted_enclosure = system_first.redact_object({"enclosure_id": "late-enclosure"})
+
+        self.assertEqual(redacted_system["system_id"], "host-03")
+        self.assertEqual(redacted_enclosure["enclosure_id"], "enc-03")
+
+    def test_alias_shaped_zero_suffix_ids_are_redacted_in_fields_and_free_text(self) -> None:
+        history_cache = {
+            "0": {
+                "system_id": "host-00",
+                "enclosure_id": "enc-00",
+                "detail": "moved from host-00 through enc-00",
+            }
+        }
+        redactor = SnapshotRedactor(build_snapshot(), history_cache, {})
+
+        redacted = redactor.redact_history_cache(history_cache)
+        system_alias = redacted["0"]["system_id"]
+        enclosure_alias = redacted["0"]["enclosure_id"]
+
+        self.assertNotEqual(system_alias, "host-00")
+        self.assertNotEqual(enclosure_alias, "enc-00")
+        self.assertEqual(
+            redacted["0"]["detail"],
+            f"moved from {system_alias} through {enclosure_alias}",
+        )
+
+    def test_actual_numeric_and_address_zero_sentinels_are_preserved(self) -> None:
+        zero_forms = (
+            "0",
+            "0000",
+            "0x0000000000000000",
+            "00:00:00:00:00:00",
+            "00-00-00-00-00-00",
+            "0.0.0.0",
+            "::",
+        )
+        redactor = SnapshotRedactor(build_snapshot(), {}, {})
+
+        for zero_form in zero_forms:
+            with self.subTest(zero_form=zero_form):
+                payload = {
+                    "system_id": zero_form,
+                    "enclosure_id": zero_form,
+                    "serial": zero_form,
+                    "sas_address": zero_form,
+                }
+                self.assertEqual(redactor.redact_object(payload), payload)
+
     def test_partial_redaction_does_not_replace_identifier_substrings(self) -> None:
         snapshot = build_snapshot()
         matching_timestamp = datetime(2026, 9, 2, 0, 1, tzinfo=timezone.utc)
@@ -1838,6 +1972,105 @@ class SnapshotRedactorIdentifierKeyTests(unittest.TestCase):
 
         self.assertEqual(redacted.slots[0].serial, "FI...0001")
         self.assertEqual(redacted.slots[0].raw_status["serial_hint"], "SE...0001")
+
+    def test_short_unknown_system_and_enclosure_ids_are_removed_from_free_text(self) -> None:
+        history_cache = {
+            "0": {
+                "system_id": "unvr",
+                "enclosure_id": "252",
+                "detail": "moved from unvr enclosure 252",
+            }
+        }
+        redactor = SnapshotRedactor(build_snapshot(), history_cache, {})
+
+        redacted = redactor.redact_history_cache(history_cache)
+        system_alias = redacted["0"]["system_id"]
+        enclosure_alias = redacted["0"]["enclosure_id"]
+
+        self.assertRegex(system_alias, r"^host-\d{2}$")
+        self.assertRegex(enclosure_alias, r"^enc-\d{2}$")
+        self.assertEqual(
+            redacted["0"]["detail"],
+            f"moved from {system_alias} enclosure {enclosure_alias}",
+        )
+        self.assertNotIn("unvr", json.dumps(redacted))
+        self.assertNotIn('"252"', json.dumps(redacted))
+
+
+class SnapshotRedactorHostnameFormTests(unittest.TestCase):
+    @staticmethod
+    def _redactor_for(config_host: str) -> SnapshotRedactor:
+        return SnapshotRedactor(
+            build_snapshot(),
+            {},
+            {},
+            configured_hostnames=collect_configured_hostnames(
+                SystemConfig(
+                    id="archive-core",
+                    label="Archive CORE",
+                    truenas=TrueNASConfig(host=config_host),
+                ).model_dump(mode="json")
+            ),
+        )
+
+    def test_short_configured_hostname_also_redacts_its_fqdn(self) -> None:
+        redactor = self._redactor_for("https://nas206:8443")
+
+        self.assertEqual(
+            redactor.redact_object("SSH timed out for nas206.lab.invalid"),
+            "SSH timed out for host-01",
+        )
+        self.assertEqual(
+            redactor.redact_object("nas206-mgmt and xnas206 stay literal"),
+            "nas206-mgmt and xnas206 stay literal",
+        )
+
+    def test_fqdn_configured_hostname_also_redacts_its_short_name(self) -> None:
+        redactor = self._redactor_for("https://nas207.lab.invalid:8443/api/v2")
+
+        self.assertEqual(
+            redactor.redact_object("collector on nas207 failed"),
+            "collector on host-01 failed",
+        )
+        self.assertEqual(
+            redactor.redact_object("collector on nas207.lab.invalid failed"),
+            "collector on host-01 failed",
+        )
+
+    def test_configured_hostname_redaction_keeps_the_url_port_and_path(self) -> None:
+        redactor = self._redactor_for("https://nas208.lab.invalid")
+
+        self.assertEqual(
+            redactor.redact_object("see https://nas208.lab.invalid:8443/ui and nas208:22"),
+            "see https://host-01:8443/ui and host-01:22",
+        )
+
+    def test_unknown_system_id_in_history_rows_gets_a_freshly_minted_alias(self) -> None:
+        history_cache = {
+            "0": {"system_id": "other-box", "detail": "slot moved from other-box shelf"}
+        }
+        redactor = SnapshotRedactor(build_snapshot(), history_cache, {})
+
+        redacted = redactor.redact_history_cache(history_cache)
+        again = redactor.redact_history_cache(history_cache)
+        minted = redacted["0"]["system_id"]
+
+        self.assertNotIn("other-box", json.dumps(redacted))
+        self.assertRegex(minted, r"^host-\d{2}$")
+        self.assertNotEqual(minted, "host-01")
+        self.assertEqual(redacted["0"]["detail"], f"slot moved from {minted} shelf")
+        self.assertEqual(again["0"]["system_id"], minted)
+
+    def test_dotted_system_label_is_redacted_with_its_domain_suffix(self) -> None:
+        snapshot = build_snapshot()
+        snapshot.systems[0].label = "nas209.lab"
+        snapshot.selected_system_label = "nas209.lab"
+        snapshot.warnings = ["collector on nas209.lab.invalid failed"]
+        redactor = SnapshotRedactor(snapshot, {}, {})
+
+        redacted = redactor.redact_snapshot(snapshot)
+
+        self.assertEqual(redacted.warnings, ["collector on host-01 failed"])
 
 
 if __name__ == "__main__":

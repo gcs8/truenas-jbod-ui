@@ -43,6 +43,9 @@ OFFLINE_IMAGE_ASSETS = {
 }
 IPV4_PATTERN = re.compile(r"(?<![\dA-Fa-f:])(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?![\dA-Fa-f:])")
 IPV6_PATTERN = re.compile(r"(?<![:\w])(?P<ip>(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4})(?![:\w])")
+# Trailing DNS labels appended to a hostname token, so a redacted host swallows
+# its own domain suffix instead of leaving it behind.
+FQDN_CONTINUATION_PATTERN = r"(?:\.[A-Za-z0-9-]+)*"
 SERIAL_PATH_KEYS = {"serial", "serial_hint"}
 PARTIAL_ID_PATH_KEYS = {
     "gptid",
@@ -150,10 +153,31 @@ class SnapshotRedactor:
         self.serial_values: list[str] = []
         self.partial_identifier_values: list[str] = []
         alias_snapshots = [snapshot, *(extra_snapshots or [])]
-        self.system_aliases = self._build_system_aliases(alias_snapshots)
-        self.enclosure_aliases = self._build_enclosure_aliases(alias_snapshots)
         self.configured_hostname_values = list(dict.fromkeys(configured_hostnames or []))
         self.configured_hostname_keys = {hostname.casefold() for hostname in self.configured_hostname_values}
+        self.raw_identifier_reservations = {
+            value.casefold()
+            for value in (
+                *self.configured_hostname_values,
+                *self._configured_hostname_short_forms(self.configured_hostname_values),
+            )
+        }
+        payloads = [
+            *(candidate.model_dump(mode="json") for candidate in alias_snapshots),
+            history_cache,
+            smart_summary_cache,
+            *(extra_payloads or []),
+        ]
+        for payload in payloads:
+            self._collect_identifier_reservations(payload)
+        self.system_aliases = self._build_system_aliases(
+            alias_snapshots,
+            self.raw_identifier_reservations,
+        )
+        self.enclosure_aliases = self._build_enclosure_aliases(
+            alias_snapshots,
+            self.raw_identifier_reservations,
+        )
         self._add_configured_hostname_aliases(snapshot)
         self._collect_known_values(snapshot.model_dump(mode="json"))
         for extra_snapshot in extra_snapshots or []:
@@ -209,12 +233,44 @@ class SnapshotRedactor:
         normalized = value.strip()
         if not normalized:
             return
-        if self._is_zero_identifier_sentinel(normalized) or len(normalized) < 5:
+        if self._is_zero_identifier_sentinel(normalized):
             return
-        if bucket == "serial":
+        if bucket == "system":
+            self._alias_for_identifier(normalized, self.system_aliases, "host", value)
+        elif bucket == "enclosure":
+            self._alias_for_identifier(normalized, self.enclosure_aliases, "enc", value)
+        elif len(normalized) < 5:
+            return
+        elif bucket == "serial":
             self.serial_values.append(normalized)
         elif bucket == "partial_id":
             self.partial_identifier_values.append(normalized)
+
+    def _collect_identifier_reservations(self, value: Any, path: tuple[Any, ...] = ()) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                next_path = path + (key,)
+                if key == "details_json" and isinstance(item, str):
+                    try:
+                        parsed = json.loads(item)
+                    except json.JSONDecodeError:
+                        parsed = None
+                    if parsed is not None:
+                        self._collect_identifier_reservations(parsed, next_path + ("parsed",))
+                self._collect_identifier_reservations(item, next_path)
+            return
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                self._collect_identifier_reservations(item, path + (index,))
+            return
+        if not isinstance(value, str):
+            return
+        normalized = value.strip()
+        if not normalized or self._is_zero_identifier_sentinel(normalized):
+            return
+        bucket = self._classify_path(path)
+        if bucket in {"system", "enclosure"}:
+            self.raw_identifier_reservations.add(normalized.casefold())
 
     def _classify_path(self, path: tuple[Any, ...]) -> str | None:
         if not path:
@@ -251,17 +307,25 @@ class SnapshotRedactor:
         return aliases
 
     @classmethod
-    def _build_system_aliases(cls, snapshots: list[InventorySnapshot]) -> dict[str, str]:
+    def _build_system_aliases(
+        cls,
+        snapshots: list[InventorySnapshot],
+        reserved_alias_values: set[str],
+    ) -> dict[str, str]:
         groups: list[list[str]] = []
         for snapshot in snapshots:
             for system in snapshot.systems:
                 groups.append([system.id, system.label])
             if snapshot.selected_system_id or snapshot.selected_system_label:
                 groups.append([snapshot.selected_system_id or "", snapshot.selected_system_label or ""])
-        return cls._build_group_aliases(groups, "host")
+        return cls._build_group_aliases(groups, "host", reserved_alias_values)
 
     @classmethod
-    def _build_enclosure_aliases(cls, snapshots: list[InventorySnapshot]) -> dict[str, str]:
+    def _build_enclosure_aliases(
+        cls,
+        snapshots: list[InventorySnapshot],
+        reserved_alias_values: set[str],
+    ) -> dict[str, str]:
         groups: list[list[str]] = []
         for snapshot in snapshots:
             for enclosure in snapshot.enclosures:
@@ -284,7 +348,7 @@ class SnapshotRedactor:
                 )
             for slot in snapshot.slots:
                 groups.append([slot.enclosure_id or "", slot.enclosure_label or "", slot.enclosure_name or ""])
-        return cls._build_group_aliases(groups, "enc")
+        return cls._build_group_aliases(groups, "enc", reserved_alias_values)
 
     @classmethod
     def _collect_configured_hostnames(cls, source_config: dict[str, Any] | None) -> list[str]:
@@ -342,12 +406,43 @@ class SnapshotRedactor:
             None,
         )
         if selected_alias is None:
-            selected_alias = next(iter(self.system_aliases.values()), "host-01")
+            selected_alias = next(
+                iter(self.system_aliases.values()),
+                self._next_identifier_alias(self.system_aliases, "host"),
+            )
         for hostname in self.configured_hostname_values:
             self.system_aliases[hostname] = selected_alias
+        # A host configured by FQDN is still written as its bare first label in
+        # collector warnings and raw fields (and the reverse), so register both
+        # forms against the same alias. The matching rule below then folds any
+        # domain suffix into whichever form it started from.
+        for short_form in self._configured_hostname_short_forms(self.configured_hostname_values):
+            self.system_aliases.setdefault(short_form, selected_alias)
+            if short_form not in self.configured_hostname_values:
+                self.configured_hostname_values.append(short_form)
+            self.configured_hostname_keys.add(short_form.casefold())
 
     @staticmethod
-    def _build_group_aliases(groups: list[list[str]], prefix: str) -> dict[str, str]:
+    def _configured_hostname_short_forms(hostnames: list[str]) -> list[str]:
+        short_forms: list[str] = []
+        seen: set[str] = set()
+        for hostname in hostnames:
+            short_form = hostname.split(".", 1)[0].strip()
+            if not short_form or short_form == hostname:
+                continue
+            folded = short_form.casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+            short_forms.append(short_form)
+        return short_forms
+
+    @staticmethod
+    def _build_group_aliases(
+        groups: list[list[str]],
+        prefix: str,
+        reserved_alias_values: set[str],
+    ) -> dict[str, str]:
         aliases: dict[str, str] = {}
         alias_index = 0
         for group in groups:
@@ -356,8 +451,11 @@ class SnapshotRedactor:
                 continue
             existing_alias = next((aliases[token] for token in tokens if token in aliases), None)
             if existing_alias is None:
-                alias_index += 1
-                existing_alias = f"{prefix}-{alias_index:02d}"
+                while True:
+                    alias_index += 1
+                    existing_alias = f"{prefix}-{alias_index:02d}"
+                    if existing_alias.casefold() not in reserved_alias_values:
+                        break
             for token in tokens:
                 aliases[token] = existing_alias
         return aliases
@@ -381,9 +479,9 @@ class SnapshotRedactor:
 
         bucket = self._classify_path(path)
         if bucket == "system":
-            return self.system_aliases.get(normalized, normalized)
+            return self._alias_for_identifier(normalized, self.system_aliases, "host", value)
         if bucket == "enclosure":
-            return self.enclosure_aliases.get(normalized, normalized)
+            return self._alias_for_identifier(normalized, self.enclosure_aliases, "enc", value)
         if bucket == "serial":
             if self._is_zero_identifier_sentinel(normalized):
                 return value
@@ -396,22 +494,77 @@ class SnapshotRedactor:
         redacted = value
         for original, replacement in self.token_replacements:
             if original.casefold() in self.configured_hostname_keys:
+                # Swallow any domain suffix so a short configured host also
+                # covers its FQDN. `-`/`_` continuations stay excluded because
+                # `nas01-mgmt` is a different host.
                 pattern = re.compile(
-                    rf"(?<![A-Za-z0-9_.-]){re.escape(original)}(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+                    rf"(?<![A-Za-z0-9_.-]){re.escape(original)}{FQDN_CONTINUATION_PATTERN}(?![A-Za-z0-9_-])",
                     re.IGNORECASE,
                 )
                 redacted = pattern.sub(lambda _match: replacement, redacted)
             elif original and original in redacted:
-                pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(original)}(?![A-Za-z0-9])")
+                # A dotted system label is a hostname too, so it takes the same
+                # domain-suffix rule; anything else keeps the plain boundary.
+                continuation = (
+                    FQDN_CONTINUATION_PATTERN
+                    if "." in original and original in self.system_aliases
+                    else ""
+                )
+                pattern = re.compile(
+                    rf"(?<![A-Za-z0-9]){re.escape(original)}{continuation}(?![A-Za-z0-9])"
+                )
                 redacted = pattern.sub(lambda _match: replacement, redacted)
         redacted = IPV4_PATTERN.sub(lambda match: self._mask_ipv4(match.group("ip")), redacted)
         redacted = IPV6_PATTERN.sub(lambda match: self._mask_ipv6(match.group("ip")), redacted)
         return redacted
 
+    def _alias_for_identifier(
+        self,
+        normalized: str,
+        aliases: dict[str, str],
+        prefix: str,
+        value: str,
+    ) -> str:
+        """Alias an identifier field, minting a new alias when it is unknown.
+
+        A history row can name a system or enclosure the snapshot no longer
+        lists. Returning it unchanged would ship the real identifier, so mint a
+        fresh alias and keep it for the life of this redactor.
+        """
+        existing = aliases.get(normalized)
+        if existing is not None:
+            return existing
+        if self._is_zero_identifier_sentinel(normalized):
+            return value
+        self.raw_identifier_reservations.add(normalized.casefold())
+        minted = self._next_identifier_alias(aliases, prefix)
+        aliases[normalized] = minted
+        return minted
+
+    def _next_identifier_alias(self, aliases: dict[str, str], prefix: str) -> str:
+        used = {alias.casefold() for alias in aliases.values()}
+        reserved = self.raw_identifier_reservations
+        index = 1
+        while True:
+            candidate = f"{prefix}-{index:02d}"
+            if candidate.casefold() not in used and candidate.casefold() not in reserved:
+                return candidate
+            index += 1
+
     @staticmethod
     def _is_zero_identifier_sentinel(value: str) -> bool:
-        compact = re.sub(r"[^0-9A-Fa-f]", "", value.strip().removeprefix("0x").removeprefix("0X"))
-        return bool(compact) and set(compact) == {"0"}
+        normalized = value.strip()
+        if re.fullmatch(r"(?:0[xX])?0+", normalized):
+            return True
+        try:
+            return int(ip_address(normalized)) == 0
+        except ValueError:
+            return bool(
+                re.fullmatch(
+                    r"0+(?P<separator>[:-])0+(?:(?P=separator)0+)*",
+                    normalized,
+                )
+            )
 
     @staticmethod
     def _serial_suffix(value: str) -> str:
