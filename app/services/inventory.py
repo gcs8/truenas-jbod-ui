@@ -9,6 +9,7 @@ import re
 import shlex
 import time
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Generic, Iterable, Literal, TypeVar
@@ -3172,6 +3173,122 @@ class InventoryService:
                 enclosure_id=enclosure_id,
             )
         return cleared
+
+    def get_cached_slot_smart_summary_without_layout(
+        self,
+        slot: int,
+        selected_enclosure_id: str | None = None,
+        *,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> SmartSummaryView | None:
+        """Return last-good SMART data without rebuilding inventory topology."""
+
+        return self.get_cached_slot_smart_summaries_without_layout(
+            [slot],
+            selected_enclosure_id=selected_enclosure_id,
+            loaded_entries=loaded_entries,
+        ).get(slot)
+
+    def get_cached_slot_smart_summaries_without_layout(
+        self,
+        slots: Iterable[int],
+        selected_enclosure_id: str | None = None,
+        *,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> dict[int, SmartSummaryView]:
+        """Return scoped last-good SMART data with one bounded cache/store pass."""
+
+        unique_slots = list(dict.fromkeys(int(slot) for slot in slots))
+        if not unique_slots:
+            return {}
+
+        self._evict_expired_smart_cache_entries()
+        requested_slots = set(unique_slots)
+        loaded_slot_entries = loaded_entries
+        if loaded_slot_entries is None and self.slot_detail_store is not None:
+            loaded_slot_entries = self.slot_detail_store.load_all()
+
+        resolved_enclosure_id = normalize_text(selected_enclosure_id)
+        snapshots = getattr(self, "_cache", {})
+        default_snapshot = snapshots.get("__default__")
+        if resolved_enclosure_id is None and default_snapshot is not None:
+            resolved_enclosure_id = normalize_text(default_snapshot.selected_enclosure_id)
+
+        candidate_enclosure_ids = {
+            enclosure_id
+            for snapshot in snapshots.values()
+            if (enclosure_id := normalize_text(snapshot.selected_enclosure_id)) is not None
+        }
+        cache_candidates: dict[tuple[str, int], SmartCacheKey] = {}
+        for cache_key in self._smart_cache:
+            if cache_key[0] != self.system.id or cache_key[1] != self.system.truenas.platform:
+                continue
+            enclosure_id = normalize_text(cache_key[2])
+            if enclosure_id is None or enclosure_id == "__default__":
+                continue
+            candidate_enclosure_ids.add(enclosure_id)
+            slot = cache_key[3]
+            if slot not in requested_slots:
+                continue
+            candidate_key = (enclosure_id, slot)
+            previous = cache_candidates.get(candidate_key)
+            if previous is None or self._smart_cache_until.get(
+                cache_key,
+                datetime.min.replace(tzinfo=timezone.utc),
+            ) > self._smart_cache_until.get(
+                previous,
+                datetime.min.replace(tzinfo=timezone.utc),
+            ):
+                cache_candidates[candidate_key] = cache_key
+
+        persisted_candidates: dict[tuple[str, int], SlotDetailCacheEntry] = {}
+        for entry in (loaded_slot_entries or {}).values():
+            if entry.system_id != self.system.id:
+                continue
+            enclosure_id = normalize_text(entry.enclosure_id)
+            if enclosure_id is None or enclosure_id == "__default__":
+                continue
+            candidate_enclosure_ids.add(enclosure_id)
+            if entry.slot in requested_slots:
+                persisted_candidates[(enclosure_id, entry.slot)] = entry
+
+        if resolved_enclosure_id is None and len(candidate_enclosure_ids) == 1:
+            resolved_enclosure_id = next(iter(candidate_enclosure_ids))
+
+        summaries: dict[int, SmartSummaryView] = {}
+        for slot in unique_slots:
+            cached = None
+            if resolved_enclosure_id is not None:
+                cache_key = cache_candidates.get((resolved_enclosure_id, slot))
+                if cache_key is not None:
+                    cached = self._smart_cache.get(cache_key)
+            if cached is not None:
+                add_perf_metadata(smart_cache="layout-unavailable-hit")
+                self._observe_smart_summary_request("layout-unavailable-hit")
+                summaries[slot] = cached
+                continue
+
+            entry = (
+                persisted_candidates.get((resolved_enclosure_id, slot))
+                if resolved_enclosure_id is not None
+                else None
+            )
+            persisted = None
+            if entry is not None and entry.smart_fields:
+                try:
+                    persisted = SmartSummaryView.model_validate(entry.smart_fields)
+                except (TypeError, ValueError):
+                    pass
+            if persisted is not None:
+                add_perf_metadata(smart_cache="layout-unavailable-persistent-hit")
+                self._observe_smart_summary_request("layout-unavailable-persistent-hit")
+                summaries[slot] = persisted
+                continue
+
+            add_perf_metadata(smart_cache="layout-unavailable-miss")
+            self._observe_smart_summary_request("layout-unavailable-miss")
+
+        return summaries
 
     async def get_slot_smart_summary(
         self,

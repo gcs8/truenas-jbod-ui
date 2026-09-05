@@ -43,7 +43,10 @@ class SlotHistoryRouteTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(json.loads(response.body), backend_payload)
+        self.assertEqual(
+            json.loads(response.body),
+            {**backend_payload, "layout_bounds": "verified"},
+        )
         registry.get_service.assert_called_once_with(None)
         history_backend.get_slot_history.assert_awaited_once_with(
             5,

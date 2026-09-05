@@ -496,13 +496,32 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     ) -> SmartSummaryView:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        await ensure_slot_bounds(slot, service, enclosure_id)
+        if fresh:
+            await ensure_slot_bounds(slot, service, enclosure_id)
+            layout_bounds = "verified"
+        else:
+            layout_bounds = await ensure_read_slot_bounds(slot, service, enclosure_id)
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         try:
-            return await service.get_slot_smart_summary(
-                slot,
-                selected_enclosure_id=enclosure_id,
-                allow_stale_cache=not fresh,
+            if layout_bounds == "unavailable":
+                summary = service.get_cached_slot_smart_summary_without_layout(
+                    slot,
+                    selected_enclosure_id=enclosure_id,
+                ) or SmartSummaryView(
+                    available=False,
+                    message=(
+                        "Cached SMART data is unavailable while the inventory "
+                        "layout cannot be resolved."
+                    ),
+                )
+            else:
+                summary = await service.get_slot_smart_summary(
+                    slot,
+                    selected_enclosure_id=enclosure_id,
+                    allow_stale_cache=not fresh,
+                )
+            return SmartSummaryView.model_validate(summary).model_copy(
+                update={"layout_bounds": layout_bounds}
             )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -572,9 +591,16 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     ) -> SmartBatchResponse:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        layout_slots = await resolve_layout_slots(service, enclosure_id)
+        if fresh:
+            layout_slots = await resolve_layout_slots(service, enclosure_id)
+            layout_bounds = "verified"
+        else:
+            layout_slots, layout_bounds = await resolve_read_layout_slots(service, enclosure_id)
         for slot in payload.slots:
-            check_slot_bounds(slot, layout_slots)
+            if slot < 0:
+                check_slot_bounds(slot, ())
+            if layout_slots is not None:
+                check_slot_bounds(slot, layout_slots)
         add_perf_metadata(
             system_id=service.system.id,
             platform=service.system.truenas.platform,
@@ -583,15 +609,35 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             smart_batch_max_concurrency=payload.max_concurrency,
         )
         try:
-            summaries = await service.get_slot_smart_summaries(
-                payload.slots,
-                selected_enclosure_id=enclosure_id,
-                max_concurrency=payload.max_concurrency,
-                allow_stale_cache=not fresh,
-            )
+            if layout_bounds == "unavailable":
+                summaries = []
+                seen_slots: set[int] = set()
+                cached_summaries = service.get_cached_slot_smart_summaries_without_layout(
+                    payload.slots,
+                    selected_enclosure_id=enclosure_id,
+                )
+                for slot in payload.slots:
+                    if slot in seen_slots:
+                        continue
+                    seen_slots.add(slot)
+                    summary = cached_summaries.get(slot) or SmartSummaryView(
+                        available=False,
+                        message=(
+                            "Cached SMART data is unavailable while the inventory "
+                            "layout cannot be resolved."
+                        ),
+                    )
+                    summaries.append(SmartBatchItem(slot=slot, summary=summary))
+            else:
+                summaries = await service.get_slot_smart_summaries(
+                    payload.slots,
+                    selected_enclosure_id=enclosure_id,
+                    max_concurrency=payload.max_concurrency,
+                    allow_stale_cache=not fresh,
+                )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return SmartBatchResponse(summaries=summaries)
+        return SmartBatchResponse(summaries=summaries, layout_bounds=layout_bounds)
 
     @router.get("/api/history/status")
     async def get_history_status() -> JSONResponse:
@@ -607,7 +653,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     ) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        await ensure_slot_bounds(slot, service, enclosure_id)
+        layout_bounds = await ensure_read_slot_bounds(slot, service, enclosure_id)
         resolved_system_id = service.system.id
         add_perf_metadata(
             system_id=resolved_system_id,
@@ -623,7 +669,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             enclosure_id,
             window_hours=window_hours,
         )
-        return JSONResponse(payload)
+        return JSONResponse({**payload, "layout_bounds": layout_bounds})
 
     @router.get("/api/history/scope")
     async def get_history_scope(
@@ -634,13 +680,29 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         metrics: list[str] | None = Query(default=None),
         event_limit: int = Query(default=12, ge=0, le=1000),
     ) -> JSONResponse:
+        requested_slots = [int(slot) for slot in (slots or [])]
+        if len(requested_slots) > SMART_BATCH_MAX_SLOTS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"At most {SMART_BATCH_MAX_SLOTS} history slots may be requested.",
+            )
+        for slot in requested_slots:
+            if slot < 0:
+                check_slot_bounds(slot, ())
+            if slot > SMART_BATCH_MAX_SLOTS:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"History slot values must not exceed {SMART_BATCH_MAX_SLOTS}.",
+                )
+        normalized_slots = sorted(set(requested_slots))
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        normalized_slots = sorted({int(slot) for slot in (slots or [])})
+        layout_bounds = "verified"
         if normalized_slots:
-            layout_slots = await resolve_layout_slots(service, enclosure_id)
+            layout_slots, layout_bounds = await resolve_read_layout_slots(service, enclosure_id)
             for slot in normalized_slots:
-                check_slot_bounds(slot, layout_slots)
+                if layout_slots is not None:
+                    check_slot_bounds(slot, layout_slots)
         add_perf_metadata(
             system_id=service.system.id,
             platform=service.system.truenas.platform,
@@ -662,6 +724,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 "configured": history_backend.configured,
                 "system_id": service.system.id,
                 "enclosure_id": enclosure_id,
+                "layout_bounds": layout_bounds,
                 "histories": {str(slot): history for slot, history in payload.items()},
             }
         )

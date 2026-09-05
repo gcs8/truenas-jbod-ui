@@ -5606,6 +5606,138 @@ class InventoryBmcCorrelationTests(unittest.TestCase):
 
 
 class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_degraded_smart_cache_uses_default_snapshot_scope_when_enclosure_is_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="cache-host", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service._cache["__default__"] = InventorySnapshot(
+                slots=[],
+                selected_enclosure_id="enc-a",
+                refresh_interval_seconds=30,
+            )
+            expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+            expected = SmartSummaryView(available=True, temperature_c=31)
+            summaries = {
+                "__default__": SmartSummaryView(available=True, temperature_c=10),
+                "enc-a": expected,
+                "enc-b": SmartSummaryView(available=True, temperature_c=42),
+            }
+            for enclosure_id, summary in summaries.items():
+                cache_key = (system.id, "core", enclosure_id, 5, (f"da-{enclosure_id}",))
+                service._smart_cache[cache_key] = summary
+                service._smart_cache_until[cache_key] = expiry
+
+            returned = service.get_cached_slot_smart_summary_without_layout(5)
+
+            self.assertIs(returned, expected)
+
+    async def test_degraded_persisted_smart_uses_default_snapshot_scope_when_enclosure_is_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="cache-host", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service._cache["__default__"] = InventorySnapshot(
+                slots=[],
+                selected_enclosure_id="enc-a",
+                refresh_interval_seconds=30,
+            )
+            store = service.slot_detail_store
+            self.assertIsNotNone(store)
+            assert store is not None
+            store.save_entries(
+                [
+                    SlotDetailCacheEntry(
+                        system_id=system.id,
+                        enclosure_id=enclosure_id,
+                        slot=5,
+                        smart_fields={"available": True, "temperature_c": temperature},
+                    )
+                    for enclosure_id, temperature in ((None, 10), ("enc-a", 31), ("enc-b", 42))
+                ]
+            )
+
+            returned = service.get_cached_slot_smart_summary_without_layout(5)
+
+            self.assertIsNotNone(returned)
+            assert returned is not None
+            self.assertEqual(returned.temperature_c, 31)
+
+    async def test_degraded_smart_cache_uses_unique_enclosure_when_default_snapshot_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="cache-host", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            expected = SmartSummaryView(available=True, temperature_c=31)
+            cache_key = (system.id, "core", "enc-a", 5, ("da0",))
+            service._smart_cache[cache_key] = expected
+            service._smart_cache_until[cache_key] = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+            returned = service.get_cached_slot_smart_summary_without_layout(5)
+
+            self.assertIs(returned, expected)
+
+    async def test_degraded_smart_scope_resolution_is_independent_of_requested_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="cache-host", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+            default_key = (system.id, "core", "enc-default-24", 5, ("da0",))
+            wide_key = (system.id, "core", "enc-wide-84", 83, ("da83",))
+            service._smart_cache[default_key] = SmartSummaryView(
+                available=True,
+                temperature_c=31,
+            )
+            service._smart_cache[wide_key] = SmartSummaryView(
+                available=True,
+                temperature_c=42,
+            )
+            service._smart_cache_until[default_key] = expiry
+            service._smart_cache_until[wide_key] = expiry
+
+            returned = service.get_cached_slot_smart_summary_without_layout(83)
+
+            self.assertIsNone(returned)
+
+    async def test_degraded_smart_cache_never_uses_synthetic_default_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="cache-host", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            cache_key = (system.id, "core", "__default__", 5, ("da0",))
+            service._smart_cache[cache_key] = SmartSummaryView(
+                available=True,
+                temperature_c=99,
+            )
+            service._smart_cache_until[cache_key] = datetime.now(timezone.utc) + timedelta(
+                minutes=5
+            )
+
+            returned = service.get_cached_slot_smart_summary_without_layout(5)
+
+            self.assertIsNone(returned)
+
+    async def test_degraded_smart_cache_rejects_ambiguous_omitted_enclosure_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="cache-host", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+            summaries = {
+                "__default__": SmartSummaryView(available=True, temperature_c=10),
+                "enc-a": SmartSummaryView(available=True, temperature_c=31),
+                "enc-b": SmartSummaryView(available=True, temperature_c=42),
+            }
+            for enclosure_id, summary in summaries.items():
+                cache_key = (system.id, "core", enclosure_id, 5, (f"da-{enclosure_id}",))
+                service._smart_cache[cache_key] = summary
+                service._smart_cache_until[cache_key] = expiry
+
+            returned = service.get_cached_slot_smart_summary_without_layout(5)
+
+            self.assertIsNone(returned)
+
     async def test_ssh_batches_for_different_hosts_are_not_globally_serialized(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()

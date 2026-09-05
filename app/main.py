@@ -34,6 +34,7 @@ from app.logging_config import configure_logging
 from app.request_context import request_id_headers
 from app.models.domain import (
     DiskInventorySyncRequest,
+    SMART_BATCH_MAX_SLOTS,
     InventorySnapshot,
     LedAction,
     LedRequest,
@@ -42,6 +43,7 @@ from app.models.domain import (
     MappingRequest,
     SasFabricAliasRequest,
     SnapshotExportRequest,
+    SmartBatchItem,
     SmartBatchRequest,
     SmartBatchResponse,
     SasFabricSnapshot,
@@ -637,6 +639,31 @@ async def ensure_slot_bounds(
     if slot < 0:
         raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
     check_slot_bounds(slot, await resolve_layout_slots(service, selected_enclosure_id))
+
+
+async def resolve_read_layout_slots(
+    service: Any | None = None,
+    selected_enclosure_id: str | None = None,
+) -> tuple[frozenset[int] | None, str]:
+    try:
+        return await resolve_layout_slots(service, selected_enclosure_id), "verified"
+    except HTTPException as exc:
+        if exc.status_code != 503:
+            raise
+        return None, "unavailable"
+
+
+async def ensure_read_slot_bounds(
+    slot: int,
+    service: Any | None = None,
+    selected_enclosure_id: str | None = None,
+) -> str:
+    if slot < 0:
+        raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
+    layout_slots, layout_bounds = await resolve_read_layout_slots(service, selected_enclosure_id)
+    if layout_slots is not None:
+        check_slot_bounds(slot, layout_slots)
+    return layout_bounds
 
 
 def resolve_admin_launch_url(request: Request, settings: Settings) -> str | None:
