@@ -501,6 +501,7 @@ class ContainerResourceContractTests(unittest.TestCase):
                 "/app/config",
                 "/app/data",
                 "/app/history",
+                "/app/host-prep",
                 "/var/run/docker.sock",
             },
             "enclosure-backup": {
@@ -519,7 +520,7 @@ class ContainerResourceContractTests(unittest.TestCase):
     def test_large_temporary_workspaces_use_disk_backed_state_mounts(self) -> None:
         expected_temp_roots = {
             "enclosure-history": "/app/history",
-            "enclosure-admin": "/app/history",
+            "enclosure-admin": "/app/host-prep",
             "enclosure-backup": "/app/backups",
         }
         for compose_name in COMPOSE_FILES:
@@ -535,6 +536,88 @@ class ContainerResourceContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("disk-backed scratch", backup_guide)
         self.assertIn("TMPDIR", backup_guide)
+
+    def test_admin_host_prep_upload_spooling_never_uses_shared_history(self) -> None:
+        for compose_name in COMPOSE_FILES:
+            compose = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))
+            admin = compose["services"]["enclosure-admin"]
+
+            with self.subTest(compose=compose_name):
+                self.assertEqual(admin["environment"].get("TMPDIR"), "/app/host-prep")
+                self.assertNotEqual(admin["environment"].get("TMPDIR"), "/app/history")
+
+    def test_admin_host_prep_staging_uses_a_dedicated_disk_backed_volume(self) -> None:
+        for compose_name in COMPOSE_FILES:
+            compose = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))
+            admin = compose["services"]["enclosure-admin"]
+
+            with self.subTest(compose=compose_name):
+                self.assertEqual(
+                    admin["environment"].get("ADMIN_HOST_PREP_TEMP_DIR"),
+                    "${ADMIN_HOST_PREP_TEMP_DIR:-/app/host-prep}",
+                )
+                self.assertIn("host-prep-staging", compose.get("volumes", {}))
+                self.assertIn("host-prep-staging:/app/host-prep", admin["volumes"])
+
+    def test_only_root_owned_admin_service_can_write_host_prep_staging(self) -> None:
+        staging_source = "host-prep-staging"
+        staging_root = PurePosixPath("/app/host-prep")
+        for compose_name in COMPOSE_FILES:
+            services = yaml.safe_load(
+                (REPO_ROOT / compose_name).read_text(encoding="utf-8")
+            )["services"]
+            admin = services["enclosure-admin"]
+
+            with self.subTest(compose=compose_name, service="enclosure-admin"):
+                self.assertEqual(admin["user"], "0:${APP_GID:-10001}")
+                self.assertIn(str(staging_root), writable_volume_targets(admin))
+
+            for service_name, service in services.items():
+                if service_name == "enclosure-admin":
+                    continue
+                writable_targets = {
+                    PurePosixPath(target) for target in writable_volume_targets(service)
+                }
+                with self.subTest(compose=compose_name, service=service_name):
+                    self.assertFalse(
+                        any(
+                            isinstance(volume, str)
+                            and volume.split(":", 1)[0] == staging_source
+                            for volume in service.get("volumes", [])
+                        )
+                    )
+                    self.assertFalse(
+                        any(
+                            target == staging_root or target in staging_root.parents
+                            for target in writable_targets
+                        )
+                    )
+
+    def test_documentation_uses_dedicated_disk_backed_host_prep_staging(self) -> None:
+        env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        admin_guide = (REPO_ROOT / "wiki/Admin-UI-and-System-Setup.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "ADMIN_HOST_PREP_TEMP_DIR=/app/host-prep",
+            env_example,
+        )
+        self.assertRegex(
+            env_example,
+            r"(?i)disk-backed[^\n]*host-prep|host-prep[^\n]*disk-backed",
+        )
+        self.assertRegex(env_example, r"(?i)TMPDIR[^\n]*not shared history|not shared history[^\n]*TMPDIR")
+        self.assertIn("`/app/host-prep`", admin_guide)
+        self.assertRegex(admin_guide, r"(?i)incoming upload[^\n]*spool[^\n]*`/app/host-prep`")
+
+    def test_host_prep_docs_recommend_removal_within_24_hours(self) -> None:
+        admin_guide = (REPO_ROOT / "wiki/Admin-UI-and-System-Setup.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertRegex(admin_guide, r"(?i)remove[^\n]*within 24 hours")
+        self.assertIn("not an automatic TTL", admin_guide)
 
     def test_default_nonroot_migration_is_documented_before_start(self) -> None:
         env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")

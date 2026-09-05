@@ -122,7 +122,9 @@ services:
     env_file:
       - .env
     environment:
-      TMPDIR: /app/history
+      # Spool inbound uploads on the dedicated admin-only volume, not history or /tmp.
+      TMPDIR: /app/host-prep
+      ADMIN_HOST_PREP_TEMP_DIR: ${ADMIN_HOST_PREP_TEMP_DIR:-/app/host-prep}
       HISTORY_SQLITE_PATH: /app/history/history.db
       HISTORY_SEGMENT_CATALOG_PATH: ${HISTORY_SEGMENT_CATALOG_PATH:-}
       HISTORY_BACKUP_DIR: ${HISTORY_BACKUP_DIR:-/app/history/backups}
@@ -145,6 +147,7 @@ services:
       - ./config:/app/config
       - ./data:/app/data
       - ./history:/app/history
+      - host-prep-staging:/app/host-prep
       - ./config/ssh:/run/ssh:ro
       - /var/run/docker.sock:/var/run/docker.sock
     restart: "no"
@@ -198,3 +201,6 @@ services:
     mem_limit: ${BACKUP_MEM_LIMIT:-3g}
     healthcheck:
       disable: true
+
+volumes:
+  host-prep-staging:

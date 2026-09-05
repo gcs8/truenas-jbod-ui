@@ -382,7 +382,7 @@ jobs:
 
           probe_compose_service enclosure-ui 10001 10001 0000000000000000 /tmp /app/data
           probe_compose_service enclosure-history 10001 10001 0000000000000000 /app/history /app/history
-          probe_compose_service enclosure-admin 0 10001 0000000000000009 /app/history /app/data
+          probe_compose_service enclosure-admin 0 10001 0000000000000009 /app/host-prep /app/data
           probe_compose_service enclosure-backup 1000 1000 0000000000000000 /app/backups /app/backups
           printf '%s\n' 'base_compose_service_contracts=ok'
 

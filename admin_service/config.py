@@ -11,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, model_v
 from app.secret_files import load_secret_environment_value
 
 
+def _default_host_prep_temp_dir() -> str:
+    temp_root = os.getenv("TMPDIR") or "/tmp"
+    return str(Path(temp_root) / "truenas-jbod-ui-host-prep")
+
+
 class AdminSettings(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
@@ -35,7 +40,7 @@ class AdminSettings(BaseModel):
     clean_backup_targets: list[Literal["ui", "history"]] = Field(
         default_factory=lambda: ["ui", "history"]
     )
-    host_prep_temp_dir: str = "/tmp/truenas-jbod-ui-host-prep"
+    host_prep_temp_dir: str = Field(default_factory=_default_host_prep_temp_dir)
 
     @model_validator(mode="after")
     def validate_authentication(self) -> "AdminSettings":

@@ -79,6 +79,11 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn("http://127.0.0.1:18080/healthz", workflow_text)
         self.assertIn('"dependency_status": "unknown"', workflow_text)
         self.assertIn('"cache_state": "empty"', workflow_text)
+        self.assertIn(
+            "probe_compose_service enclosure-admin 0 10001 0000000000000009 "
+            "/app/host-prep /app/data",
+            workflow_text,
+        )
 
     def test_ci_runs_admin_browser_qa_against_cleanroom_fixture_without_skips(self) -> None:
         workflow = yaml.safe_load(self.read(CI_WORKFLOW))
