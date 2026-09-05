@@ -28,6 +28,7 @@ from app.models.domain import (  # noqa: E402
     SlotView,
     SourceStatus,
     StorageViewRuntimePayload,
+    StorageViewRuntimeView,
     SystemOption,
 )
 from app.script_json import register_script_json_filters  # noqa: E402
@@ -58,7 +59,7 @@ def build_synthetic_snapshot() -> InventorySnapshot:
             row_index=slot // 2,
             column_index=slot % 2,
             enclosure_id="synthetic-enclosure",
-            enclosure_label="Synthetic Enclosure",
+            enclosure_label='Synthetic "Enclosure"',
             present=slot != 3,
             state=(SlotState.identify if slot == 1 else SlotState.empty if slot == 3 else SlotState.healthy),
             identify_active=slot == 1,
@@ -86,14 +87,14 @@ def build_synthetic_snapshot() -> InventorySnapshot:
         selected_system_label="Synthetic System",
         selected_system_platform="linux",
         selected_enclosure_id="synthetic-enclosure",
-        selected_enclosure_label="Synthetic Enclosure",
+        selected_enclosure_label='Synthetic "Enclosure"',
         selected_enclosure_name="Synthetic Browser Enclosure",
         selected_profile=profile,
         systems=[SystemOption(id="synthetic-system", label="Synthetic System", platform="linux")],
         enclosures=[
             EnclosureOption(
                 id="synthetic-enclosure",
-                label="Synthetic Enclosure",
+                label='Synthetic "Enclosure"',
                 name="Synthetic Browser Enclosure",
                 profile_id=profile.id,
                 rows=2,
@@ -236,6 +237,19 @@ def build_fixture_request() -> Request:
 async def build_fixture_html() -> str:
     settings = Settings()
     exporter = SnapshotExportService(settings, HistoryBackendClient(settings.history), TEMPLATES)
+    storage_view_runtime = StorageViewRuntimePayload(
+        system_id="synthetic-system",
+        views=[
+            StorageViewRuntimeView(
+                id="synthetic-view",
+                label="Synthetic View",
+                kind="manual",
+                template_id="synthetic-template",
+                slot_layout=[[0]],
+                slot_count=1,
+            )
+        ],
+    )
     rendered = await exporter.build_enclosure_snapshot_html(
         request=build_fixture_request(),
         snapshot=build_synthetic_snapshot(),
@@ -244,6 +258,7 @@ async def build_fixture_html() -> str:
         history_window_hours=None,
         history_panel_open=False,
         io_chart_mode="total",
+        storage_view_runtime=storage_view_runtime,
         generated_at=FIXTURE_GENERATED_AT,
         identifier_policy_label="Synthetic IDs",
         identifier_policy_note="Generated only from deterministic checked-in source and synthetic values.",

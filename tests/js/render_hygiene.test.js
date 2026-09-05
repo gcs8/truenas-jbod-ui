@@ -315,3 +315,166 @@ test("cache timing chips are updated in place after the first render", () => {
   assert.match(source, /setBarWidthIfChanged\(/);
   assert.match(source, /classList\.toggle\("is-expired"/);
 });
+
+function escapeOptionText(value) {
+  // Mirrors how a browser serializes an option's text node: `&`, `<` and `>`
+  // come back escaped, a double quote comes back bare.
+  return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function decodeEntities(value) {
+  return String(value)
+    .replaceAll("&quot;", '"')
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
+}
+
+function parseOptionsHtml(html) {
+  const tokens = /<optgroup([^>]*)>|<\/optgroup>|<option([^>]*)>([\s\S]*?)<\/option>/g;
+  const options = [];
+  let group = null;
+  let match = tokens.exec(html);
+  while (match) {
+    if (match[0].startsWith("</optgroup")) {
+      group = null;
+    } else if (match[1] !== undefined) {
+      const label = /label="([^"]*)"/.exec(match[1]);
+      group = { tagName: "OPTGROUP", label: decodeEntities(label ? label[1] : "") };
+    } else {
+      const value = /value="([^"]*)"/.exec(match[2]);
+      options.push({
+        value: decodeEntities(value ? value[1] : ""),
+        text: decodeEntities(match[3]),
+        selected: / selected(?=[\s>=])/.test(`${match[2]} `),
+        disabled: / disabled(?=[\s>=])/.test(`${match[2]} `),
+        parentNode: group,
+      });
+    }
+    match = tokens.exec(html);
+  }
+  return options;
+}
+
+function serializeOptions(options) {
+  let html = "";
+  let group = null;
+  options.forEach((option) => {
+    if (option.parentNode !== group) {
+      if (group) html += "</optgroup>";
+      group = option.parentNode;
+      if (group) html += `<optgroup label="${group.label.replaceAll('"', "&quot;")}">`;
+    }
+    html += `<option value="${option.value.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}"`;
+    html += `${option.selected ? " selected" : ""}${option.disabled ? " disabled" : ""}>`;
+    html += `${escapeOptionText(option.text)}</option>`;
+  });
+  if (group) html += "</optgroup>";
+  return html;
+}
+
+function createFakeSelect(ownerDocument) {
+  const select = { ownerDocument, writes: 0, options: [] };
+  Object.defineProperty(select, "innerHTML", {
+    get() {
+      return serializeOptions(this.options);
+    },
+    set(value) {
+      this.writes += 1;
+      this.options = parseOptionsHtml(value);
+      if (this.options.length && !this.options.some((option) => option.selected)) {
+        this.options[0].selected = true;
+      }
+    },
+  });
+  Object.defineProperty(select, "value", {
+    get() {
+      const selected = this.options.find((option) => option.selected);
+      return selected ? selected.value : "";
+    },
+    set(value) {
+      this.options.forEach((option) => {
+        option.selected = option.value === value;
+      });
+    },
+  });
+  return select;
+}
+
+function createFakeSelectDocument() {
+  const ownerDocument = {
+    createElement(tagName) {
+      assert.equal(tagName, "select");
+      return createFakeSelect(ownerDocument);
+    },
+  };
+  return ownerDocument;
+}
+
+function enclosureOptionsHtml(aliasLabel) {
+  return [
+    '<optgroup label="Live Enclosures">',
+    '<option value="enclosure:enc-a">Shelf A</option>',
+    `<option value="enclosure:enc-b">${aliasLabel}</option>`,
+    "</optgroup>",
+  ].join("");
+}
+
+test("a quoted enclosure alias does not rebuild the selector on every render", () => {
+  const ownerDocument = createFakeSelectDocument();
+  const select = createFakeSelect(ownerDocument);
+  const optionsHtml = enclosureOptionsHtml("24&quot; spare shelf");
+  select.innerHTML = optionsHtml;
+  select.value = "enclosure:enc-b";
+  const openOptionNode = select.options[1];
+  const { fns } = loadFunctions(APP_SOURCE, ["setSelectOptionsIfChanged", "selectOptionGroupLabel"], { Array });
+
+  // The byte compare cannot match: the browser serializes the text node's
+  // `&quot;` back as a bare quote.
+  assert.notEqual(select.innerHTML, optionsHtml);
+  assert.equal(fns.setSelectOptionsIfChanged(select, optionsHtml, "enclosure:enc-b"), false);
+  assert.equal(select.writes, 1);
+  assert.equal(select.options[1], openOptionNode);
+  assert.equal(select.value, "enclosure:enc-b");
+});
+
+test("a changed enclosure option list is rewritten and keeps the intended selection", () => {
+  const ownerDocument = createFakeSelectDocument();
+  const select = createFakeSelect(ownerDocument);
+  select.innerHTML = enclosureOptionsHtml("24&quot; spare shelf");
+  select.value = "enclosure:enc-b";
+  const { fns } = loadFunctions(APP_SOURCE, ["setSelectOptionsIfChanged", "selectOptionGroupLabel"], { Array });
+
+  assert.equal(
+    fns.setSelectOptionsIfChanged(select, enclosureOptionsHtml("24&quot; cold spare"), "enclosure:enc-b"),
+    true,
+  );
+  assert.equal(select.writes, 2);
+  assert.equal(select.options[1].text, '24" cold spare');
+  assert.equal(select.value, "enclosure:enc-b");
+});
+
+test("an option group relabel is not mistaken for an unchanged option list", () => {
+  const ownerDocument = createFakeSelectDocument();
+  const select = createFakeSelect(ownerDocument);
+  select.innerHTML = [
+    '<optgroup label="Saved Chassis Views">',
+    '<option value="view:view-a">Rack row</option>',
+    "</optgroup>",
+  ].join("");
+  const { fns } = loadFunctions(APP_SOURCE, ["setSelectOptionsIfChanged", "selectOptionGroupLabel"], { Array });
+
+  assert.equal(
+    fns.setSelectOptionsIfChanged(
+      select,
+      [
+        '<optgroup label="Virtual Storage Views">',
+        '<option value="view:view-a">Rack row</option>',
+        "</optgroup>",
+      ].join(""),
+      "view:view-a",
+    ),
+    true,
+  );
+  assert.equal(select.options[0].parentNode.label, "Virtual Storage Views");
+});

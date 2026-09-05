@@ -191,7 +191,7 @@ test("current-source heat-map overlays win the face and empty-bay cascade", asyn
   expect(pageErrors).toEqual([]);
 });
 
-test("semantic selector rendering preserves option nodes without child mutations", async ({ page }) => {
+test("enclosure selector keeps its quoted option, focus, and node across a normal render", async ({ page }) => {
   const artifactPath = resolveSlotFocusArtifact();
   const consoleErrors = [];
   const pageErrors = [];
@@ -204,29 +204,37 @@ test("semantic selector rendering preserves option nodes without child mutations
   await page.goto(pathToFileURL(artifactPath).href, { waitUntil: "load" });
 
   const observation = await page.evaluate(async () => {
-    const select = document.getElementById("system-select");
-    const originalOption = select.options[0];
+    const select = document.getElementById("enclosure-select");
+    const selectedValue = "enclosure:synthetic-enclosure";
+    const originalOption = Array.from(select.options).find((option) => option.value === selectedValue);
+    if (!originalOption) {
+      throw new Error("synthetic enclosure option is missing");
+    }
     const mutations = [];
     const observer = new MutationObserver((records) => mutations.push(...records));
     observer.observe(select, { childList: true, subtree: true });
+    select.focus();
     document.getElementById("sas-fabric-toggle-button").click();
     await new Promise((resolve) => queueMicrotask(resolve));
     observer.disconnect();
     return {
       childMutations: mutations.filter((record) => record.type === "childList").length,
-      sameOption: originalOption === select.options[0] && originalOption.isConnected,
-      selected: select.options[0].selected,
-      value: select.options[0].value,
-      text: select.options[0].text,
+      focused: document.activeElement === select,
+      sameOption: originalOption === Array.from(select.options).find((option) => option.value === selectedValue)
+        && originalOption.isConnected,
+      selected: originalOption.selected,
+      value: select.value,
+      text: originalOption.text,
     };
   });
 
   expect(observation).toEqual({
     childMutations: 0,
+    focused: true,
     sameOption: true,
     selected: true,
-    value: "synthetic-system",
-    text: "Synthetic System",
+    value: "enclosure:synthetic-enclosure",
+    text: 'Live Enclosure · Synthetic "Enclosure"',
   });
   expect(consoleErrors).toEqual([]);
   expect(pageErrors).toEqual([]);
