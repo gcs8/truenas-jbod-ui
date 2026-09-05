@@ -52,7 +52,7 @@ from app.services.inventory import (
     parse_size_to_bytes,
     resolve_persistent_id,
 )
-from app.services.mapping_store import MappingStore
+from app.services.mapping_store import MappingRevisionConflict, MappingStore
 from app.services.parsers import (
     LinuxScsiDevice,
     ParsedSSHData,
@@ -362,8 +362,14 @@ class InventoryHelpersTests(unittest.TestCase):
         )
         self.assertTrue(
             service._legacy_mapping_fallback_allowed([
-                EnclosureOption(id="enc-a::drawer-a", label="Drawer A"),
-                EnclosureOption(id="enc-a::drawer-b", label="Drawer B"),
+                EnclosureOption(
+                    id="enc-a::dell-md1280-drawer-top-42",
+                    label="Drawer A",
+                ),
+                EnclosureOption(
+                    id="enc-a::dell-md1280-drawer-bottom-42",
+                    label="Drawer B",
+                ),
             ])
         )
         self.assertFalse(service._legacy_mapping_fallback_allowed([]))
@@ -571,14 +577,14 @@ class InventoryHelpersTests(unittest.TestCase):
             })
             enclosures = [
                 EnclosureOption(
-                    id="enc-a::drawer-a",
+                    id="enc-a::dell-md1280-drawer-top-42",
                     label="Drawer A",
                     rows=2,
                     columns=4,
                     slot_count=8,
                 ),
                 EnclosureOption(
-                    id="enc-a::drawer-b",
+                    id="enc-a::dell-md1280-drawer-bottom-42",
                     label="Drawer B",
                     rows=2,
                     columns=4,
@@ -590,14 +596,17 @@ class InventoryHelpersTests(unittest.TestCase):
             warnings: list[str] = []
             frame = service._resolve_layout_frame(
                 enclosures,
-                "enc-a::drawer-b",
+                "enc-a::dell-md1280-drawer-bottom-42",
                 warnings,
                 require_profile=False,
             )
 
             self.assertIsInstance(frame, inventory_module._LayoutFrame)
             self.assertFalse(frame.allow_legacy_mapping_fallback)
-            self.assertEqual(frame.selected_meta["id"], "enc-a::drawer-b")
+            self.assertEqual(
+                frame.selected_meta["id"],
+                "enc-a::dell-md1280-drawer-bottom-42",
+            )
             self.assertEqual(len(warnings), 1)
             self.assertIn("1 manual mapping ", warnings[0])
             self.assertNotIn("2 manual", warnings[0])
@@ -615,7 +624,7 @@ class InventoryHelpersTests(unittest.TestCase):
             ]
             enclosures = [
                 EnclosureOption(
-                    id="enc-a::bottom",
+                    id="enc-a::dell-md1280-drawer-bottom-42",
                     label="Bottom drawer",
                     rows=3,
                     columns=14,
@@ -628,7 +637,7 @@ class InventoryHelpersTests(unittest.TestCase):
             warnings: list[str] = []
             frame = service._resolve_layout_frame(
                 enclosures,
-                "enc-a::bottom",
+                "enc-a::dell-md1280-drawer-bottom-42",
                 warnings,
                 require_profile=False,
             )
@@ -8450,11 +8459,11 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             expiry = datetime.now(timezone.utc) + timedelta(seconds=30)
             matching_keys = {
                 "enc-a",
-                "enc-a::dell-md1280-top-drawer",
-                "enc-a::dell-md1280-bottom-drawer",
+                "enc-a::dell-md1280-drawer-top-42",
+                "enc-a::dell-md1280-drawer-bottom-42",
                 "__default__",
             }
-            unrelated_key = "enc-b::dell-md1280-top-drawer"
+            unrelated_key = "enc-b::dell-md1280-drawer-top-42"
             for cache_key in matching_keys | {unrelated_key}:
                 service._cache[cache_key] = snapshot
                 service._cache_until[cache_key] = expiry
@@ -8470,7 +8479,7 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
 
             service.invalidate_physical_enclosure_snapshot_cache(
                 reason="test.physical.scope",
-                enclosure_id="enc-a::dell-md1280-top-drawer",
+                enclosure_id="enc-a::dell-md1280-drawer-top-42",
             )
 
             self.assertEqual(set(service._cache), {unrelated_key})
@@ -12188,7 +12197,12 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
     async def test_physical_invalidation_cleans_coordinated_drawer_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._service(temp_dir)
-            keys = ("enc-a", "enc-a::drawer-top", "enc-a::drawer-bottom", "enc-b")
+            keys = (
+                "enc-a",
+                "enc-a::dell-md1280-drawer-top-42",
+                "enc-a::dell-md1280-drawer-bottom-42",
+                "enc-b",
+            )
             fresh_until = datetime.now(timezone.utc) + timedelta(minutes=5)
             for key in keys:
                 service._admit_snapshot_key(key)
@@ -12196,7 +12210,9 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
                 service._cache_until[key] = fresh_until
                 service._get_snapshot_lock(key)
             sleeper = asyncio.create_task(asyncio.sleep(60))
-            service._snapshot_refresh_tasks["enc-a::drawer-top"] = sleeper
+            service._snapshot_refresh_tasks[
+                "enc-a::dell-md1280-drawer-top-42"
+            ] = sleeper
             service._canonical_enclosure_options = {
                 key: EnclosureOption(id=key, label=key) for key in keys
             }
@@ -14195,6 +14211,127 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(cleared)
             self.assertIsNone(service.mapping_store.get_mapping(system.id, None, 0))
+
+    async def test_drawer_mapping_mutations_and_bundles_share_physical_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="synthetic-system-a",
+                truenas=TrueNASConfig(platform="scale"),
+            )
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            physical_id = "synthetic-shelf-a"
+            top_id = f"{physical_id}::dell-md1280-drawer-top-42"
+            bottom_id = f"{physical_id}::dell-md1280-drawer-bottom-42"
+
+            def snapshot_for(view_id: str | None) -> InventorySnapshot:
+                return InventorySnapshot(
+                    slots=[
+                        SlotView(
+                            slot=7,
+                            slot_label="08",
+                            row_index=0,
+                            column_index=7,
+                            enclosure_id=physical_id,
+                        )
+                    ],
+                    refresh_interval_seconds=30,
+                    selected_system_id=system.id,
+                    selected_enclosure_id=view_id,
+                    enclosures=[
+                        EnclosureOption(id=top_id, label="Top"),
+                        EnclosureOption(id=bottom_id, label="Bottom"),
+                        EnclosureOption(id=physical_id, label="Full"),
+                    ],
+                )
+
+            service.get_snapshot = AsyncMock(
+                side_effect=lambda selected_enclosure_id=None, **_kwargs: snapshot_for(
+                    selected_enclosure_id
+                )
+            )
+            first_revision = service.mapping_store.save_revision(system.id, top_id, 7)
+            saved = await service.save_mapping(
+                7,
+                {"serial": "FIRST"},
+                selected_enclosure_id=top_id,
+                expected_revision=first_revision,
+                invalidate_snapshot=False,
+            )
+            self.assertEqual(saved.enclosure_id, physical_id)
+
+            stale_save = service.mapping_store.save_revision(system.id, top_id, 7)
+            stale_clear = service.mapping_store.clear_revision(system.id, top_id, 7)
+            updated = await service.save_mapping(
+                7,
+                {"serial": "SECOND"},
+                selected_enclosure_id=bottom_id,
+                expected_revision=service.mapping_store.save_revision(system.id, bottom_id, 7),
+                invalidate_snapshot=False,
+            )
+            self.assertEqual(updated.enclosure_id, physical_id)
+            with self.assertRaises(MappingRevisionConflict):
+                await service.save_mapping(
+                    7,
+                    {"serial": "STALE"},
+                    selected_enclosure_id=top_id,
+                    expected_revision=stale_save,
+                    invalidate_snapshot=False,
+                )
+            with self.assertRaises(MappingRevisionConflict):
+                await service.clear_mapping(
+                    7,
+                    selected_enclosure_id=top_id,
+                    expected_revision=stale_clear,
+                    invalidate_snapshot=False,
+                )
+            current = service.mapping_store.get_mapping(system.id, physical_id, 7)
+            self.assertIsNotNone(current)
+            assert current is not None
+            self.assertEqual(current.serial, "SECOND")
+
+            exported = await service.export_mapping_bundle(selected_enclosure_id=bottom_id)
+            self.assertEqual(exported.enclosure_id, physical_id)
+            self.assertEqual({item.enclosure_id for item in exported.mappings}, {physical_id})
+            imported_bundle = exported.model_copy(
+                update={
+                    "mappings": [
+                        exported.mappings[0].model_copy(update={"serial": "IMPORTED"})
+                    ]
+                }
+            )
+            preview = await service.preview_mapping_bundle(
+                imported_bundle,
+                selected_enclosure_id=top_id,
+            )
+            self.assertEqual(preview["enclosure_id"], physical_id)
+            self.assertEqual(preview["updates"][0]["enclosure_id"], physical_id)
+            result = await service.import_mapping_bundle(
+                imported_bundle,
+                selected_enclosure_id=bottom_id,
+                expected_revision=preview["revision"],
+                import_digest=preview["import_digest"],
+                invalidate_snapshot=False,
+            )
+            self.assertEqual(result["imported"], 1)
+            final_export = await service.export_mapping_bundle(selected_enclosure_id=top_id)
+            self.assertEqual(final_export.enclosure_id, physical_id)
+            self.assertEqual(final_export.mappings[0].serial, "IMPORTED")
+
+            clear_revision = service.mapping_store.clear_revision(system.id, bottom_id, 7)
+            self.assertTrue(await service.clear_mapping(
+                7,
+                selected_enclosure_id=top_id,
+                expected_revision=clear_revision,
+                invalidate_snapshot=False,
+            ))
+            self.assertIsNone(service.mapping_store.get_mapping(system.id, physical_id, 7))
 
 
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):

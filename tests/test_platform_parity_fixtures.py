@@ -799,6 +799,9 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot.selected_profile.id, "dell-md1280-drawer-top-42")
             self.assertEqual(snapshot.layout_slot_count, top.slot_count)
             self.assertEqual(len(snapshot.slots), top.slot_count)
+            self.assertEqual({slot.enclosure_id for slot in snapshot.slots}, {full.id})
+            self.assertTrue(all(slot.mapping_revision for slot in snapshot.slots))
+            self.assertTrue(all(slot.mapping_clear_revision for slot in snapshot.slots))
 
             with patch.object(
                 service,
@@ -820,6 +823,17 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(bottom_snap.selected_profile)
             assert bottom_snap.selected_profile is not None
             self.assertEqual(bottom_snap.selected_profile.id, "dell-md1280-drawer-bottom-42")
+            self.assertEqual({slot.enclosure_id for slot in bottom_snap.slots}, {full.id})
+            self.assertTrue(all(
+                slot.mapping_revision
+                == service.mapping_store.save_revision(system.id, full.id, slot.slot)
+                for slot in bottom_snap.slots
+            ))
+            self.assertTrue(all(
+                slot.mapping_clear_revision
+                == service.mapping_store.clear_revision(system.id, full.id, slot.slot)
+                for slot in bottom_snap.slots
+            ))
 
             top_snap = await service.get_snapshot(selected_enclosure_id=top.id)
             self.assertEqual(
@@ -832,6 +846,7 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(top_snap.selected_profile)
             assert top_snap.selected_profile is not None
             self.assertEqual(top_snap.selected_profile.id, "dell-md1280-drawer-top-42")
+            self.assertEqual({slot.enclosure_id for slot in top_snap.slots}, {full.id})
 
             full_snap = await service.get_snapshot(selected_enclosure_id=full.id)
             self.assertEqual(full_snap.selected_enclosure_id, full.id)
@@ -841,6 +856,16 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(full_snap.selected_profile.id, "dell-md1280-drawer-84")
             self.assertEqual(full_snap.layout_slot_count, 84)
             self.assertEqual(len(full_snap.slots), 84)
+            self.assertEqual({slot.enclosure_id for slot in full_snap.slots}, {full.id})
+            top_slot = next(slot for slot in top_snap.slots if slot.slot == 7)
+            full_top_slot = next(slot for slot in full_snap.slots if slot.slot == 7)
+            bottom_slot = next(slot for slot in bottom_snap.slots if slot.slot == 49)
+            full_bottom_slot = next(slot for slot in full_snap.slots if slot.slot == 49)
+            self.assertEqual(top_slot.mapping_revision, full_top_slot.mapping_revision)
+            self.assertEqual(top_slot.mapping_clear_revision, full_top_slot.mapping_clear_revision)
+            self.assertEqual(bottom_slot.mapping_revision, full_bottom_slot.mapping_revision)
+            self.assertEqual(bottom_slot.mapping_clear_revision, full_bottom_slot.mapping_clear_revision)
+            self.assertTrue({top.id, bottom.id, full.id}.issubset(service._snapshot_state_keys()))
 
 
 if __name__ == "__main__":

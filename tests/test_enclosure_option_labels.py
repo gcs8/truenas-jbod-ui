@@ -298,18 +298,20 @@ class EnclosureAliasOptionLabelTests(unittest.TestCase):
                 SasFabricAliasStore(Path(temp_dir) / "sas_fabric_aliases.json"),
             )
             future = datetime.now(timezone.utc) + timedelta(minutes=5)
+            drawer_top = "enc-a::dell-md1280-drawer-top-42"
+            drawer_bottom = "enc-a::dell-md1280-drawer-bottom-42"
 
             def seed_cache() -> None:
-                for key in ("__default__", "enc-a", "enc-a::drawer-top", "enc-other"):
+                for key in ("__default__", "enc-a", drawer_top, "enc-other"):
                     service._cache[key] = InventorySnapshot(slots=[], refresh_interval_seconds=30)
                     service._cache_until[key] = future
 
             seed_cache()
             service.save_sas_fabric_alias(
-                object_id="enc-a::drawer-top",
+                object_id=drawer_top,
                 object_kind="enclosure",
                 label="Archive East",
-                selected_enclosure_id="enc-a::drawer-top",
+                selected_enclosure_id=drawer_top,
                 scope="system",
             )
             self.assertEqual(set(service._cache), {"enc-other"})
@@ -317,10 +319,10 @@ class EnclosureAliasOptionLabelTests(unittest.TestCase):
 
             seed_cache()
             service.save_sas_fabric_alias(
-                object_id="enc-a::drawer-bottom",
+                object_id=drawer_bottom,
                 object_kind="enclosure",
                 label="",
-                selected_enclosure_id="enc-a::drawer-bottom",
+                selected_enclosure_id=drawer_bottom,
                 scope="system",
             )
             self.assertEqual(set(service._cache), {"enc-other"})

@@ -6,7 +6,360 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from app.models.domain import ManualMapping
-from app.services.mapping_store import MappingStore
+from app.services.mapping_store import (
+    MappingRevisionConflict,
+    MappingScopeConflict,
+    MappingStore,
+    resolve_physical_mapping_scope,
+)
+
+
+DRAWER_TOP = "synthetic-shelf-a::dell-md1280-drawer-top-42"
+DRAWER_BOTTOM = "synthetic-shelf-a::dell-md1280-drawer-bottom-42"
+
+
+class PhysicalMappingScopeResolverTests(unittest.TestCase):
+    def test_resolver_normalizes_only_exact_recognized_drawer_suffixes(self) -> None:
+        matrix = {
+            None: None,
+            "synthetic-shelf-a": "synthetic-shelf-a",
+            DRAWER_TOP: "synthetic-shelf-a",
+            DRAWER_BOTTOM: "synthetic-shelf-a",
+            "synthetic-shelf-a::unknown-drawer": "synthetic-shelf-a::unknown-drawer",
+            "::dell-md1280-drawer-top-42": "::dell-md1280-drawer-top-42",
+            "synthetic-shelf-a::": "synthetic-shelf-a::",
+            " synthetic-shelf-a::dell-md1280-drawer-top-42 ": (
+                " synthetic-shelf-a::dell-md1280-drawer-top-42 "
+            ),
+            "synthetic-shelf-a::DELL-MD1280-DRAWER-TOP-42": (
+                "synthetic-shelf-a::DELL-MD1280-DRAWER-TOP-42"
+            ),
+            "synthetic-shelf-a::label-top": "synthetic-shelf-a::label-top",
+            "synthetic-shelf-a::41": "synthetic-shelf-a::41",
+            "synthetic-shelf-a::unknown::dell-md1280-drawer-top-42": (
+                "synthetic-shelf-a::unknown"
+            ),
+            (
+                "synthetic-shelf-a::dell-md1280-drawer-top-42"
+                "::dell-md1280-drawer-bottom-42"
+            ): (
+                "synthetic-shelf-a::dell-md1280-drawer-top-42"
+                "::dell-md1280-drawer-bottom-42"
+            ),
+        }
+
+        for enclosure_id, expected in matrix.items():
+            with self.subTest(enclosure_id=enclosure_id):
+                resolved = resolve_physical_mapping_scope(enclosure_id)
+                self.assertEqual(resolved, expected)
+                self.assertEqual(resolve_physical_mapping_scope(resolved), expected)
+
+
+class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
+    def make_store(self, root: str) -> MappingStore:
+        return MappingStore(str(Path(root) / "mappings.json"))
+
+    @staticmethod
+    def alias_key(system_id: str, enclosure_id: str, slot: int) -> str:
+        return f"{system_id}:{enclosure_id}:{slot}"
+
+    def test_drawer_requests_share_one_canonical_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            mapping = ManualMapping(
+                system_id="synthetic-system-a",
+                enclosure_id=DRAWER_TOP,
+                slot=7,
+                serial="SYNTHETIC-7",
+            )
+            empty_revision = store.save_revision("synthetic-system-a", DRAWER_TOP, 7)
+
+            saved = store.save_mapping(mapping, expected_revision=empty_revision)
+
+            self.assertEqual(saved.enclosure_id, "synthetic-shelf-a")
+            self.assertEqual(
+                store.save_revision("synthetic-system-a", DRAWER_BOTTOM, 7),
+                store.save_revision("synthetic-system-a", "synthetic-shelf-a", 7),
+            )
+            self.assertEqual(
+                store.clear_revision("synthetic-system-a", DRAWER_TOP, 7),
+                store.clear_revision("synthetic-system-a", DRAWER_BOTTOM, 7),
+            )
+            for scope in ("synthetic-shelf-a", DRAWER_TOP, DRAWER_BOTTOM):
+                with self.subTest(scope=scope):
+                    resolved = store.get_mapping("synthetic-system-a", scope, 7)
+                    self.assertIsNotNone(resolved)
+                    assert resolved is not None
+                    self.assertEqual(resolved.enclosure_id, "synthetic-shelf-a")
+                    self.assertEqual(
+                        [(item.enclosure_id, item.slot) for item in store.list_mappings(
+                            "synthetic-system-a", scope
+                        )],
+                        [("synthetic-shelf-a", 7)],
+                    )
+                    self.assertEqual(
+                        store.scope_revision("synthetic-system-a", scope),
+                        store.scope_revision("synthetic-system-a", "synthetic-shelf-a"),
+                    )
+            self.assertEqual(
+                list(store.load_all()),
+                [store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7)],
+            )
+
+            incoming = [mapping.model_copy(update={"enclosure_id": DRAWER_BOTTOM, "serial": "IMPORTED"})]
+            preview = store.preview_replace_mappings(
+                "synthetic-system-a", DRAWER_BOTTOM, incoming
+            )
+            self.assertEqual(preview["updates"][0]["enclosure_id"], "synthetic-shelf-a")
+            result = store.apply_mapping_import(
+                "synthetic-system-a",
+                DRAWER_TOP,
+                incoming,
+                expected_revision=preview["revision"],
+                import_digest=preview["import_digest"],
+            )
+            self.assertEqual(result["saved_count"], 1)
+            self.assertEqual(
+                store.get_mapping("synthetic-system-a", "synthetic-shelf-a", 7).serial,
+                "IMPORTED",
+            )
+
+    def test_historical_drawer_alias_reads_without_writing_then_collapses_on_save(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            alias = ManualMapping(
+                system_id="synthetic-system-a",
+                enclosure_id=DRAWER_TOP,
+                slot=7,
+                serial="ALIAS",
+            )
+            alias_key = self.alias_key("synthetic-system-a", DRAWER_TOP, 7)
+            store._write({alias_key: alias})
+            before = store.file_path.read_bytes()
+
+            resolved = store.get_mapping("synthetic-system-a", DRAWER_BOTTOM, 7)
+            listed = store.list_mappings("synthetic-system-a", "synthetic-shelf-a")
+            preview = store.preview_replace_mappings("synthetic-system-a", DRAWER_TOP, listed)
+
+            self.assertEqual(store.file_path.read_bytes(), before)
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertEqual(resolved.enclosure_id, "synthetic-shelf-a")
+            self.assertEqual(listed[0].enclosure_id, "synthetic-shelf-a")
+            self.assertEqual(preview["unchanged"], [{"enclosure_id": "synthetic-shelf-a", "slot": 7}])
+
+            store.save_mapping(
+                alias.model_copy(update={"enclosure_id": DRAWER_BOTTOM}),
+                expected_revision=store.save_revision("synthetic-system-a", DRAWER_TOP, 7),
+            )
+            current = store.load_all()
+            self.assertNotIn(alias_key, current)
+            self.assertEqual(
+                list(current),
+                [store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7)],
+            )
+            self.assertEqual(next(iter(current.values())).enclosure_id, "synthetic-shelf-a")
+
+    def test_confirmed_clear_and_import_collapse_historical_drawer_aliases(self) -> None:
+        for operation in ("clear", "import"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.make_store(temp_dir)
+                alias = ManualMapping(
+                    system_id="synthetic-system-a",
+                    enclosure_id=DRAWER_TOP,
+                    slot=7,
+                    serial="ALIAS",
+                )
+                alias_key = self.alias_key("synthetic-system-a", DRAWER_TOP, 7)
+                store._write({alias_key: alias})
+
+                if operation == "clear":
+                    revision = store.clear_revision(
+                        "synthetic-system-a", DRAWER_BOTTOM, 7
+                    )
+                    self.assertTrue(store.clear_mapping(
+                        "synthetic-system-a",
+                        DRAWER_BOTTOM,
+                        7,
+                        expected_revision=revision,
+                    ))
+                    self.assertEqual(store.load_all(), {})
+                else:
+                    incoming = [alias.model_copy(update={"enclosure_id": DRAWER_BOTTOM})]
+                    preview = store.preview_replace_mappings(
+                        "synthetic-system-a", DRAWER_BOTTOM, incoming
+                    )
+                    store.apply_mapping_import(
+                        "synthetic-system-a",
+                        DRAWER_BOTTOM,
+                        incoming,
+                        expected_revision=preview["revision"],
+                        import_digest=preview["import_digest"],
+                    )
+                    current = store.load_all()
+                    self.assertNotIn(alias_key, current)
+                    self.assertEqual(
+                        list(current),
+                        [store._slot_key(
+                            "synthetic-system-a",
+                            "synthetic-shelf-a",
+                            7,
+                        )],
+                    )
+
+    def test_replace_canonicalizes_requested_scope_and_incoming_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+
+            saved_count = store.replace_mappings(
+                "synthetic-system-a",
+                DRAWER_TOP,
+                [ManualMapping(
+                    system_id="other-system",
+                    enclosure_id=DRAWER_BOTTOM,
+                    slot=7,
+                    serial="REPLACED",
+                )],
+            )
+
+            self.assertEqual(saved_count, 1)
+            current = store.load_all()
+            self.assertEqual(
+                list(current),
+                [store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7)],
+            )
+            mapping = next(iter(current.values()))
+            self.assertEqual(mapping.system_id, "synthetic-system-a")
+            self.assertEqual(mapping.enclosure_id, "synthetic-shelf-a")
+
+    def test_unfiltered_list_collapses_nonconflicting_drawer_aliases_per_system(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            canonical = ManualMapping(
+                system_id="synthetic-system-a",
+                enclosure_id="synthetic-shelf-a",
+                slot=7,
+                serial="SAME",
+            )
+            alias = canonical.model_copy(update={"enclosure_id": DRAWER_TOP})
+            other = canonical.model_copy(
+                update={
+                    "system_id": "synthetic-system-b",
+                    "enclosure_id": DRAWER_BOTTOM,
+                }
+            )
+            store._write({
+                store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7): canonical,
+                self.alias_key("synthetic-system-a", DRAWER_TOP, 7): alias,
+                self.alias_key("synthetic-system-b", DRAWER_BOTTOM, 7): other,
+            })
+
+            listed = store.list_mappings()
+
+            self.assertEqual(
+                [(item.system_id, item.enclosure_id, item.slot) for item in listed],
+                [
+                    ("synthetic-system-a", "synthetic-shelf-a", 7),
+                    ("synthetic-system-b", "synthetic-shelf-a", 7),
+                ],
+            )
+
+    def test_alias_sibling_changes_invalidate_save_clear_and_import_tokens(self) -> None:
+        operations = ("save", "clear", "import")
+        for operation in operations:
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temp_dir:
+                store = self.make_store(temp_dir)
+                alias_key = self.alias_key("synthetic-system-a", DRAWER_TOP, 7)
+                alias = ManualMapping(
+                    system_id="synthetic-system-a",
+                    enclosure_id=DRAWER_TOP,
+                    slot=7,
+                    serial="OLD",
+                )
+                store._write({alias_key: alias})
+                save_revision = store.save_revision("synthetic-system-a", DRAWER_BOTTOM, 7)
+                clear_revision = store.clear_revision("synthetic-system-a", DRAWER_BOTTOM, 7)
+                incoming = [alias.model_copy(update={"enclosure_id": DRAWER_BOTTOM, "serial": "NEW"})]
+                preview = store.preview_replace_mappings(
+                    "synthetic-system-a", DRAWER_BOTTOM, incoming
+                )
+                store._write({alias_key: alias.model_copy(update={"notes": "changed"})})
+                before = store.file_path.read_bytes()
+
+                with self.assertRaises(MappingRevisionConflict):
+                    if operation == "save":
+                        store.save_mapping(incoming[0], expected_revision=save_revision)
+                    elif operation == "clear":
+                        store.clear_mapping(
+                            "synthetic-system-a",
+                            DRAWER_BOTTOM,
+                            7,
+                            expected_revision=clear_revision,
+                        )
+                    else:
+                        store.apply_mapping_import(
+                            "synthetic-system-a",
+                            DRAWER_BOTTOM,
+                            incoming,
+                            expected_revision=preview["revision"],
+                            import_digest=preview["import_digest"],
+                        )
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_divergent_canonical_and_drawer_aliases_fail_closed_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            canonical = ManualMapping(
+                system_id="synthetic-system-a",
+                enclosure_id="synthetic-shelf-a",
+                slot=7,
+                serial="CANONICAL",
+            )
+            alias = canonical.model_copy(update={"enclosure_id": DRAWER_TOP, "serial": "DIVERGENT"})
+            store._write({
+                store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7): canonical,
+                self.alias_key("synthetic-system-a", DRAWER_TOP, 7): alias,
+            })
+            before = store.file_path.read_bytes()
+
+            calls = (
+                lambda: store.get_mapping("synthetic-system-a", DRAWER_BOTTOM, 7),
+                lambda: store.list_mappings("synthetic-system-a", DRAWER_TOP),
+                lambda: store.preview_replace_mappings("synthetic-system-a", DRAWER_TOP, []),
+                lambda: store.save_mapping(canonical.model_copy(update={"serial": "NEW"})),
+                lambda: store.clear_mapping("synthetic-system-a", DRAWER_TOP, 7),
+                lambda: store.replace_mappings("synthetic-system-a", DRAWER_BOTTOM, []),
+            )
+            for call in calls:
+                with self.subTest(call=call), self.assertRaises(MappingScopeConflict):
+                    call()
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_divergent_admitted_legacy_drawer_alias_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            canonical = ManualMapping(
+                system_id="synthetic-system-a",
+                enclosure_id="synthetic-shelf-a",
+                slot=7,
+                serial="CANONICAL",
+            )
+            admitted_alias = ManualMapping(
+                system_id=None,
+                enclosure_id=DRAWER_TOP,
+                slot=7,
+                serial="DIVERGENT",
+            )
+            store._write({
+                store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7): canonical,
+                f"{DRAWER_TOP}:7": admitted_alias,
+            })
+            before = store.file_path.read_bytes()
+
+            with self.assertRaises(MappingScopeConflict):
+                store.list_mappings("synthetic-system-a", DRAWER_BOTTOM)
+
+            self.assertEqual(store.file_path.read_bytes(), before)
 
 
 class MappingStoreImportTests(unittest.TestCase):
@@ -67,18 +420,21 @@ class MappingStoreImportTests(unittest.TestCase):
             }
             store.load_all = MagicMock(side_effect=AssertionError("preloaded lookup must not reload"))  # type: ignore[method-assign]
 
-            self.assertIs(store.get_mapping("system-a", "enc-a", 3, loaded_entries=loaded_entries), exact)
-            self.assertIsNone(store.get_mapping("system-a", "enc-b", 3, loaded_entries=loaded_entries))
-            self.assertIs(
-                store.get_mapping(
-                    "system-a",
-                    "enc-b",
-                    3,
-                    allow_legacy_fallback=True,
-                    loaded_entries=loaded_entries,
-                ),
-                fallback,
+            resolved_exact = store.get_mapping(
+                "system-a", "enc-a", 3, loaded_entries=loaded_entries
             )
+            self.assertEqual(resolved_exact, exact)
+            self.assertIsNot(resolved_exact, exact)
+            self.assertIsNone(store.get_mapping("system-a", "enc-b", 3, loaded_entries=loaded_entries))
+            resolved_fallback = store.get_mapping(
+                "system-a",
+                "enc-b",
+                3,
+                allow_legacy_fallback=True,
+                loaded_entries=loaded_entries,
+            )
+            self.assertEqual(resolved_fallback, fallback)
+            self.assertIsNot(resolved_fallback, fallback)
             self.assertIsNone(
                 store.get_mapping(
                     "system-b",

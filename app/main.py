@@ -62,7 +62,11 @@ from app.services.inventory import (
     UnknownEnclosureError,
 )
 from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
-from app.services.mapping_store import MappingImportDigestMismatch, MappingRevisionConflict
+from app.services.mapping_store import (
+    MappingImportDigestMismatch,
+    MappingRevisionConflict,
+    MappingScopeConflict,
+)
 from app.services.profile_registry import build_profile_reference_warnings
 from app.services.release_status import ReleaseStatusService
 from app.services.snapshot_export import (
@@ -105,6 +109,20 @@ async def snapshot_state_busy_exception_handler(
         {"ok": False, "detail": str(exc)},
         status_code=503,
         headers={"Retry-After": "1"},
+    )
+
+
+async def mapping_scope_conflict_exception_handler(
+    _: Request,
+    _exc: Exception,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": "mapping_scope_conflict",
+            "detail": MappingScopeConflict.public_detail,
+        },
+        status_code=409,
     )
 
 
@@ -529,6 +547,10 @@ def create_app() -> FastAPI:
     app.add_exception_handler(
         SnapshotStateBusyError,
         snapshot_state_busy_exception_handler,
+    )
+    app.add_exception_handler(
+        MappingScopeConflict,
+        mapping_scope_conflict_exception_handler,
     )
 
     @app.exception_handler(HTTPException)

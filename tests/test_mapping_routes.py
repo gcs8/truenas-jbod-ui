@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 
 from app import main as app_main
+from app.config import Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
+    EnclosureOption,
     InventorySnapshot,
     LedAction,
     LedRequest,
@@ -16,11 +20,17 @@ from app.models.domain import (
     MappingBundle,
     MappingImportConfirmation,
     MappingRequest,
+    SlotView,
 )
+from app.services.inventory import InventoryService
 from app.services.mapping_store import (
     MappingImportDigestMismatch,
     MappingRevisionConflict,
+    MappingScopeConflict,
+    MappingStore,
 )
+from app.services.profile_registry import ProfileRegistry
+from app.services.slot_detail_store import SlotDetailStore
 from app.services.truenas_ws import TrueNASAPIError
 
 
@@ -33,6 +43,111 @@ def with_private_exception_detail(error: Exception) -> Exception:
 
 
 class MappingImportRouteTests(unittest.TestCase):
+    def test_mapping_scope_conflict_has_a_bounded_global_409_handler(self) -> None:
+        handler = app_main.app.exception_handlers.get(MappingScopeConflict)
+        self.assertIsNotNone(handler)
+        assert handler is not None
+
+        response = asyncio.run(handler(Mock(), MappingScopeConflict()))
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(response.body), {
+            "ok": False,
+            "error": "mapping_scope_conflict",
+            "detail": MappingScopeConflict.public_detail,
+        })
+
+    def test_real_inventory_service_preserves_drawer_view_and_returns_physical_mapping(self) -> None:
+        save_route = next(
+            route
+            for route in app_main.app.routes
+            if getattr(route, "path", "") == "/api/slots/{slot}/mapping"
+            and "POST" in (getattr(route, "methods", None) or set())
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="synthetic-system-a",
+                truenas=TrueNASConfig(platform="scale"),
+            )
+            physical_id = "synthetic-shelf-a"
+            top_id = f"{physical_id}::dell-md1280-drawer-top-42"
+            bottom_id = f"{physical_id}::dell-md1280-drawer-bottom-42"
+            service = InventoryService(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                None,
+                MappingStore(str(Path(temp_dir) / "mappings.json")),
+                ProfileRegistry(settings),
+                SlotDetailStore(str(Path(temp_dir) / "slot-details.json")),
+            )
+
+            def snapshot_for(view_id: str | None) -> InventorySnapshot:
+                return InventorySnapshot(
+                    slots=[SlotView(
+                        slot=7,
+                        slot_label="08",
+                        row_index=0,
+                        column_index=7,
+                        enclosure_id=physical_id,
+                    )],
+                    layout_rows=[[7]],
+                    layout_slot_count=1,
+                    layout_columns=1,
+                    refresh_interval_seconds=30,
+                    selected_system_id=system.id,
+                    selected_enclosure_id=view_id,
+                    enclosures=[
+                        EnclosureOption(id=top_id, label="Top"),
+                        EnclosureOption(id=bottom_id, label="Bottom"),
+                        EnclosureOption(id=physical_id, label="Full"),
+                    ],
+                )
+
+            service.get_snapshot = AsyncMock(
+                side_effect=lambda selected_enclosure_id=None, **_kwargs: snapshot_for(
+                    selected_enclosure_id
+                )
+            )
+            registry = Mock()
+            registry.get_service.return_value = service
+            revision = service.mapping_store.save_revision(system.id, top_id, 7)
+            payload = MappingRequest(
+                expected_revision=revision,
+                serial="SYNTHETIC",
+                clear_identify_after_save=False,
+            )
+
+            with (
+                patch.object(app_main, "get_inventory_registry", return_value=registry),
+                patch.object(app_main, "ensure_slot_bounds"),
+                patch.object(app_main, "add_perf_metadata"),
+            ):
+                response = asyncio.run(save_route.endpoint(
+                    slot=7,
+                    payload=payload,
+                    system_id=system.id,
+                    enclosure_id=top_id,
+                ))
+                stale_response = asyncio.run(save_route.endpoint(
+                    slot=7,
+                    payload=payload,
+                    system_id=system.id,
+                    enclosure_id=bottom_id,
+                ))
+
+            body = json.loads(response.body)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(body["mapping"]["enclosure_id"], physical_id)
+            self.assertEqual(body["snapshot"]["selected_enclosure_id"], top_id)
+            self.assertEqual(stale_response.status_code, 409)
+            self.assertEqual(
+                json.loads(stale_response.body)["error"],
+                "mapping_revision_conflict",
+            )
+
     def test_mapping_import_preview_route_exists(self) -> None:
         routes = {
             (getattr(route, "path", ""), tuple(sorted(getattr(route, "methods", None) or [])))
@@ -317,13 +432,13 @@ class MappingImportRouteTests(unittest.TestCase):
                     slot=2,
                     payload=LedRequest(action=LedAction.identify),
                     system_id="system-a",
-                    enclosure_id="enc-a::dell-md1280-top-drawer",
+                    enclosure_id="enc-a::dell-md1280-drawer-top-42",
                 )
             )
 
         service.invalidate_physical_enclosure_snapshot_cache.assert_called_once_with(
             reason="route.set_slot_led",
-            enclosure_id="enc-a::dell-md1280-top-drawer",
+            enclosure_id="enc-a::dell-md1280-drawer-top-42",
             invalidate_source_bundle=True,
         )
 
@@ -366,7 +481,7 @@ class MappingImportRouteTests(unittest.TestCase):
                         clear_identify_after_save=True,
                     ),
                     system_id="system-a",
-                    enclosure_id="enc-a::dell-md1280-top-drawer",
+                    enclosure_id="enc-a::dell-md1280-drawer-top-42",
                 )
             )
 
@@ -444,6 +559,51 @@ class MappingImportRouteTests(unittest.TestCase):
                 service.set_slot_led.assert_not_awaited()
                 service.invalidate_snapshot_cache.assert_not_called()
                 service.get_snapshot.assert_not_awaited()
+
+    def test_mapping_scope_conflicts_return_bounded_409(self) -> None:
+        save_route = next(
+            route
+            for route in app_main.app.routes
+            if getattr(route, "path", "") == "/api/slots/{slot}/mapping"
+            and "POST" in (getattr(route, "methods", None) or set())
+        )
+        service = Mock()
+        service.system.id = "synthetic-system-a"
+        service.system.truenas.platform = "scale"
+        service.save_mapping = AsyncMock(
+            side_effect=with_private_exception_detail(MappingScopeConflict())
+        )
+        service.set_slot_led = AsyncMock()
+        service.get_snapshot = AsyncMock()
+        registry = Mock()
+        registry.get_service.return_value = service
+
+        with (
+            patch.object(app_main, "get_inventory_registry", return_value=registry),
+            patch.object(app_main, "ensure_slot_bounds"),
+            patch.object(app_main, "add_perf_metadata"),
+        ):
+            response = asyncio.run(save_route.endpoint(
+                slot=7,
+                payload=MappingRequest(
+                    expected_revision="a" * 64,
+                    serial="SYNTHETIC",
+                    clear_identify_after_save=False,
+                ),
+                system_id="synthetic-system-a",
+                enclosure_id="synthetic-shelf-a::dell-md1280-drawer-top-42",
+            ))
+
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(body, {
+            "ok": False,
+            "error": "mapping_scope_conflict",
+            "detail": MappingScopeConflict.public_detail,
+        })
+        self.assertNotIn(PRIVATE_EXCEPTION_DETAIL, response.body.decode("utf-8"))
+        service.set_slot_led.assert_not_awaited()
+        service.get_snapshot.assert_not_awaited()
 
     def test_confirmed_mapping_import_applies_exact_preview_then_returns_snapshot(self) -> None:
         route = next(

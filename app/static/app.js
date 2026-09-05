@@ -1658,9 +1658,21 @@
     return params;
   }
 
-  function buildScopedUrl(url) {
-    const params = buildSelectionParams();
-    return params.toString() ? `${url}?${params.toString()}` : url;
+  function buildScopedUrl(url, extraParams = null) {
+    const trustedBase = new URL("/", window.location.origin);
+    const target = new URL(String(url), trustedBase);
+    if (target.origin !== trustedBase.origin) {
+      throw new TypeError("Scoped URLs must remain same-origin internal targets.");
+    }
+    const params = new URLSearchParams(target.search);
+    if (extraParams) {
+      new URLSearchParams(extraParams).forEach((value, key) => params.set(key, value));
+    }
+    params.delete("system_id");
+    params.delete("enclosure_id");
+    buildSelectionParams().forEach((value, key) => params.set(key, value));
+    target.search = params.toString();
+    return `${target.pathname}${target.search}${target.hash}`;
   }
 
   function updateSasFabricViewLink() {
@@ -9123,8 +9135,8 @@
     return payload;
   }
 
-  async function sendScopedRequest(url, options = {}) {
-    return fetchJson(buildScopedUrl(url), options);
+  async function sendScopedRequest(url, options = {}, queryParams = null) {
+    return fetchJson(buildScopedUrl(url, queryParams), options);
   }
 
   function applyStorageViewRuntime(payload) {
@@ -9635,10 +9647,12 @@
 
     try {
       setStatus(`Clearing mapping for slot ${slot.slot_label}...`);
-      const revision = encodeURIComponent(slot.mapping_clear_revision);
+      const queryParams = new URLSearchParams();
+      queryParams.set("expected_revision", slot.mapping_clear_revision);
       const result = await sendScopedRequest(
-        `/api/slots/${slot.slot}/mapping?expected_revision=${revision}`,
+        `/api/slots/${slot.slot}/mapping`,
         { method: "DELETE", readUiAuth: true },
+        queryParams,
       );
       applySnapshot(result.snapshot);
       invalidateHistoryCaches();

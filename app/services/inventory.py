@@ -57,7 +57,7 @@ from app.services.credential_authority import (
     credential_authorities_are_approved,
     ssh_credential_authorities,
 )
-from app.services.mapping_store import MappingStore
+from app.services.mapping_store import MappingStore, resolve_physical_mapping_scope
 from app.services.profile_registry import (
     ENCLOSURE_SUB_VIEW_PROFILE_IDS,
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
@@ -1220,7 +1220,7 @@ class InventoryService:
         if kind_name == "enclosure":
             if object_text.startswith("virtual-system:"):
                 raise ValueError("Friendly enclosure names are available only for identified physical enclosures.")
-            object_text = self._base_enclosure_id(object_text) or object_text
+            object_text = resolve_physical_mapping_scope(object_text) or object_text
             enclosure_id = None
         else:
             enclosure_id = (
@@ -1983,7 +1983,7 @@ class InventoryService:
         if not enclosure_id:
             cache_keys: set[str | None] = {None}
         else:
-            base_enclosure_id = self._base_enclosure_id(enclosure_id)
+            base_enclosure_id = resolve_physical_mapping_scope(enclosure_id)
             known_enclosure_keys = (
                 self._snapshot_state_keys()
                 | set(self._smart_cache_enclosure_generations)
@@ -1997,7 +1997,8 @@ class InventoryService:
             cache_keys = {
                 key
                 for key in known_enclosure_keys
-                if key != SNAPSHOT_NO_ENCLOSURE_KEY and self._base_enclosure_id(key) == base_enclosure_id
+                if key != SNAPSHOT_NO_ENCLOSURE_KEY
+                and resolve_physical_mapping_scope(key) == base_enclosure_id
             }
             cache_keys.update({base_enclosure_id, enclosure_id, "__default__"})
         self.invalidate_snapshot_cache(
@@ -3418,7 +3419,9 @@ class InventoryService:
                 slot_view.mapping_reason
                 or "Manual mapping is unavailable because this disk has no stable physical location."
             )
-        enclosure_id = slot_view.enclosure_id if slot_view else None
+        enclosure_id = resolve_physical_mapping_scope(
+            slot_view.enclosure_id if slot_view else selected_enclosure_id
+        )
         mapping = ManualMapping(
             system_id=self.system.id,
             slot=slot,
@@ -3448,7 +3451,9 @@ class InventoryService:
                 slot_view.mapping_reason
                 or "Manual mapping is unavailable because this disk has no stable physical location."
             )
-        enclosure_id = slot_view.enclosure_id if slot_view else None
+        enclosure_id = resolve_physical_mapping_scope(
+            slot_view.enclosure_id if slot_view else selected_enclosure_id
+        )
         cleared = self.mapping_store.clear_mapping(
             self.system.id,
             enclosure_id,
@@ -4274,16 +4279,17 @@ class InventoryService:
         return summary
 
     async def export_mapping_bundle(self, selected_enclosure_id: str | None = None) -> MappingBundle:
-        mappings = self.mapping_store.list_mappings(self.system.id, selected_enclosure_id)
+        mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
+        mappings = self.mapping_store.list_mappings(self.system.id, mapping_enclosure_id)
         preview = self.mapping_store.preview_replace_mappings(
             self.system.id,
-            selected_enclosure_id,
+            mapping_enclosure_id,
             mappings,
         )
         return MappingBundle(
             app_version=__version__,
             system_id=self.system.id,
-            enclosure_id=selected_enclosure_id,
+            enclosure_id=mapping_enclosure_id,
             revision=preview["revision"],
             mappings=mappings,
         )
@@ -4294,8 +4300,11 @@ class InventoryService:
         selected_enclosure_id: str | None,
     ) -> list[ManualMapping]:
         rewritten: list[ManualMapping] = []
+        mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         for mapping in bundle.mappings:
-            target_enclosure_id = selected_enclosure_id or mapping.enclosure_id
+            target_enclosure_id = mapping_enclosure_id or resolve_physical_mapping_scope(
+                mapping.enclosure_id
+            )
             rewritten.append(
                 mapping.model_copy(
                     update={
@@ -4328,16 +4337,17 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
     ) -> dict[str, Any]:
         self._require_physical_mapping_scope(selected_enclosure_id, bundle)
+        mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
         preview = self.mapping_store.preview_replace_mappings(
             self.system.id,
-            selected_enclosure_id,
+            mapping_enclosure_id,
             rewritten,
         )
         return {
             **preview,
             "system_id": self.system.id,
-            "enclosure_id": selected_enclosure_id,
+            "enclosure_id": mapping_enclosure_id,
         }
 
     async def import_mapping_bundle(
@@ -4350,10 +4360,11 @@ class InventoryService:
         invalidate_snapshot: bool = True,
     ) -> dict[str, Any]:
         self._require_physical_mapping_scope(selected_enclosure_id, bundle)
+        mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
         result = self.mapping_store.apply_mapping_import(
             self.system.id,
-            selected_enclosure_id,
+            mapping_enclosure_id,
             rewritten,
             expected_revision=expected_revision,
             import_digest=import_digest,
@@ -4573,7 +4584,10 @@ class InventoryService:
         )
 
     def _attach_mapping_revisions(self, slots: list[SlotView]) -> list[SlotView]:
-        targets = list({(slot.enclosure_id, slot.slot) for slot in slots})
+        targets = list({
+            (resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)
+            for slot in slots
+        })
         save_revisions = self.mapping_store.save_revisions(self.system.id, targets)
         clear_revisions = self.mapping_store.clear_revisions(
             self.system.id,
@@ -4582,8 +4596,12 @@ class InventoryService:
         return [
             slot.model_copy(
                 update={
-                    "mapping_revision": save_revisions[(slot.enclosure_id, slot.slot)],
-                    "mapping_clear_revision": clear_revisions[(slot.enclosure_id, slot.slot)],
+                    "mapping_revision": save_revisions[
+                        (resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)
+                    ],
+                    "mapping_clear_revision": clear_revisions[
+                        (resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)
+                    ],
                 }
             )
             for slot in slots
@@ -4934,7 +4952,7 @@ class InventoryService:
                 warnings,
                 # Drawer sub-views resolve mappings against the base shelf id,
                 # so the probe has to use the same key the correlator uses.
-                self._base_enclosure_id(resolved_meta.get("id")),
+                resolve_physical_mapping_scope(resolved_meta.get("id")),
                 slot_positions,
                 loaded_mappings,
                 no_identified_physical_enclosure=not available_enclosures,
@@ -5872,7 +5890,7 @@ class InventoryService:
             ssh_data.ses_enclosures,
             candidate_slot_bound,
             self.system.truenas.enclosure_filter,
-            self._base_enclosure_id(selected_option.id),
+            resolve_physical_mapping_scope(selected_option.id),
         )
         for warning in ssh_meta.get("warnings") or []:
             warning_text = normalize_text(warning)
@@ -5883,7 +5901,7 @@ class InventoryService:
             self.system.truenas.enclosure_filter,
             candidate_slot_bound,
             self.settings.layout.api_slot_number_base,
-            self._base_enclosure_id(selected_option.id),
+            resolve_physical_mapping_scope(selected_option.id),
         )
         selected_meta = self._merge_enclosure_meta(self._enclosure_option_meta(selected_option), api_selected_meta)
         selected_meta = self._merge_enclosure_meta(selected_meta, ssh_meta)
@@ -5909,7 +5927,7 @@ class InventoryService:
         )
         bmc_disks_by_serial = self._build_bmc_serial_disk_index(bmc_inventory)
 
-        mapping_enclosure_id = self._base_enclosure_id(selected_option.id)
+        mapping_enclosure_id = resolve_physical_mapping_scope(selected_option.id)
         is_sub_view = mapping_enclosure_id != selected_option.id
         # Synthetic drawer sub-views render only their own layout slots. Normal
         # profiles retain the existing range behavior so sparse custom layouts
@@ -5954,11 +5972,12 @@ class InventoryService:
             bmc_disk = self._match_bmc_disk_by_serial(disk, bmc_disks_by_serial)
             if bmc_disk is not None:
                 self._apply_bmc_serial_match_to_raw_slot_status(candidate, bmc_disk, disk)
+            mapping_meta = {**selected_meta, "id": mapping_enclosure_id}
             slot_view = self._build_slot_view(
                 slot=slot,
                 row_index=row_index,
                 column_index=column_index,
-                enclosure_meta=selected_meta,
+                enclosure_meta=mapping_meta,
                 raw_slot_status=candidate,
                 disk=disk,
                 mapping=mapping,
@@ -9555,7 +9574,7 @@ class InventoryService:
                 continue
             # Multi-drawer chassis expose one selectable view per drawer in
             # addition to the whole-shelf view; the suffixed option id keeps
-            # selector state distinct while _base_enclosure_id maps it back
+            # selector state distinct while the mapping-scope resolver maps it back
             # to the real SES enclosure for candidates and manual mappings.
             for sub_profile_id in ENCLOSURE_SUB_VIEW_PROFILE_IDS.get(option.profile_id or "", []):
                 sub_profile = self.profile_registry.get(sub_profile_id)
@@ -9647,12 +9666,6 @@ class InventoryService:
             "mapping to scope it."
         )
 
-    @staticmethod
-    def _base_enclosure_id(option_id: str | None) -> str | None:
-        if not option_id:
-            return option_id
-        return option_id.split("::", 1)[0]
-
     def _legacy_mapping_fallback_allowed(
         self,
         available_enclosures: list[EnclosureOption],
@@ -9661,7 +9674,7 @@ class InventoryService:
             base_id
             for option in available_enclosures
             if option.kind == "physical"
-            and (base_id := self._base_enclosure_id(option.id))
+            and (base_id := resolve_physical_mapping_scope(option.id))
         }
         has_only_physical_options = all(
             option.kind == "physical" for option in available_enclosures

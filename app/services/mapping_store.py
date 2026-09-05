@@ -11,6 +11,28 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.models.domain import ManualMapping
+from app.services.profile_registry import ENCLOSURE_SUB_VIEW_PROFILE_IDS
+
+_DRAWER_SUB_PROFILE_IDS = frozenset(
+    sub_profile_id
+    for sub_profile_ids in ENCLOSURE_SUB_VIEW_PROFILE_IDS.values()
+    for sub_profile_id in sub_profile_ids
+)
+
+
+def resolve_physical_mapping_scope(enclosure_id: str | None) -> str | None:
+    if not enclosure_id:
+        return enclosure_id
+    physical_id, separator, profile_id = enclosure_id.rpartition("::")
+    _parent_id, parent_separator, parent_profile_id = physical_id.rpartition("::")
+    if (
+        separator
+        and physical_id
+        and profile_id in _DRAWER_SUB_PROFILE_IDS
+        and not (parent_separator and parent_profile_id in _DRAWER_SUB_PROFILE_IDS)
+    ):
+        return physical_id
+    return enclosure_id
 
 
 class MappingRevisionConflict(RuntimeError):
@@ -30,6 +52,13 @@ class MappingImportDigestMismatch(RuntimeError):
         self.current_import_digest = current_import_digest
 
 
+class MappingScopeConflict(RuntimeError):
+    public_detail = "Conflicting mapping rows exist for the same physical slot."
+
+    def __init__(self) -> None:
+        super().__init__(self.public_detail)
+
+
 class MappingStore:
     """Persist slot-to-disk calibration in a small JSON file on a bind mount."""
 
@@ -39,7 +68,37 @@ class MappingStore:
         self._lock = threading.Lock()
 
     def _slot_key(self, system_id: str | None, enclosure_id: str | None, slot: int) -> str:
-        return f"{system_id or 'default_system'}:{enclosure_id or 'default'}:{slot}"
+        physical_enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        return f"{system_id or 'default_system'}:{physical_enclosure_id or 'default'}:{slot}"
+
+    @staticmethod
+    def _canonical_mapping(mapping: ManualMapping) -> ManualMapping:
+        physical_enclosure_id = resolve_physical_mapping_scope(mapping.enclosure_id)
+        return mapping.model_copy(update={"enclosure_id": physical_enclosure_id})
+
+    @staticmethod
+    def _drawer_alias_enclosure_ids(enclosure_id: str | None) -> tuple[str, ...]:
+        physical_enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        if not physical_enclosure_id:
+            return ()
+        return tuple(
+            f"{physical_enclosure_id}::{profile_id}"
+            for profile_id in sorted(_DRAWER_SUB_PROFILE_IDS)
+        )
+
+    def _physical_scope_keys(
+        self,
+        system_id: str | None,
+        enclosure_id: str | None,
+        slot: int,
+    ) -> tuple[str, ...]:
+        physical_enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        keys = [self._slot_key(system_id, physical_enclosure_id, slot)]
+        keys.extend(
+            f"{system_id or 'default_system'}:{alias_id}:{slot}"
+            for alias_id in self._drawer_alias_enclosure_ids(physical_enclosure_id)
+        )
+        return tuple(dict.fromkeys(keys))
 
     def _resolvable_keys(
         self,
@@ -49,12 +108,16 @@ class MappingStore:
     ) -> tuple[str, ...]:
         """Keys that can resolve for this bay: canonical, scoped enclosure-less
         sibling, then the two unscoped legacy aliases (see ``get_mapping``)."""
-        return (
-            self._slot_key(system_id, enclosure_id, slot),
-            self._slot_key(system_id, None, slot),
-            f"{enclosure_id or 'default'}:{slot}",
-            f"default:{slot}",
+        physical_enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        keys = [*self._physical_scope_keys(system_id, physical_enclosure_id, slot)]
+        keys.append(self._slot_key(system_id, None, slot))
+        keys.append(f"{physical_enclosure_id or 'default'}:{slot}")
+        keys.extend(
+            f"{alias_id}:{slot}"
+            for alias_id in self._drawer_alias_enclosure_ids(physical_enclosure_id)
         )
+        keys.append(f"default:{slot}")
+        return tuple(dict.fromkeys(keys))
 
     def load_all(self) -> dict[str, ManualMapping]:
         if not self.file_path.exists():
@@ -88,15 +151,25 @@ class MappingStore:
         loaded_entries: Mapping[str, ManualMapping] | None = None,
     ) -> ManualMapping | None:
         current = self.load_all() if loaded_entries is None else loaded_entries
-        resolvable = self._resolvable_keys(system_id, enclosure_id, slot)
-        keys = list(resolvable) if allow_legacy_fallback else [resolvable[0]]
+        physical_enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        self._assert_no_alias_conflicts(
+            current,
+            system_id,
+            physical_enclosure_id,
+            slot=slot,
+        )
+        keys = (
+            self._resolvable_keys(system_id, physical_enclosure_id, slot)
+            if allow_legacy_fallback
+            else self._physical_scope_keys(system_id, physical_enclosure_id, slot)
+        )
         for key in keys:
             candidate = current.get(key)
             if candidate is None:
                 continue
             if not self._mapping_matches_system(key, candidate, system_id):
                 continue
-            return candidate
+            return self._canonical_mapping(candidate)
         return None
 
     def has_legacy_only_mapping(
@@ -134,21 +207,60 @@ class MappingStore:
         enclosure_id: str | None = None,
     ) -> list[ManualMapping]:
         mappings = self.load_all()
+        physical_enclosure_id = resolve_physical_mapping_scope(enclosure_id)
         if system_id is not None:
-            selected_scope = self._scope_entries(mappings, system_id, enclosure_id)
+            selected_scope = self._scope_entries(mappings, system_id, physical_enclosure_id)
             return [
                 selected_scope[identity]
                 for identity in sorted(selected_scope, key=lambda item: (item[0] or "", item[1]))
             ]
 
-        selected: list[ManualMapping] = []
+        effective_system_ids = {
+            self._mapping_system_id(key, mapping)
+            for key, mapping in mappings.items()
+        }
+        for effective_system_id in effective_system_ids:
+            conflict_system_id = (
+                None
+                if effective_system_id in {None, "default_system"}
+                else effective_system_id
+            )
+            self._assert_no_alias_conflicts(
+                mappings,
+                conflict_system_id,
+                physical_enclosure_id,
+            )
+
+        selected: dict[
+            tuple[str | None, str | None, int],
+            tuple[tuple[int, str], ManualMapping],
+        ] = {}
         for key, mapping in mappings.items():
-            if not self._mapping_matches_system(key, mapping, system_id):
+            canonical = self._canonical_mapping(mapping)
+            if physical_enclosure_id is not None and canonical.enclosure_id != physical_enclosure_id:
                 continue
-            if enclosure_id is not None and mapping.enclosure_id != enclosure_id:
-                continue
-            selected.append(mapping)
-        return sorted(selected, key=lambda item: item.slot)
+            effective_system_id = self._mapping_system_id(key, mapping)
+            identity = (
+                effective_system_id,
+                canonical.enclosure_id,
+                canonical.slot,
+            )
+            canonical_key = self._slot_key(
+                mapping.system_id,
+                canonical.enclosure_id,
+                canonical.slot,
+            )
+            rank = (2 if key == canonical_key else 1, key)
+            existing = selected.get(identity)
+            if existing is None or rank > existing[0]:
+                selected[identity] = (rank, canonical)
+        return [
+            selected[identity][1]
+            for identity in sorted(
+                selected,
+                key=lambda item: (item[0] or "", item[1] or "", item[2]),
+            )
+        ]
 
     def save_mapping(
         self,
@@ -158,6 +270,13 @@ class MappingStore:
     ) -> ManualMapping:
         with self._lock:
             current = self.load_all()
+            mapping = self._canonical_mapping(mapping)
+            self._assert_no_alias_conflicts(
+                current,
+                mapping.system_id,
+                mapping.enclosure_id,
+                slot=mapping.slot,
+            )
             if expected_revision is not None:
                 current_revision = self._save_revision_from_current(
                     current,
@@ -188,13 +307,15 @@ class MappingStore:
     ) -> bool:
         with self._lock:
             current = self.load_all()
+            enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+            self._assert_no_alias_conflicts(current, system_id, enclosure_id, slot=slot)
             if expected_revision is not None:
                 current_revision = self._clear_revision_from_current(
                     current, system_id, enclosure_id, slot
                 )
                 if current_revision != expected_revision:
                     raise MappingRevisionConflict(current_revision)
-            effective = None
+            effective: ManualMapping | None = None
             resolvable_keys = self._resolvable_keys(system_id, enclosure_id, slot)
             for key in resolvable_keys:
                 candidate = current.get(key)
@@ -202,7 +323,7 @@ class MappingStore:
                     continue
                 if not self._mapping_matches_system(key, candidate, system_id):
                     continue
-                effective = candidate
+                effective = self._canonical_mapping(candidate)
                 break
             if effective is None:
                 return False
@@ -229,11 +350,19 @@ class MappingStore:
     ) -> int:
         with self._lock:
             current = self.load_all()
+            enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+            self._assert_no_alias_conflicts(current, system_id, enclosure_id)
+            incoming_scope = self._normalize_incoming(
+                system_id,
+                enclosure_id,
+                mappings,
+            )
             keys_to_remove: list[str] = []
             for key, mapping in current.items():
                 if not self._mapping_matches_system(key, mapping, system_id):
                     continue
-                if enclosure_id and mapping.enclosure_id not in {None, enclosure_id}:
+                canonical = self._canonical_mapping(mapping)
+                if enclosure_id and canonical.enclosure_id not in {None, enclosure_id}:
                     continue
                 keys_to_remove.append(key)
 
@@ -241,7 +370,7 @@ class MappingStore:
                 current.pop(key, None)
 
             saved_count = 0
-            for mapping in mappings:
+            for mapping in incoming_scope.values():
                 saved = mapping.model_copy(
                     update={"updated_at": datetime.now(timezone.utc)}
                 )
@@ -303,10 +432,11 @@ class MappingStore:
 
     @staticmethod
     def _scope_identity(mapping: ManualMapping) -> tuple[str | None, int]:
-        return mapping.enclosure_id, mapping.slot
+        return resolve_physical_mapping_scope(mapping.enclosure_id), mapping.slot
 
-    @staticmethod
-    def _semantic_mapping(mapping: ManualMapping) -> dict[str, Any]:
+    @classmethod
+    def _semantic_mapping(cls, mapping: ManualMapping) -> dict[str, Any]:
+        mapping = cls._canonical_mapping(mapping)
         return {
             "enclosure_id": mapping.enclosure_id,
             "slot": mapping.slot,
@@ -315,6 +445,54 @@ class MappingStore:
             "gptid": mapping.gptid,
             "notes": mapping.notes,
         }
+
+    def _assert_no_alias_conflicts(
+        self,
+        current: Mapping[str, ManualMapping],
+        system_id: str | None,
+        enclosure_id: str | None,
+        *,
+        slot: int | None = None,
+    ) -> None:
+        physical_enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        grouped: dict[
+            tuple[str | None, int],
+            list[tuple[bool, dict[str, Any]]],
+        ] = {}
+        for key, mapping in current.items():
+            mapping_system_id = self._mapping_system_id(key, mapping)
+            if system_id is not None:
+                if mapping_system_id not in {None, system_id}:
+                    continue
+            elif mapping_system_id not in {None, "default_system"}:
+                continue
+            canonical = self._canonical_mapping(mapping)
+            if canonical.enclosure_id != physical_enclosure_id and physical_enclosure_id is not None:
+                continue
+            if slot is not None and canonical.slot != slot:
+                continue
+            if canonical.enclosure_id is None:
+                continue
+            canonical_key = self._slot_key(system_id, canonical.enclosure_id, canonical.slot)
+            alias_keys = set(
+                self._physical_scope_keys(system_id, canonical.enclosure_id, canonical.slot)
+            ) - {canonical_key}
+            is_alias = (
+                mapping.enclosure_id != canonical.enclosure_id
+                or key in alias_keys
+            )
+            grouped.setdefault(self._scope_identity(canonical), []).append(
+                (is_alias, self._semantic_mapping(canonical))
+            )
+        for rows in grouped.values():
+            if not any(is_alias for is_alias, _semantic in rows):
+                continue
+            semantic_rows = {
+                self._digest(semantic)
+                for _is_alias, semantic in rows
+            }
+            if len(semantic_rows) > 1:
+                raise MappingScopeConflict()
 
     @staticmethod
     def _digest(payload: Any) -> str:
@@ -327,17 +505,20 @@ class MappingStore:
         system_id: str | None,
         enclosure_id: str | None,
     ) -> dict[tuple[str | None, int], ManualMapping]:
+        enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        self._assert_no_alias_conflicts(current, system_id, enclosure_id)
         selected: dict[tuple[str | None, int], tuple[tuple[int, str], ManualMapping]] = {}
         for key, mapping in current.items():
             if not self._mapping_matches_system(key, mapping, system_id):
                 continue
-            if enclosure_id is not None and mapping.enclosure_id != enclosure_id:
+            canonical = self._canonical_mapping(mapping)
+            if enclosure_id is not None and canonical.enclosure_id != enclosure_id:
                 continue
-            identity = self._scope_identity(mapping)
-            rank = (self._mapping_precedence(key, mapping, system_id), key)
+            identity = self._scope_identity(canonical)
+            rank = (self._mapping_precedence(key, canonical, system_id), key)
             existing = selected.get(identity)
             if existing is None or rank > existing[0]:
-                selected[identity] = (rank, mapping)
+                selected[identity] = (rank, canonical)
         return {identity: ranked[1] for identity, ranked in selected.items()}
 
     def _normalize_incoming(
@@ -346,12 +527,18 @@ class MappingStore:
         enclosure_id: str | None,
         mappings: list[ManualMapping],
     ) -> dict[tuple[str | None, int], ManualMapping]:
+        enclosure_id = resolve_physical_mapping_scope(enclosure_id)
         normalized: dict[tuple[str | None, int], ManualMapping] = {}
         for mapping in mappings:
+            mapping_enclosure_id = resolve_physical_mapping_scope(mapping.enclosure_id)
             scoped = mapping.model_copy(
                 update={
                     "system_id": system_id,
-                    "enclosure_id": enclosure_id if enclosure_id is not None else mapping.enclosure_id,
+                    "enclosure_id": (
+                        enclosure_id
+                        if enclosure_id is not None
+                        else mapping_enclosure_id
+                    ),
                 }
             )
             identity = self._scope_identity(scoped)
@@ -378,19 +565,32 @@ class MappingStore:
         enclosure_id: str | None,
         mappings: list[ManualMapping],
     ) -> tuple[dict[str, Any], dict[tuple[str | None, int], ManualMapping]]:
+        enclosure_id = resolve_physical_mapping_scope(enclosure_id)
         current_scope = self._scope_entries(current, system_id, enclosure_id)
         incoming_scope = self._normalize_incoming(system_id, enclosure_id, mappings)
         current_payload = [
             self._semantic_mapping(current_scope[identity])
             for identity in sorted(current_scope, key=lambda item: (item[0] or "", item[1]))
         ]
-        revision = self._digest(
-            {
-                "system_id": system_id,
-                "enclosure_id": enclosure_id,
-                "mappings": current_payload,
-            }
-        )
+        stored_rows = []
+        for key, mapping in current.items():
+            if not self._mapping_matches_system(key, mapping, system_id):
+                continue
+            canonical = self._canonical_mapping(mapping)
+            if enclosure_id is not None and canonical.enclosure_id != enclosure_id:
+                continue
+            stored_rows.append({
+                "key": key,
+                "stored_system_id": mapping.system_id,
+                "stored_enclosure_id": mapping.enclosure_id,
+                "mapping": self._semantic_mapping(canonical),
+            })
+        revision = self._digest({
+            "system_id": system_id,
+            "enclosure_id": enclosure_id,
+            "mappings": current_payload,
+            "stored_rows": sorted(stored_rows, key=lambda item: item["key"]),
+        })
         additions: list[dict[str, Any]] = []
         updates: list[dict[str, Any]] = []
         removals: list[dict[str, Any]] = []
@@ -456,6 +656,7 @@ class MappingStore:
     ) -> dict[str, Any]:
         with self._lock:
             current = self.load_all()
+            enclosure_id = resolve_physical_mapping_scope(enclosure_id)
             preview, _incoming_scope = self._preview_from_current(
                 current,
                 system_id,
@@ -471,6 +672,7 @@ class MappingStore:
     ) -> str:
         with self._lock:
             current = self.load_all()
+            enclosure_id = resolve_physical_mapping_scope(enclosure_id)
             return self._scope_revision_from_current(current, system_id, enclosure_id)
 
     def clear_revision(
@@ -481,6 +683,7 @@ class MappingStore:
     ) -> str:
         with self._lock:
             current = self.load_all()
+            enclosure_id = resolve_physical_mapping_scope(enclosure_id)
             return self._clear_revision_from_current(current, system_id, enclosure_id, slot)
 
     def save_revision(
@@ -491,6 +694,7 @@ class MappingStore:
     ) -> str:
         with self._lock:
             current = self.load_all()
+            enclosure_id = resolve_physical_mapping_scope(enclosure_id)
             return self._save_revision_from_current(current, system_id, enclosure_id, slot)
 
     def save_revisions(
@@ -500,21 +704,25 @@ class MappingStore:
     ) -> dict[tuple[str | None, int], str]:
         with self._lock:
             current = self.load_all()
+            canonical_targets = {
+                target: (resolve_physical_mapping_scope(target[0]), target[1])
+                for target in targets
+            }
             scope_revisions = {
-                enclosure_id: self._scope_revision_from_current(
-                    current, system_id, enclosure_id
+                canonical[0]: self._scope_revision_from_current(
+                    current, system_id, canonical[0]
                 )
-                for enclosure_id in {target[0] for target in targets}
+                for canonical in set(canonical_targets.values())
             }
             return {
                 target: self._save_revision_from_current(
                     current,
                     system_id,
-                    target[0],
-                    target[1],
-                    scope_revision=scope_revisions[target[0]],
+                    canonical[0],
+                    canonical[1],
+                    scope_revision=scope_revisions[canonical[0]],
                 )
-                for target in targets
+                for target, canonical in canonical_targets.items()
             }
 
     def clear_revisions(
@@ -526,7 +734,10 @@ class MappingStore:
             current = self.load_all()
             return {
                 target: self._clear_revision_from_current(
-                    current, system_id, target[0], target[1]
+                    current,
+                    system_id,
+                    resolve_physical_mapping_scope(target[0]),
+                    target[1],
                 )
                 for target in targets
             }
@@ -537,6 +748,7 @@ class MappingStore:
         system_id: str | None,
         enclosure_id: str | None,
     ) -> str:
+        enclosure_id = resolve_physical_mapping_scope(enclosure_id)
         current_scope = self._scope_entries(current, system_id, enclosure_id)
         preview, _ = self._preview_from_current(
             current,
@@ -553,6 +765,7 @@ class MappingStore:
         enclosure_id: str | None,
         slot: int,
     ) -> str:
+        enclosure_id = resolve_physical_mapping_scope(enclosure_id)
         entries = []
         for key in dict.fromkeys(self._resolvable_keys(system_id, enclosure_id, slot)):
             mapping = current.get(key)
@@ -581,6 +794,7 @@ class MappingStore:
         *,
         scope_revision: str | None = None,
     ) -> str:
+        enclosure_id = resolve_physical_mapping_scope(enclosure_id)
         if scope_revision is None:
             scope_revision = self._scope_revision_from_current(
                 current, system_id, enclosure_id
@@ -604,19 +818,16 @@ class MappingStore:
         enclosure_id: str | None,
         slot: int,
     ) -> str:
+        enclosure_id = resolve_physical_mapping_scope(enclosure_id)
+        self._assert_no_alias_conflicts(current, system_id, enclosure_id, slot=slot)
         effective = None
-        for key in (
-            self._slot_key(system_id, enclosure_id, slot),
-            self._slot_key(system_id, None, slot),
-            f"{enclosure_id or 'default'}:{slot}",
-            f"default:{slot}",
-        ):
+        for key in self._resolvable_keys(system_id, enclosure_id, slot):
             candidate = current.get(key)
             if candidate is None:
                 continue
             if not self._mapping_matches_system(key, candidate, system_id):
                 continue
-            effective = candidate
+            effective = self._canonical_mapping(candidate)
             break
         effective_scope = effective.enclosure_id if effective is not None else enclosure_id
         payload = {
@@ -643,6 +854,7 @@ class MappingStore:
     ) -> dict[str, Any]:
         with self._lock:
             current = self.load_all()
+            enclosure_id = resolve_physical_mapping_scope(enclosure_id)
             preview, incoming_scope = self._preview_from_current(
                 current,
                 system_id,
@@ -658,7 +870,10 @@ class MappingStore:
                 key
                 for key, mapping in current.items()
                 if self._mapping_matches_system(key, mapping, system_id)
-                and (enclosure_id is None or mapping.enclosure_id == enclosure_id)
+                and (
+                    enclosure_id is None
+                    or resolve_physical_mapping_scope(mapping.enclosure_id) == enclosure_id
+                )
             ]
             for key in keys_to_remove:
                 current.pop(key, None)

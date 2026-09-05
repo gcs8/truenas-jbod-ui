@@ -80,6 +80,17 @@ function loadFunction(source, name, context = {}) {
   return { fn: sandbox.__loaded, context: sandbox };
 }
 
+function loadFunctions(source, names, context = {}) {
+  const sandbox = vm.createContext({ ...context });
+  const declarations = names.map((name) => functionSource(source, name)).join("\n");
+  vm.runInContext(
+    `${declarations}\n${names.map((name) => `this.${name} = ${name};`).join("\n")}`,
+    sandbox,
+    { filename: "combined.behavior.js" },
+  );
+  return sandbox;
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -345,6 +356,7 @@ test("successful mapping clear invalidates history before render", async () => {
   const events = [];
   const { fn: clearMapping } = loadFunction(APP_SOURCE, "clearMapping", {
     state,
+    URLSearchParams,
     window: { confirm: () => true },
     getSlotById() {
       return { slot: 7, slot_label: "07", mapping_clear_revision: "a".repeat(64) };
@@ -366,9 +378,10 @@ test("successful mapping clear invalidates history before render", async () => {
 
 test("mapping clear sends the selected slot scope revision", async () => {
   const state = { snapshotMode: false, selectedSlot: 7, mappingFormScopeKey: "system|enc||7" };
-  let requestedUrl = null;
+  let request = null;
   const { fn: clearMapping } = loadFunction(APP_SOURCE, "clearMapping", {
     state,
+    URLSearchParams,
     window: { confirm: () => true },
     getSlotById() {
       return {
@@ -381,8 +394,8 @@ test("mapping clear sends the selected slot scope revision", async () => {
     setStatus() {},
     writeBlockedByPolicy: () => false,
     handleWriteRejection: () => false,
-    async sendScopedRequest(url) {
-      requestedUrl = url;
+    async sendScopedRequest(url, options, params) {
+      request = { url, options, params };
       return { snapshot: { marker: "cleared" } };
     },
     applySnapshot() {},
@@ -392,10 +405,71 @@ test("mapping clear sends the selected slot scope revision", async () => {
 
   await clearMapping();
 
-  assert.equal(
-    requestedUrl,
-    `/api/slots/7/mapping?expected_revision=${"b".repeat(64)}`,
+  assert.equal(request.url, "/api/slots/7/mapping");
+  assert.equal(request.options.method, "DELETE");
+  assert.equal(request.params.get("expected_revision"), "b".repeat(64));
+});
+
+test("mapping clear final fetch URL carries separate revision and selection parameters", async () => {
+  const revision = "b".repeat(64);
+  const state = {
+    snapshotMode: false,
+    selectedSlot: 7,
+    selectedSystemId: "synthetic-system-a",
+    selectedEnclosureId: "synthetic-shelf-a::dell-md1280-drawer-top-42",
+    selectedStorageViewRuntimeId: "",
+    mappingFormScopeKey: "synthetic|drawer||7",
+  };
+  let fetchedUrl = null;
+  const context = loadFunctions(
+    APP_SOURCE,
+    ["buildSelectionParams", "buildScopedUrl", "fetchJson", "sendScopedRequest", "clearMapping"],
+    {
+      state,
+      URL,
+      URLSearchParams,
+      currentLiveEnclosureId: () => state.selectedEnclosureId,
+      window: {
+        location: { origin: "https://synthetic.example" },
+        confirm: () => true,
+      },
+      getSlotById() {
+        return {
+          slot: 7,
+          slot_label: "08",
+          mapping_clear_revision: revision,
+        };
+      },
+      readUiAuthenticatedHeaders(_url, headers) { return headers; },
+      async fetch(url) {
+        fetchedUrl = url;
+        return {
+          ok: true,
+          status: 200,
+          async json() { return { snapshot: { marker: "cleared" } }; },
+        };
+      },
+      setStatus() {},
+      writeBlockedByPolicy: () => false,
+      handleWriteRejection: () => false,
+      applySnapshot() {},
+      invalidateHistoryCaches() {},
+      renderAll() {},
+      scheduleSmartPrefetch() {},
+    },
   );
+
+  await context.clearMapping();
+
+  assert.equal(fetchedUrl.split("?").length, 2);
+  const parsed = new URL(fetchedUrl, "https://synthetic.example");
+  assert.equal(parsed.pathname, "/api/slots/7/mapping");
+  assert.deepEqual(parsed.searchParams.getAll("expected_revision"), [revision]);
+  assert.deepEqual(parsed.searchParams.getAll("system_id"), ["synthetic-system-a"]);
+  assert.deepEqual(parsed.searchParams.getAll("enclosure_id"), [
+    "synthetic-shelf-a::dell-md1280-drawer-top-42",
+  ]);
+  assert.ok([...parsed.searchParams.values()].every((value) => !value.includes("?")));
 });
 
 test("mapping mutations without a scope revision fail closed before any request", async () => {

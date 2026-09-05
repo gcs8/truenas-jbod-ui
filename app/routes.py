@@ -41,6 +41,16 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             },
         )
 
+    def mapping_scope_conflict_response() -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "mapping_scope_conflict",
+                "detail": MappingScopeConflict.public_detail,
+            },
+        )
+
     async def load_snapshot_export_sources(
         *,
         service: Any,
@@ -354,6 +364,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             )
         except MappingRevisionConflict as exc:
             return mapping_revision_conflict_response(exc)
+        except MappingScopeConflict:
+            return mapping_scope_conflict_response()
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -410,6 +422,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             )
         except MappingRevisionConflict as exc:
             return mapping_revision_conflict_response(exc)
+        except MappingScopeConflict:
+            return mapping_scope_conflict_response()
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if cleared:
@@ -442,6 +456,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 payload,
                 selected_enclosure_id=enclosure_id,
             )
+        except MappingScopeConflict:
+            return mapping_scope_conflict_response()
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError:
@@ -469,6 +485,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             )
         except MappingRevisionConflict as exc:
             return mapping_revision_conflict_response(exc)
+        except MappingScopeConflict:
+            return mapping_scope_conflict_response()
         except MappingImportDigestMismatch as exc:
             return JSONResponse(
                 status_code=409,
