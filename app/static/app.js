@@ -106,6 +106,7 @@
     refreshesInFlight: 0,
     latestRefreshToken: 0,
     storageViewsRuntimeRequestToken: 0,
+    snapshotExportSourceGeneration: 0,
     smartSummaries: {},
     preloadedSmartSummariesBySlot,
     preloadedSnapshotsByEnclosure,
@@ -2440,6 +2441,7 @@
     state.layoutRows = snapshot.layout_rows || state.layoutRows || [];
     state.selectedSystemId = nextSystemId;
     state.selectedEnclosureId = snapshot.selected_enclosure_id || null;
+    advanceSnapshotExportSourceGeneration();
     pruneSmartSummaryCache();
     if (state.selectedSlot !== null && !getSlotById(state.selectedSlot) && !getSelectedStorageViewRuntimeSlot(state.selectedSlot)) {
       state.selectedSlot = null;
@@ -6341,7 +6343,32 @@
     const payload = snapshotExportRequestPayload();
     delete payload.packaging;
     delete payload.allow_oversize;
-    return JSON.stringify(payload);
+    return JSON.stringify({
+      selected_system_id: state.selectedSystemId || null,
+      selected_enclosure_id: state.selectedEnclosureId || null,
+      source_generation: state.snapshotExportSourceGeneration || 0,
+      request: payload,
+    });
+  }
+
+  function invalidateSnapshotExportEstimate() {
+    state.export.estimate.requestToken += 1;
+    state.export.estimate.loading = false;
+    state.export.estimate.error = null;
+    state.export.estimate.data = null;
+  }
+
+  function invalidateSnapshotExportEstimateIfBasisChanged(previousBasisKey) {
+    if (snapshotExportEstimateBasisKey() === previousBasisKey) {
+      return false;
+    }
+    invalidateSnapshotExportEstimate();
+    return true;
+  }
+
+  function advanceSnapshotExportSourceGeneration() {
+    state.snapshotExportSourceGeneration = (state.snapshotExportSourceGeneration || 0) + 1;
+    invalidateSnapshotExportEstimate();
   }
 
   function estimatePackagingLabel(packaging) {
@@ -6637,6 +6664,12 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(snapshotExportRequestPayload()),
       });
+      if (
+        nextToken !== state.export.estimate.requestToken
+        || estimateBasisKey !== snapshotExportEstimateBasisKey()
+      ) {
+        return;
+      }
       if (!response.ok) {
         let detail = `Estimate failed with ${response.status}`;
         try {
@@ -6648,7 +6681,10 @@
         throw new Error(detail);
       }
       const estimate = await response.json();
-      if (nextToken !== state.export.estimate.requestToken) {
+      if (
+        nextToken !== state.export.estimate.requestToken
+        || estimateBasisKey !== snapshotExportEstimateBasisKey()
+      ) {
         return;
       }
       state.export.estimate.data = {
@@ -10059,6 +10095,7 @@
         renderSelectors();
         return;
       }
+      const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       closeEnclosureAliasEditor(false);
       if (nextSystemId !== state.selectedSystemId) {
         disarmDiskInventorySync();
@@ -10072,6 +10109,7 @@
       };
       state.storageViewsRuntimeLoading = true;
       state.selectedStorageViewRuntimeId = "";
+      invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
       resetHeatmapHistoryCache();
       resetSasFabricData();
       clearSelectedSlot();
@@ -10090,12 +10128,14 @@
         renderSelectors();
         return;
       }
+      const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       closeEnclosureAliasEditor(false);
       clearSelectedSlot();
       resetHeatmapHistoryCache();
       if (rawValue.startsWith("view:")) {
         state.selectedStorageViewRuntimeId = rawValue.slice("view:".length);
         state.selectedEnclosureId = currentLiveEnclosureId();
+        invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
         renderAll();
         syncLocation();
         ensureHeatmapData();
@@ -10109,6 +10149,7 @@
         if (selectedEnclosureId && !applyPreloadedSnapshotForEnclosureId(selectedEnclosureId)) {
           state.selectedEnclosureId = selectedEnclosureId;
         }
+        invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
         renderAll();
         syncLocation();
         ensureHeatmapData();
@@ -10116,6 +10157,7 @@
       }
       state.selectedStorageViewRuntimeId = "";
       state.selectedEnclosureId = rawValue.startsWith("enclosure:") ? rawValue.slice("enclosure:".length) : (rawValue || null);
+      invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
       state.storageViewsRuntimeLoading = true;
       resetSasFabricData();
       applyReusableSnapshot(state.selectedSystemId, state.selectedEnclosureId);
@@ -10197,7 +10239,9 @@
   }
   if (exportRedactToggle) {
     exportRedactToggle.addEventListener("change", (event) => {
+      const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       state.export.redactSensitive = Boolean(event.target.checked);
+      invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
       persistExportUiPreferences();
       syncSnapshotExportDialog();
       void refreshSnapshotExportEstimate();
@@ -10233,11 +10277,12 @@
   }
   if (exportIncludeEnclosuresToggle) {
     exportIncludeEnclosuresToggle.addEventListener("change", (event) => {
+      const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       state.export.includeLiveEnclosures = Boolean(event.target.checked);
       if (state.export.includeLiveEnclosures && selectedExportEnclosureIds().length <= 1) {
         state.export.selectedEnclosureIds = exportableLiveEnclosures().map((enclosure) => enclosure.id).filter(Boolean);
       }
-      state.export.estimate.data = null;
+      invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
       syncSnapshotExportDialog();
       void refreshSnapshotExportEstimate();
     });
@@ -10248,6 +10293,7 @@
       if (!input) {
         return;
       }
+      const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       const enclosureId = input.dataset.exportEnclosureId || "";
       const selectedIds = new Set(selectedExportEnclosureIds());
       if (input.checked) {
@@ -10261,17 +10307,19 @@
       }
       state.export.selectedEnclosureIds = [...selectedIds];
       state.export.includeLiveEnclosures = state.export.selectedEnclosureIds.length > 1;
-      state.export.estimate.data = null;
+      invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
       syncSnapshotExportDialog();
       void refreshSnapshotExportEstimate();
     });
   }
   if (exportIncludeViewsToggle) {
     exportIncludeViewsToggle.addEventListener("change", (event) => {
+      const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       state.export.includeStorageViews = Boolean(event.target.checked);
       if (state.export.includeStorageViews && !state.export.selectedStorageViewIds.length) {
         state.export.selectedStorageViewIds = exportableStorageViews().map((view) => view.id).filter(Boolean);
       }
+      invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
       syncSnapshotExportDialog();
       void refreshSnapshotExportEstimate();
     });
@@ -10282,6 +10330,7 @@
       if (!input) {
         return;
       }
+      const previousEstimateBasisKey = snapshotExportEstimateBasisKey();
       const viewId = input.dataset.exportStorageViewId || "";
       const selectedIds = new Set(selectedExportStorageViewIds());
       if (input.checked) {
@@ -10291,6 +10340,7 @@
       }
       state.export.selectedStorageViewIds = [...selectedIds];
       state.export.includeStorageViews = state.export.selectedStorageViewIds.length > 0;
+      invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
       syncSnapshotExportDialog();
       void refreshSnapshotExportEstimate();
     });
