@@ -29,6 +29,18 @@ class CIWorkflowContractTests(unittest.TestCase):
     def read(self, path: Path) -> str:
         return path.read_text(encoding="utf-8")
 
+    def test_ci_trigger_matches_the_documented_branch_policy(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        contributing = self.read(ROOT / "CONTRIBUTING.md")
+
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        self.assertEqual(triggers["push"]["branches"], ["**"])
+        self.assertIn(
+            "CI runs on every branch push and on pull requests targeting `main`.",
+            contributing,
+        )
+
     def test_python_floor_and_ceiling_are_separate_matrix_entries(self) -> None:
         workflow = yaml.safe_load(self.read(CI_WORKFLOW))
         job = workflow["jobs"]["python-source"]

@@ -453,6 +453,22 @@ class ModeledPerfFixtureTests(unittest.TestCase):
 
         self.assertIsNone(re.search(r"#(?:36|48|55|56)\b", documentation))
 
+    def test_inlined_asset_budget_decision_records_measured_headroom_without_raising_limit(self) -> None:
+        baseline = json.loads(
+            (ROOT / "docs" / "performance-baseline-v1.json").read_text(encoding="utf-8")
+        )
+        documentation = (ROOT / "docs" / "PERFORMANCE_BUDGETS.md").read_text(encoding="utf-8")
+
+        for case in baseline["cases"].values():
+            self.assertEqual(case["inlined_static_asset_bytes"], 1_597_836)
+            self.assertEqual(case["thresholds"]["inlined_static_asset_bytes"], 2_097_152)
+        self.assertIn(
+            "1,597,836 of 2,097,152 bytes (76.19%), leaving 499,316 bytes (23.81%)",
+            documentation,
+        )
+        self.assertIn("The 2 MiB ceiling remains unchanged", documentation)
+        self.assertIn("#337", documentation)
+
     def test_report_only_snapshot_export_cache_benchmark_uses_modeled_fixture(self) -> None:
         result = subprocess.run(
             [
