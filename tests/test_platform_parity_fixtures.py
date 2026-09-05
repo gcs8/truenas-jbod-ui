@@ -14,6 +14,7 @@ from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, InventoryS
 from app.services.mapping_store import MappingStore
 from app.services.parsers import (
     ParsedSSHData,
+    parse_sg_ses_aes,
     parse_sg_ses_join_filter,
     parse_ssh_outputs,
     parse_storcli_physical_drives,
@@ -523,6 +524,28 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 )
                 self.assertEqual(slot.presence_source, "sg_ses_join")
+
+    def test_scale_md1280_ses_captures_resolve_presence_without_sysfs_conflicts(self) -> None:
+        expected_populated = {"sg1": 70, "sg76": 21}
+        for dev in ("sg1", "sg76"):
+            for page, parser in (
+                ("aes", parse_sg_ses_aes),
+                ("join", parse_sg_ses_join_filter),
+            ):
+                with self.subTest(dev=dev, page=page):
+                    parsed = parser(
+                        fixture_text(f"scale_md1280_{dev}_{page}.txt"),
+                        f"sg_ses {page} /dev/{dev}",
+                    )
+
+                    self.assertIsNotNone(parsed)
+                    assert parsed is not None
+                    populated = [slot for slot in parsed.slots.values() if slot.present]
+                    self.assertEqual(len(populated), expected_populated[dev])
+                    self.assertFalse(
+                        [slot.slot_number for slot in populated if slot.presence_conflict],
+                        f"{dev} {page} populated bays must not conflict without sysfs evidence",
+                    )
 
     async def test_scale_md1280_real_captures_map_via_enclosure_driver(self) -> None:
         """
