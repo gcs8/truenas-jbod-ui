@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import unittest
+from typing import Any
 from unittest.mock import patch
 
 from app.config import PathConfig, Settings
@@ -18,6 +19,27 @@ from app.logging_config import (
 
 
 class LoggingConfigTests(unittest.TestCase):
+    @staticmethod
+    def _render_opt_in_traceback(
+        exc_info: tuple[Any, Any, Any],
+    ) -> tuple[str, str]:
+        record = logging.LogRecord(
+            name="app.observability",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="http_request_error",
+            args=(),
+            exc_info=exc_info,
+        )
+        setattr(record, INCLUDE_TRACEBACK_FIELD, True)
+        try:
+            json_traceback = json.loads(JsonFormatter(service_name="enclosure-ui").format(record))["traceback"]
+            text_line = SafeTextFormatter(service_name="enclosure-ui").format(record)
+        except RecursionError as exc:
+            raise AssertionError("traceback renderer recursively crashed") from exc
+        return json_traceback, text_line
+
     def setUp(self) -> None:
         self.root_logger = logging.getLogger()
         self.original_handlers = list(self.root_logger.handlers)
@@ -339,6 +361,132 @@ class LoggingConfigTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, json_traceback)
             self.assertNotIn(forbidden, text_line)
+
+    def test_opt_in_tracebacks_bound_deep_cause_chains_without_recursion(self) -> None:
+        root: BaseException = RuntimeError("synthetic-0")
+        current = root
+        for index in range(1, 1_200):
+            cause = RuntimeError(f"synthetic-{index}")
+            current.__cause__ = cause
+            current = cause
+        exc_info = (RuntimeError, root, None)
+
+        json_traceback, text_line = self._render_opt_in_traceback(exc_info)
+
+        self.assertIn("[traceback truncated: exception depth limit]", json_traceback)
+        self.assertLessEqual(len(json_traceback), 16_384)
+        self.assertIn(json_traceback, text_line)
+
+    def test_opt_in_tracebacks_bound_deep_context_chains_without_recursion(self) -> None:
+        root: BaseException = RuntimeError("synthetic-0")
+        current = root
+        for index in range(1, 1_200):
+            context = RuntimeError(f"synthetic-{index}")
+            current.__context__ = context
+            current = context
+        exc_info = (RuntimeError, root, None)
+
+        json_traceback, text_line = self._render_opt_in_traceback(exc_info)
+
+        self.assertIn("[traceback truncated: exception depth limit]", json_traceback)
+        self.assertLessEqual(len(json_traceback), 16_384)
+        self.assertIn(json_traceback, text_line)
+
+    def test_opt_in_tracebacks_bound_wide_exception_groups_by_node_count(self) -> None:
+        group = ExceptionGroup(
+            "synthetic-wide-group",
+            [ValueError(f"synthetic-member-{index}") for index in range(200)],
+        )
+        exc_info = (ExceptionGroup, group, None)
+
+        json_traceback, text_line = self._render_opt_in_traceback(exc_info)
+
+        self.assertIn("[traceback truncated: exception node limit]", json_traceback)
+        self.assertLessEqual(json_traceback.count("ValueError"), 63)
+        self.assertLessEqual(len(json_traceback), 16_384)
+        self.assertIn(json_traceback, text_line)
+
+    def test_opt_in_tracebacks_bound_deep_exception_groups_without_recursion(self) -> None:
+        nested: Exception = ValueError("synthetic-leaf")
+        for index in range(1_200):
+            nested = ExceptionGroup(f"synthetic-group-{index}", [nested])
+        exc_info = (ExceptionGroup, nested, None)
+
+        json_traceback, text_line = self._render_opt_in_traceback(exc_info)
+
+        self.assertIn("[traceback truncated: exception depth limit]", json_traceback)
+        self.assertLessEqual(len(json_traceback), 16_384)
+        self.assertIn(json_traceback, text_line)
+
+    def test_opt_in_tracebacks_bound_and_escape_frame_and_exception_metadata(self) -> None:
+        exception_type = type("SyntheticError\r\x1b" + "E" * 300, (Exception,), {})
+        exception = exception_type("synthetic-message")
+
+        def raise_with_metadata(depth: int) -> None:
+            if depth:
+                raise_with_metadata(depth - 1)
+            raise exception
+
+        raise_with_metadata.__code__ = raise_with_metadata.__code__.replace(
+            co_filename="F" * 300 + "TRACE_FILE\r\x00\x1b.py",
+            co_name="TRACE_FUNCTION\n\r\x00\x1b" + "N" * 300,
+        )
+        try:
+            raise_with_metadata(100)
+        except exception_type:
+            exc_info = sys.exc_info()
+
+        json_traceback, text_line = self._render_opt_in_traceback(exc_info)
+
+        self.assertIn("[traceback truncated: frame limit]", json_traceback)
+        self.assertLessEqual(json_traceback.count("  File "), 32)
+        self.assertNotIn("TRACE_FUNCTION\n", json_traceback)
+        for control in ("\r", "\x00", "\x1b"):
+            self.assertNotIn(control, json_traceback)
+            self.assertNotIn(control, text_line)
+        self.assertNotIn("E" * 300, json_traceback)
+        self.assertTrue(all(len(line) <= 340 for line in json_traceback.splitlines()))
+
+    def test_opt_in_tracebacks_mark_cycles_deterministically(self) -> None:
+        first = RuntimeError("synthetic-first")
+        second = ValueError("synthetic-second")
+        first.__cause__ = second
+        second.__cause__ = first
+        exc_info = (RuntimeError, first, None)
+
+        first_render, first_text = self._render_opt_in_traceback(exc_info)
+        second_render, second_text = self._render_opt_in_traceback(exc_info)
+
+        self.assertEqual(first_render, second_render)
+        self.assertEqual(first_text, second_text)
+        self.assertEqual(first_render.count("[traceback cycle omitted]"), 1)
+
+    def test_opt_in_tracebacks_enforce_total_output_limit(self) -> None:
+        exceptions: list[Exception] = []
+
+        def capture_exception(depth: int, exception: Exception) -> None:
+            if depth:
+                capture_exception(depth - 1, exception)
+            raise exception
+
+        capture_exception.__code__ = capture_exception.__code__.replace(
+            co_filename="M" * 300 + ".py",
+            co_name="render_total_output_probe_" + "N" * 300,
+        )
+        for index in range(63):
+            exception = RuntimeError(f"synthetic-{index}")
+            try:
+                capture_exception(31, exception)
+            except RuntimeError as captured:
+                exceptions.append(captured)
+        group = ExceptionGroup("synthetic-output-group", exceptions)
+        exc_info = (ExceptionGroup, group, None)
+
+        json_traceback, text_line = self._render_opt_in_traceback(exc_info)
+
+        self.assertLessEqual(len(json_traceback), 16_384)
+        self.assertIn("[traceback truncated: output limit]", json_traceback)
+        self.assertIn(json_traceback, text_line)
 
     def test_configure_logging_uses_json_stream_when_requested(self) -> None:
         settings = Settings(

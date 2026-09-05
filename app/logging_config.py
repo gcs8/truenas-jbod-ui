@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -30,64 +29,181 @@ OBSERVABILITY_FIELDS = (
 # full traceback rendering; only the unhandled-error diagnostic record does.
 INCLUDE_TRACEBACK_FIELD = "include_traceback"
 TRACEBACK_FILENAME_MAX_LENGTH = 160
+TRACEBACK_FUNCTION_MAX_LENGTH = 120
+TRACEBACK_EXCEPTION_CLASS_MAX_LENGTH = 120
+TRACEBACK_LINE_NUMBER_MAX_LENGTH = 20
+TRACEBACK_MAX_EXCEPTION_DEPTH = 32
+TRACEBACK_MAX_EXCEPTION_NODES = 64
+TRACEBACK_MAX_FRAMES_PER_EXCEPTION = 32
+TRACEBACK_MAX_TOTAL_FRAMES = 128
+TRACEBACK_MAX_OUTPUT_LENGTH = 16_384
 
 
 def _traceback_requested(record: logging.LogRecord) -> bool:
     return bool(getattr(record, INCLUDE_TRACEBACK_FIELD, False)) and bool(record.exc_info)
 
 
-def _format_traceback_frames(traceback_object: Any) -> list[str]:
+def _safe_traceback_metadata(value: Any, max_length: int, *, keep_tail: bool = False) -> str:
+    escaped = json.dumps(str(value), ensure_ascii=True)[1:-1]
+    if len(escaped) <= max_length:
+        return escaped
+    if keep_tail:
+        return f"...{escaped[-(max_length - 3):]}"
+    return f"{escaped[: max_length - 3]}..."
+
+
+class _BoundedTracebackOutput:
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+        self.length = 0
+        self.full = False
+        self.markers: set[str] = set()
+
+    def append(self, text: str) -> None:
+        if self.full:
+            return
+        if self.length + len(text) <= TRACEBACK_MAX_OUTPUT_LENGTH:
+            self.parts.append(text)
+            self.length += len(text)
+            return
+        marker = "\n[traceback truncated: output limit]\n"
+        prefix_length = TRACEBACK_MAX_OUTPUT_LENGTH - len(marker)
+        self.parts = [("".join(self.parts) + text)[:prefix_length], marker]
+        self.length = TRACEBACK_MAX_OUTPUT_LENGTH
+        self.full = True
+
+    def mark(self, reason: str) -> None:
+        if reason in self.markers:
+            return
+        self.markers.add(reason)
+        self.append(f"[traceback truncated: {reason}]\n")
+
+    def mark_cycle(self) -> None:
+        if "cycle" in self.markers:
+            return
+        self.markers.add("cycle")
+        self.append("[traceback cycle omitted]\n")
+
+    def render(self) -> str:
+        return "".join(self.parts)
+
+
+def _format_traceback_frames(traceback_object: Any, max_frames: int) -> tuple[list[str], int, bool]:
     rendered: list[str] = []
-    for frame, line_number in traceback.walk_tb(traceback_object):
-        filename = Path(frame.f_code.co_filename).name or "<unknown>"
-        if len(filename) > TRACEBACK_FILENAME_MAX_LENGTH:
-            filename = f"...{filename[-(TRACEBACK_FILENAME_MAX_LENGTH - 3):]}"
-        rendered.append(
-            f'  File {json.dumps(filename, ensure_ascii=False)}, line {line_number}, '
-            f'in {frame.f_code.co_name}\n'
+    current = traceback_object
+    while current is not None and len(rendered) < max_frames:
+        frame = current.tb_frame
+        filename = _safe_traceback_metadata(
+            Path(frame.f_code.co_filename).name or "<unknown>",
+            TRACEBACK_FILENAME_MAX_LENGTH,
+            keep_tail=True,
         )
-    return rendered
+        function_name = _safe_traceback_metadata(frame.f_code.co_name, TRACEBACK_FUNCTION_MAX_LENGTH)
+        line_number = _safe_traceback_metadata(current.tb_lineno, TRACEBACK_LINE_NUMBER_MAX_LENGTH)
+        rendered.append(
+            f'  File "{filename}", line {line_number}, in {function_name}\n'
+        )
+        current = current.tb_next
+    return rendered, len(rendered), current is not None
 
 
 def _format_traceback_without_exception_value(exc_info: Any) -> str:
     exception_type, exception_value, traceback_object = exc_info
+    output = _BoundedTracebackOutput()
+    frames_rendered = 0
 
-    def render_exception(
-        value: BaseException,
-        current_traceback: Any,
-        seen: set[int],
-    ) -> list[str]:
+    if not isinstance(exception_value, BaseException):
+        if traceback_object is not None:
+            output.append("Traceback (most recent call last):\n")
+            frames, frame_count, truncated = _format_traceback_frames(
+                traceback_object,
+                min(TRACEBACK_MAX_FRAMES_PER_EXCEPTION, TRACEBACK_MAX_TOTAL_FRAMES),
+            )
+            frames_rendered += frame_count
+            for frame_text in frames:
+                output.append(frame_text)
+            if truncated:
+                output.mark("frame limit")
+        class_name = exception_type.__name__ if exception_type is not None else "Exception"
+        output.append(_safe_traceback_metadata(class_name, TRACEBACK_EXCEPTION_CLASS_MAX_LENGTH))
+        return output.render()
+
+    seen: set[int] = set()
+    node_count = 0
+    stack: list[tuple[str, Any, Any, int]] = [
+        ("exception", exception_value, traceback_object, 0)
+    ]
+    while stack and not output.full:
+        task, value, current_traceback, depth = stack.pop()
+        if task == "text":
+            output.append(value)
+            continue
+        if task == "body":
+            if current_traceback is not None:
+                output.append("Traceback (most recent call last):\n")
+                available_frames = min(
+                    TRACEBACK_MAX_FRAMES_PER_EXCEPTION,
+                    TRACEBACK_MAX_TOTAL_FRAMES - frames_rendered,
+                )
+                frames, frame_count, truncated = _format_traceback_frames(
+                    current_traceback,
+                    available_frames,
+                )
+                frames_rendered += frame_count
+                for frame_text in frames:
+                    output.append(frame_text)
+                if truncated:
+                    output.mark("frame limit")
+            output.append(
+                _safe_traceback_metadata(
+                    type(value).__name__,
+                    TRACEBACK_EXCEPTION_CLASS_MAX_LENGTH,
+                )
+            )
+            if isinstance(value, BaseExceptionGroup):
+                remaining_nodes = TRACEBACK_MAX_EXCEPTION_NODES - node_count
+                members = value.exceptions[:remaining_nodes]
+                if len(value.exceptions) > len(members):
+                    output.append("\n")
+                    output.mark("exception node limit")
+                for member in reversed(members):
+                    stack.append(("exception", member, member.__traceback__, depth + 1))
+                    stack.append(("text", "\n", None, depth))
+            continue
+
+        if depth > TRACEBACK_MAX_EXCEPTION_DEPTH:
+            output.mark("exception depth limit")
+            continue
         if id(value) in seen:
-            return []
+            output.mark_cycle()
+            continue
+        if node_count >= TRACEBACK_MAX_EXCEPTION_NODES:
+            output.mark("exception node limit")
+            continue
         seen.add(id(value))
-        rendered: list[str] = []
+        node_count += 1
+        stack.append(("body", value, current_traceback, depth))
         if value.__cause__ is not None:
-            rendered.extend(render_exception(value.__cause__, value.__cause__.__traceback__, seen))
-            rendered.append("\nThe above exception was the direct cause of the following exception:\n\n")
+            stack.append(
+                (
+                    "text",
+                    "\nThe above exception was the direct cause of the following exception:\n\n",
+                    None,
+                    depth,
+                )
+            )
+            stack.append(("exception", value.__cause__, value.__cause__.__traceback__, depth + 1))
         elif value.__context__ is not None and not value.__suppress_context__:
-            rendered.extend(render_exception(value.__context__, value.__context__.__traceback__, seen))
-            rendered.append("\nDuring handling of the above exception, another exception occurred:\n\n")
-        if current_traceback is not None:
-            rendered.append("Traceback (most recent call last):\n")
-            rendered.extend(_format_traceback_frames(current_traceback))
-        rendered.append(type(value).__name__)
-        if isinstance(value, BaseExceptionGroup):
-            for member in value.exceptions:
-                member_rendered = render_exception(member, member.__traceback__, seen)
-                if member_rendered:
-                    rendered.append("\n")
-                    rendered.extend(member_rendered)
-        return rendered
-
-    if isinstance(exception_value, BaseException):
-        return "".join(render_exception(exception_value, traceback_object, set()))
-
-    rendered = []
-    if traceback_object is not None:
-        rendered.append("Traceback (most recent call last):\n")
-        rendered.extend(_format_traceback_frames(traceback_object))
-    rendered.append(exception_type.__name__ if exception_type is not None else "Exception")
-    return "".join(rendered)
+            stack.append(
+                (
+                    "text",
+                    "\nDuring handling of the above exception, another exception occurred:\n\n",
+                    None,
+                    depth,
+                )
+            )
+            stack.append(("exception", value.__context__, value.__context__.__traceback__, depth + 1))
+    return output.render()
 
 
 class JsonFormatter(logging.Formatter):
@@ -109,7 +225,10 @@ class JsonFormatter(logging.Formatter):
             if isinstance(value, str | int | float | bool):
                 payload[field_name] = value
         if record.exc_info and record.exc_info[0] is not None:
-            payload["exception_class"] = record.exc_info[0].__name__
+            payload["exception_class"] = _safe_traceback_metadata(
+                record.exc_info[0].__name__,
+                TRACEBACK_EXCEPTION_CLASS_MAX_LENGTH,
+            )
         if _traceback_requested(record):
             payload["traceback"] = _format_traceback_without_exception_value(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
@@ -145,7 +264,10 @@ class SafeTextFormatter(logging.Formatter):
             if isinstance(value, str | int | float | bool):
                 fields[field_name] = value
         if record.exc_info and record.exc_info[0] is not None:
-            fields["exception_class"] = record.exc_info[0].__name__
+            fields["exception_class"] = _safe_traceback_metadata(
+                record.exc_info[0].__name__,
+                TRACEBACK_EXCEPTION_CLASS_MAX_LENGTH,
+            )
         if fields:
             suffix = " ".join(f"{key}={value}" for key, value in fields.items())
             rendered = f"{rendered} {suffix}"
@@ -156,7 +278,8 @@ class SafeTextFormatter(logging.Formatter):
 
     def formatException(self, ei) -> str:
         exception_type = ei[0]
-        return exception_type.__name__ if exception_type is not None else "Exception"
+        class_name = exception_type.__name__ if exception_type is not None else "Exception"
+        return _safe_traceback_metadata(class_name, TRACEBACK_EXCEPTION_CLASS_MAX_LENGTH)
 
     def formatStack(self, stack_info: str) -> str:
         return ""
