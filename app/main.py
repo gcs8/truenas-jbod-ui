@@ -372,6 +372,7 @@ READ_UI_WRITES_DISABLED_NETWORK_MODE_REASON = (
     "Writes are disabled: this deployment runs the read UI in network auth mode. "
     "Set ADMIN_AUTH_MODE=basic to enable mapping, LED and alias changes."
 )
+READ_UI_SIGN_IN_REQUIRED_REASON = "Sign in to enable mapping, LED, and alias changes."
 
 
 def build_read_ui_write_policy(auth_settings: Any | None) -> dict[str, object]:
@@ -383,7 +384,11 @@ def build_read_ui_write_policy(auth_settings: Any | None) -> dict[str, object]:
     """
 
     if getattr(auth_settings, "auth_mode", None) == "basic":
-        return {"enabled": True, "mode": "basic", "reason": ""}
+        return {
+            "enabled": False,
+            "mode": "basic",
+            "reason": READ_UI_SIGN_IN_REQUIRED_REASON,
+        }
     return {
         "enabled": False,
         "mode": "network",
@@ -399,12 +404,12 @@ def resolve_read_ui_write_policy(request: Request) -> dict[str, object]:
     return build_read_ui_write_policy(getattr(app_state, "operator_auth_settings", None))
 
 
-def require_read_ui_mutation_authorization(request: Request) -> None:
+def require_read_ui_basic_credentials(request: Request) -> None:
     auth_settings = request.app.state.operator_auth_settings
     if auth_settings.auth_mode != "basic":
         raise HTTPException(
             status_code=403,
-            detail="Read UI mutations require ADMIN_AUTH_MODE=basic.",
+            detail="Read UI sign-in requires ADMIN_AUTH_MODE=basic.",
         )
     if not basic_auth_matches(
         request.headers.get("authorization"),
@@ -416,6 +421,16 @@ def require_read_ui_mutation_authorization(request: Request) -> None:
             detail="Read UI authentication required.",
             headers={"WWW-Authenticate": 'Basic realm="truenas-jbod-ui"'},
         )
+
+
+def require_read_ui_mutation_authorization(request: Request) -> None:
+    auth_settings = request.app.state.operator_auth_settings
+    if auth_settings.auth_mode != "basic":
+        raise HTTPException(
+            status_code=403,
+            detail="Read UI mutations require ADMIN_AUTH_MODE=basic.",
+        )
+    require_read_ui_basic_credentials(request)
     if not request_origin_allowed(request, request.app.state.read_ui_public_origin):
         raise HTTPException(
             status_code=403,

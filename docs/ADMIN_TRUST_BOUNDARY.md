@@ -92,6 +92,12 @@ import-preview reads remain anonymous. Main-UI `/livez`, `/healthz`, and the
 configured metrics path also remain anonymous so container health checks and
 Prometheus scraping continue to work.
 
+Each main-UI page starts signed out. Its in-page sign-in verifies the shared
+Basic credentials without changing application state. The browser holds the
+credentials only in page memory, sends them only to same-origin verification
+and mutation routes, and clears them on reload or sign-out. Separate tabs and
+the dedicated Storage Fabric page require their own sign-in.
+
 Basic credentials are only encoded, not encrypted. Use HTTPS through a reverse proxy or a private encrypted VPN. Do not expose Basic authentication over plaintext Internet transport. Keep the password in the ignored local `.env` or another deployment secret source, never in tracked configuration or command output.
 
 Main-UI browser mutations are accepted only when their `Origin` or `Referer`

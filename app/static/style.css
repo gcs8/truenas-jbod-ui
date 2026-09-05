@@ -868,6 +868,40 @@ textarea {
   padding: 0 16px;
 }
 
+.read-ui-auth-panel {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin: -8px 0 18px;
+  padding: 12px 16px;
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  background: rgba(21, 27, 34, 0.82);
+}
+
+.read-ui-auth-form {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.read-ui-auth-form label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.read-ui-auth-form input {
+  width: min(210px, 65vw);
+}
+
+.read-ui-auth-panel > .subtle {
+  flex: 1 1 220px;
+}
+
 .content-grid {
   display: grid;
   grid-template-columns: minmax(0, 2.05fr) minmax(380px, 470px);

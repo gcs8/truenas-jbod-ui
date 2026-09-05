@@ -75,6 +75,9 @@
   const state = {
     snapshotMode,
     writePolicy: normalizeWritePolicy(bootstrap.writePolicy),
+    writeAuthorization: null,
+    writeAuthPending: false,
+    writeAuthRequestToken: 0,
     snapshotExportMeta: bootstrap.snapshotExportMeta || null,
     snapshot: bootstrap.snapshot || { slots: [], systems: [], enclosures: [] },
     storageViewsRuntime: bootstrap.storageViewsRuntime || { system_id: bootstrap.snapshot?.selected_system_id || null, views: [] },
@@ -277,6 +280,13 @@
   const cacheTimingChips = document.getElementById("cache-timing-chips");
   const statusText = document.getElementById("status-text");
   const writePolicyNotice = document.getElementById("write-policy-notice");
+  const readUiAuthPanel = document.getElementById("read-ui-auth-panel");
+  const readUiAuthForm = document.getElementById("read-ui-auth-form");
+  const readUiAuthUsername = document.getElementById("read-ui-auth-username");
+  const readUiAuthPassword = document.getElementById("read-ui-auth-password");
+  const readUiAuthSubmit = document.getElementById("read-ui-auth-submit");
+  const readUiAuthSignOut = document.getElementById("read-ui-auth-sign-out");
+  const readUiAuthStatus = document.getElementById("read-ui-auth-status");
   const summaryDiskCount = document.getElementById("summary-disk-count");
   const summaryPoolCount = document.getElementById("summary-pool-count");
   const summaryEnclosureCount = document.getElementById("summary-enclosure-count");
@@ -1327,6 +1337,7 @@
     try {
       await fetchJson(`/api/sas-fabric/aliases?${params.toString()}`, {
         method: "POST",
+        readUiAuth: true,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           object_id: baseEnclosureId,
@@ -2461,9 +2472,8 @@
     statusText.dataset.tone = tone;
   }
 
-  // Effective write policy for the main UI (#273). The server publishes it in the
-  // bootstrap payload; a missing value means "enabled" so offline snapshot artifacts keep
-  // their own read-only affordances. Once disabled it never re-enables on its own.
+  // Effective write policy for the main UI (#273). Offline snapshots have no
+  // policy. Basic-mode credentials exist only in this page's state.
   function normalizeWritePolicy(raw) {
     if (!raw || typeof raw !== "object") {
       return { enabled: true, mode: "", reason: "" };
@@ -2501,15 +2511,107 @@
   }
 
   function syncWritePolicyControls() {
-    if (writePolicyAllowsWrites()) {
-      return;
-    }
     const reason = writePolicyReason();
     writePolicyControls().forEach((control) => {
+      if (writePolicyAllowsWrites()) {
+        if (control.dataset?.writePolicyDisabled === "true") {
+          control.disabled = false;
+          control.title = control.dataset.writePolicyPreviousTitle || "";
+          if (control.dataset.writePolicyHadDescribedBy === "true") {
+            control.setAttribute(
+              "aria-describedby",
+              control.dataset.writePolicyPreviousDescribedBy || "",
+            );
+          } else {
+            control.removeAttribute?.("aria-describedby");
+          }
+          delete control.dataset.writePolicyDisabled;
+          delete control.dataset.writePolicyReason;
+          delete control.dataset.writePolicyPreviousTitle;
+          delete control.dataset.writePolicyHadDescribedBy;
+          delete control.dataset.writePolicyPreviousDescribedBy;
+        }
+        return;
+      }
+      if (control.dataset?.writePolicyDisabled !== "true") {
+        if (control.disabled) {
+          return;
+        }
+        control.dataset.writePolicyDisabled = "true";
+        control.dataset.writePolicyPreviousTitle = control.title || "";
+        const previousDescribedBy = control.getAttribute?.("aria-describedby");
+        control.dataset.writePolicyHadDescribedBy = previousDescribedBy === null ? "false" : "true";
+        control.dataset.writePolicyPreviousDescribedBy = previousDescribedBy || "";
+      }
       control.disabled = true;
       control.title = reason;
+      control.dataset.writePolicyReason = reason;
       control.setAttribute("aria-describedby", "write-policy-notice");
     });
+  }
+
+  function encodeBasicAuthorization(username, password) {
+    const bytes = new TextEncoder().encode(`${username}:${password}`);
+    let binary = "";
+    bytes.forEach((byte) => {
+      binary += String.fromCharCode(byte);
+    });
+    return `Basic ${btoa(binary)}`;
+  }
+
+  function readUiAuthenticatedHeaders(url, headers = {}) {
+    if (!state.writeAuthorization) {
+      const failure = new Error("Sign in to enable this write.");
+      failure.status = 401;
+      throw failure;
+    }
+    const target = new URL(url, window.location.href);
+    if (target.origin !== window.location.origin) {
+      const failure = new Error("Write credentials can only be sent to a same-origin endpoint.");
+      failure.status = 403;
+      throw failure;
+    }
+    return { ...headers, Authorization: state.writeAuthorization };
+  }
+
+  function clearReadUiAuthorization() {
+    state.writeAuthRequestToken = (state.writeAuthRequestToken || 0) + 1;
+    state.writeAuthPending = false;
+    state.writeAuthorization = null;
+    if (readUiAuthUsername) {
+      readUiAuthUsername.value = "";
+    }
+    if (readUiAuthPassword) {
+      readUiAuthPassword.value = "";
+    }
+  }
+
+  function renderReadUiAuth() {
+    if (!readUiAuthPanel) {
+      return;
+    }
+    const available = !state.snapshotMode && state.writePolicy?.mode === "basic";
+    readUiAuthPanel.classList.toggle("hidden", !available);
+    if (!available) {
+      return;
+    }
+    const signedIn = Boolean(state.writeAuthorization);
+    readUiAuthForm?.classList.toggle("hidden", signedIn);
+    readUiAuthSignOut?.classList.toggle("hidden", !signedIn);
+    if (readUiAuthUsername) readUiAuthUsername.disabled = state.writeAuthPending;
+    if (readUiAuthPassword) readUiAuthPassword.disabled = state.writeAuthPending;
+    if (readUiAuthSubmit) readUiAuthSubmit.disabled = state.writeAuthPending;
+    if (readUiAuthStatus) {
+      if (state.writeAuthPending) {
+        readUiAuthStatus.textContent = "Checking credentials...";
+      } else if (signedIn && writePolicyAllowsWrites()) {
+        readUiAuthStatus.textContent = "Signed in for writes. Credentials clear on reload or sign-out.";
+      } else if (signedIn) {
+        readUiAuthStatus.textContent = `Signed in, but writes are blocked. ${writePolicyReason()}`;
+      } else {
+        readUiAuthStatus.textContent = "Reads remain anonymous. Credentials stay in this page only.";
+      }
+    }
   }
 
   function renderWritePolicyNotice() {
@@ -2529,6 +2631,7 @@
     state.writePolicy = normalizeWritePolicy(policy);
     renderWritePolicyNotice();
     syncWritePolicyControls();
+    renderReadUiAuth();
   }
 
   function writeBlockedByPolicy() {
@@ -2544,6 +2647,9 @@
     if (status !== 401 && status !== 403) {
       return false;
     }
+    if (status === 401) {
+      clearReadUiAuthorization();
+    }
     applyWritePolicy({
       enabled: false,
       mode: state.writePolicy?.mode || "",
@@ -2552,6 +2658,60 @@
         : error?.message || `Request failed with ${status}`,
     });
     return true;
+  }
+
+  async function submitReadUiSignIn(event) {
+    event?.preventDefault();
+    if (state.snapshotMode || state.writePolicy?.mode !== "basic" || state.writeAuthPending) {
+      return;
+    }
+    const username = readUiAuthUsername?.value || "";
+    const password = readUiAuthPassword?.value || "";
+    if (!username || !password) {
+      setStatus("Enter both the write username and password.", "error");
+      return;
+    }
+    state.writeAuthorization = encodeBasicAuthorization(username, password);
+    if (readUiAuthPassword) readUiAuthPassword.value = "";
+    state.writeAuthPending = true;
+    const requestToken = (state.writeAuthRequestToken || 0) + 1;
+    state.writeAuthRequestToken = requestToken;
+    renderReadUiAuth();
+    try {
+      await fetchJson("/api/read-ui/auth/verify", { readUiAuth: true });
+      if (requestToken !== state.writeAuthRequestToken) {
+        return;
+      }
+      applyWritePolicy({ enabled: true, mode: "basic", reason: "" });
+      renderAll();
+      setStatus("Signed in. Write controls are available on this page.");
+    } catch (error) {
+      if (requestToken !== state.writeAuthRequestToken) {
+        return;
+      }
+      clearReadUiAuthorization();
+      applyWritePolicy({
+        enabled: false,
+        mode: "basic",
+        reason: error?.message || "Write sign-in failed.",
+      });
+      setStatus(error?.message || "Write sign-in failed.", "error");
+    } finally {
+      if (requestToken === state.writeAuthRequestToken) {
+        state.writeAuthPending = false;
+      }
+      renderReadUiAuth();
+    }
+  }
+
+  function signOutReadUi() {
+    clearReadUiAuthorization();
+    applyWritePolicy({
+      enabled: false,
+      mode: "basic",
+      reason: "Sign in to enable mapping, LED, and alias changes.",
+    });
+    setStatus("Signed out. Reads remain available.");
   }
 
   function uiPerfNow() {
@@ -8935,9 +9095,12 @@
   }
 
   async function fetchJson(url, options = {}) {
+    const { readUiAuth = false, ...requestOptions } = options;
+    const headers = { "Content-Type": "application/json", ...(requestOptions.headers || {}) };
+    const requestHeaders = readUiAuth ? readUiAuthenticatedHeaders(url, headers) : headers;
     const response = await fetch(url, {
-      ...options,
-      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      ...requestOptions,
+      headers: requestHeaders,
     });
     let payload;
     try {
@@ -9172,6 +9335,7 @@
       setStatus(`Sending ${action} for slot ${slot.slot_label}...`);
       const payload = await sendScopedRequest(`/api/slots/${slot.slot}/led`, {
         method: "POST",
+        readUiAuth: true,
         body: JSON.stringify({ action }),
       });
       applySnapshot(payload.snapshot);
@@ -9428,6 +9592,7 @@
       setStatus(`Saving calibration for slot ${slot.slot_label}...`);
       const result = await sendScopedRequest(`/api/slots/${slot.slot}/mapping`, {
         method: "POST",
+        readUiAuth: true,
         body: JSON.stringify(payload),
       });
       applySnapshot(result.snapshot);
@@ -9473,7 +9638,7 @@
       const revision = encodeURIComponent(slot.mapping_clear_revision);
       const result = await sendScopedRequest(
         `/api/slots/${slot.slot}/mapping?expected_revision=${revision}`,
-        { method: "DELETE" },
+        { method: "DELETE", readUiAuth: true },
       );
       applySnapshot(result.snapshot);
       invalidateHistoryCaches();
@@ -9579,6 +9744,7 @@
       setStatus(`Importing confirmed mappings from ${file.name}...`);
       const result = await sendScopedRequest("/api/mappings/import", {
         method: "POST",
+        readUiAuth: true,
         body: JSON.stringify({
           bundle,
           expected_revision: preview.revision,
@@ -9958,6 +10124,14 @@
     });
     enclosureAliasForm.addEventListener("keydown", handleEnclosureAliasEditorKeydown);
   }
+  if (readUiAuthForm) {
+    readUiAuthForm.addEventListener("submit", (event) => {
+      void submitReadUiSignIn(event);
+    });
+  }
+  if (readUiAuthSignOut) {
+    readUiAuthSignOut.addEventListener("click", signOutReadUi);
+  }
   if (enclosureFace) {
     enclosureFace.addEventListener("click", (event) => {
       if (event.target.closest(".slot-tile")) {
@@ -10298,6 +10472,7 @@
   renderAll();
   renderWritePolicyNotice();
   syncWritePolicyControls();
+  renderReadUiAuth();
   renderHeatmapControls();
   ensureHeatmapData();
   renderUiPerfPanel();

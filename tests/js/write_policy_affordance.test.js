@@ -106,8 +106,12 @@ function control(name) {
     name,
     disabled: false,
     title: "",
+    dataset: {},
     attributes: {},
     setAttribute(key, value) { this.attributes[key] = value; },
+    getAttribute(key) { return this.attributes[key] ?? null; },
+    hasAttribute(key) { return Object.hasOwn(this.attributes, key); },
+    removeAttribute(key) { delete this.attributes[key]; },
   };
 }
 
@@ -120,9 +124,18 @@ const POLICY_FUNCTIONS = [
   "writePolicyControls",
   "syncWritePolicyControls",
   "renderWritePolicyNotice",
+  "renderReadUiAuth",
   "applyWritePolicy",
+  "clearReadUiAuthorization",
   "handleWriteRejection",
   "writeBlockedByPolicy",
+];
+
+const AUTH_FUNCTIONS = [
+  "encodeBasicAuthorization",
+  "readUiAuthenticatedHeaders",
+  "fetchJson",
+  "clearReadUiAuthorization",
 ];
 
 function buildHarness(writePolicy) {
@@ -148,6 +161,9 @@ function buildHarness(writePolicy) {
     mappingForm,
     enclosureAliasForm,
     writePolicyNotice,
+    readUiAuthPanel: null,
+    readUiAuthUsername: null,
+    readUiAuthPassword: null,
     setStatus(message, tone) { statuses.push({ message, tone }); },
   });
   const controls = [
@@ -212,6 +228,33 @@ test("an enabled policy leaves the controls and notice untouched", () => {
   assert.equal(writePolicyNotice.textContent, "");
   assert.equal(writePolicyNotice.classList.contains("hidden"), true);
   assert.equal(fns.writeBlockedByPolicy(), false);
+});
+
+test("sign-in restores policy-owned controls without changing independently disabled controls", () => {
+  const { fns, state, controls } = buildHarness({ enabled: false, mode: "basic", reason: NETWORK_REASON });
+  const policyOwned = controls[0];
+  const independentlyDisabled = controls[1];
+  policyOwned.title = "Identify this bay";
+  policyOwned.setAttribute("aria-describedby", "slot-help");
+  independentlyDisabled.disabled = true;
+  independentlyDisabled.title = "LED unavailable";
+  independentlyDisabled.setAttribute("aria-describedby", "led-help");
+
+  fns.syncWritePolicyControls();
+  assert.equal(policyOwned.disabled, true);
+  assert.equal(policyOwned.title, NETWORK_REASON);
+  assert.equal(independentlyDisabled.disabled, true);
+  assert.equal(independentlyDisabled.title, "LED unavailable");
+  assert.equal(independentlyDisabled.getAttribute("aria-describedby"), "led-help");
+
+  state.writePolicy = { enabled: true, mode: "basic", reason: "" };
+  fns.syncWritePolicyControls();
+  assert.equal(policyOwned.disabled, false);
+  assert.equal(policyOwned.title, "Identify this bay");
+  assert.equal(policyOwned.getAttribute("aria-describedby"), "slot-help");
+  assert.equal(independentlyDisabled.disabled, true);
+  assert.equal(independentlyDisabled.title, "LED unavailable");
+  assert.equal(independentlyDisabled.getAttribute("aria-describedby"), "led-help");
 });
 
 test("a 401/403 write response applies the server detail as the disabled reason", () => {
@@ -319,8 +362,9 @@ test("Storage Fabric rejects blocked alias writes and adopts 401/403 details", (
     "fabricWritePolicyReason",
     "fabricAliasWriteAttributes",
     "fabricWriteBlockedByPolicy",
+    "clearFabricAuthorization",
     "handleFabricWriteRejection",
-  ], { state });
+  ], { state, elements: { authPassword: null } });
 
   assert.equal(fns.fabricWritePolicyAllowsWrites(), false);
   assert.equal(
@@ -339,4 +383,253 @@ test("Storage Fabric rejects blocked alias writes and adopts 401/403 details", (
   assert.equal(state.writePolicy.mode, "basic");
   assert.equal(state.writePolicy.reason, "Read UI authentication required.");
   assert.equal(state.error, "Read UI authentication required.");
+});
+
+test("main UI Basic credentials stay in memory and are sent only on explicit same-origin auth requests", async () => {
+  const requests = [];
+  const state = { writeAuthorization: null };
+  const window = {
+    location: {
+      href: "https://ui.example.test/enclosures",
+      origin: "https://ui.example.test",
+    },
+  };
+  const fetch = async (url, options) => {
+    requests.push({ url, options });
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const fns = loadFunctions(AUTH_FUNCTIONS, {
+    state,
+    window,
+    fetch,
+    TextEncoder,
+    URL,
+    btoa: (value) => Buffer.from(value, "binary").toString("base64"),
+    readUiAuthUsername: null,
+    readUiAuthPassword: null,
+  });
+
+  state.writeAuthorization = fns.encodeBasicAuthorization("opérator", "pässphrase");
+  assert.match(state.writeAuthorization, /^Basic [A-Za-z0-9+/]+=*$/);
+
+  await fns.fetchJson("/api/inventory");
+  await fns.fetchJson("/api/read-ui/auth/verify", { readUiAuth: true });
+
+  assert.equal(requests[0].options.headers.Authorization, undefined);
+  assert.equal(requests[1].options.headers.Authorization, state.writeAuthorization);
+  await assert.rejects(
+    fns.fetchJson("https://attacker.example/write", { readUiAuth: true }),
+    /same-origin/,
+  );
+  assert.equal(requests.length, 2, "cross-origin rejection must happen before fetch");
+
+  fns.clearReadUiAuthorization();
+  assert.equal(state.writeAuthorization, null);
+  await assert.rejects(
+    fns.fetchJson("/api/slots/0/led", { method: "POST", readUiAuth: true }),
+    /Sign in/,
+  );
+  assert.equal(requests.length, 2, "signed-out rejection must happen before fetch");
+});
+
+test("successful sign-in rerenders feature-owned control state before exposing writes", async () => {
+  const state = {
+    snapshotMode: false,
+    writePolicy: { enabled: false, mode: "basic", reason: "Sign in." },
+    writeAuthorization: null,
+    writeAuthPending: false,
+  };
+  let renderCount = 0;
+  const fns = loadFunctions(["submitReadUiSignIn"], {
+    state,
+    readUiAuthUsername: { value: "operator" },
+    readUiAuthPassword: { value: "synthetic-passphrase" },
+    encodeBasicAuthorization: () => "Basic synthetic",
+    renderReadUiAuth() {},
+    fetchJson: async () => ({ ok: true }),
+    applyWritePolicy(policy) { state.writePolicy = policy; },
+    renderAll() { renderCount += 1; },
+    setStatus() {},
+    clearReadUiAuthorization() { state.writeAuthorization = null; },
+  });
+
+  await fns.submitReadUiSignIn({ preventDefault() {} });
+
+  assert.equal(state.writePolicy.enabled, true);
+  assert.equal(renderCount, 1);
+});
+
+test("sign-out clears the in-memory header and both credential fields on both live pages", () => {
+  const mainState = { writeAuthorization: "Basic synthetic" };
+  const mainUsername = { value: "operator" };
+  const mainPassword = { value: "passphrase" };
+  const main = loadFunctions(["clearReadUiAuthorization"], {
+    state: mainState,
+    readUiAuthUsername: mainUsername,
+    readUiAuthPassword: mainPassword,
+  });
+  main.clearReadUiAuthorization();
+  assert.equal(mainState.writeAuthorization, null);
+  assert.equal(mainUsername.value, "");
+  assert.equal(mainPassword.value, "");
+
+  const fabricState = { writeAuthorization: "Basic synthetic" };
+  const fabricUsername = { value: "operator" };
+  const fabricPassword = { value: "passphrase" };
+  const fabric = loadFabricFunctions(["clearFabricAuthorization"], {
+    state: fabricState,
+    elements: { authUsername: fabricUsername, authPassword: fabricPassword },
+  });
+  fabric.clearFabricAuthorization();
+  assert.equal(fabricState.writeAuthorization, null);
+  assert.equal(fabricUsername.value, "");
+  assert.equal(fabricPassword.value, "");
+});
+
+test("late credential verification cannot re-enable writes after sign-out on either live page", async () => {
+  let resolveMainVerification;
+  const mainVerification = new Promise((resolve) => { resolveMainVerification = resolve; });
+  const mainState = {
+    snapshotMode: false,
+    writePolicy: { enabled: false, mode: "basic", reason: "Sign in." },
+    writeAuthorization: null,
+    writeAuthPending: false,
+    writeAuthRequestToken: 0,
+  };
+  const main = loadFunctions([
+    "clearReadUiAuthorization",
+    "submitReadUiSignIn",
+    "signOutReadUi",
+  ], {
+    state: mainState,
+    readUiAuthUsername: { value: "operator" },
+    readUiAuthPassword: { value: "synthetic-passphrase" },
+    encodeBasicAuthorization: () => "Basic synthetic",
+    renderReadUiAuth() {},
+    fetchJson: async () => mainVerification,
+    applyWritePolicy(policy) { mainState.writePolicy = policy; },
+    renderAll() {},
+    setStatus() {},
+  });
+
+  const mainPending = main.submitReadUiSignIn({ preventDefault() {} });
+  main.signOutReadUi();
+  resolveMainVerification({ ok: true });
+  await mainPending;
+
+  assert.equal(mainState.writeAuthorization, null);
+  assert.equal(mainState.writePolicy.enabled, false);
+  assert.equal(mainState.writeAuthPending, false);
+
+  let resolveFabricVerification;
+  const fabricVerification = new Promise((resolve) => { resolveFabricVerification = resolve; });
+  const fabricState = {
+    writePolicy: { enabled: false, mode: "basic", reason: "Sign in." },
+    writeAuthorization: null,
+    writeAuthPending: false,
+    writeAuthRequestToken: 0,
+    error: null,
+  };
+  const elements = {
+    authUsername: { value: "operator" },
+    authPassword: { value: "synthetic-passphrase" },
+  };
+  const fabric = loadFabricFunctions([
+    "clearFabricAuthorization",
+    "submitFabricReadUiSignIn",
+    "signOutFabricReadUi",
+  ], {
+    state: fabricState,
+    elements,
+    encodeFabricBasicAuthorization: () => "Basic synthetic",
+    renderFabricReadUiAuth() {},
+    fetchJson: async () => fabricVerification,
+    render() {},
+  });
+
+  const fabricPending = fabric.submitFabricReadUiSignIn({ preventDefault() {} });
+  fabric.signOutFabricReadUi();
+  resolveFabricVerification({ ok: true });
+  await fabricPending;
+
+  assert.equal(fabricState.writeAuthorization, null);
+  assert.equal(fabricState.writePolicy.enabled, false);
+  assert.equal(fabricState.writeAuthPending, false);
+});
+
+test("a signed-in 403 state reports that writes remain blocked on both live pages", () => {
+  const node = () => ({
+    disabled: false,
+    textContent: "",
+    classList: { toggle() {} },
+  });
+  const mainStatus = node();
+  const main = loadFunctions(["writePolicyAllowsWrites", "writePolicyReason", "renderReadUiAuth"], {
+    state: {
+      snapshotMode: false,
+      writeAuthorization: "Basic synthetic",
+      writeAuthPending: false,
+      writePolicy: { enabled: false, mode: "basic", reason: "Origin is not allowed." },
+    },
+    readUiAuthPanel: node(),
+    readUiAuthForm: node(),
+    readUiAuthUsername: node(),
+    readUiAuthPassword: node(),
+    readUiAuthSubmit: node(),
+    readUiAuthSignOut: node(),
+    readUiAuthStatus: mainStatus,
+  });
+  main.renderReadUiAuth();
+  assert.match(mainStatus.textContent, /writes are blocked/i);
+  assert.match(mainStatus.textContent, /Origin is not allowed/);
+
+  const fabricStatus = node();
+  const fabric = loadFabricFunctions([
+    "fabricWritePolicyAllowsWrites",
+    "fabricWritePolicyReason",
+    "renderFabricReadUiAuth",
+  ], {
+    state: {
+      writeAuthorization: "Basic synthetic",
+      writeAuthPending: false,
+      writePolicy: { enabled: false, mode: "basic", reason: "Origin is not allowed." },
+    },
+    elements: {
+      authPanel: node(),
+      authForm: node(),
+      authUsername: node(),
+      authPassword: node(),
+      authSubmit: node(),
+      authSignOut: node(),
+      authStatus: fabricStatus,
+    },
+  });
+  fabric.renderFabricReadUiAuth();
+  assert.match(fabricStatus.textContent, /writes are blocked/i);
+  assert.match(fabricStatus.textContent, /Origin is not allowed/);
+});
+
+test("main and Storage Fabric templates expose memory-only sign-in and explicit sign-out controls", () => {
+  for (const [template, prefix] of [[TEMPLATE, "read-ui"], [FABRIC_TEMPLATE, "fabric-read-ui"]]) {
+    assert.match(template, new RegExp(`id="${prefix}-auth-form"`));
+    assert.match(template, new RegExp(`id="${prefix}-auth-username"[^>]+autocomplete="off"`));
+    assert.match(template, new RegExp(`id="${prefix}-auth-password"[^>]+type="password"[^>]+autocomplete="off"`));
+    assert.match(template, new RegExp(`id="${prefix}-auth-sign-out"`));
+  }
+  const credentialLifecycleSource = [
+    functionSource(APP_SOURCE, "submitReadUiSignIn"),
+    functionSource(APP_SOURCE, "clearReadUiAuthorization"),
+    functionSource(APP_SOURCE, "signOutReadUi"),
+    functionSource(FABRIC_SOURCE, "submitFabricReadUiSignIn"),
+    functionSource(FABRIC_SOURCE, "clearFabricAuthorization"),
+    functionSource(FABRIC_SOURCE, "signOutFabricReadUi"),
+  ].join("\n");
+  assert.doesNotMatch(credentialLifecycleSource, /localStorage|sessionStorage|document\.cookie/);
+});
+
+test("every main and Storage Fabric mutation explicitly opts into the in-memory authorization header", () => {
+  for (const name of ["sendLedAction", "saveMapping", "clearMapping", "importMappingsFromFile", "submitEnclosureAlias"]) {
+    assert.match(functionSource(APP_SOURCE, name), /readUiAuth:\s*true/, `${name} must request the memory-only header`);
+  }
+  assert.match(functionSource(FABRIC_SOURCE, "saveAliasFromForm"), /readUiAuth:\s*true/);
 });

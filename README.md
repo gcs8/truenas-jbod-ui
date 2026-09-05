@@ -98,6 +98,10 @@ default, `ADMIN_AUTH_MODE=network`, keeps inventory and history views available
 without a login but rejects mapping, alias, import, locator, and LED mutations.
 To enable those controls, set `ADMIN_AUTH_MODE=basic`, configure the shared
 username/password, and set `APP_PUBLIC_ORIGIN` to the exact main-UI origin.
+Basic mode starts each live page signed out. Use the in-page sign-in before a
+mapping, alias, locator, or LED change. The browser keeps those credentials in
+page memory and sends them only to the same-origin verification and mutation
+routes. It clears them on reload or sign-out. Reads stay anonymous.
 In network mode the main UI renders the write controls disabled with that
 reason before any click; a write the server still rejects with 401 or 403
 disables them again and shows the server's detail.

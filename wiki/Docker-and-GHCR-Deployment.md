@@ -87,6 +87,12 @@ Basic mode protects persistent and hardware-changing main-UI writes while reads
 remain anonymous. Use HTTPS through a reverse proxy or an encrypted private
 network; Basic credentials are not encrypted by HTTP itself.
 
+Each live page starts signed out. Use its in-page sign-in before a write. The
+browser holds the credentials only in page memory, sends them only to
+same-origin verification and mutation routes, and clears them on reload or
+sign-out. Separate tabs and the dedicated Storage Fabric page require their own
+sign-in.
+
 ## Default non-root runtime
 
 The base Compose file uses numeric UID/GID `10001:10001` for the UI and history
